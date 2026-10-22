@@ -233,6 +233,14 @@ pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
         &mut outcome,
     )
     .await;
+    if !file_system.uses_host_native_paths() {
+        for skill in &mut outcome.skills {
+            skill.source = Some(crate::model::SkillSource {
+                root: root.clone(),
+                file_system: crate::service::FileSystemIdentity(Arc::clone(&file_system)),
+            });
+        }
+    }
     SkillRootSnapshot {
         root,
         skills: outcome.skills,
@@ -407,7 +415,16 @@ async fn repo_agents_skill_roots(
                 plugin_root: None,
             }),
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => roots.push(SkillRoot {
+                // Absence is a catalog dependency too. Keep the candidate so
+                // the watcher can cover creation through its ancestor fallback.
+                path: agents_skills,
+                scope: SkillScope::Repo,
+                file_system: Arc::clone(&fs),
+                plugin_id: None,
+                plugin_namespace: None,
+                plugin_root: None,
+            }),
             Err(err) => {
                 tracing::warn!(
                     "failed to stat repo skills root {}: {err:#}",
@@ -512,8 +529,12 @@ fn dirs_between_project_root_and_cwd(
 }
 
 fn dedupe_skill_roots_by_path(roots: &mut Vec<SkillRoot>) {
-    let mut seen: HashSet<AbsolutePathBuf> = HashSet::new();
-    roots.retain(|root| seen.insert(root.path.clone()));
+    let mut seen = HashSet::new();
+    roots.retain(|root| {
+        let source = (!root.file_system.uses_host_native_paths())
+            .then(|| crate::service::FileSystemIdentity(Arc::clone(&root.file_system)));
+        seen.insert((root.path.clone(), source))
+    });
 }
 
 async fn canonicalize_for_skill_identity(
@@ -713,6 +734,7 @@ async fn parse_skill_file(
 
     Ok((
         SkillMetadata {
+            source: None,
             name: base_name,
             description,
             short_description,

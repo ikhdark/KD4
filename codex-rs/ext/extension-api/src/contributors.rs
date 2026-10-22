@@ -207,6 +207,19 @@ pub trait ThreadLifecycleContributor<C: Sync>: Send + Sync {
 /// A failed start prevents task execution; failed terminal callbacks do not prevent
 /// terminal recovery. Keep external cleanup independently owned when interrupted.
 pub trait TurnLifecycleContributor: Send + Sync {
+    /// Called after accepted sibling tool effects settle, never while the host
+    /// is waiting for an extension tool. Return model-visible reconciliation
+    /// feedback; a staged terminal intent must not suppress continuation yet.
+    fn on_turn_settled<'a>(
+        &'a self,
+        input: TurnStopInput<'a>,
+    ) -> ExtensionFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let _ = input;
+            None
+        })
+    }
+
     /// Called after turn-scoped extension stores are created, before the task
     /// for the turn starts running.
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
@@ -298,6 +311,12 @@ pub trait TokenUsageContributor: Send + Sync {
     }
 }
 
+/// One coherent executor catalog and the identity describing that catalog.
+pub struct ToolSurfaceSnapshot {
+    pub revision: u64,
+    pub tools: Vec<Arc<dyn ToolExecutor<ToolCall>>>,
+}
+
 /// Extension contribution that exposes native tools owned by a feature.
 pub trait ToolContributor: Send + Sync {
     /// Cheap identity for state that invalidates the contributor's cached tool surface.
@@ -315,6 +334,21 @@ pub trait ToolContributor: Send + Sync {
         0
     }
 
+    /// Captures executors and the revision describing those exact executors.
+    ///
+    /// The default is for turn-frozen contributors. Contributors with live surface
+    /// changes must override this and derive both fields from one owner snapshot.
+    fn surface_snapshot(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+    ) -> ToolSurfaceSnapshot {
+        ToolSurfaceSnapshot {
+            tools: self.tools(session_store, thread_store),
+            revision: self.surface_revision(session_store, thread_store),
+        }
+    }
+
     /// Returns the native tools visible for the supplied extension stores.
     fn tools(
         &self,
@@ -329,6 +363,12 @@ pub trait ToolContributor: Send + Sync {
 /// inspecting or rewriting tool input/output. Use `ToolContributor` for owning a
 /// tool implementation and hooks for policy that needs tool payloads.
 pub trait ToolLifecycleContributor: Send + Sync {
+    /// Required durable accounting runs before terminal completion is claimed.
+    /// Other finish callbacks are observations and must tolerate bounded delivery.
+    fn requires_finish_before_completion(&self) -> bool {
+        false
+    }
+
     /// Called once the host has accepted a tool call for execution.
     fn on_tool_start<'a>(&'a self, _input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(std::future::ready(()))

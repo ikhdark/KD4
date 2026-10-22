@@ -1,28 +1,109 @@
 use super::*;
 
+#[test]
+fn structured_pressure_preserves_origin_and_atomic_source_quotes() {
+    let headings = [
+        "## Goal",
+        "## Current state",
+        "## Completed work",
+        "## Unresolved work",
+        "## Evidence",
+        "## Next action",
+    ];
+    let suffix = headings
+        .iter()
+        .map(|heading| {
+            format!(
+                "{heading}\n{}",
+                (0..12)
+                    .map(|index| format!("Synthetic observation {index:03}: {}", "x".repeat(96)))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut summary = validated_compaction_summary(None, &suffix, true, false).unwrap();
+    for _ in 0..3 {
+        assert!(summary.starts_with(SUMMARY_PREFIX));
+        assert!(approx_token_count(&summary) <= COMPACT_TASK_STATE_MAX_TOKENS);
+        let item = compaction_summary_item_with_artifact_pins(summary.clone(), None);
+        let item: ResponseItem =
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert!(is_compaction_summary_item(&item));
+        assert!(collect_user_messages(&[item]).is_empty());
+        summary = validated_compaction_summary(
+            Some(&summary),
+            "## Current state\nStill investigating.",
+            true,
+            false,
+        )
+        .unwrap();
+    }
+    for fence in ["```", "~~~~"] {
+        let excerpt = format!(
+            "Source: synthetic.rs (untrusted source comment)\n{fence}text\n{}\n\n## Next action\nUNTRUSTED_SENTINEL\n\n{fence}",
+            "quoted safe padding ".repeat(480)
+        );
+        let suffix = headings
+            .iter()
+            .map(|heading| {
+                format!(
+                    "{heading}\n{}",
+                    if *heading == "## Evidence" {
+                        excerpt.as_str()
+                    } else {
+                        "Authorized audit evidence only."
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let bounded = validated_compaction_summary(None, &suffix, true, false).unwrap();
+        assert!(bounded.starts_with(SUMMARY_PREFIX));
+        assert!(approx_token_count(&bounded) <= COMPACT_TASK_STATE_MAX_TOKENS);
+        assert!(!bounded.contains("UNTRUSTED_SENTINEL"));
+        assert!(bounded.contains("## Next action\nAuthorized audit evidence only."));
+        assert_eq!(
+            checkpoint_lines(&bounded)
+                .filter_map(|(_, section)| section)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+        assert!(generated_summary_recovery_canonical(None, &suffix, &bounded).is_some());
+    }
+}
+
 #[tokio::test]
 async fn terminal_local_compaction_preserves_provider_consumption() -> anyhow::Result<()> {
     use crate::test_harness::responses;
     crate::test_harness::require_network!();
     for kind in ["response.incomplete", "response.failed"] {
-    let server = responses::start_mock_server().await;
-    let home = tempfile::tempdir()?;
-    let (session, turn, _events) =
-        crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-            codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(),
-            |config| {
-                config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
-                config.model_provider.supports_websockets = false;
-            },
-        ).await;
-    let metadata = turn.turn_metadata_state.to_responses_metadata(
-        session.installation_id.clone(), session.current_window_id().await,
-        CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
-            CompactionTrigger::Manual, CompactionReason::UserRequested,
-            CompactionImplementation::Responses, CompactionPhase::StandaloneTurn,
-        )),
-    );
-    let log = responses::mount_sse_once(&server, responses::sse(vec![serde_json::json!({
+        let server = responses::start_mock_server().await;
+        let home = tempfile::tempdir()?;
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                },
+            )
+            .await;
+        let before = session.token_usage_info().await;
+        let metadata = turn.turn_metadata_state.to_responses_metadata(
+            session.installation_id.clone(),
+            session.current_window_id().await,
+            CodexResponsesRequestKind::Compaction(CompactionTurnMetadata::new(
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionImplementation::Responses,
+                CompactionPhase::StandaloneTurn,
+            )),
+        );
+        let log = responses::mount_sse_once(&server, responses::sse(vec![serde_json::json!({
         "type": kind, "response": {
             "error": {"code":"insufficient_quota","message":"quota"},
             "id": "partial-compaction", "incomplete_details": {"reason":"max_output_tokens"},
@@ -31,28 +112,56 @@ async fn terminal_local_compaction_preserves_provider_consumption() -> anyhow::R
                 "output_tokens_details":{"reasoning_tokens":10}}
         }
     })])).await;
-    let mut client = session.services.model_client.new_session();
-    let result = drain_to_completed(&session, &turn, &mut client, &metadata,
-        &Prompt::default(), &CancellationToken::new()).await;
-    if kind == "response.failed" {
-        assert!(matches!(result, Err(CodexErr::QuotaExceeded)));
-    } else {
-        assert!(matches!(result, Err(CodexErr::IncompleteResponse(_))));
-    }
-    assert_eq!(session.total_token_usage().await, Some(TokenUsage {
-        input_tokens:100, cached_input_tokens:30, output_tokens:20,
-        reasoning_output_tokens:10, total_tokens:120,
-    }));
-    assert_eq!(log.requests().len(), 1);
+        let mut client = session.services.model_client.new_session();
+        let result = drain_to_completed(
+            &session,
+            &turn,
+            &mut client,
+            &metadata,
+            &Prompt::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        if kind == "response.failed" {
+            assert!(matches!(result, Err(CodexErr::QuotaExceeded)));
+        } else {
+            assert!(matches!(result, Err(CodexErr::IncompleteResponse(_))));
+        }
+        assert_eq!(
+            session.total_token_usage().await,
+            Some(TokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 30,
+                output_tokens: 20,
+                reasoning_output_tokens: 10,
+                total_tokens: 120,
+                coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
+            })
+        );
+        assert_eq!(log.requests().len(), 1);
+        let after = session.token_usage_info().await.unwrap();
+        assert_eq!(
+            after.last_token_usage,
+            before
+                .as_ref()
+                .map(|info| info.last_token_usage.clone())
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            after.estimated_context_tokens,
+            before.and_then(|info| info.estimated_context_tokens)
+        );
     }
     Ok(())
 }
 
 #[tokio::test]
 async fn repetition_rebase_retains_obligations_with_one_persisted_request() {
-    use crate::test_harness::responses::{
-        ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server,
-    };
+    use crate::test_harness::responses::ev_assistant_message;
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::mount_sse_once;
+    use crate::test_harness::responses::sse;
+    use crate::test_harness::responses::start_mock_server;
     let anchor = format!(
         "Verification is UNRUN; do not deploy. {}",
         "Preserve compatibility. ".repeat(80)
@@ -115,6 +224,7 @@ async fn repetition_rebase_retains_obligations_with_one_persisted_request() {
             CompactionPhase::StandaloneTurn,
         ),
         &mut CompactionAnalyticsDetails::default(),
+        &mut TurnItem::ContextCompaction(ContextCompactionItem::new()),
         false,
         &CancellationToken::new(),
     )
@@ -142,10 +252,12 @@ async fn repetition_rebase_retains_obligations_with_one_persisted_request() {
 
 #[tokio::test]
 async fn uncertainty_first_compaction_retains_unplanned_source_with_one_request() {
+    use crate::test_harness::responses::ev_assistant_message;
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::mount_sse_once;
+    use crate::test_harness::responses::sse;
+    use crate::test_harness::responses::start_mock_server;
     use crate::tools::command_output_artifact::read_exact_tool_output_artifact;
-    use crate::test_harness::responses::{
-        ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server,
-    };
     for custom in [false, true] {
         let server = start_mock_server().await;
         let summary = if custom {
@@ -231,6 +343,7 @@ async fn uncertainty_first_compaction_retains_unplanned_source_with_one_request(
                 CompactionPhase::StandaloneTurn,
             ),
             &mut CompactionAnalyticsDetails::default(),
+            &mut TurnItem::ContextCompaction(ContextCompactionItem::new()),
             false,
             &CancellationToken::new(),
         )
@@ -704,6 +817,128 @@ fn agent_message(text: &str) -> ResponseItem {
     }
 }
 
+#[test]
+fn consumed_native_instructions_survive_bounded_checkpoints_and_repeated_windows() {
+    for progress in [false, true] {
+        for (author, recipient) in [
+            ("/root", "/root/child"),
+            ("/root", "/root/a/child"),
+            ("/root/peer", "/root/child"),
+            ("/root/ab", "/root/a"),
+        ] {
+            let mut instruction = agent_message("Do not modify production source.");
+            if let ResponseItem::AgentMessage {
+                author: from,
+                recipient: to,
+                ..
+            } = &mut instruction
+            {
+                *from = author.into();
+                *to = recipient.into();
+            }
+            let request = user_message("Inspect the implementation and report findings.");
+            let mut history = vec![
+                request.clone(),
+                instruction.clone(),
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: "read_file".into(),
+                    namespace: None,
+                    arguments: "{}".into(),
+                    call_id: "read1".into(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id: "read1".into(),
+                    output: codex_protocol::models::FunctionCallOutputPayload::from_text(
+                        "read completed".into(),
+                    ),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ];
+            if progress {
+                let mut item = user_message("I read the source; investigating further.");
+                if let ResponseItem::Message { role, .. } = &mut item {
+                    *role = "assistant".into();
+                }
+                history.push(item);
+            }
+            for _ in 0..2 {
+                for checkpoint in [
+                    build_task_input_checkpoint(&history).0,
+                    build_local_task_input_checkpoint(&history).0,
+                ] {
+                    assert!(checkpoint.contains(&request));
+                    assert!(
+                        checkpoint.contains(&instruction),
+                        "native role and identities must remain exact"
+                    );
+                }
+                history = build_task_input_checkpoint(&history).0;
+            }
+        }
+    }
+}
+
+#[test]
+fn consumed_native_omissions_have_exact_recovery_including_encrypted_payloads() {
+    let mut encrypted = agent_message("");
+    if let ResponseItem::AgentMessage { content, .. } = &mut encrypted {
+        *content = vec![AgentMessageInputContent::EncryptedContent {
+            encrypted_content: "opaque".repeat(COMPACT_AGENT_MESSAGE_MAX_TOKENS * 4),
+        }];
+    }
+    for instruction in [
+        agent_message(&"parent constraint ".repeat(COMPACT_AGENT_MESSAGE_MAX_TOKENS * 4)),
+        encrypted,
+    ] {
+        let mut consumed = user_message("Consumed the parent input.");
+        if let ResponseItem::Message { role, .. } = &mut consumed {
+            *role = "assistant".into();
+        }
+        let source = vec![user_message("Inspect only."), instruction.clone(), consumed];
+        for (checkpoint, omitted) in [
+            {
+                let (items, _, omitted) = build_task_input_checkpoint(&source);
+                (items, omitted)
+            },
+            {
+                let (items, _, _, _, omitted) = build_local_task_input_checkpoint(&source);
+                (items, omitted)
+            },
+        ] {
+            assert!(omitted);
+            let canonical = compaction_text_recovery_for_items(task_compaction_items(&source));
+            let recovery = canonical.value.unwrap();
+            let receipt = checkpoint
+                .iter()
+                .find_map(|item| {
+                    let ResponseItem::Message { content, .. } = item else {
+                        return None;
+                    };
+                    content.iter().find_map(|part| {
+                        let ContentItem::InputText { text } = part else {
+                            return None;
+                        };
+                        let receipt: serde_json::Value = serde_json::from_str(text).ok()?;
+                        (receipt["kind"] == COMPACT_TEXT_OMISSION_MARKER
+                            && receipt["role"] == "agent")
+                            .then_some(receipt)
+                    })
+                })
+                .expect("consumed native input must participate in omission accounting");
+            assert_eq!(
+                recovery.pointer(receipt["recovery_selector"]["pointer"].as_str().unwrap()),
+                Some(&json!(instruction))
+            );
+            assert!(checkpoint.iter().all(|item| !matches!(item, ResponseItem::AgentMessage { content, .. }
+                if content.iter().any(|part| matches!(part, AgentMessageInputContent::EncryptedContent { .. })))
+                || item == &instruction), "encrypted content is never truncated");
+        }
+    }
+}
+
 fn compacted_user_message(text: &str) -> CompactedUserMessage {
     CompactedUserMessage {
         source_item_id: None,
@@ -921,7 +1156,7 @@ fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
                 },
             ],
             phase: None,
-            internal_chat_message_metadata_passthrough: Some(metadata.clone()),
+            internal_chat_message_metadata_passthrough: Some(metadata),
         },
         ResponseItem::Message {
             id: None,
@@ -937,49 +1172,10 @@ fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
 
     let collected = collect_user_messages(&items);
     let history = build_compacted_history(Vec::new(), &collected, "SUMMARY");
-
     assert_eq!(collected.len(), 2);
-    assert_eq!(
-        collected[0].content,
-        vec![
-            UserInput::Image {
-                image_url: "data:image/png;base64,mixed".to_string(),
-                detail: Some(codex_protocol::models::ImageDetail::Low),
-            },
-            UserInput::Text {
-                text: "compare this image".to_string(),
-                text_elements: Vec::new(),
-            },
-        ]
-    );
-    let ResponseItem::Message {
-        content,
-        internal_chat_message_metadata_passthrough,
-        ..
-    } = &history[0]
-    else {
-        panic!("expected rebuilt mixed user message");
-    };
-    assert_eq!(
-        content,
-        &vec![
-            ContentItem::InputImage {
-                image_url: "data:image/png;base64,mixed".to_string(),
-                detail: Some(codex_protocol::models::ImageDetail::Low),
-            },
-            ContentItem::InputText {
-                text: "compare this image".to_string(),
-            },
-        ]
-    );
-    assert_eq!(
-        internal_chat_message_metadata_passthrough.as_ref(),
-        Some(&metadata)
-    );
     assert_eq!(history.len(), 3);
-    assert_eq!(history[1], items[1]);
-    // No backslash in the needle: Debug output escapes the path separators.
-    assert!(!format!("{history:?}").contains("original.png"));
+    // Preserve source path, label, bytes, detail, order and turn metadata.
+    assert_eq!(history[..2], items[..]);
 }
 
 #[test]
@@ -1468,7 +1664,8 @@ fn repeated_compaction_without_new_input_adds_no_bookkeeping() {
         })
         .to_string()
     };
-    bind_omission_receipts_to_recovery(&mut history, &sidecar("artifact-1"));
+    let receipt_ids = new_omission_receipt_ids(&history, &[]);
+    bind_omission_receipts_to_recovery(&mut history, &sidecar("artifact-1"), &receipt_ids);
     history.push(compaction_context_message(sidecar("artifact-1")));
     let bookkeeping = |items: &[ResponseItem]| {
         items
@@ -1497,7 +1694,8 @@ fn repeated_compaction_without_new_input_adds_no_bookkeeping() {
             build_local_task_input_checkpoint(&history);
         assert!(!omitted_user && !omitted_text, "nothing new was cut");
         // A later compaction must not rebind receipts that already name their artifact.
-        bind_omission_receipts_to_recovery(&mut next, &sidecar("artifact-2"));
+        let receipt_ids = new_omission_receipt_ids(&next, &history);
+        bind_omission_receipts_to_recovery(&mut next, &sidecar("artifact-2"), &receipt_ids);
         assert_eq!(bookkeeping(&next), first_bookkeeping);
         assert_eq!(user_tokens(&next), first_tokens);
         history = next;
@@ -2711,7 +2909,9 @@ fn should_use_remote_compact_task_for_azure_provider() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     assert!(should_use_remote_compact_task(&provider, None));
@@ -2746,6 +2946,28 @@ fn incremental_guidance_does_not_repeat_or_override_custom_compact_prompt() {
         "../../prompts/templates/compact/incremental_prompt.md"
     )));
     assert!(assembled.contains("incremental update"));
+    let mut input = vec![UserInput::Text {
+        text: SUMMARIZATION_PROMPT.into(),
+        text_elements: Vec::new(),
+    }];
+    select_compaction_input(&mut input, None, None, &sections);
+    assert!(matches!(&input[0], UserInput::Text { text, .. } if text == SUMMARIZATION_PROMPT));
+    select_compaction_input(&mut input, Some(&previous), None, &sections);
+    assert_eq!(
+        input.len(),
+        1,
+        "incremental requests must not append a second default contract"
+    );
+    assert!(matches!(&input[0], UserInput::Text { text, .. } if text == &assembled));
+    for compact_prompt in [None, Some("preserve the custom structure")] {
+        let custom = "custom exact input";
+        let mut input = vec![UserInput::Text {
+            text: custom.into(),
+            text_elements: Vec::new(),
+        }];
+        select_compaction_input(&mut input, Some(&previous), compact_prompt, &sections);
+        assert!(matches!(&input[0], UserInput::Text { text, .. } if text == custom));
+    }
 }
 #[tokio::test]
 async fn process_compacted_history_reinjects_full_initial_context() {
@@ -2996,6 +3218,7 @@ async fn local_compaction_retains_literal_omission_markers_and_reports_retained_
             CompactionPhase::StandaloneTurn,
         ),
         &mut details,
+        &mut TurnItem::ContextCompaction(ContextCompactionItem::new()),
         true,
         &CancellationToken::new(),
     )
@@ -3073,10 +3296,10 @@ async fn compaction_recovery_failure_keeps_unresolved_text() {
 
 #[tokio::test]
 async fn compaction_recovery_survives_retention_resume_and_fork() {
-    use crate::tool_history::{
-        ToolHistoryLoadOutcome, load_tool_history_state, persist_tool_history_state,
-        remint_tool_history_state_for_fork,
-    };
+    use crate::tool_history::ToolHistoryLoadOutcome;
+    use crate::tool_history::load_tool_history_state;
+    use crate::tool_history::persist_tool_history_state;
+    use crate::tool_history::remint_tool_history_state_for_fork;
     use crate::tools::command_output_artifact::read_exact_tool_output_artifact;
 
     let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -3168,9 +3391,11 @@ async fn compaction_recovery_survives_retention_resume_and_fork() {
 
 #[tokio::test]
 async fn valid_local_summary_is_not_published_when_replacement_preparation_fails() {
-    use crate::test_harness::responses::{
-        ev_assistant_message, ev_completed, mount_sse_once, sse, start_mock_server,
-    };
+    use crate::test_harness::responses::ev_assistant_message;
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::mount_sse_once;
+    use crate::test_harness::responses::sse;
+    use crate::test_harness::responses::start_mock_server;
 
     let server = start_mock_server().await;
     let summary = COMPACTION_SECTIONS
@@ -3250,6 +3475,7 @@ async fn valid_local_summary_is_not_published_when_replacement_preparation_fails
             CompactionPhase::StandaloneTurn,
         ),
         &mut CompactionAnalyticsDetails::default(),
+        &mut TurnItem::ContextCompaction(ContextCompactionItem::new()),
         false,
         &CancellationToken::new(),
     )
@@ -3314,6 +3540,7 @@ async fn local_compaction_keeps_consumed_resume_invalidation() {
             CompactionPhase::StandaloneTurn,
         ),
         &mut CompactionAnalyticsDetails::default(),
+        &mut TurnItem::ContextCompaction(ContextCompactionItem::new()),
         true,
         &CancellationToken::new(),
     )
@@ -3475,15 +3702,22 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
     // Compaction is a sampling request: stale turn settings must not bypass
     // the current preference, FastMode gate, or the selected model's support.
     Arc::make_mut(&mut turn.config).service_tier = Some("priority".into());
-    use codex_protocol::openai_models::{ReasoningEffort, ReasoningEffortPreset};
+    use codex_protocol::openai_models::ReasoningEffort;
+    use codex_protocol::openai_models::ReasoningEffortPreset;
     turn.reasoning_effort = Some(ReasoningEffort::Medium);
     turn.configured_reasoning_effort = Some(ReasoningEffort::Ultra);
     turn.model_info.supports_reasoning_summaries = true;
-    turn.model_info.supported_reasoning_levels =
-        [ReasoningEffort::XHigh, ReasoningEffort::Low, ReasoningEffort::High]
-            .into_iter()
-            .map(|effort| ReasoningEffortPreset { effort, description: String::new() })
-            .collect();
+    turn.model_info.supported_reasoning_levels = [
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Low,
+        ReasoningEffort::High,
+    ]
+    .into_iter()
+    .map(|effort| ReasoningEffortPreset {
+        effort,
+        description: String::new(),
+    })
+    .collect();
     let metadata = turn.turn_metadata_state.to_responses_metadata(
         session.installation_id.clone(),
         session.current_window_id().await,
@@ -3556,7 +3790,10 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
             expected,
             "fast={fast}, supported={supported}, configured={configured:?}"
         );
-        assert_eq!(log.single_request().body_json()["reasoning"]["effort"], "xhigh");
+        assert_eq!(
+            log.single_request().body_json()["reasoning"]["effort"],
+            "xhigh"
+        );
     }
     // The newly sampled preference must not make cancellation wait for a
     // contended session state lock (for example during slow persistence).
@@ -3570,7 +3807,9 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 locked_session.lock_history_state_for_test(),
-            ).await.expect("history lock acquired")
+            )
+            .await
+            .expect("history lock acquired")
         });
         let _ = held_tx.send(());
         let released = release_rx.recv_timeout(std::time::Duration::from_secs(10));
@@ -3594,7 +3833,10 @@ async fn local_compaction_uses_current_supported_service_tier() -> anyhow::Resul
     )
     .await;
     release_tx.send(()).expect("release history holder");
-    holder.await.expect("history holder joined").expect("history holder released");
+    holder
+        .await
+        .expect("history holder joined")
+        .expect("history holder released");
     let result = result.expect("cancellation must not wait for the state lock");
     assert!(matches!(result, Err(CodexErr::TurnAborted)));
     Ok(())
@@ -3607,7 +3849,7 @@ async fn local_compaction_request_records_usage_and_completion_in_turn_timing() 
     crate::test_harness::require_network!();
     let server = responses::start_mock_server().await;
     let home = tempfile::tempdir()?;
-    let (session, turn, _events) =
+    let (mut session, turn, _events) =
         crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
             codex_login::CodexAuth::from_api_key("test-key"),
             Vec::new(),
@@ -3618,6 +3860,32 @@ async fn local_compaction_request_records_usage_and_completion_in_turn_timing() 
             },
         )
         .await;
+    let trace_root = tempfile::tempdir()?;
+    Arc::get_mut(&mut session)
+        .expect("test session is uniquely owned")
+        .services
+        .rollout_thread_trace =
+        codex_rollout_trace::ThreadTraceContext::start_root_in_root_for_test(
+            trace_root.path(),
+            codex_rollout_trace::ThreadStartedTraceMetadata {
+                thread_id: session.thread_id.to_string(),
+                agent_path: "/root".into(),
+                task_name: None,
+                nickname: None,
+                agent_role: None,
+                session_source: turn.session_source.clone(),
+                cwd: turn.config.cwd.to_path_buf(),
+                rollout_path: None,
+                model: turn.model_info.slug.clone(),
+                provider_name: turn.provider.info().name.clone(),
+                approval_policy: "never".into(),
+                sandbox_policy: "read_only".into(),
+            },
+        )?;
+    session
+        .services
+        .rollout_thread_trace
+        .record_codex_turn_started(turn.sub_id.as_str());
     let metadata = turn.turn_metadata_state.to_responses_metadata(
         session.installation_id.clone(),
         session.current_window_id().await,
@@ -3628,7 +3896,7 @@ async fn local_compaction_request_records_usage_and_completion_in_turn_timing() 
             CompactionPhase::StandaloneTurn,
         )),
     );
-    responses::mount_sse_once(
+    let response_mock = responses::mount_sse_once(
         &server,
         responses::sse(vec![
             responses::ev_assistant_message("summary", "summary"),
@@ -3656,6 +3924,87 @@ async fn local_compaction_request_records_usage_and_completion_in_turn_timing() 
         Some(1_234)
     );
     assert!(request.completed_ms.is_some());
+    assert!(
+        request.dispatch_ms.is_some(),
+        "standalone compaction must attach client timing before sending"
+    );
+    assert_eq!(request.physical_attempt_ids.len(), 1);
+    assert!(
+        request
+            .sampling_request_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty())
+    );
+    let physical_id = &request.physical_attempt_ids[0];
+    assert!(!physical_id.is_empty());
+    assert_eq!(
+        request
+            .response_id_by_attempt
+            .get(physical_id)
+            .map(String::as_str),
+        Some("compacted")
+    );
+    use sha2::Digest;
+    let sent = response_mock.single_request();
+    let expected_sha256 = hex::encode(sha2::Sha256::digest(sent.body_bytes()));
+    assert_eq!(
+        request.request_sha256_by_attempt.get(physical_id),
+        Some(&expected_sha256)
+    );
+    assert_eq!(
+        request.generation_purpose,
+        Some(codex_protocol::protocol::TurnTimingGenerationPurpose::CompactionRecovery)
+    );
+    assert_eq!(timing.counters.model_request_count, 1);
+    assert_eq!(timing.milestones.first_visible_output_ms, None);
+    let bundle = std::fs::read_dir(trace_root.path())?
+        .next()
+        .unwrap()?
+        .path();
+    let trace = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(trace) = codex_rollout_trace::replay_bundle(&bundle)
+                && trace.inference_calls.len() == 1
+                && trace
+                    .inference_calls
+                    .values()
+                    .all(|call| call.usage.is_some())
+            {
+                break trace;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("local compaction trace terminal must persist");
+    assert!(
+        trace.compaction_requests.is_empty(),
+        "one canonical inference receipt, not two trace owners"
+    );
+    let usage = trace
+        .inference_calls
+        .values()
+        .next()
+        .unwrap()
+        .usage
+        .as_ref()
+        .unwrap();
+    assert_eq!(usage.total_tokens, Some(1234));
+    assert_eq!(usage.input_tokens, 1234);
+    let captures = std::fs::read_dir(bundle.join("payloads"))?
+        .map(|entry| {
+            Ok(serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(entry?.path())?,
+            )?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(
+        captures
+            .iter()
+            .filter(|capture| capture["_codex"]["settings"]["request_kind"] == "local_compaction")
+            .count(),
+        1
+    );
     Ok(())
 }
 #[test]
@@ -3665,7 +4014,10 @@ fn successive_new_inputs_bound_inherited_recovery_metadata() {
         let mut archives = std::collections::HashMap::new();
         for epoch in 0..16 {
             let sentinel = format!("epoch-{epoch}-sentinel");
-            history.push(user_message(&format!("{} {sentinel}", "large input ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 4))));
+            history.push(user_message(&format!(
+                "{} {sentinel}",
+                "large input ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 4)
+            )));
             let source = task_compaction_items(&history);
             let (mut retained, omitted) = if remote {
                 let (items, _, omitted) = build_task_input_checkpoint(&history);
@@ -3681,10 +4033,17 @@ fn successive_new_inputs_bound_inherited_recovery_metadata() {
             let artifact_id = format!("epoch-{epoch}");
             archives.insert(artifact_id.clone(), value);
             let sidecar = serde_json::json!({"kind":"local_compaction_text_recovery", "artifact_id":artifact_id}).to_string();
-            bind_omission_receipts_to_recovery(&mut retained, &sidecar);
+            let receipt_ids = new_omission_receipt_ids(&retained, &history);
+            bind_omission_receipts_to_recovery(&mut retained, &sidecar, &receipt_ids);
             retained.push(compaction_context_message(sidecar));
-            assert!(retained.iter().filter(|item| is_compaction_text_bookkeeping_item(item))
-                .map(response_item_text_tokens).sum::<usize>() < 1400);
+            assert!(
+                retained
+                    .iter()
+                    .filter(|item| is_compaction_text_bookkeeping_item(item))
+                    .map(response_item_text_tokens)
+                    .sum::<usize>()
+                    < 1400
+            );
             history = retained;
         }
         // Follow only the surviving recovery graph, not every stored artifact.
@@ -3695,19 +4054,140 @@ fn successive_new_inputs_bound_inherited_recovery_metadata() {
             recovered.push_str(&value.to_string());
             match value {
                 serde_json::Value::Object(object) => {
-                    if let Some(id) = object.get("artifact_id").and_then(serde_json::Value::as_str)
-                        && seen.insert(id.to_string()) {
-                        pending.push(archives.get(id).expect("exact artifact remains retained").clone());
+                    if let Some(id) = object
+                        .get("artifact_id")
+                        .and_then(serde_json::Value::as_str)
+                        && seen.insert(id.to_string())
+                    {
+                        pending.push(
+                            archives
+                                .get(id)
+                                .expect("exact artifact remains retained")
+                                .clone(),
+                        );
                     }
                     pending.extend(object.into_values());
                 }
                 serde_json::Value::Array(array) => pending.extend(array),
                 serde_json::Value::String(text) => {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) { pending.push(value); }
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        pending.push(value);
+                    }
                 }
                 _ => {}
             }
         }
-        for epoch in 0..16 { assert!(recovered.contains(&format!("epoch-{epoch}-sentinel"))); }
+        for epoch in 0..16 {
+            assert!(recovered.contains(&format!("epoch-{epoch}-sentinel")));
+        }
+    }
+}
+#[test]
+fn ctxaudit_legacy_null_omission_receipt_is_never_rebound() {
+    let old =
+        compaction_text_omission_receipt("user", Some("old-source".into()), 0, 0, None, 100, 10);
+    let source = vec![
+        old.clone(),
+        user_message(&"new source ".repeat(COMPACT_USER_MESSAGE_MAX_TOKENS * 4)),
+    ];
+    let (mut retained, _, _) = build_task_input_checkpoint(&source);
+    let ids = new_omission_receipt_ids(&retained, &source);
+    assert!(!ids.contains(old.id().unwrap()));
+    bind_omission_receipts_to_recovery(&mut retained, r#"{"artifact_id":"new-archive"}"#, &ids);
+    assert!(
+        retained.contains(&old),
+        "unresolved old ownership must remain unchanged"
+    );
+}
+#[tokio::test]
+async fn ctxaudit_rejected_local_compaction_preserves_active_context() {
+    use crate::test_harness::responses;
+    crate::test_harness::require_network!();
+    for estimate in [None, Some(110)] {
+        let server = responses::start_mock_server().await;
+        let home = tempfile::tempdir().unwrap();
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |config| {
+                    config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+                    config.model_provider.supports_websockets = false;
+                    config.compact_prompt = None;
+                },
+            )
+            .await;
+        let mut assistant = user_message("assistant observation");
+        let mut local_tail = user_message("local developer notice");
+        if let ResponseItem::Message { role, .. } = &mut assistant {
+            *role = "assistant".into();
+        }
+        if let ResponseItem::Message { role, .. } = &mut local_tail {
+            *role = "developer".into();
+        }
+        session
+            .record_conversation_items(&turn, &[assistant, local_tail])
+            .await
+            .unwrap();
+        let prior = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            total_tokens: 110,
+            ..Default::default()
+        };
+        session
+            .record_token_usage_info(&turn, Some(&prior))
+            .await
+            .unwrap();
+        let mut before = session.token_usage_info().await.unwrap();
+        before.estimated_context_tokens = estimate;
+        crate::session::tests::set_test_token_usage_info(&session, before.clone()).await;
+        let active_before = session.get_total_token_usage().await;
+        let history_before = session.clone_history().await.raw_items().to_vec();
+        let window_before = session.current_window_id().await;
+        let body = responses::sse(vec![
+            responses::ev_assistant_message("bad-summary", "No required checkpoint sections."),
+            responses::ev_completed_with_tokens("rejected", 91_000),
+        ]);
+        let requests = responses::mount_sse_sequence(&server, vec![body.clone(), body]).await;
+        let result = run_compact_task_inner_impl(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            None,
+            Some(&None),
+            Vec::new(),
+            InitialContextInjection::DoNotInject,
+            CompactionTurnMetadata::new(
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionImplementation::Responses,
+                CompactionPhase::StandaloneTurn,
+            ),
+            &mut CompactionAnalyticsDetails::default(),
+            &mut TurnItem::ContextCompaction(ContextCompactionItem::new()),
+            false,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "both malformed checkpoints must be rejected"
+        );
+        assert_eq!(requests.requests().len(), 2);
+        assert_eq!(session.clone_history().await.raw_items(), history_before);
+        assert_eq!(session.current_window_id().await, window_before);
+        assert_eq!(
+            session.get_total_token_usage().await,
+            active_before,
+            "the local non-user tail is counted once"
+        );
+        let after = session.token_usage_info().await.unwrap();
+        assert_eq!(after.last_token_usage, before.last_token_usage);
+        assert_eq!(after.estimated_context_tokens, estimate);
+        assert_eq!(
+            after.total_token_usage.total_tokens,
+            prior.total_tokens + 2 * 91_000
+        );
     }
 }

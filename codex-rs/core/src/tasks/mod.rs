@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::FutureExt;
+use futures::StreamExt;
 use futures::future::BoxFuture;
 use tokio::sync::Notify;
 use tokio::sync::oneshot;
@@ -74,9 +75,40 @@ const GRACEFUL_INTERRUPTION_TIMEOUT: Duration =
 const FORCED_INTERRUPTION_TIMEOUT: Duration = Duration::from_secs(1);
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
 
+/// Bounded, caller-owned fanout. All attempts share the original deadline,
+/// including children waiting for a fanout slot. Identity order is stable.
+async fn collect_failed_turn_interrupts<F: Future<Output = &'static str>>(
+    mut children: Vec<codex_protocol::ThreadId>,
+    deadline: tokio::time::Instant,
+    interrupt: impl Fn(codex_protocol::ThreadId) -> F,
+) -> Vec<(codex_protocol::ThreadId, &'static str)> {
+    children.sort_unstable_by_key(ToString::to_string);
+    children.dedup();
+    let mut outcomes = futures::stream::iter(children.into_iter().map(|id| {
+        let interrupt = &interrupt;
+        async move {
+            let outcome = if tokio::time::Instant::now() >= deadline {
+                "not_attempted_before_deadline"
+            } else {
+                tokio::time::timeout_at(deadline, interrupt(id))
+                    .await
+                    .unwrap_or("timed_out")
+            };
+            (id, outcome)
+        }
+    }))
+    .buffer_unordered(16)
+    .collect::<Vec<_>>()
+    .await;
+    outcomes.sort_unstable_by_key(|(id, _)| id.to_string());
+    outcomes
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TurnTaskResult {
+    pub(crate) stop_cause: Option<codex_protocol::protocol::TurnExecutionStopCause>,
     pub(crate) last_agent_message: Option<String>,
+    pub(crate) accepted_final_message: Option<codex_protocol::protocol::AcceptedFinalMessage>,
     pub(crate) surfaced_result: Option<codex_protocol::protocol::SurfacedToolResult>,
     pub(crate) completion_assessment: Option<codex_protocol::protocol::TurnCompletionAssessment>,
     pub(crate) required_tool_terminal: Option<RequiredToolTerminal>,
@@ -160,9 +192,9 @@ fn turn_boundary_history_marker(
 }
 
 /// A turn whose record could not be saved still happened; only crash-safe
-/// resumption of its final state is in doubt. The turn is named because the
-/// post-terminal flush can fail after the next turn has already started.
-fn unsaved_turn_record_warning(turn_id: &str, unsaved: &str) -> String {
+/// resumption of its final state is in doubt. Name the turn so diagnostics
+/// cannot be mistaken for the persistence outcome of a queued successor.
+pub(crate) fn unsaved_turn_record_warning(turn_id: &str, unsaved: &str) -> String {
     format!(
         "Turn {turn_id} ended, but its record was not durably saved: {unsaved}. Its effects stand; resuming this thread after a crash or restart may not show that turn's final state."
     )
@@ -269,7 +301,7 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
 
 #[derive(Debug)]
 enum TurnTerminalOutcome {
-    Completed { result: TurnTaskResult },
+    Completed { result: Box<TurnTaskResult> },
     ReturnedError(CodexErr),
     Aborted(TurnAbortReason),
     WorkerJoinFailed(WorkerJoinFailure),
@@ -488,6 +520,10 @@ impl Session {
         self.start_task_locked(turn_context, input, task).await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Reservation validation, initial-input ownership and task installation stay atomic in active-turn -> turn-state lock order"
+    )]
     async fn start_task_locked<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -593,7 +629,13 @@ impl Session {
                 let session = Arc::clone(self);
                 let ctx = Arc::clone(&turn_context);
                 let task_for_run = Arc::clone(&task);
-                let task_input = input;
+                let task_input = if task_kind == TaskKind::Regular {
+                    self.input_queue
+                        .prepare_initial_input(&turn.turn_state, input)
+                        .await
+                } else {
+                    input
+                };
                 let task_cancellation_token = cancellation_token.child_token();
                 let lifecycle_token_usage = token_usage_at_turn_start.clone();
                 let (start_tx, start_rx) = oneshot::channel::<()>();
@@ -766,7 +808,9 @@ impl Session {
         result: std::result::Result<SessionTaskResult, tokio::task::JoinError>,
     ) {
         let outcome = match result {
-            Ok(Ok(result)) => TurnTerminalOutcome::Completed { result },
+            Ok(Ok(result)) => TurnTerminalOutcome::Completed {
+                result: Box::new(result),
+            },
             Ok(Err(err)) => TurnTerminalOutcome::ReturnedError(err),
             Err(err) if err.is_cancelled() => {
                 TurnTerminalOutcome::WorkerJoinFailed(WorkerJoinFailure::Cancelled)
@@ -840,7 +884,8 @@ impl Session {
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        let _ = self
+        let retry_context = Arc::clone(&turn_context);
+        let result = self
             .start_task_with_admission(
                 &task_start_permit,
                 turn_context,
@@ -849,6 +894,39 @@ impl Session {
             )
             .await;
         startup_guard.disarm();
+        if matches!(result, Err(CodexErr::AgentLimitReached { .. })) {
+            self.schedule_pending_work_capacity_retry(retry_context);
+        }
+    }
+
+    fn schedule_pending_work_capacity_retry(self: &Arc<Self>, context: Arc<TurnContext>) {
+        if self.pending_work_retry.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending = Arc::clone(&self.pending_work_retry);
+        let session = Arc::downgrade(self);
+        let control = self.services.agent_control.clone();
+        let cancelled = self.startup_cancellation.clone();
+        self.terminal_tasks.spawn(async move {
+            struct Reset(Arc<AtomicBool>);
+            impl Drop for Reset {
+                fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+            }
+            let reset = Reset(pending);
+            let guard = tokio::select! {
+                biased;
+                _ = cancelled.cancelled() => return,
+                guard = control.wait_for_execution_capacity(context.multi_agent_version, &context.session_source) => guard,
+            };
+            let Some(session) = session.upgrade() else { return; };
+            // Registration holds the acquired permit until exactly this retry
+            // consumes it, or drops it if the input/turn/shutdown state changed.
+            let Ok(_registration) = control.register_execution_permit(
+                session.thread_id, &context.sub_id, guard,
+            ) else { return; };
+            drop(reset);
+            Box::pin(session.maybe_start_turn_for_pending_work_with_sub_id(context.sub_id.clone())).await;
+        });
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
@@ -857,6 +935,18 @@ impl Session {
             .await;
         if let Some(coordinator) = schedule.coordinator() {
             coordinator.wait_completed().await;
+        }
+    }
+
+    pub(crate) async fn request_task_interrupt(self: &Arc<Self>) {
+        let had_active_turn = self.active_turn.lock().await.is_some();
+        self.schedule_turn_terminal(
+            None,
+            TurnTerminalOutcome::Aborted(TurnAbortReason::Interrupted),
+        )
+        .await;
+        if !had_active_turn {
+            self.cancel_mcp_startup().await;
         }
     }
 
@@ -964,6 +1054,30 @@ impl Session {
                     if let Some(permit) = finalization.permit.take() {
                         permit.complete_cleanup();
                     }
+                    // Returned store failures, unlike panics, also retain the exact
+                    // published event. Retry after releasing interaction/capacity;
+                    // never sample a successor turn or publish another terminal event.
+                    if !finalization.terminal_post_dispatch_completed
+                        && let Some(event) = finalization.published_terminal_event.as_ref()
+                    {
+                        for delay_ms in [100_u64, 500, 2_000] {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            let dispatched = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                session.finish_terminal_event_dispatch(
+                                    finalization.task.turn_context.as_ref(), event,
+                                ),
+                            ).await.unwrap_or(false);
+                            if dispatched {
+                                finalization.terminal_post_dispatch_completed = true;
+                                break;
+                            }
+                        }
+                        if !finalization.terminal_post_dispatch_completed {
+                            warn!(turn_id = %terminal_turn_id,
+                                "terminal reconciliation remains pending; original event retained in rollout");
+                        }
+                    }
                 }
                 .instrument(finalizer_span),
             );
@@ -976,6 +1090,9 @@ impl Session {
         if finalization.coordinator.interaction_released() {
             return false;
         }
+        self.services
+            .code_mode_service
+            .retire_delivery_turn(&finalization.task.turn_context.sub_id);
         drop(finalization.task._agent_execution_guard.take());
         let mut active = self.active_turn.lock().await;
         if active.as_ref().is_some_and(|active_turn| {
@@ -1022,42 +1139,46 @@ impl Session {
             &[],
         );
         let current_span = Span::current();
-        current_span.record(
-            "codex.turn.token_usage.input_tokens",
-            turn_token_usage.input_tokens,
-        );
-        current_span.record(
-            "codex.turn.token_usage.cached_input_tokens",
-            turn_token_usage.cached_input(),
-        );
-        current_span.record(
-            "codex.turn.token_usage.non_cached_input_tokens",
-            turn_token_usage.non_cached_input(),
-        );
-        current_span.record(
-            "codex.turn.token_usage.output_tokens",
-            turn_token_usage.output_tokens,
-        );
-        current_span.record(
-            "codex.turn.token_usage.reasoning_output_tokens",
-            turn_token_usage.reasoning_output_tokens,
-        );
-        current_span.record(
-            "codex.turn.token_usage.total_tokens",
-            turn_token_usage.total_tokens,
-        );
-        for (token_type, value) in [
-            ("total", turn_token_usage.total_tokens),
-            ("input", turn_token_usage.input_tokens),
-            ("cached_input", turn_token_usage.cached_input()),
-            ("output", turn_token_usage.output_tokens),
-            ("reasoning_output", turn_token_usage.reasoning_output_tokens),
+        for (span_field, token_type, value) in [
+            (
+                "codex.turn.token_usage.input_tokens",
+                "input",
+                turn_token_usage.known_input(),
+            ),
+            (
+                "codex.turn.token_usage.cached_input_tokens",
+                "cached_input",
+                turn_token_usage.known_cached_input(),
+            ),
+            (
+                "codex.turn.token_usage.non_cached_input_tokens",
+                "non_cached_input",
+                turn_token_usage.known_non_cached_input(),
+            ),
+            (
+                "codex.turn.token_usage.output_tokens",
+                "output",
+                turn_token_usage.known_output(),
+            ),
+            (
+                "codex.turn.token_usage.reasoning_output_tokens",
+                "reasoning_output",
+                turn_token_usage.known_reasoning_output(),
+            ),
+            (
+                "codex.turn.token_usage.total_tokens",
+                "total",
+                turn_token_usage.known_total(),
+            ),
         ] {
-            self.services.session_telemetry.histogram(
-                TURN_TOKEN_USAGE_METRIC,
-                value,
-                &[("token_type", token_type)],
-            );
+            if let Some(value) = value {
+                current_span.record(span_field, value);
+                self.services.session_telemetry.histogram(
+                    TURN_TOKEN_USAGE_METRIC,
+                    value,
+                    &[("token_type", token_type)],
+                );
+            }
         }
     }
 
@@ -1119,11 +1240,23 @@ impl Session {
             .get_or_insert(event)
             .clone();
         #[cfg(test)]
-        finalization.coordinator.wait_publication_pause_for_test().await;
-        let published_event = self
-            .publish_terminal_event(turn_context.as_ref(), event,
-                &mut finalization.published_terminal_event, recovering_publication)
+        finalization
+            .coordinator
+            .wait_publication_pause_for_test()
             .await;
+        let published_event = self
+            .publish_terminal_event(
+                turn_context.as_ref(),
+                event,
+                &mut finalization.published_terminal_event,
+                recovering_publication,
+            )
+            .await;
+        tracing::info!(target: "codex_task_observation", schema_version = 1,
+            thread_id = %self.thread_id, turn_id = %turn_context.sub_id,
+            phase = "terminal_published", clock = "unix_wall_ms",
+            at_unix_ms = chrono::Utc::now().timestamp_millis(),
+            "task boundary observation");
         // The live event and status transition must precede successor admission.
         // Do not acquire task_start_gate here: a replacement holds it while
         // waiting for this coordinator. Optional post-dispatch work stays outside.
@@ -1180,24 +1313,38 @@ impl Session {
             .finish_turn_before_terminal(&turn_context.sub_id)
             .await;
 
-        if requires_abort_cleanup {
-            if tokio::time::timeout_at(
+        if requires_abort_cleanup
+            && tokio::time::timeout_at(
                 interruption_deadline,
                 wait_for_worker_done(&finalization.task),
             )
             .await
             .is_err()
-            {
-                warn!(
-                    "task {} didn't complete gracefully after {}ms",
-                    turn_context.sub_id,
-                    GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
-                );
-                abort_worker_and_wait(&finalization.task).await;
-            }
+        {
+            warn!(
+                "task {} didn't complete gracefully after {}ms",
+                turn_context.sub_id,
+                GRACEFUL_INTERRUPTION_TIMEOUT.as_millis()
+            );
+            abort_worker_and_wait(&finalization.task).await;
+        }
+
+        // Settle request counts before abort/lifecycle observers can close the
+        // actor's metric scope. No persistence or extension callback is awaited.
+        let unaccounted = turn_context
+            .turn_timing_state
+            .unaccounted_model_request_count();
+        if unaccounted != 0 {
+            self.record_missing_model_usage(turn_context.as_ref(), unaccounted)
+                .await;
+        }
+        if requires_abort_cleanup {
             Arc::clone(&finalization.task.task)
                 .abort(Arc::clone(self), Arc::clone(&turn_context))
                 .await;
+        }
+        if unaccounted != 0 {
+            self.send_token_count_event(turn_context.as_ref()).await;
         }
 
         // Accepted tool completions can still own context extraction and identity
@@ -1285,16 +1432,17 @@ impl Session {
         // Quiescing a broken worker is not permission to discard acknowledged
         // input. Recovery retains it; allows_pending_input_restart still forbids
         // automatic resampling after worker failure.
-        finalization.restart_for_pending_input = if matches!(finalization.outcome, TurnTerminalOutcome::Aborted(_)) {
-            self.input_queue
-                .clear_pending_for_turn_state(finalization.turn_state.as_ref())
-                .await;
-            false
-        } else {
-            self.input_queue
-                .recover_pending_input_for_turn_state(finalization.turn_state.as_ref())
-                .await
-        };
+        finalization.restart_for_pending_input =
+            if matches!(finalization.outcome, TurnTerminalOutcome::Aborted(_)) {
+                self.input_queue
+                    .clear_pending_for_turn_state(finalization.turn_state.as_ref())
+                    .await;
+                false
+            } else {
+                self.input_queue
+                    .recover_pending_input_for_turn_state(finalization.turn_state.as_ref())
+                    .await
+            };
 
         if abort_reason == Some(TurnAbortReason::Interrupted) {
             run_turn_interrupt_hooks(self, &turn_context).await;
@@ -1331,35 +1479,6 @@ impl Session {
             );
         }
 
-        let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
-        if let Some(duration) = timing_snapshot.inclusive_duration() {
-            turn_context
-                .session_telemetry
-                .record_duration(TURN_E2E_DURATION_METRIC, duration, &[]);
-        }
-        let mut timing = crate::turn_timing::retain_turn_timing_details(
-            timing_snapshot.protocol_timing(),
-            &turn_context.config.codex_home,
-            &self.thread_id.to_string(),
-        )
-        .await;
-        if let TurnTerminalOutcome::Completed { result } = &finalization.outcome {
-            timing.completion_assessment = result.completion_assessment.clone();
-        }
-        if finalization
-            .permit
-            .as_ref()
-            .is_some_and(TurnTerminalPermit::try_claim_analytics_emission)
-        {
-            self.services
-                .analytics_events_client
-                .track_turn_profile(TurnProfileFact {
-                    turn_id: turn_context.sub_id.clone(),
-                    profile: timing_snapshot.legacy_profile.clone(),
-                    timing: Some(timing.clone()),
-                });
-        }
-
         let (last_agent_message, surfaced_result, required_tool_terminal, defer_pending_input) =
             match &finalization.outcome {
                 TurnTerminalOutcome::Completed { result } => (
@@ -1381,7 +1500,10 @@ impl Session {
         };
         if error.is_some()
             && (abort_reason.is_none()
-                || matches!(finalization.outcome, TurnTerminalOutcome::WorkerJoinFailed(_)))
+                || matches!(
+                    finalization.outcome,
+                    TurnTerminalOutcome::WorkerJoinFailed(_)
+                ))
         {
             self.interrupt_spawned_agents_after_failed_turn(&turn_context)
                 .await;
@@ -1417,6 +1539,80 @@ impl Session {
             }
             _ => last_agent_message,
         };
+        // Freeze only after execution-affecting cleanup and result preparation.
+        let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
+        tracing::info!(target: "codex_task_observation", schema_version = 1,
+            thread_id = %self.thread_id, turn_id = %turn_context.sub_id,
+            phase = "core_terminal_ready", clock = "unix_wall_ms",
+            at_unix_ms = chrono::Utc::now().timestamp_millis(),
+            "task boundary observation");
+        if let Some(duration) = timing_snapshot.inclusive_duration() {
+            turn_context.session_telemetry.record_duration(
+                TURN_E2E_DURATION_METRIC,
+                duration,
+                &[("boundary", "core_terminal_snapshot")],
+            );
+        }
+        let mut timing = crate::turn_timing::retain_turn_timing_details(
+            timing_snapshot.protocol_timing(),
+            &turn_context.config.codex_home,
+            &self.thread_id.to_string(),
+        )
+        .await;
+        if let TurnTerminalOutcome::Completed { result } = &finalization.outcome {
+            timing.stop_cause = result.stop_cause;
+            timing.completion_assessment = result.completion_assessment.clone();
+            timing.final_answer = Some(codex_protocol::protocol::TurnFinalAnswer {
+                tail: if error.is_none() && abort_reason.is_none() {
+                    turn_context.turn_timing_state.final_tail(
+                        result.accepted_final_message.as_ref(),
+                        result.surfaced_result.as_ref(),
+                    )
+                } else {
+                    None
+                },
+                message: if error.is_none() && abort_reason.is_none() {
+                    result.accepted_final_message.clone()
+                } else {
+                    None
+                },
+            });
+        }
+        if !unsaved_records.is_empty() {
+            timing
+                .completion_assessment
+                .get_or_insert_with(Default::default)
+                .verification_gaps
+                .push(unsaved_turn_record_warning(
+                    &turn_context.sub_id,
+                    &unsaved_records.join("; "),
+                ));
+        }
+        if let Some(snapshot) = self
+            .services
+            .validation_uncertainty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_for_turn(&turn_context.sub_id)
+        {
+            timing
+                .completion_assessment
+                .get_or_insert_with(Default::default)
+                .validation_uncertainty = Some(snapshot);
+        }
+        if finalization
+            .permit
+            .as_ref()
+            .is_some_and(TurnTerminalPermit::try_claim_analytics_emission)
+        {
+            self.services
+                .analytics_events_client
+                .track_turn_profile(TurnProfileFact {
+                    turn_id: turn_context.sub_id.clone(),
+                    profile: timing_snapshot.legacy_profile.clone(),
+                    timing: Some(timing.clone()),
+                });
+        }
         let event = if let Some(reason) = abort_reason.clone() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
@@ -1441,21 +1637,7 @@ impl Session {
         // Freeze accounting while this turn still owns the active slot. Deferred
         // reporting must never attribute a newer turn's tokens to this one.
         let total_token_usage = self.total_token_usage().await.unwrap_or_default();
-        let turn_token_usage = TokenUsage {
-            input_tokens: (total_token_usage.input_tokens - token_usage_at_turn_start.input_tokens)
-                .max(0),
-            cached_input_tokens: (total_token_usage.cached_input_tokens
-                - token_usage_at_turn_start.cached_input_tokens)
-                .max(0),
-            output_tokens: (total_token_usage.output_tokens
-                - token_usage_at_turn_start.output_tokens)
-                .max(0),
-            reasoning_output_tokens: (total_token_usage.reasoning_output_tokens
-                - token_usage_at_turn_start.reasoning_output_tokens)
-                .max(0),
-            total_tokens: (total_token_usage.total_tokens - token_usage_at_turn_start.total_tokens)
-                .max(0),
-        };
+        let turn_token_usage = total_token_usage.difference(&token_usage_at_turn_start);
         // The analytics turn event is emitted when `turn/completed` is observed and
         // rejects later facts, so usage must be queued before terminal publication.
         self.services
@@ -1484,23 +1666,6 @@ impl Session {
         self.emit_post_terminal_metrics(turn_tool_calls, &turn_token_usage)
             .await;
 
-        if let Err(err) = self.flush_rollout_durable().await {
-            warn!("failed to flush rollout after emitting terminal turn event: {err}");
-            // An earlier warning already told the client this turn's record is unsaved.
-            if unsaved_records.is_empty() {
-                self.send_event(
-                    turn_context.as_ref(),
-                    EventMsg::Warning(WarningEvent {
-                        message: unsaved_turn_record_warning(
-                            &turn_context.sub_id,
-                            &format!("terminal record ({err})"),
-                        ),
-                    }),
-                )
-                .await;
-            }
-        }
-
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
         }
@@ -1521,30 +1686,50 @@ impl Session {
                 .and_then(|metadata| metadata.agent_path)
                 .map_or_else(|| thread_id.to_string(), |path| path.as_str().to_string())
         };
+        // One owned budget covers discovery, status reads and independent
+        // queues. Dropping this future cancels all outstanding attempts; no
+        // detached task can enqueue a late or duplicate interrupt.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         let mut interrupted = Vec::new();
-        if let Ok(subtree) = control
-            .list_live_agent_subtree_thread_ids(self.thread_id)
-            .await
+        let mut unconfirmed = Vec::new();
+        match tokio::time::timeout_at(
+            deadline,
+            control.list_live_agent_subtree_thread_ids(self.thread_id),
+        )
+        .await
         {
-            for thread_id in subtree
-                .into_iter()
-                .filter(|thread_id| *thread_id != self.thread_id)
-            {
-                // A child's full submission queue must not hold this turn's
-                // terminal event.
-                if matches!(
-                    control.get_status(thread_id).await,
-                    crate::agent::AgentStatus::PendingInit | crate::agent::AgentStatus::Running
-                ) && tokio::time::timeout(
-                    Duration::from_secs(1),
-                    control.interrupt_agent(thread_id),
-                )
-                .await
-                .is_ok_and(|result| result.is_ok())
+            Ok(Ok(subtree)) => {
+                let children = subtree
+                    .into_iter()
+                    .filter(|id| *id != self.thread_id)
+                    .collect();
+                for (thread_id, outcome) in
+                    collect_failed_turn_interrupts(children, deadline, |id| async move {
+                        if !matches!(
+                            control.get_status(id).await,
+                            crate::agent::AgentStatus::PendingInit
+                                | crate::agent::AgentStatus::Running
+                        ) {
+                            return "not_running";
+                        }
+                        if control.interrupt_agent(id).await.is_ok() {
+                            "enqueued"
+                        } else {
+                            "failed"
+                        }
+                    })
+                    .await
                 {
-                    interrupted.push(label(thread_id));
+                    match outcome {
+                        "enqueued" => interrupted.push(label(thread_id)),
+                        "not_running" => {}
+                        _ => unconfirmed.push(format!("{} ({outcome})", label(thread_id))),
+                    }
                 }
             }
+            Ok(Err(_)) => unconfirmed.push("descendant discovery failed".to_string()),
+            Err(_) => unconfirmed
+                .push("descendant discovery timed out; children were not enumerated".to_string()),
         }
         let mut queued = Vec::new();
         for author in self.input_queue.pending_mailbox_authors().await {
@@ -1553,15 +1738,21 @@ impl Session {
                 queued.push(author);
             }
         }
-        if interrupted.is_empty() && queued.is_empty() {
+        if interrupted.is_empty() && queued.is_empty() && unconfirmed.is_empty() {
             return interrupted;
         }
         let mut message =
             "This turn ended on an error, so it will not read results from agents.".to_string();
         if !interrupted.is_empty() {
             message.push_str(&format!(
-                " Interrupted the agents it started that were still running, to stop their token use: {}. They keep their work and can be resumed.",
+                " Enqueued interrupt requests for agents it started: {}. This does not confirm they have stopped. They keep their work and can be resumed.",
                 crate::session::turn_execution::bounded_path_list(&interrupted)
+            ));
+        }
+        if !unconfirmed.is_empty() {
+            message.push_str(&format!(
+                " Interrupt delivery was not confirmed for {}. They may still be running.",
+                crate::session::turn_execution::bounded_path_list(&unconfirmed)
             ));
         }
         if !queued.is_empty() {
@@ -1589,10 +1780,7 @@ impl Session {
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
-        if !matches!(
-            finalization.outcome,
-            TurnTerminalOutcome::Aborted(_)
-        ) {
+        if !matches!(finalization.outcome, TurnTerminalOutcome::Aborted(_)) {
             finalization.restart_for_pending_input |= self
                 .input_queue
                 .recover_pending_input_for_turn_state(finalization.turn_state.as_ref())
@@ -1607,12 +1795,24 @@ impl Session {
         }
         turn_context.turn_timing_state.begin_finalization();
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
-        let timing = crate::turn_timing::retain_turn_timing_details(
+        let mut timing = crate::turn_timing::retain_turn_timing_details(
             timing_snapshot.protocol_timing(),
             &turn_context.config.codex_home,
             &self.thread_id.to_string(),
         )
         .await;
+        if let Some(snapshot) = self
+            .services
+            .validation_uncertainty
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_for_turn(&turn_context.sub_id)
+        {
+            timing
+                .completion_assessment
+                .get_or_insert_with(Default::default)
+                .validation_uncertainty = Some(snapshot);
+        }
         let event = if let Some(reason) = finalization.outcome.abort_reason() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
@@ -1665,11 +1865,13 @@ impl Session {
     }
 
     pub(crate) async fn begin_shutdown(&self) {
+        // Fence starts before observing an admitted transaction's permit. A
+        // rollback may own that permit long after its caller stops waiting.
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
         let Ok(_task_start_permit) = self.task_start_gate.acquire().await else {
             unreachable!("session-owned task-start semaphore is never closed");
         };
-        self.shutting_down
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) async fn close_unified_exec_processes(&self) {

@@ -28,6 +28,17 @@ impl From<AuthError> for TransportError {
 /// Header-only providers can implement `add_auth_headers`; providers that sign
 /// complete requests can override `apply_auth`.
 pub trait AuthProvider: Send + Sync {
+    /// Final request-local admission, rechecked after transport preparation.
+    fn dispatch_guard(&self) -> Option<Arc<dyn codex_client::RequestDispatchGuard>> {
+        None
+    }
+
+    /// Stable, nonsecret connection ownership for timestamped handshake credentials.
+    /// Ordinary bearer providers retain full-header fingerprinting.
+    fn connection_identity(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Adds any auth headers that are available without request body access.
     ///
     /// Implementations should be cheap and non-blocking. This method is also

@@ -5,6 +5,355 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn cached_search_streams_require_retained_evidence() {
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
+    let receipt = ExecCommandToolOutput::cached_search_miss("reused miss".into());
+    let untyped = receipt.code_mode_result(&payload);
+    assert_eq!(untyped["streams_complete"], false);
+    assert!(untyped.get("stdout").is_none());
+    let typed = receipt
+        .with_evidence(crate::tools::command_execution::RetainedSearchMiss {
+            evidence_id: "evidence".into(),
+            original_execution_id: "original".into(),
+            validity_scope_fingerprint: "scope".into(),
+            stdout: String::new(),
+            stderr: "original warning\n".into(),
+        })
+        .code_mode_result(&payload);
+    assert_eq!(typed["streams_complete"], true);
+    assert_eq!(typed["executed"], false);
+    assert_eq!(typed["reused"], true);
+    assert_eq!(typed["stdout"], "");
+    assert_eq!(typed["stderr"], "original warning\n");
+    assert!(typed.get("session_id").is_none());
+}
+
+#[tokio::test]
+async fn audit132_direct_mcp_recovery_is_registered_for_compaction() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let raw = CallToolResult {
+        content: vec![json!({"type":"text","text":"raw evidence\n".repeat(4000)})],
+        structured_content: None,
+        is_error: Some(false),
+        meta: None,
+    };
+    let output = mcp_tool_output(raw, Duration::ZERO, true, TruncationPolicy::Bytes(4000))
+        .retain_reduced_result(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+            Some((&session, "mcp-origin")),
+        )
+        .await;
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
+    let item: codex_protocol::models::ResponseItem = serde_json::from_value(
+        serde_json::to_value(output.to_response_item("mcp-origin", &payload)).unwrap(),
+    )
+    .unwrap();
+    let history = session.clone_history().await;
+    let pins = history
+        .tool_history_state()
+        .artifact_pin_payload_for_items(&[item])
+        .expect("compaction recovery pin");
+    let pins: JsonValue = serde_json::from_str(&pins).unwrap();
+    assert_eq!(pins["artifacts"][0]["call_id"], "mcp-origin");
+    assert!(pins["artifacts"][0]["artifact_id"].is_string());
+}
+
+#[tokio::test]
+async fn audit132_mixed_mcp_retention_preserves_images_and_history_safe_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let image = "data:image/png;base64,aGVsbG8=";
+    let raw = CallToolResult {
+        content: vec![
+            json!({"type":"text","text":"a".repeat(15000)}),
+            json!({"type":"image","mimeType":"image/png","data":"aGVsbG8="}),
+            json!({"type":"text","text":"b".repeat(15000)}),
+        ],
+        structured_content: Some(json!({"exact":18446744073709551615u64})),
+        is_error: Some(true),
+        meta: Some(json!({"origin":"unique-call"})),
+    };
+    let output = mcp_tool_output(
+        raw.clone(),
+        Duration::ZERO,
+        true,
+        TruncationPolicy::Tokens(1000),
+    )
+    .retain_reduced_result(home.path(), "mixed-mcp", None)
+    .await;
+    let payload = output.provider_payload();
+    assert_eq!(
+        truncate_function_output_payload(payload, TruncationPolicy::Tokens(1000)),
+        *payload
+    );
+    assert_eq!(payload.success, Some(false));
+    let FunctionCallOutputBody::ContentItems(items) = &payload.body else {
+        panic!("mixed content")
+    };
+    assert!(items.iter().any(|item| matches!(item, FunctionCallOutputContentItem::InputImage { image_url, .. } if image_url == image)));
+    let FunctionCallOutputContentItem::InputText { text } = items.last().unwrap() else {
+        panic!("retention receipt")
+    };
+    let receipt: JsonValue = serde_json::from_str(text).unwrap();
+    assert_eq!(receipt["retention_status"], "retained");
+    assert_eq!(
+        output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".into()
+        }),
+        serde_json::to_value(raw).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn patch_receipts_bound_advisories_and_retain_displaced_move_bytes() {
+    for occupied in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = codex_utils_path_uri::PathUri::from_host_native_path(root.path()).unwrap();
+        std::fs::write(root.path().join("source"), "source\r\n").unwrap();
+        if occupied {
+            std::fs::write(root.path().join("destination"), "source\r\n").unwrap();
+        }
+        let mut patch = "*** Begin Patch\n*** Update File: source\n*** Move to: destination\n*** Add File: generated\n".to_string();
+        for _ in 0..10_000 {
+            patch.push_str("+generated; \n");
+        }
+        patch.push_str("*** End Patch");
+        let delta = codex_apply_patch::apply_patch(
+            &patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            codex_exec_server::LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut output = ApplyPatchToolOutput::from_delta("applied".into(), true, &delta, None);
+        let canonical = output.structured_result();
+        assert!(output.requires_canonical_artifact());
+        assert_eq!(canonical["diagnostics"].as_array().unwrap().len(), 10_000);
+        assert_eq!(canonical["diagnostics"][9999]["line"], 10_000);
+        assert_eq!(canonical["changes"][0]["destination_replaced"], occupied);
+        if occupied {
+            assert_eq!(
+                canonical["changes"][0]["overwritten_move_content"],
+                "source\r\n"
+            );
+            assert_eq!(canonical["changes"][0]["destination_before_bytes"], 8);
+        }
+        let inline = output.diagnostic_display();
+        assert_eq!(inline["advisory_count"], 10_000);
+        assert_eq!(inline["sample_complete"], false);
+        assert_eq!(inline["sample"].as_array().unwrap().len(), 8);
+        assert!(output.model_text().len() < 4096);
+        assert!(
+            output
+                .projection_metadata()
+                .unwrap()
+                .essential_inline
+                .to_string()
+                .len()
+                < 4096
+        );
+        // Successful mutation is independent of completeness of its inventory.
+        output.changes_exact = false;
+        assert!(output.model_text().contains("changes_exact=false"));
+    }
+}
+
+#[tokio::test]
+async fn reduced_direct_mcp_result_is_recoverable_after_the_native_owner_drops() {
+    let home = tempfile::tempdir().unwrap();
+    let text = format!(
+        "{}MIDDLE_EVIDENCE_7f1{}",
+        "a".repeat(100_000),
+        "b".repeat(100_000)
+    );
+    let raw = CallToolResult {
+        content: vec![json!({"type":"text","text":text})],
+        structured_content: Some(json!({"answer":42})),
+        is_error: Some(false),
+        meta: None,
+    };
+    let output = mcp_tool_output(
+        raw.clone(),
+        Duration::ZERO,
+        true,
+        TruncationPolicy::Tokens(1_000),
+    )
+    .retain_reduced_result(home.path(), "mcp-recovery", None)
+    .await;
+    let model = output.provider_payload().body.to_text().unwrap();
+    assert_eq!(
+        truncate_function_output_payload(
+            output.provider_payload(),
+            TruncationPolicy::Tokens(1_000)
+        ),
+        *output.provider_payload()
+    );
+    let receipt: JsonValue = serde_json::from_str(model.lines().last().unwrap()).unwrap();
+    assert_eq!(receipt["retention_status"], "retained");
+    let artifact_id = receipt["artifact_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        output.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".into()
+        }),
+        serde_json::to_value(&raw).unwrap()
+    );
+    drop(output);
+    let recovered = crate::tools::command_output_artifact::read_tool_output_selectors(
+        home.path(),
+        "mcp-recovery",
+        &artifact_id,
+        vec![
+            crate::tools::command_output_artifact::ToolOutputSelector::JsonPointer {
+                pointer: "/content/0/text".into(),
+            },
+            crate::tools::command_output_artifact::ToolOutputSelector::JsonPointer {
+                pointer: "/structuredContent".into(),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    for row in &recovered.results {
+        match &row.selector {
+            crate::tools::command_output_artifact::ToolOutputSelector::JsonPointer { pointer }
+                if pointer == "/content/0/text" =>
+            {
+                use crate::tools::command_output_artifact::ToolOutputSelector;
+                use crate::tools::command_output_artifact::ToolOutputSelectorStatus;
+                // The complete value exceeds the recovery transaction budget.
+                // Follow its advertised bounded byte ranges instead of treating
+                // a typed overflow receipt as missing retained evidence.
+                assert_eq!(row.status, ToolOutputSelectorStatus::SelectorTooLarge);
+                let range = row.canonical_range.expect("exact JSON string range");
+                let mut selector = row.continuation.clone().expect("bounded continuation");
+                let mut bytes = Vec::new();
+                let mut next = range.start;
+                while next < range.end {
+                    let page = crate::tools::command_output_artifact::read_tool_output_selectors(
+                        home.path(),
+                        "mcp-recovery",
+                        &artifact_id,
+                        vec![selector],
+                    )
+                    .await
+                    .unwrap();
+                    assert!(page.complete);
+                    let part = &page.results[0];
+                    let part_range = part.canonical_range.unwrap();
+                    assert_eq!(part_range.start, next);
+                    assert!(part_range.end > next && part_range.end <= range.end);
+                    bytes.extend_from_slice(part.text.as_ref().unwrap().as_bytes());
+                    // Leave envelope headroom as the later byte offsets grow.
+                    let chunk_bytes = (part_range.end - next).min(1024);
+                    next = part_range.end;
+                    selector = ToolOutputSelector::Bytes {
+                        start: next,
+                        end: next.saturating_add(chunk_bytes).min(range.end),
+                    };
+                }
+                assert_eq!(
+                    serde_json::from_slice::<JsonValue>(&bytes).unwrap(),
+                    json!(text)
+                );
+            }
+            _ => assert_eq!(row.value, Some(json!({"answer":42}))),
+        }
+    }
+    let small_home = tempfile::tempdir().unwrap();
+    let short = CallToolResult {
+        content: vec![json!({"type":"text","text":"short"})],
+        structured_content: None,
+        is_error: None,
+        meta: None,
+    };
+    mcp_tool_output(
+        short,
+        Duration::ZERO,
+        true,
+        TruncationPolicy::Tokens(10_000),
+    )
+    .retain_reduced_result(small_home.path(), "short", None)
+    .await;
+    assert!(!small_home.path().join("tool-output").exists());
+    let between_budgets = CallToolResult {
+        content: vec![json!({"type":"text","text":"x".repeat(1050)})],
+        structured_content: None,
+        is_error: None,
+        meta: None,
+    };
+    let between = mcp_tool_output(
+        between_budgets,
+        Duration::ZERO,
+        true,
+        TruncationPolicy::Bytes(1024),
+    )
+    .retain_reduced_result(home.path(), "escaping-allowance", None)
+    .await;
+    assert!(
+        between.retained_payload.is_some(),
+        "history reduction inside the provider's 20% allowance also needs exact recovery"
+    );
+}
+
+#[test]
+fn rust_admission_busy_requires_trusted_producer_and_actual_refusal() {
+    let record = json!({"kind":"codex_rust_admission_v1", "status":"busy", "exit_code":75,
+        "validation_status":"pending", "executed":false, "queued":false,
+        "automatic_retry":false, "automatic_resume":false, "resource":"fixture-lane"});
+    for (runner, exit, terminal, valid) in [
+        (Some("rust_test_runner"), 75, true, true),
+        (None, 75, true, false),
+        (Some("other"), 75, true, false),
+        (Some("rust_test_runner"), 2, true, false),
+        (Some("rust_test_runner"), 75, false, false),
+    ] {
+        let validation = crate::validation::CommandValidation {
+            execution_context: None,
+            declared: None,
+            classification: crate::validation::classify_validation_script("cargo test"),
+            receipt_runner: runner.map(str::to_owned),
+        };
+        let mut signal = json!({"outcome":"failure", "failure_signature":"old"});
+        attach_command_validation(
+            &mut signal,
+            record.to_string().as_bytes(),
+            Some(&validation),
+            Some(exit),
+            terminal,
+        );
+        assert_eq!(signal["validation_admission_pending"] == true, valid);
+        if valid {
+            assert_eq!(signal["outcome"], "blocked");
+            assert!(signal.get("failure_signature").is_none());
+            assert!(signal.get("background_process_id").is_none());
+        }
+    }
+    for raw in [
+        "busy".to_owned(),
+        "{broken".to_owned(),
+        format!("{record}\n{record}"),
+        {
+            let mut r = record;
+            r["executed"] = json!(true);
+            r.to_string()
+        },
+    ] {
+        assert!(!runner_admission_pending(
+            raw.as_bytes(),
+            Some("rust_test_runner"),
+            Some(75)
+        ));
+    }
+}
+
+#[test]
 fn epistemic_diagnostic_coordinates_preserve_owners_and_nonlocations() {
     for (first, second) in [
         (
@@ -2167,8 +2516,8 @@ fn token_efficiency_exec_output_preserves_live_process_state_for_large_output() 
     assert!(response.len() < raw_output.len());
 }
 
-#[test]
-fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
+#[tokio::test]
+async fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     let raw_output = (0..900)
         .map(|index| {
             if index == 450 {
@@ -2179,9 +2528,14 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let artifact_id: ToolOutputArtifactId = "019fa782-f8e1-7533-a3f7-60d3f9a42997".parse().unwrap();
-    let artifact_path =
-        std::path::PathBuf::from(format!(r"C:\codex\tool-output\{artifact_id}.log"));
+    let home = tempfile::tempdir().unwrap();
+    let artifact = crate::tools::command_output_artifact::create_raw_output_artifact(
+        home.path(),
+        "exec-summary",
+        raw_output.as_bytes(),
+    )
+    .await;
+    let artifact_id = artifact.artifact_id().unwrap();
     let mut output = ExecCommandToolOutput {
         output_ranges: None,
         process_output: None,
@@ -2200,13 +2554,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         search_no_match: false,
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
-        raw_output_artifact: Some(RawOutputArtifact::Stored {
-            id: artifact_id,
-            path: artifact_path,
-            bytes: raw_output.len() as u64,
-            truncated: false,
-            handle: std::sync::Arc::new(tempfile::tempfile().expect("artifact handle")),
-        }),
+        raw_output_artifact: Some(artifact),
         repair_notice: Some("Command preflight applied one repair".to_string()),
         pending_deferred_completions: Vec::new(),
     };
@@ -2884,6 +3232,16 @@ async fn exec_code_mode_exposes_artifact_id_not_path() {
 async fn exec_code_mode_preserves_empty_output_and_explicit_lifecycle() {
     let (mut output, _, _, _retained_root) = artifact_backed_exec_output(b"", Some(1_000)).await;
     output.raw_output_artifact = None;
+    // Completeness requires the process-owned exact (here empty) output.
+    output.process_output = Some(std::sync::Arc::new(
+        crate::unified_exec::ProcessOutputSnapshot {
+            aggregated_output: Vec::new(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            aggregated_output_is_exact: true,
+            streams_are_exact: true,
+        },
+    ));
 
     let result = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
@@ -3101,7 +3459,17 @@ async fn fork91_no_match_requires_exact_error_free_terminal_streams() {
 #[tokio::test]
 async fn nested_command_output_uses_cell_budget_and_preserves_explicit_caps() {
     let raw = "source line with useful evidence\n".repeat(1500);
-    let (output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(8_000)).await;
+    let (mut output, _, _, _root) = artifact_backed_exec_output(raw.as_bytes(), Some(8_000)).await;
+    // Completeness requires the process-owned exact output, not the display chunk.
+    output.process_output = Some(std::sync::Arc::new(
+        crate::unified_exec::ProcessOutputSnapshot {
+            aggregated_output: raw.as_bytes().to_vec(),
+            stdout: raw.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            aggregated_output_is_exact: true,
+            streams_are_exact: true,
+        },
+    ));
     let payload = |cap: Option<usize>| ToolPayload::Function {
         arguments: json!({"max_output_tokens": cap}).to_string(),
     };

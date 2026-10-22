@@ -8,6 +8,7 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartSource;
 use codex_core::config::Config;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::PermissionProfile;
 use serde_json::Value;
 
@@ -138,9 +139,18 @@ pub fn thread_config_overrides_from_config(config: &Config) -> Option<HashMap<St
             .personality
             .map(|personality| personality.to_string()),
     );
+    // Like personality, forward only a chosen mode: the app-server resolves the
+    // same default, and a forwarded default reads there as explicit config.
+    let web_search_mode = config.web_search_mode.value();
+    let web_search_chosen = web_search_mode != WebSearchMode::Cached
+        || config
+            .config_layer_stack
+            .effective_config()
+            .get("web_search")
+            .is_some();
     insert(
         "web_search",
-        Some(config.web_search_mode.value().to_string()),
+        web_search_chosen.then(|| web_search_mode.to_string()),
     );
     if config.bypass_hook_trust {
         overrides.insert("bypass_hook_trust".to_string(), Value::Bool(true));

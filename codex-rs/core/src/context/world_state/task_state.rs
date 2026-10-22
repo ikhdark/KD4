@@ -55,11 +55,41 @@ impl TaskState {
 
     pub(crate) fn with_accepted_input_refs(
         mut self,
-        references: Vec<crate::plan_store::PlanInputReference>,
+        mut references: Vec<crate::plan_store::PlanInputReference>,
     ) -> Self {
         if self.0["has_plan"] == true && !references.is_empty() {
+            if references.len() > 128 {
+                std::sync::Arc::make_mut(&mut self.0)["accepted_input_refs_total"] =
+                    references.len().into();
+                std::sync::Arc::make_mut(&mut self.0)["accepted_input_refs_recovery"] =
+                    "Older authentic origins remain in the owner. Cite an exact known turn/hash or complete original text and reconcile the current scope_input_revision; this display limit does not revoke instructions.".into();
+                references.truncate(128);
+            }
             std::sync::Arc::make_mut(&mut self.0)["accepted_input_refs"] =
                 serde_json::json!(references);
+        }
+        self
+    }
+
+    pub(crate) fn with_scope_input_revision(mut self, revision: Option<String>) -> Self {
+        if self.0["has_plan"] == true
+            && let Some(revision) = revision
+        {
+            std::sync::Arc::make_mut(&mut self.0)["scope_input_revision"] = revision.into();
+        }
+        self
+    }
+
+    pub(crate) fn with_acceptance_evidence(
+        mut self,
+        evidence: &crate::plan_store::acceptance::AcceptanceEvidence,
+    ) -> Self {
+        if self.0["has_plan"] == true
+            && self.0["execution_suspended"] != true
+            && !evidence.observations.is_empty()
+        {
+            std::sync::Arc::make_mut(&mut self.0)["acceptance_evidence"] =
+                serde_json::json!(evidence);
         }
         self
     }

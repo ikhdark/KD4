@@ -32,6 +32,289 @@ const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001"
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 
 #[tokio::test]
+#[serial(codex_auth_env)]
+async fn rotated_credentials_retry_local_commit_without_rotating_predecessor_again()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let issuer = MockServer::start().await;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: Some("account-a".into()),
+        },
+        home.path(),
+    )?;
+    let mut stored = load_auth_dot_json(
+        home.path(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?
+    .unwrap();
+    stored.oauth_context = Some(OAuthContext {
+        issuer: issuer.uri(),
+        client_id: "isolated-client".into(),
+    });
+    save_auth(
+        home.path(),
+        &stored,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    Mock::given(method("POST")).and(path("/oauth/token"))
+        .and(body_partial_json(json!({"client_id":"isolated-client", "refresh_token":stored.tokens.as_ref().unwrap().refresh_token})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token":"rotated-access", "refresh_token":"single-use-r1"})))
+        .expect(1).mount(&issuer).await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/revoke"))
+        .and(body_partial_json(
+            json!({"client_id":"isolated-client", "token":"single-use-r1"}),
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&issuer)
+        .await;
+    let manager = AuthManager::new(
+        home.path().into(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::Direct,
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let lock = codex_file_system::acquire_atomic_write_lock(&home.path().join("auth-lifecycle"))?;
+    let error = manager.refresh_token_from_authority().await.unwrap_err();
+    assert!(error.to_string().contains("commit is pending"));
+    drop(lock);
+    manager.refresh_token_from_authority().await?;
+    assert_eq!(
+        manager
+            .auth_cached()
+            .unwrap()
+            .get_token_data()?
+            .refresh_token,
+        "single-use-r1"
+    );
+    assert_eq!(issuer.received_requests().await.unwrap().len(), 1);
+    // A fresh manager must retain issuer/client provenance through revoke too.
+    let restarted = AuthManager::new(
+        home.path().into(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::Direct,
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    restarted.logout_with_revoke().await?;
+    assert_eq!(issuer.received_requests().await.unwrap().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn malformed_startup_credentials_remain_unavailable_until_reload_recovers()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    std::fs::write(home.path().join("auth.json"), "{malformed")?;
+    let manager = AuthManager::new(
+        home.path().into(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::Direct,
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    assert!(manager.auth_cached().is_none());
+    assert!(manager.check_auth_load().is_err());
+    login_with_api_key(
+        home.path(),
+        "replacement-key",
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    manager.reload().await;
+    manager.check_auth_load()?;
+    assert_eq!(
+        manager.auth_cached().unwrap().api_key(),
+        Some("replacement-key")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn policy_identity_spans_only_account_id_completion_within_one_login()
+-> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".into()),
+            chatgpt_account_id: None,
+        },
+        home.path(),
+    )?;
+    let mut auth = load_auth_dot_json(
+        home.path(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?
+    .expect("stored auth should load");
+    // `save_auth` starts a login lifecycle; rewriting auth.json in place keeps it.
+    save_auth(
+        home.path(),
+        &auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    let manager = AuthManager::new(
+        home.path().into(),
+        false,
+        AuthCredentialsStoreMode::File,
+        None,
+        None,
+        AuthKeyringBackendKind::Direct,
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    let identity = |manager: &AuthManager| {
+        manager
+            .with_policy_identity(|current| current)
+            .expect("auth lock should not be poisoned")
+    };
+    let pending = identity(&manager);
+
+    auth.tokens.as_mut().expect("tokens").account_id = Some("account-a".into());
+    std::fs::write(get_auth_file(home.path()), serde_json::to_vec(&auth)?)?;
+    manager.reload().await;
+    let completed = identity(&manager);
+    assert_ne!(completed.current_epoch, pending.current_epoch);
+    assert!(completed.includes(pending.current_epoch));
+
+    // Another account is a new identity even in the same lifecycle, so an observer that
+    // sees the completion and the switch only together cannot keep its pending binding.
+    auth.tokens.as_mut().expect("tokens").account_id = Some("account-b".into());
+    std::fs::write(get_auth_file(home.path()), serde_json::to_vec(&auth)?)?;
+    manager.reload().await;
+    let switched = identity(&manager);
+    assert!(!switched.includes(pending.current_epoch));
+    assert!(!switched.includes(completed.current_epoch));
+
+    // A new login lifecycle that supplies a missing account id is a new identity too.
+    auth.tokens.as_mut().expect("tokens").account_id = None;
+    std::fs::write(get_auth_file(home.path()), serde_json::to_vec(&auth)?)?;
+    manager.reload().await;
+    let pending_again = identity(&manager);
+    auth.tokens.as_mut().expect("tokens").account_id = Some("account-b".into());
+    save_auth(
+        home.path(),
+        &auth,
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    manager.reload().await;
+    assert!(!identity(&manager).includes(pending_again.current_epoch));
+    Ok(())
+}
+
+struct DifferentAccountOnRefresh {
+    original: CodexAuth,
+    replacement: CodexAuth,
+}
+
+#[tokio::test]
+#[serial(codex_auth_env)]
+async fn empty_ephemeral_logout_fences_an_earlier_prepared_login() -> anyhow::Result<()> {
+    let _access_token_guard = remove_access_token_env_var();
+    let home = tempdir()?;
+    let prepared = PreparedAuthCommit::new(
+        home.path(),
+        AuthCredentialsStoreMode::Ephemeral,
+        AuthKeyringBackendKind::Direct,
+    )?;
+    let manager = AuthManager::new(
+        home.path().into(),
+        false,
+        AuthCredentialsStoreMode::Ephemeral,
+        None,
+        None,
+        AuthKeyringBackendKind::Direct,
+        crate::test_support::transport_default_auth_route_config(),
+    )
+    .await;
+    manager.logout().await?;
+    let auth = AuthDotJson::from_external_access_token("header.e30.sig", "account-a", Some("pro"))?;
+    assert!(crate::auth::storage::is_auth_changed(
+        &prepared.save(&auth).unwrap_err()
+    ));
+    assert!(
+        load_auth_dot_json(
+            home.path(),
+            AuthCredentialsStoreMode::Ephemeral,
+            AuthKeyringBackendKind::Direct
+        )?
+        .is_none()
+    );
+    Ok(())
+}
+impl ExternalAuth for DifferentAccountOnRefresh {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        Box::pin(async { Ok(self.original.clone()) })
+    }
+    fn refresh(&self, context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        assert_eq!(context.previous_account_id.as_deref(), Some("account-a"));
+        Box::pin(async { Ok(self.replacement.clone()) })
+    }
+}
+
+#[tokio::test]
+async fn generic_external_refresh_cannot_publish_another_account() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let original =
+        CodexAuth::from_external_chatgpt_tokens("header.e30.original", "account-a", Some("pro"))?;
+    let manager =
+        AuthManager::from_auth_for_testing_with_home(original.clone(), home.path().into());
+    manager
+        .set_external_auth(Arc::new(DifferentAccountOnRefresh {
+            original,
+            replacement: CodexAuth::from_external_chatgpt_tokens(
+                "header.e30.other",
+                "account-b",
+                Some("pro"),
+            )?,
+        }))
+        .await?;
+    assert!(manager.refresh_token_from_authority().await.is_err());
+    assert_eq!(
+        manager.auth_cached().unwrap().get_account_id().as_deref(),
+        Some("account-a")
+    );
+    assert_eq!(
+        load_auth_dot_json(
+            home.path(),
+            AuthCredentialsStoreMode::Ephemeral,
+            AuthKeyringBackendKind::Direct
+        )?
+        .unwrap()
+        .tokens
+        .unwrap()
+        .account_id
+        .as_deref(),
+        Some("account-a")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn refresh_without_id_token() {
     let codex_home = tempdir().unwrap();
     let fake_jwt = write_auth_file(
@@ -49,10 +332,10 @@ async fn refresh_without_id_token() {
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
     );
-    let expected_tokens = storage.load().unwrap().unwrap().tokens.unwrap();
+    let expected = storage.load().unwrap().unwrap();
     let updated = super::persist_tokens(
         &storage,
-        &expected_tokens,
+        &expected,
         /*id_token*/ None,
         Some("new-access-token".to_string()),
         Some("new-refresh-token".to_string()),
@@ -338,6 +621,7 @@ async fn stored_agent_identity_jwt_keeps_auth_json_unchanged() -> anyhow::Result
     save_auth(
         codex_home.path(),
         &AuthDotJson {
+            oauth_context: None,
             auth_mode: Some(AuthMode::AgentIdentity),
             openai_api_key: None,
             tokens: None,
@@ -417,6 +701,7 @@ async fn login_with_access_token_writes_only_personal_access_token() {
     assert_eq!(
         auth,
         AuthDotJson {
+            oauth_context: None,
             auth_mode: None,
             openai_api_key: None,
             tokens: None,
@@ -1037,6 +1322,7 @@ async fn pro_account_with_no_api_key_uses_chatgpt_auth() {
 
     assert_eq!(
         AuthDotJson {
+            oauth_context: None,
             auth_mode: None,
             openai_api_key: None,
             tokens: Some(TokenData {
@@ -1097,6 +1383,7 @@ async fn loads_api_key_from_auth_json() {
 fn logout_removes_auth_file() -> Result<(), std::io::Error> {
     let dir = tempdir()?;
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test-key".to_string()),
         tokens: None,
@@ -1141,6 +1428,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
         step: UnauthorizedRecoveryStep::Reload,
         expected_account_id: None,
         mode: UnauthorizedRecoveryMode::Managed,
+        expected_epoch: 0,
     };
     assert_eq!(managed.mode_name(), "managed");
     assert_eq!(managed.step_name(), "reload");
@@ -1150,6 +1438,7 @@ async fn unauthorized_recovery_reports_mode_and_step_names() {
         step: UnauthorizedRecoveryStep::ExternalRefresh,
         expected_account_id: None,
         mode: UnauthorizedRecoveryMode::External,
+        expected_epoch: 0,
     };
     assert_eq!(external.mode_name(), "external");
     assert_eq!(external.step_name(), "external_refresh");
@@ -1201,6 +1490,7 @@ async fn refresh_failure_is_scoped_to_the_matching_auth_snapshot() {
         AuthKeyringBackendKind::Direct,
         /*agent_identity_authapi_base_url*/ None,
         &crate::test_support::transport_default_auth_route_config(),
+        None,
     )
     .await
     .expect("updated auth should parse");
@@ -2542,6 +2832,7 @@ async fn workspace_policy_rejects_agent_identity_before_hydration() {
         save_auth(
             codex_home.path(),
             &AuthDotJson {
+                oauth_context: None,
                 auth_mode: Some(AuthMode::AgentIdentity),
                 openai_api_key: None,
                 tokens: None,
@@ -2804,6 +3095,7 @@ async fn enforce_login_restrictions_logs_out_for_agent_identity_workspace_mismat
     save_auth(
         codex_home.path(),
         &AuthDotJson {
+            oauth_context: None,
             auth_mode: Some(AuthMode::AgentIdentity),
             openai_api_key: None,
             tokens: None,
@@ -2909,10 +3201,12 @@ async fn identity_runtime_is_persisted_before_task_failure_and_resumed() -> anyh
         openai_api_key: None, chatgpt_plan_type: Some("pro".into()),
         chatgpt_account_id: Some("account-123".into()),
     }, home.path())?;
-    let storage: Arc<dyn AuthStorageBackend> = Arc::new(FileAuthStorage::new(home.path().into()));
+    let storage = create_auth_storage(
+        home.path().into(), AuthCredentialsStoreMode::File, AuthKeyringBackendKind::Direct,
+    );
     let auth = CodexAuth::from_auth_dot_json(home.path(), storage.load()?.unwrap(),
         AuthCredentialsStoreMode::File, None, AuthKeyringBackendKind::Direct, None,
-        &crate::test_support::transport_default_auth_route_config()).await?;
+        &crate::test_support::transport_default_auth_route_config(), Some(Arc::clone(&storage))).await?;
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/v1/agent/register"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"agent_runtime_id":"stage-one"})))

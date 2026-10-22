@@ -23,7 +23,8 @@ pub async fn observe_command_effects<T>(
 }
 
 pub(crate) fn mark_command_effects_possible() {
-    let _ = COMMAND_EFFECTS.try_with(|entered| entered.store(true, std::sync::atomic::Ordering::Release));
+    let _ = COMMAND_EFFECTS
+        .try_with(|entered| entered.store(true, std::sync::atomic::Ordering::Release));
 }
 
 pub use config_rules::hook_states_from_stack;

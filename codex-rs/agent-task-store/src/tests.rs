@@ -12,6 +12,106 @@ use uuid::Uuid;
 
 static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+#[tokio::test]
+async fn evaluation_workspace_uses_target_binding_and_rejects_foreign_authority() {
+    let fixture = Fixture::new().await;
+    let common = fixture.repo.path().join(".git");
+    std::fs::create_dir(&common).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let gitdir = target.path().join(".git-metadata");
+    std::fs::create_dir(&gitdir).unwrap();
+    std::fs::write(target.path().join(".git"), "gitdir: .git-metadata\n").unwrap();
+    std::fs::write(gitdir.join("commondir"), common.to_str().unwrap()).unwrap();
+    std::fs::write(target.path().join("marker"), "target-workspace").unwrap();
+    std::fs::write(fixture.repo.path().join("marker"), "parent-workspace").unwrap();
+    let (assignment, _) = fixture
+        .store
+        .create_assignment(target.path(), worker_draft("root-review", "src"))
+        .await
+        .unwrap();
+    let resolved = fixture
+        .store
+        .evaluation_target_workspace(fixture.repo.path(), "root-review", assignment.assignment_id)
+        .await
+        .unwrap();
+    assert_eq!(resolved, std::fs::canonicalize(target.path()).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(resolved.join("marker")).unwrap(),
+        "target-workspace"
+    );
+    assert!(
+        fixture
+            .store
+            .evaluation_target_workspace(
+                fixture.repo.path(),
+                "another-root",
+                assignment.assignment_id
+            )
+            .await
+            .is_err()
+    );
+    let unrelated = tempfile::tempdir().unwrap();
+    assert!(
+        fixture
+            .store
+            .evaluation_target_workspace(unrelated.path(), "root-review", assignment.assignment_id)
+            .await
+            .is_err()
+    );
+    std::fs::remove_file(target.path().join("marker")).unwrap();
+    // Replace the known target's Git binding; it must not be silently rebound.
+    std::fs::remove_file(gitdir.join("commondir")).unwrap();
+    assert!(
+        fixture
+            .store
+            .evaluation_target_workspace(
+                fixture.repo.path(),
+                "root-review",
+                assignment.assignment_id
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn durable_audit_independent_task_initializers_preserve_strict_migrations() {
+    let home = TempDir::new().unwrap();
+    let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into())
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        LocalAgentTaskStore::initialize(&runtime),
+        LocalAgentTaskStore::initialize(&runtime),
+    );
+    let first = first.expect("first initializer succeeds");
+    let second = second.expect("concurrent initializer reloads migration progress");
+    first.close().await;
+    second.close().await;
+    let path = home
+        .path()
+        .join("agent-task-coordination/agent_tasks.sqlite");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path))
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count as usize, TEST_MIGRATOR.migrations.len());
+    sqlx::query("INSERT INTO _sqlx_migrations(version, description, success, checksum, execution_time) VALUES (999999, 'future', 1, X'00', 0)")
+        .execute(&pool).await.unwrap();
+    pool.close().await;
+    assert!(matches!(
+        LocalAgentTaskStore::initialize(&runtime).await,
+        Err(StoreError::Migration(
+            sqlx::migrate::MigrateError::VersionMissing(999999)
+        ))
+    ));
+    runtime.close().await;
+}
 
 fn task_store_migrator_through(version: i64) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
@@ -63,9 +163,6 @@ fn embedded_migration_checksums_match_persisted_line_endings() {
     }
 }
 
-
-
-
 #[tokio::test]
 async fn agent_task_authorization_does_not_hydrate_task_capsules() {
     let fixture = Fixture::new().await;
@@ -105,7 +202,6 @@ async fn agent_task_authorization_does_not_hydrate_task_capsules() {
     assert_eq!(authorization.admission_origin, assignment.admission_origin);
     assert_eq!(authorization.current_attempt, attempt);
 }
-
 
 #[tokio::test]
 async fn audit_mutation_recovery_f064_summary_records_configured_policy() {
@@ -192,7 +288,6 @@ async fn audit_mutation_recovery_f065_validation_leases_are_server_bounded() {
     );
 }
 
-
 fn audit_capsule(assignment: &Assignment, attempt: &Attempt) -> TaskCapsuleV1 {
     TaskCapsuleV1 {
         schema_version: 1,
@@ -218,6 +313,107 @@ fn audit_capsule(assignment: &Assignment, attempt: &Attempt) -> TaskCapsuleV1 {
         prohibited_changes: assignment.prohibited_changes.clone(),
         required_evidence: assignment.required_evidence.clone(),
     }
+}
+
+#[tokio::test]
+async fn durable_audit_09_missing_or_substituted_capsule_cannot_be_reattached() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("immutable", "src"))
+        .await
+        .unwrap();
+    let mut capsule = audit_capsule(&assignment, &attempt);
+    let canonical = serde_json::to_string(&capsule).unwrap();
+    fixture
+        .store
+        .attach_task_capsule(
+            assignment.assignment_id,
+            attempt.attempt_id,
+            canonical.clone(),
+        )
+        .await
+        .unwrap();
+    let path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination/task_capsules")
+        .join(format!("{}.json", assignment.assignment_id));
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, None)
+            .await,
+        Err(StoreError::CorruptData(_))
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .attach_task_capsule(assignment.assignment_id, attempt.attempt_id, canonical)
+            .await,
+        Err(StoreError::TaskCapsuleAlreadyAttached(_))
+    ));
+    capsule.objective = "different but canonical scope".into();
+    std::fs::write(&path, serde_json::to_string(&capsule).unwrap()).unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .get_agent_task(assignment.assignment_id, None)
+            .await,
+        Err(StoreError::CorruptData(_))
+    ));
+}
+
+#[tokio::test]
+async fn durable_audit_18_torn_capsule_isolated_from_unrelated_tasks() {
+    let fixture = Fixture::new().await;
+    let (damaged, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("damaged", "src"))
+        .await
+        .unwrap();
+    let (healthy, _) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("healthy", "other"))
+        .await
+        .unwrap();
+    let directory = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination/task_capsules");
+    std::fs::create_dir_all(&directory).unwrap();
+    let stage = directory.join(format!(".{}.staged.json", damaged.assignment_id));
+    std::fs::write(&stage, b"{\"schema_version\":").unwrap();
+    fixture.store.close().await;
+    let reopened = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .get_agent_task(healthy.assignment_id, None)
+            .await
+            .is_ok()
+    );
+    assert!(
+        reopened
+            .get_agent_task(damaged.assignment_id, None)
+            .await
+            .unwrap()
+            .assignment
+            .task_capsule
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read(stage.with_extension("invalid")).unwrap(),
+        b"{\"schema_version\":"
+    );
+    let payload = serde_json::to_string(&audit_capsule(&damaged, &attempt)).unwrap();
+    reopened
+        .attach_task_capsule(damaged.assignment_id, attempt.attempt_id, payload)
+        .await
+        .unwrap();
+    reopened.close().await;
 }
 
 #[tokio::test]
@@ -264,6 +460,177 @@ async fn audit_mutation_recovery_f070_capsule_publication_reconciles_committed_s
         Some(canonical.as_str())
     );
     restarted.close().await;
+}
+
+#[tokio::test]
+async fn ma009_incomplete_stages_do_not_block_healthy_capsules_or_reattachment() {
+    let fixture = Fixture::new().await;
+    let (healthy, healthy_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("healthy-capsule", "healthy"),
+        )
+        .await
+        .unwrap();
+    let canonical = serde_json::to_string(&audit_capsule(&healthy, &healthy_attempt)).unwrap();
+    fixture
+        .store
+        .attach_task_capsule(
+            healthy.assignment_id,
+            healthy_attempt.attempt_id,
+            canonical.clone(),
+        )
+        .await
+        .unwrap();
+    let directory = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination/task_capsules");
+    let mut damaged = Vec::new();
+    for bytes in [
+        Vec::new(),
+        b"{\"schema_version\":1".to_vec(),
+        vec![b'{', 0xc3],
+    ] {
+        let (assignment, attempt) = fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                worker_draft("damaged-capsule", "damaged"),
+            )
+            .await
+            .unwrap();
+        let stage = directory.join(format!(".{}.staged.json", assignment.assignment_id));
+        std::fs::write(&stage, &bytes).unwrap();
+        damaged.push((assignment, attempt, stage, bytes));
+    }
+    // An invalid leftover must not change the already published authority.
+    let leftover = directory.join(format!(".{}.staged.json", healthy.assignment_id));
+    std::fs::write(&leftover, b"{").unwrap();
+    fixture.store.close().await;
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(directory.join(format!("{}.json", healthy.assignment_id))).unwrap(),
+        canonical.as_bytes()
+    );
+    assert_eq!(
+        restarted
+            .get_agent_task(healthy.assignment_id, None)
+            .await
+            .unwrap()
+            .assignment
+            .task_capsule
+            .as_deref(),
+        Some(canonical.as_str())
+    );
+    for (assignment, attempt, stage, bytes) in &damaged {
+        assert!(!stage.exists());
+        assert_eq!(
+            std::fs::read(stage.with_extension("invalid")).unwrap(),
+            *bytes
+        );
+        assert!(
+            restarted
+                .get_agent_task(assignment.assignment_id, None)
+                .await
+                .unwrap()
+                .assignment
+                .task_capsule
+                .is_none()
+        );
+        let payload = serde_json::to_string(&audit_capsule(assignment, attempt)).unwrap();
+        restarted
+            .attach_task_capsule(assignment.assignment_id, attempt.attempt_id, payload)
+            .await
+            .unwrap();
+    }
+    restarted.close().await;
+    let again = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(leftover.with_extension("invalid")).unwrap(),
+        b"{"
+    );
+    again.close().await;
+}
+
+#[tokio::test]
+async fn ma009_published_corruption_and_stage_io_errors_remain_errors() {
+    let fixture = Fixture::new().await;
+    let directory = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination/task_capsules");
+    let final_path = directory.join(format!("{}.json", AssignmentId::new()));
+    std::fs::write(&final_path, b"{").unwrap();
+    fixture.store.close().await;
+    assert!(matches!(
+        LocalAgentTaskStore::initialize(&fixture.state).await,
+        Err(StoreError::Json(_))
+    ));
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"{");
+    std::fs::remove_file(&final_path).unwrap();
+    // Reading a directory is a real I/O error on the supported platforms, not
+    // malformed provisional JSON, and must not be swallowed or quarantined.
+    let stage = directory.join(format!(".{}.staged.json", AssignmentId::new()));
+    std::fs::create_dir(&stage).unwrap();
+    assert!(matches!(
+        LocalAgentTaskStore::initialize(&fixture.state).await,
+        Err(StoreError::Io(_))
+    ));
+    assert!(stage.is_dir());
+    assert!(!stage.with_extension("invalid").exists());
+}
+
+#[tokio::test]
+async fn ma009_stage_recovery_does_not_mask_authoritative_assignment_decode_errors() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("capsule-db-corruption", "src"),
+        )
+        .await
+        .unwrap();
+    let stage = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination/task_capsules")
+        .join(format!(".{}.staged.json", assignment.assignment_id));
+    let payload = serde_json::to_vec(&audit_capsule(&assignment, &attempt)).unwrap();
+    std::fs::write(&stage, &payload).unwrap();
+    fixture.store.close().await;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(
+                fixture
+                    .state
+                    .codex_home()
+                    .join("agent-task-coordination/agent_tasks.sqlite"),
+            ),
+        )
+        .await
+        .unwrap();
+    // Deliberately corrupt bytes below the immutable public mutation boundary.
+    sqlx::query("DROP TRIGGER assignments_immutable_update")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE assignments SET body_json = json_set(body_json, '$.role', 'invalid-role') WHERE assignment_id = ?")
+        .bind(assignment.assignment_id.to_string()).execute(&pool).await.unwrap();
+    pool.close().await;
+    assert!(matches!(
+        LocalAgentTaskStore::initialize(&fixture.state).await,
+        Err(StoreError::Json(_))
+    ));
+    assert_eq!(std::fs::read(&stage).unwrap(), payload);
+    assert!(!stage.with_extension("invalid").exists());
 }
 
 #[tokio::test]
@@ -331,6 +698,68 @@ async fn audit_capsule_cancelled_publication_serializes_competing_attach_and_rec
     recovered.close().await;
 }
 
+#[tokio::test]
+async fn capsule_publication_in_flight_reads_as_unattached_instead_of_corrupt() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("capsule-reader", "src"))
+        .await
+        .expect("assignment");
+    let canonical = serde_json::to_string(&audit_capsule(&assignment, &attempt)).expect("capsule");
+    let pause = Arc::new(TestSnapshotCapturePause::new());
+    let writer_store = fixture.store.clone();
+    let writer_pause = pause.clone();
+    let payload = canonical.clone();
+    let writer = tokio::spawn(async move {
+        with_test_snapshot_capture_pause(
+            writer_pause,
+            writer_store.attach_task_capsule(assignment.assignment_id, attempt.attempt_id, payload),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), pause.started.acquire())
+        .await
+        .expect("publication reaches its staged window")
+        .expect("pause open")
+        .forget();
+    let stage = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination/task_capsules")
+        .join(format!(".{}.staged.json", assignment.assignment_id));
+    assert!(
+        stage.exists(),
+        "the paused writer holds a staged, unpublished capsule"
+    );
+
+    // wait_agent and list_agents hydrate descendant tasks without the assignment
+    // lock, so they can land between staging and publication.
+    let in_flight = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await;
+    // Release the writer before asserting, so a failure reports promptly
+    // instead of leaving the writer parked until the test time limit.
+    pause.release.add_permits(1);
+    let in_flight = in_flight.expect("an uncommitted publication is not corrupt persisted data");
+    assert_eq!(in_flight.assignment.task_capsule, None);
+
+    writer
+        .await
+        .expect("writer joins")
+        .expect("capsule attaches");
+    assert!(!stage.exists());
+    let published = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("published capsule reads");
+    assert_eq!(
+        published.assignment.task_capsule.as_deref(),
+        Some(canonical.as_str())
+    );
+}
 
 #[tokio::test]
 async fn wake_wait_ends_when_store_closes() {
@@ -442,11 +871,6 @@ async fn audit_validation_receipt_failed_and_cancelled_do_not_refresh_progress()
     }
 }
 
-
-
-
-
-
 #[tokio::test]
 async fn late_validation_settles_after_abandonment_without_creating_proof() {
     let fixture = Fixture::new().await;
@@ -484,14 +908,6 @@ async fn late_validation_settles_after_abandonment_without_creating_proof() {
     let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM validation_calls WHERE call_id = 'late-call' AND status = '\"running\"'").fetch_one(&pool).await.unwrap();
     assert_eq!(running, 0);
 }
-
-
-
-
-
-
-
-
 
 #[tokio::test]
 async fn audit_task_view_terminal_actor_with_future_expiry_is_released() {
@@ -909,8 +1325,6 @@ async fn coordination_pool(fixture: &Fixture) -> sqlx::SqlitePool {
         .await
         .expect("coordination database opens")
 }
-
-
 
 async fn wait_out_transient_writer_contention<T>(
     blocker_pool: &sqlx::SqlitePool,
@@ -1336,7 +1750,13 @@ async fn migration_removes_workspace_mutation_blocking_schema() {
     .fetch_one(&pool)
     .await
     .expect("historical workspace event is preserved");
-    assert_eq!(event, (r#"["src/lib.rs"]"#.to_string(), r#"["stable-contract"]"#.to_string()));
+    assert_eq!(
+        event,
+        (
+            r#"["src/lib.rs"]"#.to_string(),
+            r#"["stable-contract"]"#.to_string()
+        )
+    );
     let remaining = sqlx::query_as::<_, (String, String)>(
         "SELECT type, name
          FROM sqlite_master
@@ -1411,9 +1831,217 @@ async fn expire_workspace_actor_leases(
 
 fn criterion() -> AcceptanceCriterion {
     AcceptanceCriterion {
+        evidence_policy: None,
         id: "criterion-1".to_string(),
         text: "the requested behavior is proven".to_string(),
     }
+}
+
+#[tokio::test]
+async fn criterion_policy_keeps_legacy_claims_unresolved_and_rejects_inapplicable_reads() {
+    use sha2::Digest;
+    for policy in [
+        None,
+        Some(CriterionEvidenceRequirement::SourceInspection),
+        Some(CriterionEvidenceRequirement::ValidationExecution),
+    ] {
+        let fixture = Fixture::new().await;
+        initialize_validation_repository(fixture.repo.path());
+        let mut draft = validation_worker_draft("proof-policy", "src/lib.rs", "inspect:src/lib.rs");
+        draft.acceptance_criteria[0].evidence_policy = policy.map(|kind| CriterionEvidencePolicy {
+            kind,
+            required_evidence: Some("inspect:src/lib.rs".into()),
+            freshness: EvidenceFreshness::Historical,
+        });
+        let (assignment, attempt) = fixture
+            .store
+            .create_assignment(fixture.repo.path(), draft)
+            .await
+            .unwrap();
+        let path = fixture.repo.path().join("src/lib.rs");
+        let pending = fixture
+            .store
+            .prepare_source_inspection(attempt.attempt_id, path.to_string_lossy().into_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let reference = fixture
+            .store
+            .record_source_inspection(
+                pending,
+                "source-read".into(),
+                hex::encode(sha2::Sha256::digest(&bytes)),
+                bytes.len() as u64,
+            )
+            .await
+            .unwrap();
+        let mut receipt = completed_receipt(vec![reference.call_id.clone()]);
+        if policy.is_some() {
+            assert!(
+                matches!(
+                    fixture
+                        .store
+                        .submit_agent_receipt(attempt.attempt_id, receipt.clone())
+                        .await,
+                    Err(StoreError::CriterionResultsInvalid(_))
+                ),
+                "proof policies cannot use a bare Passed claim"
+            );
+        }
+        receipt.criterion_results[0].evidence_ref = Some(reference);
+        let sealed = fixture
+            .store
+            .submit_agent_receipt(attempt.attempt_id, receipt)
+            .await;
+        if policy == Some(CriterionEvidenceRequirement::ValidationExecution) {
+            assert!(
+                matches!(sealed, Err(StoreError::CriterionResultsInvalid(_))),
+                "file delivery is not execution"
+            );
+            continue;
+        }
+        sealed.unwrap();
+        let task = fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(task.criterion_is_satisfied("criterion-1"), policy.is_some());
+        let mut dependent = worker_draft("proof-policy", "README.md");
+        dependent.dependencies.push(assignment.assignment_id);
+        let admitted = fixture
+            .store
+            .create_assignment(fixture.repo.path(), dependent)
+            .await;
+        if policy.is_none() {
+            assert!(
+                matches!(admitted, Err(StoreError::DependencyBlocked { .. })),
+                "legacy claims do not authorize dependencies"
+            );
+        } else {
+            admitted.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn current_source_policy_reassesses_seal_reads_and_dependency_admission() {
+    use sha2::Digest;
+    for freshness in [EvidenceFreshness::Current, EvidenceFreshness::Historical] {
+        for edit_before_seal in [false, true] {
+            let fixture = Fixture::new().await;
+            initialize_validation_repository(fixture.repo.path());
+            let mut draft =
+                validation_worker_draft("source-current", "src/lib.rs", "inspect:src/lib.rs");
+            draft.acceptance_criteria[0].evidence_policy = Some(CriterionEvidencePolicy {
+                kind: CriterionEvidenceRequirement::SourceInspection,
+                required_evidence: Some("inspect:src/lib.rs".into()),
+                freshness,
+            });
+            let (assignment, attempt) = fixture
+                .store
+                .create_assignment(fixture.repo.path(), draft)
+                .await
+                .unwrap();
+            let path = fixture.repo.path().join("src/lib.rs");
+            let pending = fixture
+                .store
+                .prepare_source_inspection(attempt.attempt_id, path.to_string_lossy().into_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let reference = fixture
+                .store
+                .record_source_inspection(
+                    pending,
+                    "source-read".into(),
+                    hex::encode(sha2::Sha256::digest(&bytes)),
+                    bytes.len() as u64,
+                )
+                .await
+                .unwrap();
+            let mut receipt = completed_receipt(vec![reference.call_id.clone()]);
+            receipt.criterion_results[0].evidence_ref = Some(reference);
+            std::fs::write(fixture.repo.path().join("README.md"), "unrelated edit").unwrap();
+            if edit_before_seal {
+                std::fs::write(&path, "pub fn changed() {}\n").unwrap();
+            }
+            let sealed = fixture
+                .store
+                .submit_agent_receipt(attempt.attempt_id, receipt)
+                .await;
+            if edit_before_seal && freshness == EvidenceFreshness::Current {
+                assert!(matches!(
+                    sealed,
+                    Err(StoreError::CriterionResultsInvalid(_))
+                ));
+                continue;
+            }
+            sealed.unwrap();
+            assert!(
+                fixture
+                    .store
+                    .get_agent_task(assignment.assignment_id, Some(0))
+                    .await
+                    .unwrap()
+                    .criterion_is_satisfied("criterion-1"),
+                "an unrelated edit cannot invalidate the bound file"
+            );
+            std::fs::write(&path, "pub fn changed_again() {}\n").unwrap();
+            let expected = freshness == EvidenceFreshness::Historical;
+            let task = fixture
+                .store
+                .get_agent_task(assignment.assignment_id, Some(0))
+                .await
+                .unwrap();
+            assert_eq!(task.criterion_is_satisfied("criterion-1"), expected);
+            let mut dependent = worker_draft("source-current", "README.md");
+            dependent.dependencies.push(assignment.assignment_id);
+            let admitted = fixture
+                .store
+                .create_assignment(fixture.repo.path(), dependent)
+                .await;
+            if expected {
+                admitted.unwrap();
+            } else {
+                assert!(matches!(
+                    admitted,
+                    Err(StoreError::DependencyBlocked { .. })
+                ));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicitly_report_only_criteria_need_no_execution_or_source_proof() {
+    let fixture = Fixture::new().await;
+    let mut draft = explorer_draft("report-only", "src", "Report the inspected outcome");
+    draft.acceptance_criteria[0].text =
+        "Report an outcome without claiming behavior was verified".into();
+    draft.acceptance_criteria[0].evidence_policy = Some(CriterionEvidencePolicy {
+        kind: CriterionEvidenceRequirement::ReportOnly,
+        required_evidence: None,
+        freshness: EvidenceFreshness::Current,
+    });
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, completed_receipt(vec![]))
+        .await
+        .unwrap();
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert!(task.criterion_is_satisfied("criterion-1"));
 }
 
 fn worker_draft(root_session_id: &str, scope: &str) -> AssignmentDraft {
@@ -1490,6 +2118,11 @@ async fn architect_receipt_seals_canonical_contract_and_admits_exact_worker_proj
         capability_profile: CapabilityProfile::ReadSearch,
         objective: "define the worker contract".to_string(),
         acceptance_criteria: vec![AcceptanceCriterion {
+            evidence_policy: Some(CriterionEvidencePolicy {
+                kind: CriterionEvidenceRequirement::ReportOnly,
+                required_evidence: None,
+                freshness: EvidenceFreshness::Current,
+            }),
             id: "architecture".to_string(),
             text: "seal one canonical worker contract".to_string(),
         }],
@@ -1597,6 +2230,11 @@ async fn architect_dependent_workers_fail_closed_on_missing_or_wrong_contract_re
                 capability_profile: CapabilityProfile::ReadSearch,
                 objective: "define the worker contract".to_string(),
                 acceptance_criteria: vec![AcceptanceCriterion {
+                    evidence_policy: Some(CriterionEvidencePolicy {
+                        kind: CriterionEvidenceRequirement::ReportOnly,
+                        required_evidence: None,
+                        freshness: EvidenceFreshness::Current,
+                    }),
                     id: "architecture".to_string(),
                     text: "seal one canonical worker contract".to_string(),
                 }],
@@ -2029,7 +2667,10 @@ fn reviewer_and_verifier_invariants_are_enforced() {
         let valid = relation_draft("root", role, target);
         assert!(valid.clone().normalize(repo.path()).is_ok());
         let mut writes = valid.clone();
-        writes.write_scope = vec![RepoScope { path: "src".into(), recursive: true }];
+        writes.write_scope = vec![RepoScope {
+            path: "src".into(),
+            recursive: true,
+        }];
         assert!(matches!(
             writes.normalize(repo.path()),
             Err(StoreError::InvalidAssignment(message)) if message.contains("empty write scope")
@@ -2041,12 +2682,25 @@ fn reviewer_and_verifier_invariants_are_enforced() {
         let mut wrong_relation = valid.clone();
         wrong_relation.relation.as_mut().unwrap().kind = RelationKind::Integration;
         let mut extra_target = valid;
-        extra_target.relation.as_mut().unwrap().target_assignment_ids.push(target);
-        for invalid in [missing_dependency, missing_relation, wrong_relation, extra_target] {
-            assert!(matches!(
-                invalid.normalize(repo.path()),
-                Err(StoreError::InvalidAssignment(message)) if message.contains("requires exactly one")
-            ), "{role:?}");
+        extra_target
+            .relation
+            .as_mut()
+            .unwrap()
+            .target_assignment_ids
+            .push(target);
+        for invalid in [
+            missing_dependency,
+            missing_relation,
+            wrong_relation,
+            extra_target,
+        ] {
+            assert!(
+                matches!(
+                    invalid.normalize(repo.path()),
+                    Err(StoreError::InvalidAssignment(message)) if message.contains("requires exactly one")
+                ),
+                "{role:?}"
+            );
         }
     }
 }
@@ -2428,7 +3082,10 @@ async fn sealed_explorer_result_does_not_trust_legacy_fingerprints() {
             .expect("sealed fixture reads");
         assert_eq!(persisted.current_attempt.state, AttemptState::Completed);
         assert_eq!(
-            persisted.receipt.expect("sealed receipt").read_scope_fingerprint,
+            persisted
+                .receipt
+                .expect("sealed receipt")
+                .read_scope_fingerprint,
             legacy_fingerprint.map(str::to_string)
         );
         assert_eq!(
@@ -2779,12 +3436,14 @@ async fn criterion_execution_reference_is_validated_persisted_and_projected() {
     assignment_draft
         .acceptance_criteria
         .push(AcceptanceCriterion {
+            evidence_policy: None,
             id: "unverified-outcome".to_string(),
             text: "a separately promised outcome".to_string(),
         });
     assignment_draft
         .acceptance_criteria
         .push(AcceptanceCriterion {
+            evidence_policy: None,
             id: "shared-proof".to_string(),
             text: "another criterion supported by the same execution".to_string(),
         });
@@ -2918,49 +3577,82 @@ async fn source_inspection_receipts_bind_kind_without_workspace_tracking() {
     let fixture = Fixture::new().await;
     initialize_validation_repository(fixture.repo.path());
     let path = fixture.repo.path().join("src/lib.rs");
-    let (assignment, attempt) = fixture.store.create_assignment(
-        fixture.repo.path(),
-        validation_worker_draft("inspection", "src/lib.rs", "inspect:src/lib.rs"),
-    ).await.unwrap();
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            validation_worker_draft("inspection", "src/lib.rs", "inspect:src/lib.rs"),
+        )
+        .await
+        .unwrap();
     let bytes = std::fs::read(&path).unwrap();
     let hash = hex::encode(sha2::Sha256::digest(&bytes));
-    let fresh = fixture.store.prepare_source_inspection(
-        attempt.attempt_id, path.to_string_lossy().into_owned(),
-    ).await.unwrap().unwrap();
-    let reference = fixture.store.record_source_inspection(
-        fresh, "source-read".into(), hash, bytes.len() as u64,
-    ).await.unwrap();
+    let fresh = fixture
+        .store
+        .prepare_source_inspection(attempt.attempt_id, path.to_string_lossy().into_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let reference = fixture
+        .store
+        .record_source_inspection(fresh, "source-read".into(), hash, bytes.len() as u64)
+        .await
+        .unwrap();
     assert_eq!(reference.kind, CriterionEvidenceKind::SourceInspection);
     let mut draft = completed_receipt(vec![reference.call_id.clone()]);
     draft.criterion_results[0].evidence_ref = Some(CriterionEvidenceRef {
-        kind: CriterionEvidenceKind::ValidationExecution, ..reference.clone()
+        kind: CriterionEvidenceKind::ValidationExecution,
+        ..reference.clone()
     });
     assert!(matches!(
-        fixture.store.submit_agent_receipt(attempt.attempt_id, draft.clone()).await,
+        fixture
+            .store
+            .submit_agent_receipt(attempt.attempt_id, draft.clone())
+            .await,
         Err(StoreError::CriterionResultsInvalid(_))
     ));
     draft.criterion_results[0].evidence_ref = Some(reference);
-    fixture.store.submit_agent_receipt(attempt.attempt_id, draft).await.unwrap();
-    let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, draft)
+        .await
+        .unwrap();
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
     assert!(task.completion_evidence_summary().contains(
         "supported by complete source acquisition (semantic inspection and correctness not established; freshness unverified)"
     ));
     let stale_fixture = Fixture::new().await;
     initialize_validation_repository(stale_fixture.repo.path());
     let stale_path = stale_fixture.repo.path().join("src/lib.rs");
-    let (_, stale_attempt) = stale_fixture.store.create_assignment(
-        stale_fixture.repo.path(),
-        validation_worker_draft("stale-inspection", "src/lib.rs", "inspect:src/lib.rs"),
-    ).await.unwrap();
-    let stale = stale_fixture.store.prepare_source_inspection(
-        stale_attempt.attempt_id, stale_path.to_string_lossy().into_owned(),
-    ).await.unwrap().unwrap();
+    let (_, stale_attempt) = stale_fixture
+        .store
+        .create_assignment(
+            stale_fixture.repo.path(),
+            validation_worker_draft("stale-inspection", "src/lib.rs", "inspect:src/lib.rs"),
+        )
+        .await
+        .unwrap();
+    let stale = stale_fixture
+        .store
+        .prepare_source_inspection(
+            stale_attempt.attempt_id,
+            stale_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     std::fs::write(&stale_path, "pub fn changed() {}\n").unwrap();
     let bytes = std::fs::read(&stale_path).unwrap();
     let hash = hex::encode(sha2::Sha256::digest(&bytes));
-    let reference = stale_fixture.store.record_source_inspection(
-        stale, "stale-read".into(), hash, bytes.len() as u64,
-    ).await.expect("source inspection no longer scans workspace changes");
+    let reference = stale_fixture
+        .store
+        .record_source_inspection(stale, "stale-read".into(), hash, bytes.len() as u64)
+        .await
+        .expect("source inspection no longer scans workspace changes");
     assert_eq!(reference.kind, CriterionEvidenceKind::SourceInspection);
 }
 
@@ -2974,34 +3666,62 @@ async fn source_inspections_namespace_session_local_call_ids_by_attempt() {
     let hash = hex::encode(sha2::Sha256::digest(&bytes));
     let mut inspections = Vec::new();
     for root in ["first-session", "second-session"] {
-        let (_, attempt) = fixture.store.create_assignment(
-            fixture.repo.path(),
-            validation_worker_draft(root, "src/lib.rs", "inspect:src/lib.rs"),
-        ).await.unwrap();
-        let start = fixture.store.prepare_source_inspection(
-            attempt.attempt_id, path.to_string_lossy().into_owned(),
-        ).await.unwrap().unwrap();
+        let (_, attempt) = fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                validation_worker_draft(root, "src/lib.rs", "inspect:src/lib.rs"),
+            )
+            .await
+            .unwrap();
+        let start = fixture
+            .store
+            .prepare_source_inspection(attempt.attempt_id, path.to_string_lossy().into_owned())
+            .await
+            .unwrap()
+            .unwrap();
         // Each independent code-mode runtime legitimately starts with this ID.
-        let reference = fixture.store.record_source_inspection(
-            start, "exec-1-tool-1".into(), hash.clone(), bytes.len() as u64,
-        ).await.expect("another session's local call ID must not prevent inspection evidence");
-        let recorded = fixture.store.get_validation_call(reference.call_id.clone())
-            .await.unwrap().unwrap();
+        let reference = fixture
+            .store
+            .record_source_inspection(
+                start,
+                "exec-1-tool-1".into(),
+                hash.clone(),
+                bytes.len() as u64,
+            )
+            .await
+            .expect("another session's local call ID must not prevent inspection evidence");
+        let recorded = fixture
+            .store
+            .get_validation_call(reference.call_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(recorded.attempt_id, attempt.attempt_id);
-        assert_eq!(recorded.verified_evidence_kind(), Some(CriterionEvidenceKind::SourceInspection));
+        assert_eq!(
+            recorded.verified_evidence_kind(),
+            Some(CriterionEvidenceKind::SourceInspection)
+        );
         inspections.push((attempt, reference, recorded));
     }
     assert_ne!(inspections[0].1.call_id, inspections[1].1.call_id);
     let mut stolen = inspections[0].2.clone();
     stolen.attempt_id = inspections[1].0.attempt_id;
-    assert!(matches!(
-        fixture.store.record_validation_call(stolen).await,
-        Err(StoreError::ValidationCallOwnership { .. })
-    ), "namespacing must not weaken the durable ownership guard");
+    assert!(
+        matches!(
+            fixture.store.record_validation_call(stolen).await,
+            Err(StoreError::ValidationCallOwnership { .. })
+        ),
+        "namespacing must not weaken the durable ownership guard"
+    );
     for (attempt, reference, _) in inspections {
         let mut receipt = completed_receipt(vec![reference.call_id.clone()]);
         receipt.criterion_results[0].evidence_ref = Some(reference);
-        fixture.store.submit_agent_receipt(attempt.attempt_id, receipt).await.unwrap();
+        fixture
+            .store
+            .submit_agent_receipt(attempt.attempt_id, receipt)
+            .await
+            .unwrap();
     }
 }
 
@@ -3042,12 +3762,29 @@ async fn completed_receipt_retains_validation_without_workspace_tracking() {
         workspace_id: assignment.workspace_id.clone(),
         evidence_epoch: 0,
     });
-    fixture.store.submit_agent_receipt(attempt.attempt_id, draft).await
+    fixture
+        .store
+        .submit_agent_receipt(attempt.attempt_id, draft)
+        .await
         .expect("workspace changes no longer trigger automatic freshness rejection");
-    let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
     assert!(task.receipt.is_some());
-    assert!(task.completion_evidence_summary().contains("freshness unverified"));
-    assert!(!fixture.state.codex_home().join("agent-task-coordination").join("snapshots").exists());
+    assert!(
+        task.completion_evidence_summary()
+            .contains("freshness unverified")
+    );
+    assert!(
+        !fixture
+            .state
+            .codex_home()
+            .join("agent-task-coordination")
+            .join("snapshots")
+            .exists()
+    );
     let pool = coordination_pool(&fixture).await;
     let count: i64 = sqlx::query_scalar(
         "SELECT (SELECT COUNT(*) FROM write_claims)
@@ -3056,12 +3793,23 @@ async fn completed_receipt_retains_validation_without_workspace_tracking() {
               + (SELECT COUNT(*) FROM workspace_events)
               + (SELECT COUNT(*) FROM mutation_files)
               + (SELECT COUNT(*) FROM isolated_handoffs)",
-    ).fetch_one(&pool).await.unwrap();
-    assert_eq!(count, 0, "workspace tracking tables must not receive new records");
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        count, 0,
+        "workspace tracking tables must not receive new records"
+    );
     pool.close().await;
     fixture.store.close().await;
-    let restarted = LocalAgentTaskStore::initialize(&fixture.state).await.unwrap();
-    let reloaded = restarted.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    let restarted = LocalAgentTaskStore::initialize(&fixture.state)
+        .await
+        .unwrap();
+    let reloaded = restarted
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
     assert_eq!(reloaded.receipt, task.receipt);
     restarted.close().await;
 }
@@ -3227,25 +3975,225 @@ async fn host_legacy_outcome_persists_final_response_without_fabricating_evidenc
 }
 
 #[tokio::test]
+async fn audit115_capacity_metadata_survives_zero_observation_limit_without_changing_acceptance() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("capacity-root", ".");
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    draft.required_evidence.clear();
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .unwrap();
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            attempt.attempt_id,
+            AgentStatusClaim::NeedsMain,
+            "partial authored report".into(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .record_host_completion_with_stop_cause(
+            attempt.attempt_id,
+            "thread:turn".into(),
+            "Capacity stop; remaining scope retained".into(),
+            Some("subagent_context_budget".into()),
+        )
+        .await
+        .unwrap();
+    let cold = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(cold.receipt.as_ref(), Some(&receipt));
+    assert_eq!(cold.observations.len(), 1);
+    assert_eq!(
+        cold.observations[0].execution_stop_cause.as_deref(),
+        Some("subagent_context_budget")
+    );
+    assert!(
+        cold.receipt
+            .unwrap()
+            .criterion_results
+            .iter()
+            .all(|result| result.status == CriterionStatus::NotRun)
+    );
+}
+
+#[tokio::test]
 async fn host_completion_observations_are_idempotent_and_do_not_rewrite_sealed_receipts() {
     let fixture = Fixture::new().await;
     let mut draft = worker_draft("host-observation-root", ".");
-    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id: None };
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
     draft.workspace_strategy = WorkspaceStrategy::Shared;
     draft.required_evidence.clear();
-    let (assignment, attempt) = fixture.store.create_assignment(fixture.repo.path(), draft).await.unwrap();
-    let receipt = fixture.store.record_legacy_agent_outcome(
-        attempt.attempt_id, AgentStatusClaim::Completed, "agent report".into()).await.unwrap();
-    let write = || fixture.store.record_host_completion_observation(
-        attempt.attempt_id, "thread:turn".into(), "Host: check-alpha failed".into());
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .unwrap();
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            attempt.attempt_id,
+            AgentStatusClaim::Completed,
+            "agent report".into(),
+        )
+        .await
+        .unwrap();
+    let write = || {
+        fixture.store.record_host_completion_observation(
+            attempt.attempt_id,
+            "thread:turn".into(),
+            "Host: check-alpha failed".into(),
+        )
+    };
     let (first, duplicate) = tokio::join!(write(), write());
     first.unwrap();
     duplicate.unwrap();
-    let task = fixture.store.get_agent_task(assignment.assignment_id, None).await.unwrap();
-    assert_eq!(task.receipt, Some(receipt));
-    assert_eq!(task.observations.iter().filter(|item| item.kind == ObservationKind::HostCompletion).count(), 1);
-    assert!(fixture.store.append_observation(
-        attempt.attempt_id, ObservationKind::HostCompletion, "forged".into(), None).await.is_err());
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, None)
+        .await
+        .unwrap();
+    assert_eq!(task.receipt.as_ref(), Some(&receipt));
+    assert_eq!(
+        task.observations
+            .iter()
+            .filter(|item| item.kind == ObservationKind::HostCompletion)
+            .count(),
+        1
+    );
+    assert!(
+        fixture
+            .store
+            .append_observation(
+                attempt.attempt_id,
+                ObservationKind::HostCompletion,
+                "forged".into(),
+                None
+            )
+            .await
+            .is_err()
+    );
+    fixture
+        .store
+        .record_host_completion_observation(
+            attempt.attempt_id,
+            "thread:turn:parent-delivery".into(),
+            "parent delivery failed".into(),
+        )
+        .await
+        .unwrap();
+    for limit in [0, 1, 10] {
+        let cold = fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(limit))
+            .await
+            .unwrap();
+        let diagnostics = cold
+            .observations
+            .iter()
+            .filter(|item| item.kind == ObservationKind::HostCompletion)
+            .map(|item| item.summary.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostics,
+            vec!["Host: check-alpha failed", "parent delivery failed"]
+        );
+        assert_eq!(cold.receipt.as_ref(), Some(&receipt));
+    }
+    fixture
+        .store
+        .record_host_completion_observation(
+            attempt.attempt_id,
+            "thread:next-turn".into(),
+            "clean later terminal boundary".into(),
+        )
+        .await
+        .unwrap();
+    let cold = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(cold.observations.len(), 1);
+    assert_eq!(
+        cold.observations[0].summary,
+        "clean later terminal boundary"
+    );
+}
+
+#[tokio::test]
+async fn host_diagnostics_do_not_depend_on_general_history_tail() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("host-tail-root", ".");
+    draft.admission_origin = AssignmentAdmissionOrigin::LegacyMessage {
+        parent_assignment_id: None,
+    };
+    draft.workspace_strategy = WorkspaceStrategy::Shared;
+    draft.required_evidence.clear();
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .unwrap();
+    // The host terminal record is allowed before legacy fallback receipt sealing.
+    fixture
+        .store
+        .record_host_completion_observation(
+            attempt.attempt_id,
+            "thread:turn".into(),
+            "Host: check-alpha failed".into(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        fixture
+            .store
+            .append_observation(
+                attempt.attempt_id,
+                ObservationKind::Reading,
+                "unrelated history".into(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let receipt = fixture
+        .store
+        .record_legacy_agent_outcome(
+            attempt.attempt_id,
+            AgentStatusClaim::Completed,
+            "retained report".into(),
+        )
+        .await
+        .unwrap();
+    for limit in [0, 1, 10] {
+        let cold = fixture
+            .store
+            .get_agent_task(assignment.assignment_id, Some(limit))
+            .await
+            .unwrap();
+        assert_eq!(cold.receipt.as_ref(), Some(&receipt));
+        assert_eq!(
+            cold.observations
+                .iter()
+                .filter(|item| item.kind == ObservationKind::HostCompletion)
+                .map(|item| item.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Host: check-alpha failed"]
+        );
+    }
 }
 
 #[tokio::test]
@@ -3284,7 +4232,6 @@ async fn host_legacy_outcome_cannot_bypass_explicit_typed_receipt() {
         Err(StoreError::CriterionResultsInvalid(_))
     ));
 }
-
 
 #[tokio::test]
 async fn host_legacy_outcome_waits_for_running_validation() {
@@ -3532,9 +4479,46 @@ async fn receipt_sealing_waits_for_all_attempt_owned_running_validations() {
         .submit_agent_receipt(attempt.attempt_id, receipt)
         .await
         .expect("receipt seals after the watcher finishes");
-    let task = fixture.store.get_agent_task(assignment.assignment_id, Some(0)).await.unwrap();
+    let task = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
     assert!(task.receipt.is_some());
-    assert!(task.validation_calls.iter().all(|call| call.status != ValidationCallStatus::Running));
+    assert!(
+        task.validation_calls
+            .iter()
+            .all(|call| call.status != ValidationCallStatus::Running)
+    );
+}
+
+#[test]
+fn validation_evidence_preserves_empty_arguments_but_not_unverified_success() {
+    let mut call = ValidationCall {
+        call_id: "argv-contract".to_string(),
+        attempt_id: AttemptId::new(),
+        command_summary: "focused test".to_string(),
+        evidence: ValidationEvidence {
+            start_epoch: 0,
+            end_epoch: Some(0),
+            validation_result: Some(serde_json::json!({
+                "argv": ["checker", ""], "coveredPaths": ["."],
+                "callId": "argv-contract", "status": "succeeded", "durationMs": 1,
+            })),
+            ..ValidationEvidence::default()
+        },
+        status: ValidationCallStatus::Succeeded,
+        recorded_at: Utc::now(),
+    };
+    assert_eq!(
+        crate::local::verified_evidence_kind(&call),
+        Some(CriterionEvidenceKind::ValidationExecution)
+    );
+    call.evidence.validation_result.as_mut().unwrap()["status"] = serde_json::json!("unverified");
+    assert_eq!(crate::local::verified_evidence_kind(&call), None);
+    call.evidence.validation_result.as_mut().unwrap()["status"] = serde_json::json!("succeeded");
+    call.evidence.validation_result.as_mut().unwrap()["argv"] = serde_json::json!(["", "checker"]);
+    assert_eq!(crate::local::verified_evidence_kind(&call), None);
 }
 
 #[tokio::test]
@@ -3922,16 +4906,23 @@ async fn agent_task_bindings_persist_and_are_root_session_scoped() {
         .expect("binding persists");
     let (foreign, foreign_attempt) = fixture
         .store
-        .create_assignment(fixture.repo.path(), worker_draft("other-binding-root", "src"))
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("other-binding-root", "src"),
+        )
         .await
         .expect("foreign root assignment");
-    fixture.store.bind_agent_task(AgentTaskBindingDraft {
-        assignment_id: foreign.assignment_id,
-        attempt_id: foreign_attempt.attempt_id,
-        agent_path: expected.agent_path.clone(),
-        task_name: expected.task_name.clone(),
-        thread_id: expected.thread_id.clone(),
-    }).await.expect("binding names may repeat in another root");
+    fixture
+        .store
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: foreign.assignment_id,
+            attempt_id: foreign_attempt.attempt_id,
+            agent_path: expected.agent_path.clone(),
+            task_name: expected.task_name.clone(),
+            thread_id: expected.thread_id.clone(),
+        })
+        .await
+        .expect("binding names may repeat in another root");
     assert_eq!(
         fixture
             .store
@@ -4213,9 +5204,20 @@ async fn risk_review_progresses_to_independent_verification() {
         )
         .await
         .expect("verification verdict");
-    let task = fixture.store.get_agent_task(worker.assignment_id, Some(0)).await.unwrap();
-    assert!(task.gates.iter().all(|gate| gate.status == GateStatus::Passed));
-    assert_eq!(task.workspace_status.lease_state, Some(LeaseState::Released));
+    let task = fixture
+        .store
+        .get_agent_task(worker.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert!(
+        task.gates
+            .iter()
+            .all(|gate| gate.status == GateStatus::Passed)
+    );
+    assert_eq!(
+        task.workspace_status.lease_state,
+        Some(LeaseState::Released)
+    );
 }
 
 #[tokio::test]
@@ -4388,9 +5390,6 @@ async fn progress_heartbeat_defers_nonproductive_recovery_but_liveness_does_not(
     ));
 }
 
-
-
-
 #[tokio::test]
 async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
     let review_fixture = Fixture::new().await;
@@ -4460,10 +5459,17 @@ async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
         .expect("corrected receipt");
     // The same authorized reviewer may evaluate A1, but cannot attach an A0
     // decision to it. Root authority does not bypass the version check either.
-    for actor in [TaskActor::Root, TaskActor::Attempt(reviewer_attempt.attempt_id)] {
-        for status in [GateStatus::Passed, GateStatus::Failed, GateStatus::ChangesRequested] {
+    for actor in [
+        TaskActor::Root,
+        TaskActor::Attempt(reviewer_attempt.attempt_id),
+    ] {
+        for status in [
+            GateStatus::Passed,
+            GateStatus::Failed,
+            GateStatus::ChangesRequested,
+        ] {
             assert!(matches!(review_fixture.store.set_agent_gate(
-                actor, review_worker.assignment_id, review_attempt.attempt_id,
+                actor.clone(), review_worker.assignment_id, review_attempt.attempt_id,
                 GateKind::Review, status, "delayed A0 verdict".into(),
             ).await, Err(StoreError::AttemptNotActive(id)) if id == review_attempt.attempt_id));
         }
@@ -4683,7 +5689,9 @@ async fn wake_wait_rejects_invalid_cursor_even_without_a_stream() {
     for cursor in [cursor, WakeEventId::new()] {
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            fixture.store.wait_for_wake_events("missing-root".into(), Some(cursor)),
+            fixture
+                .store
+                .wait_for_wake_events("missing-root".into(), Some(cursor)),
         )
         .await
         .expect("invalid cursor must fail without waiting for a commit")
@@ -5019,9 +6027,18 @@ async fn automatic_wake_cursor_is_consumer_scoped_bounded_and_compare_and_swap()
 #[tokio::test]
 async fn integrator_admission_does_not_depend_on_claim_overlap_or_supersession() {
     let fixture = Fixture::new().await;
+    // Integration is an ordinary dependency: a legacy claim never authorizes it,
+    // so the dependency declares a satisfiable report-only criterion.
+    let mut dependency = worker_draft("root", "shared");
+    dependency.acceptance_criteria[0].text = "report the shared change".to_string();
+    dependency.acceptance_criteria[0].evidence_policy = Some(CriterionEvidencePolicy {
+        kind: CriterionEvidenceRequirement::ReportOnly,
+        required_evidence: None,
+        freshness: EvidenceFreshness::Current,
+    });
     let (worker, attempt) = fixture
         .store
-        .create_assignment(fixture.repo.path(), worker_draft("root", "shared"))
+        .create_assignment(fixture.repo.path(), dependency)
         .await
         .expect("worker assignment");
     let (untargeted, _) = fixture
@@ -5084,29 +6101,22 @@ async fn integrator_admission_does_not_depend_on_claim_overlap_or_supersession()
         .create_assignment(fixture.repo.path(), integrator)
         .await
         .expect("targeted integrator is admitted after the dependency gate passes");
-    let unrelated = fixture.store.get_agent_task(untargeted.assignment_id, Some(0)).await.unwrap();
+    let unrelated = fixture
+        .store
+        .get_agent_task(untargeted.assignment_id, Some(0))
+        .await
+        .unwrap();
     assert_eq!(unrelated.current_attempt.state, AttemptState::Active);
     let pool = coordination_pool(&fixture).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM write_claims")
-            .fetch_one(&pool).await.unwrap(),
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
         0
     );
     pool.close().await;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[test]
 fn assignments_without_additive_identity_or_capsule_fields_still_deserialize() {
@@ -5439,12 +6449,15 @@ fn risk_gate_and_waiver_rules_are_deterministic() {
     };
     let decision = evaluate_risk_gate(&facts);
     assert!(decision.review_required);
-    assert_eq!(decision.reasons, vec![
-        "persistence risk",
-        "more than five non-generated changed files",
-        "more than 400 non-generated changed lines",
-        "missing successful focused validation",
-    ]);
+    assert_eq!(
+        decision.reasons,
+        vec![
+            "persistence risk",
+            "more than five non-generated changed files",
+            "more than 400 non-generated changed lines",
+            "missing successful focused validation",
+        ]
+    );
     assert!(GateKind::Review.is_waivable());
     assert!(GateKind::Verification.is_waivable());
     assert!(!GateKind::Mutation.is_waivable());
@@ -5466,9 +6479,6 @@ fn risk_gate_and_waiver_rules_are_deterministic() {
 
     assert_eq!(decision.reasons, vec![CONCURRENT_DRIFT_REASON.to_string()]);
 }
-
-
-
 
 #[tokio::test]
 async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
@@ -5562,7 +6572,6 @@ async fn bounded_validation_operation_suspends_only_until_its_hard_deadline() {
         ValidationCallStatus::Cancelled
     );
 }
-
 
 #[tokio::test]
 async fn nudge_leases_and_task_restart_are_durable() {
@@ -5966,7 +6975,6 @@ async fn legacy_repository_bindings_upgrade_to_lineage_ids_on_restart() {
     restarted.close().await;
 }
 
-
 #[tokio::test]
 async fn malformed_git_lineage_metadata_rejects_assignment_without_persisting_fallback_identity() {
     for invalid in [
@@ -6135,11 +7143,22 @@ async fn attempt_ordinal_migration_initializes_fresh_and_upgrades_existing_store
             1
         );
         if predecessor {
+            // Every predecessor trigger survives the rebuild byte-for-byte; the
+            // only additions are migration 26's task-state revision fence.
+            let mut expected_attempt_triggers = prior_attempt_triggers;
+            expected_attempt_triggers.extend(["DELETE", "INSERT", "UPDATE"].map(|event| {
+                let name = format!("task_revision_attempts_{}", event.to_lowercase());
+                let sql = format!(
+                    "CREATE TRIGGER {name} AFTER {event} ON attempts\nBEGIN\n    UPDATE task_state_revision SET revision = revision + 1 WHERE id = 1;\nEND"
+                );
+                (name, sql)
+            }));
+            expected_attempt_triggers.sort();
             assert_eq!(
                 sqlx::query_as::<_, (String, String)>(
                     "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'attempts' ORDER BY name",
                 ).fetch_all(&pool).await.unwrap(),
-                prior_attempt_triggers,
+                expected_attempt_triggers,
                 "the migration preserves every live attempts trigger"
             );
             let attempts =
@@ -6254,30 +7273,136 @@ async fn automatic_wake_delivery_is_atomic_with_cursor_and_survives_losing_publi
     let fixture = Fixture::new().await;
     let root = "delivery-root".to_string();
     let consumer = "/root/consumer".to_string();
-    let (_, attempt) = fixture.store.create_assignment(fixture.repo.path(), worker_draft(&root, "src")).await.unwrap();
-    let cursor = fixture.store.automatic_wake_cursor(root.clone(), consumer.clone()).await.unwrap();
-    fixture.store.append_observation(attempt.attempt_id, ObservationKind::Reading, "ready".to_string(), None).await.unwrap();
-    let batch = fixture.store.read_wake_events(root.clone(), cursor).await.unwrap();
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft(&root, "src"))
+        .await
+        .unwrap();
+    let cursor = fixture
+        .store
+        .automatic_wake_cursor(root.clone(), consumer.clone())
+        .await
+        .unwrap();
+    fixture
+        .store
+        .append_observation(
+            attempt.attempt_id,
+            ObservationKind::Reading,
+            "ready".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+    let batch = fixture
+        .store
+        .read_wake_events(root.clone(), cursor)
+        .await
+        .unwrap();
     let next = batch.latest_event_id.unwrap();
-    assert!(fixture.store.automatic_wake_delivery(root.clone(), consumer.clone()).await.unwrap().is_none());
+    assert!(
+        fixture
+            .store
+            .automatic_wake_delivery(root.clone(), consumer.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
     let receipt = r#"{"artifact_id":"retained-output","cursor":1}"#.to_string();
-    assert!(fixture.store.publish_automatic_wake_delivery(root.clone(), consumer.clone(), cursor, next, receipt.clone()).await.unwrap());
-    assert!(!fixture.store.publish_automatic_wake_delivery(root.clone(), consumer.clone(), cursor, next, "losing-output".to_string()).await.unwrap());
-    assert_eq!(fixture.store.automatic_wake_cursor(root.clone(), consumer.clone()).await.unwrap(), Some(next));
-    assert_eq!(fixture.store.automatic_wake_delivery(root, consumer).await.unwrap(), Some(receipt));
+    assert!(
+        fixture
+            .store
+            .publish_automatic_wake_delivery(
+                root.clone(),
+                consumer.clone(),
+                cursor,
+                next,
+                receipt.clone()
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .store
+            .publish_automatic_wake_delivery(
+                root.clone(),
+                consumer.clone(),
+                cursor,
+                next,
+                "losing-output".to_string()
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        fixture
+            .store
+            .automatic_wake_cursor(root.clone(), consumer.clone())
+            .await
+            .unwrap(),
+        Some(next)
+    );
+    assert_eq!(
+        fixture
+            .store
+            .automatic_wake_delivery(root, consumer)
+            .await
+            .unwrap(),
+        Some(receipt)
+    );
 }
 
 #[tokio::test]
 async fn reusable_explorer_lookup_matches_admission_without_creating_work() {
     let fixture = Fixture::new().await;
     let draft = explorer_draft("early-reuse-root", "src/file.rs", "trace parser ownership");
-    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft.clone()).await.unwrap().is_none());
-    let admitted = fixture.store.create_admitted_assignment(fixture.repo.path(), draft.clone(), true).await.unwrap();
-    assert_eq!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft.clone()).await.unwrap(), Some(admitted.assignment.assignment_id));
-    let distinct = explorer_draft("early-reuse-root", "src/file.rs", "trace serializer ownership");
-    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), distinct).await.unwrap().is_none());
-    fixture.store.submit_agent_receipt(admitted.attempt.attempt_id, completed_receipt(Vec::new())).await.unwrap();
-    assert!(fixture.store.reusable_explorer_assignment(fixture.repo.path(), draft).await.unwrap().is_none());
+    assert!(
+        fixture
+            .store
+            .reusable_explorer_assignment(fixture.repo.path(), draft.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let admitted = fixture
+        .store
+        .create_admitted_assignment(fixture.repo.path(), draft.clone(), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .reusable_explorer_assignment(fixture.repo.path(), draft.clone())
+            .await
+            .unwrap(),
+        Some(admitted.assignment.assignment_id)
+    );
+    let distinct = explorer_draft(
+        "early-reuse-root",
+        "src/file.rs",
+        "trace serializer ownership",
+    );
+    assert!(
+        fixture
+            .store
+            .reusable_explorer_assignment(fixture.repo.path(), distinct)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fixture
+        .store
+        .submit_agent_receipt(admitted.attempt.attempt_id, completed_receipt(Vec::new()))
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .reusable_explorer_assignment(fixture.repo.path(), draft)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -6287,6 +7412,7 @@ async fn benchmark_explorer_lookup_with_sealed_history() {
     let mut draft = explorer_draft("history-benchmark", "src", "new investigation");
     draft.acceptance_criteria = (0..64)
         .map(|index| AcceptanceCriterion {
+            evidence_policy: None,
             id: format!("criterion-{index:03}"),
             text: format!("inspect the complete contract and consumer for requirement {index}"),
         })
@@ -6354,4 +7480,75 @@ async fn benchmark_explorer_lookup_with_sealed_history() {
     );
     pool.close().await;
     fixture.store.close().await;
+}
+#[path = "multi_agent_regression_tests.rs"]
+mod multi_agent_regression_tests;
+
+#[tokio::test]
+async fn capsule_publication_preserves_every_other_assignment_field_and_seals_the_slot() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("capsule-slot", "src"))
+        .await
+        .unwrap();
+    let payload = serde_json::to_string(&audit_capsule(&assignment, &attempt)).unwrap();
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(
+            fixture
+                .state
+                .codex_home()
+                .join("agent-task-coordination")
+                .join("agent_tasks.sqlite"),
+        )
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    for statement in [
+        "UPDATE assignments SET root_session_id = 'substituted', body_json = json_set(body_json, '$.task_capsule', ?) WHERE assignment_id = ?",
+        "UPDATE assignments SET body_json = json_set(body_json, '$.task_capsule', ?, '$.objective', 'substituted') WHERE assignment_id = ?",
+    ] {
+        let error = sqlx::query(statement)
+            .bind(&payload)
+            .bind(assignment.assignment_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("assignments are immutable"));
+    }
+    fixture
+        .store
+        .attach_task_capsule(
+            assignment.assignment_id,
+            attempt.attempt_id,
+            payload.clone(),
+        )
+        .await
+        .unwrap();
+    for statement in [
+        "UPDATE assignments SET body_json = json_remove(body_json, '$.task_capsule') WHERE assignment_id = ?",
+        "UPDATE assignments SET body_json = json_set(body_json, '$.task_capsule', 'null') WHERE assignment_id = ?",
+        "DELETE FROM assignments WHERE assignment_id = ?",
+    ] {
+        let error = sqlx::query(statement)
+            .bind(assignment.assignment_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("assignments are immutable"));
+    }
+    let mut expected = assignment.clone();
+    expected.task_capsule = Some(payload);
+    let current = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(current.assignment).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
 }

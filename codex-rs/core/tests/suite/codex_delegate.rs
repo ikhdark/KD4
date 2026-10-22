@@ -22,6 +22,9 @@ use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 
+/// Custom-scope reviews prefix the model's explanation with this host note.
+const CUSTOM_REVIEW_SOURCE_VALIDATION: &str = "Source validation: unverified custom scope; locations and freshness are not established by the host.\n\n";
+
 async fn assert_review_completes_without_approval(
     codex: &codex_core::CodexThread,
     expected: Result<&str, &str>,
@@ -41,7 +44,10 @@ async fn assert_review_completes_without_approval(
                         let output = event
                             .review_output
                             .expect("review returns its final result");
-                        assert_eq!(output.overall_explanation, explanation);
+                        assert_eq!(
+                            output.overall_explanation,
+                            format!("{CUSTOM_REVIEW_SOURCE_VALIDATION}{explanation}")
+                        );
                     }
                     Err(_) => assert!(
                         event.review_output.is_none(),

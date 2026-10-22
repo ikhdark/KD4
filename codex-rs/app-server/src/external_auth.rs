@@ -36,7 +36,7 @@ impl ExternalAuthBridge {
         };
         let params = ChatgptAuthTokensRefreshParams {
             reason,
-            previous_account_id: context.previous_account_id,
+            previous_account_id: context.previous_account_id.clone(),
         };
 
         let request = self.outgoing.send_request_to_connections_and_wait(
@@ -71,6 +71,14 @@ impl ExternalAuthBridge {
             response.chatgpt_account_id.as_str(),
             response.chatgpt_plan_type.as_deref(),
         )?;
+        if let Some(expected) = context.previous_account_id.as_deref()
+            && auth.get_account_id().as_deref() != Some(expected)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "authentication account changed during external refresh; log in explicitly",
+            ));
+        }
         *self
             .auth
             .write()
@@ -177,5 +185,50 @@ mod tests {
         assert_eq!(outgoing.pending_callback_count().await, 1);
         drop(refresh);
         assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn mismatched_refresh_never_updates_bridge_resolve_cache() {
+        use crate::outgoing_message::OutgoingEnvelope;
+        use crate::outgoing_message::OutgoingMessage;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        outgoing
+            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(true)))
+            .await;
+        let original =
+            CodexAuth::from_external_chatgpt_tokens("header.e30.a", "account-a", Some("pro"))
+                .unwrap();
+        let bridge = ExternalAuthBridge::new(outgoing.clone(), original);
+        let mut refresh = Box::pin(bridge.refresh(ExternalAuthRefreshContext {
+            reason: ExternalAuthRefreshReason::Unauthorized,
+            previous_account_id: Some("account-a".into()),
+        }));
+        assert!(futures::poll!(refresh.as_mut()).is_pending());
+        let OutgoingEnvelope::ToConnection {
+            message: OutgoingMessage::Request(request),
+            write_complete_tx,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected auth refresh request")
+        };
+        if let Some(tx) = write_complete_tx {
+            let _ = tx.send(std::time::Instant::now());
+        }
+        outgoing.notify_client_response(ConnectionId(1), request.id().clone(), serde_json::json!({
+            "accessToken":"header.e30.b", "chatgptAccountId":"account-b", "chatgptPlanType":"pro",
+        })).await;
+        assert_eq!(
+            refresh.await.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            bridge.resolve().await.unwrap().get_account_id().as_deref(),
+            Some("account-a")
+        );
     }
 }

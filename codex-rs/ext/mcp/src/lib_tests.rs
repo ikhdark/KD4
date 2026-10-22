@@ -35,19 +35,28 @@ async fn hosted_plugin_runtime_retains_identity_and_originator_across_enablement
                 &[],
             ))
             .await;
-        let [McpServerContribution::Set { name, config: server }] = contributions.as_slice()
+        let [
+            McpServerContribution::Set {
+                name,
+                config: server,
+            },
+        ] = contributions.as_slice()
         else {
             panic!("hosted plugin runtime should retain exactly one server");
         };
         assert_eq!(name, CODEX_APPS_MCP_SERVER_NAME);
         assert_eq!(server.enabled, enabled);
-        let McpServerTransportConfig::StreamableHttp { url, http_headers, .. } = &server.transport
+        let McpServerTransportConfig::StreamableHttp {
+            url, http_headers, ..
+        } = &server.transport
         else {
             panic!("hosted plugin runtime should use streamable HTTP");
         };
         assert_eq!(url, "https://chatgpt.com/backend-api/ps/mcp");
         assert_eq!(
-            http_headers.as_ref().and_then(|headers| headers.get("originator")),
+            http_headers
+                .as_ref()
+                .and_then(|headers| headers.get("originator")),
             Some(&"codex_work_desktop".to_string())
         );
     }

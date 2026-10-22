@@ -13,7 +13,11 @@ from unittest import mock
 
 from scripts.build import rust_build_status
 from scripts.build import rust_test_runner as runner_module
-from scripts.build.test_rust_test_runner import FakeExecutor, MANIFEST_DATA, RunnerTestCase
+from scripts.build.test_rust_test_runner import (
+    FakeExecutor,
+    MANIFEST_DATA,
+    RunnerTestCase,
+)
 from scripts.build.test_rust_test_runner import nextest_run_payload
 
 
@@ -28,14 +32,16 @@ class ValidationSchedulingTest(RunnerTestCase):
         data["targets"]["core_lib"]["helpers"] = []
         runner, executor = self.runner(manifest=runner_module.Manifest.from_data(data))
         if output is not None:
-            runner.executor = mock.Mock(return_value=subprocess.CompletedProcess(
-                [], returncode, output, ""
-            ))
+            runner.executor = mock.Mock(
+                return_value=subprocess.CompletedProcess([], returncode, output, "")
+            )
         return runner, executor
 
     def test_unknown_plan_rejects_before_metadata(self):
         with (
-            mock.patch.object(runner_module.Manifest, "load", return_value=self.manifest()),
+            mock.patch.object(
+                runner_module.Manifest, "load", return_value=self.manifest()
+            ),
             mock.patch.object(runner_module, "load_metadata") as metadata,
         ):
             self.assertEqual(runner_module.main(["plan", "unknown"]), 2)
@@ -47,22 +53,36 @@ class ValidationSchedulingTest(RunnerTestCase):
                 self.subTest(profile=profile),
                 mock.patch.object(runner_module, "load_metadata") as metadata,
             ):
-                self.assertEqual(runner_module.main([
-                    "--cargo-profile", profile, "run-target", "core_all"
-                ]), 2)
+                self.assertEqual(
+                    runner_module.main(
+                        ["--cargo-profile", profile, "run-target", "core_all"]
+                    ),
+                    2,
+                )
                 metadata.assert_not_called()
 
     def test_missing_cargo_target_rejects_before_admission(self):
         metadata = self.metadata()
         metadata.packages["codex-core"]["targets"] = []
-        for selection in (["run-target", "core_all"], ["run-gate", "demo-gate"],
-                          ["check-gates", "demo-gate"]):
+        for selection in (
+            ["run-target", "core_all"],
+            ["run-gate", "demo-gate"],
+            ["check-gates", "demo-gate"],
+        ):
             with (
                 self.subTest(selection=selection),
-                mock.patch.object(runner_module.Manifest, "load", return_value=self.manifest()),
-                mock.patch.object(runner_module, "load_metadata", return_value=metadata),
-                mock.patch.object(rust_build_status, "reserve_rust_test_target") as admission,
-                mock.patch.object(runner_module, "execution_dependency_manifest") as provenance,
+                mock.patch.object(
+                    runner_module.Manifest, "load", return_value=self.manifest()
+                ),
+                mock.patch.object(
+                    runner_module, "load_metadata", return_value=metadata
+                ),
+                mock.patch.object(
+                    rust_build_status, "reserve_rust_test_target"
+                ) as admission,
+                mock.patch.object(
+                    runner_module, "execution_dependency_manifest"
+                ) as provenance,
             ):
                 self.assertEqual(runner_module.main(selection), 2)
                 admission.assert_not_called()
@@ -72,13 +92,20 @@ class ValidationSchedulingTest(RunnerTestCase):
         for args in (["-E", ""], ["--filterset", " \t"], ["--filterset= "]):
             with self.subTest(args=args):
                 runner, executor = self.runner()
-                with self.assertRaisesRegex(runner_module.RunnerError, "requires a value"):
+                with self.assertRaisesRegex(
+                    runner_module.RunnerError, "requires a value"
+                ):
                     runner.run_target("core_all", args)
                 self.assertEqual(executor.calls, [])
 
     def test_empty_exact_selection_rejects_before_any_child_work(self):
-        for tail in (["--skip", "alpha"], ["--skip=alpha"], ["beta"],
-                     ["--exact", "alp"], ["--skip", ""]):
+        for tail in (
+            ["--skip", "alpha"],
+            ["--skip=alpha"],
+            ["beta"],
+            ["--exact", "alp"],
+            ["--skip", ""],
+        ):
             with self.subTest(tail=tail):
                 args = ["-E", "test(=alpha)", "--", *tail]
                 runner, executor = self.runner()
@@ -86,7 +113,9 @@ class ValidationSchedulingTest(RunnerTestCase):
                     runner.run_target("core_all", args)
                 self.assertEqual(executor.calls, [])
                 with mock.patch.object(runner_module, "load_metadata") as metadata:
-                    self.assertEqual(runner_module.main(["run-target", "core_all", *args]), 2)
+                    self.assertEqual(
+                        runner_module.main(["run-target", "core_all", *args]), 2
+                    )
                     metadata.assert_not_called()
 
     def test_exact_libtest_narrowing_needs_no_discovery_or_excluded_helpers(self):
@@ -109,15 +138,18 @@ class ValidationSchedulingTest(RunnerTestCase):
                 self.assertEqual(receipts, {"codex-core": ["pure::alpha"]})
                 self.assertEqual(executor.commands(["cargo", "build"]), [])
                 self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
-                command, = executor.commands(["cargo", "nextest", "run"])
-                self.assertEqual(command[-len(args):], args)
+                (command,) = executor.commands(["cargo", "nextest", "run"])
+                self.assertEqual(command[-len(args) :], args)
                 self.assertEqual(receipts.required, receipts.executed)
 
     def test_success_exit_without_completion_receipts_is_not_proof(self):
         for output, outcome in (
             ("", "evidence_incomplete"),
             ("Summary: 1 passed", "evidence_incomplete"),
-            (nextest_run_payload([("alpha", "ok")], package="wrong-binary"), "not_executed"),
+            (
+                nextest_run_payload([("alpha", "ok")], package="wrong-binary"),
+                "not_executed",
+            ),
             (nextest_run_payload([("alpha", "ignored")]), "not_executed"),
         ):
             with self.subTest(output=output):
@@ -128,7 +160,9 @@ class ValidationSchedulingTest(RunnerTestCase):
                 self.assertEqual(error.exception.completed_tests, {})
                 runner.executor.assert_called_once()
 
-    def test_success_exit_with_conflicting_results_preserves_only_independent_proof(self):
+    def test_success_exit_with_conflicting_results_preserves_only_independent_proof(
+        self,
+    ):
         for statuses, outcome in (
             (("ok", "ok"), "evidence_incomplete"),
             (("ok", "failed"), "evidence_incomplete"),
@@ -143,29 +177,105 @@ class ValidationSchedulingTest(RunnerTestCase):
                 with self.assertRaises(runner_module.RunnerError) as error:
                     runner.run_target("core_lib", ["-E", "all()"])
                 self.assertEqual(error.exception.outcome, outcome)
-                self.assertEqual(error.exception.completed_tests, {"codex-core": ["good"]})
+                self.assertEqual(
+                    error.exception.completed_tests, {"codex-core": ["good"]}
+                )
                 runner.executor.assert_called_once()
+
+    def test_failure_accounting_decodes_retained_reporter_output_once(self):
+        output = nextest_run_payload([("bad", "failed")])
+        runner, _ = self.pure_runner(output=output, returncode=100)
+        with mock.patch.object(
+            runner_module, "_nextest_events", wraps=runner_module._nextest_events
+        ) as decode:
+            with self.assertRaises(runner_module.RunnerError):
+                runner.run_target("core_lib", ["-E", "all()"])
+        decode.assert_called_once()
+
+    def test_direct_compilation_prepares_cache_before_command_custody(self):
+        for args, expected in [
+            (["cargo", "check"], ["cache", "owner"]),
+            (["cargo", "nextest", "list"], ["cache", "owner"]),
+            (["cargo", "metadata"], ["owner"]),
+            (
+                ["cargo", "nextest", "run", "--binaries-metadata", "fixture.json"],
+                ["owner"],
+            ),
+        ]:
+            events = []
+
+            @contextlib.contextmanager
+            def owner(*_args, **_kwargs):
+                events.append("owner")
+                yield mock.Mock(wait=mock.Mock(return_value=0))
+
+            with (
+                mock.patch.object(
+                    runner_module,
+                    "prepare_shared_sccache",
+                    side_effect=lambda **_: events.append("cache"),
+                ),
+                mock.patch.object(runner_module, "owned_process", owner),
+            ):
+                runner_module._default_executor(
+                    args,
+                    cwd=self.temp_dir,
+                    env={"CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir)},
+                    capture=runner_module.CAPTURE_BOTH,
+                )
+            self.assertEqual(events, expected)
+
+    def test_cache_preparation_failure_never_launches_compilation(self):
+        with (
+            mock.patch.object(
+                runner_module,
+                "prepare_shared_sccache",
+                side_effect=OSError("cache unavailable"),
+            ),
+            mock.patch.object(runner_module, "owned_process") as owner,
+        ):
+            with self.assertRaisesRegex(
+                runner_module.RunnerError, "cache preparation failed"
+            ):
+                runner_module._default_executor(
+                    ["cargo", "check"],
+                    cwd=self.temp_dir,
+                    env={},
+                    capture=runner_module.CAPTURE_BOTH,
+                )
+        owner.assert_not_called()
 
     def test_staging_failure_preserves_proof_and_only_blocks_dependent_batch(self):
         data = copy.deepcopy(MANIFEST_DATA)
         data["gates"] = {
-            "before": {"steps": [{"target": "core_lib", "tests": ["alpha"], "helpers": []}]},
-            "broken": {"steps": [{"target": "core_lib", "tests": ["alpha"], "helpers": ["codex"]}]},
-            "after": {"steps": [{"target": "core_all", "tests": ["alpha"], "helpers": []}]},
+            "before": {
+                "steps": [{"target": "core_lib", "tests": ["alpha"], "helpers": []}]
+            },
+            "broken": {
+                "steps": [
+                    {"target": "core_lib", "tests": ["alpha"], "helpers": ["codex"]}
+                ]
+            },
+            "after": {
+                "steps": [{"target": "core_all", "tests": ["alpha"], "helpers": []}]
+            },
         }
         for outcome in ("failed", "cancelled", "timed_out", "cleanup_failed"):
             with self.subTest(outcome=outcome):
                 runner, executor = self.runner(
                     manifest=runner_module.Manifest.from_data(data),
-                    executor=FakeExecutor(default_listing={"alpha": False}, artifacts={
-                        "codex": self.helper_executable("codex")
-                    }),
+                    executor=FakeExecutor(
+                        default_listing={"alpha": False},
+                        artifacts={"codex": self.helper_executable("codex")},
+                    ),
                 )
                 original = runner._helper_environment
 
                 def stage(targets, helpers, artifacts):
                     if helpers:
-                        raise runner_module.RunnerError("staging failed", outcome=outcome)
+                        raise runner_module.RunnerError(
+                            "staging failed", outcome=outcome
+                        )
                     return original(targets, helpers, artifacts)
 
                 with (
@@ -179,39 +289,51 @@ class ValidationSchedulingTest(RunnerTestCase):
                 self.assertEqual(error.exception.completed_gates, expected)
                 self.assertEqual(error.exception.outcome, outcome)
                 self.assertEqual(len(executor.commands(["cargo", "build"])), 1)
-                self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), len(expected))
+                self.assertEqual(
+                    len(executor.commands(["cargo", "nextest", "run"])), len(expected)
+                )
 
     def test_changed_runner_selects_scheduling_regressions_once(self):
         from scripts.maintenance import root_maintenance
 
-        targets = root_maintenance.python_test_targets([], [
-            "scripts/build/rust_test_runner.py", "scripts/build/test_validation_scheduling.py"
-        ])
+        targets = root_maintenance.python_test_targets(
+            [],
+            [
+                "scripts/build/rust_test_runner.py",
+                "scripts/build/test_validation_scheduling.py",
+            ],
+        )
         self.assertEqual(targets.count("scripts.build.test_validation_scheduling"), 1)
         self.assertIn("scripts.build.test_rust_test_runner", targets)
 
     def test_known_selection_failure_does_not_rescan_count(self):
+        # Failure accounting decodes the report once. A known selection needs
+        # no count; an unknown one derives it from that same decode.
         output = nextest_run_payload([("alpha", "failed")])
-        runner, _ = self.pure_runner(output=output, returncode=100)
-        with (
-            mock.patch.object(runner_module, "_nextest_selected_count") as count,
-            self.assertRaises(runner_module.RunnerError),
-        ):
-            runner.run_target("core_lib", ["-E", "test(=alpha)"])
-        count.assert_not_called()
-        runner, _ = self.pure_runner(output=output, returncode=100)
-        with (
-            mock.patch.object(runner_module, "_nextest_selected_count", return_value=1) as count,
-            self.assertRaises(runner_module.RunnerError),
-        ):
-            runner.run_target("core_lib", ["-E", "all()"])
-        count.assert_called_once()
+        for selection in (["-E", "test(=alpha)"], ["-E", "all()"]):
+            with self.subTest(selection=selection):
+                runner, _ = self.pure_runner(output=output, returncode=100)
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        runner_module,
+                        "_nextest_events",
+                        wraps=runner_module._nextest_events,
+                    ) as decode,
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(runner_module.RunnerError),
+                ):
+                    runner.run_target("core_lib", selection)
+                decode.assert_called_once()
+                self.assertIn("passed=0, failed=1, not-run=0", stderr.getvalue())
 
 
 class CrateValidationExecutionTest(unittest.TestCase):
     def test_isolated_script_entrypoints_do_not_import_from_caller(self):
         with tempfile.TemporaryDirectory() as directory:
-            Path(directory, "process_owner.py").write_text("raise RuntimeError('caller import')")
+            Path(directory, "process_owner.py").write_text(
+                "raise RuntimeError('caller import')"
+            )
             for arguments, expected in (
                 (["--help"], "run-target"),
                 (["list-targets"], "core_lib"),
@@ -219,8 +341,17 @@ class CrateValidationExecutionTest(unittest.TestCase):
             ):
                 with self.subTest(arguments=arguments):
                     result = subprocess.run(
-                        [sys.executable, "-I", "-B", str(Path(runner_module.__file__).resolve()), *arguments],
-                        cwd=directory, capture_output=True, text=True, timeout=30,
+                        [
+                            sys.executable,
+                            "-I",
+                            "-B",
+                            str(Path(runner_module.__file__).resolve()),
+                            *arguments,
+                        ],
+                        cwd=directory,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     if expected:
@@ -238,7 +369,9 @@ class CrateValidationExecutionTest(unittest.TestCase):
         for mode in ("local", "full"):
             for codes in ((0, 0), (1, 0), (0, 100), (1, 100)):
                 with self.subTest(mode=mode, codes=codes):
-                    commands = runner_module.crate_validation_commands(mode, "codex-config", ["--lib"])
+                    commands = runner_module.crate_validation_commands(
+                        mode, "codex-config", ["--lib"]
+                    )
                     started = threading.Barrier(2)
                     completed = []
 
@@ -253,19 +386,35 @@ class CrateValidationExecutionTest(unittest.TestCase):
                         completed.append(index)
                         return subprocess.CompletedProcess(command, codes[index])
 
-                    with mock.patch.object(runner_module, "run_owned", side_effect=execute):
-                        result = runner_module.run_crate_validation(mode, "codex-config", ["--lib"])
+                    with mock.patch.object(
+                        runner_module, "run_owned", side_effect=execute
+                    ):
+                        result = runner_module.run_crate_validation(
+                            mode, "codex-config", ["--lib"]
+                        )
                     self.assertCountEqual(completed, [0, 1])
                     self.assertEqual(result, next((code for code in codes if code), 0))
 
     def test_focused_mode_runs_only_the_selected_test_command(self):
         args = ["--lib", "-E", "test(=fixture)"]
-        command, = runner_module.crate_validation_commands("focused", "codex-config", args)
-        with mock.patch.object(runner_module, "run_owned", return_value=subprocess.CompletedProcess(command, 100)) as run:
-            self.assertEqual(runner_module.run_crate_validation("focused", "codex-config", args), 100)
+        (command,) = runner_module.crate_validation_commands(
+            "focused", "codex-config", args
+        )
+        with mock.patch.object(
+            runner_module,
+            "run_owned",
+            return_value=subprocess.CompletedProcess(command, 100),
+        ) as run:
+            self.assertEqual(
+                runner_module.run_crate_validation("focused", "codex-config", args), 100
+            )
         run.assert_called_once_with(
-            command, cwd=runner_module.CODEX_RS_ROOT, env=mock.ANY,
-            stdout=sys.stdout, stderr=sys.stderr, prepare_sccache=True,
+            command,
+            cwd=runner_module.CODEX_RS_ROOT,
+            env=mock.ANY,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            prepare_sccache=True,
         )
 
     def test_real_children_preserve_diagnostics_and_failure_status(self):
@@ -283,11 +432,17 @@ with mock.patch.object(runner, "crate_validation_commands", return_value=command
 """
         result = subprocess.run(
             [sys.executable, "-I", "-B", "-c", script],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         self.assertEqual(result.returncode, 17, result.stderr)
-        self.assertCountEqual(result.stdout.splitlines(), ["formatter-out", "tests-out"])
-        self.assertCountEqual(result.stderr.splitlines(), ["formatter-err", "tests-err"])
+        self.assertCountEqual(
+            result.stdout.splitlines(), ["formatter-out", "tests-out"]
+        )
+        self.assertCountEqual(
+            result.stderr.splitlines(), ["formatter-err", "tests-err"]
+        )
 
     def test_launch_exception_cancels_and_joins_the_other_check(self):
         from scripts.common.process_owner import check_operation

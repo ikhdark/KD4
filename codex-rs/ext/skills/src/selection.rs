@@ -88,7 +88,9 @@ fn select_by_path(
     selected: &mut Vec<SkillCatalogEntry>,
 ) {
     let mut matches = catalog.entries.iter().filter(|entry| entry.matches(path));
-    if let Some(entry) = matches.next() && matches.next().is_none() {
+    if let Some(entry) = matches.next()
+        && matches.next().is_none()
+    {
         push_selected(entry.entry, seen, selected);
     }
 }

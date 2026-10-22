@@ -286,9 +286,24 @@ impl ReqwestHttpRequestRunner {
             ));
         }
 
-        let body = response.bytes().await.map_err(|error| {
+        let limit = crate::connection::MAX_FILE_PAYLOAD_BYTES;
+        let unavailable = || {
             internal_error(format!(
-                "failed to read http/request response body: {error}"
+                "http/request was sent and returned status {status}, but its body exceeds the {limit}-byte buffered response limit; use streaming (do not blindly retry the request)"
+            ))
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit as u64)
+        {
+            return Err(unavailable());
+        }
+        let body = codex_http_client::collect_response_body(response.bytes_stream(), limit).await.map_err(|error| {
+            if matches!(error, codex_http_client::TransportError::ResponseTooLarge { .. }) {
+                return unavailable();
+            }
+            internal_error(format!(
+                "http/request was sent and returned status {status}, but its response body is unavailable: {error}"
             ))
         })?;
 
@@ -296,7 +311,7 @@ impl ReqwestHttpRequestRunner {
             HttpRequestResponse {
                 status,
                 headers,
-                body: body.to_vec().into(),
+                body: body.into(),
             },
             None,
         ))
@@ -379,6 +394,20 @@ impl ReqwestHttpRequestRunner {
     }
 
     fn response_headers(headers: &HeaderMap) -> Result<Vec<HttpHeader>, JSONRPCErrorError> {
+        // JSON escaping can expand a byte sixfold. Keep the full header envelope
+        // inside the response headroom reserved alongside the base64 body limit.
+        let header_bytes = headers.iter().fold(0usize, |total, (name, value)| {
+            total
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+                .saturating_add(64)
+        });
+        if header_bytes > 128 * 1024 {
+            return Err(internal_error(
+                "http/request was sent, but response headers exceed the buffered envelope limit"
+                    .into(),
+            ));
+        }
         headers
             .iter()
             .map(|(name, value)| {

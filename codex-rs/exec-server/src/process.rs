@@ -31,7 +31,9 @@ pub struct StartedExecProcess {
 pub enum ExecProcessEvent {
     Output(ProcessOutputChunk),
     /// Missing output only; does not imply exit, closure, or process failure.
-    OutputGap { through_seq: u64 },
+    OutputGap {
+        through_seq: u64,
+    },
     Exited {
         seq: u64,
         exit_code: i32,
@@ -72,7 +74,8 @@ impl ExecProcessEvent {
     /// Sequence number used to order process-owned events.
     ///
     /// `Failed` is intentionally unsequenced because it is synthesized by the
-    /// client when the session or transport fails, not emitted by the process.
+    /// session observer when exit observation or its transport fails, rather
+    /// than being evidence of a process exit.
     pub(crate) fn seq(&self) -> Option<u64> {
         match self {
             ExecProcessEvent::Output(chunk) => Some(chunk.seq),
@@ -148,6 +151,18 @@ impl ExecProcessEventLog {
             _keepalive: None,
         }
     }
+
+    // Only used by a private replay validator with no subscribers. Move the
+    // validated payloads out instead of materializing a second byte copy.
+    pub(crate) fn drain_owned(&self) -> Vec<ExecProcessEvent> {
+        let mut history = self
+            .inner
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history.retained_bytes = 0;
+        history.events.drain(..).map(Arc::unwrap_or_clone).collect()
+    }
 }
 
 pub struct ExecProcessEventReceiver {
@@ -216,6 +231,14 @@ pub trait ExecProcess: Send + Sync {
     fn signal(&self, signal: ProcessSignal) -> ExecProcessFuture<'_, ()>;
 
     fn terminate(&self) -> ExecProcessFuture<'_, ()>;
+
+    /// The pinned owner can no longer recover; a fresh session is not this process.
+    fn termination_is_unreachable(&self) -> bool {
+        false
+    }
+
+    /// Preserve unknown outcome outside active task/persistence barriers.
+    fn record_unresolved_termination(&self, _reason: &str) {}
 }
 
 pub type ExecProcessFuture<'a, T> =

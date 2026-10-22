@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
@@ -34,7 +35,6 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
-use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCHER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -125,7 +125,6 @@ async fn expect_skills_changed_notification(
     assert_eq!(notification, SkillsChangedNotification {});
     Ok(())
 }
-
 
 fn write_cached_remote_plugin_with_skill(
     codex_home: &std::path::Path,
@@ -489,11 +488,9 @@ enabled = true
             .and(path("/backend-api/accounts/account-123/settings"))
             .and(header("authorization", "Bearer chatgpt-token"))
             .and(header("chatgpt-account-id", "account-123"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "beta_settings": { "enable_plugins": plugins_enabled }
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "beta_settings": { "enable_plugins": plugins_enabled }
+            })))
             .mount(&server)
             .await;
 
@@ -589,14 +586,17 @@ async fn skills_list_skips_cwd_roots_when_environment_disabled() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn skills_list_accepts_relative_cwds_and_preserves_requested_order() -> Result<()> {
     let codex_home = TempDir::new()?;
     let first_cwd = codex_home.path().join("z-first");
     let second_cwd = codex_home.path().join("a-second");
     let relative_cwd = std::path::PathBuf::from("relative-cwd");
-    for path in [&first_cwd, &second_cwd, &codex_home.path().join(&relative_cwd)] {
+    for path in [
+        &first_cwd,
+        &second_cwd,
+        &codex_home.path().join(&relative_cwd),
+    ] {
         std::fs::create_dir_all(path)?;
     }
 
@@ -609,11 +609,7 @@ async fn skills_list_accepts_relative_cwds_and_preserves_requested_order() -> Re
 
     let request_id = mcp
         .send_skills_list_request(SkillsListParams {
-            cwds: vec![
-                first_cwd.clone(),
-                relative_cwd.clone(),
-                second_cwd.clone(),
-            ],
+            cwds: vec![first_cwd.clone(), relative_cwd.clone(), second_cwd.clone()],
             force_reload: true,
         })
         .await?;
@@ -628,11 +624,7 @@ async fn skills_list_accepts_relative_cwds_and_preserves_requested_order() -> Re
         data.iter()
             .map(|entry| entry.cwd.clone())
             .collect::<Vec<_>>(),
-        vec![
-            first_cwd.clone(),
-                relative_cwd.clone(),
-            second_cwd.clone(),
-        ]
+        vec![first_cwd.clone(), relative_cwd.clone(), second_cwd.clone(),]
     );
     assert!(data.iter().all(|entry| entry.errors.is_empty()));
     Ok(())

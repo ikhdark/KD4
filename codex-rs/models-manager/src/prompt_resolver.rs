@@ -188,7 +188,6 @@ mod tests {
         let mut model = crate::model_info::model_info_from_slug("gpt-5.6-sol");
         model.base_instructions = "remote prompt".to_string();
         model.model_messages = Some(ModelMessages {
-            token_budget: None,
             instructions_template: Some("remote template".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: Some("default".to_string()),
@@ -207,7 +206,6 @@ mod tests {
         assert_eq!(
             model.model_messages,
             Some(ModelMessages {
-                token_budget: None,
                 instructions_template: None,
                 instructions_variables: None,
                 approvals: Some(approvals),

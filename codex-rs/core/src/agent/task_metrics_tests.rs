@@ -32,6 +32,7 @@ fn tokens(total: u64) -> TokenClassTotals {
         output,
         reasoning_output: output / 2,
         total,
+        coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
     }
 }
 
@@ -48,7 +49,7 @@ fn metric_input() -> TaskMetricInput {
     TaskMetricInput {
         task_id: OpaqueId::new(7),
         duration: Duration::from_secs(20),
-        critical_path_idle_time: Duration::from_secs(5),
+        coordinator_zero_active_time: Duration::from_secs(5),
         role_usage: vec![
             RoleUsage {
                 role: RoleLabel::Worker,
@@ -120,6 +121,8 @@ fn completed_task_with_validation(
     let attempt_id = AttemptId::new();
     let now = Utc::now();
     AgentTask {
+        dependency_admissions: Vec::new(),
+        criterion_assessments: Vec::new(),
         assignment: Assignment {
             assignment_id,
             root_session_id: "root-session".to_string(),
@@ -130,6 +133,7 @@ fn completed_task_with_validation(
             capability_profile: CapabilityProfile::ScopedSourceWrite,
             objective: "complete the task".to_string(),
             acceptance_criteria: vec![AcceptanceCriterion {
+                evidence_policy: None,
                 id: "criterion".to_string(),
                 text: "criterion passes".to_string(),
             }],
@@ -261,7 +265,7 @@ fn add_gate(task: &mut AgentTask, kind: GateKind, reason: &str) {
 #[test]
 fn evaluates_complete_privacy_safe_metric_set() {
     let metrics = TaskMetrics::evaluate(metric_input()).expect("valid metrics");
-    assert_eq!(metrics.critical_path_idle_basis_points, 2_500);
+    assert_eq!(metrics.coordinator_zero_active_basis_points, 2_500);
     assert_eq!(metrics.concurrency_utilization_basis_points, 6_000);
     assert_eq!(metrics.first_pass_acceptance_basis_points, Some(7_500));
     assert_eq!(metrics.final_acceptance_basis_points, 10_000);
@@ -272,6 +276,15 @@ fn evaluates_complete_privacy_safe_metric_set() {
         output: 400 + 100,
         reasoning_output: 200 + 50,
         total: 1_000,
+        coverage: Some(codex_protocol::protocol::TokenUsageCoverage {
+            receipts: 2,
+            input_tokens: 2,
+            cached_input_tokens: 2,
+            output_tokens: 2,
+            reasoning_output_tokens: 2,
+            total_tokens: 2,
+            ..Default::default()
+        }),
     };
     assert_eq!(
         metrics.total_usage,
@@ -310,12 +323,12 @@ fn evaluates_complete_privacy_safe_metric_set() {
 #[test]
 fn rejects_inconsistent_or_unbounded_inputs() {
     let invalid_idle = TaskMetricInput {
-        critical_path_idle_time: Duration::from_secs(21),
+        coordinator_zero_active_time: Duration::from_secs(21),
         ..metric_input()
     };
     assert_eq!(
         TaskMetrics::evaluate(invalid_idle),
-        Err(MetricsError::InvalidCriticalPathIdleTime)
+        Err(MetricsError::InvalidCoordinatorZeroActiveTime)
     );
 
     let invalid_closure = TaskMetricInput {
@@ -385,8 +398,8 @@ fn recorder_aggregates_usage_and_weighted_concurrency_online() {
         .expect("first terminal sample is retained");
 
     assert_eq!(metrics.task_id, OpaqueId::new(9));
-    assert_eq!(metrics.critical_path_idle_time, Duration::from_secs(5));
-    assert_eq!(metrics.critical_path_idle_basis_points, 2_500);
+    assert_eq!(metrics.coordinator_zero_active_time, Duration::from_secs(5));
+    assert_eq!(metrics.coordinator_zero_active_basis_points, 2_500);
     assert_eq!(metrics.concurrency_utilization_basis_points, 4_000);
     assert_eq!(
         metrics.usage_by_role[&RoleCapability {
@@ -400,6 +413,15 @@ fn recorder_aggregates_usage_and_weighted_concurrency_online() {
                 output: 400 + 100,
                 reasoning_output: 200 + 50,
                 total: 1_000,
+                coverage: Some(codex_protocol::protocol::TokenUsageCoverage {
+                    receipts: 2,
+                    input_tokens: 2,
+                    cached_input_tokens: 2,
+                    output_tokens: 2,
+                    reasoning_output_tokens: 2,
+                    total_tokens: 2,
+                    ..Default::default()
+                }),
             },
             calls: 5,
         }
@@ -407,6 +429,29 @@ fn recorder_aggregates_usage_and_weighted_concurrency_online() {
     assert_eq!(metrics.total_usage.tokens.total, 1_000);
     assert_eq!(recorder.recorded_events(), 5);
     assert!(recorder.is_terminal());
+}
+
+#[test]
+fn recorder_zero_active_time_measures_coordinator_occupancy_not_task_progress() {
+    // One active assignment may be unrelated to a stalled required task. The
+    // recorder has no dependency edges and must report occupancy, not progress.
+    for (active_assignments, expected) in [
+        (0, Duration::from_secs(10)),
+        (1, Duration::ZERO),
+        (2, Duration::ZERO),
+    ] {
+        let mut recorder =
+            TaskMetricRecorder::new(OpaqueId::new(99), active_assignments, 2).unwrap();
+        let metrics = recorder
+            .finish(Duration::from_secs(10), terminal_input())
+            .unwrap()
+            .unwrap();
+        assert_eq!(metrics.coordinator_zero_active_time, expected);
+        assert_eq!(
+            metrics.coordinator_zero_active_basis_points,
+            if active_assignments == 0 { 10_000 } else { 0 }
+        );
+    }
 }
 
 #[test]
@@ -505,7 +550,7 @@ fn recorder_rejects_invalid_transitions_and_keeps_aggregating_after_counter_satu
             calls: MAX_RECORDED_EVENTS as u64 + 3
         }
     );
-    assert_eq!(metrics.critical_path_idle_time, Duration::from_secs(5));
+    assert_eq!(metrics.coordinator_zero_active_time, Duration::from_secs(5));
     assert_eq!(metrics.concurrency_utilization_basis_points, 1_000);
     assert_eq!(bounded.recorded_events(), MAX_RECORDED_EVENTS);
 }
@@ -520,6 +565,7 @@ fn recorder_checks_usage_overflow_before_committing_an_event() {
         output: u64::MAX,
         reasoning_output: u64::MAX,
         total: u64::MAX,
+        coverage: None,
     };
     recorder
         .record_role_usage(
@@ -634,8 +680,8 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
         [
             TASK_DURATION_METRIC,
             TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC,
-            TASK_CRITICAL_PATH_IDLE_DURATION_METRIC,
-            TASK_CRITICAL_PATH_IDLE_RATIO_METRIC,
+            TASK_COORDINATOR_ZERO_ACTIVE_DURATION_METRIC,
+            TASK_COORDINATOR_ZERO_ACTIVE_RATIO_METRIC,
             TASK_TOKEN_USAGE_METRIC,
             TASK_INFERENCE_CALLS_METRIC,
             TASK_CONCURRENCY_UTILIZATION_METRIC,
@@ -653,8 +699,8 @@ fn emitter_vocabulary_is_static_and_low_cardinality() {
         [
             "codex.multi_agent.task.duration_ms",
             "codex.multi_agent.task.first_meaningful_progress.duration_ms",
-            "codex.multi_agent.task.critical_path_idle.duration_ms",
-            "codex.multi_agent.task.critical_path_idle.basis_points",
+            "codex.multi_agent.task.coordinator_zero_active.duration_ms",
+            "codex.multi_agent.task.coordinator_zero_active.basis_points",
             "codex.multi_agent.task.token_usage",
             "codex.multi_agent.task.inference_calls",
             "codex.multi_agent.task.concurrency_utilization.basis_points",
@@ -836,16 +882,28 @@ fn amended_criteria_use_current_metric_denominator() {
     for count in [1, 2, 3] {
         let mut task = completed_task_with_validation(&[], &[]);
         task.current_attempt.ordinal = 1;
-        let criteria = (0..count).map(|i| AcceptanceCriterion {
-            id: format!("renamed-{i}"), text: "amended behavior".into(),
-        }).collect::<Vec<_>>();
+        let criteria = (0..count)
+            .map(|i| AcceptanceCriterion {
+                evidence_policy: None,
+                id: format!("renamed-{i}"),
+                text: "amended behavior".into(),
+            })
+            .collect::<Vec<_>>();
         task.current_attempt.amendment = Some(codex_agent_task_store::AttemptAmendment {
-            reason: "revise acceptance".into(), objective: None,
-            acceptance_criteria: Some(criteria.clone()), stop_condition: None,
+            reason: "revise acceptance".into(),
+            objective: None,
+            acceptance_criteria: Some(criteria.clone()),
+            stop_condition: None,
         });
-        task.receipt.as_mut().unwrap().criterion_results = criteria.iter().map(|criterion| CriterionResult {
-            criterion_id: criterion.id.clone(), status: CriterionStatus::Passed, evidence: None, evidence_ref: None,
-        }).collect();
+        task.receipt.as_mut().unwrap().criterion_results = criteria
+            .iter()
+            .map(|criterion| CriterionResult {
+                criterion_id: criterion.id.clone(),
+                status: CriterionStatus::Passed,
+                evidence: None,
+                evidence_ref: None,
+            })
+            .collect();
         let terminal = super::terminal_input(&task);
         assert_eq!(terminal.acceptance_total, count);
         assert_eq!(terminal.acceptance_final_closed, count);
@@ -854,4 +912,23 @@ fn amended_criteria_use_current_metric_denominator() {
         assert!(runtime.finish(&task).unwrap().is_some());
         assert!(runtime.finish(&task).unwrap().is_none());
     }
+}
+#[test]
+fn missing_receipt_counts_calls_without_certifying_zero_token_classes() {
+    let mut recorder = TaskMetricRecorder::new(OpaqueId::new(98), 1, 1).unwrap();
+    let missing =
+        TokenClassTotals::from_usage(&codex_protocol::protocol::TokenUsage::missing_receipt());
+    recorder
+        .record_role_usage(RoleLabel::Worker, CapabilityLabel::ScopedWrite, missing, 1)
+        .unwrap();
+    let usage = recorder.usage_by_role.values().next().unwrap();
+    assert_eq!(usage.calls, 1);
+    assert!(
+        usage
+            .tokens
+            .classes()
+            .into_iter()
+            .all(|(_, value)| value.is_none())
+    );
+    assert_eq!(usage.tokens.total, 0, "zero is only the known lower bound");
 }

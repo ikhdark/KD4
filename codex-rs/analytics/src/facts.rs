@@ -476,6 +476,9 @@ pub struct CodexGoalEvent {
 
 #[allow(dead_code)]
 pub(crate) enum AnalyticsFact {
+    ConnectionClosed {
+        connection_id: u64,
+    },
     Initialize {
         connection_id: u64,
         params: InitializeParams,
@@ -653,10 +656,19 @@ mod tests {
     #[test]
     fn retry_and_request_build_errors_have_distinct_analytics_kinds() {
         for (error, expected) in [
-            (CodexErr::PreDispatchRetryExhausted("connection reset".to_string()), "pre_dispatch_retry_exhausted"),
-            (CodexErr::RequestBuild("invalid header".to_string()), "request_build"),
+            (
+                CodexErr::PreDispatchRetryExhausted("connection reset".to_string()),
+                "pre_dispatch_retry_exhausted",
+            ),
+            (
+                CodexErr::RequestBuild("invalid header".to_string()),
+                "request_build",
+            ),
         ] {
-            assert_eq!(serde_json::to_value(CodexErrKind::from(&error)).expect("serialize error kind"), serde_json::json!(expected));
+            assert_eq!(
+                serde_json::to_value(CodexErrKind::from(&error)).expect("serialize error kind"),
+                serde_json::json!(expected)
+            );
         }
     }
 
@@ -679,5 +691,4 @@ mod tests {
             serde_json::json!("unexpected_status")
         );
     }
-
 }

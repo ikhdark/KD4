@@ -443,7 +443,8 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::InterAgentCommunication(_)
         | RolloutItem::InterAgentCommunicationMetadata { .. }
         | RolloutItem::Compacted(_)
-        | RolloutItem::WorldState(_) => None,
+        | RolloutItem::WorldState(_)
+        | RolloutItem::AdditionalContextState { .. } => None,
     }
 }
 
@@ -465,14 +466,12 @@ fn content_item_text(item: &ContentItem) -> Option<&str> {
 }
 
 fn excerpt_around_match(text: &str, search_term: &Regex) -> Option<String> {
-    let normalized = normalize_preview_text(text);
-    let matched = search_term.find(normalized.as_str())?;
+    let matched = search_term.find(text)?;
     let match_start = matched.start();
     let match_end = matched.end();
-    let excerpt_start =
-        char_start_before(normalized.as_str(), match_start, MATCH_CONTEXT_BEFORE_CHARS);
-    let excerpt_end = char_end_after(normalized.as_str(), match_end, MATCH_CONTEXT_AFTER_CHARS);
-    let excerpt = normalized[excerpt_start..excerpt_end].trim();
+    let excerpt_start = char_start_before(text, match_start, MATCH_CONTEXT_BEFORE_CHARS);
+    let excerpt_end = char_end_after(text, match_end, MATCH_CONTEXT_AFTER_CHARS);
+    let excerpt = normalize_preview_text(&text[excerpt_start..excerpt_end]);
     if excerpt.is_empty() {
         return None;
     }
@@ -481,8 +480,8 @@ fn excerpt_around_match(text: &str, search_term: &Regex) -> Option<String> {
     if excerpt_start > 0 {
         snippet.push_str("... ");
     }
-    snippet.push_str(excerpt);
-    if excerpt_end < normalized.len() {
+    snippet.push_str(&excerpt);
+    if excerpt_end < text.len() {
         snippet.push_str(" ...");
     }
     Some(snippet)
@@ -512,6 +511,21 @@ fn char_end_after(text: &str, byte_index: usize, chars_after: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_whitespace_is_matched_before_display_normalization() {
+        for needle in ["alpha  beta", "alpha\tbeta", "alpha\nbeta", "雪  β"] {
+            let regex = regex::RegexBuilder::new(&regex::escape(needle))
+                .case_insensitive(true)
+                .build()
+                .unwrap();
+            let text = format!("前 {needle} 後");
+            let snippet = excerpt_around_match(&text, &regex).expect("literal visible match");
+            assert!(snippet.contains(&normalize_preview_text(needle)));
+        }
+        let regex = Regex::new("alpha  beta").unwrap();
+        assert!(excerpt_around_match("alpha beta", &regex).is_none());
+    }
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use std::io::Write as _;
@@ -610,8 +624,6 @@ mod tests {
             Some((root.join(path), None))
         );
     }
-
-
 
     #[tokio::test]
     async fn compressed_scan_retains_metadata_only_match() {
@@ -774,7 +786,8 @@ mod tests {
         let home = tempfile::tempdir()?;
         let root = home.path().join("sessions");
         std::fs::create_dir_all(&root)?;
-        let path = root.join("rollout-2026-01-01T00-00-00-00000000-0000-0000-0000-000000000001.jsonl");
+        let path =
+            root.join("rollout-2026-01-01T00-00-00-00000000-0000-0000-0000-000000000001.jsonl");
         let line = serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z",
             "type": "session_meta",
@@ -787,23 +800,39 @@ mod tests {
         });
         let serialized = serde_json::to_vec(&line)?;
         let item: RolloutLine = serde_json::from_slice(&serialized)?;
-        assert!(super::super::payload_artifact::is_artifact_candidate(&item.item));
+        assert!(super::super::payload_artifact::is_artifact_candidate(
+            &item.item
+        ));
         let reference = super::super::payload_artifact::store_line(&path, &serialized)?;
         assert!(!String::from_utf8_lossy(&reference).contains("metadata-needle"));
         std::fs::write(&path, &reference)?;
         // The public path search retains metadata-only matches, but a reference alone
         // must never count as a hit. The ordinary conversation after it remains visible.
         let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-        writeln!(file, "{}", user_rollout_line("2026-01-01T00:00:01Z", "later conversation"))?;
+        writeln!(
+            file,
+            "{}",
+            user_rollout_line("2026-01-01T00:00:01Z", "later conversation")
+        )?;
         drop(file);
         assert_ripgrep_runs(&root).await;
         for (term, expected) in [
             ("metadata-needle", HashMap::from([(path.clone(), None)])),
-            ("later conversation", HashMap::from([(path.clone(), Some("later conversation".to_string()))])),
+            (
+                "later conversation",
+                HashMap::from([(path.clone(), Some("later conversation".to_string()))]),
+            ),
             ("not-present", HashMap::new()),
         ] {
-            assert_eq!(search_rollout_matches(Path::new("rg"), home.path(), false, term).await?, expected);
-            assert_eq!(search_rollout_matches(&home.path().join("missing-rg"), home.path(), false, term).await?, expected);
+            assert_eq!(
+                search_rollout_matches(Path::new("rg"), home.path(), false, term).await?,
+                expected
+            );
+            assert_eq!(
+                search_rollout_matches(&home.path().join("missing-rg"), home.path(), false, term)
+                    .await?,
+                expected
+            );
         }
         Ok(())
     }

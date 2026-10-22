@@ -109,6 +109,163 @@ fn changed_diff_emission_deduplicates_and_preserves_clear_transition() {
     assert_eq!(tracker.take_unified_diff_if_changed(), None);
 }
 
+#[tokio::test]
+async fn audit107_patch_chain_excludes_foreign_same_file_edits() {
+    for foreign in [false, true] {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("owned.txt");
+        fs::write(&file, "own = 1\nother = 7\n").unwrap();
+        let mut tracker = tracker_with_root(dir.path());
+        let first = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: owned.txt\n@@\n-own = 1\n+own = 2\n*** Add File: unaffected.txt\n+owned\n*** End Patch").await;
+        tracker.track_delta("", &first);
+        if foreign {
+            fs::write(&file, "own = 2\nother = 9\n").unwrap();
+        }
+        let next = apply_verified_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Update File: owned.txt\n@@\n-own = 2\n+own = 3\n*** End Patch",
+        )
+        .await;
+        tracker.track_delta("", &next);
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            if foreign {
+                "own = 3\nother = 9\n"
+            } else {
+                "own = 3\nother = 7\n"
+            }
+        );
+        if foreign {
+            assert!(tracker.exact_unified_diff().is_err());
+            let partial = tracker.get_unified_diff().unwrap();
+            assert!(
+                partial.contains("+owned"),
+                "unaffected exact edits must survive"
+            );
+            assert!(!partial.contains("+other = 9"));
+        } else {
+            let exact = tracker.exact_unified_diff().unwrap().unwrap();
+            assert!(exact.contains("-own = 1"));
+            assert!(exact.contains("+own = 3"));
+            assert!(!tracker.has_untracked_changes());
+        }
+    }
+}
+
+#[tokio::test]
+async fn uncertain_patch_contents_never_reach_existing_test_advisories() {
+    let dir = tempdir().unwrap();
+    let original = "import unittest\nEXPECTED = 1\nclass TestContract(unittest.TestCase):\n    def test_contract(self):\n        self.assertEqual(2, EXPECTED)\n";
+    fs::write(dir.path().join("test_contract.py"), original).unwrap();
+    fs::write(
+        dir.path().join("test_sibling.py"),
+        "def test_sibling():\n    assert True\n",
+    )
+    .unwrap();
+    let mut tracker = tracker_with_root(dir.path());
+    let first = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: test_contract.py\n@@\n-EXPECTED = 1\n+EXPECTED = 2\n*** Update File: test_sibling.py\n@@\n-    assert True\n+    assert 1 == 1\n*** End Patch").await;
+    tracker.track_delta("", &first);
+    fs::write(
+        dir.path().join("test_contract.py"),
+        original.replace("EXPECTED = 1", "EXPECTED = 2").replace(
+            "class TestContract",
+            "@unittest.skip('foreign')\nclass TestContract",
+        ),
+    )
+    .unwrap();
+    let second = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: test_contract.py\n@@\n-EXPECTED = 2\n+EXPECTED = 3\n*** End Patch").await;
+    tracker.track_delta("", &second);
+    assert!(tracker.exact_unified_diff().is_err());
+    let contents = tracker.changed_existing_contents();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].0, "test_sibling.py");
+    assert_eq!(tracker.uncertain_content_paths(), ["test_contract.py"]);
+    let partial = tracker.get_unified_diff().unwrap();
+    assert!(partial.contains("+    assert 1 == 1"));
+    assert!(!partial.contains("foreign"));
+    tracker.record_unknown_mutation();
+    assert!(tracker.changed_existing_contents().is_empty());
+    assert!(
+        tracker
+            .uncertain_content_paths()
+            .contains(&"test_sibling.py".to_string())
+    );
+}
+
+#[tokio::test]
+async fn absence_survives_an_add_delete_cycle_for_continuity() {
+    for foreign in [false, true] {
+        let dir = tempdir().unwrap();
+        let mut tracker = tracker_with_root(dir.path());
+        for patch in [
+            "*** Begin Patch\n*** Add File: new.py\n+owned\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: new.py\n*** End Patch",
+        ] {
+            let delta = apply_verified_patch(dir.path(), patch).await;
+            tracker.track_delta("", &delta);
+        }
+        if foreign {
+            fs::write(dir.path().join("new.py"), "foreign\n").unwrap();
+        }
+        let delta = apply_verified_patch(
+            dir.path(),
+            "*** Begin Patch\n*** Add File: new.py\n+new owned\n*** End Patch",
+        )
+        .await;
+        tracker.track_delta("", &delta);
+        assert_eq!(tracker.exact_unified_diff().is_err(), foreign);
+        assert!(tracker.changed_existing_contents().is_empty());
+        assert_eq!(tracker.uncertain_content_paths().is_empty(), !foreign);
+    }
+}
+
+#[tokio::test]
+async fn audit107_patch_preimages_check_existence_and_both_move_endpoints() {
+    for operation in [
+        "delete",
+        "overwrite",
+        "move_source",
+        "move_destination",
+        "recreate",
+    ] {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("source"), "before\n").unwrap();
+        fs::write(dir.path().join("destination"), "original\n").unwrap();
+        let mut tracker = tracker_with_root(dir.path());
+        let seed = apply_verified_patch(dir.path(), "*** Begin Patch\n*** Update File: source\n@@\n-before\n+owned\n*** Update File: destination\n@@\n-original\n+owned destination\n*** End Patch").await;
+        tracker.track_delta("", &seed);
+        let patch = match operation {
+            "delete" => "*** Delete File: source",
+            "overwrite" | "recreate" => "*** Add File: source\n+next",
+            _ => "*** Update File: source\n*** Move to: destination",
+        };
+        if operation == "recreate" {
+            let delete = apply_verified_patch(
+                dir.path(),
+                "*** Begin Patch\n*** Delete File: source\n*** End Patch",
+            )
+            .await;
+            tracker.track_delta("", &delete);
+        }
+        let foreign_path = if operation == "move_destination" {
+            "destination"
+        } else {
+            "source"
+        };
+        fs::write(dir.path().join(foreign_path), "foreign\n").unwrap();
+        let delta = apply_verified_patch(
+            dir.path(),
+            &format!("*** Begin Patch\n{patch}\n*** End Patch"),
+        )
+        .await;
+        assert!(delta.is_exact());
+        tracker.track_delta("", &delta);
+        assert!(tracker.exact_unified_diff().is_err(), "{operation}");
+        let partial = tracker.get_unified_diff().unwrap();
+        assert!(!partial.contains("-foreign"), "{operation}: {partial}");
+    }
+}
+
 #[test]
 fn invalidation_reports_unknown_changes_even_without_a_published_diff() {
     for published in [false, true] {
@@ -360,8 +517,26 @@ fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
 #[test]
 fn read_only_shell_commands_do_not_create_mutation_state() {
     let mut tracker = TurnDiffTracker::new();
-    tracker.record_exec_command_end(&["git".into(), "status".into()], 0, false);
-    tracker.record_exec_command_end(&["git".into(), "log".into(), "-1".into()], 0, false);
+    // Git reads are certified only with configured helpers suppressed, the same
+    // forms approval admits (fsmonitor, external diff and textconv can write).
+    let status = [
+        "git",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+    ];
+    let log = [
+        "git",
+        "-c",
+        "core.fsmonitor=false",
+        "log",
+        "--no-ext-diff",
+        "--no-textconv",
+        "-1",
+    ];
+    tracker.record_exec_command_end(&status.map(str::to_owned), 0, false);
+    tracker.record_exec_command_end(&log.map(str::to_owned), 0, false);
     tracker.record_exec_command_end(
         &["cmd".into(), "/c".into(), "type".into(), "README.md".into()],
         0,
@@ -391,7 +566,7 @@ fn read_only_shell_commands_do_not_create_mutation_state() {
         &[
             "pwsh".into(),
             "-Command".into(),
-            "Get-ChildItem . | Select-Object -First 1; git status --short".into(),
+            "Get-ChildItem . | Select-Object -First 1; git --no-optional-locks -c core.fsmonitor=false status --short".into(),
         ],
         0,
         false,
@@ -487,7 +662,17 @@ fn shell_syntax_and_literal_arguments_have_distinct_mutation_effects() {
             "-Command",
             "Write-Output 'it''s > literal'; Get-Content file",
         ],
-        vec!["git", "-ccolor.ui=false", "show", "HEAD"],
+        // Presentation-only config stays read-only once helpers are suppressed.
+        vec![
+            "git",
+            "-ccolor.ui=false",
+            "-c",
+            "core.fsmonitor=false",
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+        ],
         vec!["git", "blame", "file"],
         vec!["git", "rev-list", "HEAD"],
     ] {
@@ -598,7 +783,7 @@ fn summary_and_turn_diff_share_command_mutation_classification() {
         ("Get-ChildItem | ForEach-Object { $_.Delete() }", false),
         ("Get-ChildItem | ForEach-Object -MemberName Delete", false),
         (
-            "git diff --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             true,
         ),
         (
@@ -715,13 +900,24 @@ fn git_output_options_do_not_certify_read_only_commands() {
         assert!(!command_is_read_only_git(&command), "{command:?}");
     }
     for subcommand in ["diff", "log", "show"] {
+        // The base suppresses configured helpers, as approval requires, so each
+        // flag below is what defeats the read-only classification.
+        let safe = [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            subcommand,
+            "--no-ext-diff",
+            "--no-textconv",
+        ]
+        .map(str::to_owned);
         for flags in [
             vec!["--output=changes.patch"],
             vec!["--output", "changes.patch"],
             vec!["--ext-diff"],
             vec!["--textconv"],
         ] {
-            let mut command = vec!["git".to_string(), subcommand.to_string()];
+            let mut command = safe.to_vec();
             command.extend(flags.into_iter().map(str::to_owned));
             assert_ne!(
                 command_mutation(&command, None),
@@ -736,7 +932,6 @@ fn git_output_options_do_not_certify_read_only_commands() {
                 "{wrapped:?}"
             );
         }
-        let safe = ["git".to_string(), subcommand.to_string()];
         assert_eq!(command_mutation(&safe, None), CommandMutation::ReadOnly);
         assert!(command_is_read_only_git(&safe));
     }
@@ -874,23 +1069,51 @@ fn mutation_boundary_mutating_validation_flags_and_package_scripts_fail_closed()
 
 #[test]
 fn mutation_boundary_git_global_options_preserve_read_write_semantics() {
+    let argv = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    // Every read suppresses configured helpers, as approval requires, so the
+    // global option under test is what decides each classification.
     // A different read-only repository is not evidence for the caller's cwd.
-    assert!(!command_is_read_only_git(&[
-        "git".into(),
-        "-C".into(),
-        ".".into(),
-        "log".into()
-    ]));
+    assert!(!command_is_read_only_git(&argv(&[
+        "git",
+        "-C",
+        ".",
+        "-c",
+        "core.fsmonitor=false",
+        "log",
+        "--no-ext-diff",
+        "--no-textconv",
+    ])));
     for command in [
-        vec!["git".into(), "-C".into(), ".".into(), "log".into()],
-        vec![
-            "git".into(),
-            "-c".into(),
-            "core.pager=cat".into(),
-            "log".into(),
-            "-1".into(),
-        ],
-        vec!["git".into(), "--no-pager".into(), "show".into()],
+        argv(&[
+            "git",
+            "-C",
+            ".",
+            "-c",
+            "core.fsmonitor=false",
+            "log",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]),
+        argv(&[
+            "git",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "core.fsmonitor=false",
+            "log",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-1",
+        ]),
+        argv(&[
+            "git",
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+        ]),
     ] {
         assert!(
             !command_may_mutate(&command),
@@ -903,11 +1126,34 @@ fn mutation_boundary_git_global_options_preserve_read_write_semantics() {
             "git",
             "-c",
             "core.pager=cat",
+            "-c",
+            "core.fsmonitor=false",
             "diff",
+            "--no-ext-diff",
+            "--no-textconv",
             "--output=changed.patch",
         ],
-        vec!["git", "-C", ".", "diff", "--output=changed.patch"],
-        vec!["git", "-c", "core.pager=touch changed", "log"],
+        vec![
+            "git",
+            "-C",
+            ".",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--output=changed.patch",
+        ],
+        vec![
+            "git",
+            "-c",
+            "core.pager=touch changed",
+            "-c",
+            "core.fsmonitor=false",
+            "log",
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
     ] {
         assert!(command_may_mutate(
             &command.into_iter().map(str::to_owned).collect::<Vec<_>>()
@@ -1743,4 +1989,110 @@ async fn declared_paths_and_rewritten_tracked_paths_stay_attributed() {
         tracker.unattributed_display_paths(),
         vec!["foreign.txt".to_string()]
     );
+}
+#[tokio::test]
+async fn expanding_display_scope_rerenders_already_tracked_edits() {
+    let root = tempdir().unwrap();
+    let delta = apply_verified_patch(
+        root.path(),
+        "*** Begin Patch\n*** Add File: shared.txt\n+content\n*** End Patch\n",
+    )
+    .await;
+    let mut tracker = TurnDiffTracker::with_environment_display_roots([(
+        "alpha".into(),
+        root.path().to_path_buf(),
+    )]);
+    tracker.track_delta("alpha", &delta);
+    assert!(
+        !tracker
+            .take_unified_diff_if_changed()
+            .unwrap()
+            .contains("alpha/")
+    );
+    let roots = [
+        ("alpha".into(), root.path().to_path_buf()),
+        ("beta".into(), root.path().to_path_buf()),
+    ];
+    tracker.set_environment_display_roots(roots.clone());
+    assert!(
+        tracker
+            .take_unified_diff_if_changed()
+            .unwrap()
+            .contains("alpha/shared.txt")
+    );
+    tracker.set_environment_display_roots(roots);
+    assert!(tracker.take_unified_diff_if_changed().is_none());
+}
+
+#[tokio::test]
+async fn remote_mode_is_unknown_even_when_a_host_namesake_exists() {
+    let root = tempdir().unwrap();
+    let delta = apply_verified_patch(
+        root.path(),
+        "*** Begin Patch\n*** Add File: shared.txt\n+content\n*** End Patch\n",
+    )
+    .await;
+    let selected = crate::session::turn_context::TurnEnvironment::new(
+        "remote".into(),
+        Arc::new(
+            codex_exec_server::Environment::create_for_tests(Some("ws://127.0.0.1:1".into()))
+                .unwrap(),
+        ),
+        PathUri::from_host_native_path(root.path()).unwrap(),
+        None,
+    );
+    let snapshot = crate::environment_selection::TurnEnvironmentSnapshot {
+        turn_environments: vec![selected.clone()],
+        ..Default::default()
+    };
+    let mut remote = TurnDiffTracker::new();
+    remote.observe_environment_scope(&snapshot, &selected);
+    remote.track_delta("remote", &delta);
+    assert!(
+        remote
+            .file_mode(&TrackedPath::new("remote", &root.path().join("shared.txt")))
+            .is_none()
+    );
+    assert!(
+        remote.exact_unified_diff().is_err(),
+        "unknown remote creation mode cannot be exact"
+    );
+    let mut local = tracker_with_root(root.path());
+    local.track_delta("", &delta);
+    assert!(
+        local.exact_unified_diff().is_ok(),
+        "local metadata remains supported"
+    );
+}
+
+#[tokio::test]
+async fn git_unchanged_observation_keeps_tracked_mismatches_as_source_changes() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &delta);
+    assert_eq!(tracker.current_validation_revision(), 1);
+    // Git saw nothing and every patched path still matches: evidence only.
+    fs::write(dir.path().join("build.log"), "ignored output").unwrap();
+    let mutation = tracker
+        .reconcile_command_mutation("", CommandMutation::Uncertain, Some(LOCAL_FS.as_ref()))
+        .await;
+    tracker.record_git_unchanged_command_end_at(&[], "", None, mutation);
+    assert_eq!(tracker.current_mutation_revision(), 2);
+    assert_eq!(tracker.current_validation_revision(), 1);
+    assert_eq!(tracker.validation_changes_since(1), Some(Vec::new()));
+    // A patched path can be invisible to Git, for example an ignored file. A
+    // mismatch there is still a source change.
+    fs::write(dir.path().join("a.txt"), "external edit\n").unwrap();
+    let mutation = tracker
+        .reconcile_command_mutation("", CommandMutation::Uncertain, Some(LOCAL_FS.as_ref()))
+        .await;
+    tracker.record_git_unchanged_command_end_at(&[], "", None, mutation);
+    assert_eq!(tracker.current_mutation_revision(), 3);
+    assert_eq!(tracker.current_validation_revision(), 2);
+    assert_eq!(tracker.validation_changes_since(1), None);
 }

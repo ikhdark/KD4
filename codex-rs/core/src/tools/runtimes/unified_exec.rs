@@ -360,6 +360,17 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
+        // Only a sandbox enforces requested restrictions, and the orchestrator selects
+        // `SandboxType::None` when this host has no sandbox backend. Refuse such a
+        // local launch like `build_exec_request` instead of running it without
+        // enforcement. Remote executors select and enforce their own sandbox, and
+        // launches whose policy requested no sandbox are unchanged.
+        if attempt.sandbox_requested
+            && attempt.sandbox == codex_sandboxing::SandboxType::None
+            && !req.turn_environment.environment.is_remote()
+        {
+            return Err(ToolError::Codex(crate::exec::unavailable_sandbox_error()));
+        }
         // Serialize validations with legacy shell validation, never with patches.
         // Reject busy admission before process creation instead of hiding an
         // unbounded wait before the caller can receive a resumable handle.
@@ -379,7 +390,10 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 ),
             )
             .await
-            .map_err(ToolError::Rejected)?;
+            .map_err(|reason| {
+                crate::validation_task::record_admission_refusal(ctx);
+                ToolError::Rejected(reason)
+            })?;
             self.pending_spawns.with_workspace_operation(permit)
         } else {
             self.pending_spawns.clone()
@@ -418,13 +432,16 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         #[cfg(test)]
         test_observation::record_process_launch();
         let base_command = &req.command;
-        let session_shell = ctx.session.user_shell();
-        let shell = req
+        let session_shell = ctx
+            .session
+            .shell_for_environment(&req.turn_environment)
+            .await
+            .map_err(|error| ToolError::Rejected(error.to_string()))?;
+        let shell = session_shell.as_ref();
+        let shell_snapshot_location = req
             .turn_environment
-            .shell
-            .as_ref()
-            .unwrap_or(session_shell.as_ref());
-        let shell_snapshot_location = req.turn_environment.shell_snapshot(&req.cwd).await;
+            .shell_snapshot_for_config(&req.cwd, &ctx.turn.config)
+            .await;
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
         let launch_sandbox_permissions = sandbox_permissions_preserving_denied_reads(
             req.sandbox_permissions,
@@ -492,7 +509,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
             attempt.sandbox,
         );
         let permissions = req.canonical_additional_permissions();
-        let command = build_unified_exec_sandbox_command(
+        let mut command = build_unified_exec_sandbox_command(
             &command,
             &req.cwd,
             &env,
@@ -510,6 +527,13 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
         let options = unified_exec_options(attempt.network_denial_cancellation_token.clone());
         drop(setup_phase);
         drop(setup_timing);
+        crate::validation_task::begin_dispatch(
+            ctx,
+            &mut command.env,
+            !req.turn_environment.environment.is_remote(),
+        )
+        .await
+        .map_err(ToolError::Rejected)?;
         self.manager
             .open_session_with_exec_env(
                 req.process_id,
@@ -525,6 +549,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExe
                 Box::new(NoopSpawnLifecycle),
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
+                Some(req.turn_environment.exec_backend()),
                 &pending_spawns,
             )
             .await
@@ -768,8 +793,22 @@ mod tests {
             false,
         );
         assert!(
-            !assessment.failed_checks.is_empty(),
-            "busy is an unresolved check, not a pass"
+            assessment.failed_checks.is_empty(),
+            "owner-confirmed nonexecution is pending, not a failed check"
+        );
+        assert!(
+            !assessment
+                .validation_uncertainty
+                .as_ref()
+                .unwrap()
+                .pending_checks
+                .is_empty()
+        );
+        assert!(
+            !assessment
+                .bounded_summary("busy-validation")
+                .unwrap()
+                .contains("failed")
         );
         assert!(
             assessment
@@ -808,6 +847,104 @@ mod tests {
             .await
             .is_ok()
         );
+    }
+
+    /// Like `build_exec_request`, a local launch under managed network whose policy requested a
+    /// sandbox this host cannot provide is refused before any setup. A held validation owner
+    /// stops every other launch at admission, so the controls show the refusal applies to no
+    /// other case without starting a process.
+    #[tokio::test]
+    async fn managed_network_launch_without_available_sandbox_is_refused_before_setup() {
+        let temp = tempdir().unwrap();
+        let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        let cwd = PathUri::from_abs_path(&root);
+        let holder = crate::workspace_operation_gate::ValidationOwner::for_command(
+            codex_protocol::ThreadId::new(),
+            &["cargo".to_string(), "test".to_string()],
+        );
+        let _owner = crate::workspace_operation_gate::acquire_workspace_validation(
+            &root,
+            "cargo test -p held-validation",
+            holder,
+        )
+        .await
+        .unwrap();
+        let manager = UnifiedExecProcessManager::default();
+        let mut runtime = UnifiedExecRuntime::new(&manager);
+        let mut request = test_request(
+            SandboxPermissions::UseDefault,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+        );
+        request.command = vec!["must-not-launch-sandbox-fixture".into()];
+        request.command_for_approval = vec!["cargo".into(), "test".into()];
+        request.cwd = cwd.clone();
+        request.sandbox_cwd = cwd.clone();
+        request.turn_environment = test_turn_environment(cwd.clone());
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.approval_policy
+            .set(codex_protocol::protocol::AskForApproval::Never)
+            .unwrap();
+        turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+        Arc::make_mut(&mut turn.config).cwd = root.clone();
+        turn.environments.turn_environments = vec![test_turn_environment(cwd.clone())];
+        let ctx = ToolCtx {
+            session: Arc::new(session),
+            turn: Arc::new(turn),
+            call_id: "managed-network-sandbox".into(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+        };
+        let permissions = codex_protocol::models::PermissionProfile::Disabled;
+        for (enforce_managed_network, sandbox_requested, refused) in [
+            (true, true, true),
+            // Restrictions still require enforcement without a managed proxy.
+            (false, true, true),
+            // A launch whose policy requested no sandbox (an explicit bypass) is unchanged.
+            (true, false, false),
+            (false, false, false),
+        ] {
+            let case = (enforce_managed_network, sandbox_requested);
+            let attempt = SandboxAttempt {
+                codex_home: &root,
+                sandbox: codex_sandboxing::SandboxType::None,
+                sandbox_requested,
+                permissions: &permissions,
+                exec_server_permissions: &permissions,
+                enforce_managed_network,
+                sandbox_cwd: &cwd,
+                workspace_roots: std::slice::from_ref(&root),
+                windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+                windows_sandbox_private_desktop: false,
+                network_denial_cancellation_token: None,
+                network_proxy: None,
+            };
+            let (result, observed) = test_observation::observe(tokio::time::timeout(
+                Duration::from_secs(1),
+                runtime.run(&request, &attempt, &ctx),
+            ))
+            .await;
+            let result = result.expect("no case may wait for the held validation owner");
+            if refused {
+                let Err(ToolError::Codex(CodexErr::Io(error))) = result else {
+                    panic!("{case:?}: expected the unavailable-sandbox refusal");
+                };
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{case:?}");
+                assert_eq!(
+                    error.to_string(),
+                    "requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed",
+                    "{case:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&result, Err(ToolError::Rejected(message))
+                        if message.contains("No process was started or queued")),
+                    "{case:?}: the launch must reach validation admission"
+                );
+            }
+            assert_eq!(observed.process_launches, 0, "{case:?}");
+        }
     }
 
     fn test_turn_environment(cwd: PathUri) -> TurnEnvironment {

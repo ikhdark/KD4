@@ -340,7 +340,7 @@ pub(crate) fn apply_legacy_session_acl_rules(
                 protect_workspace_agents_dir(current_dir, workspace_sid.sid.as_ptr())
                     .with_context(|| {
                         format!(
-                            "protect workspace AGENTS.md under {}",
+                            "protect workspace .agents directory under {}",
                             current_dir.display()
                         )
                     })?;

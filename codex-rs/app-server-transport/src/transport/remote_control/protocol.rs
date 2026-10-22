@@ -292,10 +292,12 @@ mod tests {
         let cases = [
             (
                 ServerEvent::ServerMessage {
-                    message: Box::new(OutgoingMessage::Response(crate::outgoing_message::OutgoingResponse {
-                        id: codex_app_server_protocol::RequestId::Integer(7),
-                        result: serde_json::json!({"ok": true}),
-                    })),
+                    message: Box::new(OutgoingMessage::Response(
+                        crate::outgoing_message::OutgoingResponse {
+                            id: codex_app_server_protocol::RequestId::Integer(7),
+                            result: serde_json::json!({"ok": true}),
+                        },
+                    )),
                 },
                 None,
                 serde_json::json!({"type": "server_message", "message": {"id": 7, "result": {"ok": true}}}),
@@ -312,14 +314,19 @@ mod tests {
                     "message_size_bytes": 4, "message_chunk_base64": "eHk="}),
             ),
             (
-                ServerEvent::Pong { status: PongStatus::Active },
+                ServerEvent::Pong {
+                    status: PongStatus::Active,
+                },
                 None,
                 serde_json::json!({"type": "pong", "status": "active"}),
             ),
         ];
         for (event, segment_id, expected) in cases {
             assert_eq!(event.segment_id(), segment_id);
-            assert_eq!(serde_json::to_value(event).expect("serialize event"), expected);
+            assert_eq!(
+                serde_json::to_value(event).expect("serialize event"),
+                expected
+            );
         }
     }
 

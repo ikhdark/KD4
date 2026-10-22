@@ -19,6 +19,7 @@ pub struct McpServerContributionContext<'a, C> {
     originator: Option<&'a str>,
     /// Environment IDs whose selected roots may contribute to this exact step.
     available_environment_ids: Option<&'a [String]>,
+    bound_roots: &'a [codex_exec_server::ResolvedSelectedCapabilityRoot],
 }
 
 impl<C> Clone for McpServerContributionContext<'_, C> {
@@ -38,6 +39,7 @@ impl<'a, C> McpServerContributionContext<'a, C> {
             thread_init: None,
             originator: None,
             available_environment_ids: None,
+            bound_roots: &[],
         }
     }
 
@@ -55,7 +57,20 @@ impl<'a, C> McpServerContributionContext<'a, C> {
             thread_init: Some(thread_init),
             originator: Some(originator),
             available_environment_ids: Some(available_environment_ids),
+            bound_roots: &[],
         }
+    }
+
+    pub fn with_bound_roots(
+        mut self,
+        roots: &'a [codex_exec_server::ResolvedSelectedCapabilityRoot],
+    ) -> Self {
+        self.bound_roots = roots;
+        self
+    }
+
+    pub fn bound_roots(&self) -> &'a [codex_exec_server::ResolvedSelectedCapabilityRoot] {
+        self.bound_roots
     }
 
     /// Returns the host configuration visible during resolution.

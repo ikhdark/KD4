@@ -113,7 +113,11 @@ impl FileSystemHandler {
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
         let bytes = self
             .file_system
-            .read_file(&params.path, params.sandbox.as_ref())
+            .read_file_capped(
+                &params.path,
+                MAX_FILE_PAYLOAD_BYTES,
+                params.sandbox.as_ref(),
+            )
             .await
             .map_err(map_fs_error)?;
         if bytes.len() > MAX_FILE_PAYLOAD_BYTES {
@@ -176,6 +180,24 @@ impl FileSystemHandler {
         Ok(FsWriteFileResponse {})
     }
 
+    pub(crate) async fn mutate_file_if_matches(
+        &self,
+        params: crate::protocol::FsMutateFileIfMatchesParams,
+    ) -> Result<crate::protocol::FsMutateFileIfMatchesResponse, JSONRPCErrorError> {
+        let (expected, replacement) = crate::fs_helper::decode_mutation_payloads(
+            params.expected_base64,
+            params.replacement_base64,
+        )?;
+        let outcome = self
+            .file_system
+            .mutate_file_if_matches(&params.path, expected, replacement, params.sandbox.as_ref())
+            .await
+            .map_err(map_fs_error)?;
+        Ok(crate::protocol::FsMutateFileIfMatchesResponse {
+            outcome: outcome.into(),
+        })
+    }
+
     pub(crate) async fn create_directory(
         &self,
         params: FsCreateDirectoryParams,
@@ -202,6 +224,14 @@ impl FileSystemHandler {
             .await
             .map_err(map_fs_error)?;
         Ok(FsGetMetadataResponse {
+            directory_case_sensitive: if params.include_directory_case_sensitivity == Some(true) {
+                self.file_system
+                    .directory_case_sensitive(&params.path, params.sandbox.as_ref())
+                    .await
+                    .map_err(map_fs_error)?
+            } else {
+                None
+            },
             is_directory: metadata.is_directory,
             is_file: metadata.is_file,
             is_symlink: metadata.is_symlink,
@@ -298,13 +328,23 @@ fn validate_file_read_handle_id(handle_id: &str) -> Result<(), JSONRPCErrorError
 }
 
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
-    match err.kind() {
+    let mut error = match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
         io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
             invalid_request(err.to_string())
         }
         _ => internal_error(err.to_string()),
+    };
+    let mut data = codex_exec_server_protocol::file_system_error_data(err.kind());
+    // `CopyFailure` holds only integers, booleans and strings, so it serializes;
+    // the error message already carries the same recovery text regardless.
+    if let Some(copy) = codex_file_system::CopyFailure::from_io_error(&err)
+        && let Ok(copy) = serde_json::to_value(copy)
+    {
+        data["copy"] = copy;
     }
+    error.data = Some(data);
+    error
 }
 
 #[cfg(test)]
@@ -318,6 +358,25 @@ mod tests {
     use crate::FileSystemSandboxContext;
     use crate::protocol::FsReadFileParams;
     use crate::protocol::FsWriteFileParams;
+
+    #[test]
+    fn filesystem_error_data_preserves_kind_and_legacy_codes() {
+        for (kind, code) in [
+            (io::ErrorKind::PermissionDenied, -32600),
+            (io::ErrorKind::InvalidInput, -32600),
+            (io::ErrorKind::NotFound, -32004),
+            (io::ErrorKind::AlreadyExists, -32603),
+            (io::ErrorKind::InvalidData, -32603),
+        ] {
+            let error = map_fs_error(io::Error::new(kind, "native failure"));
+            assert_eq!(error.code, code);
+            assert_eq!(
+                codex_exec_server_protocol::file_system_error_kind(error.data.as_ref()),
+                Some(kind)
+            );
+            assert_eq!(error.message, "native failure");
+        }
+    }
 
     async fn bounded_read(
         handler: &FileSystemHandler,

@@ -119,6 +119,49 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
     Ok(())
 }
 
+#[tokio::test]
+async fn refreshed_index_stays_available_while_another_worker_reconciles() -> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let runtime =
+        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+            .await?;
+    runtime
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
+    // A periodic refresh reopens reconciliation and another process claims it.
+    runtime
+        .request_backfill_refresh(/*minimum_age_seconds*/ 0)
+        .await?;
+    assert!(runtime.try_claim_backfill(/*lease_seconds*/ 60).await?);
+
+    // The same claim makes a never-certified index wait out its bound (above).
+    let initialized = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        try_init_with_roots_and_backfill_lease(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "test-provider".to_string(),
+            /*backfill_lease_seconds*/ 60,
+            /*wait_timeout*/ std::time::Duration::from_millis(200),
+            /*poll_interval*/ std::time::Duration::from_millis(10),
+        ),
+    )
+    .await
+    .expect("a certified index must not wait for its refresh")?;
+    assert_eq!(
+        initialized.get_backfill_state().await?.status,
+        codex_state::BackfillStatus::Running
+    );
+    assert!(
+        require_backfill_complete(initialized, home.path())
+            .await
+            .is_some(),
+        "optional readers keep a certified index during refresh"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn startup_backfill_timeout_covers_in_flight_work() {
     let home = TempDir::new().expect("temp dir");
@@ -161,6 +204,7 @@ async fn startup_gate_releases_its_claim_when_its_bound_stops_backfill() -> anyh
             /*backfill_lease_seconds*/ Some(60),
             /*wait_timeout*/ std::time::Duration::ZERO,
             /*poll_interval*/ std::time::Duration::from_millis(10),
+            &mut metadata::BackfillMemo::default(),
         ),
     )
     .await
@@ -185,11 +229,241 @@ async fn startup_gate_releases_its_claim_when_its_bound_stops_backfill() -> anyh
             /*backfill_lease_seconds*/ Some(60),
             STARTUP_BACKFILL_WAIT_TIMEOUT,
             /*poll_interval*/ std::time::Duration::from_millis(10),
+            &mut metadata::BackfillMemo::default(),
         ),
     )
     .await
     .expect("a released claim must not block the next startup")?;
     assert!(runtime.get_thread(thread_id).await?.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn periodic_refresh_reads_only_rollouts_changed_since_startup() -> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    write_rollout_with_user_message(home.path(), ThreadId::new(), "unchanged")?;
+    let changed = ThreadId::new();
+    let changed_path = write_rollout_with_user_message(home.path(), changed, "dropped")?;
+    // Keep only its session metadata, so a message appended later is observable.
+    let session_meta = std::fs::read_to_string(&changed_path)?
+        .lines()
+        .next()
+        .map(str::to_owned)
+        .expect("session metadata line");
+    std::fs::write(&changed_path, format!("{session_meta}\n"))?;
+    let runtime =
+        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+            .await?;
+    // Startup and the periodic refresh share one runtime's memo, as `try_init` wires them.
+    let mut memo = metadata::BackfillMemo::default();
+    wait_for_backfill_gate(
+        runtime.as_ref(),
+        home.path(),
+        "test-provider",
+        /*backfill_lease_seconds*/ Some(60),
+        STARTUP_BACKFILL_WAIT_TIMEOUT,
+        /*poll_interval*/ std::time::Duration::from_millis(10),
+        &mut memo,
+    )
+    .await?;
+    assert_eq!(
+        runtime.get_backfill_state().await?.status,
+        codex_state::BackfillStatus::Complete
+    );
+    assert_eq!(
+        runtime
+            .get_thread(changed)
+            .await?
+            .expect("indexed at startup")
+            .first_user_message,
+        None
+    );
+
+    // Coverage completed an interval ago is reopened, but no unchanged rollout
+    // is read again. Before, every refresh re-read every rollout.
+    age_complete_backfill(home.path()).await?;
+    let report = refresh_backfill_once(runtime.as_ref(), home.path(), "test-provider", &mut memo)
+        .await
+        .expect("refresh pass");
+    assert_eq!((report.extracted, report.unchanged), (0, 2));
+    assert_eq!(
+        runtime.get_backfill_state().await?.status,
+        codex_state::BackfillStatus::Complete
+    );
+
+    // A rollout appended after startup is still reconciled by the next refresh.
+    {
+        use std::io::Write;
+        let line = RolloutLine {
+            timestamp: "2026-06-01T14:30:00Z".to_string(),
+            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "after startup".to_string(),
+                ..Default::default()
+            })),
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&changed_path)?;
+        writeln!(file, "{}", serde_json::to_string(&line)?)?;
+    }
+    age_complete_backfill(home.path()).await?;
+    let report = refresh_backfill_once(runtime.as_ref(), home.path(), "test-provider", &mut memo)
+        .await
+        .expect("refresh pass");
+    assert_eq!((report.extracted, report.unchanged), (1, 1));
+    assert_eq!(
+        runtime
+            .get_thread(changed)
+            .await?
+            .expect("still indexed")
+            .first_user_message
+            .as_deref(),
+        Some("after startup")
+    );
+    assert_eq!(
+        runtime.get_backfill_state().await?.status,
+        codex_state::BackfillStatus::Complete
+    );
+    Ok(())
+}
+
+/// Ages complete coverage past the refresh interval instead of waiting it out.
+async fn age_complete_backfill(home: &Path) -> anyhow::Result<()> {
+    use sqlx::Connection;
+    let mut connection = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new().filename(codex_state::state_db_path(home)),
+    )
+    .await?;
+    let aged = sqlx::query("UPDATE backfill_state SET updated_at = updated_at - 61 WHERE id = 1")
+        .execute(&mut connection)
+        .await?;
+    anyhow::ensure!(aged.rows_affected() == 1, "backfill state row is missing");
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_serves_an_uncertified_index_when_only_confirmed_payload_gaps_remain()
+-> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let gap = ThreadId::new();
+    let parent = ThreadId::new();
+    write_payload_gap_rollout(home.path(), gap, parent)?;
+    let after_gap = ThreadId::new();
+    write_rollout_with_user_message(home.path(), after_gap, "after the gap")?;
+
+    // Coverage was never certified, so before, this startup and every later one
+    // indexed the rollouts and then fell back without the database.
+    let runtime = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        try_init_with_roots_and_backfill_lease(
+            home.path().to_path_buf(),
+            home.path().to_path_buf(),
+            "test-provider".to_string(),
+            /*backfill_lease_seconds*/ 60,
+            STARTUP_BACKFILL_WAIT_TIMEOUT,
+            /*poll_interval*/ std::time::Duration::from_millis(10),
+        ),
+    )
+    .await
+    .expect("a permanent payload gap must not hold startup to its bound")?;
+
+    // Serving certifies nothing: the gap keeps the checkpoint before it and its
+    // lineage unsettled, while the rows indexed so far are served.
+    let state = runtime.get_backfill_state().await?;
+    assert_eq!(state.status, codex_state::BackfillStatus::Pending);
+    assert_eq!(state.last_success_at, None);
+    assert_eq!(state.last_watermark, None);
+    let provisional = runtime
+        .get_thread(gap)
+        .await?
+        .expect("the gap keeps its provisional row");
+    assert_eq!(
+        provisional.first_user_message.as_deref(),
+        Some("inline preview")
+    );
+    assert!(runtime.list_thread_spawn_children(parent).await?.is_empty());
+    assert!(runtime.get_thread(after_gap).await?.is_some());
+    assert!(
+        require_backfill_complete(runtime, home.path())
+            .await
+            .is_none(),
+        "optional readers still require certified coverage"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_gate_stays_closed_while_a_retryable_failure_remains_beside_a_payload_gap()
+-> anyhow::Result<()> {
+    // A retryable read error: a record in a format this build cannot read yet.
+    // Only `InvalidData` settles a rollout as unreadable.
+    let unreadable = TempDir::new().expect("temp dir");
+    write_payload_gap_rollout(unreadable.path(), ThreadId::new(), ThreadId::new())?;
+    let newer = write_rollout_with_user_message(unreadable.path(), ThreadId::new(), "newer")?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&newer)?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"timestamp": "2026-06-01T14:26:27Z", "format_version": 999})
+        )?;
+    }
+
+    // A rejected reconciliation, as when a live writer updates the row during
+    // extraction. Here another id already indexes the rollout's path, so every
+    // snapshot is stale.
+    let rejected = TempDir::new().expect("temp dir");
+    write_payload_gap_rollout(rejected.path(), ThreadId::new(), ThreadId::new())?;
+    let contested = write_rollout_with_user_message(rejected.path(), ThreadId::new(), "contested")?;
+    let runtime =
+        codex_state::StateRuntime::init(rejected.path().to_path_buf(), "test-provider".to_string())
+            .await?;
+    let mut claimant =
+        metadata::extract_metadata_from_rollout(contested.as_path(), "test-provider")
+            .await?
+            .metadata;
+    claimant.id = ThreadId::new();
+    // Spell the path as discovery does, so the backfill finds this claim by path.
+    claimant.rollout_path = contested.components().collect();
+    runtime.upsert_thread(&claimant).await?;
+
+    for (home, case) in [
+        (unreadable.path(), "unsupported record"),
+        (rejected.path(), "stale snapshot"),
+    ] {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            try_init_with_roots_and_backfill_lease(
+                home.to_path_buf(),
+                home.to_path_buf(),
+                "test-provider".to_string(),
+                /*backfill_lease_seconds*/ 60,
+                STARTUP_BACKFILL_WAIT_TIMEOUT,
+                /*poll_interval*/ std::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .expect("startup must finish within its bound");
+        let err = match result {
+            Ok(_) => panic!("{case}: a retryable failure must keep the startup gate closed"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("remains incomplete"),
+            "{case}: unexpected error: {err}"
+        );
+        let reopened =
+            codex_state::StateRuntime::init(home.to_path_buf(), "test-provider".to_string())
+                .await?;
+        let state = reopened.get_backfill_state().await?;
+        assert_eq!(
+            (state.status, state.last_success_at),
+            (codex_state::BackfillStatus::Pending, None),
+            "{case}"
+        );
+    }
     Ok(())
 }
 
@@ -211,15 +485,17 @@ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result
     metadata.title = "math".to_string();
     runtime.upsert_thread(&metadata).await?;
 
-    assert!(reconcile_rollout(
-        Some(runtime.as_ref()),
-        rollout_path.as_path(),
-        "test-provider",
-        /*builder*/ None,
-        &[],
-        /*archived_only*/ Some(false),
-    )
-    .await);
+    assert!(
+        reconcile_rollout(
+            Some(runtime.as_ref()),
+            rollout_path.as_path(),
+            "test-provider",
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ Some(false),
+        )
+        .await
+    );
 
     let persisted = runtime
         .get_thread(thread_id)
@@ -379,5 +655,55 @@ fn write_rollout_with_user_message(
         .collect::<Result<Vec<_>, _>>()?
         .join("\n");
     std::fs::write(path.as_path(), format!("{jsonl}\n"))?;
+    Ok(path)
+}
+
+/// A rollout whose session metadata lives in a payload artifact that is missing,
+/// as after copying a home without `rollout-payloads`. Its inline user message
+/// keeps a provisional row indexable. It sorts before the rollouts
+/// `write_rollout_with_user_message` writes.
+fn write_payload_gap_rollout(
+    home: &Path,
+    thread_id: ThreadId,
+    parent_thread_id: ThreadId,
+) -> anyhow::Result<std::path::PathBuf> {
+    let dir = home.join("sessions/2026/05/31");
+    std::fs::create_dir_all(dir.as_path())?;
+    let path = dir.join(format!("rollout-2026-05-31T09-00-00-{thread_id}.jsonl"));
+    let session_meta = RolloutLine {
+        timestamp: "2026-05-31T09:00:00Z".to_string(),
+        item: RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: thread_id.into(),
+                id: thread_id,
+                parent_thread_id: Some(parent_thread_id),
+                timestamp: "2026-05-31T09:00:00Z".to_string(),
+                cwd: home.to_path_buf(),
+                // Large enough to be stored as a payload artifact.
+                originator: "payload-backed session metadata ".repeat(1024),
+                model_provider: Some("test-provider".to_string()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    };
+    let mut rollout =
+        crate::payload_artifact::store_line(&path, &serde_json::to_vec(&session_meta)?)?;
+    let reference: serde_json::Value = serde_json::from_slice(&rollout)?;
+    let digest = reference["payload"]["sha256"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("session metadata was not stored as a payload"))?;
+    let payload = crate::payload_artifact::root(&path).join(format!("{digest}.json"));
+    let user_message = RolloutLine {
+        timestamp: "2026-05-31T09:00:01Z".to_string(),
+        item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "inline preview".to_string(),
+            ..Default::default()
+        })),
+    };
+    rollout.extend(serde_json::to_vec(&user_message)?);
+    rollout.push(b'\n');
+    std::fs::write(path.as_path(), rollout)?;
+    std::fs::remove_file(payload)?;
     Ok(path)
 }

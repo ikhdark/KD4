@@ -486,6 +486,15 @@ pub async fn run_remote_environment(
     config: RemoteEnvironmentConfig,
     runtime_paths: ExecServerRuntimePaths,
 ) -> Result<(), ExecServerError> {
+    run_remote_environment_with_shutdown(config, runtime_paths, crate::ExecServerShutdown::new())
+        .await
+}
+
+pub async fn run_remote_environment_with_shutdown(
+    config: RemoteEnvironmentConfig,
+    runtime_paths: ExecServerRuntimePaths,
+    shutdown: crate::ExecServerShutdown,
+) -> Result<(), ExecServerError> {
     ensure_rustls_crypto_provider();
     let client = EnvironmentRegistryClient::new_with_telemetry(
         config.base_url.clone(),
@@ -493,86 +502,101 @@ pub async fn run_remote_environment(
         config.telemetry.clone(),
     )?;
     let processor =
-        ConnectionProcessor::new_with_telemetry(runtime_paths, config.telemetry.clone());
-    let identity = NoiseChannelIdentity::generate().map_err(|error| {
-        ExecServerError::Protocol(format!("failed to generate Noise relay identity: {error}"))
-    })?;
-    let mut backoff = Duration::from_secs(1);
-    let mut response = register_with_retry(
-        &client,
-        &config.environment_id,
-        &identity.public_key(),
-        &mut backoff,
-    )
-    .await?;
+        ConnectionProcessor::new_with_telemetry(runtime_paths, config.telemetry.clone())
+            .with_shutdown(shutdown.clone());
+    let result = async {
+        let identity = NoiseChannelIdentity::generate().map_err(|error| {
+            ExecServerError::Protocol(format!("failed to generate Noise relay identity: {error}"))
+        })?;
+        let mut backoff = Duration::from_secs(1);
+        let public_key = identity.public_key();
+        let registration =
+            register_with_retry(&client, &config.environment_id, &public_key, &mut backoff);
+        let mut response = tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            response = registration => response?,
+        };
 
-    loop {
-        match connect_rendezvous(&response.url, &config.telemetry).await {
-            Ok(websocket) => {
-                let connected_at = Instant::now();
-                let executor_registration_id = response.executor_registration_id.clone();
-                info!(
-                    noise_event = "rendezvous_connection",
-                    noise_outcome = "ok",
-                    "Noise executor connected to rendezvous"
-                );
-                let disconnect_reason = run_multiplexed_environment(
-                    websocket,
-                    processor.clone(),
-                    response.environment_id.clone(),
-                    executor_registration_id.clone(),
-                    identity.clone(),
-                    RegistryHarnessKeyValidator {
-                        client: client.clone(),
-                        environment_id: config.environment_id.clone(),
-                        executor_registration_id,
-                    },
-                )
-                .await;
-                if connected_at.elapsed() >= STABLE_RENDEZVOUS_SESSION {
-                    backoff = Duration::from_secs(1);
-                }
-                info!(
-                    noise_event = "rendezvous_connection",
-                    noise_outcome = "disconnected",
-                    noise_reason = disconnect_reason.as_str(),
-                    "Noise executor disconnected from rendezvous"
-                );
-                config
-                    .telemetry
-                    .remote_reconnect(disconnect_reason.as_str());
-            }
-            Err(error) => {
-                let registration_rejected = matches!(
-                    &error,
-                    tokio_tungstenite::tungstenite::Error::Http(response)
-                        if matches!(response.status().as_u16(), 401 | 403 | 404 | 410)
-                );
-                warn!(
-                    noise_event = "rendezvous_connection",
-                    noise_outcome = "error",
-                    noise_reason = "websocket_error",
-                    "Noise executor failed to connect to rendezvous"
-                );
-                debug!(error = %error, "Noise executor rendezvous connection error");
-                if registration_rejected {
-                    config.telemetry.remote_reconnect("registration_rejected");
-                    response = register_with_retry(
-                        &client,
-                        &config.environment_id,
-                        &identity.public_key(),
-                        &mut backoff,
+        loop {
+            let connection = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                connection = connect_rendezvous(&response.url, &config.telemetry) => connection,
+            };
+            match connection {
+                Ok(websocket) => {
+                    let connected_at = Instant::now();
+                    let executor_registration_id = response.executor_registration_id.clone();
+                    info!(
+                        noise_event = "rendezvous_connection",
+                        noise_outcome = "ok",
+                        "Noise executor connected to rendezvous"
+                    );
+                    let disconnect_reason = run_multiplexed_environment(
+                        websocket,
+                        processor.clone(),
+                        response.environment_id.clone(),
+                        executor_registration_id.clone(),
+                        identity.clone(),
+                        RegistryHarnessKeyValidator {
+                            client: client.clone(),
+                            environment_id: config.environment_id.clone(),
+                            executor_registration_id,
+                        },
                     )
-                    .await?;
-                } else {
-                    config.telemetry.remote_reconnect("connect_failed");
+                    .await;
+                    if connected_at.elapsed() >= STABLE_RENDEZVOUS_SESSION {
+                        backoff = Duration::from_secs(1);
+                    }
+                    info!(
+                        noise_event = "rendezvous_connection",
+                        noise_outcome = "disconnected",
+                        noise_reason = disconnect_reason.as_str(),
+                        "Noise executor disconnected from rendezvous"
+                    );
+                    config
+                        .telemetry
+                        .remote_reconnect(disconnect_reason.as_str());
+                }
+                Err(error) => {
+                    let registration_rejected = matches!(
+                        &error,
+                        tokio_tungstenite::tungstenite::Error::Http(response)
+                            if matches!(response.status().as_u16(), 401 | 403 | 404 | 410)
+                    );
+                    warn!(
+                        noise_event = "rendezvous_connection",
+                        noise_outcome = "error",
+                        noise_reason = "websocket_error",
+                        "Noise executor failed to connect to rendezvous"
+                    );
+                    debug!(error = %error, "Noise executor rendezvous connection error");
+                    if registration_rejected {
+                        config.telemetry.remote_reconnect("registration_rejected");
+                        response = tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(()),
+                            response = register_with_retry(
+                            &client,
+                            &config.environment_id,
+                            &public_key,
+                            &mut backoff,
+                            ) => response?,
+                        };
+                    } else {
+                        config.telemetry.remote_reconnect("connect_failed");
+                    }
                 }
             }
-        }
 
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
     }
+    .await;
+    processor.shutdown().await;
+    result
 }
 
 async fn register_with_retry(
@@ -1196,13 +1220,35 @@ mod tests {
         let server = MockServer::start().await;
         let client = EnvironmentRegistryClient::new(server.uri(), static_registry_auth_provider())
             .expect("client");
-        let public_key = NoiseChannelIdentity::generate().expect("identity").public_key();
+        let public_key = NoiseChannelIdentity::generate()
+            .expect("identity")
+            .public_key();
         for (registration, url, expected) in [
-            ("", "wss://rendezvous.test/ws", "environment registry returned an empty executor registration id"),
-            ("   ", "wss://rendezvous.test/ws", "environment registry returned an empty executor registration id"),
-            ("registration-1", "", "environment registry returned an invalid rendezvous URL"),
-            ("registration-1", "https://rendezvous.test/ws", "environment registry returned an invalid rendezvous URL"),
-            ("registration-1", "ws://", "environment registry returned an invalid rendezvous URL"),
+            (
+                "",
+                "wss://rendezvous.test/ws",
+                "environment registry returned an empty executor registration id",
+            ),
+            (
+                "   ",
+                "wss://rendezvous.test/ws",
+                "environment registry returned an empty executor registration id",
+            ),
+            (
+                "registration-1",
+                "",
+                "environment registry returned an invalid rendezvous URL",
+            ),
+            (
+                "registration-1",
+                "https://rendezvous.test/ws",
+                "environment registry returned an invalid rendezvous URL",
+            ),
+            (
+                "registration-1",
+                "ws://",
+                "environment registry returned an invalid rendezvous URL",
+            ),
         ] {
             Mock::given(method("POST"))
                 .and(path("/cloud/environment/environment-requested/register"))
@@ -1215,9 +1261,13 @@ mod tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let result = client.register_environment("environment-requested", &public_key).await;
-            assert!(matches!(result, Err(ExecServerError::Protocol(message)) if message == expected),
-                "registration={registration:?}, url={url:?}");
+            let result = client
+                .register_environment("environment-requested", &public_key)
+                .await;
+            assert!(
+                matches!(result, Err(ExecServerError::Protocol(message)) if message == expected),
+                "registration={registration:?}, url={url:?}"
+            );
             server.verify().await;
             server.reset().await;
         }

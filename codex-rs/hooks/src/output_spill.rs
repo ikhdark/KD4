@@ -94,7 +94,10 @@ impl HookOutputSpiller {
             return format!("{OMITTED_HOOK_INSTRUCTIONS} Recovery unavailable: {err}");
         }
 
-        format!("{OMITTED_HOOK_INSTRUCTIONS}\n\nFull hook output saved to: {}", path.display())
+        format!(
+            "{OMITTED_HOOK_INSTRUCTIONS}\n\nFull hook output saved to: {}",
+            path.display()
+        )
     }
 
     #[expect(

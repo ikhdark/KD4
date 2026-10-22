@@ -74,7 +74,7 @@ pub(crate) struct SessionServices {
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: ArcSwap<Hooks>,
     pub(crate) rollout_thread_trace: ThreadTraceContext,
-    pub(crate) user_shell: Arc<crate::shell::Shell>,
+    pub(crate) user_shell: crate::shell::LocalShell,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) exec_policy: Arc<ExecPolicyManager>,
     pub(crate) auth_manager: Arc<AuthManager>,
@@ -319,9 +319,11 @@ impl SessionServices {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             managers.clone()
         };
-        let latest = self.latest_mcp_runtime().manager_arc();
-        if !managers.iter().any(|manager| Arc::ptr_eq(manager, &latest)) {
-            managers.push(latest);
+        if let Some(runtime) = self.mcp_runtime.load_full() {
+            let latest = runtime.manager_arc();
+            if !managers.iter().any(|manager| Arc::ptr_eq(manager, &latest)) {
+                managers.push(latest);
+            }
         }
         futures::future::join_all(managers.iter().map(|manager| manager.shutdown())).await;
         self.mcp_shutdown_managers

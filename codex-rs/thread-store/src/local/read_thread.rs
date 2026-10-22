@@ -30,7 +30,8 @@ pub(super) async fn read_thread(
     params: ReadThreadParams,
 ) -> ThreadStoreResult<StoredThread> {
     let thread_id = params.thread_id;
-    if let Some(metadata) = visible_sqlite_metadata(store, thread_id, params.include_archived).await?
+    if let Some(metadata) =
+        visible_sqlite_metadata(store, thread_id, params.include_archived).await?
     {
         let rollout_path = metadata.rollout_path.clone();
         let mut thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
@@ -77,9 +78,9 @@ pub(super) async fn read_thread_rollout_path(
     include_archived: bool,
 ) -> ThreadStoreResult<Option<std::path::PathBuf>> {
     if let Some(metadata) = visible_sqlite_metadata(store, thread_id, include_archived).await? {
-        return Ok(Some(codex_rollout::plain_rollout_path(
-            metadata.rollout_path.as_path(),
-        )));
+        return stored_thread_from_sqlite_metadata_with_name(store, metadata, None)
+            .await
+            .map(|thread| thread.rollout_path);
     }
     read_thread_from_resolved_rollout(
         store,
@@ -168,23 +169,12 @@ pub(super) async fn read_thread_by_rollout_path(
             message: format!("thread {} is archived", thread.thread_id),
         });
     }
-    if let Some(metadata) = read_sqlite_metadata(store, thread.thread_id).await {
-        thread.recency_at = metadata.recency_at;
-        thread.project_id = metadata.project_id;
-        let existing_git_info = thread.git_info.take();
-        let (fallback_sha, fallback_branch, fallback_origin_url) = match existing_git_info {
-            Some(info) => (
-                info.commit_hash.map(|sha| sha.0),
-                info.branch,
-                info.repository_url,
-            ),
-            None => (None, None, None),
-        };
-        thread.git_info = git_info_from_parts(
-            metadata.git_sha.or(fallback_sha),
-            metadata.git_branch.or(fallback_branch),
-            metadata.git_origin_url.or(fallback_origin_url),
-        );
+    if let Some(mut metadata) = read_sqlite_metadata(store, thread.thread_id).await {
+        // The requested, verified physical location owns archive/path state;
+        // the current row owns explicit metadata (including Git null clears).
+        metadata.rollout_path = thread.rollout_path.clone().unwrap_or(metadata.rollout_path);
+        metadata.archived_at = thread.archived_at;
+        thread = stored_thread_from_sqlite_metadata(store, metadata).await?;
     }
     reject_paginated_history(&thread, include_history)?;
     attach_history_if_requested(&mut thread, include_history).await?;
@@ -286,15 +276,21 @@ async fn read_thread_from_rollout_path(
                 });
             }
             thread.forked_from_id = meta_line.meta.forked_from_id;
+            thread.session_id = Some(meta_line.meta.session_id);
             thread.parent_thread_id = meta_line.meta.parent_thread_id;
             thread.history_mode = meta_line.meta.history_mode;
         }
         // The rollout summary recovered the filename identity. Preserve the
         // readable suffix without inventing missing creation-only fields.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ThreadStoreError::Internal {
-            message: format!("failed to read session metadata {}: {error}", path.display()),
-        }),
+        Err(error) => {
+            return Err(ThreadStoreError::Internal {
+                message: format!(
+                    "failed to read session metadata {}: {error}",
+                    path.display()
+                ),
+            });
+        }
     }
     // The rollout summary already applies later persisted settings to the provider.
     // SessionMeta supplies creation-only fields, not the current provider.
@@ -312,9 +308,13 @@ pub(super) async fn resolve_sqlite_rollout_location(
     store: &LocalThreadStore,
     metadata: &mut ThreadMetadata,
 ) -> ThreadStoreResult<()> {
-    if codex_rollout::existing_rollout_path(&metadata.rollout_path)
+    let foreign = read_session_meta_line(&metadata.rollout_path)
         .await
-        .is_none()
+        .is_ok_and(|line| line.meta.id != metadata.id);
+    if (foreign
+        || codex_rollout::existing_rollout_path(&metadata.rollout_path)
+            .await
+            .is_none())
         && let Some(resolved) = resolve_rollout_path(store, metadata.id, true, true).await?
     {
         metadata.rollout_path = resolved.path;
@@ -352,19 +352,32 @@ pub(super) async fn stored_thread_from_sqlite_metadata(
 
 pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
     store: &LocalThreadStore,
-    metadata: ThreadMetadata,
+    mut metadata: ThreadMetadata,
     name: Option<String>,
 ) -> ThreadStoreResult<StoredThread> {
+    resolve_sqlite_rollout_location(store, &mut metadata).await?;
     // SQLite owns the persisted projection. Session metadata only supplements fields that are
     // not stored in the row, so an unavailable or malformed rollout must not discard the row.
-    let session_meta = read_session_meta_line(metadata.rollout_path.as_path())
+    let header = read_session_meta_line(metadata.rollout_path.as_path())
         .await
         .ok()
-        .map(|meta_line| meta_line.meta)
-        .filter(|meta| meta.id == metadata.id);
+        .map(|meta_line| meta_line.meta);
+    let foreign = header.as_ref().is_some_and(|meta| meta.id != metadata.id);
+    let session_meta = header.filter(|meta| meta.id == metadata.id);
     let rollout_path = codex_rollout::plain_rollout_path(metadata.rollout_path.as_path());
     let forked_from_id = session_meta.as_ref().and_then(|meta| meta.forked_from_id);
-    let parent_thread_id = session_meta.as_ref().and_then(|meta| meta.parent_thread_id);
+    let parent_thread_id = metadata
+        .current_parent_thread_id
+        .or_else(|| session_meta.as_ref().and_then(|meta| meta.parent_thread_id));
+    let mut source = parse_session_source(&metadata.source);
+    if let Some(current_parent) = metadata.current_parent_thread_id
+        && let SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+            parent_thread_id,
+            ..
+        }) = &mut source
+    {
+        *parent_thread_id = current_parent;
+    }
     let history_mode = session_meta
         .as_ref()
         .map(|meta| meta.history_mode)
@@ -379,8 +392,11 @@ pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
     Ok(StoredThread {
         project_id: metadata.project_id,
         thread_id: metadata.id,
+        session_id: metadata
+            .session_id
+            .or_else(|| session_meta.as_ref().map(|meta| meta.session_id)),
         extra_config: None,
-        rollout_path: Some(rollout_path),
+        rollout_path: (!foreign).then_some(rollout_path),
         forked_from_id,
         parent_thread_id,
         preview,
@@ -398,7 +414,7 @@ pub(super) async fn stored_thread_from_sqlite_metadata_with_name(
         archived_at: metadata.archived_at,
         cwd: metadata.cwd,
         cli_version: metadata.cli_version,
-        source: parse_session_source(&metadata.source),
+        source,
         history_mode,
         thread_source: metadata.thread_source,
         agent_nickname: metadata.agent_nickname,
@@ -453,6 +469,7 @@ async fn stored_thread_from_meta_line(
     StoredThread {
         project_id: None,
         thread_id: meta_line.meta.id,
+        session_id: Some(meta_line.meta.session_id),
         extra_config: None,
         rollout_path: Some(rollout_path),
         forked_from_id: meta_line.meta.forked_from_id,
@@ -590,16 +607,28 @@ mod tests {
         let (meta, rest) = original.split_once('\n').unwrap();
         std::fs::write(&path, format!("{meta}\nmalformed middle record\n{rest}")).unwrap();
         let before = std::fs::read(&path).unwrap();
-        let thread = store.read_thread(ReadThreadParams {
-            thread_id, include_archived: false, include_history: true,
-        }).await.unwrap();
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: true,
+            })
+            .await
+            .unwrap();
         let items = thread.history.unwrap().items;
         assert_eq!(items.len(), 3);
         let codex_protocol::protocol::RolloutItem::ResponseItem(
             codex_protocol::models::ResponseItem::Message { role, content, .. },
-        ) = items.last().unwrap() else { panic!("missing reconstruction gap"); };
+        ) = items.last().unwrap()
+        else {
+            panic!("missing reconstruction gap");
+        };
         assert_eq!(role, "developer");
-        assert!(serde_json::to_string(content).unwrap().contains("1 malformed rollout records"));
+        assert!(
+            serde_json::to_string(content)
+                .unwrap()
+                .contains("1 malformed rollout records")
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
@@ -614,20 +643,43 @@ mod tests {
         let missing = serde_json::json!({"type": "rollout_payload_artifact", "payload": {
             "sha256": "0".repeat(64), "bytes": 10000, "item_type": "session_meta"
         }});
-        std::fs::write(&path, format!("{missing}\n{}\n", original.lines().skip(1).collect::<Vec<_>>().join("\n"))).unwrap();
-        let thread = store.read_thread(ReadThreadParams {
-            thread_id: id, include_archived: false, include_history: true,
-        }).await.unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{missing}\n{}\n",
+                original.lines().skip(1).collect::<Vec<_>>().join("\n")
+            ),
+        )
+        .unwrap();
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id: id,
+                include_archived: false,
+                include_history: true,
+            })
+            .await
+            .unwrap();
         assert_eq!(thread.thread_id, id);
         assert_eq!(thread.preview, "Hello from user");
         let history = thread.history.unwrap();
         assert_eq!(history.items.len(), 2);
-        assert!(serde_json::to_string(history.items.last().unwrap()).unwrap().contains("rollout_reconstruction_gap"));
-        let thread = store.read_thread_by_rollout_path(path, false, true).await.unwrap();
+        assert!(
+            serde_json::to_string(history.items.last().unwrap())
+                .unwrap()
+                .contains("rollout_reconstruction_gap")
+        );
+        let thread = store
+            .read_thread_by_rollout_path(path, false, true)
+            .await
+            .unwrap();
         assert_eq!(thread.thread_id, id);
         let history = thread.history.unwrap();
         assert_eq!(history.items.len(), 2);
-        assert!(serde_json::to_string(history.items.last().unwrap()).unwrap().contains("rollout_reconstruction_gap"));
+        assert!(
+            serde_json::to_string(history.items.last().unwrap())
+                .unwrap()
+                .contains("rollout_reconstruction_gap")
+        );
     }
 
     #[tokio::test]
@@ -758,12 +810,9 @@ mod tests {
         assert_eq!(git_info.branch.as_deref(), Some("sqlite-branch"));
         assert_eq!(
             git_info.commit_hash.as_ref().map(|sha| sha.0.as_str()),
-            Some("abcdef")
+            None
         );
-        assert_eq!(
-            git_info.repository_url.as_deref(),
-            Some("https://example.com/repo.git")
-        );
+        assert_eq!(git_info.repository_url.as_deref(), None);
     }
 
     #[tokio::test]
@@ -926,6 +975,75 @@ mod tests {
             .expect("read thread");
 
         assert_eq!(thread.name, Some("Saved title".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stored_reads_keep_current_parent_and_shared_session_without_a_header() {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let id = ThreadId::new();
+        let session: codex_protocol::SessionId = ThreadId::new().into();
+        let original_parent = ThreadId::new();
+        let current_parent = ThreadId::new();
+        let path = write_session_file(
+            home.path(),
+            "2025-01-03T12-00-00",
+            Uuid::parse_str(&id.to_string()).unwrap(),
+        )
+        .unwrap();
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        let mut records = bytes
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        records[0]["payload"]["session_id"] = serde_json::json!(session);
+        records[0]["payload"]["parent_thread_id"] = serde_json::json!(original_parent);
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
+        let mut builder =
+            ThreadMetadataBuilder::new(id, path.clone(), Utc::now(), SessionSource::Cli);
+        builder.session_id = Some(session);
+        runtime
+            .upsert_thread(&builder.build(&config.default_model_provider_id))
+            .await
+            .unwrap();
+        runtime
+            .upsert_thread_spawn_edge(
+                current_parent,
+                id,
+                codex_state::DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .unwrap();
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        for remove_header in [false, true] {
+            if remove_header {
+                std::fs::write(&path, b"").unwrap();
+            }
+            let thread = store
+                .read_thread(ReadThreadParams {
+                    thread_id: id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
+                .unwrap();
+            assert_eq!(thread.parent_thread_id, Some(current_parent));
+            assert_eq!(thread.session_id, Some(session));
+        }
+        runtime.close().await;
     }
 
     #[tokio::test]
@@ -1322,11 +1440,13 @@ mod tests {
             .await
             .expect("metadata read");
         assert_eq!(summary.forked_from_id, None);
+        assert_eq!(summary.rollout_path, Some(rollout_path.clone()));
+        assert_eq!(summary.session_id, Some(thread_id.into()));
         assert_eq!(
             summary.history_mode,
             codex_protocol::protocol::ThreadHistoryMode::Legacy
         );
-        assert_eq!(summary.preview, "wrong sqlite preview");
+        assert_eq!(summary.preview, "Hello from user");
 
         let thread = store
             .read_thread(ReadThreadParams {
@@ -1339,8 +1459,8 @@ mod tests {
 
         assert_eq!(thread.thread_id, thread_id);
         assert_eq!(thread.rollout_path, Some(rollout_path));
-        assert_eq!(thread.preview, "Hello from user");
-        assert_eq!(thread.model_provider, config.default_model_provider_id);
+        assert_eq!(thread.preview, "wrong sqlite preview");
+        assert_eq!(thread.model_provider, "wrong-sqlite-provider");
         let history = thread.history.expect("history should load");
         assert_eq!(history.thread_id, thread_id);
         assert_eq!(history.items.len(), 2);

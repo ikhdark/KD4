@@ -31,7 +31,8 @@ def write_stream_atomic(
 ) -> None:
     """Publish a complete stream, optionally refusing any existing destination."""
     _write_atomic(
-        path, lambda temporary: shutil.copyfileobj(source, temporary),
+        path,
+        lambda temporary: shutil.copyfileobj(source, temporary),
         exclusive=exclusive,
     )
 

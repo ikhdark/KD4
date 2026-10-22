@@ -5,6 +5,7 @@ use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::clamp_yield_time_for_readiness;
 use codex_network_proxy::ManagedNetworkSandboxContext;
+use codex_network_proxy::PROXY_ENV_KEYS;
 use codex_protocol::config_types::EnvironmentVariablePattern;
 use codex_utils_output_truncation::DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS;
 use codex_utils_output_truncation::DEFAULT_FAILURE_OUTPUT_TOKENS;
@@ -281,7 +282,8 @@ async fn queued_exit_returns_observed_state_without_expired_lock_waits() {
 
 #[tokio::test(start_paused = true)]
 async fn nested_deadline_clips_recorded_yield_budget() {
-    use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+    use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+    use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
     let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
     let manager = &session.services.unified_exec_manager;
     let process = crate::unified_exec::process_tests::remote_process(
@@ -862,7 +864,8 @@ async fn explicitly_released_reservation_cannot_remove_a_reused_id() {
     let mut first = manager.reserve_process_id().await;
     manager.reserve_process_capacity(&mut first).await.unwrap();
     let id = first.process_id();
-    manager.release_process_id_reservation(&mut first).await;
+    first.transfer_to_store();
+    manager.release_process_id(id).await;
     assert!(
         manager
             .process_store
@@ -2186,6 +2189,106 @@ async fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
     assert_ne!(first.process_id, second.process_id);
 }
 
+/// A disabled managed proxy prepares no route and grants no sandbox loopback port. The executor
+/// rebuilds the environment from the policy and its own process environment before applying the
+/// overlay, which cannot remove variables, so the policy itself must keep inherited and configured
+/// proxy routes out: the executor's Windows sandbox firewall allows the loopback ports they name.
+#[tokio::test]
+async fn exec_server_params_without_managed_proxy_route_keep_executor_proxy_routes_out() {
+    let routed = exec_server_request_for_env_test();
+    let routed_policy = routed
+        .exec_server_env_config
+        .as_ref()
+        .unwrap()
+        .policy
+        .clone();
+    let routed_params =
+        exec_server_params_for_request(/*process_id*/ 123, &routed, /*tty*/ false)
+            .await
+            .unwrap();
+    // A published route reaches the executor through the overlay; the policy is forwarded as is.
+    assert_eq!(routed_params.env_policy, Some(routed_policy));
+
+    let is_proxy_key = |key: &str| {
+        PROXY_ENV_KEYS
+            .iter()
+            .any(|proxy_key| proxy_key.eq_ignore_ascii_case(key))
+    };
+    let mut request = exec_server_request_for_env_test();
+    request.env.retain(|key, _| !is_proxy_key(key.as_str()));
+    request.exec_server_managed_network = Some(ManagedNetworkSandboxContext::default());
+    let env_config = request.exec_server_env_config.as_mut().unwrap();
+    env_config.policy.inherit = ShellEnvironmentPolicyInherit::All;
+    env_config.policy.r#set = HashMap::from([
+        (
+            "https_proxy".to_string(),
+            "http://127.0.0.1:3128".to_string(),
+        ),
+        ("KEEP_SET".to_string(), "set-value".to_string()),
+    ]);
+
+    let params =
+        exec_server_params_for_request(/*process_id*/ 124, &request, /*tty*/ false)
+            .await
+            .unwrap();
+
+    // Mirrors the executor's `child_env` in exec-server/src/local_process.rs, on an executor whose
+    // own process environment carries proxy routing.
+    let env_policy = params.env_policy.as_ref().expect("executor env policy");
+    let executor_policy = ShellEnvironmentPolicy {
+        inherit: env_policy.inherit.clone(),
+        ignore_default_excludes: env_policy.ignore_default_excludes,
+        exclude: env_policy
+            .exclude
+            .iter()
+            .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
+            .collect(),
+        r#set: env_policy.r#set.clone(),
+        include_only: env_policy
+            .include_only
+            .iter()
+            .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
+            .collect(),
+        use_profile: false,
+    };
+    let mut executor_env = codex_protocol::shell_environment::create_env_from_vars(
+        [
+            (
+                "HTTP_PROXY".to_string(),
+                "http://127.0.0.1:8888".to_string(),
+            ),
+            (
+                "All_Proxy".to_string(),
+                "socks5h://127.0.0.1:1080".to_string(),
+            ),
+            (
+                "CODEX_NETWORK_ALLOW_LOCAL_BINDING".to_string(),
+                "1".to_string(),
+            ),
+            ("KEEP_INHERITED".to_string(), "inherited-value".to_string()),
+        ],
+        &executor_policy,
+        /*thread_id*/ None,
+    );
+    codex_protocol::shell_environment::apply_env_overlay(&mut executor_env, params.env.clone());
+
+    let mut proxy_routes = executor_env
+        .keys()
+        .filter(|key| is_proxy_key(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    proxy_routes.sort();
+    assert_eq!(proxy_routes, Vec::<String>::new());
+    assert_eq!(
+        executor_env.get("KEEP_INHERITED").map(String::as_str),
+        Some("inherited-value")
+    );
+    assert_eq!(
+        executor_env.get("KEEP_SET").map(String::as_str),
+        Some("set-value")
+    );
+}
+
 #[test]
 fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
     const CHILD: &str = "CODEX_REMOTE_CA_ENV_CHILD";
@@ -2249,7 +2352,8 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
                         "shell": {"name": "cmd", "path": "cmd.exe"},
                         "cwd": "file:///C:/workspace"
                     }}),
-                    "process/start" => {
+                    "process/startOwned" => {
+                        assert!(request["params"]["incarnation"].as_str().is_some_and(|id| !id.is_empty()));
                         started_processes.insert(request["params"]["processId"].as_str().unwrap().to_string());
                         captured_tx.send(request["params"].clone()).unwrap();
                         serde_json::json!({"id": request["id"], "error": {"code": -32000, "message": "peer captured launch"}})
@@ -2282,7 +2386,7 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
         started_rx.await.unwrap();
         let mut canceled_launch = Box::pin(manager.open_session_with_prepared_exec_env(
             900, &request, false, Box::new(crate::unified_exec::NoopSpawnLifecycle),
-            None, &environment, &pending_spawns,
+            None, &environment, None, &pending_spawns,
         ));
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut canceled_launch).await.is_err(),
             "native CA read/hash must wait for the worker while the caller timer advances");
@@ -2302,7 +2406,7 @@ fn remote_ca_environment_waits_for_worker_and_preserves_peer_hash_contract() {
             }
             let result = manager.open_session_with_prepared_exec_env(
                 process_id, &request, false, Box::new(crate::unified_exec::NoopSpawnLifecycle),
-                None, &environment, &pending_spawns,
+                None, &environment, None, &pending_spawns,
             ).await;
             let error = match result { Err(error) => error, Ok(_) => panic!("external peer declines after capturing exact request") };
             assert!(error.to_string().contains("peer captured launch"), "unexpected launch error: {error:?}");
@@ -2393,7 +2497,12 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
                     "operatingSystem": "windows", "shell": {"name": "powershell", "path": "powershell.exe"},
                     "cwd": "file:///C:/workspace"
                 }}),
-                "process/start" => {
+                "process/startOwned" => {
+                    assert!(
+                        request["params"]["incarnation"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                    );
                     requests_tx.send(request.clone()).unwrap();
                     serde_json::json!({"id": request["id"], "result": {"processId": request["params"]["processId"]}})
                 }
@@ -2622,8 +2731,8 @@ async fn assert_remote_startup_failure_closes_command(cancel_during_registration
     }
     let start = requests_rx
         .try_recv()
-        .expect("normal backend sent process/start");
-    assert_eq!(start["method"], "process/start");
+        .expect("normal backend sent process/startOwned");
+    assert_eq!(start["method"], "process/startOwned");
     assert_eq!(
         start["params"]["argv"],
         serde_json::json!([
@@ -2721,7 +2830,12 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
                     "operatingSystem": "windows", "shell": {"name": "powershell", "path": "powershell.exe"},
                     "cwd": "file:///C:/workspace"
                 }}),
-                "process/start" => {
+                "process/startOwned" => {
+                    assert!(
+                        request["params"]["incarnation"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                    );
                     let argv = request["params"]["argv"].as_array().unwrap();
                     let child = tokio::process::Command::new(argv[0].as_str().unwrap())
                         .args(argv[1..].iter().map(|arg| arg.as_str().unwrap()))
@@ -2878,7 +2992,7 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
     assert!(message.contains("pending cleanup refused"), "{message}");
     let start = requests_rx
         .try_recv()
-        .expect("normal backend sent process/start");
+        .expect("normal backend sent process/startOwned");
     let raw = unsafe {
         OpenProcess(
             PROCESS_SYNCHRONIZE,
@@ -2892,7 +3006,7 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
         unsafe { WaitForSingleObject(child.as_raw_handle(), 0) },
         WAIT_TIMEOUT
     );
-    assert_eq!(start["method"], "process/start");
+    assert_eq!(start["method"], "process/startOwned");
     assert_eq!(
         start["params"]["argv"],
         serde_json::json!([
@@ -2951,6 +3065,11 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
         "failed provisional cleanup must remain discoverable for shutdown"
     );
     assert_eq!(
+        manager.process_store.lock().await.occupied_slots(),
+        1,
+        "unconfirmed native custody must still consume process admission"
+    );
+    assert_eq!(
         unsafe { WaitForSingleObject(child.as_raw_handle(), 0) },
         WAIT_TIMEOUT,
         "a rejection must not be reported as native process exit"
@@ -2989,6 +3108,11 @@ async fn remote_startup_cleanup_failure_retains_native_child_until_session_shutd
             .await,
         Some(existing_identity),
         "cleanup must preserve unrelated bookkeeping under the same process id"
+    );
+    assert_eq!(
+        manager.process_store.lock().await.occupied_slots(),
+        0,
+        "confirmed cleanup must refund exactly one admission slot"
     );
     peer.abort();
     let _ = peer.await;
@@ -4015,7 +4139,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let proxy_url = format!("ws://{}", listener.local_addr().unwrap());
                     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
-                    // A transparent transport scheduling gate: real process/start
+                    // A transparent transport scheduling gate: real process/startOwned
                     // reaches the real server, and every cleanup message passes.
                     // Withhold only its successful reply before Backend.start returns.
                     let proxy = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
@@ -4030,7 +4154,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                                     let Some(Ok(frame)) = frame else { break; };
                                     if let tokio_tungstenite::tungstenite::Message::Text(text) = &frame {
                                         let value: serde_json::Value = serde_json::from_str(text).unwrap();
-                                        if value["method"] == "process/start" { start_id = Some(value["id"].clone()); }
+                                        if value["method"] == "process/startOwned" { start_id = Some(value["id"].clone()); }
                                     }
                                     if upstream.send(frame).await.is_err() { break; }
                                 }
@@ -4102,7 +4226,7 @@ fn remote_start_cancellation_terminates_native_child_before_start_response() {
                         }
                     };
                     tokio::select! {
-                        result = &mut pending => panic!("exec completed before withheld process/start response: {result:?}"),
+                        result = &mut pending => panic!("exec completed before withheld process/startOwned response: {result:?}"),
                         pid = observation => pid,
                     }
                 }).await.expect("registered live remote command")

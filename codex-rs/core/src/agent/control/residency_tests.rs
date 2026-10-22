@@ -128,6 +128,61 @@ async fn residency_slot_reservation_unloads_oldest_idle_v2_agent() {
 }
 
 #[tokio::test]
+async fn smaller_residency_limits_reject_existing_resident_replacement() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    let home = tempfile::tempdir().unwrap();
+    config.codex_home = home.path().to_path_buf().try_into().unwrap();
+    config.cwd = home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let root = manager.start_thread(config.clone()).await.unwrap();
+    let control = manager.agent_control();
+    let state = control.upgrade().unwrap();
+    let mut residents = Vec::new();
+    for name in ["a", "b"] {
+        let slot = control
+            .reserve_v2_residency_slot(&state, &config, None)
+            .await
+            .unwrap();
+        let child = spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, name).await;
+        slot.commit(child.thread_id);
+        mark_thread_completed(child.thread.as_ref()).await;
+        residents.push(child.thread_id);
+    }
+    let mut smaller = config.clone();
+    smaller.multi_agent_v2.max_concurrent_threads_per_session = 1;
+    assert!(matches!(
+        control
+            .reserve_v2_residency_slot(&state, &smaller, None)
+            .await,
+        Err(CodexErr::AgentLimitReached { max_threads: 0 })
+    ));
+    for id in &residents {
+        assert!(
+            manager.get_thread(*id).await.is_ok(),
+            "zero capacity must not cause an eviction"
+        );
+    }
+    smaller.multi_agent_v2.max_concurrent_threads_per_session = 2;
+    assert!(
+        matches!(
+            control
+                .reserve_v2_residency_slot(&state, &smaller, None)
+                .await,
+            Err(CodexErr::AgentLimitReached { max_threads: 1 })
+        ),
+        "one-for-one replacement cannot bypass a smaller supplied cap"
+    );
+}
+
+#[tokio::test]
 async fn residency_materialization_failure_preserves_running_agent_and_buffered_history() {
     let mut config = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
@@ -377,9 +432,23 @@ async fn registered_interrupted_v2_agent_reloads_after_residency_eviction() {
         .reserve_v2_residency_slot(&state, &config, /*protected_thread_id*/ None)
         .await
         .expect("first resident slot");
-    let first =
-        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "worker_1").await;
+    let child_dir = temp_home.path().join("isolated-child");
+    std::fs::create_dir_all(&child_dir).unwrap();
+    let mut child_config = config.clone();
+    child_config.cwd = child_dir.clone().try_into().unwrap();
+    child_config.developer_instructions = Some("child-specific instructions".into());
+    child_config.model_reasoning_effort = Some(codex_protocol::openai_models::ReasoningEffort::Low);
+    let first = spawn_v2_subagent(&control, &state, child_config, root.thread_id, "worker_1").await;
     first_slot.commit(first.thread_id);
+    // This synthetic interruption bypasses normal turn preparation, which
+    // records the complete sticky settings before publishing turn events.
+    first
+        .thread
+        .codex
+        .session
+        .persist_thread_settings_snapshot()
+        .await
+        .unwrap();
     mark_thread_interrupted(first.thread.as_ref()).await;
 
     let second_slot = control
@@ -414,6 +483,8 @@ async fn registered_interrupted_v2_agent_reloads_after_residency_eviction() {
             .is_some(),
         "eviction preserves reload identity"
     );
+    // The evicted runtime's storage lease lives as long as its last strong handle.
+    drop(first.thread);
     control
         .ensure_v2_agent_loaded(config.clone(), first.thread_id)
         .await
@@ -421,7 +492,31 @@ async fn registered_interrupted_v2_agent_reloads_after_residency_eviction() {
     assert!(manager.get_thread(first.thread_id).await.is_ok());
     // A completed child follows the same reload boundary, evicting the interrupted child.
     let reloaded = manager.get_thread(first.thread_id).await.unwrap();
+    let settings = reloaded.config_snapshot().await;
+    // The default test manager selects its local executor at the requested child
+    // cwd. The full settings receipt must preserve that selection and fallback.
+    assert_eq!(
+        settings.environments.environments,
+        vec![codex_protocol::protocol::TurnEnvironmentSelection {
+            environment_id: codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+            cwd: codex_utils_path_uri::PathUri::from_host_native_path(&child_dir).unwrap(),
+        },]
+    );
+    assert_eq!(
+        settings.environments.legacy_fallback_cwd.as_path(),
+        child_dir.as_path()
+    );
+    assert_eq!(
+        settings.developer_instructions.as_deref(),
+        Some("child-specific instructions")
+    );
+    assert_eq!(
+        settings.reasoning_effort,
+        Some(codex_protocol::openai_models::ReasoningEffort::Low)
+    );
     mark_thread_completed(reloaded.as_ref()).await;
+    drop(reloaded);
+    drop(second.thread);
     control
         .ensure_v2_agent_loaded(config, second.thread_id)
         .await
@@ -586,7 +681,7 @@ async fn spawn_v2_subagent(
     parent_thread_id: ThreadId,
     label: &str,
 ) -> crate::thread_manager::NewThread {
-    state
+    let parent_turn = state
         .get_thread(parent_thread_id)
         .await
         .expect("parent")
@@ -603,8 +698,16 @@ async fn spawn_v2_subagent(
             &mut reservation,
             &config,
             parent_thread_id,
-            1,
-            Some(AgentPath::root().join(label).expect("child path")),
+            crate::agent::next_thread_spawn_depth(&parent_turn.session_source),
+            Some(
+                control
+                    .state
+                    .agent_metadata_for_thread(parent_thread_id)
+                    .and_then(|metadata| metadata.agent_path)
+                    .unwrap_or_else(AgentPath::root)
+                    .join(label)
+                    .expect("child path"),
+            ),
             None,
             None,
         )
@@ -949,14 +1052,16 @@ async fn explicit_v2_resume_preserves_cold_identity_and_accounts_for_residency()
         .expect("direct resume reaches publication boundary");
     resume.abort();
     assert!(matches!(resume.await, Err(error) if error.is_cancelled()));
+    // As in spawn, the durable edge commits before the resumed runtime is announced,
+    // so an edge-write failure rolls back through pending cleanup.
     assert!(
-        !graph
+        graph
             .list_thread_spawn_children(
                 root.thread_id,
                 Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
             )
             .await
-            .expect("read open edges before publication")
+            .expect("read open edges at the publication boundary")
             .contains(&first.thread_id)
     );
     barrier.release_one();
@@ -1064,5 +1169,315 @@ async fn touching_an_eviction_has_a_foreground_deadline_without_releasing_occupa
             .unwrap()
             .residents
             .contains(&child.thread_id)
+    );
+}
+#[tokio::test]
+async fn ma007_cleanup_lineage_reaches_grandchild_through_an_evicted_parent() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    let home = tempfile::tempdir().unwrap();
+    config.codex_home = home.path().to_path_buf().try_into().unwrap();
+    config.cwd = home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let root = manager.start_thread(config.clone()).await.unwrap();
+    let control = manager.agent_control();
+    let state = control.upgrade().unwrap();
+    let parent_slot = control
+        .reserve_v2_residency_slot(&state, &config, None)
+        .await
+        .unwrap();
+    let parent =
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "parent").await;
+    parent_slot.commit(parent.thread_id);
+    let child_slot = control
+        .reserve_v2_residency_slot(&state, &config, None)
+        .await
+        .unwrap();
+    let child = spawn_v2_subagent(
+        &control,
+        &state,
+        config.clone(),
+        parent.thread_id,
+        "grandchild",
+    )
+    .await;
+    child_slot.commit(child.thread_id);
+    mark_thread_interrupted(parent.thread.as_ref()).await;
+    let replacement = control
+        .reserve_v2_residency_slot(&state, &config, None)
+        .await
+        .unwrap();
+    assert!(manager.get_thread(parent.thread_id).await.is_err());
+    assert!(manager.get_thread(child.thread_id).await.is_ok());
+    let descendants = control
+        .live_thread_spawn_descendants(root.thread_id)
+        .await
+        .unwrap();
+    assert!(
+        descendants.contains(&child.thread_id),
+        "cleanup must traverse retained ancestry, not only loaded parent edges"
+    );
+    drop(replacement);
+    control.state.release_spawned_thread(parent.thread_id);
+    assert!(
+        control
+            .state
+            .known_spawn_edges()
+            .contains(&(root.thread_id, parent.thread_id)),
+        "a live descendant still needs the released parent's ancestry"
+    );
+    child.thread.shutdown_and_wait().await.unwrap();
+    manager.remove_thread(&child.thread_id).await;
+    control.state.release_spawned_thread(child.thread_id);
+    assert!(
+        !control
+            .state
+            .known_spawn_edges()
+            .iter()
+            .any(|(_, id)| *id == parent.thread_id || *id == child.thread_id),
+        "closing the last descendant prunes retired ancestry"
+    );
+}
+
+#[tokio::test]
+async fn ma006_durable_binding_reattaches_a_missing_registry_identity_without_reloading() {
+    use codex_agent_task_store::*;
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let home = tempfile::tempdir().unwrap();
+    config.codex_home = home.path().to_path_buf().try_into().unwrap();
+    config.cwd = home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let root = manager.start_thread(config.clone()).await.unwrap();
+    let control = manager.agent_control();
+    let state = control.upgrade().unwrap();
+    let child =
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "restored").await;
+    // Rehydration consults durable session-tree provenance, not just a task binding.
+    child.thread.ensure_rollout_materialized().await;
+    child.thread.flush_rollout().await.unwrap();
+    let source = child.thread.config_snapshot().await.session_source;
+    control
+        .persist_thread_spawn_edge_for_source(child.thread.as_ref(), child.thread_id, Some(&source))
+        .await
+        .unwrap();
+    let coordinator = control.task_coordinator();
+    let root_id = control.session_id().to_string();
+    coordinator
+        .initialize_for_workspace_coordination(
+            None,
+            home.path().join("state"),
+            config.model_provider_id.clone(),
+            root_id.clone(),
+        )
+        .await
+        .unwrap();
+    let (assignment, attempt) = coordinator
+        .create_assignment(
+            home.path(),
+            AssignmentDraft {
+                root_session_id: root_id,
+                admission_origin: AssignmentAdmissionOrigin::Typed,
+                role: AgentRole::Worker,
+                capability_profile: CapabilityProfile::ScopedSourceWrite,
+                objective: "reattach".into(),
+                acceptance_criteria: vec![AcceptanceCriterion {
+                    evidence_policy: None,
+                    id: "done".into(),
+                    text: "done".into(),
+                }],
+                read_scope: Vec::new(),
+                write_scope: Vec::new(),
+                stop_condition: "stop".into(),
+                dependencies: Vec::new(),
+                risk_hints: Vec::new(),
+                required_evidence: Vec::new(),
+                prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: WorkspaceStrategy::Shared,
+                relation: None,
+                architecture_contract_ref: None,
+            },
+        )
+        .await
+        .unwrap();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: "/root/restored".into(),
+            task_name: "restored".into(),
+            thread_id: Some(child.thread_id.to_string()),
+        })
+        .await
+        .unwrap();
+    control.state.release_spawned_thread(child.thread_id);
+    assert!(
+        control
+            .state
+            .agent_metadata_for_thread(child.thread_id)
+            .is_none()
+    );
+    let resolved = control
+        .resolve_agent_reference(root.thread_id, &SessionSource::Cli, "/root/restored")
+        .await
+        .unwrap();
+    assert_eq!(resolved, child.thread_id);
+    assert!(
+        Arc::ptr_eq(&manager.get_thread(resolved).await.unwrap(), &child.thread),
+        "restoring addressability must borrow the existing runtime"
+    );
+}
+#[tokio::test]
+async fn unloaded_parent_keeps_bounded_queue_only_completion_without_waking() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    let home = tempfile::tempdir().unwrap();
+    config.codex_home = home.path().to_path_buf().try_into().unwrap();
+    config.cwd = home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let root = manager.start_thread(config.clone()).await.unwrap();
+    let control = manager.agent_control();
+    let state = control.upgrade().unwrap();
+    let slot = control
+        .reserve_v2_residency_slot(&state, &config, None)
+        .await
+        .unwrap();
+    let parent =
+        spawn_v2_subagent(&control, &state, config.clone(), root.thread_id, "parent").await;
+    slot.commit(parent.thread_id);
+    let slot = control
+        .reserve_v2_residency_slot(&state, &config, None)
+        .await
+        .unwrap();
+    let child =
+        spawn_v2_subagent(&control, &state, config.clone(), parent.thread_id, "child").await;
+    slot.commit(child.thread_id);
+    mark_thread_completed(&parent.thread).await;
+    // Deliver the child's completion below, after its parent is actually cold.
+    let original_queue = Arc::clone(&parent.thread.codex.session.input_queue);
+    let replacement = control
+        .reserve_v2_residency_slot(&state, &config, Some(child.thread_id))
+        .await
+        .unwrap();
+    drop(replacement);
+    assert!(manager.get_thread(parent.thread_id).await.is_err());
+    let mail = crate::session_prefix::inter_agent_completion_communication(
+        AgentPath::root(),
+        "/root/parent/child".parse().unwrap(),
+        child.thread_id,
+        &crate::agent::AgentStatus::Errored("validation failed".into()),
+        Some("attempt-1"),
+    )
+    .unwrap();
+    let context = crate::agent_communication::AgentCommunicationContext::new(
+        crate::agent_communication::AgentCommunicationKind::Result,
+        child.thread_id,
+    );
+    for _ in 0..2 {
+        control
+            .send_inter_agent_communication(parent.thread_id, mail.clone(), context.clone())
+            .await
+            .unwrap();
+    }
+    assert!(
+        manager.get_thread(parent.thread_id).await.is_err(),
+        "queue-only completion must not load a runtime"
+    );
+    drop(parent.thread);
+    control
+        .ensure_v2_agent_loaded(config, parent.thread_id)
+        .await
+        .unwrap();
+    let resumed = manager.get_thread(parent.thread_id).await.unwrap();
+    assert!(Arc::ptr_eq(
+        &original_queue,
+        &resumed.codex.session.input_queue
+    ));
+    assert!(resumed.codex.session.active_turn.lock().await.is_none());
+    let messages = resumed
+        .codex
+        .session
+        .input_queue
+        .take_pending_for_state(None, false)
+        .await;
+    assert_eq!(
+        messages.len(),
+        1,
+        "existing mailbox deduplication survives reload"
+    );
+    assert!(
+        matches!(&messages[0], crate::session::TurnInput::InterAgentCommunication(found) if found == &mail)
+    );
+    control.close_agent(parent.thread_id).await.unwrap();
+    assert!(
+        control
+            .send_inter_agent_communication(parent.thread_id, mail, context)
+            .await
+            .is_err()
+    );
+    assert!(control.retained_input_queue(parent.thread_id).is_none());
+}
+
+#[tokio::test]
+async fn eviction_pin_fences_admission_without_blocking_owned_shutdown() {
+    let mut config = test_config().await;
+    let _ = config.features.enable(Feature::MultiAgentV2);
+    let home = tempfile::tempdir().unwrap();
+    config.codex_home = home.path().to_path_buf().try_into().unwrap();
+    config.cwd = home.path().to_path_buf().try_into().unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let root = manager.start_thread(config.clone()).await.unwrap();
+    let control = manager.agent_control();
+    let state = control.upgrade().unwrap();
+    let child = spawn_v2_subagent(&control, &state, config, root.thread_id, "worker").await;
+    mark_thread_completed(&child.thread).await;
+    let pin = child.thread.try_pin_for_eviction().unwrap();
+    let message = codex_protocol::protocol::InterAgentCommunication::new(
+        AgentPath::root(),
+        "/root/worker".parse().unwrap(),
+        Vec::new(),
+        "follow-up".into(),
+        true,
+    );
+    let mut delivery = Box::pin(child.thread.submit_with_preacquired_execution_guard(
+        codex_protocol::protocol::Op::InterAgentCommunication {
+            communication: message,
+        },
+        None,
+    ));
+    assert!(futures::poll!(delivery.as_mut()).is_pending());
+    child.thread.request_shutdown().await.unwrap();
+    child.thread.wait_until_drained().await.unwrap();
+    drop(pin);
+    assert!(
+        delivery.await.is_err(),
+        "stale selection must not acknowledge input into a dead runtime"
     );
 }

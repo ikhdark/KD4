@@ -806,7 +806,11 @@ mod tests {
             compiled[0].actions.inject_request_headers[0].source,
             SecretSource::File(AbsolutePathBuf::try_from(secret_file.path()).unwrap())
         );
-        assert!(compiled[0].actions.inject_request_headers[0].value.is_sensitive());
+        assert!(
+            compiled[0].actions.inject_request_headers[0]
+                .value
+                .is_sensitive()
+        );
     }
 
     #[test]
@@ -882,7 +886,10 @@ mod tests {
             } else {
                 HookEvaluation::HookedHostNoMatch
             };
-            assert_eq!(evaluate_mitm_hooks(&hooks, "api.github.com", &req), expected);
+            assert_eq!(
+                evaluate_mitm_hooks(&hooks, "api.github.com", &req),
+                expected
+            );
         }
     }
 

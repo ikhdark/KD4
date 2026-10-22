@@ -44,6 +44,11 @@ impl SkillProvider for ExecutorSkillProvider {
         Box::pin(async move {
             let mut catalog = SkillCatalog::default();
             for selected_root in query.executor_roots {
+                let binding = query
+                    .bound_executor_roots
+                    .iter()
+                    .find(|bound| bound.selected_root() == &selected_root)
+                    .cloned();
                 let selected_root_id = selected_root.id;
                 let CapabilityRootLocation::Environment {
                     environment_id,
@@ -51,7 +56,16 @@ impl SkillProvider for ExecutorSkillProvider {
                 } = selected_root.location;
                 let authority =
                     SkillAuthority::new(SkillSourceKind::Executor, selected_root_id.clone());
-                let Some(environment) = self.environment_manager.get_environment(&environment_id)
+                let Some(environment) = binding
+                    .as_ref()
+                    .map(|root| Arc::clone(root.environment()))
+                    .or_else(|| {
+                        query
+                            .bound_executor_roots
+                            .is_empty()
+                            .then(|| self.environment_manager.get_environment(&environment_id))
+                            .flatten()
+                    })
                 else {
                     return Err(SkillProviderError::new(format!(
                         "Selected capability root `{selected_root_id}` references unavailable environment `{environment_id}`."
@@ -71,6 +85,7 @@ impl SkillProvider for ExecutorSkillProvider {
                         authority.clone(),
                         &selected_root_id,
                         &environment_id,
+                        binding.clone(),
                     )
                 }));
             }
@@ -97,7 +112,12 @@ impl SkillProvider for ExecutorSkillProvider {
                     "executor skill resource is not bound to an environment",
                 ));
             };
-            let Some(environment) = self.environment_manager.get_environment(environment_id) else {
+            let Some(environment) = request
+                .resource
+                .bound_root()
+                .map(|root| Arc::clone(root.environment()))
+                .or_else(|| self.environment_manager.get_environment(environment_id))
+            else {
                 return Err(SkillProviderError::new(format!(
                     "executor skill resource references unavailable environment `{environment_id}`"
                 )));
@@ -126,6 +146,7 @@ fn catalog_entry_from_skill(
     authority: SkillAuthority,
     selected_root_id: &str,
     environment_id: &str,
+    binding: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
 ) -> SkillCatalogEntry {
     let skill_path = skill.path_to_skills_md.inferred_native_path_string();
     let normalized_path = match skill.path_to_skills_md.infer_path_convention() {
@@ -145,7 +166,8 @@ fn catalog_entry_from_skill(
             display_path.clone(),
             environment_id,
             skill.path_to_skills_md.clone(),
-        ),
+        )
+        .with_bound_root(binding),
     )
     .with_short_description(skill.short_description.clone())
     .with_display_path(display_path)

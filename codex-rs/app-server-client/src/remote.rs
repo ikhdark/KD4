@@ -80,10 +80,14 @@ struct PendingRemoteEvents {
 }
 
 impl PendingRemoteEvents {
-    fn is_empty(&self) -> bool { self.events.is_empty() }
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
 
     #[cfg(test)]
-    fn len(&self) -> usize { self.events.len() }
+    fn len(&self) -> usize {
+        self.events.len()
+    }
 
     fn pop_front(&mut self) -> Option<AppServerEvent> {
         let (event, bytes) = self.events.pop_front()?;
@@ -100,7 +104,9 @@ impl PendingRemoteEvents {
                 self.0 = self.0.saturating_add(bytes.len());
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> IoResult<()> { Ok(()) }
+            fn flush(&mut self) -> IoResult<()> {
+                Ok(())
+            }
         }
         let mut count = Counter(0);
         match &event {
@@ -108,13 +114,19 @@ impl PendingRemoteEvents {
             AppServerEvent::ServerRequest(value) => serde_json::to_writer(&mut count, value),
             AppServerEvent::Disconnected { message } => serde_json::to_writer(&mut count, message),
             AppServerEvent::Lagged { skipped } => serde_json::to_writer(&mut count, skipped),
-        }.map_err(IoError::other)?;
-        let bytes = count.0.saturating_mul(8).saturating_add(std::mem::size_of::<AppServerEvent>());
+        }
+        .map_err(IoError::other)?;
+        let bytes = count
+            .0
+            .saturating_mul(8)
+            .saturating_add(std::mem::size_of::<AppServerEvent>());
         if self.events.len() >= MAX_PENDING_REMOTE_EVENTS
             || bytes > MAX_PENDING_REMOTE_EVENT_BYTES.saturating_sub(self.bytes)
         {
-            return Err(IoError::new(ErrorKind::OutOfMemory,
-                "remote app-server required event retention budget exceeded; connection retired"));
+            return Err(IoError::new(
+                ErrorKind::OutOfMemory,
+                "remote app-server required event retention budget exceeded; connection retired",
+            ));
         }
         self.bytes += bytes;
         self.events.push_back((event, bytes));
@@ -134,6 +146,11 @@ pub enum RemoteAppServerEndpoint {
     UnixSocket {
         socket_path: AbsolutePathBuf,
     },
+    /// Implicit local discovery must validate the advertised runtime home.
+    DiscoveredUnixSocket {
+        socket_path: AbsolutePathBuf,
+        expected_home: AbsolutePathBuf,
+    },
 }
 
 impl std::fmt::Debug for RemoteAppServerEndpoint {
@@ -151,6 +168,14 @@ impl std::fmt::Debug for RemoteAppServerEndpoint {
                 .debug_struct("UnixSocket")
                 .field("socket_path", socket_path)
                 .finish(),
+            Self::DiscoveredUnixSocket {
+                socket_path,
+                expected_home,
+            } => f
+                .debug_struct("DiscoveredUnixSocket")
+                .field("socket_path", socket_path)
+                .field("expected_home", expected_home)
+                .finish(),
         }
     }
 }
@@ -163,7 +188,7 @@ impl RemoteAppServerEndpoint {
             Self::WebSocket { websocket_url, .. } => {
                 Url::parse(websocket_url).is_ok_and(|url| websocket_url_supports_auth_token(&url))
             }
-            Self::UnixSocket { .. } => false,
+            Self::UnixSocket { .. } | Self::DiscoveredUnixSocket { .. } => false,
         }
     }
 }
@@ -261,13 +286,39 @@ impl RemoteAppServerClient {
             } => {
                 let (endpoint, stream) =
                     connect_websocket_endpoint(websocket_url, auth_token).await?;
-                Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
-                    .await
+                Self::connect_with_stream(
+                    channel_capacity,
+                    endpoint,
+                    stream,
+                    initialize_params,
+                    None,
+                )
+                .await
             }
             RemoteAppServerEndpoint::UnixSocket { socket_path } => {
                 let (endpoint, stream) = connect_unix_socket_endpoint(socket_path).await?;
-                Self::connect_with_stream(channel_capacity, endpoint, stream, initialize_params)
-                    .await
+                Self::connect_with_stream(
+                    channel_capacity,
+                    endpoint,
+                    stream,
+                    initialize_params,
+                    None,
+                )
+                .await
+            }
+            RemoteAppServerEndpoint::DiscoveredUnixSocket {
+                socket_path,
+                expected_home,
+            } => {
+                let (endpoint, stream) = connect_unix_socket_endpoint(socket_path).await?;
+                Self::connect_with_stream(
+                    channel_capacity,
+                    endpoint,
+                    stream,
+                    initialize_params,
+                    Some(expected_home),
+                )
+                .await
             }
         }
     }
@@ -289,6 +340,7 @@ impl RemoteAppServerClient {
         endpoint: String,
         stream: WebSocketStream<S>,
         initialize_params: InitializeParams,
+        expected_home: Option<AbsolutePathBuf>,
     ) -> IoResult<Self>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -300,6 +352,7 @@ impl RemoteAppServerClient {
             initialize_params,
             channel_capacity,
             INITIALIZE_TIMEOUT,
+            expected_home.as_ref(),
         )
         .await?;
 
@@ -766,8 +819,7 @@ impl RemoteAppServerClient {
             initialize_response: _initialize_response,
             worker_handle,
         } = self;
-        let mut worker_handle = worker_handle;
-        let _abort_worker = crate::AbortWorkerOnDrop(worker_handle.abort_handle());
+        let mut worker_handle = tokio_util::task::AbortOnDropHandle::new(worker_handle);
         drop(event_rx);
         let (response_tx, response_rx) = oneshot::channel();
         // Queue admission can block behind a stalled socket write, so it must
@@ -986,6 +1038,7 @@ async fn initialize_remote_connection<S>(
     params: InitializeParams,
     pending_event_capacity: usize,
     initialize_timeout: Duration,
+    expected_home: Option<&AbsolutePathBuf>,
 ) -> IoResult<(Vec<AppServerEvent>, AppServerInitializeResponse)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1105,6 +1158,24 @@ where
             }
         }?;
 
+        let initialize_response = initialize_response.ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "missing remote initialize response")
+        })?;
+        if let Some(expected) = expected_home {
+            let actual = initialize_response.codex_home()
+                .and_then(|home| AbsolutePathBuf::from_absolute_path(home).ok())
+                .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!(
+                    "local app-server identity unavailable at `{endpoint}`; expected home `{}`",
+                    expected.display()
+                )))?;
+            if !codex_utils_absolute_path::paths_match_after_normalization(expected, &actual) {
+                return Err(IoError::new(ErrorKind::InvalidData, format!(
+                    "local app-server home mismatch at `{endpoint}`: expected `{}`, actual `{}`",
+                    expected.display(), actual.display()
+                )));
+            }
+        }
+
         write_jsonrpc_message(
             stream,
             JSONRPCMessage::Notification(jsonrpc_notification_from_client_notification(
@@ -1114,9 +1185,6 @@ where
         )
         .await?;
 
-        let initialize_response = initialize_response.ok_or_else(|| {
-            IoError::new(ErrorKind::InvalidData, "missing remote initialize response")
-        })?;
         Ok((pending_events, initialize_response))
     })
     .await
@@ -1128,15 +1196,21 @@ where
     })?
 }
 
-fn app_server_event_from_notification(notification: JSONRPCNotification) -> IoResult<Option<AppServerEvent>> {
+fn app_server_event_from_notification(
+    notification: JSONRPCNotification,
+) -> IoResult<Option<AppServerEvent>> {
     if !ServerNotification::is_known_method(&notification.method) {
         return Ok(None);
     }
     let method = notification.method.clone();
     ServerNotification::try_from(notification)
         .map(|notification| Some(AppServerEvent::ServerNotification(notification)))
-        .map_err(|_| IoError::new(ErrorKind::InvalidData,
-            format!("invalid payload for known app-server notification `{method}`")))
+        .map_err(|_| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                format!("invalid payload for known app-server notification `{method}`"),
+            )
+        })
 }
 
 fn remote_event_requires_delivery(event: &AppServerEvent) -> bool {
@@ -1252,17 +1326,26 @@ async fn deliver_event(
         })?;
     }
     if *skipped_events > 0 {
-        event_tx.send(AppServerEvent::Lagged { skipped: *skipped_events }).await
+        event_tx
+            .send(AppServerEvent::Lagged {
+                skipped: *skipped_events,
+            })
+            .await
             .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
         *skipped_events = 0;
     }
-    event_tx.send(event).await
+    event_tx
+        .send(event)
+        .await
         .map_err(|_| IoError::new(ErrorKind::BrokenPipe, "event consumer closed"))?;
     Ok(())
 }
 
 fn jsonrpc_request_from_client_request(request: ClientRequest) -> IoResult<JSONRPCRequest> {
-    JSONRPCRequest::try_from(request).map_err(|err| IoError::new(ErrorKind::InvalidInput, err))
+    let mut request = JSONRPCRequest::try_from(request)
+        .map_err(|err| IoError::new(ErrorKind::InvalidInput, err))?;
+    request.trace = codex_otel::current_span_w3c_trace_context();
+    Ok(request)
 }
 
 fn jsonrpc_notification_from_client_notification(
@@ -1310,11 +1393,21 @@ mod tests {
     #[test]
     fn notification_decoder_distinguishes_unknown_from_invalid_known_methods() {
         let notification = |method: &str| JSONRPCNotification {
-            method: method.into(), params: Some(serde_json::json!({})),
+            method: method.into(),
+            params: Some(serde_json::json!({})),
         };
-        assert!(app_server_event_from_notification(notification("future/extension")).unwrap().is_none());
+        assert!(
+            app_server_event_from_notification(notification("future/extension"))
+                .unwrap()
+                .is_none()
+        );
         for method in ["turn/completed", "item/agentMessage/delta", "thread/closed"] {
-            assert_eq!(app_server_event_from_notification(notification(method)).unwrap_err().kind(), ErrorKind::InvalidData);
+            assert_eq!(
+                app_server_event_from_notification(notification(method))
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidData
+            );
         }
     }
 
@@ -1324,16 +1417,41 @@ mod tests {
         let mut pending = PendingRemoteEvents::default();
         let mut skipped = 0;
         for _ in 0..=MAX_PENDING_REMOTE_EVENTS {
-            forward_remote_event(&sender, &mut pending, &mut skipped,
-                AppServerEvent::Disconnected { message: "small".into() }).unwrap();
+            forward_remote_event(
+                &sender,
+                &mut pending,
+                &mut skipped,
+                AppServerEvent::Disconnected {
+                    message: "small".into(),
+                },
+            )
+            .unwrap();
         }
         assert_eq!(pending.len(), MAX_PENDING_REMOTE_EVENTS);
-        assert!(forward_remote_event(&sender, &mut pending, &mut skipped,
-            AppServerEvent::Disconnected { message: "overflow".into() }).is_err());
+        assert!(
+            forward_remote_event(
+                &sender,
+                &mut pending,
+                &mut skipped,
+                AppServerEvent::Disconnected {
+                    message: "overflow".into()
+                }
+            )
+            .is_err()
+        );
         while pending.pop_front().is_some() {}
         assert_eq!(pending.bytes, 0);
-        assert!(forward_remote_event(&sender, &mut pending, &mut skipped,
-            AppServerEvent::Disconnected { message: "x".repeat(MAX_PENDING_REMOTE_EVENT_BYTES / 8) }).is_err());
+        assert!(
+            forward_remote_event(
+                &sender,
+                &mut pending,
+                &mut skipped,
+                AppServerEvent::Disconnected {
+                    message: "x".repeat(MAX_PENDING_REMOTE_EVENT_BYTES / 8)
+                }
+            )
+            .is_err()
+        );
         assert!(pending.is_empty());
     }
 
@@ -1603,6 +1721,7 @@ mod tests {
                 "blocked-peer".to_owned(),
                 stream,
                 crate::initialize_params("test", "1", false, false, &[]),
+                None,
             ),
         )
         .await
@@ -1656,20 +1775,18 @@ mod tests {
             // Keep the peer open without consuming the final initialized frame.
             peer
         };
-        let (result, mut peer) = timeout(
-            INITIALIZE_TIMEOUT + Duration::from_secs(2),
-            async {
-                tokio::join!(
-                    RemoteAppServerClient::connect_with_stream(
-                        1,
-                        "blocked-peer".to_owned(),
-                        stream,
-                        crate::initialize_params("test", "1", false, false, &[]),
-                    ),
-                    respond_to_initialize,
-                )
-            },
-        )
+        let (result, mut peer) = timeout(INITIALIZE_TIMEOUT + Duration::from_secs(2), async {
+            tokio::join!(
+                RemoteAppServerClient::connect_with_stream(
+                    1,
+                    "blocked-peer".to_owned(),
+                    stream,
+                    crate::initialize_params("test", "1", false, false, &[]),
+                    None,
+                ),
+                respond_to_initialize,
+            )
+        })
         .await
         .expect("the connection deadline must include writing initialized");
         let error = result
@@ -1740,6 +1857,7 @@ mod tests {
                 "blocked-peer".to_owned(),
                 stream,
                 crate::initialize_params("test", "1", false, false, &[]),
+                None,
             ),
             peer_initialize,
         );
@@ -1885,6 +2003,92 @@ mod tests {
                 "cancelled shutdown must not detach its worker"
             );
             assert!(worker.is_finished());
+        }
+    }
+}
+#[cfg(test)]
+mod discovery_identity_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    #[tokio::test]
+    async fn discovered_home_is_checked_before_initialized_but_explicit_connections_remain_permissive()
+     {
+        let expected = AbsolutePathBuf::relative_to_current_dir("home é").unwrap();
+        let other = AbsolutePathBuf::relative_to_current_dir("other home").unwrap();
+        for (advertised, implicit, accepts) in [
+            (Some(expected.to_string_lossy().to_string()), true, true),
+            (
+                Some(
+                    expected
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                        .to_ascii_uppercase(),
+                ),
+                true,
+                true,
+            ),
+            (Some(other.to_string_lossy().to_string()), true, false),
+            (None, true, false),
+            (Some("relative".to_string()), true, false),
+            (Some("/another/platform/home".to_string()), false, true),
+        ] {
+            let (client, peer) = tokio::io::duplex(4096);
+            let stream = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+            let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
+            let server = async {
+                let frame = peer.next().await.unwrap().unwrap().into_text().unwrap();
+                let JSONRPCMessage::Request(request) = serde_json::from_str(&frame).unwrap() else {
+                    panic!("initialize request")
+                };
+                assert_eq!(request.method, "initialize");
+                let mut result = serde_json::json!({"userAgent": "test/1"});
+                if let Some(home) = advertised {
+                    result["codexHome"] = home.into();
+                }
+                peer.send(Message::Text(
+                    serde_json::to_string(&JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result,
+                    }))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+                if accepts {
+                    let frame = peer.next().await.unwrap().unwrap().into_text().unwrap();
+                    let JSONRPCMessage::Notification(notification) =
+                        serde_json::from_str(&frame).unwrap()
+                    else {
+                        panic!("initialized notification")
+                    };
+                    assert_eq!(notification.method, "initialized");
+                } else {
+                    assert!(
+                        matches!(peer.next().await, None | Some(Err(_))),
+                        "identity failure must close without initialized or business RPC"
+                    );
+                }
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(
+                    RemoteAppServerClient::connect_with_stream(
+                        1,
+                        "identity-fixture".into(),
+                        stream,
+                        crate::initialize_params("test", "1", false, false, &[]),
+                        implicit.then(|| expected.clone())
+                    ),
+                    server
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), accepts);
+            if let Err(err) = result {
+                assert_eq!(err.kind(), ErrorKind::InvalidData);
+            }
         }
     }
 }

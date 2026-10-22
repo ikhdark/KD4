@@ -475,7 +475,6 @@ url = "{mcp_server_url}/mcp"
     assert_eq!(response.content[0].get("type"), Some(&json!("text")));
     assert_eq!(response.content[0].get("text"), Some(&json!("accepted")));
 
-
     mcp_server_handle.abort();
     let _ = mcp_server_handle.await;
 
@@ -636,7 +635,6 @@ url = "{mcp_server_url}/mcp"
     let _ = mcp_server_handle.await;
     Ok(())
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_tool_call_completion_notification_contains_truncated_large_result() -> Result<()> {

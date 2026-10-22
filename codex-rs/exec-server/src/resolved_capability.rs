@@ -191,3 +191,19 @@ impl fmt::Debug for ResolvedSelectedCapabilityRoot {
             .finish_non_exhaustive()
     }
 }
+
+impl PartialEq for ResolvedSelectedCapabilityRoot {
+    fn eq(&self, other: &Self) -> bool {
+        self.selected_root == other.selected_root
+            && Arc::ptr_eq(&self.environment, &other.environment)
+    }
+}
+
+impl Eq for ResolvedSelectedCapabilityRoot {}
+
+impl std::hash::Hash for ResolvedSelectedCapabilityRoot {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.selected_root.id, state);
+        std::hash::Hash::hash(&(Arc::as_ptr(&self.environment) as usize), state);
+    }
+}

@@ -27,7 +27,7 @@ fn create_apply_patch_freeform_tool_matches_expected_spec() {
         "one or many files",
         "only once per patch",
         "top to bottom",
-        "exact indentation",
+        "exact current bytes on removed lines, including indentation",
         "appends at EOF",
         "replaces an existing file",
         "incremental",

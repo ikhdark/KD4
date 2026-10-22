@@ -37,6 +37,7 @@ use codex_exec_server::WriteStatus;
 use codex_protocol::protocol::ExecOutputStream;
 use codex_sandboxing::SandboxType;
 use codex_tools::ToolExecutor;
+use codex_tools::ToolOutput as _;
 use codex_tools::ToolOutputOutcome;
 use codex_utils_pty::SpawnedProcess;
 use codex_utils_pty::spawn_pipe_process_no_stdin;
@@ -53,6 +54,107 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+struct ExitDuringWrite {
+    inner: MockExecProcess,
+    owner: std::sync::Mutex<std::sync::Weak<UnifiedExecProcess>>,
+}
+
+impl ExecProcess for ExitDuringWrite {
+    fn process_id(&self) -> &ProcessId {
+        &self.inner.process_id
+    }
+    fn subscribe_wake(&self) -> watch::Receiver<u64> {
+        self.inner.wake_tx.subscribe()
+    }
+    fn subscribe_events(&self) -> ExecProcessEventReceiver {
+        ExecProcessEventReceiver::empty()
+    }
+    fn read(
+        &self,
+        _seq: Option<u64>,
+        _bytes: Option<usize>,
+        _wait: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        Box::pin(self.inner.read())
+    }
+    fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+        Box::pin(async move {
+            let owner = self.owner.lock().unwrap().upgrade().unwrap();
+            // Release the rejected write only after independently publishing
+            // the root's clean exit and the empty reader's terminal receipt.
+            let handles = owner.output_handles();
+            handles.output_closed.store(true, Ordering::Release);
+            handles.output_closed_notify.notify_waiters();
+            owner.signal_exit_for_test(Some(0));
+            Ok(WriteResponse {
+                status: WriteStatus::StdinClosed,
+            })
+        })
+    }
+    fn signal(&self, _signal: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn terminate(&self) -> ExecProcessFuture<'_, ()> {
+        Box::pin(self.inner.terminate())
+    }
+}
+
+#[tokio::test]
+async fn rejected_stdin_survives_concurrent_clean_exit_through_manager() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let (wake_tx, _) = watch::channel(0);
+    let backend = Arc::new(ExitDuringWrite {
+        inner: MockExecProcess {
+            process_id: "exit-during-write".to_string().into(),
+            write_response: WriteResponse {
+                status: WriteStatus::StdinClosed,
+            },
+            read_responses: Mutex::new(VecDeque::new()),
+            terminate_error: None,
+            termination_control: None,
+            wake_tx,
+        },
+        owner: std::sync::Mutex::new(std::sync::Weak::new()),
+    });
+    let process = UnifiedExecProcess::from_exec_server_started(
+        StartedExecProcess {
+            process: backend.clone(),
+        },
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .unwrap();
+    *backend.owner.lock().unwrap() = Arc::downgrade(&process);
+    let manager = &session.services.unified_exec_manager;
+    store_process_for_test(manager, &session, &turn, 9876, process).await;
+    let result = manager
+        .write_stdin(super::WriteStdinRequest {
+            process_id: 9876,
+            input: "save\n",
+            yield_time_ms: 2500,
+            max_output_tokens: None,
+            truncation_policy: codex_utils_output_truncation::TruncationPolicy::Bytes(1000),
+            nested_deadline: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.process_exited);
+    assert!(result.error.as_deref().unwrap().contains("not delivered"));
+    assert_eq!(result.outcome_for_logging(), ToolOutputOutcome::Failure);
+    assert!(
+        result.code_mode_result(&ToolPayload::Function {
+            arguments: "{}".into()
+        })["error"]
+            .as_str()
+            .unwrap()
+            .contains("not delivered")
+    );
+    manager.terminate_all_processes().await;
+}
 
 pub(super) struct TerminationControl {
     pub(super) started: Notify,
@@ -1221,6 +1323,90 @@ async fn unsent_tty_interrupt_still_terminates_the_process() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn local_unsent_input_deadline_preserves_the_session_and_retry_order() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(1);
+    writer_tx.send(b"occupied".to_vec()).await.unwrap();
+    let (_stdout_tx, stdout_rx) = tokio::sync::mpsc::channel(1);
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let terminated = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&terminated);
+    let spawned = codex_utils_pty::spawn_from_driver(codex_utils_pty::ProcessDriver {
+        writer_tx,
+        stdout_rx: stdout_rx.into(),
+        stderr_rx: None,
+        exit_rx,
+        terminator: Some(Box::new(move || {
+            flag.store(true, Ordering::Release);
+            Ok(())
+        })),
+        writer_handle: None,
+        resizer: None,
+    });
+    // from_spawned exercises the direct Local variant, not the ExecServer mock.
+    let process = UnifiedExecProcess::from_spawned(
+        spawned,
+        SandboxType::None,
+        Box::new(NoopSpawnLifecycle),
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .unwrap();
+    let id = 42_440;
+    let manager = &session.services.unified_exec_manager;
+    store_process_for_test(manager, &session, &turn, id, Arc::clone(&process)).await;
+    let invocation = write_stdin_invocation_with_chars(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "local-full",
+        id,
+        "nonce\n",
+    );
+    let error = WriteStdinHandler::default()
+        .handle(invocation)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("stdin was not written before the yield deadline"),
+        "{error}"
+    );
+    assert!(!terminated.load(Ordering::Acquire));
+    assert!(!process.has_exited());
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&id)
+    );
+    assert_eq!(writer_rx.recv().await.unwrap(), b"occupied");
+    assert!(
+        writer_rx.try_recv().is_err(),
+        "cancelled input was not admitted"
+    );
+    let retry = write_stdin_invocation_with_chars(
+        Arc::clone(&session),
+        Arc::clone(&turn),
+        "local-retry",
+        id,
+        "nonce\n",
+    );
+    WriteStdinHandler::default().handle(retry).await.unwrap();
+    assert_eq!(writer_rx.recv().await.unwrap(), b"nonce\n");
+    assert!(writer_rx.try_recv().is_err());
+    assert!(!terminated.load(Ordering::Acquire));
+    exit_tx.send(0).unwrap();
+    process.cancellation_token().cancelled().await;
+    manager.terminate_all_processes().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn non_empty_write_stdin_collects_later_output_until_the_interaction_cap() {
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);
@@ -2344,6 +2530,7 @@ async fn local_output_is_published_while_artifact_state_is_busy() {
     let output_task = UnifiedExecProcess::spawn_local_output_task(
         stdout_rx,
         stderr_rx,
+        codex_utils_pty::OutputCapture::default(),
         output_handles,
         output_tx,
         Some(Arc::clone(&artifact)),
@@ -2384,7 +2571,7 @@ async fn local_output_is_published_while_artifact_state_is_busy() {
         tokio::fs::read(path)
             .await
             .expect("read finalized artifact"),
-        b"live-output"
+        b"live-output\n[output gap: producer output is missing or unverified; capture is incomplete]\n"
     );
 }
 
@@ -2418,6 +2605,7 @@ async fn local_output_artifact_is_flushed_and_unlocked_after_worker_finishes() {
     let output_task = UnifiedExecProcess::spawn_local_output_task(
         stdout_rx,
         stderr_rx,
+        codex_utils_pty::OutputCapture::default(),
         output_handles,
         output_tx,
         Some(Arc::clone(&artifact)),
@@ -2445,19 +2633,39 @@ async fn local_output_artifact_is_flushed_and_unlocked_after_worker_finishes() {
         .expect("local output should close");
     assert!(output_closed.load(Ordering::Acquire));
     output_task.await.expect("local output task should finish");
+    assert_eq!(
+        output_buffer.lock().await.lagged_chunks(),
+        1,
+        "closed channels without producer EOF receipts cannot certify exact streams"
+    );
     let (path, handle) = match &*artifact.lock().await {
         RawOutputArtifact::Stored { path, handle, .. } => (path.clone(), Arc::clone(handle)),
         RawOutputArtifact::Pending { .. } => panic!("artifact remained pending"),
         RawOutputArtifact::Failed { message, .. } => panic!("artifact failed: {message}"),
     };
     assert_eq!(
-        tokio::fs::read(path)
+        tokio::fs::read(&path)
             .await
             .expect("read finalized artifact"),
-        b"artifact-tailerror-tail"
+        b"artifact-tailerror-tail\n[output gap: producer output is missing or unverified; capture is incomplete]\n"
     );
     handle.try_lock().expect("artifact should be unlocked");
     handle.unlock().expect("release test artifact lock");
+    let artifact_id = path.file_stem().unwrap().to_str().unwrap();
+    let recovered = crate::tools::command_output_artifact::read_tool_output_selectors(
+        temp.path(),
+        "completion-barrier",
+        artifact_id,
+        vec![
+            crate::tools::command_output_artifact::ToolOutputSelector::Bytes { start: 0, end: 23 },
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(
+        !recovered.capture_complete,
+        "known prefix is not a complete producer transcript"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2489,6 +2697,7 @@ async fn local_output_closes_while_artifact_finalization_stalls() {
     let output_task = UnifiedExecProcess::spawn_local_output_task(
         stdout_rx,
         stderr_rx,
+        codex_utils_pty::OutputCapture::default(),
         output_handles,
         output_tx,
         Some(Arc::clone(&artifact)),

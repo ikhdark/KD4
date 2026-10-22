@@ -185,7 +185,11 @@ async fn request_user_input_round_trip() -> Result<()> {
     }
 
     let mut answers = Vec::new();
-    for request in server.received_requests().await.context("recorded requests")? {
+    for request in server
+        .received_requests()
+        .await
+        .context("recorded requests")?
+    {
         if !request.url.path().ends_with("/responses") {
             continue;
         }
@@ -329,7 +333,8 @@ async fn failed_user_input_responses_interrupt_without_poisoning_the_next_turn()
             .filter(|request| request.url.path().ends_with("/responses"))
             .count();
         assert_eq!(
-            response_request_count, index + 1,
+            response_request_count,
+            index + 1,
             "a failed client response must not trigger follow-up sampling"
         );
     }

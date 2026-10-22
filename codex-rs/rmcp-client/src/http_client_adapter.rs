@@ -230,19 +230,29 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
             let preview_result = match tokio::time::timeout(
                 preview_timeout,
                 collect_body_prefix(&mut body_stream, limit),
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => result,
-                Err(_) => return Err(unexpected_http_status_error(
-                    response.status, "error body preview timed out".into(),
-                    retry_after, retry_after_received_at,
-                )),
+                Err(_) => {
+                    return Err(unexpected_http_status_error(
+                        response.status,
+                        "error body preview timed out".into(),
+                        retry_after,
+                        retry_after_received_at,
+                    ));
+                }
             };
             let (body, truncated) = match preview_result {
                 Ok(result) => result,
-                Err(error) => return Err(unexpected_http_status_error(
-                    response.status, format!("error body preview unavailable: {error}"),
-                    retry_after, retry_after_received_at,
-                )),
+                Err(error) => {
+                    return Err(unexpected_http_status_error(
+                        response.status,
+                        format!("error body preview unavailable: {error}"),
+                        retry_after,
+                        retry_after_received_at,
+                    ));
+                }
             };
             if parse_error
                 && !truncated
@@ -260,7 +270,10 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 );
             }
             return Err(unexpected_http_status_error(
-                response.status, preview, retry_after, retry_after_received_at,
+                response.status,
+                preview,
+                retry_after,
+                retry_after_received_at,
             ));
         }
         match content_type.as_deref() {
@@ -279,9 +292,15 @@ impl StreamableHttpClient for StreamableHttpClientAdapter {
                 let preview = match tokio::time::timeout(
                     ERROR_BODY_PREVIEW_TIMEOUT,
                     collect_body_prefix(&mut body_stream, NON_JSON_RESPONSE_BODY_PREVIEW_BYTES),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok((body, truncated))) => {
-                        let suffix = if truncated { "... (body preview truncated)" } else { "" };
+                        let suffix = if truncated {
+                            "... (body preview truncated)"
+                        } else {
+                            ""
+                        };
                         format!("{}{suffix}", body_preview(String::from_utf8_lossy(&body)))
                     }
                     Ok(Err(error)) => format!("body preview unavailable: {error}"),
@@ -618,7 +637,8 @@ fn retry_after(headers: &[HttpHeader], now: SystemTime) -> Option<Duration> {
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
         return value.parse::<u64>().ok().map(Duration::from_secs);
     }
-    httpdate::parse_http_date(value).ok()
+    httpdate::parse_http_date(value)
+        .ok()
         .map(|date| date.duration_since(now).unwrap_or_default())
 }
 
@@ -714,12 +734,27 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         for (value, expected) in [
             (" 3 ".to_string(), Some(Duration::from_secs(3))),
-            (httpdate::fmt_http_date(now + Duration::from_secs(7)), Some(Duration::from_secs(7))),
-            (httpdate::fmt_http_date(now - Duration::from_secs(7)), Some(Duration::ZERO)),
+            (
+                httpdate::fmt_http_date(now + Duration::from_secs(7)),
+                Some(Duration::from_secs(7)),
+            ),
+            (
+                httpdate::fmt_http_date(now - Duration::from_secs(7)),
+                Some(Duration::ZERO),
+            ),
             ("-1".to_string(), None),
             ("not a date".to_string(), None),
         ] {
-            assert_eq!(retry_after(&[HttpHeader { name: "Retry-After".into(), value }], now), expected);
+            assert_eq!(
+                retry_after(
+                    &[HttpHeader {
+                        name: "Retry-After".into(),
+                        value
+                    }],
+                    now
+                ),
+                expected
+            );
         }
     }
 
@@ -727,19 +762,39 @@ mod tests {
     async fn stalled_error_body_preserves_retryable_headers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let app = Router::new().route("/", any(|| async {
-            (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "2")],
-                Body::from_stream(stream::pending::<Result<Bytes, io::Error>>()))
-        }));
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        let adapter = StreamableHttpClientAdapter::new(
-            Arc::new(codex_exec_server::ReqwestHttpClient), HeaderMap::new(), None,
+        let app = Router::new().route(
+            "/",
+            any(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after", "2")],
+                    Body::from_stream(stream::pending::<Result<Bytes, io::Error>>()),
+                )
+            }),
         );
-        let result = tokio::time::timeout(Duration::from_millis(500), adapter.post_message(
-            format!("http://{address}/").into(),
-            serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap(),
-            None, None, HashMap::new(),
-        )).await.expect("optional diagnostics must not wait for EOF");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let adapter = StreamableHttpClientAdapter::new(
+            Arc::new(codex_exec_server::ReqwestHttpClient),
+            HeaderMap::new(),
+            None,
+        );
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            adapter.post_message(
+                format!("http://{address}/").into(),
+                serde_json::from_value(
+                    serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                )
+                .unwrap(),
+                None,
+                None,
+                HashMap::new(),
+            ),
+        )
+        .await
+        .expect("optional diagnostics must not wait for EOF");
         server.abort();
         assert!(matches!(result, Err(StreamableHttpError::Client(
             StreamableHttpClientAdapterError::UnexpectedHttpStatus {

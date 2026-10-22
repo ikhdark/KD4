@@ -116,7 +116,9 @@ class DotSlashCacheStampTest(unittest.TestCase):
                 dotslash.verify_archive(archive_path, artifact, "rg")
             self.assertFalse(dotslash.archive_is_valid(archive_path, artifact, "rg"))
             self.assertFalse(archive_path.exists())
-            self.assertFalse(dotslash.verified_archive_stamp_path(archive_path).exists())
+            self.assertFalse(
+                dotslash.verified_archive_stamp_path(archive_path).exists()
+            )
 
     def test_fetch_uses_extracted_stamp_before_archive_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

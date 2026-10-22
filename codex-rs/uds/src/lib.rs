@@ -25,6 +25,20 @@ pub async fn is_stale_socket_path(socket_path: impl AsRef<Path>) -> IoResult<boo
     platform::is_stale_socket_path(socket_path.as_ref()).await
 }
 
+/// An AF_UNIX rendezvous generation pinned against rename/unlink on Windows.
+/// Deletion is authorized on this handle, never on a subsequently resolved path.
+pub struct SocketFile(std::fs::File);
+
+impl SocketFile {
+    pub fn open(path: &Path) -> IoResult<Self> {
+        platform::open_socket_file(path).map(Self)
+    }
+
+    pub fn remove(self) -> IoResult<()> {
+        platform::remove_socket_file(&self.0)
+    }
+}
+
 /// Async Unix domain socket listener.
 pub struct UnixListener {
     inner: platform::Listener,
@@ -162,6 +176,53 @@ mod platform {
             .access_mode(0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)?;
+        reparse_tag_for_file(&file)
+    }
+
+    pub(super) fn open_socket_file(path: &Path) -> IoResult<std::fs::File> {
+        use windows_sys::Win32::Storage::FileSystem::DELETE;
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            // Omitting SHARE_DELETE prevents replacement for the entire probe /
+            // deletion transaction, including by noncooperating pathname users.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        if reparse_tag_for_file(&file)? != Some(IO_REPARSE_TAG_AF_UNIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "control socket path is not an AF_UNIX endpoint",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn remove_socket_file(file: &std::fs::File) -> IoResult<()> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO;
+        use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
+        use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: file owns the inspected DELETE-capable handle; the struct is
+        // live and sized for FileDispositionInfo. No path is resolved here.
+        let result = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reparse_tag_for_file(file: &std::fs::File) -> IoResult<Option<u32>> {
         let mut info = FILE_ATTRIBUTE_TAG_INFO {
             FileAttributes: 0,
             ReparseTag: 0,

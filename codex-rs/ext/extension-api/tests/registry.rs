@@ -199,7 +199,10 @@ fn build_round_trips_every_contributor_category() {
     assert_eq!(registry.token_usage_contributors().len(), 1);
     assert_eq!(registry.context_contributors().len(), 1);
     assert_eq!(registry.mcp_server_contributors().len(), 1);
-    assert_eq!(registry.mcp_server_contributors()[0].id(), "all-contributors");
+    assert_eq!(
+        registry.mcp_server_contributors()[0].id(),
+        "all-contributors"
+    );
     assert_eq!(registry.turn_input_contributors().len(), 1);
     assert_eq!(registry.tool_contributors().len(), 1);
     assert_eq!(

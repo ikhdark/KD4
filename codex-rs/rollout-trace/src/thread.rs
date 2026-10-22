@@ -155,11 +155,16 @@ impl ThreadTraceContext {
         matches!(self.state, ThreadTraceContextState::Enabled(_))
     }
 
+    /// Records omitted optional detail without cloning, blocking or spawning.
+    pub fn note_capture_gap(&self) {
+        if let ThreadTraceContextState::Enabled(context) = &self.state {
+            context.writer.note_capture_gap();
+        }
+    }
+
     /// Starts a fresh child thread in this context's rollout tree.
     ///
-    /// Callers should use [`ThreadTraceContext::disabled`] for resumed children:
-    /// reusing the parent trace would emit a duplicate `ThreadStarted` event
-    /// for an existing thread id and make the bundle unreplayable.
+    /// Use `resume_child_thread_trace_or_disabled` for a cold-reloaded child.
     pub fn start_child_thread_trace_or_disabled(
         &self,
         metadata: ThreadStartedTraceMetadata,
@@ -171,6 +176,34 @@ impl ThreadTraceContext {
                 context.root_thread_id.clone(),
                 metadata,
             ),
+        }
+    }
+
+    /// Continues a stable child identity with a new activation in this bundle.
+    /// Replay distinguishes a same-bundle reload from imported historical work;
+    /// neither case emits a duplicate original start or invents prior execution.
+    pub fn resume_child_thread_trace_or_disabled(
+        &self,
+        metadata: ThreadStartedTraceMetadata,
+    ) -> Self {
+        let ThreadTraceContextState::Enabled(parent) = &self.state else {
+            return Self::disabled();
+        };
+        let context = EnabledThreadTraceContext {
+            writer: Arc::clone(&parent.writer),
+            root_thread_id: parent.root_thread_id.clone(),
+            thread_id: metadata.thread_id.clone(),
+        };
+        let metadata_payload =
+            context.write_json_payload_best_effort(RawPayloadKind::SessionMetadata, &metadata);
+        context.append_best_effort(RawTraceEventPayload::ThreadResumed {
+            thread_id: metadata.thread_id,
+            parent_thread_id: parent.thread_id.clone(),
+            agent_path: metadata.agent_path,
+            metadata_payload,
+        });
+        Self {
+            state: ThreadTraceContextState::Enabled(context),
         }
     }
 

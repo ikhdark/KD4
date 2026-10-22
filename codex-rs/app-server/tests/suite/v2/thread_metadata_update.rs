@@ -256,7 +256,10 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_stored_thread() -
         .get_thread(ThreadId::from_string(&thread_id)?)
         .await?
         .expect("metadata update must repair the SQLite row");
-    assert_eq!(persisted.git_branch.as_deref(), Some("feature/stored-thread"));
+    assert_eq!(
+        persisted.git_branch.as_deref(),
+        Some("feature/stored-thread")
+    );
     assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
     assert_eq!(persisted.created_at.timestamp(), updated.created_at);
 
@@ -312,6 +315,11 @@ async fn thread_metadata_update_repairs_loaded_thread_without_resetting_summary(
     let _: ThreadResumeResponse = to_response::<ThreadResumeResponse>(resume_resp)?;
 
     assert_eq!(state_db.delete_thread(thread_uuid).await?, 1);
+    // Simulate a missing row, not an explicit deletion: reconciliation must
+    // never clear deletion evidence.
+    state_db
+        .restore_deleted_thread_owners(&[thread_uuid])
+        .await?;
 
     let update_id = mcp
         .send_thread_metadata_update_request(ThreadMetadataUpdateParams {
@@ -347,7 +355,10 @@ async fn thread_metadata_update_repairs_loaded_thread_without_resetting_summary(
         .get_thread(thread_uuid)
         .await?
         .expect("metadata update must restore the deleted SQLite row");
-    assert_eq!(persisted.git_branch.as_deref(), Some("feature/loaded-thread"));
+    assert_eq!(
+        persisted.git_branch.as_deref(),
+        Some("feature/loaded-thread")
+    );
     assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
     assert_eq!(persisted.created_at.timestamp(), updated.created_at);
 
@@ -422,7 +433,10 @@ async fn thread_metadata_update_repairs_missing_sqlite_row_for_archived_thread()
         .get_thread(ThreadId::from_string(&thread_id)?)
         .await?
         .expect("metadata update must repair the archived SQLite row");
-    assert_eq!(persisted.git_branch.as_deref(), Some("feature/archived-thread"));
+    assert_eq!(
+        persisted.git_branch.as_deref(),
+        Some("feature/archived-thread")
+    );
     assert_eq!(persisted.first_user_message.as_deref(), Some(preview));
     assert_eq!(persisted.created_at.timestamp(), updated.created_at);
     assert!(persisted.archived_at.is_some());

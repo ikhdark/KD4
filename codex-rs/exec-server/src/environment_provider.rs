@@ -111,23 +111,44 @@ mod tests {
             (Some(" \t "), None, false),
             (Some("none"), None, true),
             (Some(" NoNe "), None, true),
-            (Some("ws://127.0.0.1:8765"), Some("ws://127.0.0.1:8765"), false),
-            (Some(" ws://127.0.0.1:8765 "), Some("ws://127.0.0.1:8765"), false),
+            (
+                Some("ws://127.0.0.1:8765"),
+                Some("ws://127.0.0.1:8765"),
+                false,
+            ),
+            (
+                Some(" ws://127.0.0.1:8765 "),
+                Some("ws://127.0.0.1:8765"),
+                false,
+            ),
         ] {
             let snapshot = DefaultEnvironmentProvider::new(url.map(str::to_string))
-                .snapshot().await.expect("environments");
-            assert_eq!(snapshot.include_local, !disabled && expected_remote.is_none());
+                .snapshot()
+                .await
+                .expect("environments");
+            assert_eq!(
+                snapshot.include_local,
+                !disabled && expected_remote.is_none()
+            );
             assert_eq!(
                 snapshot.default,
                 if disabled {
                     EnvironmentDefault::Disabled
                 } else {
                     EnvironmentDefault::EnvironmentId(
-                        if expected_remote.is_some() { REMOTE_ENVIRONMENT_ID } else { LOCAL_ENVIRONMENT_ID }.to_string()
+                        if expected_remote.is_some() {
+                            REMOTE_ENVIRONMENT_ID
+                        } else {
+                            LOCAL_ENVIRONMENT_ID
+                        }
+                        .to_string(),
                     )
                 }
             );
-            assert_eq!(snapshot.environments.len(), usize::from(expected_remote.is_some()));
+            assert_eq!(
+                snapshot.environments.len(),
+                usize::from(expected_remote.is_some())
+            );
             if let Some(expected_remote) = expected_remote {
                 let (id, environment) = &snapshot.environments[0];
                 assert_eq!(id, REMOTE_ENVIRONMENT_ID);

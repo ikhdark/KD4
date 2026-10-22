@@ -47,9 +47,18 @@ pub(super) fn remote_wait_request(
     mut request: WaitRequest,
 ) -> Result<WireWaitRequest, String> {
     let cell_id = match remote_cell_id(session, &request.cell_id) {
-        Ok(id) if !request.recovery.as_ref().is_some_and(|recovery| recovery.terminal_only) => id,
+        Ok(id)
+            if !request
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.terminal_only) =>
+        {
+            id
+        }
         result => {
-            let Some(recovery) = request.recovery.as_mut() else { return result.map(|_| unreachable!()); };
+            let Some(recovery) = request.recovery.as_mut() else {
+                return result.map(|_| unreachable!());
+            };
             // Only a terminal-receipt lookup may cross the generation fence.
             recovery.terminal_only = true;
             WireCellId::new(request.cell_id.as_str())

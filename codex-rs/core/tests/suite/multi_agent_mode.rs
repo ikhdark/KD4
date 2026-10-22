@@ -11,6 +11,7 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use core_test_support::require_network;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -55,6 +56,16 @@ fn configure_custom_mode_hint(config: &mut Config) {
 fn configure_ultra(config: &mut Config) {
     configure_multi_agent_v2(config);
     config.model_reasoning_effort = Some(ReasoningEffort::Ultra);
+}
+
+/// A completed turn needs a final answer: a response without one triggers the
+/// single missing-answer repair request, which would consume another fixture.
+fn answered_sse(id: &str) -> String {
+    sse(vec![
+        ev_response_created(id),
+        ev_assistant_message(&format!("{id}-answer"), "done"),
+        ev_completed(id),
+    ])
 }
 
 fn developer_texts(input: &[Value]) -> Vec<&str> {
@@ -111,11 +122,7 @@ async fn ultra_reasoning_uses_max_and_requires_explicit_request() -> Result<()> 
     require_network!();
 
     let server = start_mock_server().await;
-    let response = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
+    let response = mount_sse_once(&server, answered_sse("resp-1")).await;
     let test = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
         .with_config(configure_ultra)
@@ -150,12 +157,7 @@ async fn sol_high_xhigh_and_max_require_explicit_request() -> Result<()> {
     let responses = mount_sse_sequence(
         &server,
         (1..=3)
-            .map(|index| {
-                sse(vec![
-                    ev_response_created(&format!("resp-{index}")),
-                    ev_completed(&format!("resp-{index}")),
-                ])
-            })
+            .map(|index| answered_sse(&format!("resp-{index}")))
             .collect(),
     )
     .await;
@@ -198,12 +200,7 @@ async fn configured_mode_hint_uses_custom_mode_across_reasoning_efforts() -> Res
     let responses = mount_sse_sequence(
         &server,
         (1..=2)
-            .map(|index| {
-                sse(vec![
-                    ev_response_created(&format!("resp-{index}")),
-                    ev_completed(&format!("resp-{index}")),
-                ])
-            })
+            .map(|index| answered_sse(&format!("resp-{index}")))
             .collect(),
     )
     .await;
@@ -261,11 +258,7 @@ async fn empty_configured_mode_hint_suppresses_builtin_text() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
-    let response = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
+    let response = mount_sse_once(&server, answered_sse("resp-1")).await;
     let test = test_codex()
         .with_config(|config| {
             configure_multi_agent_v2(config);
@@ -298,12 +291,7 @@ async fn leaving_ultra_after_cold_resume_emits_explicit_mode() -> Result<()> {
     let responses = mount_sse_sequence(
         &server,
         (1..=2)
-            .map(|index| {
-                sse(vec![
-                    ev_response_created(&format!("resp-{index}")),
-                    ev_completed(&format!("resp-{index}")),
-                ])
-            })
+            .map(|index| answered_sse(&format!("resp-{index}")))
             .collect(),
     )
     .await;
@@ -360,11 +348,7 @@ async fn ultra_on_multi_agent_v1_uses_max_without_mode_instructions() -> Result<
     require_network!();
 
     let server = start_mock_server().await;
-    let response = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
+    let response = mount_sse_once(&server, answered_sse("resp-1")).await;
     let test = test_codex()
         .with_model_info_override("gpt-5.4", add_ultra_reasoning)
         .with_config(|config| {
@@ -626,15 +610,12 @@ async fn typed_spawn_task_capsule_delivers_normalized_handles_and_file_revision(
         ]),
     )
     .await;
-    mount_sse_once_match(
+    let parent_followup_requests = mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
             String::from_utf8_lossy(&request.body).contains("capsule-spawn")
         },
-        sse(vec![
-            ev_response_created("capsule-parent-done"),
-            ev_completed("capsule-parent-done"),
-        ]),
+        answered_sse("capsule-parent-done"),
     )
     .await;
     let test = test_codex()
@@ -646,7 +627,11 @@ async fn typed_spawn_task_capsule_delivers_normalized_handles_and_file_revision(
         .build(&server)
         .await?;
     std::fs::write(test.cwd_path().join("target.txt"), b"capsule file bytes\n")?;
-    test.submit_turn(PROMPT).await?;
+    let parent_completion = test.submit_turn_and_capture_completion(PROMPT).await?;
+    // A failed parent turn interrupts every spawned agent that is still pending
+    // or running, so it would race the child's first request and could cancel
+    // the capsule bootstrap before it is sampled. The parent must end cleanly.
+    assert_eq!(parent_completion.error, None);
     let capsule = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             for request in child_requests.requests() {
@@ -675,7 +660,15 @@ async fn typed_spawn_task_capsule_delivers_normalized_handles_and_file_revision(
         }
     })
     .await
-    .with_context(|| format!("waiting for normalized child task capsule: parent_requests={}, observed_spawn_outputs={:?}, candidate_child_requests={}", parent_requests.requests().len(), child_requests.requests().iter().filter_map(|request| request.function_call_output_text("capsule-spawn")).collect::<Vec<_>>(), child_requests.requests().len()))??;
+    .with_context(|| {
+        format!(
+            "waiting for normalized child task capsule: parent_requests={}, \
+             spawn_output={:?}, candidate_child_requests={}",
+            parent_requests.requests().len(),
+            parent_followup_requests.function_call_output_text("capsule-spawn"),
+            child_requests.requests().len(),
+        )
+    })??;
     assert_eq!(capsule["schema_version"], 1);
     assert_eq!(capsule["objective"], OBJECTIVE);
     assert_eq!(
@@ -801,10 +794,7 @@ async fn assert_registered_wait_item_terminal_with_stalled_store(
             let body = String::from_utf8_lossy(&request.body);
             body.contains(SPAWN_ID) && !body.contains(PRIME_PROMPT) && !body.contains(TEST_PROMPT)
         },
-        sse(vec![
-            ev_response_created("wait-lifecycle-spawned"),
-            ev_completed("wait-lifecycle-spawned"),
-        ]),
+        answered_sse("wait-lifecycle-spawned"),
     )
     .await;
     responses::mount_sse_once_match(
@@ -826,10 +816,7 @@ async fn assert_registered_wait_item_terminal_with_stalled_store(
             let body = String::from_utf8_lossy(&request.body);
             body.contains(PRIME_ID) && !body.contains(TEST_PROMPT)
         },
-        sse(vec![
-            ev_response_created("wait-lifecycle-primed"),
-            ev_completed("wait-lifecycle-primed"),
-        ]),
+        answered_sse("wait-lifecycle-primed"),
     )
     .await;
     responses::mount_sse_once_match(
@@ -854,10 +841,7 @@ async fn assert_registered_wait_item_terminal_with_stalled_store(
                 |request: &wiremock::Request| {
                     String::from_utf8_lossy(&request.body).contains(WAIT_ID)
                 },
-                sse(vec![
-                    ev_response_created("wait-lifecycle-done"),
-                    ev_completed("wait-lifecycle-done"),
-                ]),
+                answered_sse("wait-lifecycle-done"),
             )
             .await,
         )

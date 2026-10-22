@@ -22,9 +22,26 @@ use serde_json::Value;
 /// Monotonic sequence number assigned by the raw trace writer.
 pub type RawEventSeq = u64;
 
-/// Current raw event envelope schema version. Existing response-reference objects
-/// remain readable; completion events also accept null when capture is unavailable.
-pub(crate) const RAW_TRACE_EVENT_SCHEMA_VERSION: u32 = 1;
+/// Producer observation captured before optional persistence. Offsets are
+/// comparable only within the same process-local clock domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceOccurrence {
+    pub clock_id: String,
+    pub offset_us: u64,
+}
+
+impl TraceOccurrence {
+    pub fn now() -> Self {
+        Self {
+            clock_id: codex_protocol::timing::process_clock_domain_id().to_string(),
+            offset_us: u64::try_from(codex_protocol::timing::process_monotonic_ns() / 1_000)
+                .unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// Version 3 adds explicit resumed-thread activations. Earlier events remain readable.
+pub(crate) const RAW_TRACE_EVENT_SCHEMA_VERSION: u32 = 3;
 
 /// One append-only raw trace event.
 ///
@@ -33,6 +50,12 @@ pub(crate) const RAW_TRACE_EVENT_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawTraceEvent {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<TraceOccurrence>,
+    /// Cumulative known payload/detail losses in this writer. Absent in v1;
+    /// zero means no reported loss, never proof of task/operation completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_capture_gap_count: Option<u64>,
     /// Contiguous writer-assigned order inside one rollout event log.
     pub seq: RawEventSeq,
     /// Recorder wall-clock time for display; use `seq` for recorded order and
@@ -86,6 +109,14 @@ pub enum RawTraceEventPayload {
         thread_id: AgentThreadId,
         status: RolloutStatus,
     },
+    /// A new observed activation, not a second original thread start. The event
+    /// sequence identifies this activation inside the current bundle.
+    ThreadResumed {
+        thread_id: AgentThreadId,
+        parent_thread_id: AgentThreadId,
+        agent_path: String,
+        metadata_payload: Option<RawPayloadRef>,
+    },
     CodexTurnStarted {
         codex_turn_id: CodexTurnId,
         thread_id: AgentThreadId,
@@ -102,6 +133,15 @@ pub enum RawTraceEventPayload {
         provider_name: String,
         request_payload: RawPayloadRef,
     },
+    /// Identity/lifecycle survives an unavailable request body. This is an
+    /// explicit per-attempt capture gap, not a failed provider operation.
+    InferenceStartedWithoutPayload {
+        inference_call_id: InferenceCallId,
+        thread_id: AgentThreadId,
+        codex_turn_id: CodexTurnId,
+        model: String,
+        provider_name: String,
+    },
     InferenceCompleted {
         inference_call_id: InferenceCallId,
         /// Responses API `response.id`; used by `previous_response_id`.
@@ -113,6 +153,9 @@ pub enum RawTraceEventPayload {
     },
     InferenceFailed {
         inference_call_id: InferenceCallId,
+        /// Survives unavailable response-payload capture; absent in legacy traces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
         /// Provider transport request id, such as `x-request-id`, when the
         /// provider returned one before the stream failed.
         upstream_request_id: Option<String>,
@@ -163,6 +206,11 @@ pub enum RawTraceEventPayload {
         status: ExecutionStatus,
         result_payload: Option<RawPayloadRef>,
     },
+    /// Payload-free covered root aggregates survive capped per-call timing rows.
+    ProcessStartsObserved {
+        tool_call_id: ToolCallId,
+        observations: serde_json::Value,
+    },
     CodeCellStarted {
         /// Runtime-local handle allocated by code mode for waits and nested tools.
         runtime_cell_id: String,
@@ -192,6 +240,15 @@ pub enum RawTraceEventPayload {
         provider_name: String,
         request_payload: RawPayloadRef,
     },
+    /// Metadata-only lifecycle when optional request capture failed.
+    CompactionRequestStartedWithoutPayload {
+        compaction_id: CompactionId,
+        compaction_request_id: CompactionRequestId,
+        thread_id: AgentThreadId,
+        codex_turn_id: CodexTurnId,
+        model: String,
+        provider_name: String,
+    },
     CompactionRequestCompleted {
         compaction_id: CompactionId,
         compaction_request_id: CompactionRequestId,
@@ -202,6 +259,13 @@ pub enum RawTraceEventPayload {
         compaction_id: CompactionId,
         compaction_request_id: CompactionRequestId,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_payload: Option<RawPayloadRef>,
+    },
+    CompactionRequestCancelled {
+        compaction_id: CompactionId,
+        compaction_request_id: CompactionRequestId,
+        reason: String,
     },
     /// Checkpoint installation event for remote-compacted replacement history.
     CompactionInstalled {
@@ -244,14 +308,20 @@ impl RawTraceEventPayload {
             | RawTraceEventPayload::ThreadEnded { .. }
             | RawTraceEventPayload::CodexTurnStarted { .. }
             | RawTraceEventPayload::CodexTurnEnded { .. }
-            | RawTraceEventPayload::CompactionRequestFailed { .. }
+            | RawTraceEventPayload::InferenceStartedWithoutPayload { .. }
+            | RawTraceEventPayload::CompactionRequestStartedWithoutPayload { .. }
+            | RawTraceEventPayload::CompactionRequestCancelled { .. }
             | RawTraceEventPayload::CodeCellStarted { .. }
+            | RawTraceEventPayload::ProcessStartsObserved { .. }
             | RawTraceEventPayload::McpToolCallCorrelationAssigned { .. }
             | RawTraceEventPayload::AgentResultObserved {
                 carried_payload: None,
                 ..
             } => &[],
             RawTraceEventPayload::ThreadStarted {
+                metadata_payload, ..
+            }
+            | RawTraceEventPayload::ThreadResumed {
                 metadata_payload, ..
             } => metadata_payload.as_slice(),
             RawTraceEventPayload::InferenceStarted {
@@ -272,6 +342,9 @@ impl RawTraceEventPayload {
                 response_payload, ..
             } => response_payload.as_slice(),
             RawTraceEventPayload::CompactionRequestCompleted {
+                response_payload, ..
+            }
+            | RawTraceEventPayload::CompactionRequestFailed {
                 response_payload, ..
             } => response_payload.as_slice(),
             RawTraceEventPayload::InferenceFailed {

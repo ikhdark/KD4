@@ -10,6 +10,81 @@ use crate::SortDirection;
 use crate::ThreadMetadataBuilder;
 use crate::runtime::test_support::unique_temp_dir;
 
+#[tokio::test]
+async fn project_lookahead_does_not_decode_an_unrequested_corrupt_object() -> anyhow::Result<()> {
+    let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".into()).await?;
+    let mut ids = Vec::new();
+    for name in ["A", "B", "C"] {
+        ids.push(
+            runtime
+                .create_project(name.into(), Vec::new(), BTreeMap::new(), &[], name)
+                .await?
+                .project
+                .id,
+        );
+    }
+    sqlx::query("UPDATE projects SET metadata = '{corrupt' WHERE id = ?")
+        .bind(&ids[1])
+        .execute(runtime.pool.as_ref())
+        .await?;
+    let page = runtime
+        .list_projects(None, 1, ProjectSortKey::Position, SortDirection::Asc)
+        .await?;
+    assert_eq!(page.projects[0].id, ids[0]);
+    assert!(page.next_cursor.is_some());
+    assert!(
+        runtime
+            .list_projects(
+                page.next_cursor.as_deref(),
+                1,
+                ProjectSortKey::Position,
+                SortDirection::Asc
+            )
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn adjacent_project_move_only_updates_changed_positions_and_normalizes_sparse_ties()
+-> anyhow::Result<()> {
+    for positions in [vec![0, 1, 2, 3], vec![10, 20, 20, 90]] {
+        let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".into()).await?;
+        let mut ids = Vec::new();
+        for (i, position) in positions.iter().enumerate() {
+            let id = format!("p{i}");
+            sqlx::query("INSERT INTO projects (id, name, metadata, position, created_at_ms, updated_at_ms) VALUES (?, ?, '{}', ?, 0, 0)")
+                .bind(&id).bind(&id).bind(position).execute(runtime.pool.as_ref()).await?;
+            ids.push(id);
+        }
+        sqlx::query("CREATE TABLE position_updates (id TEXT NOT NULL)")
+            .execute(runtime.pool.as_ref())
+            .await?;
+        sqlx::query("CREATE TRIGGER count_position_updates AFTER UPDATE OF position ON projects BEGIN INSERT INTO position_updates VALUES (NEW.id); END")
+            .execute(runtime.pool.as_ref()).await?;
+        assert_eq!(
+            runtime.move_project(&ids[2], Some(&ids[1])).await?,
+            Some(true)
+        );
+        let page = runtime
+            .list_projects(None, 10, ProjectSortKey::Position, SortDirection::Asc)
+            .await?;
+        assert_eq!(
+            page.projects
+                .iter()
+                .map(|p| (p.id.as_str(), p.position))
+                .collect::<Vec<_>>(),
+            vec![("p0", 0), ("p2", 1), ("p1", 2), ("p3", 3)]
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_updates")
+            .fetch_one(runtime.pool.as_ref())
+            .await?;
+        assert_eq!(count, if positions[0] == 0 { 2 } else { 4 });
+    }
+    Ok(())
+}
+
 /// Assigns through `patch_thread_metadata`, the explicit-assignment path the runtime uses.
 async fn assign_project(
     runtime: &StateRuntime,
@@ -147,6 +222,10 @@ async fn project_lifecycle_preserves_order_and_clears_assignments() -> anyhow::R
         Some(project.clone())
     );
     // Restore the active fixture for the project-deletion assertions below.
+    // Deletion evidence blocks re-insertion until an explicit restore clears it.
+    runtime
+        .restore_deleted_thread_owners(&[active_thread_id])
+        .await?;
     runtime.upsert_thread(&active_metadata).await?;
     assign_project(&runtime, &active_metadata, Some(&project.id)).await?;
     runtime
@@ -401,7 +480,6 @@ async fn project_list_rejects_malformed_cursors() -> anyhow::Result<()> {
     }
     Ok(())
 }
-
 
 #[tokio::test]
 async fn project_list_orders_and_pages_recency_with_roots_and_nulls() -> anyhow::Result<()> {

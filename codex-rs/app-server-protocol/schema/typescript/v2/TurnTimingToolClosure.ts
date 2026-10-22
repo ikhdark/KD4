@@ -11,4 +11,9 @@ import type { TurnTimingToolCallIdentity } from "./TurnTimingToolCallIdentity";
  * exactly-once persisted projection, with no orphan or duplicate lifecycle
  * records and no ledger overflow.
  */
-export type TurnTimingToolClosure = { acceptedCount: number, timingPairedCount: number, terminalCount: number, persistedCount: number, duplicateCallIdCount: number, duplicateAcceptanceCount: number, duplicateTimingCount: number, duplicatePersistenceCount: number, orphanTimingCount: number, orphanPersistenceCount: number, overflowCount: number, unresolvedCalls?: Array<TurnTimingToolCallIdentity>, orphanCalls?: Array<TurnTimingToolCallIdentity>, complete: boolean, };
+export type TurnTimingToolClosure = {
+/**
+ * False when a legacy record omitted the entire closure ledger. Its zero
+ * counts and incomplete verdict are unavailable evidence, not observations.
+ */
+measurementAvailable: boolean, acceptedCount: number, timingPairedCount: number, terminalCount: number, persistedCount: number, duplicateCallIdCount: number, duplicateAcceptanceCount: number, duplicateTimingCount: number, duplicatePersistenceCount: number, orphanTimingCount: number, orphanPersistenceCount: number, overflowCount: number, unresolvedCalls?: Array<TurnTimingToolCallIdentity>, orphanCalls?: Array<TurnTimingToolCallIdentity>, complete: boolean, };

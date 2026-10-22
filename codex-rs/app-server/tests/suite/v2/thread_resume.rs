@@ -189,11 +189,12 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
         mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
     )
     .await??;
+    // A known live thread without a rollout is not-materialized, not missing.
     assert!(
         resume_err
             .error
             .message
-            .contains("no rollout found for thread id"),
+            .contains("known live thread has not materialized its rollout"),
         "unexpected resume error: {}",
         resume_err.error.message
     );
@@ -1015,7 +1016,9 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
         "expected rollouts to include one turn"
     );
     let turn = &thread.turns[0];
-    assert_eq!(turn.status, TurnStatus::Completed);
+    // A user-only rollout turn never received an answer; idle resume reports
+    // that unfinished turn as interrupted.
+    assert_eq!(turn.status, TurnStatus::Interrupted);
     assert_eq!(turn.items.len(), 1, "expected user message item");
     match &turn.items[0] {
         ThreadItem::UserMessage { content, .. } => {
@@ -1887,13 +1890,17 @@ async fn thread_goal_set_edits_objective_without_resetting_usage() -> Result<()>
 
 #[tokio::test]
 async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Result<()> {
+    // Each turn delivers a final answer; an answerless response would spend the
+    // next mock response on the bounded missing-answer repair attempt.
     let server = create_mock_responses_server_sequence_unchecked(vec![
         responses::sse(vec![
             responses::ev_response_created("materialize-thread"),
+            responses::ev_assistant_message("materialize-answer", "Materialized"),
             responses::ev_completed("materialize-thread"),
         ]),
         responses::sse(vec![
             responses::ev_response_created("goal-continuation"),
+            responses::ev_assistant_message("goal-continuation-answer", "Goal progress"),
             responses::ev_completed_with_tokens("goal-continuation", /*total_tokens*/ 200),
         ]),
     ])
@@ -1980,8 +1987,7 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     )
     .await??;
 
-    let created =
-        wait_for_goal_event(&capture, DEFAULT_READ_TIMEOUT, "created", "active").await?;
+    let created = wait_for_goal_event(&capture, DEFAULT_READ_TIMEOUT, "created", "active").await?;
     let persisted_goal_id = created["event_params"]["goal_id"]
         .as_str()
         .expect("created goal id");
@@ -2052,13 +2058,8 @@ async fn thread_goal_lifecycle_emits_analytics_and_clear_deletes_goal() -> Resul
     )
     .await??;
 
-    let cleared = wait_for_goal_event(
-        &capture,
-        DEFAULT_READ_TIMEOUT,
-        "cleared",
-        "budgetLimited",
-    )
-    .await?;
+    let cleared =
+        wait_for_goal_event(&capture, DEFAULT_READ_TIMEOUT, "cleared", "budgetLimited").await?;
     assert_eq!(cleared["event_params"]["goal_id"], persisted_goal_id);
     assert_eq!(cleared["event_params"]["turn_id"], serde_json::Value::Null);
 
@@ -2261,6 +2262,14 @@ async fn thread_resume_token_usage_replay_ignores_stale_interrupted_tail_turn() 
     let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
     let stale_turn_id = "incomplete-turn-after-token-usage";
     let appended_rollout = [
+        // The minimal fixture has user input and usage, but no completion.
+        // Persist a real terminal boundary for the first, completed turn.
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "turn_id": "saved-turn", "last_agent_message": null }
+        })
+        .to_string(),
         json!({
             "timestamp": meta_rfc3339,
             "type": "event_msg",
@@ -2361,6 +2370,14 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
     let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
     let interrupted_turn_id = "interrupted-turn-with-token-usage";
     let appended_rollout = [
+        // The minimal fixture has user input and usage, but no completion.
+        // Persist a real terminal boundary for the first, completed turn.
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "turn_id": "saved-turn", "last_agent_message": null }
+        })
+        .to_string(),
         json!({
             "timestamp": meta_rfc3339,
             "type": "event_msg",
@@ -2395,6 +2412,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                         output_tokens: 50,
                         reasoning_output_tokens: 15,
                         total_tokens: 230,
+                        coverage: None,
                     },
                     last_token_usage: TokenUsage {
                         input_tokens: 90,
@@ -2402,6 +2420,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                         output_tokens: 40,
                         reasoning_output_tokens: 12,
                         total_tokens: 130,
+                        coverage: None,
                     },
                     model_context_window: Some(200_000),
                 }),
@@ -2695,6 +2714,14 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
     let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
     let turn_id = "incomplete-turn";
     let appended_rollout = [
+        // The minimal fixture has only user input. Persist a real terminal
+        // boundary for the first, completed turn.
+        json!({
+            "timestamp": meta_rfc3339,
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "turn_id": "saved-turn", "last_agent_message": null }
+        })
+        .to_string(),
         json!({
             "timestamp": meta_rfc3339,
             "type": "event_msg",
@@ -3925,7 +3952,17 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
     })
     .await??;
     let expected_readme_path = workspace.join("README.md");
+    let ThreadItem::FileChange {
+        environment: Some(environment),
+        ..
+    } = &original_started
+    else {
+        panic!("a dispatched patch must retain its captured environment provenance");
+    };
+    assert_eq!(environment.environment_id, "local");
+    assert!(!environment.owner_id.is_empty());
     let expected_file_change = ThreadItem::FileChange {
+        environment: Some(environment.clone()),
         id: "patch-call".to_string(),
         changes: vec![codex_app_server_protocol::FileUpdateChange {
             path: expected_readme_path.to_string_lossy().into_owned(),
@@ -4443,7 +4480,6 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
     // metadata happens to be bundled for this slug.
     let mut model = codex_models_manager::model_info::model_info_from_slug("gpt-5.4");
     model.model_messages = Some(codex_protocol::openai_models::ModelMessages {
-        token_budget: None,
         instructions_template: Some(format!(
             "{{{{ personality }}}}\n\n{CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT}"
         )),
@@ -4550,11 +4586,9 @@ async fn thread_resume_accepts_personality_override() -> Result<()> {
         .expect("expected request for resumed thread turn");
     let developer_texts = request.message_input_texts("developer");
     assert!(
-        developer_texts
-            .iter()
-            .any(|text| {
-                text.contains("<personality_spec>") && text.contains("resume-friendly-sentinel")
-            }),
+        developer_texts.iter().any(|text| {
+            text.contains("<personality_spec>") && text.contains("resume-friendly-sentinel")
+        }),
         "expected a personality update message in developer input, got {developer_texts:?}"
     );
     let instructions_text = request.instructions_text();

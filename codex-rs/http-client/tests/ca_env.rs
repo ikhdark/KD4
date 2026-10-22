@@ -427,8 +427,6 @@ fn assert_token_exchange_request(request: &str) {
     );
 }
 
-
-
 #[test]
 fn prefers_codex_ca_cert_over_ssl_cert_file() {
     let temp_dir = TempDir::new().expect("tempdir");
@@ -593,11 +591,36 @@ fn rejects_malformed_pem_with_hint() {
 #[test]
 fn accepts_openssl_trusted_certificate() {
     let temp_dir = TempDir::new().expect("tempdir");
-    let cert_path = write_cert_file(&temp_dir, "trusted.pem", TRUSTED_TEST_CERT);
+    // Rustls cannot enforce X509_AUX purposes, so only unrestricted TRUSTED CERTIFICATE blocks
+    // (no AUX after the certificate DER) are normalized into roots.
+    let unrestricted = TEST_CERT_1
+        .replace(
+            "-----BEGIN CERTIFICATE-----",
+            "-----BEGIN TRUSTED CERTIFICATE-----",
+        )
+        .replace(
+            "-----END CERTIFICATE-----",
+            "-----END TRUSTED CERTIFICATE-----",
+        );
+    let cert_path = write_cert_file(&temp_dir, "trusted.pem", &unrestricted);
 
     let output = run_probe(&[(CODEX_CA_CERT_ENV, cert_path.as_path())]);
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "unrestricted trusted certificate was rejected\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A real `openssl x509 -addtrust serverAuth -trustout` artifact carries nonempty AUX, which
+    // must be rejected rather than trimmed into an unrestricted root.
+    let restricted_path = write_cert_file(&temp_dir, "restricted.pem", TRUSTED_TEST_CERT);
+
+    let output = run_probe(&[(CODEX_CA_CERT_ENV, restricted_path.as_path())]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("AUX policy"), "stderr:\n{stderr}");
 }
 
 #[test]

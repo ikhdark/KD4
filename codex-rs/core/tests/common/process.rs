@@ -63,7 +63,10 @@ pub async fn capture_contained_command(
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = ContainedChild::spawn(command).map_err(std::io::Error::other)?;
     let mut stdout_pipe = child.stdout.take().expect("piped stdout");
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");
@@ -76,8 +79,15 @@ pub async fn capture_contained_command(
     let mut status = None;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if stdout_done && stderr_done && let Some(status) = status {
-            return Ok(std::process::Output { status, stdout, stderr });
+        if stdout_done
+            && stderr_done
+            && let Some(status) = status
+        {
+            return Ok(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
         tokio::select! {
             biased;
@@ -241,7 +251,9 @@ mod native {
             anyhow::bail!("failed to open process {pid}: {error}");
         }
         // SAFETY: `raw` is a valid, owned process handle returned above.
-        Ok(Some(ProcessHandle(unsafe { OwnedHandle::from_raw_handle(raw) })))
+        Ok(Some(ProcessHandle(unsafe {
+            OwnedHandle::from_raw_handle(raw)
+        })))
     }
 
     impl ProcessHandle {

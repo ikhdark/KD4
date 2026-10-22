@@ -25,8 +25,10 @@ const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
 #[cfg(test)]
 fn load_session_for_import(path: &Path) -> io::Result<Option<ImportedExternalAgentSession>> {
-    Ok(load_session_for_import_with_content_sha256(path)?
-        .map(|(session, _content_sha256)| session))
+    Ok(
+        load_session_for_import_with_content_sha256(path)?
+            .map(|(session, _content_sha256)| session),
+    )
 }
 
 pub(crate) fn load_session_for_import_with_content_sha256(
@@ -224,7 +226,7 @@ mod tests {
         assert_eq!(
             turns[1].items[1],
             ThreadItem::AgentMessage {
-                id: "item-4".into(),
+                id: "item-external-import-turn-2-2".into(),
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
             }
@@ -268,7 +270,7 @@ mod tests {
         assert_eq!(
             turns[0].items.last(),
             Some(&ThreadItem::AgentMessage {
-                id: "item-3".into(),
+                id: "item-external-import-turn-1-3".into(),
                 text: EXTERNAL_SESSION_IMPORTED_MARKER.into(),
                 phase: None,
             })
@@ -543,7 +545,6 @@ mod tests {
 
         assert_eq!(imported.title.as_deref(), Some("Imported session"));
     }
-
 
     fn record(role: &str, text: &str, cwd: &Path) -> JsonValue {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);

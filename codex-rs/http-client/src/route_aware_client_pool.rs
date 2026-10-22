@@ -46,6 +46,7 @@ pub struct RouteAwareClientPool {
     http_client_factory: HttpClientFactory,
     route_class: ClientRouteClass,
     client_builder: HttpClientBuilder,
+    force_direct: bool,
     clients: Arc<Mutex<CachedRouteClients>>,
     client_build: Arc<tokio::sync::Mutex<()>>,
 }
@@ -125,6 +126,26 @@ pub enum RouteAwareRequestError {
 }
 
 impl RouteAwareRequestError {
+    /// Bounded diagnostic category, never containing URLs, credentials, paths or resolver text.
+    pub fn safe_category(&self) -> &'static str {
+        match self {
+            Self::Route(RouteAwareClientPoolError::Resolve(_)) => "route_resolution",
+            Self::Route(RouteAwareClientPoolError::Build(
+                BuildRouteAwareHttpClientError::CustomCa(_),
+            )) => "local_ca_configuration",
+            Self::Route(RouteAwareClientPoolError::Build(
+                BuildRouteAwareHttpClientError::InvalidProxyConfig { .. },
+            )) => "local_proxy_configuration",
+            Self::Route(RouteAwareClientPoolError::BuildTask(_)) => "local_client_construction",
+            Self::Build(_) => "request_validation",
+            Self::UnsupportedRedirectScheme(_) | Self::TooManyRedirects => "redirect_policy",
+            Self::Timeout => "deadline",
+            Self::Request(error) if error.is_timeout() => "deadline",
+            Self::Request(error) if error.is_connect() => "connection",
+            Self::Request(_) => "request_unknown",
+        }
+    }
+
     pub fn status(&self) -> Option<StatusCode> {
         match self {
             Self::Request(error) => error.status(),
@@ -372,9 +393,16 @@ impl RouteAwareClientPool {
             http_client_factory,
             route_class,
             client_builder,
+            force_direct: false,
             clients: Arc::new(Mutex::new(CachedRouteClients::default())),
             client_build: Arc::new(tokio::sync::Mutex::new(())),
         }
+    }
+
+    /// Forces direct routing without native or environment discovery (for sandboxed owners).
+    pub fn with_direct_routing(mut self) -> Self {
+        self.force_direct = true;
+        self
     }
 
     /// Creates a pool with the shared defaults but without URL or response-header diagnostics.
@@ -517,9 +545,13 @@ impl RouteAwareClientPool {
         request: reqwest::Request,
     ) -> Result<reqwest::Response, RouteAwareRequestError> {
         let http_client_factory = self.http_client_factory.clone();
+        let force_direct = self.force_direct;
         self.send_with_resolver(request, move |request_url| {
             let http_client_factory = http_client_factory.clone();
             async move {
+                if force_direct {
+                    return Ok(OutboundProxyRoute::Direct);
+                }
                 http_client_factory
                     .resolve_proxy_route_async(request_url)
                     .await
@@ -597,6 +629,7 @@ impl RouteAwareClientPool {
                     client.execute(request).await
                 }
             };
+            let execute_request = crate::admit_dispatch(execute_request);
             let response = match match timeout_deadline {
                 Some(timeout_deadline) => {
                     tokio::time::timeout_at(timeout_deadline, execute_request)
@@ -604,7 +637,9 @@ impl RouteAwareClientPool {
                         .map_err(|_| RouteAwareRequestError::Timeout)?
                 }
                 None => execute_request.await,
-            } {
+            }
+            .map_err(RouteAwareRequestError::Build)?
+            {
                 Ok(response) => response,
                 Err(error) => {
                     if follows_redirects_manually {
@@ -668,7 +703,8 @@ impl RouteAwareClientPool {
             .await
             .map_err(RouteAwareClientPoolError::Resolve)?;
         crate::transport::record_timing(|timing| {
-            timing.proxy_resolution = Some(timing.proxy_resolution.unwrap_or_default() + route_start.elapsed());
+            timing.proxy_resolution =
+                Some(timing.proxy_resolution.unwrap_or_default() + route_start.elapsed());
         });
         tracing::debug!(
             event.name = "codex.http.proxy_resolution",
@@ -733,7 +769,8 @@ impl RouteAwareClientPool {
 
 fn trace_client_selection(duration: Duration, client_cache_hit: bool) {
     crate::transport::record_timing(|timing| {
-        timing.client_pool_selection = Some(timing.client_pool_selection.unwrap_or_default() + duration);
+        timing.client_pool_selection =
+            Some(timing.client_pool_selection.unwrap_or_default() + duration);
     });
     // A reused client is not proof of a reused socket; never label this connection reuse.
     tracing::debug!(

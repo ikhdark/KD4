@@ -51,7 +51,7 @@ async fn marketplace_upgrade_no_longer_runs_at_top_level() -> Result<()> {
         .args(["marketplace", "upgrade"])
         .assert()
         .failure()
-        .stderr(contains("unrecognized subcommand 'upgrade'"));
+        .stderr(contains("unrecognized subcommand 'marketplace'"));
 
     Ok(())
 }

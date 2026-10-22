@@ -10,11 +10,29 @@ const DEFINITION_TABLE_KEYS: [&str; 2] = ["$defs", "definitions"];
 const SCHEMA_CHILD_KEYS: [&str; 4] = ["items", "anyOf", "oneOf", "allOf"];
 const COMPOSITION_SCHEMA_KEYS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
 const UNSUPPORTED_ASSERTION_KEYS: &[&str] = &[
-    "not", "if", "then", "else", "prefixItems", "additionalItems", "contains",
-    "minContains", "maxContains", "uniqueItems", "minProperties", "maxProperties",
-    "patternProperties", "propertyNames", "dependencies", "dependentRequired",
-    "dependentSchemas", "unevaluatedItems", "unevaluatedProperties", "$dynamicRef",
-    "$recursiveRef", "$dynamicAnchor", "$recursiveAnchor",
+    "not",
+    "if",
+    "then",
+    "else",
+    "prefixItems",
+    "additionalItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    "uniqueItems",
+    "minProperties",
+    "maxProperties",
+    "patternProperties",
+    "propertyNames",
+    "dependencies",
+    "dependentRequired",
+    "dependentSchemas",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "$dynamicRef",
+    "$recursiveRef",
+    "$dynamicAnchor",
+    "$recursiveAnchor",
 ];
 
 /// Primitive JSON Schema type names we support in tool definitions.
@@ -55,19 +73,32 @@ pub struct JsonSchema {
     pub schema_anchor: Option<String>,
     #[serde(rename = "$ref", skip_serializing_if = "Option::is_none")]
     pub schema_ref: Option<String>,
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none", serialize_with = "serialize_schema_type")]
+    #[serde(
+        rename = "type",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_schema_type"
+    )]
     pub schema_type: Option<JsonSchemaType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// Annotation only; the harness does not apply defaults to omitted arguments.
-    #[serde(default, deserialize_with = "deserialize_default_annotation", skip_serializing_if = "Option::is_none", serialize_with = "serialize_canonical_literal")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_default_annotation",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_canonical_literal"
+    )]
     pub default: Option<JsonValue>,
     /// Responses-only marker for reviewed encrypted tool parameters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<bool>,
-    #[serde(rename = "enum", skip_serializing_if = "Option::is_none", serialize_with = "serialize_canonical_literal")]
+    #[serde(
+        rename = "enum",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_canonical_literal"
+    )]
     pub enum_values: Option<Vec<JsonValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
@@ -93,7 +124,10 @@ pub struct JsonSchema {
     pub max_items: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<BTreeMap<String, JsonSchema>>,
-    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "serialize_required")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_required"
+    )]
     pub required: Option<Vec<String>>,
     #[serde(
         rename = "additionalProperties",
@@ -112,26 +146,40 @@ pub struct JsonSchema {
     pub definitions: Option<BTreeMap<String, JsonSchema>>,
 }
 
-fn deserialize_default_annotation<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<JsonValue>, D::Error> {
+fn deserialize_default_annotation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<JsonValue>, D::Error> {
     JsonValue::deserialize(deserializer).map(Some)
 }
 
 pub(crate) fn canonical_json(value: JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => JsonValue::Object(
-            map.into_iter().map(|(key, value)| (key, canonical_json(value)))
-                .collect::<BTreeMap<_, _>>().into_iter().collect(),
+            map.into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
         ),
-        JsonValue::Array(values) => JsonValue::Array(values.into_iter().map(canonical_json).collect()),
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.into_iter().map(canonical_json).collect())
+        }
         other => other,
     }
 }
 
-fn serialize_canonical_literal<T: Serialize, S: serde::Serializer>(value: &T, serializer: S) -> Result<S::Ok, S::Error> {
-    canonical_json(serde_json::to_value(value).map_err(serde::ser::Error::custom)?).serialize(serializer)
+fn serialize_canonical_literal<T: Serialize, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    canonical_json(serde_json::to_value(value).map_err(serde::ser::Error::custom)?)
+        .serialize(serializer)
 }
 
-fn serialize_required<S: serde::Serializer>(value: &Option<Vec<String>>, serializer: S) -> Result<S::Ok, S::Error> {
+fn serialize_required<S: serde::Serializer>(
+    value: &Option<Vec<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     let mut value = value.clone();
     if let Some(values) = &mut value
         && values.iter().collect::<BTreeSet<_>>().len() == values.len()
@@ -141,7 +189,10 @@ fn serialize_required<S: serde::Serializer>(value: &Option<Vec<String>>, seriali
     value.serialize(serializer)
 }
 
-fn serialize_schema_type<S: serde::Serializer>(value: &Option<JsonSchemaType>, serializer: S) -> Result<S::Ok, S::Error> {
+fn serialize_schema_type<S: serde::Serializer>(
+    value: &Option<JsonSchemaType>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     let mut value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
     normalize_set_keyword(&mut value, true);
     value.serialize(serializer)
@@ -150,9 +201,16 @@ fn serialize_schema_type<S: serde::Serializer>(value: &Option<JsonSchemaType>, s
 fn normalize_set_keyword(value: &mut JsonValue, is_type: bool) {
     if let JsonValue::Array(values) = value {
         let valid = !is_type || !values.is_empty();
-        let names = values.iter().filter_map(JsonValue::as_str).collect::<BTreeSet<_>>();
-        if valid && names.len() == values.len()
-            && (!is_type || names.iter().all(|name| schema_type_from_str(name).is_some()))
+        let names = values
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect::<BTreeSet<_>>();
+        if valid
+            && names.len() == values.len()
+            && (!is_type
+                || names
+                    .iter()
+                    .all(|name| schema_type_from_str(name).is_some()))
         {
             values.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
         }
@@ -168,14 +226,36 @@ pub(crate) fn canonical_schema(mut value: JsonValue) -> JsonValue {
                 normalize_set_keyword(value, keyword == "type");
             }
         }
-        for keyword in ["properties", "patternProperties", "$defs", "definitions", "dependentSchemas"] {
+        for keyword in [
+            "properties",
+            "patternProperties",
+            "$defs",
+            "definitions",
+            "dependentSchemas",
+        ] {
             if let Some(JsonValue::Object(children)) = map.get_mut(keyword) {
                 for child in children.values_mut() {
                     *child = canonical_schema(std::mem::take(child));
                 }
             }
         }
-        for keyword in ["items", "prefixItems", "additionalProperties", "additionalItems", "anyOf", "oneOf", "allOf", "not", "if", "then", "else", "contains", "propertyNames", "unevaluatedProperties", "unevaluatedItems"] {
+        for keyword in [
+            "items",
+            "prefixItems",
+            "additionalProperties",
+            "additionalItems",
+            "anyOf",
+            "oneOf",
+            "allOf",
+            "not",
+            "if",
+            "then",
+            "else",
+            "contains",
+            "propertyNames",
+            "unevaluatedProperties",
+            "unevaluatedItems",
+        ] {
             if let Some(child) = map.get_mut(keyword) {
                 if let JsonValue::Array(children) = child {
                     for child in children {
@@ -331,7 +411,9 @@ fn prepare_tool_input_schema(mut input_schema: JsonValue) -> Result<JsonValue, s
         && !map.contains_key("enum")
         && !map.contains_key("const")
         && !has_composition_keyword(map)
-        && ["properties", "required", "additionalProperties"].iter().any(|key| map.contains_key(*key))
+        && ["properties", "required", "additionalProperties"]
+            .iter()
+            .any(|key| map.contains_key(*key))
     {
         map.insert("type".into(), json!("object"));
     }
@@ -356,7 +438,9 @@ fn project_mcp_schema(value: &mut JsonValue) {
     if value == &JsonValue::Bool(false) {
         *value = json!({});
     }
-    let Some(map) = value.as_object_mut() else { return };
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
     if map.contains_key("patternProperties") {
         // Keys accepted by a removed pattern must not become forbidden extras.
         map.remove("additionalProperties");

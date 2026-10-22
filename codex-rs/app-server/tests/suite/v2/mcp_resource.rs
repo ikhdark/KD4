@@ -555,7 +555,6 @@ enabled = false
     Ok(())
 }
 
-
 #[tokio::test]
 async fn mcp_resource_read_returns_error_for_unknown_thread() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -836,8 +835,8 @@ impl ServerHandler for ResourceAppsMcpServer {
         let uri = request.uri;
         if uri == SKILL_MAIN_PROMPT_URI {
             self.calls.main_prompt_reads.fetch_add(1, Ordering::Relaxed);
-            return Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                     uri: SKILL_MAIN_PROMPT_URI.to_string(),
                     mime_type: Some("text/markdown".to_string()),
                     text: SKILL_CONTENTS.to_string(),
@@ -848,8 +847,8 @@ impl ServerHandler for ResourceAppsMcpServer {
         }
         if uri == SKILL_REFERENCE_URI {
             self.calls.reference_reads.fetch_add(1, Ordering::Relaxed);
-            return Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
+            return Ok(
+                ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                     uri: SKILL_REFERENCE_URI.to_string(),
                     mime_type: Some("text/markdown".to_string()),
                     text: SKILL_REFERENCE_CONTENTS.to_string(),

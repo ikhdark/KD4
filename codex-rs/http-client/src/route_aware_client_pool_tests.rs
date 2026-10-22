@@ -211,14 +211,18 @@ async fn shared_pool_isolates_concurrent_request_headers_and_cancellation() {
     let pool = manual_redirect_pool();
     let sibling = pool.clone();
     let cancelled_pool = pool.clone();
-    let mut cancelled = Box::pin(cancelled_pool.client_for_url_with_resolver(
-        "https://pending.test/responses",
-        |_| std::future::pending::<io::Result<OutboundProxyRoute>>(),
-    ));
-    assert!(std::future::Future::poll(
-        cancelled.as_mut(),
-        &mut std::task::Context::from_waker(std::task::Waker::noop()),
-    ).is_pending());
+    let mut cancelled = Box::pin(
+        cancelled_pool.client_for_url_with_resolver("https://pending.test/responses", |_| {
+            std::future::pending::<io::Result<OutboundProxyRoute>>()
+        }),
+    );
+    assert!(
+        std::future::Future::poll(
+            cancelled.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending()
+    );
 
     let request = |address, session: &'static str| {
         let mut request = reqwest::Request::new(
@@ -411,6 +415,49 @@ async fn request_timeout_covers_route_selection() {
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
         assert_eq!(pool.cached_route_count(), 0);
     }
+}
+
+#[tokio::test]
+async fn authority_change_during_route_resolution_prevents_network_dispatch() {
+    struct Guard(Arc<std::sync::RwLock<bool>>);
+    impl crate::RequestDispatchGuard for Guard {
+        fn admit(&self, dispatch: &mut dyn FnMut()) -> Result<(), String> {
+            let active = self.0.read().unwrap();
+            if !*active {
+                return Err("authentication invalidated".into());
+            }
+            dispatch();
+            Ok(())
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let request = reqwest::Request::new(
+        Method::GET,
+        format!("http://{}/responses", listener.local_addr().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    let active = Arc::new(std::sync::RwLock::new(true));
+    let guard = Arc::new(Guard(Arc::clone(&active)));
+    let pool = RouteAwareClientPool::with_builder(
+        HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        ClientRouteClass::Api,
+        HttpClientBuilder::new().timeout(Duration::from_secs(3)),
+    );
+    let result = crate::with_dispatch_guard(
+        Some(guard),
+        pool.send_with_resolver(request, |_| async {
+            tokio::task::yield_now().await;
+            *active.write().unwrap() = false;
+            Ok(OutboundProxyRoute::Direct)
+        }),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(RouteAwareRequestError::Build(message)) if message == "authentication invalidated")
+    );
+    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
 }
 
 #[tokio::test]
@@ -899,15 +946,25 @@ async fn latency_edge_benchmark() {
     let mut warm_us = Vec::new();
     for _ in 0..7 {
         let pool = RouteAwareClientPool::new(
-            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault), ClientRouteClass::Api);
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            ClientRouteClass::Api,
+        );
         let start = Instant::now();
-        let (_, first) = pool.client_for_url_with_resolver("https://localhost/responses",
-            |_| async { Ok(OutboundProxyRoute::Direct) }).await.unwrap();
+        let (_, first) = pool
+            .client_for_url_with_resolver("https://localhost/responses", |_| async {
+                Ok(OutboundProxyRoute::Direct)
+            })
+            .await
+            .unwrap();
         cold_us.push(start.elapsed().as_micros());
         let start = Instant::now();
         for _ in 0..100 {
-            let (_, next) = pool.client_for_url_with_resolver("https://localhost/responses",
-                |_| async { Ok(OutboundProxyRoute::Direct) }).await.unwrap();
+            let (_, next) = pool
+                .client_for_url_with_resolver("https://localhost/responses", |_| async {
+                    Ok(OutboundProxyRoute::Direct)
+                })
+                .await
+                .unwrap();
             assert!(first.shares_transport_with(&next));
         }
         warm_us.push(start.elapsed().as_micros() / 100);
@@ -915,11 +972,19 @@ async fn latency_edge_benchmark() {
     }
     cold_us.sort_unstable();
     warm_us.sort_unstable();
-    let result = format!("latency_edge pool: samples=7 cold_median_us={} warm_median_us={} cold_us={cold_us:?} warm_us={warm_us:?}\n", cold_us[3], warm_us[3]);
+    let result = format!(
+        "latency_edge pool: samples=7 cold_median_us={} warm_median_us={} cold_us={cold_us:?} warm_us={warm_us:?}\n",
+        cold_us[3], warm_us[3]
+    );
     eprint!("{result}");
     if let Some(path) = std::env::var_os("KD4_TRANSPORT_EDGE_OUTPUT") {
         use std::io::Write;
-        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
-            .write_all(result.as_bytes()).unwrap();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(result.as_bytes())
+            .unwrap();
     }
 }

@@ -1,5 +1,289 @@
 use super::*;
+use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_rollout::RolloutRecorder;
+
+#[tokio::test]
+async fn unapplied_correction_replays_through_later_status_query_without_reauthorizing_old_text() {
+    use crate::plan_store::AcceptedPlanInput;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::items::UserMessageItem;
+    use codex_protocol::user_input::UserInput;
+    let (session, turn) = make_session_and_context().await;
+    let accepted = |id: &str, text: &str| {
+        let mut message = UserMessageItem::new(&[UserInput::Text {
+            text: text.into(),
+            text_elements: Vec::new(),
+        }]);
+        message.id = format!("msg_user_{id}");
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(
+            codex_protocol::protocol::ItemCompletedEvent {
+                thread_id: session.thread_id,
+                turn_id: id.into(),
+                item: TurnItem::UserMessage(message),
+                completed_at_ms: 0,
+            },
+        ))
+    };
+    for compact in [false, true] {
+        let mut context = accepted_context(turn.to_turn_context_item());
+        context.turn_id = Some("original".into());
+        let plan: UpdatePlanArgs =
+            serde_json::from_value(json!({"plan":[{"step":"Deploy", "status":"pending"}]}))
+                .unwrap();
+        let mut rollout = completed_user_turn_rollout(
+            context.clone(),
+            vec![
+                accepted("original", "Deploy"),
+                RolloutItem::EventMsg(EventMsg::PlanUpdate(plan.clone())),
+            ],
+        );
+        context.turn_id = Some("correction".into());
+        rollout.extend(completed_user_turn_rollout(
+            context.clone(),
+            vec![accepted("correction", "Cancel deployment")],
+        ));
+        for index in 0..140 {
+            let id = format!("status-{index}");
+            context.turn_id = Some(id.clone());
+            rollout.extend(completed_user_turn_rollout(
+                context.clone(),
+                vec![accepted(&id, "Progress?")],
+            ));
+        }
+        context.turn_id = Some("status".into());
+        let mut status = vec![
+            accepted("status", "What is your progress?"),
+            RolloutItem::EventMsg(EventMsg::PlanUpdate(plan)),
+        ];
+        if compact {
+            status.push(RolloutItem::Compacted(CompactedItem {
+                message: "summary is not input authority".into(),
+                replacement_history: Some(Vec::new()),
+                window_number: Some(1),
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }));
+        }
+        rollout.extend(completed_user_turn_rollout(context, status));
+        session
+            .apply_rollout_reconstruction(&turn, &rollout, false)
+            .await;
+        let rebuilt = session
+            .reconstruct_history_from_rollout(&turn, &rollout)
+            .await;
+        let input = rebuilt.accepted_input.unwrap();
+        assert!(input.references().len() > 128);
+        let correction =
+            AcceptedPlanInput::from_texts("correction", ["Cancel deployment"].into_iter())
+                .references()
+                .remove(0);
+        assert!(input.references().contains(&correction));
+        let store = &session.services.plan_store;
+        let id = crate::plan_store::plan_step_id("Deploy");
+        let mut args = json!({"plan":[], "expected_revision":store.execution_snapshot().await.unwrap().revision,
+            "superseded":[{"step_id":id,"reason":"User cancelled deployment"}],
+            "scope_change_refs":{id.clone():correction}});
+        assert!(
+            store
+                .stage_tool(serde_json::from_value(args.clone()).unwrap())
+                .await
+                .is_err()
+        );
+        args["scope_change_reviewed_revision"] = json!(input.review_revision());
+        store
+            .stage_tool(serde_json::from_value(args).unwrap())
+            .await
+            .unwrap()
+            .commit();
+        assert_eq!(
+            store
+                .execution_snapshot()
+                .await
+                .unwrap()
+                .obligations
+                .superseded,
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn accepted_correction_authority_replays_and_rollback_clears_discarded_input() {
+    use crate::context::ContextualUserFragment;
+    use crate::plan_store::AcceptedPlanInput;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::items::UserMessageItem;
+    use codex_protocol::user_input::UserInput;
+    let (session, turn) = make_session_and_context().await;
+    let plan: UpdatePlanArgs = serde_json::from_value(json!({"plan":[
+        {"step":"Keep A", "status":"pending"}, {"step":"Check B", "status":"pending"}
+    ]}))
+    .unwrap();
+    let accepted = |turn_id: &str, parts: &[&str]| {
+        let mut message = UserMessageItem::new(
+            &parts
+                .iter()
+                .map(|text| UserInput::Text {
+                    text: (*text).into(),
+                    text_elements: Vec::new(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        message.id = format!("msg_user_{turn_id}");
+        let event = EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+            thread_id: session.thread_id,
+            turn_id: turn_id.into(),
+            item: TurnItem::UserMessage(message),
+            completed_at_ms: 0,
+        });
+        assert!(codex_rollout::should_persist_event_msg(
+            &event,
+            codex_protocol::protocol::ThreadHistoryMode::Legacy
+        ));
+        serde_json::from_value::<RolloutItem>(
+            serde_json::to_value(RolloutItem::EventMsg(event)).unwrap(),
+        )
+        .unwrap()
+    };
+    let text = "Skip B; retain A.\r\n保持 A";
+    for checkpoint in [false, true] {
+        let mut context = accepted_context(turn.to_turn_context_item());
+        context.turn_id = Some("first".into());
+        let mut first = completed_user_turn_rollout(
+            context.clone(),
+            vec![
+                accepted("first", &["Keep A and B"]),
+                RolloutItem::EventMsg(EventMsg::PlanUpdate(plan.clone())),
+            ],
+        );
+        context.turn_id = Some("correction".into());
+        let mut correction = vec![accepted("correction", &[text, "second exact part"])];
+        if checkpoint {
+            correction.push(RolloutItem::Compacted(CompactedItem {
+                message: "summary is not authority".into(),
+                replacement_history: Some(Vec::new()),
+                window_number: Some(1),
+                first_window_id: None,
+                previous_window_id: None,
+                window_id: None,
+            }));
+        }
+        first.extend(completed_user_turn_rollout(context.clone(), correction));
+        // Cross the real canonical -> legacy persistence ordering too.
+        let mut with_legacy_fanout = Vec::new();
+        for item in first {
+            let fanout = match &item {
+                RolloutItem::EventMsg(event @ EventMsg::ItemCompleted(_)) => {
+                    event.as_legacy_events(false)
+                }
+                _ => Vec::new(),
+            };
+            with_legacy_fanout.push(item);
+            with_legacy_fanout.extend(fanout.into_iter().map(RolloutItem::EventMsg));
+        }
+        let mut first = with_legacy_fanout;
+        session
+            .apply_rollout_reconstruction(&turn, &first, false)
+            .await;
+        let rebuilt = session
+            .reconstruct_history_from_rollout(&turn, &first)
+            .await;
+        let mut expected =
+            AcceptedPlanInput::from_texts("correction", [text, "second exact part"].into_iter());
+        expected.retain_earlier(&AcceptedPlanInput::from_texts(
+            "first",
+            ["Keep A and B"].into_iter(),
+        ));
+        assert_eq!(rebuilt.accepted_input, Some(expected));
+        let store = &session.services.plan_store;
+        let (_, lineage) = store.snapshot_with_lineage().await.unwrap();
+        let b = lineage.step_id("Check B");
+        let revision = store.execution_snapshot().await.unwrap().revision;
+        let mut retire = json!({"expected_revision":revision,"plan":[{"step":"Keep A","status":"pending"}],
+            "superseded":[{"step_id":b,"reason":"User removed B"}],
+            "scope_change_instructions":{b.clone():text}});
+        assert!(
+            store
+                .stage_tool(serde_json::from_value(retire.clone()).unwrap())
+                .await
+                .is_ok()
+        );
+        first.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )));
+        session
+            .apply_rollout_reconstruction(&turn, &first, false)
+            .await;
+        retire["expected_revision"] = json!(store.execution_snapshot().await.unwrap().revision);
+        let error = store
+            .stage_tool(serde_json::from_value(retire).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("scope change"), "{error}");
+        let rebuilt = session
+            .reconstruct_history_from_rollout(&turn, &first)
+            .await;
+        assert_eq!(
+            rebuilt.accepted_input,
+            Some(AcceptedPlanInput::from_texts(
+                "first",
+                ["Keep A and B"].into_iter()
+            ))
+        );
+        // A truly newer legacy-only correction has no trustworthy original
+        // text-part provenance; it must not resurrect the prior native input.
+        first.extend(completed_user_turn_rollout(
+            {
+                let mut context = accepted_context(turn.to_turn_context_item());
+                context.turn_id = Some("legacy-only".into());
+                context
+            },
+            Vec::new(),
+        ));
+        session
+            .apply_rollout_reconstruction(&turn, &first, false)
+            .await;
+        assert!(
+            !store
+                .task_state(false)
+                .await
+                .body()
+                .contains("accepted_input_refs")
+        );
+        // Image-only/empty accepted input supersedes old text; context and
+        // summary-only messages never acquire authorization.
+        context.turn_id = Some("empty".into());
+        first.extend(completed_user_turn_rollout(
+            context,
+            vec![
+                accepted("empty", &[]),
+                RolloutItem::ResponseItem(user_message(text)),
+            ],
+        ));
+        session
+            .apply_rollout_reconstruction(&turn, &first, false)
+            .await;
+        assert!(
+            !store
+                .task_state(false)
+                .await
+                .body()
+                .contains("accepted_input_refs")
+        );
+        session
+            .apply_rollout_reconstruction(&turn, &[], false)
+            .await;
+        assert!(
+            !store
+                .task_state(false)
+                .await
+                .body()
+                .contains("accepted_input_refs")
+        );
+    }
+}
 
 use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
@@ -25,6 +309,126 @@ use serde_json::json;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+fn native_command_record(id: u32, artifact: Option<&str>) -> RolloutItem {
+    use codex_protocol::items::CommandExecutionItem;
+    use codex_protocol::items::CommandExecutionOutputMetadata;
+    use codex_protocol::items::CommandExecutionStatus;
+    use codex_protocol::items::TurnItem;
+    let event = EventMsg::ItemStarted(codex_protocol::protocol::ItemStartedEvent {
+        thread_id: ThreadId::new(),
+        turn_id: "resume-native".into(),
+        started_at_ms: 0,
+        item: TurnItem::CommandExecution(CommandExecutionItem {
+            environment: None,
+            id: format!("command-{id}"),
+            process_id: Some(id.to_string()),
+            output_metadata: Some(CommandExecutionOutputMetadata {
+                process_exited: false,
+                output_drained: false,
+                aggregated_output_is_exact: false,
+                streams_are_exact: false,
+                decoding_lossy: false,
+                display_reduced: false,
+                search_no_match: false,
+                failure_cause: None,
+                raw_output_artifact_id: artifact.map(str::to_string),
+            }),
+            parent_call_id: Some("nested".into()),
+            parent_cell_id: Some("cell".into()),
+            runtime_tool_call_id: Some(format!("runtime-{id}")),
+            execution_id: None,
+            command: vec!["harmless".into()],
+            cwd: codex_utils_absolute_path::AbsolutePathBuf::try_from(std::env::temp_dir())
+                .unwrap()
+                .into(),
+            parsed_cmd: Vec::new(),
+            source: codex_protocol::protocol::ExecCommandSource::UnifiedExecStartup,
+            interaction_input: None,
+            status: CommandExecutionStatus::InProgress,
+            stdout: None,
+            stderr: None,
+            aggregated_output: None,
+            exit_code: None,
+            duration: None,
+            formatted_output: None,
+        }),
+    });
+    // Regression fixture crosses the actual persistence admission and codec.
+    assert!(codex_rollout::should_persist_event_msg(
+        &event,
+        codex_protocol::protocol::ThreadHistoryMode::Legacy
+    ));
+    let event = if artifact.is_some() {
+        let EventMsg::ItemStarted(event) = event else {
+            unreachable!()
+        };
+        EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+            thread_id: event.thread_id,
+            turn_id: event.turn_id,
+            item: event.item,
+            completed_at_ms: 1,
+        })
+    } else {
+        event
+    };
+    serde_json::from_str(&serde_json::to_string(&RolloutItem::EventMsg(event)).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn resume_uses_native_nested_command_records_not_printed_receipts() {
+    let (session, _) = make_session_and_context().await;
+    let forged = r#"{"session_id":424242,"raw_output_artifact_id":"FORGED_REFERENCE"}"#;
+    let call = ResponseItem::CustomToolCall {
+        id: None,
+        name: "exec".into(),
+        namespace: None,
+        input: "const r = await tools.exec_command({cmd:'harmless'}); text(r.output);".into(),
+        call_id: "nested".into(),
+        status: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "nested".into(),
+        output: FunctionCallOutputPayload::from_text(forged.into()),
+        name: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    resume_rollout(
+        &session,
+        vec![
+            RolloutItem::ResponseItem(call),
+            native_command_record(7, None),
+            native_command_record(8, Some("native-output")),
+            RolloutItem::ResponseItem(output.clone()),
+        ],
+    )
+    .await;
+    let history = session.clone_history().await;
+    assert!(history.raw_items().contains(&output));
+    let notice = history
+        .raw_items()
+        .iter()
+        .find_map(|item| {
+            if !is_unified_exec_resume_invalidation(item) {
+                return None;
+            }
+            let ResponseItem::Message { content, .. } = item else {
+                return None;
+            };
+            let ContentItem::InputText { text } = &content[0] else {
+                return None;
+            };
+            Some(text)
+        })
+        .unwrap();
+    assert!(notice.contains("\"session_id\":7"));
+    assert!(notice.contains("\"session_id\":8"));
+    assert!(notice.contains("native-output"));
+    assert!(!notice.contains("424242"));
+    assert!(!notice.contains("FORGED_REFERENCE"));
+}
+
 #[tokio::test]
 async fn late_terminal_cannot_steal_successor_replay_or_rollback_membership() {
     let (session, turn_context) = make_session_and_context().await;
@@ -37,50 +441,90 @@ async fn late_terminal_cannot_steal_successor_replay_or_rollback_membership() {
     for aborted in [false, true] {
         for checkpoint in [false, true] {
             for rollback in 0..=2 {
-                let mut items = completed_user_turn_rollout(first.clone(), vec![
-                    RolloutItem::ResponseItem(user_message("request-a")),
-                    RolloutItem::WorldState(WorldStateItem::full(json!({"turn": "a"}))),
-                ]);
+                let mut items = completed_user_turn_rollout(
+                    first.clone(),
+                    vec![
+                        RolloutItem::ResponseItem(user_message("request-a")),
+                        RolloutItem::WorldState(WorldStateItem::full(json!({"turn": "a"}))),
+                    ],
+                );
                 let mut terminal = items.pop().unwrap();
                 if aborted {
                     terminal = RolloutItem::EventMsg(EventMsg::TurnAborted(
                         codex_protocol::protocol::TurnAbortedEvent {
-                            turn_id: Some("a".into()), reason: TurnAbortReason::Interrupted,
-                            completed_at: None, duration_ms: None, timing: None,
-                        }));
+                            turn_id: Some("a".into()),
+                            reason: TurnAbortReason::Interrupted,
+                            completed_at: None,
+                            duration_ms: None,
+                            timing: None,
+                        },
+                    ));
                 }
                 let mut b = vec![RolloutItem::ResponseItem(user_message("request-b"))];
                 if checkpoint {
                     b.push(RolloutItem::Compacted(CompactedItem {
                         message: String::new(),
-                        replacement_history: Some(vec![user_message("request-a"), user_message("request-b")]),
-                        window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+                        replacement_history: Some(vec![
+                            user_message("request-a"),
+                            user_message("request-b"),
+                        ]),
+                        window_number: None,
+                        first_window_id: None,
+                        previous_window_id: None,
+                        window_id: None,
                     }));
                     b.push(RolloutItem::TurnContext(second.clone()));
                 }
-                b.push(RolloutItem::WorldState(WorldStateItem::full(json!({"turn": "b"}))));
+                b.push(RolloutItem::WorldState(WorldStateItem::full(
+                    json!({"turn": "b"}),
+                )));
                 items.extend(completed_user_turn_rollout(second.clone(), b));
                 items.push(terminal);
                 items.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
                     codex_protocol::protocol::TurnAbortedEvent {
-                        turn_id: Some("unrelated-terminal".into()), reason: TurnAbortReason::Interrupted,
-                        completed_at: None, duration_ms: None, timing: None,
-                    })));
+                        turn_id: Some("unrelated-terminal".into()),
+                        reason: TurnAbortReason::Interrupted,
+                        completed_at: None,
+                        duration_ms: None,
+                        timing: None,
+                    },
+                )));
                 if rollback != 0 {
                     items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-                        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: rollback })));
+                        codex_protocol::protocol::ThreadRolledBackEvent {
+                            num_turns: rollback,
+                        },
+                    )));
                 }
-                let rebuilt = session.reconstruct_history_from_rollout(&turn_context, &items).await;
+                let rebuilt = session
+                    .reconstruct_history_from_rollout(&turn_context, &items)
+                    .await;
                 let expected = match rollback {
                     0 => vec![user_message("request-a"), user_message("request-b")],
                     1 => vec![user_message("request-a")],
                     _ => Vec::new(),
                 };
                 assert_eq!(rebuilt.history, expected);
-                assert_eq!(rebuilt.previous_turn_settings.map(|settings| settings.model),
-                    match rollback { 0 => Some("model-b".into()), 1 => Some("model-a".into()), _ => None });
-                assert_eq!(rebuilt.world_state_baseline.map(|state| serde_json::to_value(state).unwrap()),
-                    match rollback { 0 => Some(json!({"turn":"b"})), 1 => Some(json!({"turn":"a"})), _ => None });
+                assert_eq!(
+                    rebuilt
+                        .previous_turn_settings
+                        .map(|settings| settings.model),
+                    match rollback {
+                        0 => Some("model-b".into()),
+                        1 => Some("model-a".into()),
+                        _ => None,
+                    }
+                );
+                assert_eq!(
+                    rebuilt
+                        .world_state_baseline
+                        .map(|state| serde_json::to_value(state).unwrap()),
+                    match rollback {
+                        0 => Some(json!({"turn":"b"})),
+                        1 => Some(json!({"turn":"a"})),
+                        _ => None,
+                    }
+                );
             }
         }
     }
@@ -172,9 +616,17 @@ async fn continuity_loader_gap_survives_checkpoints_with_reserved_origin() {
     crate::stable_context::normalize_provider_context_item_id(&mut provider);
     assert!(!codex_rollout::is_rollout_reconstruction_notice(&quoted));
     assert!(!codex_rollout::is_rollout_reconstruction_notice(&provider));
-    let normalized = provider.clone();
-    crate::stable_context::normalize_provider_context_item_id(&mut provider);
-    assert_eq!(provider, normalized);
+    // `msg_provider_` is itself reserved (stable_context_tests): re-ingesting the
+    // escaped ID escapes it again and still gains no notice identity.
+    let mut renormalized = provider.clone();
+    crate::stable_context::normalize_provider_context_item_id(&mut renormalized);
+    assert_ne!(
+        renormalized, provider,
+        "raw IDs resembling an escape must be escaped too; ingress normalizes exactly once"
+    );
+    assert!(!codex_rollout::is_rollout_reconstruction_notice(
+        &renormalized
+    ));
     for local in [false, true] {
         let mut history = initial.clone();
         for _ in 0..3 {
@@ -267,7 +719,7 @@ fn assistant_message(text: &str) -> ResponseItem {
 }
 
 #[test]
-fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
+fn printed_receipt_format_never_establishes_resume_handles() {
     let record = json!({"session_id": 42, "raw_output_artifact_id": "saved",
         "nested_commands": [{"tool": "exec_command", "session_id": 43, "raw_output_artifact_id": "nested-saved"}]});
     // Framing a complete receipt with status text must not discard the nested
@@ -302,23 +754,8 @@ fn resume_handles_match_for_json_record_pretty_json_and_json_lines() {
         };
         let evidence: serde_json::Value =
             serde_json::from_str(text.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
-        assert_eq!(evidence["recorded_process_handles"][0]["session_id"], 42);
-        assert_eq!(
-            evidence["recorded_process_handles"][0]["raw_output_artifact_id"],
-            "saved"
-        );
-        assert_eq!(
-            evidence["recorded_process_handles"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        assert_eq!(evidence["recorded_process_handles"][1]["session_id"], 43);
-        assert_eq!(
-            evidence["recorded_process_handles"][1]["raw_output_artifact_id"],
-            "nested-saved"
-        );
+        assert_eq!(evidence["recorded_process_handles"], json!([]));
+        assert_eq!(evidence["omitted_handle_count"], 0);
     }
 }
 
@@ -387,7 +824,10 @@ fn accepted_context(mut item: TurnContextItem) -> TurnContextItem {
     item
 }
 
-fn inter_agent_assistant_message(text: &str) -> ResponseItem {
+/// The records `record_inter_agent_communication` persists for a delivered
+/// instruction. Trigger provenance is typed; an assistant message carrying the
+/// same JSON is never an instruction-turn boundary.
+fn inter_agent_instruction_records(text: &str) -> [RolloutItem; 2] {
     let communication = InterAgentCommunication::new(
         AgentPath::root(),
         AgentPath::root().join("worker").unwrap(),
@@ -395,15 +835,10 @@ fn inter_agent_assistant_message(text: &str) -> ResponseItem {
         text.to_string(),
         /*trigger_turn*/ true,
     );
-    ResponseItem::Message {
-        id: None,
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: serde_json::to_string(&communication).unwrap(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }
+    [
+        RolloutItem::InterAgentCommunicationMetadata { trigger_turn: true },
+        RolloutItem::ResponseItem(communication.to_model_input_item()),
+    ]
 }
 
 #[tokio::test]
@@ -449,9 +884,12 @@ async fn reconstruct_history_ignores_tool_manifest_records() {
         history,
         plan: _,
         plan_lineage: _,
+        accepted_input: _,
         previous_turn_settings: _,
         reference_context_item: _,
         world_state_baseline: _,
+        additional_context: _,
+        repository_sources: _,
         window_number: _,
         first_window_id: _,
         previous_window_id: _,
@@ -844,6 +1282,329 @@ async fn nested_plan_handler_persists_checklist_for_resume() {
         restored.services.plan_store.update(expected).await.effect,
         crate::plan_store::PlanUpdateEffect::NoOp
     );
+}
+
+#[tokio::test]
+async fn audit32_cross_turn_noop_recovers_only_matching_surviving_lineage() {
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::registry::ToolExecutor;
+    for case in [
+        "same_turn",
+        "later_turn",
+        "several_turns",
+        "checkpoint",
+        "rolled_back_noop",
+        "different_revision",
+        "rolled_back_donor",
+    ] {
+        let (session, turn) = make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let plan = checklist("visible completed work");
+        let mut plan = plan;
+        plan.plan[0].status = codex_protocol::plan_tool::StepStatus::Completed;
+        let mut seed = crate::plan_store::PlanLineage::default();
+        seed.requirements.insert(
+            "original-orphan".into(),
+            crate::plan_store::PlanRequirement {
+                text: "Original unfinished requirement".into(),
+                status: codex_protocol::plan_tool::StepStatus::Pending,
+                superseded_reason: Some("Unaccepted retirement proposal".into()),
+            },
+        );
+        session
+            .services
+            .plan_store
+            .restore_with_lineage(Some(plan.clone()), Some(seed))
+            .await;
+        let (plan, lineage) = session
+            .services
+            .plan_store
+            .snapshot_with_lineage()
+            .await
+            .unwrap();
+        let revision = session
+            .services
+            .plan_store
+            .execution_snapshot()
+            .await
+            .unwrap()
+            .revision;
+        let durable = json!({"current_plan":plan, "lineage":lineage.compact_for_plan(&plan),
+            "lineage_complete":true, "revision":revision});
+        // Exercise the actual handler's no-op response, not a hand-authored projection.
+        // Mark the restored ledger durable first, so this call publishes nothing.
+        session
+            .services
+            .plan_store
+            .stage_tool(
+                serde_json::from_value(json!({
+                    "expected_revision":revision, "plan":plan.plan
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .commit_published();
+        let payload = ToolPayload::Function {
+            arguments: json!({
+                "expected_revision":revision, "plan":plan.plan
+            })
+            .to_string(),
+        };
+        let output = crate::tools::handlers::PlanHandler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "audit32-noop".into(),
+                tool_name: codex_tools::ToolName::plain("update_plan"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap();
+        let mut active = output.code_mode_result(&payload);
+        assert_eq!(active["effect"], "no_op");
+        assert_eq!(active["lineage_complete"], false);
+        if case == "different_revision" {
+            active["revision"] = json!("different-authority-with-identical-rows");
+        }
+        let call = RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            name: "update_plan".into(),
+            namespace: None,
+            arguments: serde_json::to_string(&plan).unwrap(),
+            call_id: "audit32-noop".into(),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        let result = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "audit32-noop".into(),
+            output: FunctionCallOutputPayload::from_text(active.to_string()),
+            internal_chat_message_metadata_passthrough: None,
+        });
+        let mut context = accepted_context(turn.to_turn_context_item());
+        context.turn_id = Some("audit32-source".into());
+        let mut first = vec![RolloutItem::ResponseItem(
+            crate::plan_store::plan_snapshot_item(&durable),
+        )];
+        if case == "same_turn" {
+            first.extend([call.clone(), result.clone()]);
+        }
+        let mut rollout = completed_user_turn_rollout(context.clone(), first);
+        if case == "rolled_back_donor" {
+            rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+            )));
+        }
+        if case != "same_turn" {
+            for index in 0..if case == "several_turns" { 3 } else { 1 } {
+                context.turn_id = Some(format!("audit32-noop-{index}"));
+                let mut records = vec![call.clone(), result.clone()];
+                if case == "checkpoint" {
+                    records.push(RolloutItem::Compacted(CompactedItem {
+                        message: String::new(),
+                        replacement_history: Some(Vec::new()),
+                        window_number: Some(1),
+                        first_window_id: None,
+                        previous_window_id: None,
+                        window_id: None,
+                    }));
+                    records.push(RolloutItem::TurnContext(context.clone()));
+                }
+                rollout.extend(completed_user_turn_rollout(context.clone(), records));
+            }
+        }
+        if case == "rolled_back_noop" {
+            rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+            )));
+        }
+        let rebuilt = session
+            .reconstruct_history_from_rollout(&turn, &rollout)
+            .await;
+        if matches!(case, "different_revision" | "rolled_back_donor") {
+            assert!(rebuilt.plan_lineage.is_none(), "{case}");
+            assert!(
+                serde_json::to_string(&rebuilt.history)
+                    .unwrap()
+                    .contains("<plan_reconstruction_gap>")
+            );
+        } else {
+            assert_eq!(rebuilt.plan, Some(plan.clone()), "{case}");
+            assert_eq!(rebuilt.plan_lineage, Some(lineage.clone()), "{case}");
+            session
+                .services
+                .plan_store
+                .restore_with_lineage(None, None)
+                .await;
+            session
+                .apply_rollout_reconstruction(&turn, &rollout, false)
+                .await;
+            assert_eq!(
+                session.services.plan_store.snapshot_with_lineage().await,
+                Some((plan, lineage)),
+                "{case}"
+            );
+            assert_eq!(
+                session
+                    .services
+                    .plan_store
+                    .execution_snapshot()
+                    .await
+                    .unwrap()
+                    .revision,
+                revision,
+                "{case}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn audit32_review_markers_exclude_foreign_events_but_not_parent_updates() {
+    use codex_protocol::items::EnteredReviewModeItem;
+    use codex_protocol::items::ExitedReviewModeItem;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::protocol::EnteredReviewModeEvent;
+    use codex_protocol::protocol::ExitedReviewModeEvent;
+    use codex_protocol::protocol::ItemCompletedEvent;
+    use codex_protocol::protocol::ReviewTarget;
+    for markers in ["legacy", "items", "both", "unmarked"] {
+        for rollback in [false, true] {
+            let (session, turn) = make_session_and_context().await;
+            let parent = checklist("parent unfinished work");
+            session
+                .services
+                .plan_store
+                .restore(Some(parent.clone()))
+                .await;
+            let (_, lineage) = session
+                .services
+                .plan_store
+                .snapshot_with_lineage()
+                .await
+                .unwrap();
+            let revision = session
+                .services
+                .plan_store
+                .execution_snapshot()
+                .await
+                .unwrap()
+                .revision;
+            let durable = json!({"current_plan":parent, "lineage":lineage.compact_for_plan(&parent),
+                "lineage_complete":true, "revision":revision});
+            let mut context = accepted_context(turn.to_turn_context_item());
+            context.turn_id = Some("audit32-parent".into());
+            let mut rollout = completed_user_turn_rollout(
+                context.clone(),
+                vec![RolloutItem::ResponseItem(
+                    crate::plan_store::plan_snapshot_item(&durable),
+                )],
+            );
+            context.turn_id = Some("audit32-review".into());
+            let target = ReviewTarget::Custom {
+                instructions: "Review the patch".into(),
+            };
+            let mut review = Vec::new();
+            if matches!(markers, "legacy" | "both") {
+                review.push(RolloutItem::EventMsg(EventMsg::EnteredReviewMode(
+                    EnteredReviewModeEvent {
+                        target: target.clone(),
+                        user_facing_hint: None,
+                        turn_id: None,
+                        item_id: None,
+                    },
+                )));
+            }
+            if matches!(markers, "items" | "both") {
+                review.push(RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                    ItemCompletedEvent {
+                        thread_id: session.thread_id(),
+                        turn_id: "audit32-review".into(),
+                        item: TurnItem::EnteredReviewMode(EnteredReviewModeItem {
+                            id: "enter-review".into(),
+                            target,
+                            user_facing_hint: "Review patch".into(),
+                        }),
+                        completed_at_ms: 0,
+                    },
+                )));
+            }
+            let mut child = checklist("independent review finished");
+            child.plan[0].status = codex_protocol::plan_tool::StepStatus::Completed;
+            review.push(RolloutItem::EventMsg(EventMsg::PlanUpdate(child.clone())));
+            if matches!(markers, "items" | "both") {
+                review.push(RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                    ItemCompletedEvent {
+                        thread_id: session.thread_id(),
+                        turn_id: "audit32-review".into(),
+                        item: TurnItem::ExitedReviewMode(ExitedReviewModeItem {
+                            id: "exit-review".into(),
+                            review_output: None,
+                        }),
+                        completed_at_ms: 0,
+                    },
+                )));
+            }
+            if matches!(markers, "legacy" | "both") {
+                review.push(RolloutItem::EventMsg(EventMsg::ExitedReviewMode(
+                    ExitedReviewModeEvent {
+                        turn_id: None,
+                        item_id: None,
+                        review_output: None,
+                    },
+                )));
+            }
+            rollout.extend(completed_user_turn_rollout(context.clone(), review));
+            if rollback {
+                rollout.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                    codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+                )));
+            }
+            let rebuilt = session
+                .reconstruct_history_from_rollout(&turn, &rollout)
+                .await;
+            let expected = if markers == "unmarked" && !rollback {
+                child
+            } else {
+                parent
+            };
+            assert_eq!(
+                rebuilt.plan,
+                Some(expected),
+                "{markers}, rollback={rollback}"
+            );
+            if markers != "unmarked" || rollback {
+                assert_eq!(rebuilt.plan_lineage, Some(lineage));
+            }
+            assert!(
+                !serde_json::to_string(&rebuilt.history)
+                    .unwrap()
+                    .contains("<plan_reconstruction_gap>")
+            );
+            // A later genuine parent update remains authoritative.
+            let own = checklist("new parent-owned work");
+            context.turn_id = Some("audit32-own".into());
+            rollout.extend(completed_user_turn_rollout(
+                context,
+                vec![RolloutItem::EventMsg(EventMsg::PlanUpdate(own.clone()))],
+            ));
+            assert_eq!(
+                session
+                    .reconstruct_history_from_rollout(&turn, &rollout)
+                    .await
+                    .plan,
+                Some(own)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1377,7 +2138,14 @@ fn resume_notice_lists_all_recorded_handles_and_preserves_artifact_references() 
         },
     ];
     let original = history.clone();
-    super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
+    super::rollout_reconstruction::append_unified_exec_resume_invalidation_with_rollout(
+        &mut history,
+        &[
+            native_command_record(7, Some("first-output")),
+            native_command_record(8, Some("draining-output")),
+            native_command_record(9, Some("nested-output")),
+        ],
+    );
     assert_eq!(&history[..2], original.as_slice());
     let ResponseItem::Message { content, .. } = history.last().unwrap() else {
         panic!("missing notice")
@@ -1426,7 +2194,13 @@ fn resume_notice_bounds_handle_evidence_and_reports_omissions() {
             internal_chat_message_metadata_passthrough: None,
         },
     ];
-    super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
+    let rollout = (0..40)
+        .map(|id| native_command_record(id, Some(&format!("output-{id}"))))
+        .collect::<Vec<_>>();
+    super::rollout_reconstruction::append_unified_exec_resume_invalidation_with_rollout(
+        &mut history,
+        &rollout,
+    );
     let ResponseItem::Message { content, .. } = history.last().unwrap() else {
         panic!("missing notice")
     };
@@ -1483,7 +2257,12 @@ fn resume_ignores_explicit_unrelated_receipt_owners() {
             ];
             let original = history.clone();
             super::rollout_reconstruction::append_unified_exec_resume_invalidation(&mut history);
-            assert_eq!(history, original);
+            assert_eq!(&history[..original.len()], original.as_slice());
+            assert!(
+                !serde_json::to_string(history.last().unwrap())
+                    .unwrap()
+                    .contains("session_id")
+            );
         }
     }
 }
@@ -1577,7 +2356,7 @@ async fn reloaded_process_handles_are_excluded_from_allocation() {
 }
 
 #[test]
-fn resume_does_not_invalidate_completed_or_unrelated_nested_results() {
+fn legacy_nested_results_get_only_generic_invalidation() {
     use super::rollout_reconstruction::append_unified_exec_resume_invalidation;
     for state in [
         json!({"tool": "exec_command", "process_exited": true, "polled_session_id": 1}),
@@ -1604,7 +2383,10 @@ fn resume_does_not_invalidate_completed_or_unrelated_nested_results() {
         ];
         let original = history.clone();
         append_unified_exec_resume_invalidation(&mut history);
-        assert_eq!(history, original);
+        assert_eq!(&history[..original.len()], original.as_slice());
+        let notice = serde_json::to_string(history.last().unwrap()).unwrap();
+        assert!(notice.contains("recorded_process_handles"));
+        assert!(!notice.contains("session_id"));
     }
 }
 
@@ -2350,7 +3132,8 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
         turn_id: Some(assistant_turn_id.clone()),
         ..first_context_item.clone()
     };
-    let assistant_instruction = inter_agent_assistant_message("continue");
+    let [assistant_instruction_metadata, assistant_instruction] =
+        inter_agent_instruction_records("continue");
     let assistant_reply = assistant_message("worker reply");
 
     let rollout_items = vec![
@@ -2398,7 +3181,8 @@ async fn reconstruct_history_rollback_counts_inter_agent_assistant_turns() {
             },
         )),
         RolloutItem::TurnContext(assistant_turn_context),
-        RolloutItem::ResponseItem(assistant_instruction),
+        assistant_instruction_metadata,
+        assistant_instruction,
         RolloutItem::ResponseItem(assistant_reply),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
@@ -3894,4 +4678,73 @@ async fn mixed_legacy_and_modern_rollback_preserves_legacy_turns_and_modern_stee
             }
         }
     }
+}
+#[test]
+fn ctxaudit_unsettled_recovery_distinguishes_reused_legacy_invocations() {
+    use super::rollout_reconstruction::append_unsettled_tool_recovery;
+    use super::rollout_reconstruction::unsettled_tool_recovery_page;
+    let call = |path: &str| {
+        RolloutItem::ResponseItem(ResponseItem::FunctionCall {
+            id: None,
+            call_id: "reused".into(),
+            name: "exec_command".into(),
+            namespace: None,
+            arguments: json!({"path":path}).to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        })
+    };
+    let output = RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "reused".into(),
+        output: FunctionCallOutputPayload::from_text("returned".into()),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let page = unsettled_tool_recovery_page(&[call("A"), output.clone(), call("B")], 0);
+    assert_eq!(page["unresolved_count"], 1);
+    assert_eq!(page["operations"][0]["target"], "B");
+    let page = unsettled_tool_recovery_page(&[call("A"), call("B"), output.clone()], 0);
+    assert_eq!(
+        page["unresolved_count"], 2,
+        "ambiguous legacy results settle neither invocation"
+    );
+    assert_eq!(page["operations"][0]["target"], "B");
+    assert_eq!(page["operations"][1]["target"], "A");
+    let mut history = Vec::new();
+    let source = vec![call("A")];
+    append_unsettled_tool_recovery(&mut history, &source);
+    let notice = history[0].clone();
+    assert!(crate::stable_context::is_unsettled_tool_recovery_notice(
+        &notice
+    ));
+    let mut quoted = notice.clone();
+    quoted.set_id(None);
+    assert!(!crate::stable_context::is_unsettled_tool_recovery_notice(
+        &quoted
+    ));
+    let mut provider = notice;
+    crate::stable_context::normalize_provider_context_item_id(&mut provider);
+    assert!(!crate::stable_context::is_unsettled_tool_recovery_notice(
+        &provider
+    ));
+    append_unsettled_tool_recovery(&mut history, &source);
+    assert_eq!(
+        history.len(),
+        1,
+        "resume must replace, not duplicate, its current warning"
+    );
+    let carried = history.clone();
+    append_unsettled_tool_recovery(&mut history, &[]);
+    assert_eq!(
+        history, carried,
+        "a checkpoint-only fork cannot prove inherited effects settled"
+    );
+    append_unsettled_tool_recovery(&mut history, &[call("different inherited source")]);
+    assert!(
+        history.contains(&carried[0]),
+        "an unrelated current invocation cannot settle inherited unknown effects"
+    );
+    assert_eq!(history.len(), 2);
+    let mut settled = Vec::new();
+    append_unsettled_tool_recovery(&mut settled, &[call("A"), output]);
+    assert!(settled.is_empty());
 }

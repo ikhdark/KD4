@@ -93,12 +93,12 @@ pub use codex_rollout::StateDbHandle;
 pub use codex_state::log_db::LogDbLayer;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::time::timeout;
 use toml::Value as TomlValue;
 use tracing::warn;
 
 const IN_PROCESS_CONNECTION_ID: ConnectionId = ConnectionId(0);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_REQUEST_CAPACITY: usize = 8;
 /// Default bounded channel capacity for in-process runtime queues.
 pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 
@@ -263,6 +263,7 @@ pub enum InProcessServerEvent {
 enum InProcessClientMessage {
     Request {
         request: Box<ClientRequest>,
+        trace: Option<codex_protocol::protocol::W3cTraceContext>,
         response_tx: oneshot::Sender<PendingClientRequestResponse>,
     },
     Notification {
@@ -277,13 +278,20 @@ enum InProcessClientMessage {
         error: JSONRPCErrorError,
     },
     Shutdown {
-        done_tx: oneshot::Sender<()>,
+        done_tx: oneshot::Sender<IoResult<()>>,
     },
+    #[cfg(test)]
+    PanicProcessor,
 }
 
 enum ProcessorCommand {
-    Request(Box<ClientRequest>),
+    Request {
+        request: Box<ClientRequest>,
+        trace: Option<codex_protocol::protocol::W3cTraceContext>,
+    },
     Notification(ClientNotification),
+    #[cfg(test)]
+    Panic,
 }
 
 #[derive(Clone)]
@@ -300,9 +308,20 @@ impl InProcessClientSender {
     /// produces an `INVALID_REQUEST` response and can make request routing
     /// ambiguous in the caller.
     pub async fn request(&self, request: ClientRequest) -> IoResult<PendingClientRequestResponse> {
+        self.request_with_trace(request, codex_otel::current_span_w3c_trace_context())
+            .await
+    }
+
+    /// Preserve an explicitly captured caller carrier across facade worker hops.
+    pub async fn request_with_trace(
+        &self,
+        request: ClientRequest,
+        trace: Option<codex_protocol::protocol::W3cTraceContext>,
+    ) -> IoResult<PendingClientRequestResponse> {
         let (response_tx, response_rx) = oneshot::channel();
         self.try_send_client_message(InProcessClientMessage::Request {
             request: Box::new(request),
+            trace,
             response_tx,
         })?;
         response_rx.await.map_err(|err| {
@@ -349,7 +368,20 @@ impl InProcessClientSender {
     }
 
     fn try_send_client_message(&self, message: InProcessClientMessage) -> IoResult<()> {
-        match self.client_tx.try_send(message) {
+        let control = match &message {
+            InProcessClientMessage::Request { request, .. } => {
+                request.is_control()
+                    && serde_json::to_vec(request).is_ok_and(|bytes| bytes.len() <= 64 * 1024)
+            }
+            // Client replies and lifecycle messages also need ingress progress.
+            _ => true,
+        };
+        match codex_app_server_transport::try_send_with_control_reserve(
+            &self.client_tx,
+            message,
+            control,
+            CONTROL_REQUEST_CAPACITY,
+        ) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(IoError::new(
                 ErrorKind::WouldBlock,
@@ -371,7 +403,7 @@ impl InProcessClientSender {
 pub struct InProcessClientHandle {
     client: InProcessClientSender,
     event_rx: mpsc::Receiver<InProcessServerEvent>,
-    runtime_handle: tokio::task::JoinHandle<()>,
+    runtime_handle: tokio::task::JoinHandle<IoResult<()>>,
     initialize_response: Option<codex_app_server_protocol::Result>,
     #[cfg(test)]
     _test_outgoing: std::sync::Weak<OutgoingMessageSender>,
@@ -390,31 +422,66 @@ impl InProcessClientHandle {
 
     /// Requests runtime shutdown and waits for worker termination.
     ///
-    /// Shutdown is bounded by internal timeouts and may abort background tasks
-    /// if graceful drain does not complete in time.
-    pub async fn shutdown(mut self) -> IoResult<()> {
+    /// The deadline bounds observation. Committed cleanup retains its runtime
+    /// owner even if this caller is cancelled or times out.
+    pub async fn shutdown(self) -> IoResult<()> {
+        let owner = tokio::spawn(self.shutdown_owned());
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, owner)
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::TimedOut,
+                    "in-process runtime shutdown remains owned and pending",
+                )
+            })?
+            .map_err(|error| IoError::other(format!("in-process shutdown owner failed: {error}")))?
+    }
+
+    async fn shutdown_owned(mut self) -> IoResult<()> {
         // Explicit shutdown abandons unread events. Close the receiver first so
         // a runtime task blocked on a must-deliver event can observe closure,
         // finish cleanup, and avoid leaving both transport directions stalled.
         self.event_rx.close();
         let mut runtime_handle = self.runtime_handle;
         let (done_tx, done_rx) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
 
-        if self
-            .client
-            .client_tx
-            .send(InProcessClientMessage::Shutdown { done_tx })
-            .await
-            .is_ok()
-        {
-            let _ = timeout(SHUTDOWN_TIMEOUT, done_rx).await;
-        }
+        let _acknowledgement = if matches!(
+            tokio::time::timeout_at(
+                deadline,
+                self.client
+                    .client_tx
+                    .send(InProcessClientMessage::Shutdown { done_tx }),
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            match tokio::time::timeout_at(deadline, done_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(IoError::other(
+                    "session persistence shutdown acknowledgement lost",
+                )),
+                Err(_) => Err(IoError::new(
+                    ErrorKind::TimedOut,
+                    "session persistence shutdown unconfirmed",
+                )),
+            }
+        } else {
+            Err(IoError::other(
+                "session persistence shutdown channel closed",
+            ))
+        };
 
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut runtime_handle).await {
-            runtime_handle.abort();
-            let _ = runtime_handle.await;
+        // A completed join can contain a panic; timeout success is not task success.
+        let runtime_result =
+            finish_in_process_task("runtime", &mut runtime_handle, None, deadline).await;
+        match runtime_result {
+            // Closing unread lossless delivery can finish the runtime before it
+            // consumes Shutdown. Its joined result is the authoritative barrier,
+            // including persistence, even if the queued acknowledgement was lost.
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) | Err(error) => Err(error),
         }
-        Ok(())
     }
 
     pub fn sender(&self) -> InProcessClientSender {
@@ -471,7 +538,9 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
 async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClientHandle> {
     let channel_capacity = args.channel_capacity.max(1);
     let installation_id = resolve_installation_id(&args.config.codex_home).await?;
-    let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(channel_capacity);
+    let (client_tx, mut client_rx) = mpsc::channel::<InProcessClientMessage>(
+        channel_capacity.saturating_add(CONTROL_REQUEST_CAPACITY),
+    );
     let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
     #[cfg(test)]
     let (test_outgoing_tx, test_outgoing_rx) = oneshot::channel();
@@ -525,7 +594,10 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         initialized,
                         experimental,
                         opt_outs,
-                        None,
+                        // This owner drains the single-slot writer immediately below.
+                        // Do not select deferred physical-stdio delivery: it can enqueue
+                        // after try_recv, stranding the last event without another wakeup.
+                        Some(delivery_failure.clone()),
                         delivery_failure.clone(),
                     ),
                 )]);
@@ -569,6 +641,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         );
         let outbound_shutdown = delivery_failure.clone();
         let mut outbound_handle = tokio::spawn(async move {
+            let _worker_owner = outbound_shutdown.clone().drop_guard();
             loop {
                 let envelope = tokio::select! {
                     _ = outbound_shutdown.cancelled() => break,
@@ -591,8 +664,12 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             args.arg0_paths.clone(),
             args.thread_config_loader,
         );
-        let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(channel_capacity);
+        let (processor_tx, mut processor_rx) = mpsc::channel::<ProcessorCommand>(
+            channel_capacity.saturating_add(CONTROL_REQUEST_CAPACITY),
+        );
+        let processor_lifetime = delivery_failure.clone().drop_guard();
         let mut processor_handle = tokio::spawn(async move {
+            let _worker_owner = processor_lifetime;
             let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
                 outgoing: Arc::clone(&processor_outgoing),
                 analytics_events_client,
@@ -619,7 +696,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 tokio::select! {
                     command = processor_rx.recv() => {
                         match command {
-                            Some(ProcessorCommand::Request(request)) => {
+                            Some(ProcessorCommand::Request { request, trace }) => {
                                 let was_initialized = session.initialized();
                                 processor
                                     .process_client_request(
@@ -627,6 +704,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                         *request,
                                         Arc::clone(&session),
                                         &outbound_initialized,
+                                        trace,
                                     )
                                     .await;
                                 let is_initialized = session.initialized();
@@ -655,6 +733,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             Some(ProcessorCommand::Notification(notification)) => {
                                 processor.process_client_notification(notification).await;
                             }
+                            #[cfg(test)]
+                            Some(ProcessorCommand::Panic) => panic!("processor owner sentinel"),
                             None => {
                                 break;
                             }
@@ -685,12 +765,22 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 .clear_all_listeners()
                 .await;
             processor.drain_background_tasks().await;
-            processor.thread_processor.shutdown_threads().await;
+            let result = processor
+                .thread_processor
+                .shutdown_threads_with_result()
+                .await;
+            processor.thread_processor.wait_for_background_tasks().await;
+            processor.finish_shutdown_delivery().await;
+            result
         });
         let mut pending_request_responses =
             HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
+        let mut pending_controls = HashSet::new();
         let mut shutdown_ack = None;
         let mut skipped_events = 0usize;
+        let mut notification_result = None;
+        let mut outbound_result = None;
+        let mut processor_result = None;
 
         loop {
             if delivery_failure.is_cancelled() {
@@ -698,12 +788,20 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             }
             tokio::select! {
                 _ = delivery_failure.cancelled() => break,
+                result = &mut notification_handle => { notification_result = Some(result); break; }
+                result = &mut outbound_handle => { outbound_result = Some(result); break; }
+                result = &mut processor_handle => { processor_result = Some(result); break; }
                 message = client_rx.recv() => {
                     match message {
-                        Some(InProcessClientMessage::Request { request, response_tx }) => {
+                        Some(InProcessClientMessage::Request { request, trace, response_tx }) => {
                             let request = *request;
                             let request_id = request.id().clone();
-                            let at_capacity = pending_request_responses.len() >= channel_capacity;
+                            let control = request.is_control();
+                            let at_capacity = if control {
+                                pending_controls.len() >= CONTROL_REQUEST_CAPACITY
+                            } else {
+                                pending_request_responses.len().saturating_sub(pending_controls.len()) >= channel_capacity
+                            };
                             match pending_request_responses.entry(request_id.clone()) {
                                 Entry::Vacant(entry) => {
                                     // Cancellation of a waiter does not cancel dispatched work;
@@ -716,6 +814,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                         continue;
                                     }
                                     entry.insert(response_tx);
+                                    if control { pending_controls.insert(request_id.clone()); }
                                 }
                                 Entry::Occupied(_) => {
                                     let _ = response_tx.send(Err(invalid_request(format!(
@@ -725,9 +824,13 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                 }
                             }
 
-                            match processor_tx.try_send(ProcessorCommand::Request(Box::new(request))) {
+                            match codex_app_server_transport::try_send_with_control_reserve(
+                                &processor_tx, ProcessorCommand::Request { request: Box::new(request), trace },
+                                control, CONTROL_REQUEST_CAPACITY,
+                            ) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
+                                    pending_controls.remove(&request_id);
                                     if let Some(response_tx) =
                                         pending_request_responses.remove(&request_id)
                                     {
@@ -738,6 +841,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                     }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    pending_controls.remove(&request_id);
                                     if let Some(response_tx) =
                                         pending_request_responses.remove(&request_id)
                                     {
@@ -750,7 +854,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                         }
                         Some(InProcessClientMessage::Notification { notification }) => {
-                            match processor_tx.try_send(ProcessorCommand::Notification(notification)) {
+                            match codex_app_server_transport::try_send_with_control_reserve(
+                                &processor_tx, ProcessorCommand::Notification(notification), false, CONTROL_REQUEST_CAPACITY,
+                            ) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     warn!("dropping in-process client notification (queue full)");
@@ -774,6 +880,10 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             shutdown_ack = Some(done_tx);
                             break;
                         }
+                        #[cfg(test)]
+                        Some(InProcessClientMessage::PanicProcessor) => {
+                            let _ = processor_tx.send(ProcessorCommand::Panic).await;
+                        }
                         None => {
                             break;
                         }
@@ -786,6 +896,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                     let outgoing_message = queued_message.message;
                     match outgoing_message {
                         OutgoingMessage::Response(response) => {
+                            pending_controls.remove(&response.id);
                             if let Some(response_tx) = pending_request_responses.remove(&response.id) {
                                 let _ = response_tx.send(Ok(response.result));
                             } else {
@@ -796,6 +907,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                         }
                         OutgoingMessage::Error(error) => {
+                            pending_controls.remove(&error.id);
                             if let Some(response_tx) = pending_request_responses.remove(&error.id) {
                                 let _ = response_tx.send(Err(error.error));
                             } else {
@@ -855,13 +967,14 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         }
 
         delivery_failure.cancel();
-        if timeout(SHUTDOWN_TIMEOUT, &mut notification_handle)
-            .await
-            .is_err()
-        {
-            notification_handle.abort();
-            let _ = notification_handle.await;
-        }
+        let cleanup_deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let notification_result = finish_in_process_task(
+            "notification",
+            &mut notification_handle,
+            notification_result,
+            cleanup_deadline,
+        )
+        .await;
         // Settle requests queued while lossless event delivery was blocked.
         drop(client_rx);
         drop(writer_rx);
@@ -880,18 +993,44 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             )));
         }
 
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut processor_handle).await {
-            processor_handle.abort();
-            let _ = processor_handle.await;
+        let processor_result = finish_in_process_task(
+            "processor",
+            &mut processor_handle,
+            processor_result,
+            cleanup_deadline,
+        )
+        .await
+        .and_then(|result| result);
+        let outbound_result = finish_in_process_task(
+            "outbound",
+            &mut outbound_handle,
+            outbound_result,
+            cleanup_deadline,
+        )
+        .await;
+        for (owner, result) in [
+            ("notification", &notification_result),
+            ("processor", &processor_result),
+            ("outbound", &outbound_result),
+        ] {
+            if let Err(error) = result {
+                warn!(owner, %error, "in-process worker shutdown failed");
+            }
         }
-        if let Err(_elapsed) = timeout(SHUTDOWN_TIMEOUT, &mut outbound_handle).await {
-            outbound_handle.abort();
-            let _ = outbound_handle.await;
-        }
+        // Cleanup all peers before returning the first failure.
+        let shutdown_result = notification_result
+            .and(processor_result)
+            .and(outbound_result);
 
         if let Some(done_tx) = shutdown_ack {
-            let _ = done_tx.send(());
+            let _ = done_tx.send(
+                shutdown_result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| IoError::new(error.kind(), error.to_string())),
+            );
         }
+        shutdown_result
     });
 
     #[cfg(test)]
@@ -911,6 +1050,31 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
     })
 }
 
+async fn finish_in_process_task<T>(
+    name: &str,
+    handle: &mut tokio::task::JoinHandle<T>,
+    completed: Option<std::result::Result<T, tokio::task::JoinError>>,
+    deadline: tokio::time::Instant,
+) -> IoResult<T> {
+    let joined = match completed {
+        Some(result) => result,
+        None => match tokio::time::timeout_at(deadline, &mut *handle).await {
+            Ok(result) => result,
+            Err(_) => {
+                // The enclosing retained shutdown task keeps joining actual
+                // descendants. Never abort a processor between commit and its
+                // required background/core persistence cleanup.
+                warn!(
+                    name,
+                    "in-process shutdown observation expired; owner continues draining"
+                );
+                handle.await
+            }
+        },
+    };
+    joined.map_err(|error| IoError::other(format!("in-process {name} task failed: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +1088,39 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::path::Path;
     use tempfile::TempDir;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn audit_observability_caller_trace_reaches_runtime_mailbox() {
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let sender = InProcessClientSender { client_tx };
+        let trace = codex_protocol::protocol::W3cTraceContext {
+            traceparent: Some("00-11111111111111111111111111111111-2222222222222222-00".into()),
+            tracestate: Some("vendor=value".into()),
+        };
+        let request = sender.request_with_trace(
+            ClientRequest::GetAccount {
+                request_id: RequestId::Integer(7),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            },
+            Some(trace.clone()),
+        );
+        tokio::pin!(request);
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        let InProcessClientMessage::Request {
+            trace: captured,
+            response_tx,
+            ..
+        } = client_rx.try_recv().unwrap()
+        else {
+            panic!("expected typed request");
+        };
+        assert_eq!(captured, Some(trace));
+        response_tx.send(Ok(serde_json::json!({}))).unwrap();
+        assert!(request.await.unwrap().is_ok());
+    }
 
     async fn build_test_config(codex_home: &Path) -> Config {
         let mut config = match ConfigBuilder::default()
@@ -1032,7 +1229,13 @@ mod tests {
         let loader = Arc::new(BlockingLoader::default());
         let client = start_test_client_with_loader(SessionSource::Cli, 1, loader.clone()).await;
         let sender = client.sender();
-        drop(sender.client_tx.reserve().await.expect("initialization notification drained"));
+        drop(
+            sender
+                .client_tx
+                .reserve_many(CONTROL_REQUEST_CAPACITY + 1)
+                .await
+                .expect("initialization notification drained"),
+        );
         let request = |id| ClientRequest::ThreadStart {
             request_id: RequestId::Integer(id),
             params: ThreadStartParams::default(),
@@ -1063,6 +1266,25 @@ mod tests {
         assert_eq!(
             overload.data,
             Some(serde_json::json!({"reason": "inFlightTaskCapacity", "retryable": true}))
+        );
+        assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
+        let control = timeout(
+            Duration::from_secs(2),
+            sender.request(ClientRequest::TurnInterrupt {
+                request_id: RequestId::Integer(3),
+                params: codex_app_server_protocol::TurnInterruptParams {
+                    thread_id: "not-a-thread".into(),
+                    turn_id: "turn".into(),
+                },
+            }),
+        )
+        .await
+        .expect("reserved interrupt reaches dispatch with ordinary capacity full")
+        .expect("transport")
+        .expect_err("unknown thread is rejected by the real handler");
+        assert_ne!(
+            control.code,
+            codex_app_server_protocol::OVERLOADED_ERROR_CODE
         );
         assert_eq!(loader.calls.load(Ordering::SeqCst), 1);
         loader.release.notify_one();
@@ -1144,7 +1366,12 @@ mod tests {
     async fn in_process_start_clamps_zero_channel_capacity() {
         let client =
             start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 0).await;
-        assert_eq!(client.client.client_tx.max_capacity(), 1);
+        // Zero clamps the ordinary queue to one slot; control requests keep their
+        // reserved headroom above it.
+        assert_eq!(
+            client.client.client_tx.max_capacity(),
+            1 + CONTROL_REQUEST_CAPACITY
+        );
         assert_eq!(client.event_rx.max_capacity(), 1);
         let response = timeout(Duration::from_secs(2), async {
             loop {
@@ -1184,6 +1411,24 @@ mod tests {
         use codex_app_server_protocol::ProcessOutputStream;
 
         let notifications = [
+            ServerNotification::ThreadTokenUsageUpdated(
+                codex_app_server_protocol::ThreadTokenUsageUpdatedNotification {
+                    thread_id: "usage-thread".into(), turn_id: "usage-turn".into(),
+                    token_usage: serde_json::from_value(serde_json::json!({
+                        "total":{"totalTokens":10,"inputTokens":10,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},
+                        "last":{"totalTokens":10,"inputTokens":10,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},
+                        "modelContextWindow":null,"estimatedContextTokens":null
+                    })).unwrap(),
+                }),
+            ServerNotification::ThreadTokenUsageUpdated(
+                codex_app_server_protocol::ThreadTokenUsageUpdatedNotification {
+                    thread_id: "usage-thread".into(), turn_id: "usage-turn".into(),
+                    token_usage: serde_json::from_value(serde_json::json!({
+                        "total":{"totalTokens":100,"inputTokens":100,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},
+                        "last":{"totalTokens":90,"inputTokens":90,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},
+                        "modelContextWindow":null,"estimatedContextTokens":null
+                    })).unwrap(),
+                }),
             ServerNotification::CommandExecOutputDelta(CommandExecOutputDeltaNotification {
                 process_id: "command-1".into(),
                 stream: CommandExecOutputStream::Stdout,
@@ -1197,6 +1442,10 @@ mod tests {
                 cap_reached: true,
             }),
             ServerNotification::ProcessExited(ProcessExitedNotification {
+                stdout_base64: None,
+                stderr_base64: None,
+                stdout_capture: None,
+                stderr_capture: None,
                 process_handle: "process-1".into(),
                 exit_code: 7,
                 stdout: "hello".into(),
@@ -1318,6 +1567,44 @@ mod tests {
             .expect("delivery task should finish")
             .expect("delivery task should join cleanly");
 
+        // A terminal event must arrive without a subsequent notification to wake
+        // the router, including after its lossless backpressure has cleared.
+        timeout(
+            Duration::from_secs(2),
+            outgoing.send_server_notification_to_connection_and_wait(
+                IN_PROCESS_CONNECTION_ID,
+                ServerNotification::TurnCompleted(
+                    codex_app_server_protocol::TurnCompletedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn: codex_app_server_protocol::Turn {
+                            id: "turn-1".to_string(),
+                            items: Vec::new(),
+                            items_view: codex_app_server_protocol::TurnItemsView::NotLoaded,
+                            status: codex_app_server_protocol::TurnStatus::Completed,
+                            error: None,
+                            started_at: None,
+                            completed_at: None,
+                            duration_ms: None,
+                            timing: None,
+                            surfaced_result: None,
+                        },
+                        timing: None,
+                        surfaced_result: None,
+                    },
+                ),
+            ),
+        )
+        .await
+        .expect("terminal notification should be acknowledged without another notification");
+        assert!(matches!(
+            timeout(Duration::from_secs(2), client.next_event())
+                .await
+                .expect("terminal notification should arrive without another notification"),
+            Some(InProcessServerEvent::ServerNotification(
+                ServerNotification::TurnCompleted(notification)
+            )) if notification.turn.id == "turn-1"
+        ));
+
         drop(outgoing);
         client
             .shutdown()
@@ -1407,7 +1694,66 @@ mod tests {
         timeout(Duration::from_secs(2), client.runtime_handle)
             .await
             .expect("runtime must release blocked event delivery")
-            .expect("runtime task");
+            .expect("runtime task")
+            .expect("worker cleanup completes after delivery failure");
+    }
+
+    #[tokio::test]
+    async fn in_process_join_reports_child_panics() {
+        for name in ["notification", "processor", "outbound", "runtime"] {
+            let mut child: tokio::task::JoinHandle<()> =
+                tokio::spawn(async { panic!("owned worker sentinel") });
+            let error = finish_in_process_task(
+                name,
+                &mut child,
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .expect_err("a completed failed join is not shutdown success");
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("owned worker sentinel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn processor_panic_reaches_public_shutdown() {
+        let client = start_test_client(SessionSource::Cli).await;
+        client
+            .client
+            .client_tx
+            .send(InProcessClientMessage::PanicProcessor)
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .expect("failed runtime must remain joinable")
+            .expect_err("worker panic is not graceful shutdown");
+        assert!(error.to_string().contains("processor"), "{error}");
+        assert!(
+            error.to_string().contains("processor owner sentinel"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn elapsed_shutdown_observer_retains_committed_child() {
+        let (release, wait) = oneshot::channel();
+        let mut child = tokio::spawn(async move {
+            wait.await.expect("committed child must not be aborted");
+            42
+        });
+        let mut drain = Box::pin(finish_in_process_task(
+            "processor",
+            &mut child,
+            None,
+            tokio::time::Instant::now(),
+        ));
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        release
+            .send(())
+            .expect("retained child still owns its receiver");
+        assert_eq!(drain.await.unwrap(), 42);
     }
 
     #[tokio::test]

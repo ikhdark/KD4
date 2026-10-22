@@ -309,14 +309,17 @@ impl SessionReporterImpl {
                     snapshot.total_match_count
                 },
                 scanned_file_count: snapshot.scanned_file_count,
-                walk_complete: snapshot.walk_complete,
+                walk_complete: snapshot.walk_complete
+                    && snapshot.match_complete
+                    && !snapshot.cancelled,
             },
         );
         self.shared
             .enqueue_delivery(DeliveryKind::Update, query, notification);
     }
 
-    fn send_complete(&self, query: &str) {
+    fn send_complete(&self, snapshot: &file_search::FileSearchSnapshot) {
+        let query = snapshot.query.as_str();
         if self.shared.canceled.load(Ordering::Relaxed) {
             return;
         }
@@ -332,6 +335,23 @@ impl SessionReporterImpl {
             FuzzyFileSearchSessionCompletedNotification {
                 session_id: self.shared.session_id.clone(),
                 query: query.clone(),
+                results: Some(FuzzyFileSearchResponse {
+                    files: if query.is_empty() {
+                        Vec::new()
+                    } else {
+                        collect_files(&snapshot.matches)
+                    },
+                    total_match_count: if query.is_empty() {
+                        0
+                    } else {
+                        snapshot.total_match_count
+                    },
+                    scanned_file_count: snapshot.scanned_file_count,
+                    walk_complete: snapshot.walk_complete
+                        && snapshot.match_complete
+                        && !snapshot.cancelled,
+                }),
+                cancelled: snapshot.cancelled,
             },
         );
         self.shared
@@ -344,13 +364,16 @@ impl file_search::SessionReporter for SessionReporterImpl {
         self.send_snapshot(snapshot);
     }
 
-    fn on_complete(&self, query: &str) {
-        self.send_complete(query);
+    fn on_complete(&self, _query: &str) {}
+
+    fn on_complete_snapshot(&self, snapshot: &file_search::FileSearchSnapshot) {
+        self.send_complete(snapshot);
     }
 }
 
 fn collect_files(matches: &[file_search::FileMatch]) -> Vec<FuzzyFileSearchResult> {
-    let mut files = matches
+    // The engine chooses top-k using the full relevance key. Keep its ordering.
+    matches
         .iter()
         .map(|m| {
             let file_name = m.path.file_name().unwrap_or_default();
@@ -366,14 +389,7 @@ fn collect_files(matches: &[file_search::FileMatch]) -> Vec<FuzzyFileSearchResul
                 indices: m.indices.clone(),
             }
         })
-        .collect::<Vec<_>>();
-
-    files.sort_by(file_search::cmp_by_score_desc_then_path_asc::<
-        FuzzyFileSearchResult,
-        _,
-        _,
-    >(|f| f.score, |f| f.path.as_str()));
-    files
+        .collect()
 }
 
 #[cfg(test)]
@@ -388,8 +404,66 @@ mod tests {
             FuzzyFileSearchSessionCompletedNotification {
                 session_id: "session".to_string(),
                 query: query.to_string(),
+                ..Default::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn required_completion_retains_terminal_results_when_progress_is_lost() {
+        let (tx, _rx) = mpsc::channel(1);
+        let shared = Arc::new(SessionShared {
+            connection_id: ConnectionId(1),
+            session_id: "session".into(),
+            latest_query: Mutex::new("needle".into()),
+            outgoing: Arc::new(OutgoingMessageSender::new(
+                tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            )),
+            pending_deliveries: Mutex::new(PendingDeliveries::default()),
+            delivery_ready: Notify::new(),
+            query_changed: Notify::new(),
+            delivery_cancellation: CancellationToken::new(),
+            canceled: Arc::new(AtomicBool::new(false)),
+        });
+        let reporter = SessionReporterImpl {
+            shared: shared.clone(),
+        };
+        let snapshot = file_search::FileSearchSnapshot {
+            query: "needle".into(),
+            walk_complete: true,
+            match_complete: true,
+            total_match_count: 1,
+            scanned_file_count: 2,
+            matches: vec![file_search::FileMatch {
+                score: 10,
+                path: "z/needle.rs".into(),
+                root: "/repo".into(),
+                match_type: file_search::MatchType::File,
+                indices: None,
+            }],
+            ..Default::default()
+        };
+        reporter.send_snapshot(&snapshot);
+        shared.pending_deliveries.lock().unwrap().update.take();
+        reporter.send_complete(&snapshot);
+        let notification = shared
+            .pending_deliveries
+            .lock()
+            .unwrap()
+            .take_next()
+            .unwrap()
+            .notification;
+        let ServerNotification::FuzzyFileSearchSessionCompleted(completed) = notification else {
+            panic!("completion");
+        };
+        assert_eq!(completed.query, "needle");
+        let terminal = completed
+            .results
+            .expect("terminal results must not depend on progress delivery");
+        assert!(terminal.walk_complete);
+        assert_eq!(terminal.scanned_file_count, 2);
+        assert_eq!(terminal.files[0].path, "z/needle.rs");
     }
 
     // Stopping a session drops it; a finished search emits nothing either way,

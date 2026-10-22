@@ -26,7 +26,9 @@ impl ToolOutputSchema {
                 schema.as_ref().and_then(|schema| schema.get("properties"))
             }
         };
-        properties.and_then(Value::as_object).into_iter()
+        properties
+            .and_then(Value::as_object)
+            .into_iter()
             .flat_map(|properties| properties.keys().map(String::as_str))
     }
 
@@ -65,7 +67,9 @@ impl ToolOutputSchema {
 
 impl From<Value> for ToolOutputSchema {
     fn from(value: Value) -> Self {
-        Self(OutputSchemaStorage::Json(Arc::new(crate::json_schema::canonical_schema(value))))
+        Self(OutputSchemaStorage::Json(Arc::new(
+            crate::json_schema::canonical_schema(value),
+        )))
     }
 }
 

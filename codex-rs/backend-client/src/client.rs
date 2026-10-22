@@ -50,6 +50,14 @@ pub use thread_usage::ThreadUsageBreakdownGroup;
 
 #[derive(Debug)]
 pub enum RequestError {
+    LocalAuth(anyhow::Error),
+    InvalidResponse(anyhow::Error),
+    /// Headers arrived, but the response did not complete. The request may have taken effect.
+    IncompleteResponse {
+        method: String,
+        status: StatusCode,
+        source: codex_http_client::HttpError,
+    },
     UnexpectedStatus {
         method: String,
         url: String,
@@ -63,8 +71,10 @@ pub enum RequestError {
 impl RequestError {
     pub fn status(&self) -> Option<StatusCode> {
         match self {
-            Self::UnexpectedStatus { status, .. } => Some(*status),
-            Self::Other(_) => None,
+            Self::UnexpectedStatus { status, .. } | Self::IncompleteResponse { status, .. } => {
+                Some(*status)
+            }
+            Self::Other(_) | Self::LocalAuth(_) | Self::InvalidResponse(_) => None,
         }
     }
 
@@ -76,6 +86,10 @@ impl RequestError {
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::IncompleteResponse { method, status, .. } => write!(
+                f,
+                "{method} request dispatched; response incomplete after HTTP {status}"
+            ),
             Self::UnexpectedStatus {
                 method,
                 url,
@@ -86,7 +100,9 @@ impl fmt::Display for RequestError {
                 f,
                 "{method} {url} failed: {status}; content-type={content_type}; body={body}"
             ),
-            Self::Other(err) => write!(f, "{err}"),
+            Self::Other(err) | Self::LocalAuth(err) | Self::InvalidResponse(err) => {
+                write!(f, "{err}")
+            }
         }
     }
 }
@@ -94,8 +110,11 @@ impl fmt::Display for RequestError {
 impl std::error::Error for RequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::IncompleteResponse { source, .. } => Some(source),
             Self::UnexpectedStatus { .. } => None,
-            Self::Other(err) => Some(err.as_ref()),
+            Self::Other(err) | Self::LocalAuth(err) | Self::InvalidResponse(err) => {
+                Some(err.as_ref())
+            }
         }
     }
 }
@@ -145,6 +164,7 @@ pub struct Client {
     chatgpt_account_id: Option<String>,
     chatgpt_account_is_fedramp: bool,
     path_style: PathStyle,
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl fmt::Debug for Client {
@@ -206,6 +226,7 @@ impl Client {
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,
             path_style,
+            request_timeout: None,
         }
     }
 
@@ -252,30 +273,40 @@ impl Client {
         self
     }
 
-    fn headers(&self) -> HeaderMap {
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    fn headers(&self) -> std::result::Result<HeaderMap, RequestError> {
         let mut h = HeaderMap::new();
         if let Some(ua) = &self.user_agent {
             h.insert(USER_AGENT, ua.clone());
         } else {
             h.insert(USER_AGENT, HeaderValue::from_static("codex-cli"));
         }
-        self.auth_provider.add_auth_headers(&mut h);
-        if let Some(acc) = &self.chatgpt_account_id
-            && let Ok(name) = HeaderName::from_bytes(b"ChatGPT-Account-Id")
-            && let Ok(hv) = HeaderValue::from_str(acc)
-        {
-            h.insert(name, hv);
+        self.auth_provider
+            .try_add_auth_headers(&mut h)
+            .map_err(|err| RequestError::LocalAuth(anyhow::Error::new(err)))?;
+        if let Some(acc) = &self.chatgpt_account_id {
+            let value = HeaderValue::from_str(acc)
+                .map_err(|err| RequestError::LocalAuth(anyhow::Error::new(err)))?;
+            h.insert(HeaderName::from_static("chatgpt-account-id"), value);
         }
         if self.chatgpt_account_is_fedramp
             && let Ok(name) = HeaderName::from_bytes(b"X-OpenAI-Fedramp")
         {
             h.insert(name, HeaderValue::from_static("true"));
         }
-        h
+        Ok(h)
     }
 
     fn request(&self, method: Method, url: &str) -> RouteAwareRequestBuilder {
-        self.http.request(method, url)
+        let request = self.http.request(method, url);
+        match self.request_timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
     }
 
     async fn exec_request(
@@ -284,19 +315,9 @@ impl Client {
         method: &str,
         url: &str,
     ) -> Result<(String, String)> {
-        let res = req.send().await?;
-        let status = res.status();
-        let ct = res
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let body = res.text().await.unwrap_or_default();
-        if !status.is_success() {
-            anyhow::bail!("{method} {url} failed: {status}; content-type={ct}; body={body}");
-        }
-        Ok((body, ct))
+        self.exec_request_detailed(req, method, url)
+            .await
+            .map_err(Into::into)
     }
 
     async fn exec_request_detailed(
@@ -313,7 +334,14 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = res.text().await.unwrap_or_default();
+        let body = res
+            .text()
+            .await
+            .map_err(|source| RequestError::IncompleteResponse {
+                method: method.to_string(),
+                status,
+                source: source.without_url(),
+            })?;
         if !status.is_success() {
             return Err(RequestError::UnexpectedStatus {
                 method: method.to_string(),
@@ -355,7 +383,7 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/accounts/check", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/accounts/check", self.base_url),
         };
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, _) = self.exec_request_detailed(req, "GET", &url).await?;
         serde_json::from_str(&body)
             .map_err(|_| RequestError::Other(anyhow::anyhow!("Invalid accounts response.")))
@@ -363,7 +391,7 @@ impl Client {
 
     pub async fn get_token_usage_profile(&self) -> Result<TokenUsageProfile> {
         let url = self.token_usage_profile_url();
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json(&url, &ct, &body)
     }
@@ -382,7 +410,7 @@ impl Client {
         let url = self.send_add_credits_nudge_email_url();
         let req = self
             .request(Method::POST, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&SendAddCreditsNudgeEmailRequest { credit_type });
         self.exec_request_detailed(req, "POST", &url).await?;
@@ -397,9 +425,28 @@ impl Client {
         cursor: Option<&str>,
     ) -> Result<PaginatedListTaskListItem> {
         let url = self.list_tasks_url(limit, task_filter, environment_id, cursor)?;
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json::<PaginatedListTaskListItem>(&url, &ct, &body)
+    }
+
+    pub async fn list_cloud_environments(
+        &self,
+        repo: Option<(&str, &str)>,
+    ) -> Result<Vec<crate::CloudEnvironment>> {
+        let prefix = match self.path_style {
+            PathStyle::CodexApi => "api/codex",
+            PathStyle::ChatGptApi => "wham",
+        };
+        let mut url = url::Url::parse(&format!("{}/{prefix}/environments", self.base_url))?;
+        if let Some((owner, repo)) = repo {
+            url.path_segments_mut().map_err(|_| anyhow::anyhow!("invalid environment base URL"))?
+                .extend(["by-repo", "github", owner, repo]);
+        }
+        let url = url.as_str();
+        let req = self.request(Method::GET, url).headers(self.headers()?);
+        let (body, ct) = self.exec_request_detailed(req, "GET", url).await?;
+        self.decode_json(url, &ct, &body)
     }
 
     fn list_tasks_url(
@@ -449,9 +496,10 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/tasks/{}", self.base_url, task_id),
             PathStyle::ChatGptApi => format!("{}/wham/tasks/{}", self.base_url, task_id),
         };
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         let parsed: CodeTaskDetailsResponse = self.decode_json(&url, &ct, &body)?;
+        parsed.validate_task_id(task_id)?;
         Ok((parsed, body, ct))
     }
 
@@ -470,7 +518,7 @@ impl Client {
                 self.base_url, task_id, turn_id
             ),
         };
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request(req, "GET", &url).await?;
         self.decode_json::<TurnAttemptsSiblingTurnsResponse>(&url, &ct, &body)
     }
@@ -486,10 +534,10 @@ impl Client {
             PathStyle::CodexApi => format!("{}/api/codex/config/bundle", self.base_url),
             PathStyle::ChatGptApi => format!("{}/wham/config/bundle", self.base_url),
         };
-        let req = self.request(Method::GET, &url).headers(self.headers());
+        let req = self.request(Method::GET, &url).headers(self.headers()?);
         let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
         self.decode_json::<ConfigBundleResponse>(&url, &ct, &body)
-            .map_err(RequestError::from)
+            .map_err(RequestError::InvalidResponse)
     }
 
     /// Fetch authenticated Codex user settings from the active backend route.
@@ -502,7 +550,7 @@ impl Client {
         let url = self.user_settings_url();
         let req = self
             .request(Method::GET, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(
                 CACHE_CONTROL,
                 HeaderValue::from_static("no-cache, no-store"),
@@ -518,7 +566,7 @@ impl Client {
         let url = self.workspace_messages_url();
         let req = self
             .request(Method::GET, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         let (body, ct) = self.exec_request_detailed(req, "GET", &url).await?;
         self.decode_json::<CodexWorkspaceMessagesResponse>(&url, &ct, &body)
@@ -534,10 +582,10 @@ impl Client {
         };
         let req = self
             .request(Method::POST, &url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .json(&request_body);
-        let (body, ct) = self.exec_request(req, "POST", &url).await?;
+        let (body, ct) = self.exec_request_detailed(req, "POST", &url).await?;
         // Extract id from JSON: prefer `task.id`; fallback to top-level `id` when present.
         match serde_json::from_str::<serde_json::Value>(&body) {
             Ok(v) => {
@@ -546,8 +594,10 @@ impl Client {
                     .and_then(|t| t.get("id"))
                     .and_then(|s| s.as_str())
                 {
+                    anyhow::ensure!(!id.trim().is_empty(), "POST {url} returned an empty task id");
                     Ok(id.to_string())
                 } else if let Some(id) = v.get("id").and_then(|s| s.as_str()) {
+                    anyhow::ensure!(!id.trim().is_empty(), "POST {url} returned an empty task id");
                     Ok(id.to_string())
                 } else {
                     anyhow::bail!(
@@ -1270,7 +1320,7 @@ mod tests {
             &auth,
             HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
         );
-        let headers = client.headers();
+        let headers = client.headers().expect("valid auth headers");
 
         assert_eq!(
             [
@@ -1285,6 +1335,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn malformed_cloud_credentials_never_dispatch_a_request() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let auth = CodexAuth::from_external_chatgpt_tokens(
+            "e30.e30.sig",
+            "account\ninvalid",
+            Some("enterprise"),
+        )
+        .unwrap();
+        let client = Client::from_auth(
+            server.uri(),
+            &auth,
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        );
+        assert!(matches!(
+            client.get_config_bundle().await,
+            Err(RequestError::LocalAuth(_))
+        ));
+        server.verify().await;
+    }
+
     fn test_client(base_url: &str, path_style: PathStyle) -> Client {
         Client {
             base_url: base_url.to_string(),
@@ -1297,6 +1373,7 @@ mod tests {
             chatgpt_account_id: None,
             chatgpt_account_is_fedramp: false,
             path_style,
+            request_timeout: None,
         }
     }
 }

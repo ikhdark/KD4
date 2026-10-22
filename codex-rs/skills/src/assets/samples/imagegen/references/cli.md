@@ -58,7 +58,7 @@ python "$IMAGE_GEN" edit \
 ## Guardrails
 - Use the bundled CLI directly (`python "$IMAGE_GEN" ...`) after activating the correct environment.
 - Do **not** create one-off runners (for example `gen_images.py`) unless the user explicitly asks for a custom wrapper.
-- **Never modify** `scripts/image_gen.py`. If something is missing, ask the user before doing anything else.
+- Do not modify `scripts/image_gen.py` as part of this fallback workflow. If a required capability is missing and no documented option covers it, ask for the missing decision and continue authorized independent work.
 - Do not silently downgrade from CLI `gpt-image-2` or built-in `image_gen` to CLI `gpt-image-1.5`; ask first unless the user already explicitly requested `gpt-image-1.5`, `scripts/image_gen.py`, or CLI fallback.
 
 ## Defaults

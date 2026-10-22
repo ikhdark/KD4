@@ -66,6 +66,10 @@ const RETAINED_OUTPUT_BYTES_PER_PROCESS: usize = 1024 * 1024;
 const NOTIFICATION_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const RETAINED_STDIN_WRITE_IDS_PER_PROCESS: usize = 4096;
+// Together with the existing 128-item writer queue, cap accepted stdin at
+// 129 MiB including the currently blocked write. IDs retain at most 2 MiB.
+const MAX_STDIN_CHUNK_BYTES: usize = 1024 * 1024;
+const MAX_STDIN_WRITE_ID_BYTES: usize = 256;
 const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_LOCAL_STDIN_WRITE_ID: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
@@ -81,6 +85,7 @@ struct RetainedOutputChunk {
 }
 
 struct RunningProcess {
+    start_generation: Arc<ProcessStart>,
     session: ExecCommandSession,
     tty: bool,
     pipe_stdin: bool,
@@ -97,8 +102,8 @@ struct RunningProcess {
     open_streams: usize,
     closed: bool,
     finalizing: bool,
-    metrics: Option<ProcessMetricGuard>,
-    termination_requested: bool,
+    termination_requested: Arc<std::sync::atomic::AtomicBool>,
+    failure: Option<String>,
     sandbox: SandboxType,
     sandbox_denied: bool,
 }
@@ -138,7 +143,8 @@ impl AcceptedStdinWriteIds {
             // Do not acknowledge an unknown gap or turn an expired retry into
             // a new write. The caller must reconcile, not retry with a new ID.
             return Err(invalid_params(
-                "writeId has expired from the stdin retry window; input was not written".to_string(),
+                "writeId has expired from the stdin retry window; input was not written"
+                    .to_string(),
             ));
         }
         Ok(false)
@@ -163,17 +169,43 @@ impl AcceptedStdinWriteIds {
     }
 }
 
-struct ProcessStart;
+#[derive(Default)]
+struct ProcessStart {
+    incarnation: Option<String>,
+}
 
 // Release the exact provisional entry if a connection disappears during spawn.
 // Capture the runtime at admission: an already-polled start future can be
 // dropped outside an entered runtime. Cleanup still requires that runtime alive.
-struct ProcessStartReservation {
+pub(crate) struct ProcessStartReservation {
     inner: Arc<Inner>,
     process_id: ProcessId,
     start: Arc<ProcessStart>,
     runtime: tokio::runtime::Handle,
     active: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessStartIdentity(Arc<ProcessStart>);
+
+impl ProcessStartIdentity {
+    fn matches(&self, entry: &ProcessEntry) -> bool {
+        let current = match entry {
+            ProcessEntry::Starting(start) => start,
+            ProcessEntry::Running(process) => &process.start_generation,
+        };
+        Arc::ptr_eq(current, &self.0)
+    }
+
+    pub(crate) fn has_incarnation(&self, incarnation: &str) -> bool {
+        self.0.incarnation.as_deref() == Some(incarnation)
+    }
+}
+
+impl ProcessStartReservation {
+    pub(crate) fn identity(&self) -> ProcessStartIdentity {
+        ProcessStartIdentity(Arc::clone(&self.start))
+    }
 }
 
 impl Drop for ProcessStartReservation {
@@ -216,6 +248,7 @@ pub(crate) struct LocalProcess {
 }
 
 struct LocalExecProcess {
+    identity: ProcessStartIdentity,
     process_id: ProcessId,
     backend: LocalProcess,
     wake_tx: watch::Sender<u64>,
@@ -265,14 +298,14 @@ impl LocalProcess {
                 .drain()
                 .filter_map(|(_, process)| match process {
                     ProcessEntry::Starting(_) => None,
-                    ProcessEntry::Running(process) => Some(process),
+                    ProcessEntry::Running(process) => {
+                        process.termination_requested.store(true, Ordering::Release);
+                        Some(process)
+                    }
                 })
                 .collect::<Vec<_>>()
         };
-        for mut process in remaining {
-            if let Some(metrics) = process.metrics.take() {
-                metrics.finish("terminated");
-            }
+        for process in remaining {
             let _ = process.session.terminate();
         }
     }
@@ -286,12 +319,28 @@ impl LocalProcess {
         *notification_sender = notifications;
     }
 
-    async fn start_process(
+    pub(crate) async fn reserve_start(
         &self,
-        params: ExecParams,
-    ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError> {
-        let process_id = params.process_id.clone();
-        let start = Arc::new(ProcessStart);
+        process_id: &ProcessId,
+    ) -> Result<ProcessStartReservation, JSONRPCErrorError> {
+        self.reserve_start_owned(process_id, None).await
+    }
+
+    pub(crate) async fn reserve_start_owned(
+        &self,
+        process_id: &ProcessId,
+        incarnation: Option<String>,
+    ) -> Result<ProcessStartReservation, JSONRPCErrorError> {
+        if incarnation
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 256)
+        {
+            return Err(invalid_params(
+                "incarnation must contain 1..=256 bytes".into(),
+            ));
+        }
+        let process_id = process_id.clone();
+        let start = Arc::new(ProcessStart { incarnation });
         let mut reservation = ProcessStartReservation {
             inner: Arc::clone(&self.inner),
             process_id: process_id.clone(),
@@ -302,7 +351,7 @@ impl LocalProcess {
         {
             let mut process_map = self.inner.processes.lock().await;
             if process_map.contains_key(&process_id) {
-                return Err(invalid_request(format!(
+                return Err(crate::rpc::process_start_refused(format!(
                     "process {process_id} already exists"
                 )));
             }
@@ -313,6 +362,62 @@ impl LocalProcess {
             reservation.active = true;
         }
 
+        Ok(reservation)
+    }
+
+    pub(crate) async fn process_start_identity(
+        &self,
+        process_id: &ProcessId,
+    ) -> Option<ProcessStartIdentity> {
+        self.inner
+            .processes
+            .lock()
+            .await
+            .get(process_id)
+            .map(|entry| match entry {
+                ProcessEntry::Starting(start) => ProcessStartIdentity(Arc::clone(start)),
+                ProcessEntry::Running(process) => {
+                    ProcessStartIdentity(Arc::clone(&process.start_generation))
+                }
+            })
+    }
+
+    pub(crate) async fn owned_identity(
+        &self,
+        process_id: &ProcessId,
+        incarnation: Option<&str>,
+    ) -> Result<Option<ProcessStartIdentity>, JSONRPCErrorError> {
+        let Some(incarnation) = incarnation else {
+            return Ok(None);
+        };
+        let identity = self
+            .process_start_identity(process_id)
+            .await
+            .filter(|identity| identity.0.incarnation.as_deref() == Some(incarnation))
+            .ok_or_else(|| invalid_request("process handle has expired or was replaced".into()))?;
+        Ok(Some(identity))
+    }
+
+    async fn start_process(
+        &self,
+        params: ExecParams,
+    ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError> {
+        let reservation = self.reserve_start(&params.process_id).await?;
+        self.start_process_reserved(params, reservation).await
+    }
+
+    async fn start_process_reserved(
+        &self,
+        params: ExecParams,
+        mut reservation: ProcessStartReservation,
+    ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError> {
+        let process_id = params.process_id.clone();
+        let start = Arc::clone(&reservation.start);
+        if process_id != reservation.process_id || !Arc::ptr_eq(&self.inner, &reservation.inner) {
+            return Err(invalid_request(
+                "process start reservation does not match its owner".into(),
+            ));
+        }
         // Sandbox preparation can walk filesystem trees to resolve deny globs.
         // Reserve the process ID first so termination can cancel queued preparation.
         let runtime_paths = self.runtime_paths.clone();
@@ -372,6 +477,8 @@ impl LocalProcess {
             PROCESS_EVENT_CHANNEL_CAPACITY,
             RETAINED_OUTPUT_BYTES_PER_PROCESS,
         );
+        let termination_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let metrics;
         {
             let mut process_map = self.inner.processes.lock().await;
             if !matches!(
@@ -385,9 +492,11 @@ impl LocalProcess {
                     "process {process_id} start was cancelled"
                 )));
             }
+            metrics = self.inner.telemetry.process_started();
             process_map.insert(
                 process_id.clone(),
                 ProcessEntry::Running(Box::new(RunningProcess {
+                    start_generation: Arc::clone(&start),
                     session: spawned.session,
                     tty,
                     pipe_stdin,
@@ -406,8 +515,8 @@ impl LocalProcess {
                     open_streams: 2,
                     closed: false,
                     finalizing: false,
-                    metrics: Some(self.inner.telemetry.process_started()),
-                    termination_requested: false,
+                    termination_requested: Arc::clone(&termination_requested),
+                    failure: None,
                     sandbox,
                     sandbox_denied: false,
                 })),
@@ -441,6 +550,8 @@ impl LocalProcess {
             spawned.exit_rx,
             Arc::clone(&self.inner),
             output_notify,
+            metrics,
+            termination_requested,
         ));
 
         Ok((ExecResponse { process_id }, wake_tx, events))
@@ -452,9 +563,28 @@ impl LocalProcess {
             .map(|(response, _, _)| response)
     }
 
+    pub(crate) async fn exec_reserved(
+        &self,
+        params: ExecParams,
+        reservation: ProcessStartReservation,
+    ) -> Result<ExecResponse, JSONRPCErrorError> {
+        self.start_process_reserved(params, reservation)
+            .await
+            .map(|(response, _, _)| response)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn exec_read(
         &self,
         params: ReadParams,
+    ) -> Result<ReadResponse, JSONRPCErrorError> {
+        self.exec_read_bound(params, None).await
+    }
+
+    pub(crate) async fn exec_read_bound(
+        &self,
+        params: ReadParams,
+        identity: Option<&ProcessStartIdentity>,
     ) -> Result<ReadResponse, JSONRPCErrorError> {
         let after_seq = params.after_seq.unwrap_or(0);
         let max_bytes = params.max_bytes.unwrap_or(usize::MAX);
@@ -467,6 +597,11 @@ impl LocalProcess {
                 let process = process_map.get(&params.process_id).ok_or_else(|| {
                     invalid_request(format!("unknown process id {}", params.process_id))
                 })?;
+                if identity.is_some_and(|identity| !identity.matches(process)) {
+                    return Err(invalid_request(
+                        "process handle has expired or was replaced".into(),
+                    ));
+                }
                 let ProcessEntry::Running(process) = process else {
                     return Err(invalid_request(format!(
                         "process id {} is starting",
@@ -513,7 +648,7 @@ impl LocalProcess {
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
                         closed: process.closed,
-                        failure: None,
+                        failure: process.failure.clone(),
                         output_gap: (after_seq < process.last_evicted_seq).then_some(
                             crate::protocol::ProcessOutputGap {
                                 through_seq: process.last_evicted_seq,
@@ -537,6 +672,7 @@ impl LocalProcess {
             if !response.chunks.is_empty()
                 || response.output_gap.is_some()
                 || response.closed
+                || response.failure.is_some()
                 || has_new_terminal_event
                 || tokio::time::Instant::now() >= deadline
             {
@@ -558,12 +694,28 @@ impl LocalProcess {
         self.inner.read_wait_started.notified().await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn exec_write(
         &self,
         params: WriteParams,
     ) -> Result<WriteResponse, JSONRPCErrorError> {
-        if params.write_id.is_empty() {
-            return Err(invalid_params("writeId must not be empty".to_string()));
+        self.exec_write_bound(params, None).await
+    }
+
+    pub(crate) async fn exec_write_bound(
+        &self,
+        params: WriteParams,
+        identity: Option<&ProcessStartIdentity>,
+    ) -> Result<WriteResponse, JSONRPCErrorError> {
+        if params.write_id.is_empty() || params.write_id.len() > MAX_STDIN_WRITE_ID_BYTES {
+            return Err(invalid_params(
+                "writeId must contain 1..=256 bytes; input was not accepted".to_string(),
+            ));
+        }
+        if params.chunk.0.len() > MAX_STDIN_CHUNK_BYTES {
+            return Err(invalid_params(
+                "stdin chunk exceeds the 1 MiB limit; input was not accepted".to_string(),
+            ));
         }
 
         let (writer_tx, accepted_stdin_write_ids) = {
@@ -573,6 +725,11 @@ impl LocalProcess {
                     status: WriteStatus::UnknownProcess,
                 });
             };
+            if identity.is_some_and(|identity| !identity.matches(process)) {
+                return Err(invalid_request(
+                    "process handle has expired or was replaced".into(),
+                ));
+            }
             let ProcessEntry::Running(process) = process else {
                 return Ok(WriteResponse {
                     status: WriteStatus::Starting,
@@ -612,20 +769,32 @@ impl LocalProcess {
 
         // After this synchronous send, record the write id before any further await.
         // Otherwise a cancelled RPC handler could retry and write the same bytes again.
-        permit.send(params.chunk.into_inner());
-        accepted_stdin_write_ids.remember(params.write_id);
+        // Typed local callers can supply a short Vec with an arbitrarily large
+        // spare capacity. The accepted queue owns only the bounded payload.
+        permit.send(params.chunk.into_inner().into_boxed_slice().into_vec());
+        accepted_stdin_write_ids.remember(params.write_id.into_boxed_str().into_string());
 
         Ok(WriteResponse {
             status: WriteStatus::Accepted,
         })
     }
 
-    pub(crate) async fn signal_process(
+    pub(crate) async fn signal_process_bound(
         &self,
         params: SignalParams,
+        identity: Option<&ProcessStartIdentity>,
     ) -> Result<SignalResponse, JSONRPCErrorError> {
         {
             let process_map = self.inner.processes.lock().await;
+            if identity.is_some_and(|identity| {
+                !process_map
+                    .get(&params.process_id)
+                    .is_some_and(|entry| identity.matches(entry))
+            }) {
+                return Err(invalid_request(
+                    "process handle has expired or was replaced".into(),
+                ));
+            }
             match process_map.get(&params.process_id) {
                 Some(ProcessEntry::Running(process)) => {
                     if process.exit_code.is_some() {
@@ -643,22 +812,43 @@ impl LocalProcess {
         Ok(SignalResponse {})
     }
 
+    #[cfg(test)]
     pub(crate) async fn terminate_process(
         &self,
         params: TerminateParams,
     ) -> Result<TerminateResponse, JSONRPCErrorError> {
+        self.terminate_admitted(params, None).await
+    }
+
+    pub(crate) async fn terminate_admitted(
+        &self,
+        params: TerminateParams,
+        identity: Option<ProcessStartIdentity>,
+    ) -> Result<TerminateResponse, JSONRPCErrorError> {
         let running = {
             let mut process_map = self.inner.processes.lock().await;
+            if let Some(identity) = identity {
+                let matches = match process_map.get(&params.process_id) {
+                    Some(ProcessEntry::Starting(start)) => Arc::ptr_eq(start, &identity.0),
+                    Some(ProcessEntry::Running(process)) => {
+                        Arc::ptr_eq(&process.start_generation, &identity.0)
+                    }
+                    None => false,
+                };
+                if !matches {
+                    return Ok(TerminateResponse { running: false });
+                }
+            }
             match process_map.get_mut(&params.process_id) {
                 Some(ProcessEntry::Running(process)) => {
                     if process.exit_code.is_some() {
                         return Ok(TerminateResponse { running: false });
                     }
-                    if !process.termination_requested {
+                    if !process.termination_requested.load(Ordering::Acquire) {
                         process.session.request_terminate().map_err(|err| {
                             internal_error(format!("failed to terminate process: {err}"))
                         })?;
-                        process.termination_requested = true;
+                        process.termination_requested.store(true, Ordering::Release);
                     }
                     true
                 }
@@ -679,7 +869,10 @@ fn child_env(params: &ExecParams) -> HashMap<String, String> {
         .env_policy
         .as_ref()
         .map_or_else(HashMap::new, |env_policy| {
-            shell_environment::create_env(&shell_environment_policy(env_policy), /*thread_id*/ None)
+            shell_environment::create_env(
+                &shell_environment_policy(env_policy),
+                /*thread_id*/ None,
+            )
         });
     shell_environment::apply_env_overlay(&mut env, params.env.clone());
     env
@@ -706,12 +899,18 @@ fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolic
 
 impl LocalProcess {
     async fn start(&self, params: ExecParams) -> Result<StartedExecProcess, ExecServerError> {
+        let reservation = self
+            .reserve_start(&params.process_id)
+            .await
+            .map_err(map_handler_error)?;
+        let identity = reservation.identity();
         let (response, wake_tx, events) = self
-            .start_process(params)
+            .start_process_reserved(params, reservation)
             .await
             .map_err(map_handler_error)?;
         Ok(StartedExecProcess {
             process: Arc::new(LocalExecProcess {
+                identity,
                 process_id: response.process_id,
                 backend: self.clone(),
                 wake_tx,
@@ -735,20 +934,74 @@ impl LocalExecProcess {
         wait_ms: Option<u64>,
     ) -> Result<ReadResponse, ExecServerError> {
         self.backend
-            .read(&self.process_id, after_seq, max_bytes, wait_ms)
+            .exec_read_bound(
+                ReadParams {
+                    process_id: self.process_id.clone(),
+                    after_seq,
+                    max_bytes,
+                    wait_ms,
+                },
+                Some(&self.identity),
+            )
             .await
+            .map_err(map_handler_error)
     }
 
     async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError> {
-        self.backend.write(&self.process_id, chunk).await
+        self.backend
+            .exec_write_bound(
+                WriteParams {
+                    process_id: self.process_id.clone(),
+                    chunk: chunk.into(),
+                    write_id: format!(
+                        "local-{}",
+                        NEXT_LOCAL_STDIN_WRITE_ID.fetch_add(1, Ordering::Relaxed)
+                    ),
+                },
+                Some(&self.identity),
+            )
+            .await
+            .map_err(map_handler_error)
     }
 
     async fn signal(&self, signal: ProcessSignal) -> Result<(), ExecServerError> {
-        self.backend.signal(&self.process_id, signal).await
+        self.backend
+            .signal_process_bound(
+                SignalParams {
+                    process_id: self.process_id.clone(),
+                    signal,
+                },
+                Some(&self.identity),
+            )
+            .await
+            .map_err(map_handler_error)?;
+        Ok(())
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
-        self.backend.terminate(&self.process_id).await
+        tokio::time::timeout(PROCESS_TERMINATION_TIMEOUT, async {
+            let mut wake = self.wake_tx.subscribe();
+            loop {
+                let response = self
+                    .backend
+                    .terminate_admitted(
+                        TerminateParams {
+                            process_id: self.process_id.clone(),
+                        },
+                        Some(self.identity.clone()),
+                    )
+                    .await
+                    .map_err(map_handler_error)?;
+                if !response.running {
+                    return Ok(());
+                }
+                let _ = wake.changed().await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            ExecServerError::Protocol("timed out confirming local process termination".into())
+        })?
     }
 }
 
@@ -793,24 +1046,10 @@ impl ExecProcess for LocalExecProcess {
     }
 }
 
+// Unbound by-id helpers for tests. Production handles go through
+// `LocalExecProcess`, which binds every operation to its start identity.
+#[cfg(test)]
 impl LocalProcess {
-    async fn read(
-        &self,
-        process_id: &ProcessId,
-        after_seq: Option<u64>,
-        max_bytes: Option<usize>,
-        wait_ms: Option<u64>,
-    ) -> Result<ReadResponse, ExecServerError> {
-        self.exec_read(ReadParams {
-            process_id: process_id.clone(),
-            after_seq,
-            max_bytes,
-            wait_ms,
-        })
-        .await
-        .map_err(map_handler_error)
-    }
-
     async fn write(
         &self,
         process_id: &ProcessId,
@@ -826,20 +1065,6 @@ impl LocalProcess {
         })
         .await
         .map_err(map_handler_error)
-    }
-
-    async fn signal(
-        &self,
-        process_id: &ProcessId,
-        signal: ProcessSignal,
-    ) -> Result<(), ExecServerError> {
-        self.signal_process(SignalParams {
-            process_id: process_id.clone(),
-            signal,
-        })
-        .await
-        .map_err(map_handler_error)?;
-        Ok(())
     }
 
     async fn terminate(&self, process_id: &ProcessId) -> Result<(), ExecServerError> {
@@ -887,6 +1112,7 @@ fn map_handler_error(error: JSONRPCErrorError) -> ExecServerError {
     ExecServerError::Server {
         code: error.code,
         message: error.message,
+        data: error.data,
     }
 }
 
@@ -918,7 +1144,9 @@ async fn stream_output(
                 let Some(evicted) = process.output.pop_front() else {
                     break;
                 };
-                process.last_evicted_seq = evicted.seq;
+                // A capture-loss marker may already declare a later hole; front
+                // eviction must never move the declared gap backwards past it.
+                process.last_evicted_seq = process.last_evicted_seq.max(evicted.seq);
                 process.retained_bytes = process.retained_bytes.saturating_sub(evicted.chunk.len());
             }
             let _ = process.wake_tx.send(seq);
@@ -945,7 +1173,7 @@ async fn stream_output(
         }
     }
 
-    finish_output_stream(process_id, inner).await;
+    finish_output_stream(process_id, stream, inner).await;
 }
 
 async fn watch_exit(
@@ -953,26 +1181,61 @@ async fn watch_exit(
     exit_rx: tokio::sync::oneshot::Receiver<i32>,
     inner: Arc<Inner>,
     output_notify: Arc<Notify>,
+    metrics: ProcessMetricGuard,
+    termination_requested: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let exit_code = exit_rx.await.unwrap_or(-1);
-    let tty = {
-        let mut processes = inner.processes.lock().await;
-        match processes.get_mut(&process_id) {
-            Some(ProcessEntry::Running(process)) => {
-                if let Some(metrics) = process.metrics.take() {
-                    metrics.finish(if process.termination_requested {
-                        "terminated"
-                    } else if exit_code == 0 {
-                        "success"
-                    } else {
-                        "error"
-                    });
+    let exit = exit_rx.await;
+    let observed_at = std::time::Instant::now();
+    let exit_code = match exit {
+        Ok(exit_code) => exit_code,
+        Err(_) => {
+            let message = "process exit observation lost".to_string();
+            {
+                let mut processes = inner.processes.lock().await;
+                if let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) {
+                    process.failure = Some(message.clone());
+                    process
+                        .events
+                        .publish(ExecProcessEvent::Failed(message.clone()));
+                    let _ = process.wake_tx.send(process.next_seq);
                 }
-                process.tty
             }
-            Some(ProcessEntry::Starting(_)) | None => false,
+            output_notify.notify_waiters();
+            // Do not let a blocked notification sink extend the observation lease.
+            drop(metrics);
+            if let Some(notifications) = notification_sender(&inner) {
+                let _ = notifications
+                    .notify(
+                        crate::protocol::EXEC_FAILED_METHOD,
+                        &crate::protocol::ExecFailedNotification {
+                            process_id,
+                            message,
+                        },
+                    )
+                    .await;
+            }
+            // Dropping the observation lease is unknown, not a confirmed exit.
+            return;
         }
     };
+    let (tty, requested) = {
+        let mut processes = inner.processes.lock().await;
+        let tty = match processes.get_mut(&process_id) {
+            Some(ProcessEntry::Running(process)) => process.tty,
+            Some(ProcessEntry::Starting(_)) | None => false,
+        };
+        (tty, termination_requested.load(Ordering::Acquire))
+    };
+    metrics.finish(
+        if requested {
+            "terminated"
+        } else if exit_code == 0 {
+            "success"
+        } else {
+            "error"
+        },
+        observed_at,
+    );
     if tty {
         let processes = inner.processes.lock().await;
         if let Some(ProcessEntry::Running(process)) = processes.get(&process_id) {
@@ -1014,15 +1277,54 @@ async fn watch_exit(
     maybe_emit_closed(process_id, Arc::clone(&inner)).await;
 }
 
-async fn finish_output_stream(process_id: ProcessId, inner: Arc<Inner>) {
-    {
+async fn finish_output_stream(process_id: ProcessId, stream: ExecOutputStream, inner: Arc<Inner>) {
+    let gap = {
         let mut processes = inner.processes.lock().await;
         let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
             return;
         };
-
+        let capture = process.session.output_capture();
+        let complete = match stream {
+            ExecOutputStream::Stdout => capture.stdout_complete(),
+            ExecOutputStream::Stderr => capture.stderr_complete(),
+            // Both terminal receivers report `Pty`, and one is a placeholder
+            // that closes at spawn while the terminal is still producing output.
+            // Judge the shared capture only once the last receiver has drained.
+            ExecOutputStream::Pty => process.open_streams > 1 || capture.complete(),
+        };
+        let mut gap = None;
+        if !complete {
+            // Capture loss has an ordered position of its own, even if no
+            // bytes were received. Reuse the existing live/read gap contract.
+            let through_seq = process.next_seq;
+            process.next_seq += 1;
+            process.last_evicted_seq = through_seq;
+            process
+                .events
+                .publish(ExecProcessEvent::OutputGap { through_seq });
+            let _ = process.wake_tx.send(through_seq);
+            gap = Some((through_seq, Arc::clone(&process.output_notify)));
+        }
         if process.open_streams > 0 {
             process.open_streams -= 1;
+        }
+        gap
+    };
+    if let Some((through_seq, output_notify)) = gap {
+        // Remote sessions publish strictly in sequence order. Without this
+        // notification every later event, including close, waits forever
+        // behind a sequence that was never sent.
+        output_notify.notify_waiters();
+        if let Some(notifications) = notification_sender(&inner) {
+            let _ = notifications
+                .notify(
+                    crate::protocol::EXEC_OUTPUT_GAP_METHOD,
+                    &crate::protocol::ExecOutputGapNotification {
+                        process_id: process_id.clone(),
+                        through_seq,
+                    },
+                )
+                .await;
         }
     }
 
@@ -1097,6 +1399,9 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
             return;
         }
         process.sandbox_denied = assessment.unwrap_or(false);
+        // Native custody ends at confirmed root exit plus drained readers, not
+        // at replay expiry. The record retains only replayable evidence.
+        process.session.finish();
         process.closed = true;
         let seq = process.next_seq;
         process.next_seq += 1;
@@ -1193,6 +1498,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_stdin_or_id_is_rejected_before_writer_or_dedup_mutation() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "stdin-bounds").await;
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        let accepted = {
+            let mut processes = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap()
+            else {
+                panic!("running");
+            };
+            running.pipe_stdin = true;
+            running.session = dummy_session_with_writer(writer_tx);
+            running.accepted_stdin_write_ids.clone()
+        };
+        for (bytes, id) in [
+            (MAX_STDIN_CHUNK_BYTES + 1, "legal".to_string()),
+            (1, "x".repeat(MAX_STDIN_WRITE_ID_BYTES + 1)),
+        ] {
+            let error = backend
+                .exec_write(WriteParams {
+                    process_id: process.process_id.clone(),
+                    chunk: vec![0; bytes].into(),
+                    write_id: id,
+                })
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("not accepted"));
+            assert!(writer_rx.try_recv().is_err());
+            assert!(accepted.lock().await.ids.is_empty());
+        }
+        let result = backend
+            .exec_write(WriteParams {
+                process_id: process.process_id.clone(),
+                chunk: b"exact".to_vec().into(),
+                write_id: "legal".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.status, WriteStatus::Accepted);
+        assert_eq!(writer_rx.recv().await.unwrap(), b"exact");
+        drop(process);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn expired_stdin_retry_never_reaches_the_writer() {
         for prefix in ["", "local-"] {
             let backend = LocalProcess::default();
@@ -1200,7 +1550,9 @@ mod tests {
             let (writer_tx, mut writer_rx) = mpsc::channel(1);
             {
                 let mut processes = backend.inner.processes.lock().await;
-                let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap() else {
+                let ProcessEntry::Running(running) =
+                    processes.get_mut(&process.process_id).unwrap()
+                else {
                     panic!("running process");
                 };
                 running.pipe_stdin = true;
@@ -1212,15 +1564,27 @@ mod tests {
                 write_id: format!("{prefix}{sequence}"),
             };
             for sequence in 1..=RETAINED_STDIN_WRITE_IDS_PER_PROCESS + 1 {
-                assert_eq!(backend.exec_write(request(sequence)).await.unwrap().status, WriteStatus::Accepted);
+                assert_eq!(
+                    backend.exec_write(request(sequence)).await.unwrap().status,
+                    WriteStatus::Accepted
+                );
                 assert_eq!(writer_rx.recv().await.unwrap(), b"input");
             }
             let error = backend.exec_write(request(1)).await.unwrap_err();
             assert!(error.message.contains("expired"));
-            assert!(matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            assert!(matches!(
+                writer_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
             // Recent retries still acknowledge without writing again.
-            assert_eq!(backend.exec_write(request(2)).await.unwrap().status, WriteStatus::Accepted);
-            assert!(matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+            assert_eq!(
+                backend.exec_write(request(2)).await.unwrap().status,
+                WriteStatus::Accepted
+            );
+            assert!(matches!(
+                writer_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
             drop(process);
             backend.shutdown().await;
         }
@@ -1234,7 +1598,8 @@ mod tests {
         writer_tx.send(b"occupied".to_vec()).await.unwrap();
         let accepted = {
             let mut processes = backend.inner.processes.lock().await;
-            let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap() else {
+            let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap()
+            else {
                 panic!("running process");
             };
             running.pipe_stdin = true;
@@ -1256,7 +1621,10 @@ mod tests {
         }
         assert_eq!(writer_rx.recv().await.unwrap(), b"occupied");
         assert!(pending.await.unwrap_err().message.contains("expired"));
-        assert!(matches!(writer_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         drop(process);
         backend.shutdown().await;
     }
@@ -1269,8 +1637,7 @@ mod tests {
         writer_tx.send(b"occupied".to_vec()).await.unwrap();
         {
             let mut processes = backend.inner.processes.lock().await;
-            let ProcessEntry::Running(running) =
-                processes.get_mut(&process.process_id).unwrap()
+            let ProcessEntry::Running(running) = processes.get_mut(&process.process_id).unwrap()
             else {
                 panic!("running process");
             };
@@ -1278,6 +1645,10 @@ mod tests {
             running.session = dummy_session_with_writer(writer_tx);
         }
         let handle = LocalExecProcess {
+            identity: backend
+                .process_start_identity(&process.process_id)
+                .await
+                .unwrap(),
             process_id: process.process_id.clone(),
             backend: backend.clone(),
             wake_tx: watch::channel(0).0,
@@ -1328,18 +1699,90 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn retained_handle_never_reads_or_controls_a_reused_id() {
+        let backend = LocalProcess::default();
+        let mut old = spawn_test_process(&backend, "reused-handle").await;
+        let id = old.process_id.clone();
+        let handle = {
+            let map = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(process) = map.get(&id).unwrap() else {
+                panic!("running");
+            };
+            LocalExecProcess {
+                process_id: id.clone(),
+                backend: backend.clone(),
+                identity: ProcessStartIdentity(Arc::clone(&process.start_generation)),
+                wake_tx: process.wake_tx.clone(),
+                events: process.events.clone(),
+            }
+        };
+        old.exit(7);
+        drop(old.stdout_tx);
+        drop(old.stderr_tx);
+        old.exit_watch.await.unwrap();
+        loop {
+            if matches!(backend.inner.processes.lock().await.get(&id), Some(ProcessEntry::Running(process)) if process.closed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(EXITED_PROCESS_RETENTION + Duration::from_millis(1)).await;
+        while backend.inner.processes.lock().await.contains_key(&id) {
+            tokio::task::yield_now().await;
+        }
+        let replacement = spawn_test_process(&backend, id.as_str()).await;
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        {
+            let mut map = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(process) = map.get_mut(&id).unwrap() else {
+                panic!("running");
+            };
+            process.pipe_stdin = true;
+            process.session = dummy_session_with_writer(writer_tx);
+        }
+        assert!(handle.read(None, None, None).await.is_err());
+        assert!(handle.write(b"stale".to_vec()).await.is_err());
+        assert!(handle.signal(ProcessSignal::Interrupt).await.is_err());
+        handle.terminate().await.unwrap();
+        assert!(writer_rx.try_recv().is_err());
+        {
+            let map = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(process) = map.get(&id).unwrap() else {
+                panic!("running");
+            };
+            assert!(!process.termination_requested.load(Ordering::Acquire));
+            assert!(process.exit_code.is_none());
+        }
+        assert_eq!(
+            backend
+                .write(&id, b"current".to_vec())
+                .await
+                .unwrap()
+                .status,
+            WriteStatus::Accepted
+        );
+        assert_eq!(writer_rx.recv().await.unwrap(), b"current");
+        drop(replacement);
+        backend.shutdown().await;
+    }
+
     fn telemetry_backend() -> (
         LocalProcess,
         codex_otel::MetricsClient,
         InMemoryMetricExporter,
     ) {
         let exporter = InMemoryMetricExporter::default();
-        let metrics = codex_otel::MetricsClient::new(MetricsConfig::in_memory(
-            "test",
-            "codex-exec-server",
-            env!("CARGO_PKG_VERSION"),
-            exporter.clone(),
-        ))
+        let metrics = codex_otel::MetricsClient::new(
+            MetricsConfig::in_memory(
+                "test",
+                "codex-exec-server",
+                env!("CARGO_PKG_VERSION"),
+                exporter.clone(),
+            )
+            .with_runtime_reader(),
+        )
         .expect("metrics");
         let telemetry = ExecServerTelemetry::new(metrics.clone());
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
@@ -1376,7 +1819,9 @@ mod tests {
             panic!("finished process metric should be a u64 sum");
         };
         assert_eq!(
-            sum.data_points().map(opentelemetry_sdk::metrics::data::SumDataPoint::value).collect::<Vec<_>>(),
+            sum.data_points()
+                .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                .collect::<Vec<_>>(),
             vec![1],
         );
         let results = sum
@@ -1397,8 +1842,8 @@ mod tests {
         let backend = runtime.block_on(async { LocalProcess::default() });
         for replace in [false, true] {
             let process_id = ProcessId::from("replacement-reservation");
-            let original = Arc::new(ProcessStart);
-            let replacement = Arc::new(ProcessStart);
+            let original = Arc::new(ProcessStart::default());
+            let replacement = Arc::new(ProcessStart::default());
             let guard = ProcessStartReservation {
                 inner: Arc::clone(&backend.inner),
                 process_id: process_id.clone(),
@@ -1762,12 +2207,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_observability_lost_exit_is_not_a_confirmed_completion() {
+        let (backend, metrics, _exporter) = telemetry_backend();
+        let mut process = spawn_test_process(&backend, "lost-exit").await;
+        drop(process.exit_tx.take());
+        process.exit_watch.await.expect("exit observer");
+        let response = backend
+            .exec_read(ReadParams {
+                process_id: process.process_id,
+                after_seq: None,
+                max_bytes: None,
+                wait_ms: None,
+            })
+            .await
+            .expect("observation failure remains readable");
+        assert!(!response.exited);
+        assert_eq!(response.exit_code, None);
+        assert_eq!(
+            response.failure.as_deref(),
+            Some("process exit observation lost")
+        );
+        let snapshot = metrics.snapshot().expect("observation metrics");
+        assert!(
+            !snapshot
+                .scope_metrics()
+                .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+                .any(|metric| metric.name() == "exec_server_processes_finished_total")
+        );
+        let lost = snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == "exec_server_process_observation_lost_total")
+            .unwrap();
+        let AggregatedMetrics::U64(MetricData::Sum(lost)) = lost.data() else {
+            panic!("lost counter");
+        };
+        assert_eq!(
+            lost.data_points()
+                .map(opentelemetry_sdk::metrics::data::SumDataPoint::value)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        backend.shutdown().await;
+        metrics.shutdown().expect("shutdown metrics");
+    }
+
+    #[tokio::test]
     async fn shutdown_before_exit_records_terminated() {
         let (backend, metrics, exporter) = telemetry_backend();
         let mut process = spawn_test_process(&backend, "shutdown-before-exit").await;
 
         backend.shutdown().await;
+        let snapshot = metrics.snapshot().expect("snapshot pending exit");
+        assert!(
+            !snapshot
+                .scope_metrics()
+                .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+                .any(|metric| metric.name() == "exec_server_processes_finished_total")
+        );
+        let active = snapshot
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+            .find(|metric| metric.name() == "exec_server_processes_active")
+            .unwrap();
+        let AggregatedMetrics::I64(MetricData::Gauge(active)) = active.data() else {
+            panic!("active gauge");
+        };
+        assert_eq!(
+            active
+                .data_points()
+                .map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
         process.exit(/*exit_code*/ 0);
+        process.exit_watch.await.expect("exit observer");
 
         assert_finished_process_result(metrics, &exporter, "terminated");
     }
@@ -1869,6 +2383,68 @@ mod tests {
         backend.shutdown().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn closed_record_releases_native_custody_before_replay_expiry() {
+        let backend = LocalProcess::default();
+        let mut process = spawn_test_process(&backend, "released-custody").await;
+        let owner = Arc::new(());
+        let custody = Arc::downgrade(&owner);
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
+        let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let session = codex_utils_pty::spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: stdout_rx.into(),
+            stderr_rx: Some(stderr_rx.into()),
+            exit_rx,
+            terminator: Some(Box::new(move || {
+                let _retained = &owner;
+                Ok(())
+            })),
+            writer_handle: None,
+            resizer: None,
+        })
+        .session;
+        drop(stdout_tx);
+        drop(stderr_tx);
+        exit_tx.send(0).unwrap();
+        while !session.output_capture().complete() {
+            tokio::task::yield_now().await;
+        }
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(record)) = processes.get_mut(&process.process_id) else {
+                panic!("running record");
+            };
+            record.session = session;
+        }
+        assert!(custody.upgrade().is_some());
+        process
+            .stdout_tx
+            .send(b"replay evidence".to_vec())
+            .await
+            .unwrap();
+        process.exit(0);
+        drop(process.stdout_tx);
+        drop(process.stderr_tx);
+        let response = read_process_until_closed(&backend, &process.process_id).await;
+        assert!(response.closed);
+        assert!(
+            custody.upgrade().is_none(),
+            "replay retained the native terminator"
+        );
+        assert!(
+            backend
+                .inner
+                .processes
+                .lock()
+                .await
+                .contains_key(&process.process_id)
+        );
+        backend.shutdown().await;
+    }
+
     #[tokio::test]
     async fn read_observes_output_notified_after_snapshot_before_wait() {
         let backend = LocalProcess::default();
@@ -1954,7 +2530,7 @@ mod tests {
                 .await
                 .expect_err("a future cursor is not a successful empty read");
             assert!(
-                matches!(error, ExecServerError::Server { code: -32602, message }
+                matches!(error, ExecServerError::Server { code: -32602, message, .. }
                 if message.contains("afterSeq") && message.contains("last available sequence"))
             );
         }
@@ -2167,6 +2743,7 @@ mod tests {
         stdout_tx: mpsc::Sender<Vec<u8>>,
         stderr_tx: mpsc::Sender<Vec<u8>>,
         exit_tx: Option<oneshot::Sender<i32>>,
+        exit_watch: tokio::task::JoinHandle<()>,
     }
 
     impl TestProcess {
@@ -2191,11 +2768,24 @@ mod tests {
             RETAINED_OUTPUT_BYTES_PER_PROCESS,
         );
 
+        let session = dummy_session();
+        // This fixture forwards its own synthetic streams. Settle the dummy
+        // driver's genuine empty EOF receipts before using its native handle.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !session.output_capture().complete() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let mut processes = backend.inner.processes.lock().await;
+        let termination_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let metrics = backend.inner.telemetry.process_started();
         let previous = processes.insert(
             process_id.clone(),
             ProcessEntry::Running(Box::new(RunningProcess {
-                session: dummy_session(),
+                session,
+                start_generation: Arc::new(super::ProcessStart::default()),
                 tty: false,
                 pipe_stdin: false,
                 accepted_stdin_write_ids: Arc::new(Mutex::new(AcceptedStdinWriteIds::default())),
@@ -2211,8 +2801,8 @@ mod tests {
                 open_streams: 2,
                 closed: false,
                 finalizing: false,
-                metrics: Some(backend.inner.telemetry.process_started()),
-                termination_requested: false,
+                termination_requested: Arc::clone(&termination_requested),
+                failure: None,
                 sandbox: SandboxType::None,
                 sandbox_denied: false,
             })),
@@ -2234,11 +2824,13 @@ mod tests {
             Arc::clone(&backend.inner),
             Arc::clone(&output_notify),
         ));
-        tokio::spawn(watch_exit(
+        let exit_watch = tokio::spawn(watch_exit(
             process_id.clone(),
             exit_rx,
             Arc::clone(&backend.inner),
             output_notify,
+            metrics,
+            termination_requested,
         ));
 
         TestProcess {
@@ -2246,7 +2838,270 @@ mod tests {
             stdout_tx,
             stderr_tx,
             exit_tx: Some(exit_tx),
+            exit_watch,
         }
+    }
+
+    #[tokio::test]
+    async fn native_reader_cutoff_is_an_ordered_gap_in_live_and_retained_replay() {
+        let backend = LocalProcess::default();
+        let mut fixture = spawn_test_process(&backend, "capture-cutoff").await;
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (_native_stdout, native_stdout_rx) = mpsc::channel(1);
+        let (_native_exit, native_exit_rx) = oneshot::channel();
+        let native = codex_utils_pty::spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: native_stdout_rx.into(),
+            stderr_rx: None,
+            exit_rx: native_exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
+        });
+        native.session.finish(); // Abort before native EOF, independently of the process exit.
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(process)) = processes.get_mut(&fixture.process_id)
+            else {
+                panic!("running fixture");
+            };
+            process.session = native.session;
+        }
+        fixture
+            .stdout_tx
+            .send(b"known prefix".to_vec())
+            .await
+            .unwrap();
+        let prefix = read_process_until_change(&backend, &fixture.process_id, Some(0)).await;
+        assert_eq!(prefix.chunks[0].chunk.0, b"known prefix");
+        fixture.exit(0);
+        let TestProcess {
+            process_id,
+            stdout_tx,
+            stderr_tx,
+            exit_watch,
+            ..
+        } = fixture;
+        drop(stdout_tx);
+        drop(stderr_tx);
+        exit_watch.await.unwrap();
+        let response = timeout(Duration::from_secs(2), async {
+            loop {
+                let response = backend
+                    .exec_read(ReadParams {
+                        process_id: process_id.clone(),
+                        after_seq: Some(0),
+                        max_bytes: None,
+                        wait_ms: Some(0),
+                    })
+                    .await
+                    .unwrap();
+                if response.closed {
+                    break response;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.exit_code, Some(0));
+        assert!(response.output_gap.as_ref().unwrap().through_seq > prefix.chunks[0].seq);
+        let replay =
+            crate::client::recovery::replay_process_events(0, false, response, None).unwrap();
+        assert!(replay.iter().any(
+            |event| matches!(event, ExecProcessEvent::OutputGap { through_seq } if *through_seq > 0)
+        ));
+        assert!(replay.iter().any(|event| matches!(event, ExecProcessEvent::Output(chunk) if chunk.chunk.0 == b"known prefix")));
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pty_placeholder_close_is_not_capture_loss_while_the_terminal_drains() {
+        let backend = LocalProcess::default();
+        let fixture = spawn_test_process(&backend, "pty-placeholder").await;
+        // A live terminal reader keeps its capture incomplete; PTY spawns have
+        // no separate stderr stream, so that half of the capture is preset.
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (native_stdout_tx, native_stdout_rx) = mpsc::channel(1);
+        let (_native_exit, native_exit_rx) = oneshot::channel();
+        let native = codex_utils_pty::spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: native_stdout_rx.into(),
+            stderr_rx: None,
+            exit_rx: native_exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
+        });
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(process)) = processes.get_mut(&fixture.process_id)
+            else {
+                panic!("running fixture");
+            };
+            process.tty = true;
+            process.session = native.session;
+        }
+        let read_params = ReadParams {
+            process_id: fixture.process_id.clone(),
+            after_seq: None,
+            max_bytes: None,
+            wait_ms: Some(0),
+        };
+        // Both terminal receivers report `Pty`; the placeholder closes first.
+        finish_output_stream(
+            fixture.process_id.clone(),
+            ExecOutputStream::Pty,
+            Arc::clone(&backend.inner),
+        )
+        .await;
+        let response = backend.exec_read(read_params.clone()).await.unwrap();
+        assert!(
+            response.output_gap.is_none(),
+            "placeholder EOF while the terminal is live is not output loss"
+        );
+        // The terminal receiver itself draining without native EOF is loss.
+        finish_output_stream(
+            fixture.process_id.clone(),
+            ExecOutputStream::Pty,
+            Arc::clone(&backend.inner),
+        )
+        .await;
+        let response = backend.exec_read(read_params).await.unwrap();
+        assert!(response.output_gap.is_some());
+        drop(native_stdout_tx);
+        drop(fixture);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn eviction_after_capture_loss_keeps_the_marker_inside_the_gap() {
+        let backend = LocalProcess::default();
+        let fixture = spawn_test_process(&backend, "capture-loss-then-eviction").await;
+        // A live native stdout reader keeps that half of the capture incomplete.
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (native_stdout_tx, native_stdout_rx) = mpsc::channel(1);
+        let (_native_exit, native_exit_rx) = oneshot::channel();
+        let native = codex_utils_pty::spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: native_stdout_rx.into(),
+            stderr_rx: None,
+            exit_rx: native_exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
+        });
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(process)) = processes.get_mut(&fixture.process_id)
+            else {
+                panic!("running fixture");
+            };
+            process.session = native.session;
+        }
+        fixture
+            .stderr_tx
+            .send(vec![b'x'; RETAINED_OUTPUT_BYTES_PER_PROCESS])
+            .await
+            .unwrap();
+        read_process_until_change(&backend, &fixture.process_id, None).await;
+        // Stdout drains without native EOF: its loss marker takes sequence 2.
+        finish_output_stream(
+            fixture.process_id.clone(),
+            ExecOutputStream::Stdout,
+            Arc::clone(&backend.inner),
+        )
+        .await;
+        // Later stderr output evicts sequence 1 from the front of retention.
+        fixture.stderr_tx.send(b"tail".to_vec()).await.unwrap();
+        let tail = read_process_until_change(&backend, &fixture.process_id, Some(2)).await;
+        assert_eq!(tail.chunks[0].chunk.0, b"tail");
+        let between = backend
+            .exec_read(ReadParams {
+                process_id: fixture.process_id.clone(),
+                after_seq: Some(1),
+                max_bytes: None,
+                wait_ms: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(between.output_gap.map(|gap| gap.through_seq), Some(2));
+        let retained = backend
+            .exec_read(ReadParams {
+                process_id: fixture.process_id.clone(),
+                after_seq: Some(0),
+                max_bytes: None,
+                wait_ms: Some(0),
+            })
+            .await
+            .unwrap();
+        let replay = crate::client::recovery::replay_process_events(0, false, retained, None)
+            .expect("the retained gap declares the capture-loss hole");
+        assert_eq!(replay[0], ExecProcessEvent::OutputGap { through_seq: 2 });
+        assert!(matches!(&replay[1], ExecProcessEvent::Output(chunk) if chunk.chunk.0 == b"tail"));
+        drop(native_stdout_tx);
+        drop(fixture);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn capture_loss_marker_is_notified_to_remote_sessions() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let backend = LocalProcess::with_runtime_paths(
+            Some(RpcNotificationSender::new(outgoing_tx)),
+            ExecServerTelemetry::default(),
+            /*runtime_paths*/ None,
+        );
+        let fixture = spawn_test_process(&backend, "capture-loss-notification").await;
+        // A live native stdout reader keeps that half of the capture incomplete.
+        let (writer_tx, _writer_rx) = mpsc::channel(1);
+        let (native_stdout_tx, native_stdout_rx) = mpsc::channel(1);
+        let (_native_exit, native_exit_rx) = oneshot::channel();
+        let native = codex_utils_pty::spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx: native_stdout_rx.into(),
+            stderr_rx: None,
+            exit_rx: native_exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
+        });
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let Some(ProcessEntry::Running(process)) = processes.get_mut(&fixture.process_id)
+            else {
+                panic!("running fixture");
+            };
+            process.session = native.session;
+        }
+        finish_output_stream(
+            fixture.process_id.clone(),
+            ExecOutputStream::Stdout,
+            Arc::clone(&backend.inner),
+        )
+        .await;
+        // Remote sessions publish in sequence order, so the marker's sequence
+        // must reach them like every other sequenced process event.
+        let message = timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .expect("capture loss should be notified")
+            .expect("notification channel stays open");
+        let crate::rpc::RpcServerOutboundMessage::Notification(notification) = message else {
+            panic!("expected a notification");
+        };
+        assert_eq!(notification.method, crate::protocol::EXEC_OUTPUT_GAP_METHOD);
+        let params: crate::protocol::ExecOutputGapNotification =
+            serde_json::from_value(notification.params.expect("gap params")).unwrap();
+        assert_eq!(
+            params,
+            crate::protocol::ExecOutputGapNotification {
+                process_id: fixture.process_id.clone(),
+                through_seq: 1,
+            }
+        );
+        drop(native_stdout_tx);
+        drop(fixture);
+        backend.shutdown().await;
     }
 
     fn dummy_session() -> ExecCommandSession {

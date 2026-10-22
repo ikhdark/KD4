@@ -16,38 +16,100 @@ def semantic_cases():
     """
     cases = []
     for name, body, edges in (
-        ("import_alias", "from product import run as action\ndef test_case(): action()\n", ["product.run"]),
-        ("parameter_shadow", "from product import run\ndef test_case(run): run()\n", []),
-        ("assigned_shadow", "from product import run\ndef test_case():\n run = lambda: 2\n run()\n", []),
-        ("local_import", "from product import run\ndef test_case():\n from unavailable import run\n run()\n", []),
-        ("comprehension_shadow", "from product import run\ndef test_case():\n return [run() for run in callbacks]\n", []),
+        (
+            "import_alias",
+            "from product import run as action\ndef test_case(): action()\n",
+            ["product.run"],
+        ),
+        (
+            "parameter_shadow",
+            "from product import run\ndef test_case(run): run()\n",
+            [],
+        ),
+        (
+            "assigned_shadow",
+            "from product import run\ndef test_case():\n run = lambda: 2\n run()\n",
+            [],
+        ),
+        (
+            "local_import",
+            "from product import run\ndef test_case():\n from unavailable import run\n run()\n",
+            [],
+        ),
+        (
+            "comprehension_shadow",
+            "from product import run\ndef test_case():\n return [run() for run in callbacks]\n",
+            [],
+        ),
         ("unbound_module", "def test_case(): product.run()\n", []),
-        ("rebound_import", "from product import run\nrun = lambda: 2\ndef test_case(): run()\n", []),
-        ("decorator_not_body", "from product import run\n@run()\ndef test_case(): pass\n", []),
+        (
+            "rebound_import",
+            "from product import run\nrun = lambda: 2\ndef test_case(): run()\n",
+            [],
+        ),
+        (
+            "decorator_not_body",
+            "from product import run\n@run()\ndef test_case(): pass\n",
+            [],
+        ),
     ):
-        cases.append({"name": name, "sources": {"product.py": "def run(): return 1\n", "test_case.py": body},
-                      "test": "test_case.test_case", "edges": edges})
-    cases.append({"name": "package_relative_import", "sources": {
-        "pkg/__init__.py": "from .impl import run\ndef test_case(): run()\n",
-        "pkg/impl.py": "def run(): return 1\n"}, "test": "pkg.test_case", "edges": ["pkg.impl.run"]})
+        cases.append(
+            {
+                "name": name,
+                "sources": {
+                    "product.py": "def run(): return 1\n",
+                    "test_case.py": body,
+                },
+                "test": "test_case.test_case",
+                "edges": edges,
+            }
+        )
+    cases.append(
+        {
+            "name": "package_relative_import",
+            "sources": {
+                "pkg/__init__.py": "from .impl import run\ndef test_case(): run()\n",
+                "pkg/impl.py": "def run(): return 1\n",
+            },
+            "test": "pkg.test_case",
+            "edges": ["pkg.impl.run"],
+        }
+    )
     for name, body in (
-        ("match_control", ' match flag:\n  case True: return {"value": 1}\n  case _: return {"value": 2}\n'),
+        (
+            "match_control",
+            ' match flag:\n  case True: return {"value": 1}\n  case _: return {"value": 2}\n',
+        ),
         ("assert_precondition", ' assert flag\n return {"value": 1}\n'),
     ):
-        cases.append({"name": name, "sources": {
-            "product.py": "def choose(flag):\n" + body,
-            "test_case.py": 'from product import choose\ndef test_case(self): self.assertEqual(choose(True)["value"], choose(False)["value"])\n'},
-            "forbidden": "compared_value_independent_of_parameter"})
-    cases.append({"name": "preceding_failure", "sources": {
-        "product.py": "import subprocess\ndef run():\n guard()\n return subprocess.run(['tool'])\n",
-        "test_case.py": "from product import run\nfrom unittest.mock import patch\n@patch('product.subprocess.run')\ndef test_fake(mocked): run()\ndef test_real(): run()\n"},
-        "required": "external_boundary_only_mocked"})
+        cases.append(
+            {
+                "name": name,
+                "sources": {
+                    "product.py": "def choose(flag):\n" + body,
+                    "test_case.py": 'from product import choose\ndef test_case(self): self.assertEqual(choose(True)["value"], choose(False)["value"])\n',
+                },
+                "forbidden": "compared_value_independent_of_parameter",
+            }
+        )
+    cases.append(
+        {
+            "name": "preceding_failure",
+            "sources": {
+                "product.py": "import subprocess\ndef run():\n guard()\n return subprocess.run(['tool'])\n",
+                "test_case.py": "from product import run\nfrom unittest.mock import patch\n@patch('product.subprocess.run')\ndef test_fake(mocked): run()\ndef test_real(): run()\n",
+            },
+            "required": "external_boundary_only_mocked",
+        }
+    )
     return cases
 
 
 def semantic_case_checks(case, report):
-    checks = {"incomplete": report["analysis_complete"] is False,
-              "advisory": report["advisory_only"] is True}
+    checks = {
+        "incomplete": report["analysis_complete"] is False,
+        "advisory": report["advisory_only"] is True,
+    }
     if "edges" in case:
         checks["edges"] = report["tests"][case["test"]]["reached"] == case["edges"]
     reasons = {row["reason"] for row in report["diagnostics"]}
@@ -59,23 +121,62 @@ def semantic_case_checks(case, report):
 
 
 class SemanticEvidenceTests(unittest.TestCase):
+    def test_comprehension_global_references_preserve_outer_iterator_and_shadow_targets(
+        self,
+    ):
+        import ast
+        from scripts.maintenance.python_test_oracles import global_references
+
+        for expression, expected in (
+            ("[run() for _ in values]", 1),
+            ("{run() for _ in values}", 1),
+            ("{_: run() for _ in values}", 1),
+            ("(run() for _ in values)", 1),
+            ("[run() for run in values]", 0),
+            ("[run() for (run, other) in values]", 0),
+            ("[item for item in run()]", 1),
+            ("[[run() for run in values] for _ in values]", 0),
+        ):
+            with self.subTest(expression=expression):
+                source = (
+                    "from product import run\ndef action(values):\n return "
+                    + expression
+                    + "\n"
+                )
+                tree = ast.parse(source)
+                refs = global_references(tree, source, "fixture.py")
+                self.assertEqual(
+                    sum(
+                        id(node) in refs
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Name) and node.id == "run"
+                    ),
+                    expected,
+                )
+
     def test_above_root_relative_import_is_not_a_sibling_relationship(self):
         from importlib.util import resolve_name
 
         with self.assertRaises(ImportError):
             resolve_name("..product", "pkg")
-        report = analyze({
-            "pkg/__init__.py": "from ..product import run\ndef test_case(): run()\n",
-            "product.py": "def run(): return 7\n",
-        })
+        report = analyze(
+            {
+                "pkg/__init__.py": "from ..product import run\ndef test_case(): run()\n",
+                "product.py": "def run(): return 7\n",
+            }
+        )
         self.assertEqual(report["tests"]["pkg.test_case"]["reached"], [])
-        self.assertTrue(any(row["reason"] == "unresolved_call" for row in report["unknown"]))
+        self.assertTrue(
+            any(row["reason"] == "unresolved_call" for row in report["unknown"])
+        )
 
     def test_definition_time_expressions_are_not_test_body_calls(self):
-        report = analyze({
-            "product.py": "def run(): return 7\n",
-            "test_case.py": "from product import run\ndef test_case(value: run() = run()) -> run(): pass\n",
-        })
+        report = analyze(
+            {
+                "product.py": "def run(): return 7\n",
+                "test_case.py": "from product import run\ndef test_case(value: run() = run()) -> run(): pass\n",
+            }
+        )
         self.assertEqual(report["tests"]["test_case.test_case"]["reached"], [])
 
     def test_compiler_bindings_and_control_flow_counterexamples(self):
@@ -461,7 +562,10 @@ class Cases(unittest.TestCase):
 
 class AdvisoryContractTests(unittest.TestCase):
     def test_patched_call_edges_do_not_establish_real_boundary_coverage(self):
-        from scripts.benchmark_scripts.benchmark_semantic_contracts import checks, patched_boundary_cases
+        from scripts.benchmark_scripts.benchmark_semantic_contracts import (
+            checks,
+            patched_boundary_cases,
+        )
 
         for name, sources in patched_boundary_cases().items():
             with self.subTest(case=name):
@@ -475,7 +579,9 @@ class AdvisoryContractTests(unittest.TestCase):
     def test_patched_call_fixture_runtime_paths(self):
         import types
         from unittest.mock import patch
-        from scripts.benchmark_scripts.benchmark_semantic_contracts import patched_boundary_cases
+        from scripts.benchmark_scripts.benchmark_semantic_contracts import (
+            patched_boundary_cases,
+        )
 
         for name, sources in patched_boundary_cases().items():
             with self.subTest(case=name):
@@ -484,20 +590,34 @@ class AdvisoryContractTests(unittest.TestCase):
                 with patch.dict(sys.modules, {"product": product, "test_case": tests}):
                     # Only these fixed authored fixtures are executed. The
                     # analyzer itself must never import/execute supplied source.
-                    exec(compile(sources["product.py"], "product.py", "exec"), product.__dict__)
-                    exec(compile(sources["test_case.py"], "test_case.py", "exec"), tests.__dict__)
+                    exec(
+                        compile(sources["product.py"], "product.py", "exec"),
+                        product.__dict__,
+                    )
+                    exec(
+                        compile(sources["test_case.py"], "test_case.py", "exec"),
+                        tests.__dict__,
+                    )
                     with patch("subprocess.run") as boundary:
                         tests.test_fake()
                         tests.test_candidate()
                         if hasattr(tests, "test_real"):
                             tests.test_real()
-                        expected = int(name in {"unaffected_import_binding", "patched_entrypoint_with_real"})
+                        expected = int(
+                            name
+                            in {
+                                "unaffected_import_binding",
+                                "patched_entrypoint_with_real",
+                            }
+                        )
                         self.assertEqual(boundary.call_count, expected)
                         if expected:
                             boundary.assert_called_once_with(["tool"])
 
     def test_patched_boundary_receivers_and_object_targets_stay_unknown(self):
-        from scripts.benchmark_scripts.benchmark_semantic_contracts import patched_boundary_cases
+        from scripts.benchmark_scripts.benchmark_semantic_contracts import (
+            patched_boundary_cases,
+        )
 
         sources = patched_boundary_cases()["patched_entrypoint"]
         prefix = sources["test_case.py"].split('@patch("test_case.run")')[0]
@@ -509,18 +629,29 @@ class AdvisoryContractTests(unittest.TestCase):
         }
         for name, body in variants.items():
             with self.subTest(case=name):
-                result = self.worker(json.dumps({"sources": {
-                    **sources, "test_case.py": prefix + body,
-                }}).encode())
+                result = self.worker(
+                    json.dumps(
+                        {
+                            "sources": {
+                                **sources,
+                                "test_case.py": prefix + body,
+                            }
+                        }
+                    ).encode()
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 report = json.loads(result.stdout)
-                self.assertIn("external_boundary_only_mocked",
-                              {row["reason"] for row in report["diagnostics"]})
-                self.assertTrue(any(
-                    row["reason"] == "boundary_reachability_unknown"
-                    and row.get("test_callable") == "test_case.test_candidate"
-                    for row in report["unknown"]
-                ))
+                self.assertIn(
+                    "external_boundary_only_mocked",
+                    {row["reason"] for row in report["diagnostics"]},
+                )
+                self.assertTrue(
+                    any(
+                        row["reason"] == "boundary_reachability_unknown"
+                        and row.get("test_callable") == "test_case.test_candidate"
+                        for row in report["unknown"]
+                    )
+                )
 
     def worker(self, payload):
         return subprocess.run(
@@ -595,31 +726,57 @@ class Cases(unittest.TestCase):
             "    return subprocess.run(['tool']) if enabled else None\n",
             "    return enabled and subprocess.run(['tool'])\n",
             "    return [subprocess.run(['tool']) for _ in range(int(enabled))]\n",
+            "    return {subprocess.run(['tool']) for _ in range(int(enabled))}\n",
+            "    return {_: subprocess.run(['tool']) for _ in range(int(enabled))}\n",
+            "    return list(subprocess.run(['tool']) for _ in range(int(enabled)))\n",
+            "    return [[subprocess.run(['tool']) for _ in range(1)] for _ in range(int(enabled))]\n",
         )
-        for body in bodies:
-            with self.subTest(body=body):
+        cases = [
+            ("import subprocess", body, "product.subprocess.run") for body in bodies
+        ]
+        cases += [
+            (
+                "import subprocess as process",
+                "    return [process.run(['tool']) for _ in range(int(enabled))]\n",
+                "product.process.run",
+            ),
+            (
+                "from subprocess import run as invoke",
+                "    return {_: invoke(['tool']) for _ in range(int(enabled))}\n",
+                "product.invoke",
+            ),
+        ]
+        for imports, body, patch_target in cases:
+            with self.subTest(imports=imports, body=body):
                 # Every disabled call above avoids subprocess.run by Python's
                 # control-flow rules. A direct call alone is not real coverage.
-                report = analyze({
-                    "product.py": "import subprocess\ndef run(enabled):\n" + body,
-                    "test_product.py": """
+                report = analyze(
+                    {
+                        "product.py": imports + "\ndef run(enabled):\n" + body,
+                        "test_product.py": f"""
 import unittest
 from unittest.mock import patch
 from product import run
 class Cases(unittest.TestCase):
-    @patch("product.subprocess.run")
+    @patch({patch_target!r})
     def test_fake(self, mocked):
         run(True)
         mocked.assert_called_once()
     def test_disabled(self): self.assertFalse(run(False))
 """,
-                })
+                    }
+                )
                 self.assertTrue(report["parse_complete"])
-                findings = [row for row in report["diagnostics"]
-                            if row["reason"] == "external_boundary_only_mocked"]
+                findings = [
+                    row
+                    for row in report["diagnostics"]
+                    if row["reason"] == "external_boundary_only_mocked"
+                ]
                 self.assertEqual(len(findings), 1)
-                self.assertIn("test_product.Cases.test_disabled",
-                              findings[0]["unknown_reaching_tests"])
+                self.assertIn(
+                    "test_product.Cases.test_disabled",
+                    findings[0]["unknown_reaching_tests"],
+                )
 
     def test_unexecuted_test_call_is_not_real_boundary_coverage(self):
         for body in (
@@ -629,9 +786,10 @@ class Cases(unittest.TestCase):
             "        False and run()\n",
         ):
             with self.subTest(body=body):
-                report = analyze({
-                    "product.py": "import subprocess\ndef run(): return subprocess.run(['tool'])\n",
-                    "test_product.py": """
+                report = analyze(
+                    {
+                        "product.py": "import subprocess\ndef run(): return subprocess.run(['tool'])\n",
+                        "test_product.py": """
 import unittest
 from unittest.mock import patch
 from product import run
@@ -641,11 +799,15 @@ class Cases(unittest.TestCase):
         run()
         mocked.assert_called_once()
     def test_disabled(self):
-""" + body,
-                })
+"""
+                        + body,
+                    }
+                )
                 self.assertTrue(report["parse_complete"])
-                self.assertIn("external_boundary_only_mocked",
-                              {row["reason"] for row in report["diagnostics"]})
+                self.assertIn(
+                    "external_boundary_only_mocked",
+                    {row["reason"] for row in report["diagnostics"]},
+                )
 
     def test_deferred_function_bodies_are_not_direct_boundary_coverage(self):
         for producer, execute in (
@@ -653,9 +815,10 @@ class Cases(unittest.TestCase):
             ("async def run(): return subprocess.run(['tool'])", "asyncio.run(run())"),
         ):
             with self.subTest(producer=producer):
-                report = analyze({
-                    "product.py": "import subprocess\n" + producer,
-                    "test_product.py": f"""
+                report = analyze(
+                    {
+                        "product.py": "import subprocess\n" + producer,
+                        "test_product.py": f"""
 import asyncio, unittest
 from unittest.mock import patch
 from product import run
@@ -668,10 +831,13 @@ class Cases(unittest.TestCase):
         deferred = run()
         deferred.close()
 """,
-                })
+                    }
+                )
                 self.assertTrue(report["parse_complete"])
-                self.assertIn("external_boundary_only_mocked",
-                              {row["reason"] for row in report["diagnostics"]})
+                self.assertIn(
+                    "external_boundary_only_mocked",
+                    {row["reason"] for row in report["diagnostics"]},
+                )
 
     def test_dynamic_loader_and_dispatch_are_explicit_unknowns(self):
         report = analyze(
@@ -782,39 +948,71 @@ class ModuleIdentityTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(source, encoding="utf-8")
             observed = subprocess.run(
-                [sys.executable, "-B", "-c",
-                 "import importlib.util, json; s = importlib.util.find_spec('pkg'); "
-                 "print(json.dumps({'package': s.submodule_search_locations is not None})); "
-                 "from pkg import run"],
-                cwd=root, capture_output=True, text=True, timeout=5,
+                [
+                    sys.executable,
+                    "-B",
+                    "-c",
+                    "import importlib.util, json; s = importlib.util.find_spec('pkg'); "
+                    "print(json.dumps({'package': s.submodule_search_locations is not None})); "
+                    "from pkg import run",
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
         self.assertEqual(json.loads(observed.stdout), {"package": True})
         self.assertNotEqual(observed.returncode, 0)
         self.assertIn("ImportError", observed.stderr)
         worker = subprocess.run(
-            [sys.executable, "-I", "-B", str(Path(__file__).with_name("python_test_oracles.py"))],
-            input=json.dumps({"sources": sources}).encode(), capture_output=True, timeout=10,
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(Path(__file__).with_name("python_test_oracles.py")),
+            ],
+            input=json.dumps({"sources": sources}).encode(),
+            capture_output=True,
+            timeout=10,
         )
         self.assertEqual(worker.returncode, 0, worker.stderr)
         report = json.loads(worker.stdout)
         self.assertEqual(report["tests"]["test_case.test_case"]["reached"], [])
-        collisions = [row for row in report["unknown"] if row["reason"] == "ambiguous_module_identity"]
-        self.assertEqual({row["path"] for row in collisions}, {"pkg.py", "pkg/__init__.py"})
+        collisions = [
+            row
+            for row in report["unknown"]
+            if row["reason"] == "ambiguous_module_identity"
+        ]
+        self.assertEqual(
+            {row["path"] for row in collisions}, {"pkg.py", "pkg/__init__.py"}
+        )
         self.assertFalse(report["analysis_complete"])
         self.assertEqual(report["diagnostics"], [])
 
-    def test_colliding_path_spellings_are_unknown_and_unique_modules_still_resolve(self):
+    def test_colliding_path_spellings_are_unknown_and_unique_modules_still_resolve(
+        self,
+    ):
         for paths in [("pkg/item.py", "pkg\\item.py"), ("pkg/item.py", "pkg.item.py")]:
             with self.subTest(paths=paths):
-                report = analyze({
-                    paths[0]: "def run(): return 1\n",
-                    paths[1]: "def other(): return 2\n",
-                    "safe.py": "def run(): return 3\n",
-                    "test_case.py": "from pkg.item import run\nimport safe\ndef test_case(): run(); safe.run()\n",
-                })
-                self.assertEqual(report["tests"]["test_case.test_case"]["reached"], ["safe.run"])
-                self.assertEqual({row["path"] for row in report["unknown"]
-                                  if row["reason"] == "ambiguous_module_identity"}, set(paths))
+                report = analyze(
+                    {
+                        paths[0]: "def run(): return 1\n",
+                        paths[1]: "def other(): return 2\n",
+                        "safe.py": "def run(): return 3\n",
+                        "test_case.py": "from pkg.item import run\nimport safe\ndef test_case(): run(); safe.run()\n",
+                    }
+                )
+                self.assertEqual(
+                    report["tests"]["test_case.test_case"]["reached"], ["safe.run"]
+                )
+                self.assertEqual(
+                    {
+                        row["path"]
+                        for row in report["unknown"]
+                        if row["reason"] == "ambiguous_module_identity"
+                    },
+                    set(paths),
+                )
 
 
 class SemanticContractCounterexamples(unittest.TestCase):
@@ -822,11 +1020,18 @@ class SemanticContractCounterexamples(unittest.TestCase):
         from scripts.maintenance.root_maintenance import test_modules_for_changed_path
 
         # Authored fixtures remain; the retired worker benchmark has no route.
-        self.assertIn("scripts.maintenance.test_python_test_oracles.SemanticContractCounterexamples",
-                      test_modules_for_changed_path(
-                          "scripts/benchmark_scripts/benchmark_semantic_contracts.py"))
-        self.assertEqual(test_modules_for_changed_path(
-            "scripts/benchmark_scripts/benchmark_semantic_evidence.py"), ())
+        self.assertIn(
+            "scripts.maintenance.test_python_test_oracles.SemanticContractCounterexamples",
+            test_modules_for_changed_path(
+                "scripts/benchmark_scripts/benchmark_semantic_contracts.py"
+            ),
+        )
+        self.assertEqual(
+            test_modules_for_changed_path(
+                "scripts/benchmark_scripts/benchmark_semantic_evidence.py"
+            ),
+            (),
+        )
 
     def test_semantic_fixtures_through_real_analyzer(self):
         from scripts.benchmark_scripts.benchmark_semantic_contracts import cases, checks

@@ -416,10 +416,22 @@ mod tests {
     #[test]
     fn parse_reports_each_invalid_delimiter_with_its_offset() {
         for (source, expected) in [
-            ("Hello, {{   }}.", TemplateParseError::EmptyPlaceholder { start: 7 }),
-            ("Hello, {{ name.", TemplateParseError::UnterminatedPlaceholder { start: 7 }),
-            ("Hello, {{ outer {{ inner }} }}.", TemplateParseError::NestedPlaceholder { start: 7 }),
-            ("Hello, }} world.", TemplateParseError::UnmatchedClosingDelimiter { start: 7 }),
+            (
+                "Hello, {{   }}.",
+                TemplateParseError::EmptyPlaceholder { start: 7 },
+            ),
+            (
+                "Hello, {{ name.",
+                TemplateParseError::UnterminatedPlaceholder { start: 7 },
+            ),
+            (
+                "Hello, {{ outer {{ inner }} }}.",
+                TemplateParseError::NestedPlaceholder { start: 7 },
+            ),
+            (
+                "Hello, }} world.",
+                TemplateParseError::UnmatchedClosingDelimiter { start: 7 },
+            ),
         ] {
             assert_eq!(Template::parse(source).unwrap_err(), expected, "{source:?}");
         }

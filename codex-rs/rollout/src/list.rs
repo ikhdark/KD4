@@ -1053,12 +1053,17 @@ async fn build_thread_item(
 /// metadata/preview extraction as list operations without scanning the whole
 /// sessions tree.
 pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> {
+    let updated_at = file_modified_time(&path)
+        .await
+        .ok()
+        .flatten()
+        .and_then(format_rfc3339);
     build_thread_item(
         path,
         &[],
         /*provider_matcher*/ None,
         /*cwd_filters*/ None,
-        /*updated_at*/ None,
+        updated_at,
         /*default_provider*/ "",
     )
     .await
@@ -1170,6 +1175,13 @@ pub(crate) fn parse_timestamp_uuid_from_filename(name: &str) -> Option<(OffsetDa
         format_description!("[year]-[month]-[day]T[hour]-[minute]-[second]");
     let ts = PrimitiveDateTime::parse(ts_str, format).ok()?.assume_utc();
     Some((ts, uuid))
+}
+
+/// The physical CreatedAt scanner key, not the canonical header timestamp.
+pub fn rollout_created_at_key(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let (timestamp, _) = parse_timestamp_uuid_from_filename(name)?;
+    format_rfc3339(timestamp)
 }
 
 struct ThreadCandidate {
@@ -1386,7 +1398,7 @@ async fn read_head_summary(
                     RolloutItem::TurnContext(_) => {
                         // Not included in `head`; skip.
                     }
-                    RolloutItem::WorldState(_) => {
+                    RolloutItem::WorldState(_) | RolloutItem::AdditionalContextState { .. } => {
                         // Not included in `head`; skip.
                     }
                     RolloutItem::Compacted(_) => {
@@ -1419,7 +1431,9 @@ async fn read_head_summary(
 
     if !summary.saw_session_meta && parse_errors > 0 {
         summary.thread_id = thread_id;
-        summary.created_at = path.file_name().and_then(|name| name.to_str())
+        summary.created_at = path
+            .file_name()
+            .and_then(|name| name.to_str())
             .and_then(parse_timestamp_uuid_from_filename)
             .and_then(|(created_at, _)| format_rfc3339(created_at));
     }
@@ -1477,6 +1491,7 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::AdditionalContextState { .. }
                 | RolloutItem::EventMsg(_) => {}
             }
         }
@@ -1527,10 +1542,10 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
             };
         }
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, format!(
-        "rollout at {} has no session metadata",
-        path.display()
-    )))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("rollout at {} has no session metadata", path.display()),
+    ))
 }
 
 async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {
@@ -1662,15 +1677,24 @@ async fn find_thread_path_by_id_str_in_subdir(
 
 // Damaged payloads remain recoverable through the canonical reader, but a
 // filename alone (including an empty file) must never establish ownership.
-async fn verified_rollout_thread_id(path: &Path) -> io::Result<ThreadId> {
+pub async fn verified_rollout_thread_id(path: &Path) -> io::Result<ThreadId> {
     match read_session_meta_line(path).await {
         Ok(meta) => Ok(meta.meta.id),
-        Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
             let mut has_valid_item = false;
             let (id, parse_errors) = RolloutRecorder::for_each_rollout_item(path, |_| {
                 has_valid_item = true;
-            }).await?;
-            if has_valid_item && parse_errors > 0 && let Some(id) = id {
+            })
+            .await?;
+            if has_valid_item
+                && parse_errors > 0
+                && let Some(id) = id
+            {
                 Ok(id)
             } else {
                 Err(error)
@@ -1710,18 +1734,27 @@ async fn find_rollout_path_by_id_from_filenames(
             };
             // Legacy names may use a custom timestamp/prefix, but the UUID
             // must be a complete final component, never a fuzzy subsequence.
-            let stem = rollout_file.plain_file_name().strip_suffix(".jsonl").unwrap_or_default();
+            let stem = rollout_file
+                .plain_file_name()
+                .strip_suffix(".jsonl")
+                .unwrap_or_default();
             let id = parse_timestamp_uuid_from_filename(rollout_file.plain_file_name())
                 .map(|(_, id)| id)
-                .or_else(|| stem.char_indices().filter(|(_, c)| *c == '-')
-                    .find_map(|(i, _)| Uuid::parse_str(&stem[i + 1..]).ok()));
+                .or_else(|| {
+                    stem.char_indices()
+                        .filter(|(_, c)| *c == '-')
+                        .find_map(|(i, _)| Uuid::parse_str(&stem[i + 1..]).ok())
+                });
             if id != Some(target) {
                 continue;
             }
-            let Some(path) = compression::existing_rollout_path(&rollout_file.into_path()).await else {
+            let Some(path) = compression::existing_rollout_path(&rollout_file.into_path()).await
+            else {
                 continue;
             };
-            if verified_rollout_thread_id(&path).await.ok()
+            if verified_rollout_thread_id(&path)
+                .await
+                .ok()
                 .is_some_and(|id| id.to_string() == target.to_string())
                 && found.as_ref().is_none_or(|current| path < *current)
             {
@@ -1735,6 +1768,55 @@ async fn find_rollout_path_by_id_from_filenames(
 /// Locate a recorded thread rollout file by its UUID string using the existing
 /// paginated listing implementation. Returns `Ok(Some(path))` if found, `Ok(None)` if not present
 /// or the id is invalid.
+pub async fn find_thread_rollout_paths(
+    home: &Path,
+    thread_id: ThreadId,
+) -> io::Result<Vec<PathBuf>> {
+    let mut stack = vec![
+        home.join(SESSIONS_SUBDIR),
+        home.join(ARCHIVED_SESSIONS_SUBDIR),
+    ];
+    let mut paths = Vec::new();
+    let suffix = format!("-{thread_id}.jsonl");
+    let mut visited = 0usize;
+    while let Some(directory) = stack.pop() {
+        let mut entries = match tokio::fs::read_dir(directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            visited += 1;
+            if visited > 1_000_000 {
+                return Err(io::Error::other(
+                    "rollout enumeration limit exceeded; no mutation performed",
+                ));
+            }
+            let kind = entry.file_type().await?;
+            if kind.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !kind.is_file() {
+                continue;
+            }
+            let Some(file) = compression::RolloutFile::from_path(entry.path()) else {
+                continue;
+            };
+            if !file.plain_file_name().ends_with(&suffix) {
+                continue;
+            }
+            let path = file.into_path();
+            if read_session_meta_line(&path).await?.meta.id == thread_id {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 pub async fn find_thread_path_by_id_str(
     codex_home: &Path,
     id_str: &str,
@@ -1844,7 +1926,9 @@ mod tests {
                     "cwd": ".", "originator": "test", "cli_version": "test",
                     "source": "cli"
                 }
-            }).to_string() + "\n";
+            })
+            .to_string()
+                + "\n";
             let bytes = if suffix.ends_with(".zst") {
                 zstd::stream::encode_all(content.as_bytes(), 0)?
             } else {
@@ -1867,14 +1951,23 @@ mod tests {
             if suffix.ends_with(".zst") {
                 let plain = directory.join(format!("rollout-custom-{id}.jsonl"));
                 tokio::fs::write(&plain, &content).await?;
-                assert_eq!(find_archived_thread_path_by_id_str(home.path(), &id, None).await?, Some(plain.clone()));
+                assert_eq!(
+                    find_archived_thread_path_by_id_str(home.path(), &id, None).await?,
+                    Some(plain.clone())
+                );
                 tokio::fs::write(&plain, content.replace(&id, &Uuid::nil().to_string())).await?;
-                assert_eq!(find_archived_thread_path_by_id_str(home.path(), &id, None).await?, None);
+                assert_eq!(
+                    find_archived_thread_path_by_id_str(home.path(), &id, None).await?,
+                    None
+                );
             }
             let wrong_id = Uuid::nil().to_string();
             let misleading = directory.join(format!("rollout-custom-{wrong_id}.jsonl"));
             tokio::fs::write(&misleading, &content).await?;
-            assert_eq!(find_rollout_path_by_id_from_filenames(&directory, &wrong_id).await?, None);
+            assert_eq!(
+                find_rollout_path_by_id_from_filenames(&directory, &wrong_id).await?,
+                None
+            );
         }
         let missing_id = Uuid::from_u128(0xffffffffffffffffffffffffffffffff).to_string();
         assert_eq!(

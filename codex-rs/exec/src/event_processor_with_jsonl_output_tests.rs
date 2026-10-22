@@ -4,31 +4,258 @@ use serde_json::json;
 use tempfile::tempdir;
 
 #[test]
+fn accepted_final_receipt_controls_recovered_artifact_not_activity() {
+    use codex_protocol::protocol::AcceptedFinalMessage;
+    use codex_protocol::protocol::AcceptedFinalMessageOrigin;
+    use codex_protocol::protocol::TurnFinalAnswer;
+    use codex_protocol::protocol::TurnTiming;
+    for accepted in [Some("{\"answer\":\"α\"}\n"), None] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("answer.txt");
+        let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
+        processor.collect_thread_events(agent_completion("stale", "rejected earlier final"));
+        let ServerNotification::TurnCompleted(mut completion) = crate::tests::recovery_completion()
+        else {
+            unreachable!()
+        };
+        completion.turn.items = vec![ThreadItem::AgentMessage {
+            id: "progress".into(),
+            text: "only commentary".into(),
+            phase: Some(codex_protocol::models::MessagePhase::Commentary),
+        }];
+        completion.timing = Some(TurnTiming {
+            final_answer: Some(TurnFinalAnswer {
+                tail: None,
+                message: accepted.map(|text| AcceptedFinalMessage {
+                    item_id: "accepted".into(),
+                    text: text.into(),
+                    origin: AcceptedFinalMessageOrigin::LegacyUnphased,
+                    completion_attempt_id: "turn:2".into(),
+                }),
+            }),
+            ..Default::default()
+        });
+        let result = processor.collect_thread_events(ServerNotification::TurnCompleted(completion));
+        assert_eq!(processor.final_message(), accepted);
+        processor.print_final_output().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            accepted.unwrap_or_default()
+        );
+        let terminal = result
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ThreadEvent::TurnCompleted(event) => Some(event),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            terminal
+                .timing
+                .as_ref()
+                .unwrap()
+                .final_answer
+                .as_ref()
+                .unwrap()
+                .message
+                .as_ref()
+                .map(|message| message.text.as_str()),
+            accepted
+        );
+    }
+}
+
+#[test]
+fn agent_phase_is_preserved_and_legacy_selection_excludes_commentary() {
+    use codex_protocol::models::MessagePhase;
+    let final_item = ThreadItem::AgentMessage {
+        id: "final".into(),
+        text: "answer".into(),
+        phase: Some(MessagePhase::FinalAnswer),
+    };
+    let commentary = ThreadItem::AgentMessage {
+        id: "progress".into(),
+        text: "progress".into(),
+        phase: Some(MessagePhase::Commentary),
+    };
+    let mapped =
+        EventProcessorWithJsonOutput::map_item_with_id(commentary.clone(), || "exec-id".into())
+            .unwrap();
+    assert_eq!(serde_json::to_value(mapped).unwrap()["phase"], "commentary");
+    assert_eq!(
+        crate::event_processor::final_message_from_turn_items(&[final_item, commentary.clone()]),
+        Some("answer".into())
+    );
+    assert_eq!(
+        crate::event_processor::final_message_from_turn_items(&[commentary]),
+        None
+    );
+}
+
+#[test]
+fn web_search_wire_has_one_item_identity_and_round_trips() {
+    for action in [
+        None,
+        Some(AppServerWebSearchAction::Other),
+        Some(AppServerWebSearchAction::Search {
+            query: Some("α \"quoted\"\n".into()),
+            queries: None,
+        }),
+        Some(AppServerWebSearchAction::OpenPage {
+            url: Some("https://example.com/α".into()),
+        }),
+        Some(AppServerWebSearchAction::FindInPage {
+            url: None,
+            pattern: Some("β".into()),
+        }),
+    ] {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        let item = ThreadItem::WebSearch(codex_app_server_protocol::WebSearchItem {
+            status: None,
+            error: None,
+            id: "provider-call".into(),
+            query: "α \"quoted\"\nβ".into(),
+            action,
+        });
+        let start = processor.map_started_item(item.clone()).unwrap();
+        let completed = processor.map_completed_item_mut(item).unwrap();
+        assert_eq!(start.id, completed.id);
+        for item in [start, completed] {
+            let event = ThreadEvent::ItemCompleted(ItemCompletedEvent { item });
+            let raw = serde_json::to_string(&event).unwrap();
+            assert_eq!(raw.matches("\"id\":").count(), 1, "{raw}");
+            assert_eq!(serde_json::from_str::<ThreadEvent>(&raw).unwrap(), event);
+            let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(value["item"]["call_id"], "provider-call");
+            assert_eq!(value["item"]["id"], "item_0");
+        }
+    }
+}
+
+#[test]
+fn plan_completion_and_recovery_deliver_exact_text_once() {
+    for streamed in [false, true] {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        let plan = ThreadItem::Plan {
+            id: "plan".into(),
+            text: "Plan α\nVerify β".into(),
+        };
+        if streamed {
+            let mut notification = agent_completion("unused", "");
+            let ServerNotification::ItemCompleted(payload) = &mut notification else {
+                unreachable!()
+            };
+            payload.item = plan.clone();
+            let collected = processor.collect_thread_events(notification);
+            assert_eq!(
+                serde_json::to_value(&collected.events[0]).unwrap()["item"]["text"],
+                "Plan α\nVerify β"
+            );
+        }
+        let ServerNotification::TurnCompleted(mut completion) = crate::tests::recovery_completion()
+        else {
+            unreachable!()
+        };
+        completion.turn.items = vec![plan];
+        let collected =
+            processor.collect_thread_events(ServerNotification::TurnCompleted(completion));
+        assert_eq!(collected.events.len(), if streamed { 1 } else { 2 });
+        assert_eq!(processor.final_message(), Some("Plan α\nVerify β"));
+    }
+}
+
+#[test]
+fn fatal_finalization_preserves_completed_artifact_and_terminal() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("answer.txt");
+    let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
+    processor.output = Box::new(Vec::<u8>::new());
+    processor.process_server_notification(crate::tests::recovery_completion());
+    processor.print_final_output().unwrap();
+    let before = std::fs::read(&path).unwrap();
+    processor.process_invocation_error("durable barrier failed".into());
+    assert!(processor.terminal_emitted);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        processor
+            .collect_event_stream_error("closed".into())
+            .is_empty()
+    );
+}
+
+#[test]
+fn terminal_usage_distinguishes_missing_zero_and_latest_received_snapshot() {
+    for totals in [vec![], vec![0], vec![10, 100]] {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        for total in &totals {
+            processor.collect_thread_events(ServerNotification::ThreadTokenUsageUpdated(
+                codex_app_server_protocol::ThreadTokenUsageUpdatedNotification {
+                    thread_id: "thread-1".into(), turn_id: "turn-1".into(),
+                    token_usage: serde_json::from_value(json!({
+                        "total":{"totalTokens":total,"inputTokens":total,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},
+                        "last":{"totalTokens":total,"inputTokens":total,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},
+                        "modelContextWindow":null,"estimatedContextTokens":null
+                    })).unwrap(),
+                }));
+        }
+        let events = processor.collect_thread_events(crate::tests::recovery_completion());
+        let Some(ThreadEvent::TurnCompleted(event)) = events.events.last() else {
+            panic!("terminal");
+        };
+        assert_eq!(
+            event.usage.as_ref().map(|usage| usage.input_tokens),
+            totals.last().copied()
+        );
+    }
+}
+
+#[test]
 fn progress_is_correlated_bounded_and_does_not_replace_the_terminal_item() {
     let mut processor = EventProcessorWithJsonOutput::new(None);
     let id = processor.started_item_id("call");
     for index in 0..3 {
-        let events = processor.collect_thread_events(ServerNotification::CommandExecutionOutputDelta(
-            codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
-                thread_id: "thread".into(), turn_id: "turn".into(), item_id: "call".into(),
-                delta: "λ".repeat(20_000),
-                stream: Some(codex_protocol::protocol::ExecOutputStream::Stderr),
-                decoding_lossy: Some(false),
-            },
-        ));
-        let [ThreadEvent::ItemProgress(event)] = events.events.as_slice() else { panic!("one delta"); };
+        let events =
+            processor.collect_thread_events(ServerNotification::CommandExecutionOutputDelta(
+                codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item_id: "call".into(),
+                    delta: "λ".repeat(20_000),
+                    stream: Some(codex_protocol::protocol::ExecOutputStream::Stderr),
+                    decoding_lossy: Some(false),
+                },
+            ));
+        let [ThreadEvent::ItemProgress(event)] = events.events.as_slice() else {
+            panic!("one delta");
+        };
         assert_eq!(event.item_id, id);
         assert_eq!(event.call_id, "call");
-        let crate::exec_events::ItemProgress::CommandOutput { delta, truncated, stream, decoding_lossy } = &event.progress else { panic!("command delta"); };
+        let crate::exec_events::ItemProgress::CommandOutput {
+            delta,
+            truncated,
+            stream,
+            decoding_lossy,
+        } = &event.progress
+        else {
+            panic!("command delta");
+        };
         assert_eq!(delta.len(), 16 * 1024);
         assert_eq!(*delta, "λ".repeat(8192));
         assert_eq!(*decoding_lossy, Some(false));
         assert!(*truncated);
-        assert_eq!(*stream, Some(codex_protocol::protocol::ExecOutputStream::Stderr));
+        assert_eq!(
+            *stream,
+            Some(codex_protocol::protocol::ExecOutputStream::Stderr)
+        );
         let events = processor.collect_thread_events(ServerNotification::McpToolCallProgress(
             codex_app_server_protocol::McpToolCallProgressNotification {
-                thread_id: "thread".into(), turn_id: "turn".into(), item_id: "call".into(),
-                message: "working".into(), progress: Some(f64::from(index)), total: None,
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "call".into(),
+                message: "working".into(),
+                progress: Some(f64::from(index)),
+                total: None,
             },
         ));
         assert_eq!(events.events.len(), 1);
@@ -47,14 +274,22 @@ fn progress_is_correlated_bounded_and_does_not_replace_the_terminal_item() {
     for late in [
         ServerNotification::CommandExecutionOutputDelta(
             codex_app_server_protocol::CommandExecutionOutputDeltaNotification {
-                thread_id: "thread".into(), turn_id: "turn".into(), item_id: "call".into(),
-                delta: "late".into(), stream: None, decoding_lossy: None,
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "call".into(),
+                delta: "late".into(),
+                stream: None,
+                decoding_lossy: None,
             },
         ),
         ServerNotification::McpToolCallProgress(
             codex_app_server_protocol::McpToolCallProgressNotification {
-                thread_id: "thread".into(), turn_id: "turn".into(), item_id: "call".into(),
-                message: "late".into(), progress: None, total: None,
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                item_id: "call".into(),
+                message: "late".into(),
+                progress: None,
+                total: None,
             },
         ),
     ] {
@@ -65,14 +300,23 @@ fn progress_is_correlated_bounded_and_does_not_replace_the_terminal_item() {
 
 #[test]
 fn every_terminal_outcome_has_one_receipt_with_available_timing() {
-    for status in [TurnStatus::Completed, TurnStatus::Failed, TurnStatus::Interrupted] {
+    for status in [
+        TurnStatus::Completed,
+        TurnStatus::Failed,
+        TurnStatus::Interrupted,
+    ] {
         let mut processor = EventProcessorWithJsonOutput::new(None);
-        let ServerNotification::TurnCompleted(mut notification) = crate::tests::recovery_completion() else { panic!("completion"); };
+        let ServerNotification::TurnCompleted(mut notification) =
+            crate::tests::recovery_completion()
+        else {
+            panic!("completion");
+        };
         notification.turn.items.clear();
         notification.turn.status = status.clone();
         let timing = codex_app_server_protocol::TurnTiming::default();
         notification.timing = Some(timing.clone());
-        let events = processor.collect_thread_events(ServerNotification::TurnCompleted(notification.clone()));
+        let events = processor
+            .collect_thread_events(ServerNotification::TurnCompleted(notification.clone()));
         assert_eq!(events.events.len(), 1);
         match &events.events[0] {
             ThreadEvent::TurnCompleted(event) => {
@@ -82,34 +326,63 @@ fn every_terminal_outcome_has_one_receipt_with_available_timing() {
             ThreadEvent::TurnFailed(event) => {
                 assert_ne!(status, TurnStatus::Completed);
                 assert_eq!(event.timing, Some(timing));
-                assert_eq!(event.disposition, if status == TurnStatus::Interrupted {
-                    crate::exec_events::TurnFailureDisposition::Interrupted
-                } else { crate::exec_events::TurnFailureDisposition::Failed });
+                assert_eq!(
+                    event.disposition,
+                    if status == TurnStatus::Interrupted {
+                        crate::exec_events::TurnFailureDisposition::Interrupted
+                    } else {
+                        crate::exec_events::TurnFailureDisposition::Failed
+                    }
+                );
                 assert!(event.usage.is_none());
             }
             other => panic!("unexpected receipt: {other:?}"),
         }
-        assert!(processor.collect_thread_events(ServerNotification::TurnCompleted(notification)).events.is_empty());
-        assert!(processor.collect_event_stream_error("closed".into()).is_empty());
+        assert!(
+            processor
+                .collect_thread_events(ServerNotification::TurnCompleted(notification))
+                .events
+                .is_empty()
+        );
+        assert!(
+            processor
+                .collect_event_stream_error("closed".into())
+                .is_empty()
+        );
     }
     let mut processor = EventProcessorWithJsonOutput::new(None);
     let events = processor.collect_event_stream_error("lost".into());
-    let ThreadEvent::TurnFailed(event) = events.last().unwrap() else { panic!("receipt"); };
-    assert_eq!(event.disposition, crate::exec_events::TurnFailureDisposition::TransportLost);
+    let ThreadEvent::TurnFailed(event) = events.last().unwrap() else {
+        panic!("receipt");
+    };
+    assert_eq!(
+        event.disposition,
+        crate::exec_events::TurnFailureDisposition::TransportLost
+    );
     let value = serde_json::to_value(event).unwrap();
     assert!(value["timing"].is_null());
     assert!(value["usage"].is_null());
     let terminal = events.last().unwrap();
     let wire = serde_json::to_value(terminal).unwrap();
-    assert_eq!(wire, serde_json::json!({
-        "type": "turn.failed",
-        "error": { "message": "lost" },
-        "disposition": "transport_lost",
-        "usage": null,
-        "timing": null,
-    }));
-    assert_eq!(&serde_json::from_value::<ThreadEvent>(wire).unwrap(), terminal);
-    assert!(processor.collect_event_stream_error("lost again".into()).is_empty());
+    assert_eq!(
+        wire,
+        serde_json::json!({
+            "type": "turn.failed",
+            "error": { "message": "lost" },
+            "disposition": "transport_lost",
+            "usage": null,
+            "timing": null,
+        })
+    );
+    assert_eq!(
+        &serde_json::from_value::<ThreadEvent>(wire).unwrap(),
+        terminal
+    );
+    assert!(
+        processor
+            .collect_event_stream_error("lost again".into())
+            .is_empty()
+    );
 }
 
 fn agent_completion(id: &str, text: &str) -> ServerNotification {
@@ -129,6 +402,7 @@ fn agent_completion(id: &str, text: &str) -> ServerNotification {
 fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
     let items = vec![
         ThreadItem::CommandExecution {
+            environment: None,
             output_metadata: None,
             stdout: None,
             stderr: None,
@@ -150,6 +424,7 @@ fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
             duration_ms: None,
         },
         ThreadItem::FileChange {
+            environment: None,
             id: "patch".into(),
             changes: Vec::new(),
             status: PatchApplyStatus::InProgress,
@@ -236,7 +511,11 @@ fn turn_recovery_preserves_in_progress_items_until_terminal_evidence() {
             completion.turn.items = vec![item];
             let terminal = processor
                 .collect_thread_events(ServerNotification::TurnCompleted(completion.clone()));
-            assert_eq!(terminal.events.len(), 1, "do not repeat the terminal turn receipt");
+            assert_eq!(
+                terminal.events.len(),
+                1,
+                "do not repeat the terminal turn receipt"
+            );
             let ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) = &terminal.events[0]
             else {
                 panic!("expected terminal item");
@@ -280,7 +559,7 @@ fn recovered_message_is_deduplicated_by_identity_not_text() {
         ));
         if expected_count == 1 {
             assert!(
-                matches!(&collected.events[0], ThreadEvent::ItemCompleted(ItemCompletedEvent { item: ExecThreadItem { details: ThreadItemDetails::AgentMessage(AgentMessageItem { text }), .. } }) if text == "same answer")
+                matches!(&collected.events[0], ThreadEvent::ItemCompleted(ItemCompletedEvent { item: ExecThreadItem { details: ThreadItemDetails::AgentMessage(AgentMessageItem { text, .. }), .. } }) if text == "same answer")
             );
         }
         assert_eq!(processor.final_message(), Some("same answer"));
@@ -322,7 +601,6 @@ fn stdout_failure_is_returned_without_overwriting_last_message() {
         "previous answer"
     );
 }
-
 
 #[test]
 fn failed_turn_does_not_overwrite_output_last_message_file() {
@@ -446,6 +724,7 @@ fn event_stream_error_emits_fatal_and_turn_terminal_events() {
 
     let error = ThreadErrorEvent {
         message: "worker exited early".to_string(),
+        ..Default::default()
     };
     assert_eq!(
         events,
@@ -498,41 +777,45 @@ fn completed_turn_exposes_timing_in_jsonl_event() {
     };
 
     for top_level in [true, false] {
-    let mut processor = EventProcessorWithJsonOutput::new(None);
-    let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
-        codex_app_server_protocol::TurnCompletedNotification {
-            surfaced_result: None,
-            thread_id: "thread-1".to_string(),
-            timing: top_level.then(|| timing.clone()),
-            turn: codex_app_server_protocol::Turn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
-                status: TurnStatus::Completed,
-                error: None,
-                started_at: None,
-                completed_at: Some(0),
-                duration_ms: None,
-                timing: Some(if top_level { Default::default() } else { timing.clone() }),
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
+            codex_app_server_protocol::TurnCompletedNotification {
                 surfaced_result: None,
+                thread_id: "thread-1".to_string(),
+                timing: top_level.then(|| timing.clone()),
+                turn: codex_app_server_protocol::Turn {
+                    id: "turn-1".to_string(),
+                    items_view: codex_app_server_protocol::TurnItemsView::Full,
+                    items: Vec::new(),
+                    status: TurnStatus::Completed,
+                    error: None,
+                    started_at: None,
+                    completed_at: Some(0),
+                    duration_ms: None,
+                    timing: Some(if top_level {
+                        Default::default()
+                    } else {
+                        timing.clone()
+                    }),
+                    surfaced_result: None,
+                },
             },
-        },
-    ));
+        ));
 
-    assert_eq!(collected.status, CodexStatus::InitiateShutdown);
-    let [ThreadEvent::TurnCompleted(event)] = collected.events.as_slice() else {
-        panic!("expected one turn.completed event");
-    };
-    assert_eq!(event.timing, Some(timing.clone()));
-    let serialized = serde_json::to_value(event).expect("serialize event");
-    assert_eq!(
-        serialized["timing"]["unions"]["modelStreamWaitUnionNs"],
-        json!(12_345_678)
-    );
-    assert_eq!(
-        serialized["timing"]["modelRequests"][1]["isContinuation"],
-        json!(true)
-    );
+        assert_eq!(collected.status, CodexStatus::InitiateShutdown);
+        let [ThreadEvent::TurnCompleted(event)] = collected.events.as_slice() else {
+            panic!("expected one turn.completed event");
+        };
+        assert_eq!(event.timing, Some(timing.clone()));
+        let serialized = serde_json::to_value(event).expect("serialize event");
+        assert_eq!(
+            serialized["timing"]["unions"]["modelStreamWaitUnionNs"],
+            json!(12_345_678)
+        );
+        assert_eq!(
+            serialized["timing"]["modelRequests"][1]["isContinuation"],
+            json!(true)
+        );
     }
 }
 
@@ -613,4 +896,53 @@ fn mcp_tool_call_result_preserves_meta_in_jsonl_event() {
         json!({"raw_messages": [{"ref_id": "turn0search0"}]})
     );
     assert!(serialized["item"]["result"].get("meta").is_none());
+}
+#[test]
+fn json_stream_preserves_final_phase_through_terminal_with_unloaded_items() {
+    use codex_protocol::models::MessagePhase;
+    for answer in [Some("answer"), Some(""), None] {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+        for (id, text, phase) in answer
+            .map(|text| ("final", text, MessagePhase::FinalAnswer))
+            .into_iter()
+            .chain(std::iter::once((
+                "progress",
+                "I will check next",
+                MessagePhase::Commentary,
+            )))
+        {
+            let mut notification = agent_completion(id, text);
+            let ServerNotification::ItemCompleted(payload) = &mut notification else {
+                unreachable!()
+            };
+            let ThreadItem::AgentMessage {
+                phase: item_phase, ..
+            } = &mut payload.item
+            else {
+                unreachable!()
+            };
+            *item_phase = Some(phase.clone());
+            let events = processor.collect_thread_events(notification).events;
+            assert_eq!(
+                serde_json::to_value(&events[0]).unwrap()["item"]["phase"],
+                if phase == MessagePhase::FinalAnswer {
+                    "final_answer"
+                } else {
+                    "commentary"
+                }
+            );
+        }
+        assert_eq!(processor.final_message(), answer);
+        let ServerNotification::TurnCompleted(mut terminal) = crate::tests::recovery_completion()
+        else {
+            unreachable!()
+        };
+        terminal.turn.items.clear();
+        terminal.timing = None;
+        terminal.turn.timing = None;
+        terminal.surfaced_result = None;
+        terminal.turn.surfaced_result = None;
+        processor.collect_thread_events(ServerNotification::TurnCompleted(terminal));
+        assert_eq!(processor.final_message(), answer);
+    }
 }

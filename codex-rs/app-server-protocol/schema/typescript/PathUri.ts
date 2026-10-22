@@ -9,17 +9,19 @@
  * URL, and the URI cannot be mutated after construction. [`Self::basename`],
  * [`Self::parent`], and [`Self::join`] operate on URI path segments without
  * interpreting them using the operating system running Codex. Fallback URIs
- * created by [`Self::from_abs_path`] are opaque to these lexical operations.
+ * created by [`Self::from_abs_path`] are opaque except for validated ordinary
+ * Windows UNC paths, whose hierarchy stops at the share root.
  *
  * `file:` paths retain their URI spelling so they can be parsed independently
  * of the current host. A local POSIX `file:` URI can also retain
  * percent-encoded non-UTF-8 bytes for lossless native round trips.
  *
  * Like [VS Code resources], path operations use `/` URI separators on every
- * host. Lexical path operations preserve a URL authority without interpreting
- * Windows drive or UNC roots from path text. Native path normalization,
- * filesystem aliases, symlinks, case sensitivity, and Unicode normalization
- * are not resolved.
+ * host. Lexical operations infer a POSIX or Windows convention from URI spelling
+ * and preserve drive or UNC share roots when traversing parents or joining paths.
+ * This interpretation is independent of the host operating system. These operations
+ * do not consult the host filesystem or resolve aliases, symlinks, case sensitivity,
+ * or Unicode normalization.
  *
  * Serde represents a `PathUri` as its canonical URI string. Deserialization
  * accepts only valid `file:` URI strings. These strings round-trip through

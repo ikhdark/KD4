@@ -272,14 +272,17 @@ mod tests {
                     false,
                 ),
             );
-            let other =
-                codex_connectors::list_all_connectors_with_options(other_context, true, |_| async {
+            let other = codex_connectors::list_all_connectors_with_options(
+                other_context,
+                true,
+                |_| async {
                     Ok(serde_json::from_value(serde_json::json!({
                         "apps": [], "next_token": null
                     }))?)
-                })
-                .await
-                .expect("replace in-memory cache");
+                },
+            )
+            .await
+            .expect("replace in-memory cache");
             assert!(other.is_empty());
         }
         assert_eq!(

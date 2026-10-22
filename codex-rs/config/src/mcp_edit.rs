@@ -4,8 +4,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 
-use codex_file_system::acquire_atomic_write_lock;
-use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::acquire_resolved_atomic_write_lock;
 use codex_file_system::write_atomically;
 use tokio::task;
 use toml::Value as TomlValue;
@@ -83,8 +82,7 @@ impl ConfigEditsBuilder {
     fn apply_blocking(self) -> std::io::Result<()> {
         fs::create_dir_all(&self.codex_home)?;
         let config_path = self.codex_home.join(CONFIG_TOML_FILE);
-        let _lock = acquire_atomic_write_lock(&config_path)?;
-        let write_paths = resolve_symlink_write_paths(&config_path)?;
+        let (write_paths, _lock) = acquire_resolved_atomic_write_lock(&config_path)?;
         let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
         let mut mutated = false;
         if let Some(servers) = self.mcp_servers.as_ref() {

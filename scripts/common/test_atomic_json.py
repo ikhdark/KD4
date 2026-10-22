@@ -27,11 +27,17 @@ class AtomicJsonTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report"
             with self.assertRaisesRegex(OSError, "producer interrupted"):
-                atomic_json.write_stream_atomic(output, InterruptedSource(b"partial"), exclusive=True)
+                atomic_json.write_stream_atomic(
+                    output, InterruptedSource(b"partial"), exclusive=True
+                )
             self.assertEqual(list(Path(directory).iterdir()), [])
-            atomic_json.write_stream_atomic(output, io.BytesIO(b"complete"), exclusive=True)
+            atomic_json.write_stream_atomic(
+                output, io.BytesIO(b"complete"), exclusive=True
+            )
             with self.assertRaises(FileExistsError):
-                atomic_json.write_stream_atomic(output, io.BytesIO(b"replacement"), exclusive=True)
+                atomic_json.write_stream_atomic(
+                    output, io.BytesIO(b"replacement"), exclusive=True
+                )
             self.assertEqual(output.read_bytes(), b"complete")
             self.assertEqual(list(Path(directory).iterdir()), [output])
 
@@ -39,11 +45,18 @@ class AtomicJsonTest(unittest.TestCase):
         link = os.link
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report"
+
             def race(source, destination):
                 destination.write_bytes(b"winner")
                 link(source, destination)
-            with mock.patch.object(atomic_json.os, "link", side_effect=race), self.assertRaises(FileExistsError):
-                atomic_json.write_stream_atomic(output, io.BytesIO(b"loser"), exclusive=True)
+
+            with (
+                mock.patch.object(atomic_json.os, "link", side_effect=race),
+                self.assertRaises(FileExistsError),
+            ):
+                atomic_json.write_stream_atomic(
+                    output, io.BytesIO(b"loser"), exclusive=True
+                )
             self.assertEqual(output.read_bytes(), b"winner")
             self.assertEqual(list(Path(directory).iterdir()), [output])
 
@@ -65,12 +78,20 @@ class AtomicJsonTest(unittest.TestCase):
                     destination.write_bytes(winner)
                     link(source, destination)
 
-                with mock.patch.object(atomic_json.os, "link", side_effect=race) as publish:
+                with mock.patch.object(
+                    atomic_json.os, "link", side_effect=race
+                ) as publish:
                     if winner == candidate:
-                        atomic_json.write_bytes_atomic(output, candidate, immutable=True)
+                        atomic_json.write_bytes_atomic(
+                            output, candidate, immutable=True
+                        )
                     else:
-                        with self.assertRaisesRegex(ValueError, "immutable delivery artifact was modified"):
-                            atomic_json.write_bytes_atomic(output, candidate, immutable=True)
+                        with self.assertRaisesRegex(
+                            ValueError, "immutable delivery artifact was modified"
+                        ):
+                            atomic_json.write_bytes_atomic(
+                                output, candidate, immutable=True
+                            )
                 publish.assert_called_once()
                 self.assertEqual(output.read_bytes(), winner)
                 self.assertEqual(list(Path(directory).iterdir()), [output])

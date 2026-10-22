@@ -162,6 +162,9 @@ fn insert_pending<K: Eq + Hash, V>(pending: &mut HashMap<K, V>, key: K, value: V
 
 #[derive(Default)]
 pub(crate) struct AnalyticsReducer {
+    retirement_pending: bool,
+    delivery_loss_epoch: u64,
+    delivery_gap_active: bool,
     requests: HashMap<(u64, RequestId), RequestState>,
     turns: HashMap<String, TurnState>,
     turn_order: VecDeque<String>,
@@ -173,12 +176,14 @@ pub(crate) struct AnalyticsReducer {
 }
 
 struct ConnectionState {
+    closed: bool,
     app_server_client: CodexAppServerClientMetadata,
     runtime: CodexRuntimeMetadata,
 }
 
 #[derive(Default)]
 struct ThreadAnalyticsState {
+    retire_when_unreferenced: bool,
     connection_id: Option<u64>,
     metadata: Option<ThreadMetadataState>,
     originator: Option<String>,
@@ -369,6 +374,8 @@ struct CompletedTurnState {
 
 #[derive(Default)]
 struct TurnState {
+    tool_count_baseline_seen: bool,
+    tool_counts_incomplete: bool,
     emitted: bool,
     connection_id: Option<u64>,
     thread_id: Option<String>,
@@ -437,6 +444,134 @@ impl TurnToolCounts {
 }
 
 impl AnalyticsReducer {
+    fn retire_closed_metadata(&mut self) {
+        if !self.retirement_pending {
+            return;
+        }
+        let mut protected = self
+            .turns
+            .values()
+            .filter(|turn| !turn.emitted)
+            .filter_map(|turn| turn.thread_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        protected.extend(self.requests.values().map(|request| match request {
+            RequestState::TurnStart(request) => request.thread_id.clone(),
+            RequestState::TurnSteer(request) => request.thread_id.clone(),
+        }));
+        protected.extend(
+            self.pending_reviews
+                .values()
+                .map(|review| review.thread_id.clone()),
+        );
+        protected.extend(
+            self.tool_items_in_progress
+                .keys()
+                .map(|key| key.thread_id.clone()),
+        );
+        protected.extend(
+            self.item_review_summaries
+                .keys()
+                .map(|key| key.thread_id.clone()),
+        );
+        protected.extend(
+            self.threads
+                .iter()
+                .filter(|(_, thread)| !thread.retire_when_unreferenced)
+                .map(|(id, _)| id.clone()),
+        );
+        let mut ancestors = protected.iter().cloned().collect::<Vec<_>>();
+        while let Some(id) = ancestors.pop() {
+            if let Some(parent) = self
+                .threads
+                .get(&id)
+                .and_then(|thread| thread.metadata.as_ref())
+                .and_then(|metadata| metadata.parent_thread_id.as_ref())
+                && protected.insert(parent.clone())
+            {
+                ancestors.push(parent.clone());
+            }
+        }
+        self.threads
+            .retain(|id, thread| !thread.retire_when_unreferenced || protected.contains(id));
+        let mut connections = self
+            .requests
+            .keys()
+            .map(|(id, _)| *id)
+            .collect::<std::collections::HashSet<_>>();
+        connections.extend(
+            self.turns
+                .values()
+                .filter(|turn| !turn.emitted)
+                .filter_map(|turn| turn.connection_id),
+        );
+        connections.extend(
+            self.threads
+                .values()
+                .filter_map(|thread| thread.connection_id),
+        );
+        self.connections
+            .retain(|id, connection| !connection.closed || connections.contains(id));
+        self.retirement_pending = self
+            .connections
+            .values()
+            .any(|connection| connection.closed)
+            || self
+                .threads
+                .values()
+                .any(|thread| thread.retire_when_unreferenced);
+    }
+
+    fn admit_thread_metadata(&mut self, thread_id: &str) -> bool {
+        if self.threads.contains_key(thread_id) || self.threads.len() < MAX_PENDING_ANALYTICS_ITEMS
+        {
+            return true;
+        }
+        self.retire_closed_metadata();
+        if self.threads.len() < MAX_PENDING_ANALYTICS_ITEMS {
+            return true;
+        }
+        tracing::warn!(
+            thread_id,
+            "analytics context unavailable: thread metadata capacity reached"
+        );
+        false
+    }
+
+    fn ingest_connection_closed(&mut self, connection_id: u64) {
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            connection.closed = true;
+            self.retirement_pending = true;
+        }
+        // A closed connection cannot produce a new acknowledged RPC response.
+        self.requests.retain(|(id, _), _| *id != connection_id);
+        for thread in self
+            .threads
+            .values_mut()
+            .filter(|thread| thread.connection_id == Some(connection_id))
+        {
+            thread.retire_when_unreferenced = true;
+            self.retirement_pending = true;
+        }
+    }
+
+    pub(crate) fn observe_delivery_loss(&mut self, epoch: u64) {
+        if epoch == self.delivery_loss_epoch && epoch != u64::MAX {
+            return;
+        }
+        self.delivery_loss_epoch = epoch;
+        self.delivery_gap_active = true;
+        for turn in self.turns.values_mut() {
+            turn.tool_counts_incomplete = true;
+        }
+    }
+
+    pub(crate) fn delivery_queue_drained(&mut self, epoch: u64) {
+        self.observe_delivery_loss(epoch);
+        // Pending turns retain their gap. Only a later accepted baseline can
+        // establish a fresh complete observation window after a real drain.
+        self.delivery_gap_active = epoch == u64::MAX;
+    }
+
     // Keep recent completed IDs as lightweight markers so late facts cannot
     // recreate their payloads. The same FIFO bound also retires lost completions.
     fn turn_state(&mut self, turn_id: &str) -> Option<&mut TurnState> {
@@ -448,7 +583,13 @@ impl AnalyticsReducer {
                 self.clear_turn_items(&oldest);
             }
             self.turn_order.push_back(turn_id.to_string());
-            self.turns.insert(turn_id.to_string(), TurnState::default());
+            self.turns.insert(
+                turn_id.to_string(),
+                TurnState {
+                    tool_counts_incomplete: self.delivery_gap_active,
+                    ..TurnState::default()
+                },
+            );
         }
         self.turns.get_mut(turn_id).filter(|turn| !turn.emitted)
     }
@@ -463,7 +604,26 @@ impl AnalyticsReducer {
     }
 
     pub(crate) async fn ingest(&mut self, input: AnalyticsFact, out: &mut Vec<TrackEventRequest>) {
+        let may_retire = match &input {
+            AnalyticsFact::ConnectionClosed { .. }
+            | AnalyticsFact::ClientResponse { .. }
+            | AnalyticsFact::ErrorResponse { .. }
+            | AnalyticsFact::ServerResponse { .. }
+            | AnalyticsFact::ServerRequestAborted { .. }
+            | AnalyticsFact::EffectivePermissionsApprovalResponse { .. } => true,
+            AnalyticsFact::Notification(notification) => matches!(
+                notification.as_ref(),
+                ServerNotification::ItemCompleted(_)
+                    | ServerNotification::TurnCompleted(_)
+                    | ServerNotification::ThreadClosed(_)
+                    | ServerNotification::ThreadArchived(_)
+            ),
+            _ => false,
+        };
         match input {
+            AnalyticsFact::ConnectionClosed { connection_id } => {
+                self.ingest_connection_closed(connection_id)
+            }
             AnalyticsFact::Initialize {
                 connection_id,
                 params,
@@ -599,6 +759,9 @@ impl AnalyticsReducer {
                 }
             },
         }
+        if may_retire {
+            self.retire_closed_metadata();
+        }
     }
 
     fn ingest_initialize(
@@ -609,9 +772,22 @@ impl AnalyticsReducer {
         runtime: CodexRuntimeMetadata,
         rpc_transport: AppServerRpcTransport,
     ) {
+        if self.connections.len() >= MAX_PENDING_ANALYTICS_ITEMS
+            && !self.connections.contains_key(&connection_id)
+        {
+            self.retire_closed_metadata();
+            if self.connections.len() >= MAX_PENDING_ANALYTICS_ITEMS {
+                tracing::warn!(
+                    connection_id,
+                    "analytics context unavailable: connection metadata capacity reached"
+                );
+                return;
+            }
+        }
         self.connections.insert(
             connection_id,
             ConnectionState {
+                closed: false,
                 app_server_client: CodexAppServerClientMetadata {
                     product_client_id,
                     client_name: Some(params.client_info.name),
@@ -631,12 +807,16 @@ impl AnalyticsReducer {
         input: SubAgentThreadStartedInput,
         out: &mut Vec<TrackEventRequest>,
     ) {
+        if !self.admit_thread_metadata(&input.thread_id) {
+            return;
+        }
         let parent_thread_id = input.parent_thread_id.clone();
         let parent_connection_id = parent_thread_id
             .as_ref()
             .and_then(|parent_thread_id| self.threads.get(parent_thread_id))
             .and_then(|thread| thread.connection_id);
         let thread_state = self.threads.entry(input.thread_id.clone()).or_default();
+        thread_state.retire_when_unreferenced = false;
         thread_state
             .originator
             .get_or_insert_with(|| input.product_client_id.clone());
@@ -1265,6 +1445,23 @@ impl AnalyticsReducer {
         out: &mut Vec<TrackEventRequest>,
     ) {
         match notification {
+            ServerNotification::ThreadClosed(notification) => {
+                if let Some(thread) = self.threads.get_mut(&notification.thread_id) {
+                    thread.retire_when_unreferenced = true;
+                    self.retirement_pending = true;
+                }
+            }
+            ServerNotification::ThreadArchived(notification) => {
+                if let Some(thread) = self.threads.get_mut(&notification.thread_id) {
+                    thread.retire_when_unreferenced = true;
+                    self.retirement_pending = true;
+                }
+            }
+            ServerNotification::ThreadUnarchived(notification) => {
+                if let Some(thread) = self.threads.get_mut(&notification.thread_id) {
+                    thread.retire_when_unreferenced = false;
+                }
+            }
             ServerNotification::ItemStarted(notification) => {
                 let Some(item_id) = tracked_tool_item_id(&notification.item) else {
                     return;
@@ -1281,13 +1478,20 @@ impl AnalyticsReducer {
                 {
                     return;
                 }
+                let key = ToolItemKey {
+                    thread_id: notification.thread_id,
+                    turn_id: notification.turn_id,
+                    item_id,
+                };
+                if self.tool_items_in_progress.len() >= MAX_PENDING_ANALYTICS_ITEMS
+                    && !self.tool_items_in_progress.contains_key(&key)
+                    && let Some(turn) = self.turn_state(&key.turn_id)
+                {
+                    turn.tool_counts_incomplete = true;
+                }
                 insert_pending(
                     &mut self.tool_items_in_progress,
-                    ToolItemKey {
-                        thread_id: notification.thread_id,
-                        turn_id: notification.turn_id,
-                        item_id,
-                    },
+                    key,
                     PendingToolItem {
                         started_at_ms,
                         item: notification.item,
@@ -1371,6 +1575,7 @@ impl AnalyticsReducer {
                     return;
                 };
                 turn_state.thread_id = Some(notification.thread_id);
+                turn_state.tool_count_baseline_seen = true;
                 turn_state.started_at = notification
                     .turn
                     .started_at
@@ -1409,10 +1614,19 @@ impl AnalyticsReducer {
                     .and_then(|timing| timing.completed_at_unix_ms)
                     .and_then(|milliseconds| u64::try_from(milliseconds).ok())
                     .or_else(|| completed_at.and_then(|seconds| seconds.checked_mul(1000)));
+                // Interrupted and failed turns flush and count their abandoned
+                // items below. Only items cleared without being counted leave a gap.
+                let flushes_abandoned_tools =
+                    abandoned_tool_status.is_some() && completed_at_ms.is_some();
+                let has_uncounted_tools = self.tool_items_in_progress.keys().any(|key| {
+                    key.turn_id == turn_id
+                        && (!flushes_abandoned_tools || key.thread_id != thread_id)
+                });
                 let Some(turn_state) = self.turn_state(&turn_id) else {
                     return;
                 };
                 turn_state.thread_id = Some(thread_id.clone());
+                turn_state.tool_counts_incomplete |= has_uncounted_tools;
                 turn_state.completed = Some(CompletedTurnState {
                     status: analytics_turn_status(notification.turn.status),
                     turn_error: notification
@@ -1457,6 +1671,9 @@ impl AnalyticsReducer {
         let thread_id = thread.id;
         let parent_thread_id = thread.parent_thread_id;
         let forked_from_thread_id = thread.forked_from_id;
+        if !self.admit_thread_metadata(&thread_id) {
+            return;
+        }
         let Some(connection_state) = self.connections.get(&connection_id) else {
             return;
         };
@@ -1468,6 +1685,7 @@ impl AnalyticsReducer {
             initialization_mode,
         );
         let thread_state = self.threads.entry(thread_id.clone()).or_default();
+        thread_state.retire_when_unreferenced = false;
         if let Some(originator) = thread_originator {
             thread_state.originator = Some(originator);
         }
@@ -1808,6 +2026,7 @@ impl AnalyticsReducer {
                 ..TurnState::default()
             },
         );
+        self.retire_closed_metadata();
     }
 
     fn thread_connection_or_warn(
@@ -1912,6 +2131,7 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
             duration_ms,
             ..
         } => ThreadItem::CommandExecution {
+            environment: None,
             output_metadata: None,
             stdout: None,
             stderr: None,
@@ -1934,7 +2154,9 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
             id,
             changes,
             status,
+            ..
         } => ThreadItem::FileChange {
+            environment: None,
             id: id.clone(),
             changes: changes
                 .iter()
@@ -2030,6 +2252,7 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
                     (
                         thread_id.clone(),
                         CollabAgentState {
+                            stop_cause: state.stop_cause,
                             status: state.status.clone(),
                             message: None,
                             surfaced_result: None,
@@ -2046,6 +2269,7 @@ pub(crate) fn analytics_tool_item(item: &ThreadItem) -> Option<ThreadItem> {
             revised_prompt: item.revised_prompt.as_ref().map(|_| String::new()),
             result: String::new(),
             saved_path: item.saved_path.clone(),
+            provider_usage: item.provider_usage.clone(),
         }),
         ThreadItem::UserMessage { .. }
         | ThreadItem::HookPrompt { .. }
@@ -2155,6 +2379,7 @@ fn tool_item_event(input: ToolItemEventInput<'_>) -> Option<TrackEventRequest> {
             id,
             changes,
             status,
+            ..
         } => {
             let (terminal_status, failure_kind) =
                 override_tool_item_outcome(patch_apply_outcome(status), terminal_status_override)?;
@@ -2932,6 +3157,8 @@ fn codex_turn_event_params(
     } = profile;
     let token_usage = turn_state.token_usage.clone();
     let codex_error = turn_state.codex_error.as_ref();
+    let tool_counts_complete =
+        turn_state.tool_count_baseline_seen && !turn_state.tool_counts_incomplete;
     CodexTurnEventParams {
         thread_id,
         session_id: thread_metadata.session_id.clone(),
@@ -2967,14 +3194,19 @@ fn codex_turn_event_params(
         codex_error_kind: codex_error.map(|error| error.kind),
         codex_error_http_status_code: codex_error.and_then(|error| error.http_status_code),
         steer_count: Some(turn_state.steer_count),
-        total_tool_call_count: Some(turn_state.tool_counts.total),
-        shell_command_count: Some(turn_state.tool_counts.shell_command),
-        file_change_count: Some(turn_state.tool_counts.file_change),
-        mcp_tool_call_count: Some(turn_state.tool_counts.mcp_tool_call),
-        dynamic_tool_call_count: Some(turn_state.tool_counts.dynamic_tool_call),
-        subagent_tool_call_count: Some(turn_state.tool_counts.subagent_tool_call),
-        web_search_count: Some(turn_state.tool_counts.web_search),
-        image_generation_count: Some(turn_state.tool_counts.image_generation),
+        total_tool_call_count: tool_counts_complete.then_some(turn_state.tool_counts.total),
+        shell_command_count: tool_counts_complete.then_some(turn_state.tool_counts.shell_command),
+        file_change_count: tool_counts_complete.then_some(turn_state.tool_counts.file_change),
+        mcp_tool_call_count: tool_counts_complete.then_some(turn_state.tool_counts.mcp_tool_call),
+        dynamic_tool_call_count: tool_counts_complete
+            .then_some(turn_state.tool_counts.dynamic_tool_call),
+        subagent_tool_call_count: tool_counts_complete
+            .then_some(turn_state.tool_counts.subagent_tool_call),
+        web_search_count: tool_counts_complete.then_some(turn_state.tool_counts.web_search),
+        image_generation_count: tool_counts_complete
+            .then_some(turn_state.tool_counts.image_generation),
+        token_usage_scope: "turn",
+        token_usage_coverage: token_usage.as_ref().and_then(|usage| usage.coverage),
         input_tokens: token_usage
             .as_ref()
             .map(|token_usage| token_usage.input_tokens),
@@ -3139,35 +3371,72 @@ mod tests {
         use crate::analytics_client_tests::sample_turn_start_response;
         let mut reducer = AnalyticsReducer::default();
         let mut out = Vec::new();
-        reducer.ingest(AnalyticsFact::ClientRequest {
-            connection_id: 7,
-            request_id: RequestId::Integer(3),
-            request: Box::new(ClientRequest::ThreadArchive {
-                request_id: RequestId::Integer(3),
-                params: codex_app_server_protocol::ThreadArchiveParams { thread_id: "thread-2".into() },
-            }),
-        }, &mut out).await;
-        assert!(reducer.requests.is_empty(), "untracked requests must not retain correlation state");
-        for rejected in [false, true] {
-            if rejected {
-                reducer.ingest(AnalyticsFact::ClientRequest {
+        reducer
+            .ingest(
+                AnalyticsFact::ClientRequest {
                     connection_id: 7,
                     request_id: RequestId::Integer(3),
-                    request: Box::new(sample_turn_start_request("thread-2", 3)),
-                }, &mut out).await;
-                assert_eq!(reducer.requests.len(), 1, "positive control: start request is retained");
-                reducer.ingest(AnalyticsFact::ErrorResponse {
-                    connection_id: 7, request_id: RequestId::Integer(3), error_type: None,
-                }, &mut out).await;
-                assert!(reducer.requests.is_empty(), "error must remove pending request");
+                    request: Box::new(ClientRequest::ThreadArchive {
+                        request_id: RequestId::Integer(3),
+                        params: codex_app_server_protocol::ThreadArchiveParams {
+                            thread_id: "thread-2".into(),
+                        },
+                    }),
+                },
+                &mut out,
+            )
+            .await;
+        assert!(
+            reducer.requests.is_empty(),
+            "untracked requests must not retain correlation state"
+        );
+        for rejected in [false, true] {
+            if rejected {
+                reducer
+                    .ingest(
+                        AnalyticsFact::ClientRequest {
+                            connection_id: 7,
+                            request_id: RequestId::Integer(3),
+                            request: Box::new(sample_turn_start_request("thread-2", 3)),
+                        },
+                        &mut out,
+                    )
+                    .await;
+                assert_eq!(
+                    reducer.requests.len(),
+                    1,
+                    "positive control: start request is retained"
+                );
+                reducer
+                    .ingest(
+                        AnalyticsFact::ErrorResponse {
+                            connection_id: 7,
+                            request_id: RequestId::Integer(3),
+                            error_type: None,
+                        },
+                        &mut out,
+                    )
+                    .await;
+                assert!(
+                    reducer.requests.is_empty(),
+                    "error must remove pending request"
+                );
             }
-            reducer.ingest(AnalyticsFact::ClientResponse {
-                connection_id: 7,
-                request_id: RequestId::Integer(3),
-                response: Box::new(sample_turn_start_response("turn-2")),
-                thread_originator: None,
-            }, &mut out).await;
-            assert!(reducer.turns.is_empty(), "late response must not resurrect ignored or failed request");
+            reducer
+                .ingest(
+                    AnalyticsFact::ClientResponse {
+                        connection_id: 7,
+                        request_id: RequestId::Integer(3),
+                        response: Box::new(sample_turn_start_response("turn-2")),
+                        thread_originator: None,
+                    },
+                    &mut out,
+                )
+                .await;
+            assert!(
+                reducer.turns.is_empty(),
+                "late response must not resurrect ignored or failed request"
+            );
             assert!(out.is_empty());
         }
     }
@@ -3181,6 +3450,99 @@ mod tests {
                 item: sample_command_execution_item(CommandExecutionStatus::InProgress, None, None),
             },
         )))
+    }
+
+    #[tokio::test]
+    async fn audit_observability_metadata_retirement_and_lost_close_bound() {
+        use crate::analytics_client_tests::sample_initialize_fact;
+        use crate::analytics_client_tests::sample_thread_start_response;
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        ingest_turn_prerequisites(&mut reducer, &mut out, true, true, true, true).await;
+        // One active owner must survive more than a full retention budget of churn.
+        for index in 0..=MAX_PENDING_ANALYTICS_ITEMS {
+            let connection_id = index as u64 + 8;
+            let thread_id = format!("closed-{index}");
+            reducer
+                .ingest(sample_initialize_fact(connection_id), &mut out)
+                .await;
+            reducer
+                .ingest(
+                    AnalyticsFact::ClientResponse {
+                        connection_id,
+                        request_id: RequestId::Integer(1),
+                        response: Box::new(sample_thread_start_response(
+                            &thread_id, false, "gpt-5",
+                        )),
+                        thread_originator: None,
+                    },
+                    &mut out,
+                )
+                .await;
+            reducer
+                .ingest(AnalyticsFact::ConnectionClosed { connection_id }, &mut out)
+                .await;
+            assert_eq!(reducer.connections.len(), 1);
+            assert_eq!(reducer.threads.len(), 1);
+            assert!(reducer.threads.contains_key("thread-2"));
+            out.clear();
+        }
+        // If every close fact is lost, omit new context rather than growing
+        // forever or replacing an active owner's attribution.
+        for index in 0..=MAX_PENDING_ANALYTICS_ITEMS {
+            let connection_id = index as u64 + 8;
+            reducer
+                .ingest(sample_initialize_fact(connection_id), &mut out)
+                .await;
+            reducer
+                .ingest(
+                    AnalyticsFact::ClientResponse {
+                        connection_id,
+                        request_id: RequestId::Integer(1),
+                        response: Box::new(sample_thread_start_response(
+                            &format!("lost-{index}"),
+                            false,
+                            "gpt-5",
+                        )),
+                        thread_originator: None,
+                    },
+                    &mut out,
+                )
+                .await;
+            out.clear();
+        }
+        assert_eq!(reducer.connections.len(), MAX_PENDING_ANALYTICS_ITEMS);
+        assert_eq!(reducer.threads.len(), MAX_PENDING_ANALYTICS_ITEMS);
+        assert!(reducer.threads.contains_key("thread-2"));
+        reducer
+            .ingest(
+                AnalyticsFact::ConnectionClosed { connection_id: 7 },
+                &mut out,
+            )
+            .await;
+        assert!(
+            reducer.connections.contains_key(&7),
+            "active turn still needs its original context"
+        );
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                    "thread-2",
+                    "turn-2",
+                    codex_app_server_protocol::TurnStatus::Completed,
+                    None,
+                ))),
+                &mut out,
+            )
+            .await;
+        let event = out
+            .iter()
+            .find(|event| matches!(event, TrackEventRequest::TurnEvent(_)))
+            .unwrap();
+        let event = serde_json::to_value(event).unwrap();
+        assert_eq!(event["event_params"]["session_id"], "session-thread-2");
+        assert!(!reducer.connections.contains_key(&7));
+        assert!(!reducer.threads.contains_key("thread-2"));
     }
 
     #[tokio::test]

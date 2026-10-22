@@ -26,6 +26,9 @@ pub(crate) enum TurnInput {
         client_id: Option<String>,
     },
     ResponseItem(ResponseItem),
+    /// A supplied source map is owned by accepted input until its ordered
+    /// history transaction commits; failed startup must not consume it.
+    AdditionalContext(indexmap::IndexMap<String, codex_protocol::protocol::AdditionalContextEntry>),
     /// Model-visible runtime context generated inside the active turn. Unlike
     /// user or extension steering, this must not wake owner-held operations or
     /// force another turn solely because it is queued.
@@ -58,6 +61,9 @@ pub(crate) struct TurnInputQueue {
 
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
 pub(crate) struct InputQueue {
+    // Last in the queue lock order; never held across an await. Nested tool
+    // admission shares this fence with successful steering commits.
+    user_intent: std::sync::Mutex<UserIntentState>,
     activity_tx: watch::Sender<InputQueueActivity>,
     agent_activity_tx: watch::Sender<InputQueueActivity>,
     startup_recovery_items: Mutex<TurnInputQueue>,
@@ -66,6 +72,14 @@ pub(crate) struct InputQueue {
     max_seen_mailbox_communication_ids: usize,
     max_pending_turn_input_items: usize,
     max_pending_turn_input_bytes: usize,
+}
+
+#[derive(Default)]
+struct UserIntentState {
+    // Epochs are only compared for equality, so steering admissions wrap the
+    // counter instead of exhausting it; the epoch still changes on every one.
+    accepted: u64,
+    incorporated: u64,
 }
 
 #[derive(Default)]
@@ -81,6 +95,7 @@ impl InputQueue {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         let (agent_activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
+            user_intent: std::sync::Mutex::new(UserIntentState::default()),
             activity_tx,
             agent_activity_tx,
             startup_recovery_items: Mutex::new(TurnInputQueue::default()),
@@ -90,6 +105,30 @@ impl InputQueue {
             max_pending_turn_input_items: MAX_PENDING_TURN_INPUT_ITEMS,
             max_pending_turn_input_bytes: MAX_PENDING_TURN_INPUT_BYTES,
         }
+    }
+
+    pub(crate) fn incorporated_user_intent_epoch(&self) -> u64 {
+        self.user_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .incorporated
+    }
+
+    /// Poll the first dispatch under the steering commit fence. Once admitted,
+    /// the same owner future must settle even if later steering changes intent.
+    pub(crate) fn admit_code_mode_tool<T>(
+        &self,
+        authoring_epoch: u64,
+        admit: impl FnOnce() -> T,
+    ) -> Result<T, u64> {
+        let intent = self
+            .user_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if intent.accepted != authoring_epoch {
+            return Err(intent.accepted);
+        }
+        Ok(admit())
     }
 
     #[cfg(test)]
@@ -152,11 +191,36 @@ impl InputQueue {
         Option<InputQueueActivity>,
     ) {
         let receiver = self.agent_activity_tx.subscribe();
+        let pending = self.pending_agent_activity(turn_state).await;
+        (receiver, pending)
+    }
+
+    pub(crate) async fn pending_agent_activity(
+        &self,
+        turn_state: Option<&Mutex<TurnState>>,
+    ) -> Option<InputQueueActivity> {
         let mut pending = self.pending_activity(turn_state, false).await;
         if pending != Some(InputQueueActivity::Steer) && self.has_pending_mailbox_items().await {
             pending = Some(InputQueueActivity::Mailbox);
         }
-        (receiver, pending)
+        pending
+    }
+
+    /// A watch is a wake hint, never a retained activity or its priority.
+    pub(crate) async fn next_agent_activity(
+        &self,
+        turn_state: Option<&Mutex<TurnState>>,
+        receiver: &mut watch::Receiver<InputQueueActivity>,
+    ) -> InputQueueActivity {
+        loop {
+            receiver.borrow_and_update();
+            if let Some(activity) = self.pending_agent_activity(turn_state).await {
+                return activity;
+            }
+            if receiver.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     /// Derives the highest-priority pending activity from queue state.
@@ -401,6 +465,7 @@ impl InputQueue {
     pub(crate) async fn clear_pending_for_turn_state(&self, turn_state: &Mutex<TurnState>) {
         let mut turn_state = turn_state.lock().await;
         turn_state.clear_pending_waiters();
+        turn_state.input_in_flight.clear();
         turn_state.pending_input = TurnInputQueue::default();
     }
 
@@ -473,10 +538,17 @@ impl InputQueue {
             // All fallible admission checks are complete. The caller already
             // holds its context guards; commit them without another await before
             // publishing input or waking its consumers.
+            let mut intent = self
+                .user_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             commit_context();
             turn_state.pending_input.items.extend_from_slice(input);
             turn_state.pending_input.bytes += bytes;
             turn_state.accept_mailbox_delivery_for_current_turn();
+            if input.iter().any(TurnInput::is_steering_input) {
+                intent.accepted = intent.accepted.wrapping_add(1);
+            }
         }
         self.activity_tx.send_replace(InputQueueActivity::Steer);
         self.agent_activity_tx
@@ -503,8 +575,15 @@ impl InputQueue {
             input.len(),
             bytes,
         )?;
+        let mut intent = self
+            .user_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         turn_state.pending_input.items.extend_from_slice(input);
         turn_state.pending_input.bytes += bytes;
+        if input.iter().any(TurnInput::is_steering_input) {
+            intent.accepted = intent.accepted.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -561,6 +640,20 @@ impl InputQueue {
         true
     }
 
+    /// Called under the startup admission lock, immediately before worker
+    /// installation. Earlier recovery and taskless input precede the new prompt.
+    pub(crate) async fn prepare_initial_input(
+        &self,
+        state: &Mutex<TurnState>,
+        input: Vec<TurnInput>,
+    ) -> Vec<TurnInput> {
+        let mut state = state.lock().await;
+        let mut earlier = std::mem::take(&mut state.pending_input);
+        earlier.items.extend(input);
+        state.input_in_flight.extend(earlier.items.iter().cloned());
+        earlier.items
+    }
+
     fn transfer_mailbox_prefix(&self, mailbox: &mut MailboxState, input: &mut TurnInputQueue) {
         while let Some((_, bytes)) = mailbox.pending_mails.front() {
             if input.items.len() >= self.max_pending_turn_input_items
@@ -579,6 +672,7 @@ impl InputQueue {
 
     /// Takes already-ready mail for an initial user request, leaving later
     /// steering and recovered user work in their owning queues.
+    #[cfg(test)]
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "Acquire all owners before moving accepted mail"
@@ -588,6 +682,25 @@ impl InputQueue {
         active_turn: &Mutex<Option<ActiveTurn>>,
         initial_input: &[TurnInput],
     ) -> Vec<TurnInput> {
+        let active = active_turn.lock().await;
+        self.take_initial_mailbox_for_state(
+            active.as_ref().map(|turn| turn.turn_state.as_ref()),
+            initial_input,
+            false,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Acquire all owners in recovery -> turn-state -> mailbox order before moving accepted mail"
+    )]
+    pub(crate) async fn take_initial_mailbox_for_state(
+        &self,
+        state: Option<&Mutex<TurnState>>,
+        initial_input: &[TurnInput],
+        retain_for_recording: bool,
+    ) -> Vec<TurnInput> {
         let mut output = TurnInputQueue {
             items: Vec::new(),
             bytes: initial_input
@@ -595,10 +708,9 @@ impl InputQueue {
                 .map(turn_input_size_bytes)
                 .fold(0usize, usize::saturating_add),
         };
-        let active = active_turn.lock().await;
         let mut recovered = self.startup_recovery_items.lock().await;
-        let mut turn = match active.as_ref() {
-            Some(turn) => Some(turn.turn_state.lock().await),
+        let mut turn = match state {
+            Some(state) => Some(state.lock().await),
             None => None,
         };
         if turn
@@ -629,11 +741,17 @@ impl InputQueue {
             true
         };
         if !take_owned_mail(&mut recovered, &mut output) {
+            if retain_for_recording && let Some(turn) = turn.as_mut() {
+                turn.input_in_flight.extend(output.items.iter().cloned());
+            }
             return output.items;
         }
         if let Some(turn) = turn.as_mut()
             && !take_owned_mail(&mut turn.pending_input, &mut output)
         {
+            if retain_for_recording {
+                turn.input_in_flight.extend(output.items.iter().cloned());
+            }
             return output.items;
         }
         while let Some((_, bytes)) = mailbox.pending_mails.front() {
@@ -649,6 +767,9 @@ impl InputQueue {
             mailbox.bytes -= bytes;
             output.bytes += bytes;
             output.items.push(TurnInput::InterAgentCommunication(mail));
+        }
+        if retain_for_recording && let Some(turn) = turn.as_mut() {
+            turn.input_in_flight.extend(output.items.iter().cloned());
         }
         output.items
     }
@@ -698,11 +819,16 @@ impl InputQueue {
     ) -> bool {
         let mut recovered = self.startup_recovery_items.lock().await;
         let mut turn_state = turn_state.lock().await;
-        let has_input = !turn_state.pending_input.items.is_empty();
+        let has_input =
+            !turn_state.input_in_flight.is_empty() || !turn_state.pending_input.items.is_empty();
+        let mut in_flight =
+            TurnInputQueue::from_items(turn_state.input_in_flight.drain(..).collect());
+        recovered.append(&mut in_flight);
         recovered.append(&mut turn_state.pending_input);
         has_input
     }
 
+    #[cfg(test)]
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -711,13 +837,26 @@ impl InputQueue {
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
     ) -> Vec<TurnInput> {
+        let active = active_turn.lock().await;
+        self.take_pending_for_state(active.as_ref().map(|turn| turn.turn_state.as_ref()), false)
+            .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Every queue owner must be held before draining so cancelled acquisition preserves accepted input"
+    )]
+    pub(crate) async fn take_pending_for_state(
+        &self,
+        state: Option<&Mutex<TurnState>>,
+        retain_for_recording: bool,
+    ) -> Vec<TurnInput> {
         // Acquire every required queue before removing accepted input. Cancellation while
         // waiting for any lock must leave all input available to the next consumer.
         // Match active-turn injection's active -> recovery -> turn-state lock order.
-        let active = active_turn.lock().await;
         let mut recovered = self.startup_recovery_items.lock().await;
-        let mut turn_state = match active.as_ref() {
-            Some(active_turn) => Some(active_turn.turn_state.lock().await),
+        let mut turn_state = match state {
+            Some(state) => Some(state.lock().await),
             None => None,
         };
         let accepts_mailbox_delivery = turn_state
@@ -735,6 +874,20 @@ impl InputQueue {
         }
         if let Some(mailbox) = mailbox.as_mut() {
             self.transfer_mailbox_prefix(mailbox, &mut input);
+        }
+        if retain_for_recording && let Some(turn_state) = turn_state.as_mut() {
+            turn_state
+                .input_in_flight
+                .extend(input.items.iter().cloned());
+        }
+        // All steering in these queues is now owned by the history recording
+        // transaction. Later arrivals cannot acquire this request's authority.
+        if retain_for_recording {
+            let mut intent = self
+                .user_intent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            intent.incorporated = intent.accepted;
         }
         input.items
     }
@@ -801,6 +954,7 @@ fn turn_input_size_bytes(input: &TurnInput) -> usize {
             serialized_size(item)
         }
         TurnInput::InterAgentCommunication(communication) => serialized_size(communication),
+        TurnInput::AdditionalContext(values) => serialized_size(values),
     }
 }
 
@@ -860,14 +1014,17 @@ impl TurnInputQueue {
 
 impl TurnInput {
     fn is_steering_input(&self) -> bool {
-        matches!(self, Self::UserInput { .. } | Self::ResponseItem(_))
+        matches!(
+            self,
+            Self::UserInput { .. } | Self::ResponseItem(_) | Self::AdditionalContext(_)
+        )
     }
 
     fn requires_turn_continuation(&self) -> bool {
         match self {
             Self::InternalResponseItem(_) => false,
             Self::InterAgentCommunication(mail) => mail.trigger_turn,
-            Self::UserInput { .. } | Self::ResponseItem(_) => true,
+            Self::UserInput { .. } | Self::ResponseItem(_) | Self::AdditionalContext(_) => true,
         }
     }
 }
@@ -877,6 +1034,82 @@ mod tests {
     use super::*;
     use codex_protocol::AgentPath;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn user_intent_changes_only_after_successful_steering_admission() {
+        let input = TurnInput::AdditionalContext(Default::default());
+        let state = Mutex::new(TurnState::default());
+        let full = InputQueue::with_pending_turn_input_limits(0, 0);
+        assert!(
+            full.extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                &state,
+                std::slice::from_ref(&input),
+                || panic!("rejected context committed"),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(full.admit_code_mode_tool(0, || true), Ok(true));
+
+        let queue = InputQueue::new();
+        queue.publish_internal_completion();
+        queue
+            .extend_pending_input_for_turn_state(&state, &[])
+            .await
+            .unwrap();
+        assert_eq!(queue.admit_code_mode_tool(0, || true), Ok(true));
+        queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                &state,
+                &[input],
+                || {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.incorporated_user_intent_epoch(),
+            0,
+            "queued input is not yet in a prompt"
+        );
+        assert_eq!(
+            queue.admit_code_mode_tool::<()>(0, || panic!("stale tool admitted")),
+            Err(1)
+        );
+        queue.take_pending_for_state(Some(&state), true).await;
+        assert_eq!(queue.incorporated_user_intent_epoch(), 1);
+        assert_eq!(queue.admit_code_mode_tool(1, || true), Ok(true));
+    }
+
+    #[tokio::test]
+    async fn exhausted_user_intent_epoch_wraps_and_still_invalidates_stale_plans() {
+        let input = TurnInput::AdditionalContext(Default::default());
+        let state = Mutex::new(TurnState::default());
+        let queue = InputQueue::new();
+        queue.user_intent.lock().unwrap().accepted = u64::MAX;
+        queue
+            .extend_pending_input_for_turn_state(&state, std::slice::from_ref(&input))
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.admit_code_mode_tool::<()>(u64::MAX, || panic!("stale tool admitted")),
+            Err(0)
+        );
+        queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                &state,
+                &[input],
+                || {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            queue.admit_code_mode_tool::<()>(0, || panic!("stale tool admitted")),
+            Err(1)
+        );
+        queue.take_pending_for_state(Some(&state), true).await;
+        assert_eq!(queue.incorporated_user_intent_epoch(), 1);
+        assert_eq!(queue.admit_code_mode_tool(1, || true), Ok(true));
+    }
 
     #[tokio::test]
     async fn admission_measures_only_new_input_not_the_existing_queue() {

@@ -225,7 +225,11 @@ impl McpHandler {
                 "invalid MCP tool input schema: {error}"
             ))
         })?;
-        Ok(Self { tool_info, spec, input_validator })
+        Ok(Self {
+            tool_info,
+            spec,
+            input_validator,
+        })
     }
 
     fn hook_tool_name(&self) -> HookToolName {
@@ -365,6 +369,7 @@ impl McpHandler {
             cancellation_token,
             call_id,
             payload,
+            source,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -388,12 +393,17 @@ impl McpHandler {
                 "MCP arguments must be a JSON object".into(),
             ));
         }
-        let errors = self.input_validator.iter_errors(&tool_input_value)
-            .take(4).map(|error| error.to_string()).collect::<Vec<_>>();
+        let errors = self
+            .input_validator
+            .iter_errors(&tool_input_value)
+            .take(4)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
         if !errors.is_empty() {
             return Err(FunctionCallError::RespondToModel(format!(
                 "tool `{}` arguments violate its full input schema: {}",
-                self.tool_name(), errors.join("; ")
+                self.tool_name(),
+                errors.join("; ")
             )));
         }
         let started = Instant::now();
@@ -428,13 +438,28 @@ impl McpHandler {
                 call,
             )
             .await;
-        Ok(boxed_tool_output(McpToolOutput::new(
+        let output = McpToolOutput::new(
             result.result.clone(),
             result.tool_input.clone(),
             started.elapsed(),
             can_request_original_image_detail(&turn.model_info),
             turn.model_info.truncation_policy.into(),
-        )))
+        );
+        let output = if matches!(
+            source,
+            crate::tools::context::ToolCallSource::CodeMode { .. }
+        ) {
+            output
+        } else {
+            output
+                .retain_reduced_result(
+                    &turn.config.codex_home,
+                    &session.thread_id.to_string(),
+                    Some((session.as_ref(), &call_id)),
+                )
+                .await
+        };
+        Ok(boxed_tool_output(output))
     }
 }
 
@@ -1213,21 +1238,32 @@ mod tests {
             "not":{"required":["forbidden"]}
         })));
         let handler = McpHandler::new(info).expect("conditional schema registers");
-        for arguments in [json!({"mode":"edit"}), json!({"text":"orphan"}), json!({"forbidden":true})] {
-            let result = handler.handle_call(ToolInvocation {
-                session: Arc::clone(&session),
-                step_context: StepContext::for_test(Arc::clone(&turn)),
-                cancellation_token: CancellationToken::new(),
-                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-                call_id: "invalid-conditional".into(),
-                tool_name: handler.tool_name(),
-                source: ToolCallSource::Direct,
-                payload: ToolPayload::Function { arguments: arguments.to_string() },
-            }).await;
+        for arguments in [
+            json!({"mode":"edit"}),
+            json!({"text":"orphan"}),
+            json!({"forbidden":true}),
+        ] {
+            let result = handler
+                .handle_call(ToolInvocation {
+                    session: Arc::clone(&session),
+                    step_context: StepContext::for_test(Arc::clone(&turn)),
+                    cancellation_token: CancellationToken::new(),
+                    tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                    call_id: "invalid-conditional".into(),
+                    tool_name: handler.tool_name(),
+                    source: ToolCallSource::Direct,
+                    payload: ToolPayload::Function {
+                        arguments: arguments.to_string(),
+                    },
+                })
+                .await;
             let Err(FunctionCallError::RespondToModel(error)) = result else {
                 panic!("invalid full-schema arguments must not reach the remote tool");
             };
-            assert!(error.contains("arguments violate its full input schema"), "{error}");
+            assert!(
+                error.contains("arguments violate its full input schema"),
+                "{error}"
+            );
         }
     }
 

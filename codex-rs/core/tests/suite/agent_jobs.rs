@@ -183,6 +183,25 @@ fn has_function_call_output(body: &Value) -> bool {
         })
 }
 
+async fn function_call_output_text(server: &wiremock::MockServer, call_id: &str) -> Option<String> {
+    server
+        .received_requests()
+        .await?
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&decode_body_bytes(request)).ok())
+        .find_map(|body| {
+            body.get("input")?
+                .as_array()?
+                .iter()
+                .find(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                        && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+                })?
+                .get("output")
+                .map(Value::to_string)
+        })
+}
+
 fn extract_job_and_item(body: &Value) -> Option<(String, String)> {
     let texts = message_input_texts(body);
     let mut combined = texts.join("\n");
@@ -581,13 +600,45 @@ async fn spawn_agents_on_csv_stop_halts_future_items() -> Result<()> {
         .expect("job_id from csv");
     let db = test.codex.state_db().expect("state db");
     let job = db.get_agent_job(job_id.as_str()).await?.expect("job");
-    assert_eq!(job.status, codex_state::AgentJobStatus::Cancelled);
     let progress = db.get_agent_job_progress(job_id.as_str()).await?;
-    assert_eq!(progress.total_items, 3);
-    assert_eq!(progress.completed_items, 1);
-    assert_eq!(progress.failed_items, 0);
-    assert_eq!(progress.running_items, 0);
-    assert_eq!(progress.pending_items, 2);
-    assert_eq!(worker_calls.load(Ordering::SeqCst), 1);
+    let items = db
+        .list_agent_job_items(job_id.as_str(), None, None)
+        .await?
+        .into_iter()
+        .map(|item| {
+            (
+                item.item_id,
+                item.status,
+                item.attempt_count,
+                item.assigned_thread_id,
+                item.last_error,
+            )
+        })
+        .collect::<Vec<_>>();
+    let spawn_output = function_call_output_text(&server, "call-spawn")
+        .await
+        .unwrap_or_else(|| "<missing>".to_string());
+    // This test has failed only under full-suite load. Name the path that
+    // terminalized the job: the job error, whether it ever started, the
+    // parent's tool result and the per-item ledger.
+    let diagnostics = format!(
+        "status={:?} started_at={:?} last_error={:?} progress={progress:?} worker_calls={}\n\
+         items={items:?}\nspawn_agents_on_csv output: {spawn_output}\nexported csv:\n{output}",
+        job.status,
+        job.started_at,
+        job.last_error,
+        worker_calls.load(Ordering::SeqCst),
+    );
+    assert_eq!(
+        job.status,
+        codex_state::AgentJobStatus::Cancelled,
+        "{diagnostics}"
+    );
+    assert_eq!(progress.total_items, 3, "{diagnostics}");
+    assert_eq!(progress.completed_items, 1, "{diagnostics}");
+    assert_eq!(progress.failed_items, 0, "{diagnostics}");
+    assert_eq!(progress.running_items, 0, "{diagnostics}");
+    assert_eq!(progress.pending_items, 2, "{diagnostics}");
+    assert_eq!(worker_calls.load(Ordering::SeqCst), 1, "{diagnostics}");
     Ok(())
 }

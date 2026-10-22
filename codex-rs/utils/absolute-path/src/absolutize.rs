@@ -31,12 +31,30 @@ fn normalize_path(path: &Path) -> PathBuf {
     {
         return path.to_path_buf();
     }
+    // Keep the declared slash convention of slash-leading UNC paths. Building
+    // them with PathBuf::push otherwise changes only the tail to backslashes,
+    // which loses the serialized spelling of opaque Windows path URIs.
+    #[cfg(windows)]
+    let slash_unc = path.as_os_str().as_encoded_bytes().starts_with(b"/")
+        && matches!(path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::UNC(_, _)));
+    #[cfg(not(windows))]
+    let slash_unc = false;
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
                 normalized.pop();
+            }
+            Component::RootDir if slash_unc => {
+                normalized.as_mut_os_string().push("/");
+            }
+            Component::Normal(name) if slash_unc => {
+                if !normalized.as_os_str().as_encoded_bytes().ends_with(b"/") {
+                    normalized.as_mut_os_string().push("/");
+                }
+                normalized.as_mut_os_string().push(name);
             }
             Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
                 normalized.push(component.as_os_str());

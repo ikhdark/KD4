@@ -58,6 +58,7 @@ fn format_bounded_subagent_error_notification(agent_reference: &str, error: &str
 /// Runtime error completions are idempotent within a producer attempt. Reuse
 /// mailbox admission's bounded, resume-seeded ID deduplication before history
 /// insertion. Ordinary messages and successful answers remain distinct.
+#[cfg(test)]
 pub(crate) fn inter_agent_completion_communication(
     task_name: AgentPath,
     sender: AgentPath,
@@ -65,8 +66,31 @@ pub(crate) fn inter_agent_completion_communication(
     status: &AgentStatus,
     receipt: Option<&str>,
 ) -> Option<InterAgentCommunication> {
-    let message =
-        format_inter_agent_completion_message(task_name.clone(), sender.clone(), status, receipt)?;
+    inter_agent_completion_communication_with_diagnostics(
+        task_name,
+        sender,
+        sender_thread_id,
+        status,
+        receipt,
+        None,
+    )
+}
+
+pub(crate) fn inter_agent_completion_communication_with_diagnostics(
+    task_name: AgentPath,
+    sender: AgentPath,
+    sender_thread_id: ThreadId,
+    status: &AgentStatus,
+    receipt: Option<&str>,
+    protected_host_summary: Option<&str>,
+) -> Option<InterAgentCommunication> {
+    let message = format_inter_agent_completion_message_with_diagnostics(
+        task_name.clone(),
+        sender.clone(),
+        status,
+        receipt,
+        protected_host_summary,
+    )?;
     let mut communication =
         InterAgentCommunication::new(sender, task_name, Vec::new(), message, false);
     if let AgentStatus::Errored(error) = status {
@@ -91,13 +115,43 @@ pub(crate) fn inter_agent_completion_communication(
     Some(communication)
 }
 
+#[cfg(test)]
 pub(crate) fn format_inter_agent_completion_message(
     task_name: AgentPath,
     sender: AgentPath,
     status: &AgentStatus,
     receipt: Option<&str>,
 ) -> Option<String> {
+    format_inter_agent_completion_message_with_diagnostics(task_name, sender, status, receipt, None)
+}
+
+fn format_inter_agent_completion_message_with_diagnostics(
+    task_name: AgentPath,
+    sender: AgentPath,
+    status: &AgentStatus,
+    receipt: Option<&str>,
+    protected_host_summary: Option<&str>,
+) -> Option<String> {
     let payload = match status {
+        AgentStatus::Stopped {
+            last_agent_message,
+            stop_cause,
+        } => {
+            let cause = serde_json::to_string(stop_cause).unwrap_or_default();
+            return Some(format_bounded_inter_agent_completion_message(
+                task_name,
+                sender,
+                last_agent_message
+                    .as_deref()
+                    .unwrap_or("No authored report was delivered."),
+                TYPED_COMPLETION_NEXT_ACTION,
+                receipt,
+                Some(&format!(
+                    "Host execution stop cause: {cause}. Task acceptance is separate; reconcile remaining assigned scope.\n{}",
+                    protected_host_summary.unwrap_or_default()
+                )),
+            ));
+        }
         AgentStatus::Completed(Some(message)) => {
             return Some(format_bounded_inter_agent_completion_message(
                 task_name,
@@ -105,6 +159,7 @@ pub(crate) fn format_inter_agent_completion_message(
                 message,
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
+                protected_host_summary,
             ));
         }
         AgentStatus::Completed(None) => String::new(),
@@ -118,6 +173,7 @@ pub(crate) fn format_inter_agent_completion_message(
                 message,
                 TYPED_COMPLETION_NEXT_ACTION,
                 receipt,
+                protected_host_summary,
             ));
         }
         AgentStatus::CompletedWithSurface {
@@ -131,6 +187,7 @@ pub(crate) fn format_inter_agent_completion_message(
                 &format!("Agent errored: {error}"),
                 ERROR_NEXT_ACTION,
                 receipt,
+                protected_host_summary,
             ));
         }
         AgentStatus::Shutdown => "Agent shut down.".to_string(),
@@ -150,27 +207,50 @@ fn format_bounded_inter_agent_completion_message(
     payload: &str,
     retrieval_guidance: &str,
     receipt: Option<&str>,
+    protected_host_summary: Option<&str>,
 ) -> String {
-    let unabridged =
-        InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload.to_string())
+    // Only host-owned input gets protected space. Matching authored text in an
+    // omitted middle section cannot suppress or replace these facts.
+    let mut protected = protected_host_summary.unwrap_or_default().to_string();
+    let payload = payload
+        .strip_prefix(protected.as_str())
+        .filter(|_| !protected.is_empty())
+        .map(|payload| payload.strip_prefix("\n\n").unwrap_or(payload))
+        .unwrap_or(payload);
+    let render = |payload: &str, protected: &str| {
+        let body = if protected.is_empty() {
+            payload.to_string()
+        } else {
+            format!("{protected}\n\n{payload}")
+        };
+        InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), body)
             .with_receipt(receipt)
-            .render();
+            .render()
+    };
+    let unabridged = render(payload, &protected);
     if approx_token_count(&unabridged) < COMPLETION_MESSAGE_MAX_TOKENS {
         return unabridged;
     }
 
-    let mut payload_budget = ERROR_MAX_TOKENS;
+    let retrieval_guidance = if receipt.is_some() {
+        "The full sealed receipt remains available at the exact receipt locator above; no automatic retrieval was performed."
+    } else {
+        retrieval_guidance
+    };
+    if approx_token_count(&render(retrieval_guidance, &protected)) >= COMPLETION_MESSAGE_MAX_TOKENS
+    {
+        // Preserve an explicit material-omission notice and exact recovery
+        // identity rather than silently dropping the tail of host diagnostics.
+        protected = format!(
+            "{}\nMaterial host diagnostics omitted (completion checks, verification gaps, advisories and/or delivery recovery); retrieve the exact receipt for the complete facts.",
+            truncate_text(&protected, TruncationPolicy::Tokens(512))
+        );
+    }
+    let mut payload_budget = ERROR_MAX_TOKENS.saturating_sub(approx_token_count(&protected));
     loop {
         let payload = truncate_text(payload, TruncationPolicy::Tokens(payload_budget));
-        let retrieval_guidance = if receipt.is_some() {
-            "The full sealed receipt remains available at the exact receipt locator above; no automatic retrieval was performed."
-        } else {
-            retrieval_guidance
-        };
         let payload = format!("{payload}\n\n{retrieval_guidance}");
-        let message = InterAgentCompletionMessage::new(task_name.clone(), sender.clone(), payload)
-            .with_receipt(receipt)
-            .render();
+        let message = render(&payload, &protected);
         let message_tokens = approx_token_count(&message);
         if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || payload_budget == 0 {
             return message;

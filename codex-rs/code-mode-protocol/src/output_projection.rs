@@ -30,17 +30,24 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
                     results.iter().any(|result| {
                         result.get("text").is_some_and(Value::is_string)
                             || (result["selector"]["kind"] == "search"
-                                && result["value"]["hydrated_ranges"]
-                                    .as_array()
-                                    .is_some_and(|ranges| ranges.iter().any(|range| {
-                                        range.get("text").is_some_and(Value::is_string)
-                                    })))
+                                && result["value"]["hydrated_ranges"].as_array().is_some_and(
+                                    |ranges| {
+                                        ranges.iter().any(|range| {
+                                            range.get("text").is_some_and(Value::is_string)
+                                        })
+                                    },
+                                ))
                     })
                 }));
     let mcp_text = !local_text_tool
-        && object.get("content").and_then(Value::as_array).is_some_and(|content| {
-            content.iter().any(|item| item["type"] == "text" && item.get("text").is_some_and(Value::is_string))
-        });
+        && object
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|item| {
+                    item["type"] == "text" && item.get("text").is_some_and(Value::is_string)
+                })
+            });
     let mut projected = object.clone();
     if tool.namespace.is_none() && matches!(tool.name.as_str(), "exec_command" | "write_stdin") {
         // Chunk IDs identify transport frames, not resumable commands or artifacts.
@@ -87,18 +94,33 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         // Compatibility booleans remain script-visible. Presentation names the
         // scope rather than conflating this poll with the cumulative transcript.
         if let Some(reduced) = object.get("output_reduced").and_then(Value::as_bool) {
-            projected.insert("current_chunk_display_complete".into(), Value::Bool(!reduced));
+            projected.insert(
+                "current_chunk_display_complete".into(),
+                Value::Bool(!reduced),
+            );
             projected.remove("output_reduced");
         }
         if let Some(complete) = object.get("streams_complete").and_then(Value::as_bool) {
             projected.insert("cumulative_streams_complete".into(), Value::Bool(complete));
             projected.remove("streams_complete");
         }
-        if object.get("raw_output_artifact_id").is_some_and(Value::is_string) {
+        // A producer that emits this field also knows capture finalization and
+        // exact aggregation, which these envelope fields cannot show. Print the
+        // value a script reads; derive it only for envelopes that lack it.
+        if object
+            .get("raw_output_artifact_id")
+            .is_some_and(Value::is_string)
+            && !object
+                .get("retained_artifact_complete")
+                .is_some_and(Value::is_boolean)
+        {
             let complete = object.get("process_exited") == Some(&Value::Bool(true))
                 && object.get("session_id").is_none_or(Value::is_null)
-                && object.get("raw_output_artifact_error").is_none_or(Value::is_null)
-                && object.get("raw_output_artifact_retention_limit_hit") == Some(&Value::Bool(false));
+                && object
+                    .get("raw_output_artifact_error")
+                    .is_none_or(Value::is_null)
+                && object.get("raw_output_artifact_retention_limit_hit")
+                    == Some(&Value::Bool(false));
             projected.insert("retained_artifact_complete".into(), Value::Bool(complete));
         }
         projected.remove("output_complete");
@@ -119,17 +141,9 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         if object.get("artifact_id") == Some(&Value::Null) {
             projected.remove("artifact_id");
         }
-        // `canonical_uri` is the resolved `path` re-encoded as a file: URI for
-        // local reads. Host-owned locators (`skill:`, `context:`) and remote
-        // environments are not derivable, so only omit an exact re-encoding.
-        if let (Some(path), Some(uri)) = (
-            object.get("path").and_then(Value::as_str),
-            object.get("canonical_uri").and_then(Value::as_str),
-        ) && derived_file_uri(path).as_deref() == Some(uri)
-        {
-            projected.remove("canonical_uri");
-        }
-        project_selector_bindings(object, &mut projected);
+        // History groups delivered ranges by canonical URI and environment.
+        // Even a locally derivable URI must survive display projection; path
+        // text alone is deliberately treated as legacy, unattributed evidence.
         if object.get("complete") == Some(&Value::Bool(true))
             && object.get("selection_status").and_then(Value::as_str) == Some("complete")
         {
@@ -150,13 +164,20 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
         // direct tool responses must still satisfy their advertised schema.
         if let Some(results) = projected.get_mut("results").and_then(Value::as_array_mut) {
             for result in results {
-                let Some(result) = result.as_object_mut() else { continue };
+                let Some(result) = result.as_object_mut() else {
+                    continue;
+                };
                 project_search_metadata(result);
                 if let (Some(start), Some(end), Some(bytes)) = (
-                    result.get("canonical_range").and_then(|range| range["start"].as_u64()),
-                    result.get("canonical_range").and_then(|range| range["end"].as_u64()),
+                    result
+                        .get("canonical_range")
+                        .and_then(|range| range["start"].as_u64()),
+                    result
+                        .get("canonical_range")
+                        .and_then(|range| range["end"].as_u64()),
                     result.get("exact_bytes").and_then(Value::as_u64),
-                ) && end.checked_sub(start) == Some(bytes) {
+                ) && end.checked_sub(start) == Some(bytes)
+                {
                     result.remove("exact_bytes");
                 }
                 // A completed drain no longer needs a traversal plan. Keep its
@@ -189,100 +210,34 @@ pub fn model_visible_tool_result(tool: &ToolName, raw: &Value) -> Option<Value> 
     (raw_text || mcp_text || projected != *object).then_some(Value::Object(projected))
 }
 
-/// The `file:` URI for `path`, but only when it is a pure re-encoding.
-///
-/// `PathUri` percent-encodes reserved and non-ASCII bytes and has a lossy
-/// fallback for non-UTF-8 Windows paths, so a textual reconstruction is only
-/// provably identical when every byte is an unreserved path character.
-/// Anything else returns `None` and keeps `canonical_uri` in view rather than
-/// guessing at the encoding.
-fn derived_file_uri(path: &str) -> Option<String> {
-    let safe = |byte: u8| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'\\' | b'.' | b'-' | b'_' | b'~')
-    };
-    // `encoded_path` is always rooted at a single `/`. A Windows drive letter
-    // keeps its literal colon there; a colon anywhere else is reserved and gets
-    // escaped. A POSIX path is already rooted, so strip that root rather than
-    // emitting a second separator, which is how a UNC share is spelled.
-    // `checked` excludes the drive's own colon, which is the one reserved byte
-    // that survives encoding unescaped.
-    let (body, checked) = match path.as_bytes() {
-        [drive, b':', ..] if drive.is_ascii_alphabetic() => (path, &path[2..]),
-        [b'/', rest @ ..] if rest.first() != Some(&b'/') => (&path[1..], &path[1..]),
-        _ => return None,
-    };
-    (!body.is_empty() && checked.bytes().all(safe))
-        .then(|| format!("file:///{}", body.replace('\\', "/")))
-        .filter(|uri| !uri.starts_with("file:////"))
-}
-
-/// A symbol/enclosing binding whose resolved range was delivered verbatim as a
-/// result selector restates that result. Bindings survive result sorting and
-/// merging, so a binding that no longer matches any delivered selector is the
-/// only record of the item's real extent: keep those, and keep every identity
-/// field, which no result carries.
-fn project_selector_bindings(
-    object: &serde_json::Map<String, Value>,
-    projected: &mut serde_json::Map<String, Value>,
-) {
-    let delivered = object
-        .get("results")
-        .and_then(Value::as_array)
-        .map(|results| {
-            results
-                .iter()
-                .filter(|result| {
-                    result.get("status").and_then(Value::as_str) == Some("ok")
-                        && result.get("complete") == Some(&Value::Bool(true))
-                })
-                .filter_map(|result| result.get("selector"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if delivered.is_empty() {
-        return;
-    }
-    let Some(bindings) = projected
-        .get_mut("selector_bindings")
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    for binding in bindings {
-        let Some(binding) = binding.as_object_mut() else {
-            continue;
-        };
-        let restated = binding
-            .get("resolved_selectors")
-            .and_then(Value::as_array)
-            .is_some_and(|resolved| {
-                resolved.len() == 1 && delivered.contains(&&resolved[0])
-            });
-        // `syntax_error` warns that the range itself may be wrong, so its
-        // binding keeps the range it is warning about.
-        if restated && !binding.contains_key("syntax_error") {
-            binding.remove("resolved_selectors");
-        }
-    }
-}
-
 /// Search coordinates and hydrated evidence remain inline. Only omit aliases
 /// derivable from that same result, never a recovery path for missing context.
 fn project_search_metadata(result: &mut serde_json::Map<String, Value>) {
     if result.get("status").and_then(Value::as_str) != Some("ok")
-        || result.get("selector").and_then(|selector| selector["kind"].as_str()) != Some("search")
+        || result
+            .get("selector")
+            .and_then(|selector| selector["kind"].as_str())
+            != Some("search")
     {
         return;
     }
-    let redundant_children = result.get("child_selectors").and_then(Value::as_array)
-        .zip(result.get("value").and_then(|value| value["hydrated_ranges"].as_array()))
-        .is_some_and(|(children, ranges)| !children.is_empty()
-            && children.len() == ranges.len()
-            && children.iter().zip(ranges).all(|(child, range)| {
-                range.get("selector") == Some(child)
-                    && (range.get("text").is_some_and(Value::is_string)
-                        || range.get("data_base64").is_some_and(Value::is_string))
-            }));
+    let redundant_children = result
+        .get("child_selectors")
+        .and_then(Value::as_array)
+        .zip(
+            result
+                .get("value")
+                .and_then(|value| value["hydrated_ranges"].as_array()),
+        )
+        .is_some_and(|(children, ranges)| {
+            !children.is_empty()
+                && children.len() == ranges.len()
+                && children.iter().zip(ranges).all(|(child, range)| {
+                    range.get("selector") == Some(child)
+                        && (range.get("text").is_some_and(Value::is_string)
+                            || range.get("data_base64").is_some_and(Value::is_string))
+                })
+        });
     if redundant_children {
         result.remove("child_selectors");
     }
@@ -318,7 +273,10 @@ fn patch_without_repeated_summary(raw: &Value) -> Option<Value> {
             }
             Some(summary)
         });
-        if summary.as_deref().is_some_and(|summary| raw["text"].as_str() == Some(summary)) {
+        if summary
+            .as_deref()
+            .is_some_and(|summary| raw["text"].as_str() == Some(summary))
+        {
             projected.remove("text");
         }
     }
@@ -374,19 +332,38 @@ mod tests {
             assert!(compact["results"][0].get("child_selectors").is_none());
             let mut restored = compact.clone();
             let selected = &mut restored["results"][0];
-            assert_eq!(selected["value"], raw["results"][0]["value"], "required search metadata stays inline");
-            selected["child_selectors"] = json!(selected["value"]["hydrated_ranges"].as_array().unwrap()
-                .iter().map(|range| range["selector"].clone()).collect::<Vec<_>>());
-            assert_eq!(restored, raw, "all omitted fields must be exactly recoverable");
-            println!("projection_audit search_metadata before_bytes={} after_bytes={}",
-                raw.to_string().len(), compact.to_string().len());
+            assert_eq!(
+                selected["value"], raw["results"][0]["value"],
+                "required search metadata stays inline"
+            );
+            selected["child_selectors"] = json!(
+                selected["value"]["hydrated_ranges"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|range| range["selector"].clone())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                restored, raw,
+                "all omitted fields must be exactly recoverable"
+            );
+            println!(
+                "projection_audit search_metadata before_bytes={} after_bytes={}",
+                raw.to_string().len(),
+                compact.to_string().len()
+            );
 
             // Coordinates without context must retain the lazy retrieval list.
             let mut missing = raw.clone();
             missing["results"][0]["value"]["hydrated_ranges"] = json!([]);
-            let projected = model_visible_tool_result(&tool, &missing).unwrap_or_else(|| missing.clone());
+            let projected =
+                model_visible_tool_result(&tool, &missing).unwrap_or_else(|| missing.clone());
             assert_eq!(projected["results"][0]["child_selectors"], json!([child]));
-            assert_eq!(projected["results"][0]["continuation"], raw["results"][0]["continuation"]);
+            assert_eq!(
+                projected["results"][0]["continuation"],
+                raw["results"][0]["continuation"]
+            );
 
             // Shared ranges need their reference; nonmatching metadata diagnoses
             // producer inconsistencies instead of silently normalizing them.
@@ -420,20 +397,33 @@ mod tests {
         let mut expected = raw.clone();
         expected.as_object_mut().unwrap().remove("text");
         assert_eq!(compact, expected);
-        println!("projection_audit patch_receipt before_bytes={} after_bytes={}",
-            raw.to_string().len(), compact.to_string().len());
+        println!(
+            "projection_audit patch_receipt before_bytes={} after_bytes={}",
+            raw.to_string().len(),
+            compact.to_string().len()
+        );
         for (field, value) in [
-            ("success", json!(false)), ("changes_exact", json!(false)),
+            ("success", json!(false)),
+            ("changes_exact", json!(false)),
             ("text", json!("Success with a warning: partial receipt")),
-            ("text", json!("Success. Updated the following files:\r\nA new\r\n")),
+            (
+                "text",
+                json!("Success. Updated the following files:\r\nA new\r\n"),
+            ),
             ("changes", json!([{ "kind":"unknown", "path":"new" }])),
         ] {
             let mut exceptional = raw.clone();
             exceptional[field] = value;
             exceptional["retry"] = json!({"patch_id":"retained", "hunks":[2]});
-            assert_eq!(model_visible_tool_result(&tool, &exceptional), Some(exceptional));
+            assert_eq!(
+                model_visible_tool_result(&tool, &exceptional),
+                Some(exceptional)
+            );
         }
-        assert_eq!(model_visible_tool_result(&ToolName::plain("other"), &raw), None);
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("other"), &raw),
+            None
+        );
     }
 
     #[test]
@@ -445,24 +435,39 @@ mod tests {
             "raw_output_artifact_error":null,
             "stdout":"progress", "stderr":"", "streams_complete":true});
         let compact = model_visible_tool_result(&ToolName::plain("exec_command"), &raw).unwrap();
-        assert_eq!(compact, json!({"output":"progress", "session_id":7,
+        assert_eq!(
+            compact,
+            json!({"output":"progress", "session_id":7,
             "execution_state":"running", "exit_code":null,
             "raw_output_artifact_id":"retained", "cumulative_streams_complete":true,
-            "retained_artifact_complete":false}));
+            "retained_artifact_complete":false})
+        );
         let terminal = json!({"output":"done", "execution_state":"exited",
             "process_exited":true, "exit_code":0, "output_complete":true,
             "output_reduced":false, "session_id":7,
             "session_capabilities":{"polling":true},
             "raw_output_artifact_id":"retained", "raw_output_artifact_bytes":4});
         let mut expected = terminal.clone();
-        for key in ["process_exited", "output_reduced", "raw_output_artifact_id",
-            "raw_output_artifact_bytes", "output_complete"] {
+        for key in [
+            "process_exited",
+            "output_reduced",
+            "raw_output_artifact_id",
+            "raw_output_artifact_bytes",
+            "output_complete",
+        ] {
             expected.as_object_mut().unwrap().remove(key);
         }
         expected["current_chunk_display_complete"] = json!(true);
         expected["retained_artifact_complete"] = json!(false);
-        println!("projection_audit terminal_controls before_bytes={} after_bytes={}", terminal.to_string().len(), expected.to_string().len());
-        assert_eq!(model_visible_tool_result(&ToolName::plain("write_stdin"), &terminal), Some(expected));
+        println!(
+            "projection_audit terminal_controls before_bytes={} after_bytes={}",
+            terminal.to_string().len(),
+            expected.to_string().len()
+        );
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("write_stdin"), &terminal),
+            Some(expected)
+        );
         // A reduced result keeps the locator and selector that recover its gap.
         let reduced = json!({"output":"head\n[omitted lines 2-9 of 10]\ntail",
             "execution_state":"exited", "exit_code":0, "output_complete":false,
@@ -473,7 +478,10 @@ mod tests {
         expected.as_object_mut().unwrap().remove("output_reduced");
         expected["current_chunk_display_complete"] = json!(false);
         expected["retained_artifact_complete"] = json!(false);
-        assert_eq!(model_visible_tool_result(&ToolName::plain("exec_command"), &reduced), Some(expected));
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("exec_command"), &reduced),
+            Some(expected)
+        );
         // Exited processes may still have output to drain. Keep the handle and
         // all mismatching state, including a producer's contradictory flags.
         let inconsistent = json!({"output":"diagnostic", "execution_state":"running",
@@ -483,7 +491,10 @@ mod tests {
         expected.as_object_mut().unwrap().remove("output_complete");
         expected.as_object_mut().unwrap().remove("output_reduced");
         expected["current_chunk_display_complete"] = json!(true);
-        assert_eq!(model_visible_tool_result(&ToolName::plain("exec_command"), &inconsistent), Some(expected));
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("exec_command"), &inconsistent),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -540,16 +551,28 @@ mod tests {
         let projected = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
         assert_eq!(projected["results"], raw["results"]);
         assert_eq!(projected["source_sha256"], raw["source_sha256"]);
-        for field in ["selection_status", "retained_bytes", "retained_artifact_complete"] {
+        for field in [
+            "selection_status",
+            "retained_bytes",
+            "retained_artifact_complete",
+        ] {
             assert!(projected.get(field).is_none(), "{field}");
         }
         assert!(raw.to_string().len() - projected.to_string().len() >= 90);
-        for (field, value) in [("snapshot_error", json!("disk full")), ("artifact_id", json!("retained")), ("retained_bytes", json!(3))] {
+        for (field, value) in [
+            ("snapshot_error", json!("disk full")),
+            ("artifact_id", json!("retained")),
+            ("retained_bytes", json!(3)),
+        ] {
             let mut exceptional = raw.clone();
             exceptional[field] = value;
-            let projected = model_visible_tool_result(&ToolName::plain("read_file"), &exceptional).unwrap();
+            let projected =
+                model_visible_tool_result(&ToolName::plain("read_file"), &exceptional).unwrap();
             assert_eq!(projected["retained_bytes"], exceptional["retained_bytes"]);
-            assert_eq!(projected["retained_artifact_complete"], exceptional["retained_artifact_complete"]);
+            assert_eq!(
+                projected["retained_artifact_complete"],
+                exceptional["retained_artifact_complete"]
+            );
         }
     }
 
@@ -589,62 +612,69 @@ mod tests {
                 "subdivision_plan":{"chunk_count":2}, "message":"drained 2 pages"}]});
         let mut expected = raw.clone();
         for field in ["exact_bytes", "subdivision_plan"] {
-            expected["results"][0].as_object_mut().unwrap().remove(field);
+            expected["results"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
         }
-        println!("projection_audit recovery_metadata before_bytes={} after_bytes={}", raw.to_string().len(), expected.to_string().len());
+        println!(
+            "projection_audit recovery_metadata before_bytes={} after_bytes={}",
+            raw.to_string().len(),
+            expected.to_string().len()
+        );
         for tool in ["read_file", "read_tool_output"] {
             let mut projected = expected.clone();
             if tool == "read_file" {
-                projected.as_object_mut().unwrap().remove("delivered_selection_complete");
+                projected
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("delivered_selection_complete");
             }
-            assert_eq!(model_visible_tool_result(&ToolName::plain(tool), &raw), Some(projected));
+            assert_eq!(
+                model_visible_tool_result(&ToolName::plain(tool), &raw),
+                Some(projected)
+            );
             let mut incomplete = raw.clone();
             incomplete["retained_artifact_complete"] = json!(false);
             incomplete["retained_bytes"] = json!(6);
             incomplete["delivered_selection_complete"] = json!(false);
             incomplete["results"][0]["exact_bytes"] = json!(9);
             incomplete["results"][0]["continuation"] = json!({"kind":"bytes","start":6,"end":8});
-            assert_eq!(model_visible_tool_result(&ToolName::plain(tool), &incomplete), Some(incomplete));
+            assert_eq!(
+                model_visible_tool_result(&ToolName::plain(tool), &incomplete),
+                Some(incomplete)
+            );
         }
     }
 
     #[test]
-    fn read_display_omits_canonical_uri_only_when_it_re_encodes_path() {
+    fn read_display_preserves_canonical_source_identity() {
         let raw = json!({"artifact_id":null, "source_sha256":"sha", "complete":true,
             "path":r"C:\repo\src\main.rs", "canonical_uri":"file:///C:/repo/src/main.rs",
             "environment_id":"local",
             "results":[{"selector":{"kind":"bytes","start":0,"end":4}, "status":"ok",
                 "complete":true, "text":"body"}]});
         let compact = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
-        assert!(compact.get("canonical_uri").is_none());
-        // The omitted locator is rebuilt from the path that stays in view.
-        assert_eq!(
-            derived_file_uri(compact["path"].as_str().unwrap()).as_deref(),
-            raw["canonical_uri"].as_str()
-        );
-        // POSIX paths re-encode the same way.
-        let mut posix = raw.clone();
-        posix["path"] = json!("/home/alice/src/main.rs");
-        posix["canonical_uri"] = json!("file:///home/alice/src/main.rs");
-        assert!(
-            model_visible_tool_result(&ToolName::plain("read_file"), &posix)
-                .unwrap()
-                .get("canonical_uri")
-                .is_none()
-        );
-        // Percent-encoding, host-owned locators and remote environments are not
-        // textually derivable, so the locator has to stay.
+        assert_eq!(compact["canonical_uri"], raw["canonical_uri"]);
+        assert_eq!(compact["environment_id"], raw["environment_id"]);
+        // Identity must survive for every path spelling, not only opaque URIs.
         for (path, uri) in [
-            (r"C:\repo\Alice Smith\main.rs", "file:///C:/repo/Alice%20Smith/main.rs"),
+            ("/home/alice/src/main.rs", "file:///home/alice/src/main.rs"),
+            (
+                r"C:\repo\Alice Smith\main.rs",
+                "file:///C:/repo/Alice%20Smith/main.rs",
+            ),
             ("skill:reviewer", "skill:reviewer"),
-            (r"C:\repo\src\main.rs", "vscode-remote://host/repo/src/main.rs"),
+            (
+                r"C:\repo\src\main.rs",
+                "vscode-remote://host/repo/src/main.rs",
+            ),
         ] {
             let mut opaque = raw.clone();
             opaque["path"] = json!(path);
             opaque["canonical_uri"] = json!(uri);
             assert_eq!(
-                model_visible_tool_result(&ToolName::plain("read_file"), &opaque)
-                    .unwrap()["canonical_uri"],
+                model_visible_tool_result(&ToolName::plain("read_file"), &opaque).unwrap()["canonical_uri"],
                 json!(uri),
                 "kept for {path}"
             );
@@ -660,13 +690,27 @@ mod tests {
                 "resolved_selectors":[delivered]}]});
         let compact = model_visible_tool_result(&ToolName::plain("read_file"), &raw).unwrap();
         let binding = &compact["selector_bindings"][0];
-        assert!(binding.get("resolved_selectors").is_none());
-        // Identity and the request it answers stay; the range is the delivered
-        // result's own selector.
+        assert_eq!(binding["resolved_selectors"], json!([delivered]));
+        // Result sorting must never detach an owner from its exact range.
         assert_eq!(binding["qualified_name"], "A::b");
         assert_eq!(binding["kind"], "fn");
         assert_eq!(binding["selector_index"], 0);
         assert_eq!(compact["results"][0]["selector"], delivered);
+
+        let later = json!({"kind":"lines","start":6,"end":6});
+        let reversed = json!({"source_sha256":"sha", "complete":true,
+            "results":[
+                {"selector":delivered,"status":"ok","complete":true,"text":" fn run() {}\n"},
+                {"selector":later,"status":"ok","complete":true,"text":" fn run() {}\n"}],
+            "selector_bindings":[
+                {"selector_index":0,"qualified_name":"B::run","kind":"fn","resolved_selectors":[later]},
+                {"selector_index":1,"qualified_name":"A::run","kind":"fn","resolved_selectors":[delivered]}]});
+        let projected =
+            model_visible_tool_result(&ToolName::plain("read_file"), &reversed).unwrap();
+        assert_eq!(
+            projected["selector_bindings"],
+            reversed["selector_bindings"]
+        );
 
         // Merging and sorting are why bindings exist: when the delivered
         // selector is a wider merged range, the binding is the only record of
@@ -674,8 +718,8 @@ mod tests {
         let mut merged = raw.clone();
         merged["results"][0]["selector"] = json!({"kind":"lines","start":1,"end":121});
         assert_eq!(
-            model_visible_tool_result(&ToolName::plain("read_file"), &merged)
-                .unwrap()["selector_bindings"][0]["resolved_selectors"],
+            model_visible_tool_result(&ToolName::plain("read_file"), &merged).unwrap()["selector_bindings"]
+                [0]["resolved_selectors"],
             json!([delivered])
         );
 
@@ -690,8 +734,7 @@ mod tests {
             mutate(&mut guarded);
             assert_eq!(
                 model_visible_tool_result(&ToolName::plain("read_file"), &guarded)
-                    .unwrap_or_else(|| guarded.clone())["selector_bindings"][0]
-                    ["resolved_selectors"],
+                    .unwrap_or_else(|| guarded.clone())["selector_bindings"][0]["resolved_selectors"],
                 json!([delivered])
             );
         }
@@ -709,11 +752,17 @@ mod tests {
             ("completion_authority", json!("checklist_only")),
             ("lineage_complete", json!(false)),
             ("step_ids", json!(["a", "b"])),
-            ("current_plan", json!({"explanation":null, "plan":[
+            (
+                "current_plan",
+                json!({"explanation":null, "plan":[
                 {"step":"Inspect", "status":"completed"},
-                {"step":"Patch the owner", "status":"in_progress"}]})),
-            ("lineage", json!({"requirements":{"d":{"text":"Drop cache", "status":"pending",
-                "superseded_reason":"not needed"}}, "step_requirements":{}})),
+                {"step":"Patch the owner", "status":"in_progress"}]}),
+            ),
+            (
+                "lineage",
+                json!({"requirements":{"d":{"text":"Drop cache", "status":"pending",
+                "superseded_reason":"not needed"}}, "step_requirements":{}}),
+            ),
         ] {
             updated[key] = value;
         }
@@ -723,7 +772,10 @@ mod tests {
         );
         // Anything else, such as a rejected update, prints unchanged.
         let rejected = json!({"error":"stale plan revision"});
-        assert_eq!(model_visible_tool_result(&ToolName::plain("update_plan"), &rejected), None);
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("update_plan"), &rejected),
+            None
+        );
     }
 
     #[test]
@@ -757,12 +809,25 @@ mod tests {
     fn mcp_text_without_structured_content_registers_without_changing_data() {
         let raw = json!({"content":[{"type":"text","text":"first\r\n\"second\"","annotations":{"priority":1}},
             {"type":"image","data":"abc","mimeType":"image/png"}], "isError":true,"_meta":{"id":7}});
-        for tool in [ToolName::plain("mcp__server__tool"), ToolName::namespaced("server", "tool")] {
+        for tool in [
+            ToolName::plain("mcp__server__tool"),
+            ToolName::namespaced("server", "tool"),
+        ] {
             assert_eq!(model_visible_tool_result(&tool, &raw), Some(raw.clone()));
-            for content in [json!([]), json!([{"type":"image","data":"abc"}]), json!([{"type":"text","text":null}])] {
-                assert_eq!(model_visible_tool_result(&tool, &json!({"content":content})), None);
+            for content in [
+                json!([]),
+                json!([{"type":"image","data":"abc"}]),
+                json!([{"type":"text","text":null}]),
+            ] {
+                assert_eq!(
+                    model_visible_tool_result(&tool, &json!({"content":content})),
+                    None
+                );
             }
         }
-        assert_eq!(model_visible_tool_result(&ToolName::plain("other"), &raw), None);
+        assert_eq!(
+            model_visible_tool_result(&ToolName::plain("other"), &raw),
+            None
+        );
     }
 }

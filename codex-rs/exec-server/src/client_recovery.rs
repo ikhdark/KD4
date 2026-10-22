@@ -1,10 +1,10 @@
+use futures::StreamExt;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use futures::StreamExt;
 
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -40,6 +40,68 @@ const SESSION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(25);
 const SESSION_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const REGISTRY_RECOVERY_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const REGISTRY_RECOVERY_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Validate an unbounded retained read using the same interpreter as connection
+/// recovery. Nothing is exposed until the complete suffix has been validated.
+/// `exit_known` refers only to an exit already delivered at or before `after_seq`.
+pub fn replay_process_events(
+    after_seq: u64,
+    exit_known: bool,
+    response: ReadResponse,
+    trigger: Option<ExecProcessEvent>,
+) -> Result<Vec<ExecProcessEvent>, ExecServerError> {
+    let target = response
+        .next_seq
+        .checked_sub(1)
+        .ok_or_else(|| recovery_gap_error(0))?;
+    if (response.closed && !response.exited)
+        || (response.exited != response.exit_code.is_some())
+        || response
+            .chunks
+            .windows(2)
+            .any(|pair| pair[0].seq >= pair[1].seq)
+        || response
+            .chunks
+            .iter()
+            .any(|chunk| chunk.seq == 0 || chunk.seq > target)
+        || trigger
+            .as_ref()
+            .and_then(ExecProcessEvent::seq)
+            .is_some_and(|seq| seq > target)
+    {
+        return Err(recovery_gap_error(target));
+    }
+    let mut state = SessionState::new(false);
+    // The response is already transport-bounded. This private log must not evict
+    // small events merely because the ordinary subscriber replay holds only 256.
+    // Recovered events are the chunks plus exit, close and trigger; each may be
+    // preceded by one declared gap, and one gap may trail them.
+    state.events = crate::process::ExecProcessEventLog::new(
+        response.chunks.len().saturating_mul(2).saturating_add(7),
+        usize::MAX,
+    );
+    {
+        let ordered = state
+            .ordered_events
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ordered.last_published_seq = after_seq;
+        ordered.exit_published = exit_known;
+        ordered.pending_byte_limit = Some(usize::MAX);
+        if let Some(event) = trigger
+            && event.seq().is_some_and(|seq| seq > after_seq)
+        {
+            ordered
+                .insert_pending(event)
+                .map_err(ExecServerError::Protocol)?;
+        }
+    }
+    state.recover_events(response)?;
+    if state.last_published_seq() < target {
+        return Err(recovery_gap_error(target));
+    }
+    Ok(state.events.drain_owned())
+}
 
 impl SessionState {
     fn last_published_seq(&self) -> u64 {
@@ -244,20 +306,31 @@ impl SessionState {
 
     fn recover_output_gap(&self, response: ReadResponse) -> Result<bool, ExecServerError> {
         let target = response.next_seq.saturating_sub(1);
-        let gap = response.output_gap.as_ref().ok_or_else(|| recovery_gap_error(target))?;
+        let gap = response
+            .output_gap
+            .as_ref()
+            .ok_or_else(|| recovery_gap_error(target))?;
         if gap.through_seq > target
             || response.exited != gap.exit_seq.is_some()
-            || gap.exit_seq.is_some_and(|seq| seq == 0 || seq > target || response.exit_code.is_none())
+            || gap
+                .exit_seq
+                .is_some_and(|seq| seq == 0 || seq > target || response.exit_code.is_none())
             || (response.closed && gap.exit_seq.is_none_or(|seq| seq >= target))
-            || response.chunks.windows(2).any(|pair| pair[0].seq >= pair[1].seq)
+            || response
+                .chunks
+                .windows(2)
+                .any(|pair| pair[0].seq >= pair[1].seq)
             || response.chunks.iter().any(|chunk| {
-                chunk.seq > target || Some(chunk.seq) == gap.exit_seq
+                chunk.seq > target
+                    || Some(chunk.seq) == gap.exit_seq
                     || (response.closed && chunk.seq == target)
             })
         {
             return Err(recovery_gap_error(target));
         }
-        let mut ordered = self.ordered_events.lock()
+        let mut ordered = self
+            .ordered_events
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ordered.failure.is_some() || ordered.closed_published {
             return Ok(false);
@@ -269,18 +342,26 @@ impl SessionState {
             recovered.insert(chunk.seq, ExecProcessEvent::Output(chunk));
         }
         if let Some(seq) = gap.exit_seq {
-            recovered.insert(seq, ExecProcessEvent::Exited {
+            recovered.insert(
                 seq,
-                exit_code: response.exit_code.ok_or_else(|| recovery_gap_error(target))?,
-                sandbox_denied: (response.sandbox_denied || response.closed)
-                    .then_some(response.sandbox_denied),
-            });
+                ExecProcessEvent::Exited {
+                    seq,
+                    exit_code: response
+                        .exit_code
+                        .ok_or_else(|| recovery_gap_error(target))?,
+                    sandbox_denied: (response.sandbox_denied || response.closed)
+                        .then_some(response.sandbox_denied),
+                },
+            );
         }
         if response.closed {
-            recovered.insert(target, ExecProcessEvent::Closed {
-                seq: target,
-                sandbox_denied: Some(response.sandbox_denied),
-            });
+            recovered.insert(
+                target,
+                ExecProcessEvent::Closed {
+                    seq: target,
+                    sandbox_denied: Some(response.sandbox_denied),
+                },
+            );
         }
         for (seq, event) in ordered.pending.range(..=target) {
             recovered.entry(*seq).or_insert_with(|| event.clone());
@@ -289,7 +370,11 @@ impl SessionState {
         let last_published_seq = cursor;
         // Validate all holes before publishing anything. Only server-declared
         // output eviction can advance the cursor without an event.
-        for seq in recovered.keys().copied().filter(|seq| *seq > last_published_seq) {
+        for seq in recovered
+            .keys()
+            .copied()
+            .filter(|seq| *seq > last_published_seq)
+        {
             if seq > cursor.saturating_add(1) && seq - 1 > gap.through_seq {
                 return Err(recovery_gap_error(target));
             }
@@ -299,22 +384,31 @@ impl SessionState {
             return Err(recovery_gap_error(target));
         }
         ordered.pending.retain(|seq, _| *seq > target);
-        ordered.pending_bytes = ordered.pending.values()
-            .map(super::pending_process_event_bytes).sum();
+        ordered.pending_bytes = ordered
+            .pending
+            .values()
+            .map(super::pending_process_event_bytes)
+            .sum();
         let mut closed = false;
         for (seq, event) in recovered {
             if seq <= ordered.last_published_seq {
                 continue;
             }
             if seq > ordered.last_published_seq.saturating_add(1) {
-                self.events.publish(ExecProcessEvent::OutputGap { through_seq: seq - 1 });
+                self.events.publish(ExecProcessEvent::OutputGap {
+                    through_seq: seq - 1,
+                });
                 ordered.last_published_seq = seq - 1;
             }
-            ordered.insert_pending(event).map_err(ExecServerError::Protocol)?;
+            ordered
+                .insert_pending(event)
+                .map_err(ExecServerError::Protocol)?;
             closed |= self.publish_ready(&mut ordered);
         }
         if ordered.last_published_seq < target {
-            self.events.publish(ExecProcessEvent::OutputGap { through_seq: target });
+            self.events.publish(ExecProcessEvent::OutputGap {
+                through_seq: target,
+            });
             ordered.last_published_seq = target;
         }
         drop(ordered);
@@ -604,11 +698,14 @@ impl Inner {
                 let response = rpc_client
                     .call::<_, ReadResponse>(
                         EXEC_READ_METHOD,
-                        &ReadParams {
-                            process_id: process_id.clone(),
-                            after_seq: Some(session.last_published_seq()),
-                            max_bytes: None,
-                            wait_ms: Some(0),
+                        &crate::protocol::OwnedProcessParams {
+                            incarnation: Some(session.incarnation.clone()),
+                            params: ReadParams {
+                                process_id: process_id.clone(),
+                                after_seq: Some(session.last_published_seq()),
+                                max_bytes: None,
+                                wait_ms: Some(0),
+                            },
                         },
                     )
                     .await
@@ -636,7 +733,18 @@ impl Inner {
                         recovery_policy: RecoveryPolicy::Wait,
                     };
                     tokio::spawn(async move {
-                        super::cleanup_process_start(&client, &process_id, &session).await;
+                        let ticket = crate::ProcessCleanupTicket::new(
+                            process_id.clone(),
+                            client.inner.session_id.get().cloned(),
+                        );
+                        super::cleanup_process_start(
+                            &client,
+                            &process_id,
+                            &session,
+                            &ticket,
+                            &std::sync::atomic::AtomicBool::new(true),
+                        )
+                        .await;
                     });
                 }
             }

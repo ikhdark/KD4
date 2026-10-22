@@ -37,7 +37,7 @@ pub fn format_review_findings_block(
     for (idx, item) in findings.iter().enumerate() {
         lines.push(String::new());
 
-        let title = &item.title;
+        let title = canonical_review_title(&item.title, item.priority);
         let location = format_location(item);
 
         if let Some(flags) = selection {
@@ -59,10 +59,14 @@ pub fn format_review_findings_block(
 
 /// Render a human-readable review summary suitable for a user-facing message.
 ///
-/// Returns either the explanation, the formatted findings block, or both
-/// separated by a blank line. If neither is present, emits a fallback message.
+/// Preserve the explicit verdict even for historical results with no explanation.
 pub fn render_review_output_text(output: &ReviewOutputEvent) -> String {
-    let mut sections = Vec::new();
+    let verdict = match output.overall_correctness.as_str() {
+        "patch is correct" => "Review verdict: patch is correct.",
+        "patch is incorrect" => "Review verdict: patch is incorrect.",
+        _ => "Review verdict unavailable.",
+    };
+    let mut sections = vec![verdict.to_string()];
     let explanation = output.overall_explanation.trim();
     if !explanation.is_empty() {
         sections.push(explanation.to_string());
@@ -74,9 +78,54 @@ pub fn render_review_output_text(output: &ReviewOutputEvent) -> String {
             sections.push(trimmed.to_string());
         }
     }
-    if sections.is_empty() {
-        REVIEW_FALLBACK_MESSAGE.to_string()
+    sections.join("\n\n")
+}
+
+/// Numeric priority is authoritative; never display a contradictory model marker.
+pub fn canonical_review_title(title: &str, priority: i32) -> String {
+    let title = title.trim();
+    let substance = ["[P0]", "[P1]", "[P2]", "[P3]"]
+        .into_iter()
+        .find_map(|prefix| title.strip_prefix(prefix))
+        .unwrap_or(title)
+        .trim_start();
+    if (0..=3).contains(&priority) {
+        format!("[P{priority}] {substance}")
     } else {
-        sections.join("\n\n")
+        substance.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_is_not_inferred_from_narrative_or_empty_findings() {
+        for (verdict, label) in [
+            ("patch is correct", "Review verdict: patch is correct."),
+            ("patch is incorrect", "Review verdict: patch is incorrect."),
+            ("", "Review verdict unavailable."),
+        ] {
+            let output = ReviewOutputEvent {
+                findings: Vec::new(),
+                overall_correctness: verdict.to_string(),
+                overall_explanation: "Inspection completed.".to_string(),
+                overall_confidence_score: 0.9,
+            };
+            assert_eq!(
+                render_review_output_text(&output),
+                format!("{label}\n\nInspection completed.")
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_priority_owns_display() {
+        assert_eq!(
+            canonical_review_title("[P0] Preserve λ", 2),
+            "[P2] Preserve λ"
+        );
+        assert_eq!(canonical_review_title("Preserve λ", 3), "[P3] Preserve λ");
     }
 }

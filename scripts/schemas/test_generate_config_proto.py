@@ -94,7 +94,7 @@ exit 0
     fake_bin = temp_path / "fake-bin"
     fake_bin.mkdir()
     (fake_bin / "rustfmt.cmd").write_text(
-        "@echo off\r\nexit /b 0\r\n",
+        '@echo off\r\necho %CD%>"%CARGO_LANE_LOG%.formatter-cwd"\r\nexit /b 0\r\n',
         encoding="utf-8",
     )
 
@@ -125,6 +125,7 @@ class GenerateConfigProtoTest(unittest.TestCase):
         self,
         fixture: ProtoFixture,
         *args: str,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
@@ -143,7 +144,38 @@ class GenerateConfigProtoTest(unittest.TestCase):
             check=False,
             timeout=30,
             env=fixture.env,
+            cwd=cwd,
         )
+
+    def test_formatter_uses_workspace_cwd_and_preserves_caller_relative_protoc(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = create_fixture(root)
+            caller = root / "unrelated"
+            caller.mkdir()
+            protoc = write_lf(caller / "relative-protoc.exe", "inert protoc")
+            result = self.run_fixture(
+                fixture, "-Check", "-ProtocPath", protoc.name, cwd=caller
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                Path(str(fixture.cargo_lane_log) + ".formatter-cwd")
+                .read_text()
+                .strip(),
+                str(root / "repo" / "codex-rs"),
+            )
+            self.assert_lane_args(fixture, protoc=protoc)
+
+    def test_relay_and_hooks_generators_use_declared_workspace_directory(self):
+        justfile = (REPO_ROOT / "justfile").read_text()
+        self.assertIn('set working-directory := "codex-rs"', justfile)
+        for recipe in (
+            "generate-exec-server-relay-proto",
+            "generate-exec-server-relay-proto-check",
+            "write-hooks-schema",
+        ):
+            preamble = justfile.split(f"\n{recipe}:", 1)[0].rsplit("\n\n", 1)[-1]
+            self.assertNotIn("[no-cd]", preamble)
 
     def assert_lane_args(
         self, fixture: ProtoFixture, *, protoc: Path | None = None
@@ -188,7 +220,11 @@ class GenerateConfigProtoTest(unittest.TestCase):
             )
             with mock.patch.dict(
                 os.environ,
-                {"PATH": str(host_protoc.parent) + os.pathsep + os.environ.get("PATH", "")},
+                {
+                    "PATH": str(host_protoc.parent)
+                    + os.pathsep
+                    + os.environ.get("PATH", "")
+                },
             ):
                 fixture = create_fixture(temp_path)
             generated_before = fixture.checked_generated.read_bytes()
@@ -216,7 +252,9 @@ class GenerateConfigProtoTest(unittest.TestCase):
             path_protoc = write_lf(
                 temp_path / "path-bin" / "protoc.cmd", "@echo off\nexit /b 0\n"
             )
-            fixture.env["PATH"] = str(path_protoc.parent) + os.pathsep + fixture.env["PATH"]
+            fixture.env["PATH"] = (
+                str(path_protoc.parent) + os.pathsep + fixture.env["PATH"]
+            )
 
             result = self.run_fixture(fixture, "-Check")
 
@@ -314,7 +352,8 @@ class GenerateConfigProtoTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(
-                fixture.checked_generated.read_bytes(), EXPECTED_GENERATED.encode("utf-8")
+                fixture.checked_generated.read_bytes(),
+                EXPECTED_GENERATED.encode("utf-8"),
             )
             self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
             self.assert_lane_args(fixture)

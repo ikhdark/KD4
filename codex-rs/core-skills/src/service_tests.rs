@@ -23,6 +23,45 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn newly_covered_missing_repo_root_invalidates_its_empty_catalog() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let root = cwd.path().join(".agents/skills");
+    let service = SkillsService::new(home.path().abs(), false);
+    let input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        ConfigLayerStack::default(),
+        false,
+    );
+    assert!(
+        service
+            .snapshot_for_config(&input, Some(Arc::clone(&LOCAL_FS)))
+            .await
+            .outcome()
+            .skills
+            .is_empty()
+    );
+    fs::create_dir_all(root.join("new")).unwrap();
+    fs::write(
+        root.join("new/SKILL.md"),
+        "---\nname: new\ndescription: discovered after coverage gap\n---\nBody\n",
+    )
+    .unwrap();
+    service.invalidate_roots(&[root]);
+    let current = service
+        .snapshot_for_config(&input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    assert!(
+        current
+            .outcome()
+            .skills
+            .iter()
+            .any(|skill| skill.name == "new")
+    );
+}
+
 fn write_user_skill(codex_home: &TempDir, dir: &str, name: &str, description: &str) {
     let skill_dir = codex_home.path().join("skills").join(dir);
     fs::create_dir_all(&skill_dir).unwrap();
@@ -100,6 +139,7 @@ fn plugin_skill_root_for_skill_path(
 
 fn test_skill(name: &str, path: PathBuf) -> SkillMetadata {
     SkillMetadata {
+        source: None,
         name: name.to_string(),
         description: "test".to_string(),
         short_description: None,
@@ -255,7 +295,12 @@ async fn bundled_system_skills_are_discovered_without_harness_tools() {
     let config_layer_stack = config_stack(&codex_home, "");
     let service = SkillsService::new(codex_home.path().abs(), true);
     let outcome = skills_for_config_with_stack(&service, &cwd, &config_layer_stack, &[]).await;
-    assert!(outcome.skills.iter().all(|skill| skill.name != "harness-tools"));
+    assert!(
+        outcome
+            .skills
+            .iter()
+            .all(|skill| skill.name != "harness-tools")
+    );
     let skill = outcome
         .skills
         .iter()
@@ -329,7 +374,13 @@ async fn skills_for_config_short_circuits_on_the_stable_input_identity() {
     let first = skills_service
         .snapshot_for_config(&input, Some(Arc::clone(&fs)))
         .await;
-    assert!(first.outcome().skills.iter().any(|skill| skill.name == "skill-a"));
+    assert!(
+        first
+            .outcome()
+            .skills
+            .iter()
+            .any(|skill| skill.name == "skill-a")
+    );
     write_user_skill(&codex_home, "b", "skill-b", "from b");
     // A fallback hit in the roots cache would hide a missing input-cache fast path.
     skills_service
@@ -779,17 +830,25 @@ async fn skills_for_cwd_uses_repo_roots_only_with_executor_filesystem() {
 
     for fs in [Some(Arc::clone(&LOCAL_FS)), None] {
         let has_repo_fs = fs.is_some();
-        let snapshot = skills_service.snapshot_for_cwd(&skills_input, true, fs).await;
+        let snapshot = skills_service
+            .snapshot_for_cwd(&skills_input, true, fs)
+            .await;
         let outcome = snapshot.outcome();
         assert_eq!(
             errors_under(outcome, &[codex_home.path(), cwd.path()]),
             Vec::new()
         );
-        let user = outcome.skills.iter().find(|skill| skill.name == "user-skill")
+        let user = outcome
+            .skills
+            .iter()
+            .find(|skill| skill.name == "user-skill")
             .expect("user root remains available without executor filesystem");
         assert_eq!(user.scope, SkillScope::User);
         assert_eq!(user.description, "from local user root");
-        let repo = outcome.skills.iter().find(|skill| skill.name == "repo-skill");
+        let repo = outcome
+            .skills
+            .iter()
+            .find(|skill| skill.name == "repo-skill");
         assert_eq!(repo.is_some(), has_repo_fs);
         if let Some(repo) = repo {
             assert_eq!(repo.scope, SkillScope::Repo);
@@ -881,6 +940,7 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
         config_layer_stack.clone(),
         bundled_skills_enabled_from_stack(&config_layer_stack),
     );
+    let config_before = skills_service.snapshot_for_config(&base_input, None).await;
     let snapshot_a = skills_service
         .snapshot_for_cwd(&base_input, /*force_reload*/ false, /*fs*/ None)
         .await;
@@ -919,6 +979,42 @@ async fn skills_for_cwd_uses_cached_result_until_force_reload() {
             .skills
             .iter()
             .any(|skill| skill.name == "late-skill")
+    );
+    // Both the original config allocation and an equivalent fresh stack must
+    // see the same reload; neither input nor semantic-root hits may retain A.
+    for input in [
+        base_input.clone(),
+        SkillsLoadInput::new(
+            cwd.path().abs(),
+            Vec::new(),
+            config_layer_stack.clone(),
+            bundled_skills_enabled_from_stack(&config_layer_stack),
+        ),
+    ] {
+        let fresh = skills_service.snapshot_for_config(&input, None).await;
+        assert!(
+            fresh
+                .outcome()
+                .skills
+                .iter()
+                .any(|skill| skill.name == "late-skill")
+        );
+        let warm = skills_service.snapshot_for_config(&input, None).await;
+        assert!(std::ptr::eq(fresh.outcome(), warm.outcome()));
+    }
+    assert!(
+        config_before
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "late-skill")
+    );
+    assert!(
+        snapshot_a
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "late-skill")
     );
 }
 
@@ -988,8 +1084,7 @@ async fn skills_for_cwd_cache_follows_reinstalled_plugin_skill_roots() {
     fs::remove_dir_all(replaced_version_root).expect("remove replaced plugin version");
     let upgraded_path = write_version("2.0.0", "after update");
     let upgraded =
-        cwd_snapshot_plugin_skill(&skills_service, &cwd, &config_layer_stack, &upgraded_path)
-            .await;
+        cwd_snapshot_plugin_skill(&skills_service, &cwd, &config_layer_stack, &upgraded_path).await;
 
     assert_eq!(upgraded.description, "after update");
     assert_eq!(
@@ -1065,7 +1160,10 @@ fn disabled_paths_for_skills_allows_session_flags_to_override_user_layer() {
         } else {
             HashSet::from([skill.path_to_skills_md.clone()])
         };
-        assert_eq!(resolve_disabled_skill_paths(std::slice::from_ref(&skill), &rules), expected);
+        assert_eq!(
+            resolve_disabled_skill_paths(std::slice::from_ref(&skill), &rules),
+            expected
+        );
     }
 }
 

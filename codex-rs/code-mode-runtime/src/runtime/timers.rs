@@ -28,8 +28,14 @@ struct TimerWork {
 }
 
 impl TimerWork {
-    fn queue_due(&mut self, now: Instant, tx: &std_mpsc::Sender<RuntimeCommand>) -> Result<(), String> {
-        let mut due: Vec<_> = self.scheduled.iter()
+    fn queue_due(
+        &mut self,
+        now: Instant,
+        tx: &std_mpsc::Sender<RuntimeCommand>,
+    ) -> Result<(), String> {
+        let mut due: Vec<_> = self
+            .scheduled
+            .iter()
             .filter(|(_, deadline)| **deadline <= now)
             .map(|(id, deadline)| (*deadline, *id))
             .collect();
@@ -40,7 +46,8 @@ impl TimerWork {
         }
         if !self.fired.is_empty() && !self.wake_pending {
             self.wake_pending = true;
-            tx.send(RuntimeCommand::TimersReady).map_err(|_| "timer runtime closed".to_string())?;
+            tx.send(RuntimeCommand::TimersReady)
+                .map_err(|_| "timer runtime closed".to_string())?;
         }
         Ok(())
     }
@@ -84,7 +91,9 @@ impl TimerScheduler {
             }));
         }
         let (work, wake) = &*self.shared;
-        let mut work = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut work = work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if work.scheduled.len() + work.fired.len() >= MAX_PENDING_TIMEOUTS_PER_CELL {
             return Err("code mode timer scheduler is full".to_string());
         }
@@ -102,7 +111,9 @@ impl TimerScheduler {
 
     fn cancel(&self, id: u64) {
         let (work, wake) = &*self.shared;
-        let mut work = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut work = work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = work.scheduled.values().min().copied();
         let removed = work.scheduled.remove(&id);
         work.fired.retain(|fired| *fired != id);
@@ -112,7 +123,11 @@ impl TimerScheduler {
     }
 
     pub(super) fn take_fired(&self) -> Vec<u64> {
-        let mut work = self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut work = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         work.wake_pending = false;
         std::mem::take(&mut work.fired)
     }
@@ -121,7 +136,9 @@ impl TimerScheduler {
 impl Drop for TimerScheduler {
     fn drop(&mut self) {
         let (work, wake) = &*self.shared;
-        work.lock().unwrap_or_else(std::sync::PoisonError::into_inner).shutdown = true;
+        work.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shutdown = true;
         wake.notify_one();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -134,7 +151,9 @@ fn run_scheduler(
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
 ) {
     let (work, wake) = &*shared;
-    let mut work = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut work = work
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
         if work.shutdown {
             break;
@@ -146,9 +165,11 @@ fn run_scheduler(
         }
         work = if let Some(deadline) = work.scheduled.values().min().copied() {
             wake.wait_timeout(work, deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(std::sync::PoisonError::into_inner).0
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0
         } else {
-            wake.wait(work).unwrap_or_else(std::sync::PoisonError::into_inner)
+            wake.wait(work)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         };
     }
 }
@@ -156,7 +177,7 @@ fn run_scheduler(
 pub(super) fn schedule_timeout(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
-) -> Result<u64, String> {
+) -> Result<Option<u64>, String> {
     let callback = args.get(0);
     if !callback.is_function() {
         return Err("setTimeout expects a function callback".to_string());
@@ -164,11 +185,11 @@ pub(super) fn schedule_timeout(
     let callback = v8::Local::<v8::Function>::try_from(callback)
         .map_err(|_| "setTimeout expects a function callback".to_string())?;
 
-    let delay_ms = args
-        .get(1)
-        .number_value(scope)
-        .map(normalize_delay_ms)
-        .unwrap_or(0);
+    let Some(delay) = args.get(1).number_value(scope) else {
+        // Preserve the pending coercion exception, without registering work.
+        return Ok(None);
+    };
+    let delay_ms = normalize_delay_ms(delay);
 
     let callback = v8::Global::new(scope, callback);
     let state = scope
@@ -192,7 +213,7 @@ pub(super) fn schedule_timeout(
         return Err(err);
     }
 
-    Ok(timeout_id)
+    Ok(Some(timeout_id))
 }
 
 pub(super) fn clear_timeout(
@@ -304,9 +325,16 @@ mod tests {
                         scheduler.cancel(id);
                     }
                 }
-                samples.push(start.elapsed().as_secs_f64()*1000.0);
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
             }
-            crate::runtime::critical_path_tests::report(if zero {"zero-timer-cells"} else {"later-timer-churn"}, &samples);
+            crate::runtime::critical_path_tests::report(
+                if zero {
+                    "zero-timer-cells"
+                } else {
+                    "later-timer-churn"
+                },
+                &samples,
+            );
         }
     }
 
@@ -373,7 +401,10 @@ mod tests {
         barrier.wait();
         drop(scheduler);
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(matches!(runtime_rx.try_recv(), Err(std_mpsc::TryRecvError::Disconnected)));
+        assert!(matches!(
+            runtime_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
@@ -381,7 +412,10 @@ mod tests {
         let (runtime_tx, runtime_rx) = std_mpsc::channel();
         let mut scheduler = TimerScheduler::new(runtime_tx);
         scheduler.schedule(1, Duration::ZERO).unwrap();
-        assert!(matches!(runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(), super::RuntimeCommand::TimersReady));
+        assert!(matches!(
+            runtime_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            super::RuntimeCommand::TimersReady
+        ));
         scheduler.cancel(1);
         assert!(scheduler.take_fired().is_empty());
     }
@@ -390,10 +424,15 @@ mod tests {
     fn zero_timers_are_deferred_bounded_and_coalesced_without_a_worker() {
         let (tx, rx) = std_mpsc::channel();
         let mut scheduler = TimerScheduler::new(tx);
-        for id in 1..=128 { scheduler.schedule(id, Duration::ZERO).unwrap(); }
+        for id in 1..=128 {
+            scheduler.schedule(id, Duration::ZERO).unwrap();
+        }
         assert!(scheduler.worker.is_none());
         assert!(scheduler.schedule(129, Duration::ZERO).is_err());
-        assert!(matches!(rx.try_recv().unwrap(), super::RuntimeCommand::TimersReady));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            super::RuntimeCommand::TimersReady
+        ));
         assert!(rx.try_recv().is_err());
         scheduler.cancel(1);
         assert_eq!(scheduler.take_fired(), (2..=128).collect::<Vec<_>>());
@@ -402,7 +441,10 @@ mod tests {
             scheduler.cancel(id);
         }
         assert!(scheduler.worker.is_none());
-        assert!(matches!(rx.try_recv().unwrap(), super::RuntimeCommand::TimersReady));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            super::RuntimeCommand::TimersReady
+        ));
         assert!(rx.try_recv().is_err());
         assert!(scheduler.take_fired().is_empty());
     }
@@ -412,7 +454,13 @@ mod tests {
         let (tx, rx) = std_mpsc::channel();
         let mut scheduler = TimerScheduler::new(tx);
         // The earlier deadline has the larger ID, so ID order cannot stand in.
-        scheduler.shared.0.lock().unwrap().scheduled.insert(5, Instant::now()-Duration::from_secs(1));
+        scheduler
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .scheduled
+            .insert(5, Instant::now() - Duration::from_secs(1));
         scheduler.schedule(2, Duration::ZERO).unwrap();
         rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(scheduler.take_fired(), vec![5, 2]);
@@ -440,15 +488,28 @@ mod tests {
         let evidence = {
             let mut work = scheduler.shared.0.lock().unwrap();
             work.scheduled.get(&1).copied().map(|deadline| {
-                let early_result = work.queue_due(deadline - Duration::from_nanos(1), &scheduler.runtime_command_tx);
+                let early_result = work.queue_due(
+                    deadline - Duration::from_nanos(1),
+                    &scheduler.runtime_command_tx,
+                );
                 let early_fired = work.fired.clone();
                 let early_wake = rx.try_recv();
                 let due_result = work.queue_due(deadline, &scheduler.runtime_command_tx);
                 let due_wake = rx.try_recv();
                 let repeat_result = work.queue_due(deadline + delay, &scheduler.runtime_command_tx);
                 let repeated_wake = rx.try_recv();
-                (deadline, early_result, early_fired, early_wake, due_result, due_wake,
-                    repeat_result, repeated_wake, work.fired.clone(), work.scheduled.is_empty())
+                (
+                    deadline,
+                    early_result,
+                    early_fired,
+                    early_wake,
+                    due_result,
+                    due_wake,
+                    repeat_result,
+                    repeated_wake,
+                    work.fired.clone(),
+                    work.scheduled.is_empty(),
+                )
             })
         };
         if scheduler.worker.is_some() {
@@ -456,8 +517,18 @@ mod tests {
         }
         drop(scheduler);
         scheduled.unwrap();
-        let (deadline, early_result, early_fired, early_wake, due_result, due_wake,
-            repeat_result, repeated_wake, fired, empty) = evidence.unwrap();
+        let (
+            deadline,
+            early_result,
+            early_fired,
+            early_wake,
+            due_result,
+            due_wake,
+            repeat_result,
+            repeated_wake,
+            fired,
+            empty,
+        ) = evidence.unwrap();
         assert!(deadline >= before + delay && deadline <= after + delay);
         early_result.unwrap();
         assert!(early_fired.is_empty());

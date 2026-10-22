@@ -38,7 +38,6 @@ use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
 use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Threading::CreateProcessWithLogonW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -51,7 +50,6 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 const RUNNER_SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const RUNNER_PIPE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const RUNNER_ERROR_MODE_FLAGS: u32 = 0x0001 | 0x0002;
 const WAIT_OBJECT_0: u32 = 0;
 
 #[derive(Debug)]
@@ -366,9 +364,9 @@ pub(crate) fn spawn_runner_transport(
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let env_block: Option<Vec<u16>> = None;
 
-    // SAFETY: SetErrorMode takes only flag bits and returns the previous process error mode for
-    // restoration below.
-    let previous_error_mode = unsafe { SetErrorMode(RUNNER_ERROR_MODE_FLAGS) };
+    // CreateProcessWithLogonW uses the default child error mode by default.
+    // Do not exchange the parent's process-wide mode: overlapping launches
+    // could restore one another's temporary values, and affect unrelated work.
     // SAFETY: All credential, executable and cwd strings are live NUL-terminated buffers;
     // cmdline_vec is writable, si has its required size, and pi is a writable output
     // structure. A null environment requests inheritance.
@@ -391,20 +389,18 @@ pub(crate) fn spawn_runner_transport(
             &mut pi,
         )
     };
-    // SAFETY: Read the process-create error before SetErrorMode can replace it.
+    // SAFETY: Capture the native creation error immediately, before cleanup.
     let spawn_error = unsafe { GetLastError() };
-    // SAFETY: Restore the process error mode returned before process creation.
-    unsafe {
-        SetErrorMode(previous_error_mode);
-    }
     if spawn_res == 0 {
-        return Err(anyhow::Error::from(RunnerLogonError { code: spawn_error }).context(format!(
-            "launch runner {} (exists: {}) in {} (exists: {})",
-            runner_exe.display(),
-            runner_exe.is_file(),
-            cwd.display(),
-            cwd.is_dir(),
-        )));
+        return Err(
+            anyhow::Error::from(RunnerLogonError { code: spawn_error }).context(format!(
+                "launch runner {} (exists: {}) in {} (exists: {})",
+                runner_exe.display(),
+                runner_exe.is_file(),
+                cwd.display(),
+                cwd.is_dir(),
+            )),
+        );
     }
     let expected_runner_pid = pi.dwProcessId;
 
@@ -524,9 +520,9 @@ fn read_frame_with_timeout(pipe_read: &File, timeout: Duration) -> Result<Option
                     "timed out after {}ms waiting for runner spawn_ready",
                     timeout.as_millis()
                 )),
-                mpsc::RecvTimeoutError::Disconnected => {
-                    Err(anyhow::anyhow!("runner startup reader exited without a result"))
-                }
+                mpsc::RecvTimeoutError::Disconnected => Err(anyhow::anyhow!(
+                    "runner startup reader exited without a result"
+                )),
             }
         }
     }
@@ -574,13 +570,13 @@ mod tests {
     fn startup_reader_delivers_frame_and_leaves_following_frame_unread() {
         let (read, mut write) = startup_test_pipe();
         for process_id in [42, 73] {
-        let message = crate::ipc_framed::FramedMessage {
-            version: crate::ipc_framed::IPC_PROTOCOL_VERSION,
-            message: crate::ipc_framed::Message::SpawnReady {
-                payload: crate::ipc_framed::SpawnReady { process_id },
-            },
-        };
-        crate::ipc_framed::write_frame(&mut write, &message).unwrap();
+            let message = crate::ipc_framed::FramedMessage {
+                version: crate::ipc_framed::IPC_PROTOCOL_VERSION,
+                message: crate::ipc_framed::Message::SpawnReady {
+                    payload: crate::ipc_framed::SpawnReady { process_id },
+                },
+            };
+            crate::ipc_framed::write_frame(&mut write, &message).unwrap();
         }
         for expected_id in [42, 73] {
             let received = super::read_frame_with_timeout(&read, std::time::Duration::from_secs(2))

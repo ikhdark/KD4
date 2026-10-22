@@ -47,7 +47,11 @@ struct ExpectedValue {
 #[test]
 fn json_schema_policy_fixtures_convert_to_responses_tools() {
     for fixture in FIXTURE_PATHS.into_iter().map(load_fixture::<FixtureFile>) {
-        assert!(!fixture.tools.is_empty(), "{} fixture must exercise tools", fixture.source);
+        assert!(
+            !fixture.tools.is_empty(),
+            "{} fixture must exercise tools",
+            fixture.source
+        );
         for fixture_tool in &fixture.tools {
             let responses_tool = convert_fixture_tool(&fixture, fixture_tool);
             let parameters = serde_json::to_value(&responses_tool.parameters)
@@ -162,7 +166,10 @@ fn json_schema_policy_oversized_golden_schema_rejects_not_and_preserves_guidance
         "compaction should reduce schema size from {input_bytes} bytes"
     );
 
-    assert_eq!(parameters.get("description"), fixture_tool.input_schema.get("description"));
+    assert_eq!(
+        parameters.get("description"),
+        fixture_tool.input_schema.get("description")
+    );
 
     let expected_values = [
         (

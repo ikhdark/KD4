@@ -94,10 +94,14 @@ pub fn augment_tool_spec_for_code_mode(spec: ToolSpec) -> ToolSpec {
                             kind: CodeModeToolKind::Function,
                             input_schema: serde_json::to_value(&tool.parameters).ok(),
                             default_timeout_ms: None,
-                            output_schema: tool.output_schema.as_ref().map(crate::ToolOutputSchema::to_value),
+                            output_schema: tool
+                                .output_schema
+                                .as_ref()
+                                .map(crate::ToolOutputSchema::to_value),
                         };
-                        tool.description =
-                            codex_code_mode::augment_tool_definition(definition).description.to_string();
+                        tool.description = codex_code_mode::augment_tool_definition(definition)
+                            .description
+                            .to_string();
                     }
                 }
             }
@@ -142,7 +146,6 @@ pub fn collect_code_mode_tool_definitions<'a>(
             .then_with(|| left.tool_name.cmp(&right.tool_name))
     });
 
-
     tool_definitions
         .into_iter()
         .map(codex_code_mode::augment_tool_definition)
@@ -174,7 +177,10 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                 kind: CodeModeToolKind::Function,
                 input_schema: serde_json::to_value(&tool.parameters).ok(),
                 default_timeout_ms: None,
-                output_schema: tool.output_schema.as_ref().map(crate::ToolOutputSchema::to_value),
+                output_schema: tool
+                    .output_schema
+                    .as_ref()
+                    .map(crate::ToolOutputSchema::to_value),
             }]
         }
         ToolSpec::Freeform(tool) => {
@@ -202,7 +208,10 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
                     kind: CodeModeToolKind::Function,
                     input_schema: serde_json::to_value(&tool.parameters).ok(),
                     default_timeout_ms: None,
-                    output_schema: tool.output_schema.as_ref().map(crate::ToolOutputSchema::to_value),
+                    output_schema: tool
+                        .output_schema
+                        .as_ref()
+                        .map(crate::ToolOutputSchema::to_value),
                 },
             })
             .collect(),
@@ -216,7 +225,8 @@ fn code_mode_tool_definitions_for_spec(spec: &ToolSpec) -> Vec<CodeModeToolDefin
             description: format!(
                 "{}\n\n{CODE_MODE_TOOL_SEARCH_RESULT_GUIDANCE}",
                 description.trim()
-            ).into(),
+            )
+            .into(),
             kind: CodeModeToolKind::Function,
             input_schema: serde_json::to_value(parameters).ok(),
             default_timeout_ms: None,

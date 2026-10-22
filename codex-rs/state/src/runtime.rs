@@ -64,6 +64,10 @@ use uuid::Uuid;
 mod agent_jobs;
 mod backfill;
 mod external_agent_config_imports;
+
+#[cfg(test)]
+#[path = "runtime_compat_tests.rs"]
+mod compatibility_tests;
 mod goals;
 mod logs;
 pub use logs::LogReader;
@@ -88,6 +92,8 @@ pub use external_agent_config_imports::ExternalAgentConfigImportSuccessRecord;
 pub use goals::GoalAccountingMode;
 pub use goals::GoalAccountingOutcome;
 pub use goals::GoalStore;
+pub use goals::GoalTerminalTransition;
+pub use goals::GoalTerminalTransitionOutcome;
 pub use goals::GoalUpdate;
 pub use recovery::RuntimeDbBackup;
 pub use recovery::backup_runtime_db_for_fresh_start;
@@ -206,7 +212,8 @@ impl StateRuntime {
         tokio::spawn(async move {
             let _owners = recovery::lock_runtime_initialization(&codex_home).await?;
             Self::init_inner(codex_home, default_provider, telemetry_override).await
-        }).await?
+        })
+        .await?
     }
 
     /// Recheck damage after admission, quarantine only damaged databases, and
@@ -216,28 +223,37 @@ impl StateRuntime {
         default_provider: String,
     ) -> anyhow::Result<Vec<RuntimeDbBackup>> {
         tokio::spawn(async move {
-            let home = database_path.parent().ok_or_else(|| anyhow::anyhow!("database has no parent"))?.to_path_buf();
+            let home = database_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("database has no parent"))?
+                .to_path_buf();
             let _owners = recovery::lock_runtime_initialization(&home).await?;
             let mut backups = Vec::new();
             let mut attempted = BTreeSet::new();
             loop {
-                let error = match Self::init_inner(home.clone(), default_provider.clone(), None).await {
-                    Ok(runtime) => {
-                        runtime.close().await;
-                        return Ok(backups);
-                    }
-                    Err(error) => error,
-                };
-                let blocking_home = tokio::fs::metadata(&home).await.is_ok_and(|metadata| metadata.is_file());
+                let error =
+                    match Self::init_inner(home.clone(), default_provider.clone(), None).await {
+                        Ok(runtime) => {
+                            runtime.close().await;
+                            return Ok(backups);
+                        }
+                        Err(error) => error,
+                    };
+                let blocking_home = tokio::fs::metadata(&home)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_file());
                 let path = match runtime_db_path_for_corruption_error(&error) {
                     Some(path) => path,
                     None if blocking_home => database_path.clone(),
                     None => return Err(error),
                 };
-                if !attempted.insert(path.clone()) { return Err(error); }
+                if !attempted.insert(path.clone()) {
+                    return Err(error);
+                }
                 backups.extend(recovery::backup_runtime_db_owned(&path).await?);
             }
-        }).await?
+        })
+        .await?
     }
 
     async fn init_inner(
@@ -270,6 +286,10 @@ impl StateRuntime {
         let [pool, logs_pool, goals_pool] = results;
         let (pool, logs_pool, goals_pool) =
             (Arc::new(pool?), Arc::new(logs_pool?), Arc::new(goals_pool?));
+        if let Err(error) = goals::transfer_legacy_goals(pool.as_ref(), goals_pool.as_ref()).await {
+            close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
+            return Err(error);
+        }
         let started = Instant::now();
         let backfill_state_result = ensure_backfill_state_row_in_pool(pool.as_ref())
             .await
@@ -443,7 +463,8 @@ async fn open_goals_sqlite(
     open_sqlite(path, migrator, GOALS_DB, telemetry_override).await
 }
 
-pub(crate) async fn connect_sqlite_pool_with_retry(
+/// Connect a SQLite pool using the shared bounded retry for startup PRAGMA contention.
+pub async fn connect_sqlite_pool_with_retry(
     options: SqliteConnectOptions,
     max_connections: u32,
     started: Instant,
@@ -494,8 +515,13 @@ async fn open_sqlite(
         let migrator = runtime_migrator_for_pool(pool_ref, migrator).await?;
         if matches!(spec.kind, DbKind::State) {
             repair_legacy_recency_migration_version(pool_ref, &migrator).await?;
+            goals::preserve_legacy_goals(pool_ref, &migrator).await?;
         }
-        migrator.run(pool_ref).await.map_err(anyhow::Error::from)?;
+        if matches!(spec.kind, DbKind::State) {
+            crate::migrations::run_state_migrations(pool_ref, &migrator).await?;
+        } else {
+            migrator.run(pool_ref).await.map_err(anyhow::Error::from)?;
+        }
         Ok::<(), anyhow::Error>(())
     })
     .await;
@@ -833,7 +859,9 @@ mod tests {
         .fetch_one(runtime.pool.as_ref())
         .await
         .expect("inspect thread schema");
-        assert_eq!(memory_columns, 0);
+        // Retired features stay absent, but older ordinary writers still name
+        // this inert storage column in their INSERT/UPSERT statements.
+        assert_eq!(memory_columns, 1);
 
         runtime.pool.close().await;
         runtime.logs_pool.close().await;

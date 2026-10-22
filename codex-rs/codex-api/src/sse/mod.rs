@@ -1,3 +1,3 @@
 pub(crate) mod responses;
 
-pub use responses::spawn_response_stream;
+pub(crate) use responses::spawn_response_stream_with_dialect;

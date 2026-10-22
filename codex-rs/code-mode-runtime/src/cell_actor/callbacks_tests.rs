@@ -3,11 +3,11 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
+use crate::NestedCancellation;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -64,7 +64,9 @@ impl CellHost for SlowSetupCallbackHost {
         panic!("unexpected completion commit");
     }
 
-    async fn closed(&self, _: Option<CellEvent>) {}
+    async fn closed(&self, event: Option<CellEvent>) -> Option<CellEvent> {
+        event
+    }
 }
 
 #[tokio::test]
@@ -81,11 +83,16 @@ async fn callback_setup_does_not_restart_the_published_deadline() {
             Arc::new(SlowSetupCallbackHost {
                 setup,
                 ready: ready_tx,
-                completed: timeout.is_zero().then(|| serde_json::json!({"retained": "done"})),
+                completed: timeout
+                    .is_zero()
+                    .then(|| serde_json::json!({"retained": "done"})),
             }),
             CellToolCall {
                 id: "slow-setup".into(),
-                name: ToolName { name: "fixture".into(), namespace: None },
+                name: ToolName {
+                    name: "fixture".into(),
+                    namespace: None,
+                },
                 kind: ToolKind::Function,
                 input: None,
                 timeout,
@@ -101,22 +108,37 @@ async fn callback_setup_does_not_restart_the_published_deadline() {
         let deadline = ready_rx.try_recv().unwrap();
         let command = runtime_rx.try_recv().unwrap();
         assert!(tasks.is_empty());
-        assert!(runtime_rx.try_recv().is_err(), "one invocation must yield only one receipt");
+        assert!(
+            runtime_rx.try_recv().is_err(),
+            "one invocation must yield only one receipt"
+        );
         if timeout.is_zero() {
             assert!(deadline.is_none());
             assert!(!cancellation.token().is_cancelled());
-            assert!(matches!(command, RuntimeCommand::ToolResponse { result, .. }
-                if result == serde_json::json!({"retained": "done"})));
+            assert!(
+                matches!(command, RuntimeCommand::ToolResponse { result, .. }
+                if result == serde_json::json!({"retained": "done"}))
+            );
         } else {
-            assert!(matches!(command, RuntimeCommand::ToolError { error_text, .. }
-                if error_text.contains("150ms timeout")));
+            assert!(
+                matches!(command, RuntimeCommand::ToolError { error_text, .. }
+                if error_text.contains("150ms timeout"))
+            );
             assert!(cancellation.token().is_cancelled());
             let excess = elapsed.saturating_sub(setup);
-            eprintln!("callback_setup_deadline wall_us={} setup_us={} extra_wait_us={} deadline_overrun_us={}",
-                elapsed.as_micros(), setup.as_micros(), excess.as_micros(), deadline.unwrap().elapsed().as_micros());
+            eprintln!(
+                "callback_setup_deadline wall_us={} setup_us={} extra_wait_us={} deadline_overrun_us={}",
+                elapsed.as_micros(),
+                setup.as_micros(),
+                excess.as_micros(),
+                deadline.unwrap().elapsed().as_micros()
+            );
             // Synchronous setup itself cannot be preempted, but after it yields
             // an expired deadline must not add another full 150 ms wait.
-            assert!(excess < Duration::from_millis(100), "restarted callback timeout: {elapsed:?}");
+            assert!(
+                excess < Duration::from_millis(100),
+                "restarted callback timeout: {elapsed:?}"
+            );
         }
     }
 }
@@ -149,7 +171,9 @@ impl CellHost for PanickingCallbackHost {
         panic!("unexpected completion commit");
     }
 
-    async fn closed(&self, _event: Option<CellEvent>) {}
+    async fn closed(&self, event: Option<CellEvent>) -> Option<CellEvent> {
+        event
+    }
 }
 
 impl CellHost for NonCooperativeCallbackHost {
@@ -181,7 +205,9 @@ impl CellHost for NonCooperativeCallbackHost {
         panic!("unexpected completion commit");
     }
 
-    async fn closed(&self, _event: Option<CellEvent>) {}
+    async fn closed(&self, event: Option<CellEvent>) -> Option<CellEvent> {
+        event
+    }
 }
 
 #[tokio::test]
@@ -270,8 +296,12 @@ async fn tool_callback_timeout_rejects_the_js_promise_and_cancels_the_delegate()
         assert_eq!(id, "tool-timeout");
         assert_eq!(
             error_text,
-            format!("nested tool `{}` exceeded its 1000ms timeout",
-                namespace.map_or("stuck".to_string(), |namespace| format!("{namespace}__stuck")))
+            format!(
+                "nested tool `{}` exceeded its 1000ms timeout",
+                namespace.map_or("stuck".to_string(), |namespace| format!(
+                    "{namespace}__stuck"
+                ))
+            )
         );
         assert!(cancellation_token.is_cancelled());
     }
@@ -317,7 +347,12 @@ async fn notification_timeout_rejects_the_js_promise_and_cancels_the_delegate() 
     );
     assert!(cancellation_token.is_cancelled());
     // The delegate holds its own delivery token, not the cell's.
-    let delivery_token = host.notify_token.lock().unwrap().clone().expect("delegate was notified");
+    let delivery_token = host
+        .notify_token
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("delegate was notified");
     assert!(delivery_token.is_cancelled());
 }
 
@@ -463,16 +498,37 @@ async fn completion_cancels_tools_before_held_notification_delivery() {
     let mut notifications = JoinSet::new();
     let mut tools = JoinSet::new();
     let release = CancellationToken::new();
-    notifications.spawn({ let release = release.clone(); async move { release.cancelled().await } });
-    tools.spawn({ let token = tool.token().clone(); async move { token.cancelled().await } });
-    let cleanup = finish_callbacks(&notification_token, &tool, &mut notifications, &mut tools,
-        CallbackCompletion::DrainNotifications, None);
+    notifications.spawn({
+        let release = release.clone();
+        async move { release.cancelled().await }
+    });
+    tools.spawn({
+        let token = tool.token().clone();
+        async move { token.cancelled().await }
+    });
+    let cleanup = finish_callbacks(
+        &notification_token,
+        &tool,
+        &mut notifications,
+        &mut tools,
+        CallbackCompletion::DrainNotifications,
+        None,
+    );
     tokio::pin!(cleanup);
     assert!(futures::poll!(&mut cleanup).is_pending());
-    assert!(tool.token().is_cancelled(), "abandoned effects stop before notification acknowledgement");
-    assert!(!notification_token.is_cancelled(), "accepted notification keeps its delivery grace");
+    assert!(
+        tool.token().is_cancelled(),
+        "abandoned effects stop before notification acknowledgement"
+    );
+    assert!(
+        !notification_token.is_cancelled(),
+        "accepted notification keeps its delivery grace"
+    );
     tokio::time::advance(CALLBACK_CANCELLATION_GRACE + Duration::from_millis(1)).await;
-    assert!(futures::poll!(&mut cleanup).is_pending(), "ordinary completion preserves accepted delivery past cancellation grace");
+    assert!(
+        futures::poll!(&mut cleanup).is_pending(),
+        "ordinary completion preserves accepted delivery past cancellation grace"
+    );
     assert!(!notification_token.is_cancelled());
     release.cancel();
     cleanup.await;
@@ -507,9 +563,12 @@ async fn ordinary_completion_keeps_notification_delivery_timeout() {
         &mut tools,
         CallbackCompletion::DrainNotifications,
         None,
-    ).await;
+    )
+    .await;
     assert_eq!(started.elapsed(), NOTIFICATION_DELIVERY_TIMEOUT);
-    assert!(matches!(runtime_rx.try_recv(), Ok(RuntimeCommand::NotificationError { id, .. }) if id == "accepted"));
+    assert!(
+        matches!(runtime_rx.try_recv(), Ok(RuntimeCommand::NotificationError { id, .. }) if id == "accepted")
+    );
     assert!(notification_token.is_cancelled());
     assert!(tool.token().is_cancelled());
 }

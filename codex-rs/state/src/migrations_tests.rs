@@ -43,6 +43,53 @@ fn migrator_through(version: i64) -> Migrator {
     }
 }
 
+#[tokio::test]
+async fn publication_upgrade_keeps_legacy_terminal_paths_out_of_retry_work() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    migrator_through(49).run(&pool).await.unwrap();
+    for (job, status) in [
+        ("historical", "completed"),
+        ("known-obligation", "failed"),
+        ("admitted", "pending"),
+    ] {
+        sqlx::query("INSERT INTO agent_jobs (id,name,status,instruction,input_headers_json,input_csv_path,output_csv_path,created_at,updated_at) VALUES (?,?,?,'work','[]','in.csv','retained.csv',0,0)")
+            .bind(job).bind(job).bind(status).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO agent_job_recovery_exports (job_id) VALUES ('known-obligation')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = migration_ledger(&pool).await;
+    runtime_state_migrator().run(&pool).await.unwrap();
+    let queued: Vec<String> =
+        sqlx::query_scalar("SELECT job_id FROM agent_job_recovery_exports ORDER BY job_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        queued,
+        vec!["admitted".to_string(), "known-obligation".to_string()]
+    );
+    let after = migration_ledger(&pool)
+        .await
+        .into_iter()
+        .filter(|row| row.0 <= 49)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after, before,
+        "additive publication state must preserve old migration receipts"
+    );
+    let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_job_attempts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 0, "historical workers are unknown, not invented");
+}
+
 async fn migration_ledger(
     pool: &sqlx::SqlitePool,
 ) -> Vec<(i64, String, String, i64, Vec<u8>, i64)> {
@@ -305,7 +352,11 @@ async fn recency_repair_accepts_both_checkout_line_endings_without_rewriting_che
         repair_legacy_recency_migration_version(&pool, &compatible)
             .await
             .expect("equivalent LF and CRLF migrations should repair");
-        assert_eq!(migration_ledger(&pool).await, expected_ledger, "{line_endings:?}");
+        assert_eq!(
+            migration_ledger(&pool).await,
+            expected_ledger,
+            "{line_endings:?}"
+        );
 
         compatible
             .run(&pool)
@@ -366,7 +417,8 @@ VALUES (?, ?, TRUE, ?, 0)
         .expect("line-ending-equivalent history should be accepted");
 
     assert_eq!(migration_ledger(&pool).await, original_ledger);
-    assert_eq!(latest_known_version, 48);
+    // New migrations must not invalidate the historical-checksum preservation check.
+    assert!(latest_known_version >= 50);
     assert_eq!(
         STATE_MIGRATOR
             .migrations

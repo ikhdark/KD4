@@ -56,7 +56,10 @@ mod tests {
             let mut host = FramedWriter::new(host);
             host.write(&message(1)).await.unwrap();
             let (events, mut rx) = mpsc::channel(1);
-            events.send(DriverEvent::Failed("already queued".into())).await.unwrap();
+            events
+                .send(DriverEvent::Failed("already queued".into()))
+                .await
+                .unwrap();
             let cancellation = CancellationToken::new();
             let pump = drive_reader(FramedReader::new(pipe), events, cancellation.clone());
             tokio::pin!(pump);
@@ -64,13 +67,23 @@ mod tests {
             let started = std::time::Instant::now();
             cancellation.cancel();
             tokio::time::timeout(Duration::from_millis(100), &mut pump)
-                .await.expect("cancel must not wait for driver queue capacity").unwrap();
+                .await
+                .expect("cancel must not wait for driver queue capacity")
+                .unwrap();
             samples.push(started.elapsed().as_micros());
-            assert!(matches!(rx.recv().await, Some(DriverEvent::Failed(reason)) if reason == "already queued"));
-            assert!(rx.recv().await.is_none(), "no late message after connection retirement");
+            assert!(
+                matches!(rx.recv().await, Some(DriverEvent::Failed(reason)) if reason == "already queued")
+            );
+            assert!(
+                rx.recv().await.is_none(),
+                "no late message after connection retirement"
+            );
         }
         samples.sort_unstable();
-        eprintln!("reader_cancel_backpressure_us={samples:?} median={}", samples[3]);
+        eprintln!(
+            "reader_cancel_backpressure_us={samples:?} median={}",
+            samples[3]
+        );
     }
 
     #[tokio::test]
@@ -82,10 +95,13 @@ mod tests {
         drop(host);
         let (events, mut rx) = mpsc::channel(2);
         let error = drive_reader(FramedReader::new(pipe), events, CancellationToken::new())
-            .await.unwrap_err();
+            .await
+            .unwrap_err();
         assert!(error.contains("closed its stdout"));
         for id in [1, 2] {
-            assert!(matches!(rx.recv().await, Some(DriverEvent::HostMessage(actual)) if actual == message(id)));
+            assert!(
+                matches!(rx.recv().await, Some(DriverEvent::HostMessage(actual)) if actual == message(id))
+            );
         }
         assert!(rx.recv().await.is_none());
     }

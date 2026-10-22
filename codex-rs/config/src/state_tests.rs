@@ -169,19 +169,23 @@ fn origins_exclude_replaced_subtrees_and_preserve_surviving_siblings() {
         vec![low, high, disabled],
         ConfigRequirements::default(),
         ConfigRequirementsToml::default(),
-    ).unwrap();
+    )
+    .unwrap();
     // The documented overlay contract replaces lists/scalars, merges tables,
     // and ignores disabled layers. These are the five remaining scalar leaves.
     assert_eq!(stack.effective_config(), toml::from_str::<TomlValue>(
         "items = [{ new = 6 }]\nempty = []\nobject = 7\nscalar = { new = 8 }\nkeep = { inherited = 5, added = 9 }\n"
     ).unwrap());
-    assert_eq!(stack.origins(), HashMap::from([
-        ("items.0.new".to_string(), high_metadata.clone()),
-        ("object".to_string(), high_metadata.clone()),
-        ("scalar.new".to_string(), high_metadata.clone()),
-        ("keep.added".to_string(), high_metadata),
-        ("keep.inherited".to_string(), low_metadata),
-    ]));
+    assert_eq!(
+        stack.origins(),
+        HashMap::from([
+            ("items.0.new".to_string(), high_metadata.clone()),
+            ("object".to_string(), high_metadata.clone()),
+            ("scalar.new".to_string(), high_metadata.clone()),
+            ("keep.added".to_string(), high_metadata),
+            ("keep.inherited".to_string(), low_metadata),
+        ])
+    );
 }
 
 #[test]

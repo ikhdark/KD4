@@ -324,8 +324,10 @@ mod tests {
         let set_cookie = HeaderValue::from_static("_cfuvid=visitor; Path=/; Secure; HttpOnly");
         for scheme in ["http", "wss"] {
             let store = ChatGptCloudflareCookieStore::default();
-            let url = reqwest::Url::parse(&format!("{scheme}://chatgpt.com/backend-api/codex/responses"))
-                .expect("URL should parse");
+            let url = reqwest::Url::parse(&format!(
+                "{scheme}://chatgpt.com/backend-api/codex/responses"
+            ))
+            .expect("URL should parse");
             assert!(!is_chatgpt_cookie_url(&url));
             store.set_cookies(&mut std::iter::once(&set_cookie), &url);
             assert_eq!(store.cookies(&url), None);

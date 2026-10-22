@@ -91,7 +91,6 @@ async fn merge_noops_do_not_write_but_still_validate() -> anyhow::Result<()> {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn mcp_server_edits_preserve_empty_tool_allowlists() -> anyhow::Result<()> {
     for merge in [false, true] {
@@ -144,12 +143,14 @@ async fn mcp_server_edits_preserve_explicit_empty_oauth_scopes() -> anyhow::Resu
         let path = home.path().join(CONFIG_TOML_FILE);
         std::fs::write(&path, "# retained user setting\nmodel = 'chosen'\n")?;
         let servers = BTreeMap::from([
-            ("empty".to_string(), toml::from_str::<McpServerConfig>(
-                "url = 'https://example.com/mcp'\nscopes = []",
-            )?),
-            ("unset".to_string(), toml::from_str::<McpServerConfig>(
-                "url = 'https://example.com/other'",
-            )?),
+            (
+                "empty".to_string(),
+                toml::from_str::<McpServerConfig>("url = 'https://example.com/mcp'\nscopes = []")?,
+            ),
+            (
+                "unset".to_string(),
+                toml::from_str::<McpServerConfig>("url = 'https://example.com/other'")?,
+            ),
         ]);
         let builder = ConfigEditsBuilder::new(home.path());
         if merge {
@@ -158,7 +159,10 @@ async fn mcp_server_edits_preserve_explicit_empty_oauth_scopes() -> anyhow::Resu
             builder.replace_mcp_servers(&servers).apply().await?;
         }
         let stored: TomlValue = toml::from_str(&std::fs::read_to_string(&path)?)?;
-        assert_eq!(stored["mcp_servers"]["empty"]["scopes"], TomlValue::Array(vec![]));
+        assert_eq!(
+            stored["mcp_servers"]["empty"]["scopes"],
+            TomlValue::Array(vec![])
+        );
         assert!(stored["mcp_servers"]["unset"].get("scopes").is_none());
         assert_eq!(stored["model"].as_str(), Some("chosen"));
         let reloaded = load_global_mcp_servers(home.path()).await?;

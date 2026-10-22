@@ -38,12 +38,7 @@ fn app_mcp_routing_tracks_auth_mode_and_plugin_activation() {
                 let original_servers = mcp_servers([("linear", 1), ("docs", 2), ("notion", 3)]);
                 let mut servers = original_servers.clone();
 
-                apply_app_mcp_routing_policy(
-                    &mut apps,
-                    &mut servers,
-                    auth_mode,
-                    plugin_active,
-                );
+                apply_app_mcp_routing_policy(&mut apps, &mut servers, auth_mode, plugin_active);
 
                 assert_eq!(
                     apps,

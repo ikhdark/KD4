@@ -25,12 +25,21 @@ async fn closing_actor_serves_terminal_event_before_host_cleanup() {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let handle = CellHandle::new(command_tx, state.clone());
     let event = CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "retained".into() }],
-        error_text: None, output_loss: None,
+        content_items: vec![OutputItem::Text {
+            text: "retained".into(),
+        }],
+        error_text: None,
+        output_loss: None,
     };
-    assert_eq!(state.commit_completion(event.clone(), None, || {}), CompletionCommit::Committed);
+    assert_eq!(
+        state.commit_completion(event.clone(), None, || {}),
+        CompletionCommit::Committed
+    );
     let (tx, rx) = oneshot::channel();
-    assert!(matches!(state.deliver_completion(Some(tx)), CompletionDelivery::Delivered));
+    assert!(matches!(
+        state.deliver_completion(Some(tx)),
+        CompletionDelivery::Delivered
+    ));
     assert_eq!(rx.await.unwrap().unwrap(), event);
     state.tombstone();
     drop(command_rx);
@@ -72,7 +81,9 @@ impl CellHost for TestHost {
         cell_state.commit_completion(event, pending_initial_yield_items, || {})
     }
 
-    async fn closed(&self, _event: Option<CellEvent>) {}
+    async fn closed(&self, event: Option<CellEvent>) -> Option<CellEvent> {
+        event
+    }
 }
 
 impl CellHost for RecordingHost {
@@ -106,7 +117,9 @@ impl CellHost for RecordingHost {
         completion
     }
 
-    async fn closed(&self, _event: Option<CellEvent>) {}
+    async fn closed(&self, event: Option<CellEvent>) -> Option<CellEvent> {
+        event
+    }
 }
 
 struct CellActorHarness {
@@ -400,10 +413,16 @@ async fn decision_idle_bound_resets_on_output_and_nested_completion() {
     tokio::task::yield_now().await;
     for event in [
         RuntimeEvent::ContentItem {
-            item: FunctionCallOutputContentItem::InputText { text: "progress".to_string() },
+            item: FunctionCallOutputContentItem::InputText {
+                text: "progress".to_string(),
+            },
             admitted_bytes: 0,
         },
-        RuntimeEvent::Notify { id: None, call_id: "notify".to_string(), text: "progress".to_string() },
+        RuntimeEvent::Notify {
+            id: None,
+            call_id: "notify".to_string(),
+            text: "progress".to_string(),
+        },
         RuntimeEvent::ToolCall {
             id: "tool".to_string(),
             name: codex_protocol::ToolName::plain("test"),
@@ -415,20 +434,33 @@ async fn decision_idle_bound_resets_on_output_and_nested_completion() {
         tokio::time::advance(DECISION_IDLE_TIMEOUT - Duration::from_secs(3)).await;
         harness.event_tx.send(event).unwrap();
         // Drain the runtime event and the nested callback's completion.
-        for _ in 0..5 { tokio::task::yield_now().await; }
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
-        assert!(matches!(harness.initial_event_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(
+            harness.initial_event_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
     }
     tokio::time::advance(DECISION_IDLE_TIMEOUT).await;
     let event = harness.initial_event_rx.await.unwrap().unwrap();
     assert!(matches!(event, CellEvent::Yielded { content_items }
         if matches!(content_items.last(), Some(OutputItem::Text { text }) if text.contains("idle for 10 minutes"))));
     // An idle yield is not cancellation, and the original cell can still finish.
-    harness.event_tx.send(RuntimeEvent::Result {
-        stored_value_writes: HashMap::new(), error_text: None, output_loss: None,
-    }).unwrap();
-    assert!(matches!(harness.handle.observe(ObserveMode::Decision).await, Ok(CellEvent::Completed { .. })));
+    harness
+        .event_tx
+        .send(RuntimeEvent::Result {
+            stored_value_writes: HashMap::new(),
+            error_text: None,
+            output_loss: None,
+        })
+        .unwrap();
+    assert!(matches!(
+        harness.handle.observe(ObserveMode::Decision).await,
+        Ok(CellEvent::Completed { .. })
+    ));
     harness.task.await.unwrap();
 }
 
@@ -974,7 +1006,9 @@ fn failed_completion_delivery_rebuffers_the_event() {
             discarded_items: 2,
             discarded_bytes_lower_bound: 17,
         }),
-        content_items: vec![OutputItem::Text { text: "retained λ\n".into() }],
+        content_items: vec![OutputItem::Text {
+            text: "retained λ\n".into(),
+        }],
         error_text: Some("original failure".into()),
     };
     assert_eq!(

@@ -22,11 +22,7 @@ mod prompt_provenance;
 mod recommended_plugins_instructions;
 mod subagent_notification;
 mod task_capsule;
-mod token_budget_context;
 mod turn_aborted;
-pub(crate) use token_budget_context::{
-    AutoCompactFallbackPrompt, ContextWindowGuidance, TokenBudgetContext, TokenBudgetReminder,
-};
 mod user_instructions;
 mod user_shell_command;
 pub(crate) mod world_state;

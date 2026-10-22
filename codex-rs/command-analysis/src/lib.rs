@@ -15,5 +15,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation).await
+    let observation = codex_utils_pty::process_observation::ProcessObservationContext::current();
+    tokio::task::spawn_blocking(move || {
+        codex_utils_pty::process_observation::ProcessObservationContext::scope_sync(
+            observation,
+            operation,
+        )
+    })
+    .await
 }

@@ -167,11 +167,113 @@ impl ExecServerHandler {
         session.process().exec(params).await
     }
 
+    pub(crate) async fn reserve_owned_start(
+        &self,
+        params: &crate::protocol::OwnedProcessParams<ExecParams>,
+    ) -> Result<crate::local_process::ProcessStartReservation, JSONRPCErrorError> {
+        self.require_initialized_for("exec")?
+            .process()
+            .reserve_owned_start(params)
+            .await
+    }
+
+    pub(crate) async fn exec_owned(
+        &self,
+        params: crate::protocol::OwnedProcessParams<ExecParams>,
+    ) -> Result<ExecResponse, JSONRPCErrorError> {
+        if params.incarnation.is_none() {
+            return Err(crate::rpc::invalid_params(
+                "owned start requires an incarnation".into(),
+            ));
+        }
+        let reservation = self.reserve_owned_start(&params).await?;
+        self.exec_reserved(params.params, reservation).await
+    }
+
+    pub(crate) async fn read_owned(
+        &self,
+        params: crate::protocol::OwnedProcessParams<ReadParams>,
+    ) -> Result<ReadResponse, JSONRPCErrorError> {
+        let response = self
+            .require_initialized_for("exec")?
+            .process()
+            .read_owned(params)
+            .await?;
+        self.require_session_attached()?;
+        Ok(response)
+    }
+
+    pub(crate) async fn write_owned(
+        &self,
+        params: crate::protocol::OwnedProcessParams<WriteParams>,
+    ) -> Result<WriteResponse, JSONRPCErrorError> {
+        self.require_initialized_for("exec")?
+            .process()
+            .write_owned(params)
+            .await
+    }
+
+    pub(crate) async fn signal_owned(
+        &self,
+        params: crate::protocol::OwnedProcessParams<SignalParams>,
+    ) -> Result<SignalResponse, JSONRPCErrorError> {
+        self.require_initialized_for("exec")?
+            .process()
+            .signal_owned(params)
+            .await
+    }
+
+    pub(crate) async fn terminate_owned(
+        &self,
+        params: crate::protocol::OwnedProcessParams<TerminateParams>,
+    ) -> Result<TerminateResponse, JSONRPCErrorError> {
+        self.require_initialized_for("exec")?
+            .process()
+            .terminate_owned(params)
+            .await
+    }
+
+    pub(crate) async fn exec_reserved(
+        &self,
+        params: ExecParams,
+        reservation: crate::local_process::ProcessStartReservation,
+    ) -> Result<ExecResponse, JSONRPCErrorError> {
+        self.require_initialized_for("exec")?
+            .process()
+            .exec_reserved(params, reservation)
+            .await
+    }
+
+    pub(crate) async fn terminate_admitted(
+        &self,
+        params: TerminateParams,
+        identity: crate::local_process::ProcessStartIdentity,
+    ) -> Result<TerminateResponse, JSONRPCErrorError> {
+        self.require_initialized_for("exec")?
+            .process()
+            .terminate_admitted(params, identity)
+            .await
+    }
+
+    pub(crate) async fn process_start_identity(
+        &self,
+        process_id: &crate::ProcessId,
+    ) -> Result<Option<crate::local_process::ProcessStartIdentity>, JSONRPCErrorError> {
+        Ok(self
+            .require_initialized_for("exec")?
+            .process()
+            .process_start_identity(process_id)
+            .await)
+    }
+
     pub(crate) fn environment_info(&self) -> Result<EnvironmentInfo, JSONRPCErrorError> {
         self.require_initialized_for("environment info")?;
         Ok(EnvironmentInfo::local())
     }
 
+    // Unowned read/terminate are test conveniences; the router dispatches the
+    // owned variants so a stale handle cannot reach a successor process.
+    #[cfg(test)]
     pub(crate) async fn exec_read(
         &self,
         params: ReadParams,
@@ -182,22 +284,7 @@ impl ExecServerHandler {
         Ok(response)
     }
 
-    pub(crate) async fn exec_write(
-        &self,
-        params: WriteParams,
-    ) -> Result<WriteResponse, JSONRPCErrorError> {
-        let session = self.require_initialized_for("exec")?;
-        session.process().exec_write(params).await
-    }
-
-    pub(crate) async fn signal(
-        &self,
-        params: SignalParams,
-    ) -> Result<SignalResponse, JSONRPCErrorError> {
-        let session = self.require_initialized_for("exec")?;
-        session.process().signal(params).await
-    }
-
+    #[cfg(test)]
     pub(crate) async fn terminate(
         &self,
         params: TerminateParams,
@@ -311,6 +398,14 @@ impl ExecServerHandler {
     ) -> Result<FsWriteFileResponse, JSONRPCErrorError> {
         self.require_initialized_for("filesystem")?;
         self.file_system.write_file(params).await
+    }
+
+    pub(crate) async fn fs_mutate_file_if_matches(
+        &self,
+        params: crate::protocol::FsMutateFileIfMatchesParams,
+    ) -> Result<crate::protocol::FsMutateFileIfMatchesResponse, JSONRPCErrorError> {
+        self.require_initialized_for("filesystem")?;
+        self.file_system.mutate_file_if_matches(params).await
     }
 
     pub(crate) async fn fs_create_directory(

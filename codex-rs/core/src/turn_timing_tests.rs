@@ -51,6 +51,186 @@ use crate::tools::tool_dispatch_trace::ToolDispatchTimingSnapshot;
 const NS_PER_MS: u128 = 1_000_000;
 
 #[test]
+fn accepted_final_tail_excludes_commentary_and_counts_canonical_unicode_once() {
+    use codex_protocol::models::MessagePhase;
+    use codex_protocol::protocol::AcceptedFinalMessage;
+    use codex_protocol::protocol::AcceptedFinalMessageOrigin;
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let item = |id: &str, text: &str, phase| ResponseItem::Message {
+        id: Some(codex_protocol::ResponseItemId::from_server(id.into())),
+        role: "assistant".into(),
+        phase,
+        content: vec![ContentItem::OutputText { text: text.into() }],
+        internal_chat_message_metadata_passthrough: None,
+    };
+    clock.set_ms(10);
+    state.record_response_event_milestones(&ResponseEvent::OutputItemDone(item(
+        "comment",
+        "working",
+        Some(MessagePhase::Commentary),
+    )));
+    clock.set_ms(20);
+    state.record_response_event_milestones(&ResponseEvent::OutputItemAdded(item(
+        "final",
+        "",
+        Some(MessagePhase::FinalAnswer),
+    )));
+    clock.set_ms(25);
+    state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("e\u{301} α".into()));
+    clock.set_ms(40);
+    state.record_response_event_milestones(&ResponseEvent::OutputItemDone(item(
+        "final",
+        "e\u{301} α",
+        Some(MessagePhase::FinalAnswer),
+    )));
+    clock.set_ms(45);
+    state.record_response_event_milestones(&ResponseEvent::OutputItemDone(item(
+        "final",
+        "e\u{301} α",
+        Some(MessagePhase::FinalAnswer),
+    )));
+    clock.set_ms(50);
+    let answer = AcceptedFinalMessage {
+        item_id: "final".into(),
+        text: "e\u{301} α".into(),
+        origin: AcceptedFinalMessageOrigin::AssistantFinal,
+        completion_attempt_id: "turn:1".into(),
+    };
+    let tail = state.final_tail(Some(&answer), None).unwrap();
+    assert_eq!(tail.first_content_host_ms, Some(25));
+    assert_eq!(tail.full_content_host_ms, Some(40));
+    assert_eq!(tail.reconciled_host_ms, Some(50));
+    assert_eq!(
+        (
+            tail.text_codepoints,
+            tail.text_utf8_bytes,
+            tail.whitespace_words
+        ),
+        (Some(4), Some(6), Some(2))
+    );
+    assert!(tail.required_evidence.is_none());
+    assert!(tail.native_render_ack.is_none());
+    assert_eq!(tail.item_id.as_deref(), Some("final"));
+    let mut changed = answer;
+    changed.text = "different accepted projection".into();
+    let tail = state.final_tail(Some(&changed), None).unwrap();
+    assert_eq!(
+        tail.first_content_host_ms, None,
+        "never attribute a divergent raw stream to accepted text"
+    );
+    assert_eq!(tail.full_content_host_ms, None);
+}
+
+#[test]
+fn direct_and_media_final_tail_preserve_unknown_and_not_applicable_endpoints() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    clock.set_ms(60);
+    state.record_direct_final_content();
+    let mut surfaced = codex_protocol::protocol::SurfacedToolResult {
+        adapter: "owner".into(),
+        value: serde_json::json!({}),
+        canonical_message: Some("verified".into()),
+    };
+    let tail = state.final_tail(None, Some(&surfaced)).unwrap();
+    assert_eq!(
+        (tail.first_content_host_ms, tail.full_content_host_ms),
+        (Some(60), Some(60))
+    );
+    assert_eq!(tail.text_codepoints, Some(8));
+    assert!(tail.item_id.is_none());
+    surfaced.canonical_message = None;
+    let media = state.final_tail(None, Some(&surfaced)).unwrap();
+    assert!(media.text_codepoints.is_none());
+    assert!(media.first_content_host_ms.is_none());
+    assert!(media.full_content_host_ms.is_none());
+    assert!(state.final_tail(None, None).is_none());
+    let legacy: codex_protocol::protocol::TurnFinalAnswer =
+        serde_json::from_value(serde_json::json!({"message":null})).unwrap();
+    assert!(legacy.tail.is_none());
+}
+
+#[test]
+fn canonical_provider_remainder_requires_reported_components_and_is_not_final_text() {
+    use codex_protocol::protocol::TokenUsageCoverage;
+    for (coverage, reasoning, expected) in [
+        (Some(TokenUsageCoverage::fully_reported()), 60, Some(40)),
+        (Some(TokenUsageCoverage::fully_reported()), 0, Some(100)),
+        (None, 0, None),
+        (
+            Some(TokenUsageCoverage {
+                reasoning_output_tokens: 0,
+                ..TokenUsageCoverage::fully_reported()
+            }),
+            0,
+            None,
+        ),
+        (Some(TokenUsageCoverage::fully_reported()), 101, None),
+    ] {
+        let timing = Arc::new(TurnTimingState::default());
+        let wait = timing.begin_model_request_wait();
+        timing.mark_model_request_dispatched();
+        timing.record_model_attempt_identity("sampling", "physical");
+        timing.record_generation_token_usage(Some(&TokenUsage {
+            input_tokens: 10,
+            output_tokens: 100,
+            reasoning_output_tokens: reasoning,
+            total_tokens: 110,
+            coverage,
+            ..Default::default()
+        }));
+        drop(wait);
+        let snapshot = timing.complete_snapshot().protocol_timing();
+        assert_eq!(
+            snapshot.model_requests[0]
+                .token_usage
+                .as_ref()
+                .unwrap()
+                .output_excluding_reported_reasoning_tokens,
+            expected
+        );
+        assert_eq!(
+            snapshot.counters.purpose_aggregates[0].output_excluding_reported_reasoning_tokens,
+            expected
+        );
+        assert!(snapshot.final_answer.is_none());
+    }
+}
+
+#[test]
+fn evicted_request_usage_never_certifies_whole_turn_coverage() {
+    let timing = Arc::new(TurnTimingState::default());
+    for index in 0..=MAX_MODEL_REQUEST_TIMINGS {
+        // Physical retries in one logical generation stay within generation bounds.
+        let wait = timing.begin_model_request_wait();
+        timing.mark_model_request_dispatched();
+        timing
+            .record_model_attempt_identity(&format!("sample-{index}"), &format!("attempt-{index}"));
+        if index != 0 {
+            timing.record_generation_token_usage(Some(&TokenUsage {
+                coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
+                ..Default::default()
+            }));
+        }
+        drop(wait);
+    }
+    let snapshot = timing.complete_snapshot().protocol_timing();
+    assert_eq!(snapshot.model_requests.len(), MAX_MODEL_REQUEST_TIMINGS);
+    assert_eq!(
+        snapshot.counters.model_request_count as usize,
+        MAX_MODEL_REQUEST_TIMINGS + 1
+    );
+    assert_eq!(snapshot.model_request_history_truncated, Some(true));
+    // Local equality still describes only the retained window, not all requests.
+    let aggregate = &snapshot.counters.purpose_aggregates[0];
+    assert_eq!(
+        aggregate.expected_usage_count,
+        aggregate.observed_usage_count
+    );
+}
+
+#[test]
 fn diagnostic_usage_distinguishes_missing_zero_and_multiple_attempts() {
     let known = super::ModelRequestTiming {
         physical_attempt_ids: vec!["known".into()],
@@ -61,9 +241,34 @@ fn diagnostic_usage_distinguishes_missing_zero_and_multiple_attempts() {
     for (requests, expected, observed) in [
         (vec![], 0, 0),
         (vec![known.clone()], 1, 1),
-        (vec![super::ModelRequestTiming { token_usage: None, ..known.clone() }], 1, 0),
-        (vec![super::ModelRequestTiming { physical_attempt_ids: vec!["a".into(), "b".into()], ..known.clone() }], 2, 0),
-        (vec![known.clone(), super::ModelRequestTiming { physical_attempt_ids: vec!["missing".into()], token_usage: None, ..known.clone() }], 2, 1),
+        (
+            vec![super::ModelRequestTiming {
+                token_usage: None,
+                ..known.clone()
+            }],
+            1,
+            0,
+        ),
+        (
+            vec![super::ModelRequestTiming {
+                physical_attempt_ids: vec!["a".into(), "b".into()],
+                ..known.clone()
+            }],
+            2,
+            0,
+        ),
+        (
+            vec![
+                known.clone(),
+                super::ModelRequestTiming {
+                    physical_attempt_ids: vec!["missing".into()],
+                    token_usage: None,
+                    ..known.clone()
+                },
+            ],
+            2,
+            1,
+        ),
         (vec![known.clone(), known], 2, 1),
     ] {
         let aggregate = super::diagnostic_token_aggregate(&requests, |_| true, false);
@@ -76,6 +281,42 @@ fn diagnostic_usage_distinguishes_missing_zero_and_multiple_attempts() {
             assert_eq!(purpose.observed_usage_count, Some(observed));
         }
     }
+}
+
+#[test]
+fn component_coverage_requires_one_unique_physical_attempt_per_receipt() {
+    use codex_protocol::protocol::TokenUsageCoverage;
+    let known = super::ModelRequestTiming {
+        physical_attempt_ids: vec!["known".into()],
+        token_usage: Some(codex_protocol::protocol::TurnTimingProviderTokenUsage {
+            coverage: Some(TokenUsageCoverage::fully_reported()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::receipt_component_coverage([&known].into_iter())
+            .unwrap()
+            .receipts,
+        1
+    );
+    for ids in [vec![], vec![String::new()], vec!["a".into(), "b".into()]] {
+        let ambiguous = super::ModelRequestTiming {
+            physical_attempt_ids: ids,
+            ..known.clone()
+        };
+        assert!(super::receipt_component_coverage([&ambiguous].into_iter()).is_none());
+    }
+    assert!(super::receipt_component_coverage([&known, &known].into_iter()).is_none());
+    let missing = super::ModelRequestTiming {
+        physical_attempt_ids: vec!["missing".into()],
+        token_usage: None,
+        ..known.clone()
+    };
+    let coverage = super::receipt_component_coverage([&known, &missing].into_iter()).unwrap();
+    assert_eq!(coverage.receipts, 2);
+    assert_eq!(coverage.output_tokens, 1);
+    assert_eq!(coverage.reasoning_output_tokens, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -347,6 +588,8 @@ fn schema_ten_planning_digest_fields_are_ignored_on_deserialization() {
     let (clock, state) = timing();
     state.mark_turn_started();
     clock.set_ms(1);
+    // Dispatch marks an existing model-request row (one dispatch per row).
+    drop(state.begin_model_request_wait());
     state.mark_model_request_dispatched();
     clock.set_ms(2);
     let _ =
@@ -413,6 +656,8 @@ fn pre_first_model_output_snapshot_is_atomic_and_immutable() {
     clock.set_ms(6);
     drop(normalization);
     clock.set_ms(10);
+    // Dispatch marks an existing model-request row (one dispatch per row).
+    drop(state.begin_model_request_wait());
     state.mark_model_request_dispatched();
 
     clock.set_ms(15);
@@ -463,6 +708,8 @@ fn pending_turn_preparation_is_attributed_before_first_model_output() {
     drop(planning);
     clock.set_ms(10);
     drop(preparation);
+    // Dispatch marks an existing model-request row (one dispatch per row).
+    drop(state.begin_model_request_wait());
     state.mark_model_request_dispatched();
 
     clock.set_ms(15);
@@ -531,11 +778,19 @@ fn turn_timing_state_records_ttfm_independently_of_visible_output() {
 
 #[test]
 fn final_publication_is_not_observational_nonprogress() {
-    for (phase, action, expected) in [
-        (Some("final_answer"), None, 0),
-        (Some("commentary"), None, 1),
-        (None, None, 0),
-        (None, Some("same-action"), 1),
+    let collector = crate::session::turn_execution::SamplingRequestSignalCollector::default();
+    let empty_identity = collector.structured_action_fingerprint();
+    assert!(
+        empty_identity.is_some(),
+        "known empty actions retain their identity"
+    );
+    assert!(collector.has_no_structured_actions());
+    for (phase, action, known_empty, expected) in [
+        (Some("final_answer"), empty_identity.as_deref(), true, 0),
+        (Some("commentary"), empty_identity.as_deref(), true, 1),
+        (None, empty_identity.as_deref(), true, 0),
+        (None, None, false, 1),
+        (None, Some("same-action"), false, 1),
     ] {
         let (_clock, state) = timing();
         state.mark_turn_started();
@@ -553,7 +808,7 @@ fn final_publication_is_not_observational_nonprogress() {
         }))
         .unwrap();
         state.record_response_event_milestones(&ResponseEvent::OutputItemDone(item));
-        state.record_generation_outcome(Vec::new(), action.map(str::to_string), true);
+        state.record_generation_outcome(Vec::new(), action.map(str::to_string), known_empty, true);
         let timing = state.complete_snapshot().protocol_timing();
         assert_eq!(
             timing.observational_nonprogress_tokens.logical_generations,
@@ -686,6 +941,52 @@ fn sampling_checkpoints_write_only_changed_entries_and_recovery_merges_them() {
     );
 }
 
+#[test]
+fn sampling_checkpoints_write_only_new_activity_intervals_and_recovery_rebuilds_them() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut written = Vec::new();
+    let mut boundaries = Vec::new();
+    for generation in 0..4_u128 {
+        let start = generation * 20;
+        clock.set_ms(start + 5);
+        let model = state.begin_model_stream_wait();
+        clock.set_ms(start + 15);
+        drop(model);
+        clock.set_ms(start + 20);
+        let checkpoint = state.sampling_checkpoint();
+        let timeline = checkpoint.timing.activity_timeline.as_ref().unwrap();
+        // Timeline scalars stay cumulative while its intervals are incremental.
+        assert_eq!(timeline.duration_ns, ((start + 20) * NS_PER_MS) as u64);
+        written.push(timeline.intervals.len());
+        boundaries.push(codex_protocol::protocol::RolloutItem::SamplingBoundary(
+            codex_protocol::protocol::SamplingBoundaryItem {
+                sampling_request_id: format!("sampling-{generation}"),
+                physical_attempt_id: format!("attempt-{generation}"),
+                workspace_freshness_notices: Vec::new(),
+                turn_id: None,
+                unresolved_context: true,
+                timing_checkpoint: Some(checkpoint),
+            },
+        ));
+    }
+    // Each generation adds an orchestration and a model interval. A later
+    // checkpoint repeats only the previous checkpoint's still-open interval,
+    // so its size does not grow with the number of earlier generations.
+    assert_eq!(written, vec![3, 3, 3, 3]);
+    let full = state
+        .complete_snapshot()
+        .protocol_timing()
+        .activity_timeline
+        .unwrap();
+    assert_eq!(full.intervals.len(), 9);
+    let (_, recovered) = crate::context::lost_turn_recovery(&boundaries);
+    assert_eq!(
+        recovered.activity_timeline.unwrap().intervals,
+        full.intervals
+    );
+}
+
 #[tokio::test]
 async fn turn_timing_state_uses_one_wall_and_monotonic_start_sample() {
     let clock = Arc::new(FakeClock::new(10 * NS_PER_MS, 123_456));
@@ -702,9 +1003,10 @@ async fn turn_timing_state_uses_one_wall_and_monotonic_start_sample() {
 
 #[test]
 fn lost_turn_recovery_lists_nested_in_flight_calls_from_merged_checkpoints() {
-    use codex_protocol::protocol::{
-        RolloutItem, SamplingBoundaryItem, SamplingTimingCheckpoint, TurnTimingToolCall,
-    };
+    use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::SamplingBoundaryItem;
+    use codex_protocol::protocol::SamplingTimingCheckpoint;
+    use codex_protocol::protocol::TurnTimingToolCall;
     let boundary = |calls, incremental| {
         RolloutItem::SamplingBoundary(SamplingBoundaryItem {
             sampling_request_id: "sampling".into(),
@@ -942,6 +1244,14 @@ fn namespaced_tools_preserve_domain_action_milestones() {
 fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     let (clock, state) = timing();
     state.mark_turn_started();
+    clock.set_ms(25);
+    assert!(state.try_record_accepted_tool_call(
+        "call-1",
+        &ToolExecutionId::default(),
+        TurnTimingToolCallSource::CodeMode,
+        Some("outer-call"),
+        "shell_command",
+    ));
     clock.set_ms(100);
     state.record_tool_dispatch_timing(
         "call-1",
@@ -999,6 +1309,7 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     clock.set_ms(120);
     let mut pending = Some(ContinuationCause::ToolResult);
     state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    drop(state.begin_model_request_wait());
     clock.set_ms(130);
     state.mark_model_request_dispatched();
 
@@ -1012,7 +1323,7 @@ fn delivered_tool_relay_timing_persists_every_lifecycle_boundary() {
     assert_eq!(call.runtime_tool_call_id.as_deref(), Some("runtime-call-1"));
     assert_eq!(call.source, TurnTimingToolCallSource::CodeMode);
     assert_eq!(call.outcome.as_deref(), Some("failure"));
-    assert_eq!(call.accepted_at_ms, Some(20));
+    assert_eq!(call.accepted_at_ms, Some(25));
     assert_eq!(call.first_poll_at_ms, Some(30));
     assert_eq!(call.parallel_gate_admitted_at_ms, Some(35));
     assert_eq!(call.handler_entry_at_ms, Some(40));
@@ -1057,6 +1368,8 @@ fn batched_tool_results_share_one_model_resume_boundary() {
     clock.set_ms(120);
     let mut pending = Some(ContinuationCause::ToolResult);
     state.begin_model_generation(&mut pending, &SessionSource::Cli);
+    // Dispatch marks an existing model-request row (one dispatch per row).
+    drop(state.begin_model_request_wait());
     clock.set_ms(130);
     state.mark_model_request_dispatched();
 
@@ -1305,6 +1618,104 @@ fn exact_tool_closure_pairs_and_persists_direct_and_nested_calls() {
 /// Recorded sessions persisted results only at the terminal flush, so each
 /// checkpoint listed every finished call as unresolved (113 at the last one).
 #[test]
+fn audit_observability_closure_index_preserves_mixed_lifecycle_counts() {
+    use codex_protocol::protocol::SamplingGenerationId;
+    use codex_protocol::protocol::TurnTimingToolCallIdentity;
+    for size in [1usize, 256, 1024, 4096] {
+        let mut ledger = super::ToolClosureLedger::default();
+        let identity = |index: usize| TurnTimingToolCallIdentity {
+            execution_id: ToolExecutionId(format!("execution-{index}")),
+            sampling_generation_id: SamplingGenerationId("generation".into()),
+            call_id: format!("call-{index}"),
+            ..Default::default()
+        };
+        for index in 0..size {
+            let id = identity(index);
+            if index % 5 == 0 {
+                ledger.record_timing(id.clone(), true);
+            }
+            assert!(ledger.register_accepted(id.clone()));
+            if index % 3 == 0 {
+                ledger.record_timing(id.clone(), true);
+            }
+            if index % 2 == 0 {
+                ledger.record_persisted(id);
+            }
+        }
+        let paired = |index: usize| index.is_multiple_of(3) || index.is_multiple_of(5);
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.accepted_count, size as u32);
+        assert_eq!(
+            snapshot.timing_paired_count,
+            (0..size).filter(|index| paired(*index)).count() as u32
+        );
+        assert_eq!(
+            snapshot.terminal_count,
+            (0..size)
+                .filter(|index| paired(*index) || index % 2 == 0)
+                .count() as u32
+        );
+        assert_eq!(
+            snapshot.persisted_count,
+            (0..size).filter(|index| index % 2 == 0).count() as u32
+        );
+        assert_eq!(
+            snapshot.unresolved_calls.len(),
+            (0..size)
+                .filter(|index| !(paired(*index) && index % 2 == 0))
+                .count()
+        );
+        assert!(snapshot.orphan_calls.is_empty());
+        let checkpoint = ledger.snapshot_for_checkpoint();
+        assert_eq!(
+            checkpoint.unresolved_calls.len(),
+            (0..size).filter(|index| !paired(*index)).count()
+        );
+        // Count exact duplicate-key predicates independently of result equality.
+        assert!(ledger.key_comparisons.get() <= size as u64 * 2);
+        assert!(ledger.register_accepted(identity(0)));
+        let mut duplicate = identity(0);
+        duplicate.execution_id = ToolExecutionId("different-execution".into());
+        assert!(!ledger.register_accepted(duplicate));
+        assert_eq!(ledger.snapshot().accepted_count, size as u32);
+    }
+}
+
+#[test]
+fn audit_observability_live_checkpoint_does_not_clone_omitted_tool_history() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    state.record_accepted_tool_call(
+        "call",
+        &ToolExecutionId("execution".into()),
+        TurnTimingToolCallSource::Direct,
+        None,
+    );
+    state.record_tool_dispatch_timing(
+        "call",
+        "exec_command",
+        TurnTimingToolCallSource::Direct,
+        ToolCallTimingLineage::default(),
+        ToolDispatchTimingSnapshot {
+            execution_id: ToolExecutionId("execution".into()),
+            outcome: Some("success"),
+            ..Default::default()
+        },
+    );
+    let original = state.state();
+    assert!(!original.tool_calls.is_empty());
+    assert!(!original.tool_closure.entries.is_empty());
+    let observation = original.checkpoint_clone();
+    assert!(observation.tool_calls.is_empty());
+    assert!(observation.tool_closure.entries.is_empty());
+    assert!(observation.background_tool_process_exits.is_empty());
+    assert_eq!(
+        observation.counters.tool_call_count,
+        original.counters.tool_call_count
+    );
+}
+
+#[test]
 fn sampling_checkpoints_list_only_in_flight_calls_as_unresolved() {
     let (_clock, state) = timing();
     state.mark_turn_started();
@@ -1357,6 +1768,7 @@ async fn sealed_tool_closure_waits_for_terminal_timing_and_persistence() {
         &execution_id,
         TurnTimingToolCallSource::Direct,
         None,
+        "exec_command",
     ));
     state.record_tool_call_acceptance_closed();
 
@@ -1445,6 +1857,7 @@ async fn exact_tool_closure_is_not_limited_by_diagnostic_history_cap() {
             &execution_id,
             TurnTimingToolCallSource::Direct,
             None,
+            "exec_command",
         ));
         state.record_tool_dispatch_timing(
             &call_id,
@@ -1906,7 +2319,6 @@ fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
         ContinuationCause::ServerEndTurnFalse,
         ContinuationCause::PendingInput,
         ContinuationCause::StopHook,
-        ContinuationCause::InvalidImageRecovery,
     ];
     for cause in causes {
         let mut pending = Some(cause);
@@ -1924,7 +2336,8 @@ fn continuation_counters_are_consumed_once_and_retries_are_not_recounted() {
     assert_eq!(profile.server_end_turn_false, 1);
     assert_eq!(profile.pending_input, 1);
     assert_eq!(profile.stop_hook, 1);
-    assert_eq!(profile.invalid_image_recovery, 1);
+    // No continuation sanitizes an invalid image anymore; the field stays zero.
+    assert_eq!(profile.invalid_image_recovery, 0);
     let continuation_sum = profile.compaction
         + profile.tool_result
         + profile.server_end_turn_false
@@ -1977,7 +2390,7 @@ fn decision_latency_records_dispatch_actionable_output_and_completion() {
     });
 
     let timing = state.complete_snapshot().protocol_timing();
-    assert_eq!(timing.schema_version, 31);
+    assert_eq!(timing.schema_version, 34);
     assert_eq!(timing.model_requests.len(), 2);
     assert_eq!(timing.model_requests[0].dispatch_ms, Some(20));
     assert_eq!(timing.model_requests[0].first_model_output_ms, Some(25));
@@ -2058,6 +2471,47 @@ fn decision_latency_unions_parallel_tool_time_per_generation() {
         .find(|aggregate| aggregate.purpose == TurnTimingGenerationPurpose::ImplementationDecision)
         .expect("implementation aggregate");
     assert_eq!(aggregate.tool_active_union_ns, 50 * NS_PER_MS as u64);
+}
+
+#[test]
+fn yielded_tool_union_stays_with_its_origin_across_generations() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let mut pending = None;
+    state.begin_model_generation_with_metadata(
+        &mut pending,
+        &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::ImplementationDecision),
+        TurnTimingGenerationDisposition::DecisionBearing,
+        None,
+    );
+    drop(state.begin_model_request_wait());
+    let first = state.begin_tool_execution();
+    clock.set_ms(40);
+    state.begin_model_generation_with_metadata(
+        &mut pending,
+        &SessionSource::Cli,
+        Some(TurnTimingGenerationPurpose::ValidationInterpretation),
+        TurnTimingGenerationDisposition::DecisionBearing,
+        None,
+    );
+    drop(state.begin_model_request_wait());
+    clock.set_ms(60);
+    let second = state.begin_tool_execution();
+    clock.set_ms(100);
+    drop(first);
+    clock.set_ms(120);
+    drop(second);
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.unions.tool_active_union_ns, 120 * NS_PER_MS as u64);
+    assert_eq!(
+        timing.model_requests[0].tool_active_union_ns,
+        100 * NS_PER_MS as u64
+    );
+    assert_eq!(
+        timing.model_requests[1].tool_active_union_ns,
+        60 * NS_PER_MS as u64
+    );
 }
 
 #[test]
@@ -2179,6 +2633,7 @@ fn request_categories_reconcile_full_logical_prompt_with_provider_usage() {
         output_tokens: 5,
         reasoning_output_tokens: 2,
         total_tokens: 105,
+        coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
     }));
 
     let timing = state.complete_snapshot().protocol_timing();
@@ -2237,9 +2692,10 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
     );
     let request_wait = state.begin_model_request_wait();
     state.record_model_attempt_identity("sampling-1", "attempt-1");
-    state.record_model_attempt_identity("sampling-1", "attempt-2");
     clock.set_ms(5);
-    state.mark_model_request_dispatched();
+    state.mark_model_attempt_dispatched("sampling-1", "attempt-1", false);
+    state.record_model_attempt_identity("sampling-1", "attempt-2");
+    state.mark_model_attempt_dispatched("sampling-1", "attempt-2", true);
     drop(request_wait);
     let stream_wait = state.begin_model_stream_wait();
     clock.set_ms(20);
@@ -2252,8 +2708,9 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
         output_tokens: 10,
         reasoning_output_tokens: 4,
         total_tokens: 110,
+        coverage: None,
     }));
-    state.record_generation_outcome(Vec::new(), Some("same-action".to_string()), true);
+    state.record_generation_outcome(Vec::new(), Some("same-action".to_string()), false, true);
     assert!(
         state.state().model_requests[0].next_structured_action_changed,
         "no next action has been observed yet"
@@ -2267,7 +2724,8 @@ fn typed_deterministic_generation_records_exact_disposition_and_nonprogress() {
         Some("trusted-state".to_string()),
     );
     drop(state.begin_model_request_wait());
-    state.record_generation_outcome(Vec::new(), Some("same-action".to_string()), true);
+    state.mark_model_request_dispatched();
+    state.record_generation_outcome(Vec::new(), Some("same-action".to_string()), false, true);
     let timing = state.complete_snapshot().protocol_timing();
     let usage = timing.model_requests[0]
         .token_usage
@@ -2365,7 +2823,7 @@ fn progress_telemetry_compares_completed_actions_across_purposes_and_retries() {
             state.record_model_retry();
             drop(state.begin_model_request_wait());
         }
-        state.record_generation_outcome(Vec::new(), action.map(str::to_string), true);
+        state.record_generation_outcome(Vec::new(), action.map(str::to_string), false, true);
     }
     let timing = state.complete_snapshot().protocol_timing();
     let primary = timing
@@ -2562,6 +3020,7 @@ fn validation_failure_diagnosis_repair_and_rereview_remain_decision_bearing() {
                 TurnTimingProgressKind::ValidationResult
             }],
             Some(format!("action-{index}")),
+            false,
             false,
         );
     }
@@ -2815,6 +3274,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
 
     clock.set_ms(10);
     let model = state.begin_model_request_wait();
+    state.mark_model_request_dispatched();
     clock.set_ms(30);
     let tool = state.begin_tool_execution();
     clock.set_ms(60);
@@ -2838,7 +3298,7 @@ fn exclusive_ledger_partitions_every_nanosecond_and_subtracts_only_interactive_o
     clock.set_ms(140);
 
     let profile = state.complete_snapshot().profile;
-    assert_eq!(profile.schema_version, 31);
+    assert_eq!(profile.schema_version, 34);
     assert!(profile.profile_valid);
     assert!(profile.classification_complete);
     assert_eq!(profile.inclusive_duration_ns, 140 * NS_PER_MS);
@@ -2897,14 +3357,14 @@ fn request_setup_before_dispatch_is_not_model_time() {
     assert_eq!(profile.exclusive.total_ns(), profile.inclusive_duration_ns);
     // Setup [12, 26) is orchestration, and a tool running during setup
     // [26, 32) does not overlap the model.
-    assert_eq!(profile.exclusive.orchestration_ns, 24 * NS_PER_MS);
+    assert_eq!(profile.exclusive.orchestration_ns, 26 * NS_PER_MS);
     assert_eq!(profile.exclusive.tool_only_ns, 6 * NS_PER_MS);
     assert_eq!(profile.exclusive.model_tool_overlap_ns, 3 * NS_PER_MS);
-    // A request wait outside transport readiness [10, 12) stays model time.
-    assert_eq!(profile.exclusive.model_only_ns, 57 * NS_PER_MS);
+    // No physical dispatch occurred during [10, 12), even without a setup guard.
+    assert_eq!(profile.exclusive.model_only_ns, 55 * NS_PER_MS);
     assert_eq!(profile.exclusive.finalization_ns, 10 * NS_PER_MS);
-    assert_eq!(profile.unions.model_request_wait_ns, 10 * NS_PER_MS);
-    assert_eq!(profile.unions.model_active_ns, 60 * NS_PER_MS);
+    assert_eq!(profile.unions.model_request_wait_ns, 8 * NS_PER_MS);
+    assert_eq!(profile.unions.model_active_ns, 58 * NS_PER_MS);
     // The reclassified interval is exactly the request's recorded setup.
     assert_eq!(
         snapshot.protocol_timing().model_requests[0].setup_phase_ns["transport_readiness"],
@@ -3623,6 +4083,7 @@ fn timing_histories_evict_oldest_entries_at_their_caps() {
         vec![TurnTimingProgressKind::WorkspaceMutation; MAX_MODEL_REQUEST_PROGRESS_KINDS + 1],
         Some("latest-action".to_string()),
         false,
+        false,
     );
 
     let profile = state.complete_snapshot().profile;
@@ -3688,6 +4149,8 @@ fn live_timestamp_samples_now_without_advancing_accounting_and_freezes_on_comple
     clock.set_ms(100);
     assert_eq!(state.monotonic_offset_ms(), 100);
     assert_eq!(state.state().last_monotonic_ns, Some(0));
+    // Dispatch marks an existing model-request row (one dispatch per row).
+    drop(state.begin_model_request_wait());
     state.mark_model_request_dispatched();
     clock.set_ms(150);
     assert_eq!(state.monotonic_offset_ms(), 150);
@@ -3712,7 +4175,8 @@ fn sealed_acceptance_rejects_new_ownership_before_snapshot() {
         "late",
         &ToolExecutionId("late".into()),
         TurnTimingToolCallSource::Direct,
-        None
+        None,
+        "exec_command",
     ));
     assert_eq!(state.tool_closure_snapshot().accepted_count, 0);
 }
@@ -3823,6 +4287,60 @@ fn prepared_request_is_not_counted_until_dispatched() {
 }
 
 #[test]
+fn same_sampling_row_counts_auth_retry_once_per_transport_identity() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    state.begin_model_generation(&mut None, &SessionSource::Cli);
+    let request = state.begin_model_request_wait();
+    state.record_model_attempt_identity("sampling", "primary");
+    // Preparation/readiness is not a transport invocation.
+    assert_eq!(state.state().counters.model_request_count, 0);
+    clock.set_ms(10);
+    state.mark_model_attempt_dispatched("sampling", "primary", false);
+    state.mark_model_request_attempt_ended();
+    state.record_model_attempt_identity("sampling", "refreshed");
+    clock.set_ms(20);
+    state.mark_model_attempt_dispatched("sampling", "refreshed", true);
+    state.mark_model_attempt_dispatched("sampling", "primary", false);
+    state.mark_model_attempt_dispatched("sampling", "refreshed", true);
+    drop(request);
+    let timing = state.complete_snapshot().protocol_timing();
+    assert_eq!(timing.counters.logical_generation_count, 1);
+    assert_eq!(timing.counters.model_request_count, 2);
+    assert_eq!(timing.counters.attempts_by_kind.primary, 1);
+    assert_eq!(timing.counters.attempts_by_kind.retry, 1);
+    assert_eq!(timing.model_requests.len(), 1);
+    assert_eq!(timing.model_requests[0].dispatch_ms, Some(10));
+}
+
+#[test]
+fn attempt_count_survives_identity_tail_eviction_and_rejects_stale_dispatches() {
+    let (_, state) = timing();
+    state.mark_turn_started();
+    let request = state.begin_model_request_wait();
+    for index in 0..=MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS {
+        let id = format!("attempt-{index}");
+        state.record_model_attempt_identity("sampling", &id);
+        state.mark_model_attempt_dispatched("sampling", &id, index > 0);
+    }
+    let expected = (MAX_MODEL_REQUEST_PHYSICAL_ATTEMPT_IDS + 1) as u32;
+    // Evicted/foreign identities cannot be rebound to the live row by a late callback.
+    state.mark_model_attempt_dispatched("sampling", "attempt-0", false);
+    state.mark_model_attempt_dispatched("old-sampling", "attempt-1", false);
+    let counters = state.state().counters.clone();
+    assert_eq!(counters.model_request_count, expected);
+    assert_eq!(counters.attempts_by_kind.primary, 1);
+    assert_eq!(counters.attempts_by_kind.retry, expected - 1);
+    assert_eq!(counters.physical_attempt_detail_eviction_count, 1);
+    assert!(state.state().model_request_history_truncated);
+    assert_eq!(
+        state.state().model_requests[0].physical_attempt_count(),
+        expected as usize
+    );
+    drop(request);
+}
+
+#[test]
 fn completed_snapshot_accepts_keyed_late_diagnostics_without_changing_duration() {
     let (clock, state) = timing();
     state.mark_turn_started();
@@ -3903,6 +4421,7 @@ fn overlapping_legacy_guards_do_not_invalidate_modern_model_tool_overlap() {
     state.mark_turn_started();
     let sampling = state.begin_sampling();
     let model = state.begin_model_request_wait();
+    state.mark_model_request_dispatched();
     let tool = state.begin_tool_execution();
     let legacy_tool = state.begin_tool_blocking();
     clock.set_ms(10);
@@ -3911,4 +4430,223 @@ fn overlapping_legacy_guards_do_not_invalidate_modern_model_tool_overlap() {
     assert!(profile.profile_valid);
     assert_eq!(profile.counters.invalid_transition_count, 0);
     assert_eq!(profile.exclusive.model_tool_overlap_ns, 10 * NS_PER_MS);
+}
+#[test]
+fn retained_model_tail_is_explicitly_partial_without_losing_whole_turn_attempt_count() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    for _ in 0..=MAX_MODEL_REQUEST_TIMINGS {
+        drop(state.begin_model_request_wait());
+        state.mark_model_request_dispatched();
+        drop(state.begin_model_stream_wait());
+    }
+    let profile = state.complete_snapshot().protocol_timing();
+    assert_eq!(profile.model_requests.len(), MAX_MODEL_REQUEST_TIMINGS);
+    assert_eq!(
+        profile.counters.model_request_count,
+        (MAX_MODEL_REQUEST_TIMINGS + 1) as u32
+    );
+    assert_eq!(profile.model_request_history_truncated, Some(true));
+    assert_eq!(profile.counters.model_request_detail_eviction_count, 1);
+}
+#[test]
+fn failed_dispatch_accounting_is_independent_of_receipts_and_ignores_unsent_setup() {
+    let (_clock, state) = timing();
+    state.mark_turn_started();
+    drop(state.begin_model_request_wait());
+    assert_eq!(state.unaccounted_model_request_count(), 0);
+    state.mark_model_request_dispatched();
+    assert_eq!(state.unaccounted_model_request_count(), 1);
+    state.mark_model_responses_accounted(1);
+    assert_eq!(state.unaccounted_model_request_count(), 0);
+    // Repeated observation of the same handoff cannot invent another request.
+    state.mark_model_request_dispatched();
+    assert_eq!(state.unaccounted_model_request_count(), 0);
+}
+
+#[test]
+fn unique_admission_records_unpolled_calls_in_the_accepting_generation() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    state.begin_model_generation(&mut None, &SessionSource::Cli);
+    drop(state.begin_model_request_wait());
+    clock.set_ms(3);
+    let first = ToolExecutionId("unpolled".into());
+    assert!(state.try_record_accepted_tool_call(
+        "first",
+        &first,
+        TurnTimingToolCallSource::Direct,
+        None,
+        "exec"
+    ));
+    clock.set_ms(5);
+    assert!(state.try_record_accepted_tool_call(
+        "nested",
+        &ToolExecutionId("nested".into()),
+        TurnTimingToolCallSource::CodeMode,
+        Some("first"),
+        "read_file"
+    ));
+    // Exact replay is idempotent; a conflicting call ID is not admitted.
+    assert!(state.try_record_accepted_tool_call(
+        "first",
+        &first,
+        TurnTimingToolCallSource::Direct,
+        None,
+        "exec"
+    ));
+    assert!(!state.try_record_accepted_tool_call(
+        "first",
+        &ToolExecutionId("conflict".into()),
+        TurnTimingToolCallSource::Direct,
+        None,
+        "exec"
+    ));
+    state.begin_model_generation(&mut None, &SessionSource::Cli);
+    clock.set_ms(11);
+    let snapshot = state.complete_snapshot().protocol_timing();
+    assert_eq!(snapshot.counters.tool_call_count, 2);
+    assert_eq!(snapshot.tool_closure.accepted_count, 2);
+    assert_eq!(snapshot.model_requests[0].tool_call_count, 2);
+    assert_eq!(snapshot.milestones.first_tool_accepted_ms, Some(3));
+    assert_eq!(snapshot.milestones.first_useful_tool_accepted_ms, Some(5));
+    assert_eq!(snapshot.milestones.first_tool_handler_entry_ms, None);
+    assert!(
+        snapshot.tool_calls.is_empty(),
+        "admission is not first poll or handler entry"
+    );
+}
+
+#[test]
+fn ttft_observes_content_not_headers_or_later_visible_text() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    let header = ResponseItem::FunctionCall {
+        id: None,
+        name: "read_file".into(),
+        namespace: None,
+        arguments: String::new(),
+        call_id: "call".into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    clock.set_ms(2);
+    state.record_response_event_milestones(&ResponseEvent::OutputItemAdded(header));
+    for event in [
+        ResponseEvent::Created,
+        ResponseEvent::OutputTextDelta(String::new()),
+        ResponseEvent::ToolCallInputDelta {
+            call_id: Some("call".into()),
+            item_id: "call-item".into(),
+            delta: String::new(),
+        },
+    ] {
+        state.record_response_event_milestones(&event);
+    }
+    assert_eq!(state.state().milestones.first_model_content_ns, None);
+    clock.set_ms(5);
+    state.record_response_event_milestones(&ResponseEvent::ToolCallInputDelta {
+        call_id: Some("call".into()),
+        item_id: "call-item".into(),
+        delta: "{\"path\":".into(),
+    });
+    assert_eq!(state.state().milestones.first_visible_output_ns, None);
+    clock.set_ms(17);
+    state.record_response_event_milestones(&ResponseEvent::OutputTextDelta("done".into()));
+    let snapshot = state.complete_snapshot();
+    assert_eq!(snapshot.time_to_first_token_ms, Some(5));
+    assert_eq!(
+        snapshot.protocol_timing().milestones.first_model_output_ms,
+        Some(2)
+    );
+    assert_eq!(
+        snapshot
+            .protocol_timing()
+            .milestones
+            .first_visible_output_ms,
+        Some(17)
+    );
+}
+
+#[test]
+fn internal_compaction_is_model_work_not_first_user_content() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    state.begin_compaction_generation();
+    drop(state.begin_model_request_wait());
+    state.mark_model_request_dispatched();
+    clock.set_ms(4);
+    state.record_response_event_milestones(&ResponseEvent::OutputTextDelta(
+        "internal summary".into(),
+    ));
+    assert_eq!(state.state().milestones.first_model_content_ns, None);
+    assert_eq!(state.state().milestones.first_visible_output_ns, None);
+    assert_eq!(state.state().milestones.first_actionable_output_ns, None);
+    state.begin_model_generation(&mut None, &SessionSource::Cli);
+    clock.set_ms(9);
+    state.record_response_event_milestones(&ResponseEvent::ToolCallInputDelta {
+        call_id: Some("owner-read".into()),
+        item_id: "owner-item".into(),
+        delta: "{\"path\":".into(),
+    });
+    assert_eq!(state.complete_snapshot().time_to_first_token_ms, Some(9));
+}
+
+#[test]
+fn timeline_separates_yielded_process_flight_from_guarded_runtime() {
+    let clock = Arc::new(FakeClock::new(0, 0));
+    let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
+    state.mark_turn_started();
+    state.record_process_spawned();
+    let runtime = state.begin_tool_execution();
+    clock.set_ms(10);
+    drop(runtime);
+    clock.set_ms(20);
+    let model = state.begin_model_stream_wait();
+    clock.set_ms(90);
+    drop(model);
+    clock.set_ms(100);
+    state.record_process_exited();
+    let timing = state.complete_snapshot().protocol_timing();
+    assert!(timing.profile_valid);
+    assert_eq!(timing.unions.tool_active_union_ns, 10_000_000);
+    let timeline = timing.activity_timeline.unwrap();
+    let duration = |select: fn(&codex_protocol::timing::TurnTimingActivityInterval) -> bool| {
+        timeline
+            .intervals
+            .iter()
+            .filter(|interval| select(interval))
+            .map(|interval| interval.end_ns - interval.start_ns)
+            .sum::<u64>()
+    };
+    assert_eq!(duration(|interval| interval.process_in_flight), 100_000_000);
+    assert_eq!(
+        duration(|interval| interval.model_active && interval.process_in_flight),
+        70_000_000
+    );
+    assert_eq!(
+        duration(|interval| interval.model_active && interval.tool_active),
+        0
+    );
+    assert_eq!(timeline.open_process_count, 0);
+    assert!(timeline.coverage_complete);
+}
+
+#[test]
+fn timeline_cap_preserves_scalar_accounting_but_discloses_lost_coverage() {
+    let clock = Arc::new(FakeClock::new(0, 0));
+    let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
+    state.mark_turn_started();
+    for index in 0..4_100_u128 {
+        let runtime = state.begin_tool_execution();
+        clock.set(index * 2 + 1, 0);
+        drop(runtime);
+        clock.set(index * 2 + 2, 0);
+    }
+    let timing = state.complete_snapshot().protocol_timing();
+    assert!(timing.profile_valid);
+    assert_eq!(timing.inclusive_duration_ns, 8_200);
+    let timeline = timing.activity_timeline.unwrap();
+    assert_eq!(timeline.intervals.len(), 8_192);
+    assert!(timeline.dropped_intervals > 0);
+    assert!(!timeline.coverage_complete);
 }

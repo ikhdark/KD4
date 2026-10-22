@@ -328,13 +328,15 @@ enum CliCommand {
 }
 
 pub async fn run() -> Result<()> {
+    let cli = Cli::parse();
+    validate_endpoint_options(&cli)?;
     let Cli {
         codex_bin,
         url,
         config_overrides,
         dynamic_tools,
         command,
-    } = Cli::parse();
+    } = cli;
 
     let dynamic_tools = parse_dynamic_tools_arg(&dynamic_tools)?;
 
@@ -534,6 +536,40 @@ enum Endpoint {
 struct BackgroundAppServer {
     process: Child,
     url: String,
+}
+
+fn validate_endpoint_options(cli: &Cli) -> Result<()> {
+    if matches!(cli.command, CliCommand::Serve { .. }) {
+        if cli.url.is_some() {
+            bail!("serve does not support --url; use --listen to choose the binding");
+        }
+        return Ok(());
+    }
+    if matches!(
+        cli.command,
+        CliCommand::ThreadIncrementElicitation { .. }
+            | CliCommand::ThreadDecrementElicitation { .. }
+            | CliCommand::ThreadHoldElicitation { .. }
+    ) {
+        if !cli.config_overrides.is_empty() {
+            bail!(
+                "elicitation commands do not support --config; configure the existing websocket app-server instead"
+            );
+        }
+        resolve_shared_websocket_url(
+            cli.codex_bin.clone(),
+            cli.url.clone(),
+            "elicitation command",
+        )?;
+        return Ok(());
+    }
+    let endpoint = resolve_endpoint(cli.codex_bin.clone(), cli.url.clone())?;
+    if matches!(endpoint, Endpoint::ConnectWs(_)) && !cli.config_overrides.is_empty() {
+        bail!(
+            "--config only configures a spawned app-server; use --codex-bin or configure the existing websocket server instead"
+        );
+    }
+    Ok(())
 }
 
 fn resolve_endpoint(codex_bin: Option<PathBuf>, url: Option<String>) -> Result<Endpoint> {
@@ -2090,9 +2126,13 @@ impl CodexClient {
                     }
                     let operation_succeeded = match (&payload.item, self.approval_expectation) {
                         (
-                            ThreadItem::CommandExecution { status, exit_code, .. },
+                            ThreadItem::CommandExecution {
+                                status, exit_code, ..
+                            },
                             Some(ApprovalExpectation::Command | ApprovalExpectation::NoCommand),
-                        ) => Some(*status == CommandExecutionStatus::Completed && *exit_code == Some(0)),
+                        ) => Some(
+                            *status == CommandExecutionStatus::Completed && *exit_code == Some(0),
+                        ),
                         (
                             ThreadItem::FileChange { status, .. },
                             Some(ApprovalExpectation::FileChange),
@@ -2100,9 +2140,8 @@ impl CodexClient {
                         _ => None,
                     };
                     if let Some(succeeded) = operation_succeeded {
-                        approval_operation_succeeded = Some(
-                            approval_operation_succeeded.unwrap_or(true) && succeeded,
-                        );
+                        approval_operation_succeeded =
+                            Some(approval_operation_succeeded.unwrap_or(true) && succeeded);
                     }
                     if let ThreadItem::CommandExecution {
                         id,
@@ -2382,11 +2421,8 @@ impl CodexClient {
         );
         self.command_approval_count += 1;
         if self.approval_expectation.is_some() {
-            self.approval_requests.push((
-                thread_id,
-                turn_id,
-                ApprovalExpectation::Command,
-            ));
+            self.approval_requests
+                .push((thread_id, turn_id, ApprovalExpectation::Command));
         }
         if let Some(environment_id) = environment_id.as_deref() {
             println!("< environment: {environment_id}");
@@ -2713,6 +2749,76 @@ impl Drop for CodexClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn endpoint_options_reject_ineffective_overrides_before_startup() {
+        use super::*;
+        // No connections, tracing setup or child starts occur in validation.
+        for command in [
+            vec!["watch"],
+            vec!["send-message-v2", "hello"],
+            vec!["model-list"],
+            vec!["thread-list"],
+            vec!["thread-increment-elicitation", "id"],
+            vec!["thread-hold-elicitation", "id", "--hold-seconds", "1"],
+            vec!["thread-decrement-elicitation", "id", "lease"],
+            vec!["live-elicitation-timeout-pause"],
+        ] {
+            for url in [None, Some("ws://127.0.0.1:4222")] {
+                for config_after_command in [false, true] {
+                    let mut args = vec!["client"];
+                    if let Some(url) = url {
+                        args.extend(["--url", url]);
+                    }
+                    if !config_after_command {
+                        args.extend(["-c", "model=chosen"]);
+                    }
+                    args.extend(command.iter().copied());
+                    if config_after_command {
+                        args.extend(["-c", "model=chosen"]);
+                    }
+                    let cli = Cli::try_parse_from(args).unwrap();
+                    let error = validate_endpoint_options(&cli).unwrap_err();
+                    assert!(
+                        error.to_string().contains("configure the existing"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        for args in [
+            vec!["client", "--url", "ws://127.0.0.1:4222", "serve"],
+            vec!["client", "serve", "--url", "ws://127.0.0.1:4222"],
+        ] {
+            assert!(
+                validate_endpoint_options(&Cli::try_parse_from(args).unwrap())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--listen")
+            );
+        }
+        for args in [
+            vec!["client", "watch"],
+            vec![
+                "client",
+                "--codex-bin",
+                "codex",
+                "-c",
+                "model=chosen",
+                "watch",
+            ],
+            vec![
+                "client",
+                "-c",
+                "model=chosen",
+                "serve",
+                "--listen",
+                "ws://127.0.0.1:4223",
+            ],
+        ] {
+            validate_endpoint_options(&Cli::try_parse_from(args).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn approval_smoke_requires_matching_wire_requests() {
         use super::*;
@@ -3359,12 +3465,16 @@ mod tests {
         assert_eq!(initialized, serde_json::json!({ "method": "initialized" }));
     }
     /// Real stdio peer; the production deadline owns/terminates it just like its app-server child.
+    /// The peer logs each request itself, so the log is complete only for requests it answered;
+    /// a test whose deadline terminates the peer mid-request uses `stalled_smoke_deadline_client`.
+    /// `ready` follows PowerShell's lazy first-use work (JSON module autoload, first conversions,
+    /// log creation), so a deadline armed after it budgets only the caller and warm replies.
     pub(super) fn smoke_deadline_client(log: &std::path::Path, body: &str) -> super::CodexClient {
         use super::*;
         use std::os::windows::process::CommandExt;
         let log_path = log.to_string_lossy().replace('\'', "''");
         let script = format!(
-            "$log = '{log_path}'; [Console]::WriteLine('ready'); while ($null -ne ($line = [Console]::In.ReadLine())) {{ [System.IO.File]::AppendAllText($log, $line + [Environment]::NewLine); $request = $line | ConvertFrom-Json; {body} }}"
+            "$log = '{log_path}'; [System.IO.File]::AppendAllText($log, ''); $null = '{{}}' | ConvertFrom-Json; $null = @{{warm=1}} | ConvertTo-Json -Compress; [Console]::WriteLine('ready'); while ($null -ne ($line = [Console]::In.ReadLine())) {{ [System.IO.File]::AppendAllText($log, $line + [Environment]::NewLine); $request = $line | ConvertFrom-Json; {body} }}"
         );
         let mut child = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -3383,6 +3493,71 @@ mod tests {
             stdin,
             stdout,
         })
+    }
+
+    /// Silent stdio peer for deadline tests: the production deadline owns and terminates its
+    /// child exactly as it would a stalled app-server. Requests go to a separate recorder that
+    /// the deadline does not own, because a record kept by the terminated child races that
+    /// termination: under load the child can read a request yet die before persisting it.
+    pub(super) fn stalled_smoke_deadline_client() -> (super::CodexClient, RequestRecorder) {
+        use super::*;
+        use std::os::windows::process::CommandExt;
+        let powershell = |script: &str, stdin: Stdio| {
+            Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .creation_flags(0x08000000)
+                .stdin(stdin)
+                .stdout(Stdio::piped())
+                .spawn()
+        };
+        let mut recorder = powershell(
+            "try { while ($null -ne ($line = [Console]::In.ReadLine())) { [Console]::WriteLine($line) } } catch { exit 1 }; exit 0",
+            Stdio::piped(),
+        )
+        .expect("start request recorder");
+        let recorded = BufReader::new(recorder.stdout.take().expect("recorder stdout"));
+        // Drain concurrently so recording never applies backpressure to the client's writes.
+        let lines =
+            thread::spawn(move || -> std::io::Result<Vec<String>> { recorded.lines().collect() });
+        let mut child = powershell(
+            "[Console]::WriteLine('ready'); Start-Sleep -Seconds 5",
+            Stdio::null(),
+        )
+        .expect("start real stalled stdio peer");
+        let mut stdout = BufReader::new(child.stdout.take().expect("peer stdout"));
+        let mut ready = String::new();
+        stdout.read_line(&mut ready).expect("peer ready");
+        assert_eq!(ready.trim(), "ready");
+        let client = CodexClient::from_transport(ClientTransport::Stdio {
+            child: std::sync::Arc::new(std::sync::Mutex::new(child)),
+            stdin: recorder.stdin.take(),
+            stdout,
+        });
+        (client, RequestRecorder { recorder, lines })
+    }
+
+    /// Requests a stalled smoke client wrote, observed by a process its deadline does not stop.
+    pub(super) struct RequestRecorder {
+        recorder: std::process::Child,
+        lines: std::thread::JoinHandle<std::io::Result<Vec<String>>>,
+    }
+
+    impl RequestRecorder {
+        /// Closes the client's request stream, then returns every request it wrote, in order.
+        pub(super) fn finish(mut self, client: super::CodexClient) -> Vec<serde_json::Value> {
+            drop(client);
+            let lines = self
+                .lines
+                .join()
+                .expect("request recorder reader")
+                .expect("recorded request lines");
+            let status = self.recorder.wait().expect("request recorder exit");
+            assert!(status.success(), "request recorder failed: {status}");
+            lines
+                .iter()
+                .map(|line| serde_json::from_str(line).expect("RPC JSON"))
+                .collect()
+        }
     }
 
     #[test]

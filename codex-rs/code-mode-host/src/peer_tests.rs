@@ -33,7 +33,11 @@ async fn outgoing_bytes_remain_charged_until_delivery_with_reserved_control() {
     let message = || HostToClient::DelegateRequest {
         id: codex_code_mode_protocol::host::DelegateRequestId::new(1),
         session_id: session_id("s"),
-        request: DelegateRequest::Notify { call_id: "call".into(), cell_id: CellId::new("cell".into()).into(), text: "x".repeat(256) },
+        request: DelegateRequest::Notify {
+            call_id: "call".into(),
+            cell_id: CellId::new("cell".into()).into(),
+            text: "x".repeat(256),
+        },
     };
     assert!(peer.send(message()).is_ok());
     assert!(peer.send(message()).is_err());
@@ -44,15 +48,30 @@ async fn outgoing_bytes_remain_charged_until_delivery_with_reserved_control() {
     assert!(peer.send(message()).is_err());
     let failure = || HostToClient::Response {
         id: RequestId::new(1),
-        result: codex_code_mode_protocol::host::WireResult::Err { message: "busy".into() },
+        result: codex_code_mode_protocol::host::WireResult::Err {
+            message: "busy".into(),
+        },
     };
     assert!(peer.send(failure()).is_ok());
     assert!(peer.send(failure()).is_err());
-    assert_eq!(peer.control_bytes.available_permits(), super::OUTGOING_CONTROL_BYTES);
-    assert!(peer.send(HostToClient::CancelDelegateRequest {
-        id: codex_code_mode_protocol::host::DelegateRequestId::new(1), cause: None,
-    }).is_ok());
-    assert!(peer.send(HostToClient::CellClosed { session_id: session_id("s"), cell_id: CellId::new("cell".into()).into() }).is_ok());
+    assert_eq!(
+        peer.control_bytes.available_permits(),
+        super::OUTGOING_CONTROL_BYTES
+    );
+    assert!(
+        peer.send(HostToClient::CancelDelegateRequest {
+            id: codex_code_mode_protocol::host::DelegateRequestId::new(1),
+            cause: None,
+        })
+        .is_ok()
+    );
+    assert!(
+        peer.send(HostToClient::CellClosed {
+            session_id: session_id("s"),
+            cell_id: CellId::new("cell".into()).into()
+        })
+        .is_ok()
+    );
     drop(frame);
     assert_eq!(peer.outgoing_bytes.available_permits(), 1024);
     assert!(peer.send(message()).is_ok());
@@ -196,22 +215,25 @@ fn cell_closure_has_reserved_capacity() {
     for index in 0..=super::CELL_MESSAGE_CAPACITY {
         let (dispatched_tx, _dispatched_rx) = oneshot::channel();
         let result = peer.route_cell_message(
-                key.clone(),
-                super::CellMessage::Delegate {
-                    id: codex_code_mode_protocol::host::DelegateRequestId::new(index as i64),
-                    request: Box::new(DelegateRequest::Notify {
-                        call_id: format!("call-{index}"),
-                        cell_id: cell.clone().into(),
-                        text: "buffered".to_string(),
-                    }),
-                    dispatched_tx,
-                },
-                None
-            );
+            key.clone(),
+            super::CellMessage::Delegate {
+                id: codex_code_mode_protocol::host::DelegateRequestId::new(index as i64),
+                request: Box::new(DelegateRequest::Notify {
+                    call_id: format!("call-{index}"),
+                    cell_id: cell.clone().into(),
+                    text: "buffered".to_string(),
+                }),
+                dispatched_tx,
+            },
+            None,
+        );
         if index < super::CELL_MESSAGE_CAPACITY {
             assert_eq!(result, Ok(()));
         } else {
-            assert_eq!(result, Err("code-mode cell message queue is full".to_string()));
+            assert_eq!(
+                result,
+                Err("code-mode cell message queue is full".to_string())
+            );
         }
     }
     assert!(!peer.is_disconnected());

@@ -470,8 +470,7 @@ async fn create_workspace_plugin_upload(
     size_bytes: usize,
     remote_plugin_id: Option<&str>,
 ) -> Result<RemoteWorkspacePluginUploadUrlResponse, RemotePluginCatalogError> {
-    let url =
-        remote_plugin_service_url(config, &["public", "plugins", "workspace", "upload-url"])?;
+    let url = remote_plugin_service_url(config, &["public", "plugins", "workspace", "upload-url"])?;
     let request = authenticated_request(client.post(&url), auth)?.json(
         &RemoteWorkspacePluginUploadUrlRequest {
             filename,

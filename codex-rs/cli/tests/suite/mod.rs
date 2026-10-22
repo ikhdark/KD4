@@ -6,7 +6,6 @@ mod app;
 mod app_server;
 mod apply;
 mod debug_models;
-mod delete;
 mod exec_server;
 mod execpolicy;
 mod features;
@@ -17,7 +16,6 @@ mod marketplace_upgrade;
 mod mcp_add_remove;
 mod mcp_list;
 mod plugin_cli;
-mod update;
 
 /// Runs this test build's `codex` binary against an isolated home. A
 /// developer-level `CODEX_SQLITE_HOME` would otherwise keep the state database

@@ -13,7 +13,9 @@ use super::codex_command;
 async fn list_and_get_render_expected_output() -> Result<()> {
     let codex_home = TempDir::new()?;
 
-    let output = codex_command(codex_home.path())?.args(["mcp", "list"]).output()?;
+    let output = codex_command(codex_home.path())?
+        .args(["mcp", "list"])
+        .output()?;
     assert!(output.status.success());
     assert!(String::from_utf8(output.stdout)?.contains("No MCP servers configured yet."));
 

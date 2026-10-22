@@ -987,7 +987,11 @@ async fn thread_start_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    write_mock_responses_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &server.uri(),
+        &server.uri(),
+    )?;
     let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut mcp = TestAppServer::builder()
@@ -1085,7 +1089,11 @@ async fn thread_start_normalizes_service_tiers_and_accepts_metrics_service_name(
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     for (requested_tier, service_name, expected_tier) in [
-        (Some("experimental-tier-id"), None, None),
+        (
+            Some("experimental-tier-id"),
+            None,
+            Some("experimental-tier-id"),
+        ),
         (
             Some(SERVICE_TIER_DEFAULT_REQUEST_VALUE),
             None,
@@ -1112,7 +1120,8 @@ async fn thread_start_normalizes_service_tiers_and_accepts_metrics_service_name(
             ..
         } = to_response::<ThreadStartResponse>(resp)?;
 
-        // Unsupported catalog ids are dropped rather than echoed back.
+        // The requested preference is preserved across metadata refreshes;
+        // sampling omits tiers the current model does not advertise.
         assert_eq!(service_tier.as_deref(), expected_tier);
         assert!(!thread.id.is_empty(), "thread id should not be empty");
     }

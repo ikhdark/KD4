@@ -9,12 +9,21 @@ pub fn truncate_model_text(text: &str, limit: usize) -> String {
     truncate_model_text_at_lines(text, limit, 0, text.lines().count())
 }
 
-pub fn truncate_model_text_at_lines(text: &str, limit: usize, line_offset: usize, total_lines: usize) -> String {
+pub fn truncate_model_text_at_lines(
+    text: &str,
+    limit: usize,
+    line_offset: usize,
+    total_lines: usize,
+) -> String {
     truncate_model_text_at_lines_with_artifact(text, limit, line_offset, total_lines, None)
 }
 
 pub fn truncate_model_text_at_lines_with_artifact(
-    text: &str, limit: usize, line_offset: usize, total_lines: usize, artifact_id: Option<&str>,
+    text: &str,
+    limit: usize,
+    line_offset: usize,
+    total_lines: usize,
+    artifact_id: Option<&str>,
 ) -> String {
     truncate_model_text_at_lines_with_recovery(text, limit, line_offset, total_lines, artifact_id).0
 }
@@ -22,19 +31,35 @@ pub fn truncate_model_text_at_lines_with_artifact(
 /// Returns the actual omitted source lines alongside presentation, even when
 /// the budget is too small to display a coordinate marker.
 pub fn truncate_model_text_at_lines_with_recovery(
-    text: &str, limit: usize, line_offset: usize, total_lines: usize, artifact_id: Option<&str>,
+    text: &str,
+    limit: usize,
+    line_offset: usize,
+    total_lines: usize,
+    artifact_id: Option<&str>,
 ) -> (String, Option<(usize, usize)>) {
-    truncate_model_text_at_lines_with_limits(text, limit, limit, line_offset, total_lines, artifact_id)
+    truncate_model_text_at_lines_with_limits(
+        text,
+        limit,
+        limit,
+        line_offset,
+        total_lines,
+        artifact_id,
+    )
 }
 
 /// Retain a whole packet up to `whole_packet_limit`, otherwise truncate to
 /// `limit`. Reuse the same encoding for admission and truncation. Callers own
 /// the hard cap; a zero truncation budget never admits a nonempty packet.
 pub fn truncate_model_text_at_lines_with_limits(
-    text: &str, limit: usize, whole_packet_limit: usize, line_offset: usize,
-    total_lines: usize, artifact_id: Option<&str>,
+    text: &str,
+    limit: usize,
+    whole_packet_limit: usize,
+    line_offset: usize,
+    total_lines: usize,
+    artifact_id: Option<&str>,
 ) -> (String, Option<(usize, usize)>) {
-    let all_lines = (!text.is_empty()).then(|| (line_offset + 1, line_offset + text.lines().count()));
+    let all_lines =
+        (!text.is_empty()).then(|| (line_offset + 1, line_offset + text.lines().count()));
     // Silent projections need neither the vocabulary nor a token vector for
     // output that will be discarded, including logs preceding a script error.
     if limit == 0 {
@@ -76,13 +101,17 @@ pub fn truncate_model_text_at_lines_with_limits(
         }
         if marker != "…" {
             marker = crate::omitted_line_marker_at_lines(
-                text, head_end, text.len() - (tail_bytes.len() - tail_start),
-                line_offset, total_lines,
+                text,
+                head_end,
+                text.len() - (tail_bytes.len() - tail_start),
+                line_offset,
+                total_lines,
             );
             if let Some(artifact_id) = artifact_id {
                 marker = marker.replace("]\n", &format!("; artifact_id={artifact_id}]\n"));
             }
-            let files = omitted_file_counts(text, head_end, text.len() - (tail_bytes.len() - tail_start));
+            let files =
+                omitted_file_counts(text, head_end, text.len() - (tail_bytes.len() - tail_start));
             // Tiny budgets still retain the line-coordinate recovery notice.
             if model_token_count(&files) <= limit / 3 {
                 marker.push_str(&files);
@@ -108,7 +137,9 @@ pub fn truncate_model_text_at_lines_with_limits(
         let result_tokens = model_token_count(&result);
         if result_tokens <= limit {
             let (first, last, _) = crate::omitted_line_span(
-                text, head_end, text.len() - (tail_bytes.len() - tail_start),
+                text,
+                head_end,
+                text.len() - (tail_bytes.len() - tail_start),
             );
             return (result, Some((first + line_offset, last + line_offset)));
         }
@@ -132,54 +163,80 @@ const SOURCE_LABEL_PREFIX: &str = "[source {";
 
 /// Last complete source label line that begins inside the omitted range.
 fn omitted_source_label(text: &str, start: usize, end: usize) -> Option<&str> {
-    let offset = text[start..end].rmatch_indices(SOURCE_LABEL_PREFIX)
+    let offset = text[start..end]
+        .rmatch_indices(SOURCE_LABEL_PREFIX)
         .map(|(relative, _)| start + relative)
         .find(|&offset| offset == 0 || text.as_bytes()[offset - 1] == b'\n')?;
-    let line_end = text[offset..].find('\n').map_or(text.len(), |length| offset + length);
+    let line_end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |length| offset + length);
     let line = text[offset..line_end].trim_end_matches('\r');
     line.ends_with("}]").then_some(line)
 }
 
 fn omitted_file_counts(text: &str, start: usize, end: usize) -> String {
     let first = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
-    let last = if text[..end].ends_with('\n') { end } else {
-        text[end..].find('\n').map_or(text.len(), |offset| end + offset)
+    let last = if text[..end].ends_with('\n') {
+        end
+    } else {
+        text[end..]
+            .find('\n')
+            .map_or(text.len(), |offset| end + offset)
     };
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     for line in text[first..last].lines() {
-        let path = line.match_indices(':').find_map(|(offset, _)| {
-            let rest = &line[offset + 1..];
-            let (number, _) = rest.split_once(':')?;
-            // Timestamps and syslog prefixes also look like `prefix:digits:`.
-            let candidate = &line[..offset];
-            (!number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
-                && (candidate.contains(['/', '\\'])
-                    || !(candidate.contains(char::is_whitespace)
-                        || candidate.starts_with(|ch: char| ch.is_ascii_digit()))))
+        let path = line
+            .match_indices(':')
+            .find_map(|(offset, _)| {
+                let rest = &line[offset + 1..];
+                let (number, _) = rest.split_once(':')?;
+                // Timestamps and syslog prefixes also look like `prefix:digits:`.
+                let candidate = &line[..offset];
+                (!number.is_empty()
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+                    && (candidate.contains(['/', '\\'])
+                        || !(candidate.contains(char::is_whitespace)
+                            || candidate.starts_with(|ch: char| ch.is_ascii_digit()))))
                 .then_some(candidate)
-        }).or_else(|| {
-            // Bare paths from rg --files/-l. Do not turn ordinary prose or
-            // source lines into invented filenames.
-            (!line.is_empty() && !line.chars().any(char::is_whitespace)
-                && (line.contains(['/', '\\']) || line.rsplit_once('.').is_some_and(|(base, ext)|
-                    !base.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric))))
+            })
+            .or_else(|| {
+                // Bare paths from rg --files/-l. Do not turn ordinary prose or
+                // source lines into invented filenames.
+                (!line.is_empty()
+                    && !line.chars().any(char::is_whitespace)
+                    && (line.contains(['/', '\\'])
+                        || line.rsplit_once('.').is_some_and(|(base, ext)| {
+                            !base.is_empty()
+                                && !ext.is_empty()
+                                && ext.chars().all(char::is_alphanumeric)
+                        })))
                 .then_some(line)
-        });
-        if let Some(path) = path.filter(|path| !path.is_empty() && !path.contains(['\u{1b}', '\t'])) {
+            });
+        if let Some(path) = path.filter(|path| !path.is_empty() && !path.contains(['\u{1b}', '\t']))
+        {
             *counts.entry(path).or_default() += 1;
         }
     }
-    if counts.is_empty() { return String::new(); }
+    if counts.is_empty() {
+        return String::new();
+    }
     let mut notice = String::from("Omitted hits by file (includes partial boundary lines):\n");
     let mut shown = 0;
     for (path, count) in &counts {
-        if shown == 8 { break; }
-        if path.len() > 160 { continue; }
+        if shown == 8 {
+            break;
+        }
+        if path.len() > 160 {
+            continue;
+        }
         notice.push_str(&format!("{path}: {count}\n"));
         shown += 1;
     }
     if shown < counts.len() {
-        notice.push_str(&format!("{} additional files not listed\n", counts.len() - shown));
+        notice.push_str(&format!(
+            "{} additional files not listed\n",
+            counts.len() - shown
+        ));
     }
     notice
 }
@@ -196,14 +253,26 @@ mod tests {
             for limit in [0, 1, 10, 100, tokens, tokens.saturating_sub(1)] {
                 let whole = limit.saturating_add(limit / 3);
                 let actual = truncate_model_text_at_lines_with_limits(
-                    &source, limit, whole, 50, 200, Some("fixture"),
+                    &source,
+                    limit,
+                    whole,
+                    50,
+                    200,
+                    Some("fixture"),
                 );
                 if limit > 0 && tokens <= whole {
                     assert_eq!(actual, (source.clone(), None));
                 } else {
-                    assert_eq!(actual, truncate_model_text_at_lines_with_recovery(
-                        &source, limit, 50, 200, Some("fixture"),
-                    ));
+                    assert_eq!(
+                        actual,
+                        truncate_model_text_at_lines_with_recovery(
+                            &source,
+                            limit,
+                            50,
+                            200,
+                            Some("fixture"),
+                        )
+                    );
                     assert!(model_token_count(&actual.0) <= limit);
                 }
             }
@@ -244,22 +313,28 @@ mod tests {
     fn artifact_qualified_marker_keeps_the_budget_and_source_coordinates() {
         let source = "source line\n".repeat(2000);
         let artifact = "01a115cd-c4a8-7403-b194-68d9ebaec306";
-        let text = truncate_model_text_at_lines_with_artifact(&source, 120, 0, 2000, Some(artifact));
+        let text =
+            truncate_model_text_at_lines_with_artifact(&source, 120, 0, 2000, Some(artifact));
         assert!(text.contains(&format!("artifact_id={artifact}]")));
         assert!(text.contains("[omitted lines "));
         assert!(model_token_count(&text) <= 120);
 
         let second = "[source {\"path\":\"b.md\",\"complete\":true}]";
-        let source = format!("[source {{\"path\":\"a.md\",\"complete\":true}}]\n{}{second}\n{}",
-            "first body\n".repeat(1500), "second body\n".repeat(1500));
-        let text = truncate_model_text_at_lines_with_artifact(&source, 200, 0, 3002, Some(artifact));
+        let source = format!(
+            "[source {{\"path\":\"a.md\",\"complete\":true}}]\n{}{second}\n{}",
+            "first body\n".repeat(1500),
+            "second body\n".repeat(1500)
+        );
+        let text =
+            truncate_model_text_at_lines_with_artifact(&source, 200, 0, 3002, Some(artifact));
         let (_, after_marker) = text.split_once("[omitted lines ").unwrap();
         let (_, relabeled) = after_marker.split_once(&format!("{second}\n")).unwrap();
         assert!(relabeled.contains("second body\n") && !relabeled.contains("first body"));
         assert!(model_token_count(&text) <= 200);
         // A label the tail still carries is not repeated.
         let labeled_tail = format!("{}{second}\nsecond body\n", "first body\n".repeat(3000));
-        let text = truncate_model_text_at_lines_with_artifact(&labeled_tail, 200, 0, 3002, Some(artifact));
+        let text =
+            truncate_model_text_at_lines_with_artifact(&labeled_tail, 200, 0, 3002, Some(artifact));
         assert_eq!(text.matches(second).count(), 1);
     }
 
@@ -283,12 +358,20 @@ mod tests {
         assert!(output.contains("Omitted hits by file"));
         assert!(model_token_count(&output) <= 300);
         assert!(omitted_file_counts("ordinary prose\n", 0, 15).is_empty());
-        for log in ["2026-06-02T00:35:13.759Z INFO healthcheck ok\n", "Jun 3 09:15:22 host msg\n",
-            "12:2026-06-02T00:35:13 single-file hit\n"] {
+        for log in [
+            "2026-06-02T00:35:13.759Z INFO healthcheck ok\n",
+            "Jun 3 09:15:22 host msg\n",
+            "12:2026-06-02T00:35:13 single-file hit\n",
+        ] {
             assert!(omitted_file_counts(log, 0, log.len()).is_empty(), "{log}");
         }
-        assert!(omitted_file_counts("src/日本語.rs\n", 0, "src/日本語.rs\n".len()).contains("src/日本語.rs: 1"));
-        let many = (0..30).map(|i| format!("src/file_{i}.rs\n")).collect::<String>();
+        assert!(
+            omitted_file_counts("src/日本語.rs\n", 0, "src/日本語.rs\n".len())
+                .contains("src/日本語.rs: 1")
+        );
+        let many = (0..30)
+            .map(|i| format!("src/file_{i}.rs\n"))
+            .collect::<String>();
         assert!(omitted_file_counts(&many, 0, many.len()).contains("22 additional files"));
     }
 
@@ -298,7 +381,11 @@ mod tests {
             let source = line.repeat(2_000) + "FAILURE_TAIL\n";
             for limit in [64, 100, 200] {
                 let (output, gap) = truncate_model_text_at_lines_with_recovery(
-                    &source, limit, 50, 2_100, Some("fixture-artifact"),
+                    &source,
+                    limit,
+                    50,
+                    2_100,
+                    Some("fixture-artifact"),
                 );
                 assert!(model_token_count(&output) <= limit);
                 assert!(output.ends_with("FAILURE_TAIL\n"));
@@ -308,7 +395,10 @@ mod tests {
                 assert!(source.ends_with(tail));
                 let (first, last) = gap.unwrap();
                 assert_eq!(first, 51 + head.bytes().filter(|&b| b == b'\n').count());
-                assert_eq!(last, 50 + source[..source.len() - tail.len()].lines().count());
+                assert_eq!(
+                    last,
+                    50 + source[..source.len() - tail.len()].lines().count()
+                );
             }
         }
     }
@@ -317,7 +407,11 @@ mod tests {
     fn tiny_packet_keeps_failure_tail_when_its_line_marker_shrinks() {
         let source = "src/file.rs:12:needle\n".repeat(64) + "FAILURE_TAIL\n";
         let (output, _) = truncate_model_text_at_lines_with_recovery(
-            &source, 33, 0, source.lines().count(), Some("fixture-artifact"),
+            &source,
+            33,
+            0,
+            source.lines().count(),
+            Some("fixture-artifact"),
         );
         assert!(model_token_count(&output) <= 33);
         assert!(output.ends_with("FAILURE_TAIL\n"));

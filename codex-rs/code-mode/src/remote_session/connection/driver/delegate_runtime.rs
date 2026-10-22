@@ -358,10 +358,15 @@ impl ConnectionDriver {
         self.apply_delegate_effects(effects)
     }
 
-    pub(super) fn close_session_locally(&mut self, session_id: &SessionId) -> DelegateEffects {
+    pub(super) fn close_session_locally(&mut self, session_id: &SessionId) -> bool {
         self.requests.remove_unclaimed_for_session(session_id);
-        let owners = self.sessions.remove_session(session_id);
-        self.delegates.close_cells(owners)
+        let Some((cleanup, owners)) = self.sessions.remove_session(session_id) else {
+            return true;
+        };
+        let effects = self.delegates.close_cells(owners);
+        let applied = self.apply_delegate_effects(effects);
+        cleanup.finish();
+        applied
     }
 
     pub(super) fn apply_delegate_effects(&mut self, effects: DelegateEffects) -> bool {

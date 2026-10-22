@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use codex_file_system::acquire_atomic_write_lock;
-use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::acquire_resolved_atomic_write_lock;
 use codex_file_system::write_atomically;
 use tokio::task;
 use toml_edit::DocumentMut;
@@ -58,8 +57,7 @@ pub fn apply_user_plugin_config_edits_blocking(
     }
 
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let _lock = acquire_atomic_write_lock(&config_path)?;
-    let write_paths = resolve_symlink_write_paths(&config_path)?;
+    let (write_paths, _lock) = acquire_resolved_atomic_write_lock(&config_path)?;
     let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
     let mut mutated = false;
     for edit in edits {
@@ -177,7 +175,6 @@ enabled = true
         assert_eq!(config, expected);
     }
 
-
     #[tokio::test]
     async fn clear_user_plugin_removes_empty_plugins_table() {
         let codex_home = TempDir::new().unwrap();
@@ -251,7 +248,6 @@ enabled = true
     fn read_config(codex_home: &Path) -> toml::Value {
         toml::from_str(&fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).unwrap()).unwrap()
     }
-
 
     #[tokio::test]
     async fn plugin_edits_reject_malformed_tables_without_persisting_batch() {

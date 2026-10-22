@@ -176,8 +176,13 @@ async fn mcp_server_openai_form_elicitation_round_trip() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn openai_form_capability_follows_the_turn_starting_connection() -> Result<()> {
-    let (responses_server, response_mock, apps_server_url, apps_server_handle, openai_form_advertised) =
-        start_elicitation_services(ElicitationScenario::OpenAiForm, /*warmup_turns*/ 2).await?;
+    let (
+        responses_server,
+        response_mock,
+        apps_server_url,
+        apps_server_handle,
+        openai_form_advertised,
+    ) = start_elicitation_services(ElicitationScenario::OpenAiForm, /*warmup_turns*/ 2).await?;
     let codex_home = TempDir::new()?;
     write_config_toml(codex_home.path(), &responses_server.uri(), &apps_server_url)?;
     write_chatgpt_auth(

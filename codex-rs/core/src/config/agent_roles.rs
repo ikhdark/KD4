@@ -202,6 +202,13 @@ async fn read_declared_role(
     declared_role_name: &str,
     role_toml: &AgentRoleToml,
 ) -> std::io::Result<(String, AgentRoleConfig)> {
+    let declared_role_name = declared_role_name.trim();
+    if declared_role_name.is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "declared agent role name cannot be blank",
+        ));
+    }
     let mut role = agent_role_config_from_toml(fs, declared_role_name, role_toml).await?;
     let mut role_name = declared_role_name.to_string();
     if let Some(config_file) = role.config_file.as_deref() {
@@ -209,6 +216,9 @@ async fn read_declared_role(
         let parsed_file = files
             .read(fs, &config_file, Some(declared_role_name))
             .await?;
+        if let Some(Ok(contents)) = files.contents.get(&config_file) {
+            role.capture_config_file_contents(contents.clone());
+        }
         role_name = parsed_file.role_name;
         role.description = parsed_file.description.or(role.description);
         role.nickname_candidates = parsed_file.nickname_candidates.or(role.nickname_candidates);
@@ -219,7 +229,10 @@ async fn read_declared_role(
 
 fn merge_missing_role_fields(role: &mut AgentRoleConfig, fallback: &AgentRoleConfig) {
     role.description = role.description.clone().or(fallback.description.clone());
-    role.config_file = role.config_file.clone().or(fallback.config_file.clone());
+    if role.config_file.is_none() {
+        role.config_file = fallback.config_file.clone();
+        role.config_snapshot = fallback.config_snapshot.clone();
+    }
     role.nickname_candidates = role
         .nickname_candidates
         .clone()
@@ -267,6 +280,7 @@ async fn agent_role_config_from_toml(
         description,
         config_file: config_file.map(AbsolutePathBuf::into_path_buf),
         nickname_candidates,
+        config_snapshot: Default::default(),
     })
 }
 
@@ -329,7 +343,12 @@ pub(crate) fn parse_agent_role_file_contents(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| role_name_hint.map(ToOwned::to_owned))
+        .or_else(|| {
+            role_name_hint
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned)
+        })
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -593,14 +612,16 @@ async fn discover_agent_roles_in_dir(
             );
             continue;
         }
-        roles.insert(
-            role_name,
-            AgentRoleConfig {
-                description: parsed_file.description,
-                config_file: Some(agent_file.to_path_buf()),
-                nickname_candidates: parsed_file.nickname_candidates,
-            },
-        );
+        let role = AgentRoleConfig {
+            description: parsed_file.description,
+            config_file: Some(agent_file.to_path_buf()),
+            nickname_candidates: parsed_file.nickname_candidates,
+            config_snapshot: Default::default(),
+        };
+        if let Some(Ok(contents)) = files.contents.get(agent_file) {
+            role.capture_config_file_contents(contents.clone());
+        }
+        roles.insert(role_name, role);
     }
 
     Ok(roles)
@@ -760,5 +781,59 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("incomplete"));
         Ok(())
+    }
+}
+#[cfg(test)]
+mod role_key_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn padded_keys_are_normalized_before_publication_and_collisions_are_reported() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("role.toml");
+        std::fs::write(
+            &path,
+            "developer_instructions = 'restricted custom worker'\nsandbox_mode = 'read-only'\n",
+        )
+        .unwrap();
+        let cfg: ConfigToml = toml::Value::try_from(serde_json::json!({"agents": {
+            " worker ": {"description":"restricted", "config_file":path},
+            "worker": {"description":"collision"},
+            "\u{2003}Explorer\u{2003}": {"description":"case-sensitive"},
+            " \t ": {"description":"invalid"}
+        }}))
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let mut warnings = Vec::new();
+        let roles = load_agent_roles(
+            codex_exec_server::LOCAL_FS.as_ref(),
+            &cfg,
+            &ConfigLayerStack::default(),
+            &mut warnings,
+        )
+        .await
+        .unwrap();
+        assert_eq!(roles.len(), 2);
+        assert!(roles.contains_key("worker") && roles.contains_key("Explorer"));
+        assert_eq!(warnings.len(), 2);
+        let mut config = crate::config::ConfigBuilder::without_managed_config_for_tests()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(home.path().to_path_buf()))
+            .build()
+            .await
+            .unwrap();
+        config.agent_roles = roles;
+        crate::agent::role::apply_role_to_config(&mut config, Some("worker"))
+            .await
+            .unwrap();
+        assert_eq!(
+            config.developer_instructions.as_deref(),
+            Some("restricted custom worker")
+        );
+        assert_eq!(
+            config.permissions.permission_profile(),
+            &codex_protocol::models::PermissionProfile::read_only()
+        );
     }
 }

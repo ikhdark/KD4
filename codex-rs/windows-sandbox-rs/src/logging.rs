@@ -113,12 +113,18 @@ mod tests {
     fn preview_does_not_panic_on_utf8_boundary() {
         // Exercise both actual truncation boundaries, not just the total byte limit.
         for (command, expected) in [
-            (format!("{}😀{}", "x".repeat(96), "y".repeat(200)),
-             format!("{} … {}", "x".repeat(96), "y".repeat(98))),
-            (format!("{}😀{}", "x".repeat(200), "y".repeat(96)),
-             format!("{} … {}", "x".repeat(97), "y".repeat(96))),
-            (format!("{}😀", "x".repeat(199)),
-             format!("{} … {}😀", "x".repeat(97), "x".repeat(94))),
+            (
+                format!("{}😀{}", "x".repeat(96), "y".repeat(200)),
+                format!("{} … {}", "x".repeat(96), "y".repeat(98)),
+            ),
+            (
+                format!("{}😀{}", "x".repeat(200), "y".repeat(96)),
+                format!("{} … {}", "x".repeat(97), "y".repeat(96)),
+            ),
+            (
+                format!("{}😀", "x".repeat(199)),
+                format!("{} … {}😀", "x".repeat(97), "x".repeat(94)),
+            ),
         ] {
             assert_eq!(preview(&[command]), expected);
         }

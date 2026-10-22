@@ -15,7 +15,6 @@ use crate::tools::command_execution::CompletionApplyResult;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -27,7 +26,6 @@ use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runt
 use crate::tools::handlers::command_search::classify_rg_search_narrowing_without_native_scope;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
 use crate::tools::handlers::command_search::missing_rg_path_advisory_with_cancellation;
-use crate::tools::handlers::command_search::observe_rg_search_scope_state_with_freshness;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::normalize_and_validate_additional_permissions_uri;
@@ -213,7 +211,10 @@ pub(super) async fn attach_missing_rg_path_advisory(
 ) {
     // Raw command output is untrusted: an apparent rg error can name any host
     // path. Match read_file's policy before probing for diagnostic suggestions.
-    if !turn.file_system_sandbox_policy().has_full_disk_read_access() {
+    if !turn
+        .file_system_sandbox_policy()
+        .has_full_disk_read_access()
+    {
         return;
     }
     const RG_ERROR: &[u8] = b"rg: ";
@@ -256,7 +257,9 @@ pub(super) async fn attach_hidden_rg_directory_advisory(
     workspace: &crate::git_workspace::GitWorkspaceCache,
 ) {
     // Both exec_command and write_stdin use host-side directory/Git queries.
-    if !turn.file_system_sandbox_policy().has_full_disk_read_access()
+    if !turn
+        .file_system_sandbox_policy()
+        .has_full_disk_read_access()
         || !response.search_no_match_is_success()
     {
         return;
@@ -278,14 +281,12 @@ pub(super) async fn attach_hidden_rg_directory_advisory(
     let Ok(Some(root)) = workspace.resolve_workspace_root(cwd).await else {
         return;
     };
-    let mut visible = Vec::new();
-    for path in candidates {
-        if !crate::git_workspace::git_ignores_all_changed_paths(&root, std::slice::from_ref(&path))
-            .await
-        {
-            visible.push(path.display().to_string());
-        }
-    }
+    let ignored = crate::git_workspace::git_ignored_paths(&root, &candidates).await;
+    let visible: Vec<_> = candidates
+        .into_iter()
+        .filter(|path| !ignored.contains(path))
+        .map(|path| path.display().to_string())
+        .collect();
     if visible.is_empty() {
         return;
     }
@@ -373,7 +374,7 @@ impl ExecCommandHandler {
             source,
         );
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
-        let turn_environment = crate::tools::handlers::wait_for_tool_environment(
+        let turn_environment = crate::tools::handlers::wait_for_observed_tool_environment(
             &step_context.environments,
             environment_args.environment_id.as_deref(),
             &cancellation_token,
@@ -454,11 +455,10 @@ impl ExecCommandHandler {
         }
         // A remote shell is required above for every shell-wrapped command. The local session
         // fallback can therefore only be reached by local commands or structured remote argv.
-        let shell = turn_environment
-            .shell
-            .clone()
-            .map(Arc::new)
-            .unwrap_or_else(|| session.user_shell());
+        let shell = session
+            .shell_for_environment(turn_environment)
+            .await
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
         let allow_login_shell =
             super::super::shell::ShellCommandHandler::effective_allow_login_shell(
                 &turn.session_source,
@@ -553,7 +553,7 @@ impl ExecCommandHandler {
                     let search_command = resolved_command.safety_command.clone();
                     let search_shell_type = resolved_command.preflight_shell_type;
                     let search_cwd = native_cwd.clone();
-                    let mut search = crate::tools::run_blocking_command_analysis(move || {
+                    let search = crate::tools::run_blocking_command_analysis(move || {
                         classify_rg_search_with_repository(
                             &search_command,
                             search_shell_type,
@@ -568,10 +568,8 @@ impl ExecCommandHandler {
                         ))
                     })?
                     .map_err(FunctionCallError::RespondToModel)?;
-                    if let Some((_, search)) = search.as_mut() {
-                        observe_rg_search_scope_state_with_freshness(search, args.force_fresh)
-                            .await;
-                    }
+                    // Source-only snapshots cannot identify the image executed
+                    // by this runtime. Leave optional negative-replay proof unset.
                     search.map(|(root, search)| (root.to_string_lossy().into_owned(), search))
                 } else {
                     let search_command = resolved_command.safety_command.clone();
@@ -851,8 +849,15 @@ impl ExecCommandHandler {
         drop(reuse_phase);
         // Validation shares ordinary attempt accounting. Only input-state
         // determined failures are replayed; focused failing tests remain rerunnable.
-        turn.full_suite_budget
-            .admit(full_suite)
+        if full_suite {
+            turn.full_suite_budget.refresh_owned_nonexecution().await;
+        }
+        let _suite_permit = turn
+            .full_suite_budget
+            .reserve(
+                full_suite,
+                crate::validation_task::reservation_owner(&session, &turn, &call_id),
+            )
             .map_err(FunctionCallError::RespondToModel)?;
         let attempt_phase =
             crate::tools::tool_dispatch_trace::begin_tool_phase("exec_attempt_freshness");
@@ -863,14 +868,33 @@ impl ExecCommandHandler {
             .await
         {
             if blocked.is_search_miss() {
-                return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                let receipt = ExecCommandToolOutput::cached_search_miss(blocked.render_for_model());
+                if let Some(evidence) = session
+                    .services
+                    .command_execution
+                    .retained_search_miss(&attempt_key)
+                    .await
+                {
+                    return Ok(boxed_tool_output(receipt.with_evidence(evidence)));
+                }
+                if !nested {
+                    return Ok(boxed_tool_output(receipt));
+                }
+                // A persisted/prose miss has no exact streams. Structured callers
+                // execute afresh instead of receiving fabricated empty output.
+                session
+                    .services
+                    .command_execution
+                    .begin_attempt_with_freshness(&attempt_key, repaired, true)
+                    .await
+                    .map_err(|blocked| {
+                        FunctionCallError::RespondToModel(blocked.render_for_model())
+                    })?;
+            } else {
+                return Err(FunctionCallError::RespondToModel(
                     blocked.render_for_model(),
-                    Some(true),
-                )));
+                ));
             }
-            return Err(FunctionCallError::RespondToModel(
-                blocked.render_for_model(),
-            ));
         }
         drop(attempt_phase);
 
@@ -1027,6 +1051,26 @@ impl ExecCommandHandler {
         };
         let result = match exec_result {
             Ok(mut response) => {
+                if response.search_no_match_is_success()
+                    && let Some(snapshot) = response.process_output.as_ref()
+                    && snapshot.streams_are_exact
+                    && snapshot.stdout.len().saturating_add(snapshot.stderr.len()) <= 16 * 1024
+                    && let (Ok(stdout), Ok(stderr)) = (
+                        String::from_utf8(snapshot.stdout.clone()),
+                        String::from_utf8(snapshot.stderr.clone()),
+                    )
+                {
+                    session
+                        .services
+                        .command_execution
+                        .record_retained_search_miss(
+                            &attempt_key,
+                            response.event_call_id.clone(),
+                            stdout,
+                            stderr,
+                        )
+                        .await;
+                }
                 background_process_expected = response.process_id.is_some();
                 let finalized_artifact = response
                     .raw_output_artifact
@@ -1074,7 +1118,8 @@ impl ExecCommandHandler {
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 if !environment_is_remote && let Some(native_cwd) = native_cwd.as_ref() {
-                    attach_missing_rg_path_advisory(&mut response, native_cwd.as_path(), &turn).await;
+                    attach_missing_rg_path_advisory(&mut response, native_cwd.as_path(), &turn)
+                        .await;
                     attach_hidden_rg_directory_advisory(
                         &mut response,
                         native_cwd.as_path(),
@@ -1211,42 +1256,17 @@ impl ExecCommandHandler {
                 ))
             }
             Err(err) => {
-                let retry_failure = matches!(
-                    &err,
-                    UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
-                );
-                if retry_failure {
-                    let finalized_running_process =
-                        if matches!(&err, UnifiedExecError::ProcessFailed { .. }) {
-                            if let Some((execution_id, parent_tool_execution_id)) =
-                                tracked_execution.as_ref()
-                            {
-                                session
-                                    .services
-                                    .command_execution
-                                    .finish_running_process_with_execution_id(
-                                        process_id,
-                                        *execution_id,
-                                        parent_tool_execution_id,
-                                        Some(-1),
-                                    )
-                                    .await
-                            } else {
-                                CompletionApplyResult::Missing
-                            }
-                        } else {
-                            CompletionApplyResult::Missing
-                        };
-                    if !matches!(
-                        finalized_running_process,
-                        CompletionApplyResult::Applied | CompletionApplyResult::AlreadyApplied
-                    ) {
-                        session
-                            .services
-                            .command_execution
-                            .record_exit(&attempt_key, -1)
-                            .await;
-                    }
+                let retry_failure = matches!(&err, UnifiedExecError::CreateProcess { .. });
+                // A generic error is not native exit evidence. Once registered,
+                // only the owner/watcher's authoritative outcome may finish it.
+                // A watcher may already have retired a registered identity, so
+                // absence from the live ledger is not proof of a pre-spawn failure.
+                if retry_failure && tracked_execution.is_none() {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, -1)
+                        .await;
                 }
                 let repair = repair_notice
                     .as_deref()

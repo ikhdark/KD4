@@ -143,6 +143,16 @@ impl ApplyPatchRuntime {
             }
         }
 
+        if req.turn_environment.environment.is_remote() {
+            if binding.is_some() {
+                return Err(ToolError::Rejected(
+                    "apply_patch: typed patch tracking requires a local execution environment"
+                        .to_string(),
+                ));
+            }
+            self.workspace_tracking_started = true;
+            return Ok(());
+        }
         let cwd = match req.turn_environment.cwd().to_abs_path() {
             Ok(cwd) => cwd.to_path_buf(),
             Err(error) => {

@@ -13,7 +13,7 @@ pub const UPDATE_GOAL_TOOL_NAME: &str = "update_goal";
 pub fn create_get_goal_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: GET_GOAL_TOOL_NAME.to_string(),
-        description: "Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget."
+        description: "Get the current goal for this thread, including status, budgets, token and elapsed-time usage, remaining token budget, and terminalTransition. A pending or failed_unconfirmed terminal transition stops automatic continuation even if durable status is still active. Explicitly retry the terminal update after resolving its failure, or ask the user to reactivate; persistenceConfirmed=false means stop metadata could not be durably confirmed."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -75,7 +75,8 @@ pub fn create_update_goal_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: UPDATE_GOAL_TOOL_NAME.to_string(),
-        description: r#"Update the existing goal.
+        description: r#"Request a terminal update of the existing goal.
+The tool returns a pending intent promptly. The goal remains active until the host settles accepted sibling tool effects and reconciles current task/input evidence. A later host notice confirms acceptance or explains rejection; a pending response is not a terminal receipt. Reconcile a rejection before requesting another terminal update.
 Use this tool only to mark the goal achieved or genuinely blocked.
 Set status to `complete` only when the objective has actually been achieved and no required work remains.
 Set status to `blocked` when authoritative evidence establishes that user input, external change, or unavailable authorization is required and no permitted independent work remains.

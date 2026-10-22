@@ -19,7 +19,6 @@ use crate::tasks::CompactTask;
 use crate::tasks::UserShellCommandMode;
 use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
-use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
@@ -49,7 +48,9 @@ use tracing::info;
 use tracing::warn;
 
 pub async fn interrupt(sess: &Arc<Session>) {
-    sess.interrupt_task().await;
+    // Claim cancellation before returning to dispatch, but do not make the
+    // control loop an observer of the cancellation-resistant finalizer.
+    sess.request_task_interrupt().await;
 }
 
 pub async fn clean_background_terminals(sess: &Arc<Session>) {
@@ -210,14 +211,32 @@ pub(super) async fn user_input_or_turn_inner(
         return;
     }
 
+    let final_output_json_schema = match final_output_json_schema
+        .map(super::turn_context::PreparedOutputSchema::prepare)
+        .transpose()
+    {
+        Ok(schema) => Some(schema),
+        Err(message) => {
+            let error = CodexErr::InvalidRequest(message);
+            if let Some((permit, admission)) = start_only_admission.take() {
+                drop(permit);
+                let _ = admission.send(Err(error));
+            } else {
+                sess.send_event_raw_without_materializing_rollout(Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(error.to_error_event(None)),
+                })
+                .await;
+            }
+            return;
+        }
+    };
     let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
     let updates = if emit_thread_settings_applied {
         thread_settings_update(sess, thread_settings).await
     } else {
         SessionSettingsUpdate::default()
     };
-    let final_output_json_schema = Some(final_output_json_schema);
-
     let session_configuration = match sess.apply_turn_settings(&sub_id, &updates).await {
         Ok(session_configuration) => session_configuration,
         Err(err) => {
@@ -261,6 +280,21 @@ pub(super) async fn user_input_or_turn_inner(
         )
         .await;
     }
+    if additional_context.contains_key(crate::validation_task::METADATA_KEY)
+        && sess.active_turn.lock().await.is_some()
+    {
+        sess.send_event_raw(Event {
+            id: sub_id.clone(),
+            msg: EventMsg::Error(
+                CodexErr::InvalidRequest(
+                    "validation task/grant metadata cannot change an active task".into(),
+                )
+                .to_error_event(None),
+            ),
+        })
+        .await;
+        return;
+    }
     let items = if start_only_admission.is_some() {
         items
     } else {
@@ -287,6 +321,26 @@ pub(super) async fn user_input_or_turn_inner(
         }
     };
 
+    if let Some(entry) = additional_context.get(crate::validation_task::METADATA_KEY)
+        && let Err(message) = crate::validation_task::accept_metadata(
+            sess,
+            entry,
+            !session_configuration.session_source.is_non_root_agent(),
+        )
+        .await
+    {
+        let error = CodexErr::InvalidRequest(message);
+        sess.send_event_raw(Event {
+            id: sub_id.clone(),
+            msg: EventMsg::Error(error.to_error_event(None)),
+        })
+        .await;
+        if let Some((permit, admission)) = start_only_admission.take() {
+            drop(permit);
+            let _ = admission.send(Err(error));
+        }
+        return;
+    }
     let current_context = sess
         .new_turn_from_configuration(
             sub_id.clone(),
@@ -325,15 +379,7 @@ pub(super) async fn user_input_or_turn_inner(
             return;
         }
     };
-    let additional_context_input = {
-        let mut state = sess.state.lock().await;
-        state.additional_context.merge(additional_context)
-    };
-    let mut task_input = additional_context_input
-        .into_iter()
-        .map(ResponseItem::from)
-        .map(TurnInput::ResponseItem)
-        .collect::<Vec<_>>();
+    let mut task_input = vec![TurnInput::AdditionalContext(additional_context)];
     if !items.is_empty() {
         task_input.push(TurnInput::UserInput {
             content: items,
@@ -683,15 +729,45 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
 
 pub(super) const TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
-async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
-    let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    sess.begin_shutdown().await;
+async fn cancel_startup_work(sess: &Arc<Session>) {
+    sess.startup_cancellation.cancel();
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
     if let Some(startup_transport) = sess.take_session_startup_transport().await {
         startup_transport.abort().await;
     }
+}
+
+pub(super) async fn shutdown_unpublished_session(sess: &Arc<Session>) {
+    cancel_startup_work(sess).await;
+    sess.services.turn_environments.shutdown();
+    // Independent services drain concurrently: a blocked snapshot write must
+    // not keep a speculative socket, code-mode lease or MCP client alive.
+    let (_, _, code_mode, _) = tokio::join!(
+        sess.services.turn_environments.finish_shutdown(),
+        sess.services.unified_exec_manager.terminate_all_processes(),
+        sess.services.code_mode_service.shutdown(),
+        sess.services.shutdown_mcp_managers(),
+    );
+    if let Err(error) = code_mode {
+        warn!(%error, "failed to close unpublished code-mode session");
+    }
+}
+
+/// Runtime teardown result. A timed-out history flush leaves its stalled write
+/// owned; persistence retirement queues behind that same write.
+struct RuntimeShutdown {
+    error: Option<CodexErr>,
+    tool_history_flush_timed_out: bool,
+}
+
+async fn shutdown_session_runtime(sess: &Arc<Session>) -> RuntimeShutdown {
+    let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let admission_incomplete = tokio::time::timeout_at(terminal_deadline, sess.begin_shutdown())
+        .await
+        .is_err();
+    cancel_startup_work(sess).await;
     // The abort waiter and finalizer keep their own session ownership when the
     // shutdown observation expires. Accepted writes must not be cancelled.
     let abort = sess.terminal_tasks.spawn({
@@ -729,12 +805,13 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
     if let Err(err) = sess.services.code_mode_service.shutdown().await {
         warn!("failed to shutdown code mode session: {err}");
     }
-    let persistence_error = match tokio::time::timeout(
+    let tool_history_flush = tokio::time::timeout(
         TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT,
         sess.flush_tool_history_persistence(),
     )
-    .await
-    {
+    .await;
+    let tool_history_flush_timed_out = tool_history_flush.is_err();
+    let persistence_error = match tool_history_flush {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(error),
         Err(_) => Some(CodexErr::Fatal(
@@ -743,35 +820,78 @@ async fn shutdown_session_runtime(sess: &Arc<Session>) -> Option<CodexErr> {
         )),
     };
     sess.services.shutdown_mcp_managers().await;
-    persistence_error.or_else(|| {
-        (abort_incomplete || terminal_incomplete).then(|| CodexErr::Fatal(
+    let error = persistence_error.or_else(|| {
+        (admission_incomplete || abort_incomplete || terminal_incomplete).then(|| CodexErr::Fatal(
             "turn finalization did not complete before the shutdown deadline; accepted history writes remain owned, but durability is unconfirmed".to_string(),
         ))
-    })
+    });
+    RuntimeShutdown {
+        error,
+        tool_history_flush_timed_out,
+    }
 }
 
-async fn shutdown_thread_persistence(sess: &Arc<Session>) -> Result<(), String> {
-    let Some(live_thread) = sess.live_thread().cloned() else {
-        return Ok(());
-    };
+async fn shutdown_thread_persistence(
+    sess: &Arc<Session>,
+    tool_history_flush_timed_out: bool,
+) -> Result<(), String> {
+    let live_thread = sess.live_thread().cloned();
     // Never close the writer underneath accepted commits. This owner must be
     // outside terminal_tasks: it waits for that tracker itself to drain.
-    let owner = tokio::spawn({
+    let owner = sess.persistence_tasks.spawn({
         let sess = Arc::clone(sess);
         async move {
             sess.terminal_tasks.wait().await;
             sess.wait_for_ordered_history_commits().await;
-            let result = live_thread
+            // History retires first: its snapshots may still need the thread
+            // writer. A failed history checkpoint does not skip normal thread
+            // storage cleanup; it only keeps storage ownership below.
+            let tool_history = sess
+                .tool_history_persistence
                 .shutdown()
                 .await
-                .map_err(|error| error.to_string());
+                .map_err(|error| format!("completed-tool history checkpoint failed: {error}"));
+            let thread = match live_thread {
+                Some(live_thread) => live_thread
+                    .shutdown()
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Ok(()),
+            };
+            let result = match (tool_history, thread) {
+                (Ok(()), Ok(())) => {
+                    // Stopped thread handles may remain alive for stale-incarnation
+                    // checks. They must not retain exclusive storage ownership once
+                    // both writers have retired. Failed/pending shutdown keeps it.
+                    sess._storage_ownership
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    Ok(())
+                }
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(history), Err(thread)) => Err(format!("{history}; {thread}")),
+            };
             if let Err(error) = &result {
                 warn!(%error, "owned thread persistence shutdown failed");
             }
+            *sess
+                .persistence_retirement_result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result.clone());
             result
         }
     });
-    match tokio::time::timeout(TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT, owner).await {
+    sess.persistence_tasks.close();
+    // Retirement queues behind a history flush that already timed out; waiting
+    // on that same stalled writer again only delays the pending report. The
+    // owner keeps running either way and drain waiters still observe it.
+    let observation = if tool_history_flush_timed_out {
+        Duration::ZERO
+    } else {
+        TOOL_HISTORY_SHUTDOWN_FLUSH_TIMEOUT
+    };
+    match tokio::time::timeout(observation, owner).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err(
@@ -782,7 +902,17 @@ async fn shutdown_thread_persistence(sess: &Arc<Session>) -> Result<(), String> 
 }
 
 pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
-    if let Some(error) = shutdown_session_runtime(sess).await {
+    let runtime = shutdown_session_runtime(sess).await;
+    finish_shutdown(sess, sub_id, runtime).await
+}
+
+async fn finish_shutdown(sess: &Arc<Session>, sub_id: String, runtime: RuntimeShutdown) -> bool {
+    let RuntimeShutdown {
+        error: runtime_error,
+        tool_history_flush_timed_out,
+    } = runtime;
+    let mut mandatory_error = runtime_error.as_ref().map(ToString::to_string);
+    if let Some(error) = runtime_error {
         sess.send_event_raw(Event {
             id: sub_id.clone(),
             msg: EventMsg::Error(error.to_error_event(/*message_prefix*/ None)),
@@ -809,7 +939,11 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
 
     // Gracefully flush and shutdown thread persistence on session end so tests
     // that inspect durable state do not race with the background writer.
-    if let Err(e) = shutdown_thread_persistence(sess).await {
+    if let Err(e) = shutdown_thread_persistence(sess, tool_history_flush_timed_out).await {
+        mandatory_error = Some(match mandatory_error {
+            Some(prior) => format!("{prior}; {e}"),
+            None => e.clone(),
+        });
         warn!("failed to shutdown thread persistence: {e}");
         let event = Event {
             id: sub_id.clone(),
@@ -821,6 +955,11 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
         sess.send_event_raw(event).await;
     }
 
+    *sess
+        .persistence_shutdown_result
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(mandatory_error.map_or(Ok(()), Err));
     let event = Event {
         id: sub_id,
         msg: EventMsg::ShutdownComplete,
@@ -900,7 +1039,45 @@ pub(super) async fn submission_loop(
     let mut ordered = std::collections::VecDeque::new();
     let mut pending: Option<(String, bool, futures::future::BoxFuture<'static, bool>)> = None;
     let mut shutdown_received = false;
+    let mut shutdown_runtime: Option<(
+        String,
+        futures::future::BoxFuture<'static, RuntimeShutdown>,
+    )> = None;
     loop {
+        if let Some((sub_id, runtime)) = shutdown_runtime.as_mut() {
+            // Keep completion controls available while execution drains. Once
+            // producers stop, close admission and terminalize the entire accepted
+            // buffer before retiring persistence or publishing ShutdownComplete.
+            tokio::select! {
+                biased;
+                runtime_shutdown = runtime => {
+                    let sub_id = sub_id.clone();
+                    rx_sub.close();
+                    while let Ok(queued) = rx_sub.try_recv() {
+                        let cancellable = matches!(queued.submission.op, Op::UserInput { .. } | Op::Review { .. });
+                        cancel_queued_preparation(&sess, queued.submission.id, cancellable).await;
+                    }
+                    finish_shutdown(&sess, sub_id, runtime_shutdown).await;
+                    shutdown_received = true;
+                    break;
+                }
+                received = rx_sub.recv(), if !rx_sub.is_closed() => {
+                    if let Ok(queued) = received {
+                        if matches!(queued.submission.op,
+                            Op::ExecApproval { .. } | Op::PatchApproval { .. }
+                            | Op::UserInputAnswer { .. } | Op::RequestPermissionsResponse { .. }
+                            | Op::DynamicToolResponse { .. } | Op::ResolveElicitation { .. })
+                        {
+                            dispatch_submission(Arc::clone(&sess), Arc::clone(&config), queued).await;
+                        } else {
+                            let cancellable = matches!(queued.submission.op, Op::UserInput { .. } | Op::Review { .. });
+                            cancel_queued_preparation(&sess, queued.submission.id, cancellable).await;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if pending.is_none()
             && let Some(queued) = ordered.pop_front()
         {
@@ -965,6 +1142,14 @@ pub(super) async fn submission_loop(
             }
             ordered = retained;
         }
+        if matches!(queued.submission.op, Op::Shutdown) {
+            let session = Arc::clone(&sess);
+            shutdown_runtime = Some((
+                queued.submission.id,
+                Box::pin(async move { shutdown_session_runtime(&session).await }),
+            ));
+            continue;
+        }
         if dispatch_submission(Arc::clone(&sess), Arc::clone(&config), queued).await {
             shutdown_received = true;
             break;
@@ -992,15 +1177,29 @@ pub(super) async fn submission_loop(
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
-        if let Some(error) = shutdown_session_runtime(&sess).await {
+        let RuntimeShutdown {
+            error: runtime_error,
+            tool_history_flush_timed_out,
+        } = shutdown_session_runtime(&sess).await;
+        let mut mandatory_error = runtime_error.as_ref().map(ToString::to_string);
+        if let Some(error) = runtime_error {
             warn!(
                 "completed-tool history was not durable when the submission channel closed: {error}"
             );
         }
         sess.emit_thread_stop_lifecycle().await;
-        if let Err(err) = shutdown_thread_persistence(&sess).await {
+        if let Err(err) = shutdown_thread_persistence(&sess, tool_history_flush_timed_out).await {
             warn!("failed to shutdown thread persistence after submission channel closed: {err}");
+            mandatory_error = Some(match mandatory_error {
+                Some(prior) => format!("{prior}; {err}"),
+                None => err,
+            });
         }
+        *sess
+            .persistence_shutdown_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(mandatory_error.map_or(Ok(()), Err));
     }
     debug!("Agent loop exited");
 }
@@ -1019,7 +1218,7 @@ async fn cancel_queued_preparation(sess: &Session, id: String, emit_aborted: boo
     {
         let _ = admission.send(Err(CodexErr::TurnAborted));
     }
-    if emit_aborted && sess.active_turn.lock().await.is_none() {
+    if emit_aborted {
         sess.send_event_raw(Event {
             id: id.clone(),
             msg: EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
@@ -1341,7 +1540,7 @@ mod dispatch_tests {
             rx_event: events.clone(),
             agent_status: session.agent_status.subscribe(),
             session: Arc::clone(&session),
-            session_loop_termination: futures::future::ready(()).boxed().shared(),
+            session_loop_termination: futures::future::ready(Ok(())).boxed().shared(),
         };
         codex
             .enqueue_submission(user_submission("blocked"))
@@ -1430,6 +1629,19 @@ mod dispatch_tests {
         tokio::time::timeout(Duration::from_secs(2), dispatcher)
             .await
             .unwrap();
+        let mut terminal_order = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event.msg {
+                EventMsg::TurnAborted(aborted)
+                    if aborted.turn_id.as_deref() == Some("after-shutdown") =>
+                {
+                    terminal_order.push("queued-abort");
+                }
+                EventMsg::ShutdownComplete => terminal_order.push("shutdown-complete"),
+                _ => {}
+            }
+        }
+        assert_eq!(terminal_order, vec!["queued-abort", "shutdown-complete"]);
         assert_eq!(
             session.submission_preparation_slots.available_permits(),
             super::super::SUBMISSION_CHANNEL_CAPACITY
@@ -1449,7 +1661,7 @@ mod dispatch_tests {
             rx_event: events,
             agent_status: session.agent_status.subscribe(),
             session: Arc::clone(&session),
-            session_loop_termination: futures::future::ready(()).boxed().shared(),
+            session_loop_termination: futures::future::ready(Ok(())).boxed().shared(),
         };
         codex.submit(Op::Interrupt).await.unwrap();
         let mut sending = Box::pin(codex.enqueue_submission(user_submission("cancelled-send")));

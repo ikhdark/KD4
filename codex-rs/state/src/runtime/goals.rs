@@ -1,6 +1,133 @@
 use super::*;
 use crate::model::ThreadGoalRow;
+use sqlx::Connection;
 use uuid::Uuid;
+
+/// Fence old SQL writers by renaming their table under a write reservation.
+/// Migration 34's deployed DROP IF EXISTS then cannot destroy the last copy.
+pub(super) async fn preserve_legacy_goals(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> anyhow::Result<()> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_goals')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !exists {
+        return Ok(());
+    }
+    // Normalize v29-v32 using the unchanged deployed migrations first.
+    let prefix = Migrator {
+        migrations: std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|migration| migration.version < 34)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: migrator.ignore_missing,
+        locking: migrator.locking,
+        no_tx: migrator.no_tx,
+        table_name: migrator.table_name.clone(),
+        create_schemas: migrator.create_schemas.clone(),
+    };
+    let mut connection = pool.acquire().await?;
+    sqlx::query("PRAGMA synchronous = FULL")
+        .execute(&mut *connection)
+        .await?;
+    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+    // Preflight can race another initializer. Normalize and fence the same
+    // protected schema, and do not rename a table a peer has already moved.
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'thread_goals')",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if exists {
+        prefix.run_direct(None, &mut *transaction, false).await?;
+        sqlx::query("ALTER TABLE thread_goals RENAME TO codex_legacy_thread_goals_pending")
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    sqlx::query("PRAGMA synchronous = NORMAL")
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+/// The retained source is also the restart receipt. Equal targets are retries;
+/// divergent targets stop the handoff rather than guessing which goal is newer.
+pub(super) async fn transfer_legacy_goals(
+    source: &SqlitePool,
+    target: &SqlitePool,
+) -> anyhow::Result<()> {
+    let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'codex_legacy_thread_goals_pending')")
+        .fetch_one(source).await?;
+    if !pending {
+        return Ok(());
+    }
+    // All handoffs lock source before destination. Keep the source reservation
+    // through the receipt so a second initializer cannot replay an old snapshot
+    // over goal edits made after the first initializer has returned.
+    let mut source_transaction = source.begin_with("BEGIN IMMEDIATE").await?;
+    let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'codex_legacy_thread_goals_pending')")
+        .fetch_one(&mut *source_transaction).await?;
+    if !pending {
+        source_transaction.commit().await?;
+        return Ok(());
+    }
+    type LegacyGoal = (
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        i64,
+    );
+    let mut connection = target.acquire().await?;
+    sqlx::query("PRAGMA synchronous = FULL")
+        .execute(&mut *connection)
+        .await?;
+    let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+    let mut last_thread_id: Option<String> = None;
+    loop {
+        let rows: Vec<LegacyGoal> = sqlx::query_as("SELECT thread_id, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms FROM codex_legacy_thread_goals_pending WHERE (? IS NULL OR thread_id > ?) ORDER BY thread_id LIMIT 1000")
+            .bind(&last_thread_id).bind(&last_thread_id)
+            .fetch_all(&mut *source_transaction).await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            sqlx::query("INSERT INTO thread_goals (thread_id, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(thread_id) DO NOTHING")
+                .bind(&row.0).bind(&row.1).bind(&row.2).bind(&row.3).bind(row.4).bind(row.5).bind(row.6).bind(row.7).bind(row.8)
+                .execute(&mut *transaction).await?;
+            let copied: LegacyGoal = sqlx::query_as("SELECT thread_id, goal_id, objective, status, token_budget, tokens_used, time_used_seconds, created_at_ms, updated_at_ms FROM thread_goals WHERE thread_id = ?")
+                .bind(&row.0).fetch_one(&mut *transaction).await?;
+            anyhow::ensure!(
+                copied == row,
+                "legacy goal transfer conflict for {}; source retained",
+                row.0
+            );
+            last_thread_id = Some(row.0);
+        }
+    }
+    transaction.commit().await?;
+    sqlx::query("PRAGMA synchronous = NORMAL")
+        .execute(&mut *connection)
+        .await?;
+    // Keep the source evidence after acknowledgement; never retry it over later
+    // legitimate goal edits, and never fabricate already-dropped accounting.
+    sqlx::query("ALTER TABLE codex_legacy_thread_goals_pending RENAME TO codex_legacy_thread_goals_transferred")
+        .execute(&mut *source_transaction).await?;
+    source_transaction.commit().await?;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct GoalStore {
@@ -24,6 +151,28 @@ pub struct GoalUpdate {
     pub expected_goal_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalTerminalTransitionOutcome {
+    Pending,
+    ConfirmedTerminal,
+    FailedUnconfirmed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalTerminalTransition {
+    pub goal_id: String,
+    pub objective: String,
+    pub turn_id: String,
+    pub transition_id: String,
+    pub intended_status: crate::ThreadGoalStatus,
+    pub reason: String,
+    pub outcome: GoalTerminalTransitionOutcome,
+    pub persistence_confirmed: bool,
+    pub error: Option<String>,
+}
+
 pub enum GoalAccountingOutcome {
     Unchanged(Option<crate::ThreadGoal>),
     Updated(crate::ThreadGoal),
@@ -37,6 +186,44 @@ pub enum GoalAccountingMode {
 }
 
 impl GoalStore {
+    pub async fn get_terminal_transition(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Option<GoalTerminalTransition>> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT terminal_transition FROM thread_goals WHERE thread_id = ?")
+                .bind(thread_id.to_string())
+                .fetch_optional(self.pool.as_ref())
+                .await?
+                .flatten();
+        value
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Identity-checked intent publication; it never writes status or accounting.
+    pub async fn set_terminal_transition(
+        &self,
+        thread_id: ThreadId,
+        transition: &GoalTerminalTransition,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query("UPDATE thread_goals SET terminal_transition = ? WHERE thread_id = ? AND goal_id = ? AND objective = ?")
+            .bind(serde_json::to_string(transition)?).bind(thread_id.to_string())
+            .bind(&transition.goal_id).bind(&transition.objective)
+            .execute(self.pool.as_ref()).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn clear_terminal_transition(
+        &self,
+        thread_id: ThreadId,
+        goal_id: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE thread_goals SET terminal_transition = NULL WHERE thread_id = ? AND goal_id = ?")
+            .bind(thread_id.to_string()).bind(goal_id).execute(self.pool.as_ref()).await?;
+        Ok(())
+    }
+
     pub async fn get_thread_goal(
         &self,
         thread_id: ThreadId,
@@ -89,6 +276,7 @@ INSERT INTO thread_goals (
 ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
     goal_id = excluded.goal_id,
+    terminal_transition = NULL,
     objective = excluded.objective,
     status = excluded.status,
     token_budget = excluded.token_budget,
@@ -152,7 +340,8 @@ ON CONFLICT(thread_id) DO UPDATE SET
     tokens_used = 0,
     time_used_seconds = 0,
     created_at_ms = excluded.created_at_ms,
-    updated_at_ms = excluded.updated_at_ms
+    updated_at_ms = excluded.updated_at_ms,
+    terminal_transition = NULL
 WHERE thread_goals.status = 'complete'
 RETURNING
     thread_id,
@@ -532,6 +721,200 @@ mod tests {
     use crate::runtime::test_support::unique_temp_dir;
     use pretty_assertions::assert_eq;
 
+    #[tokio::test]
+    async fn durable_audit_05_legacy_goal_handoff_preserves_accounting_and_later_edits() {
+        let home = unique_temp_dir();
+        tokio::fs::create_dir_all(&home).await.unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(base_sqlite_options(&crate::state_db_path(&home)))
+            .await
+            .unwrap();
+        let mut prefix = runtime_state_migrator();
+        prefix
+            .migrations
+            .to_mut()
+            .retain(|migration| migration.version <= 33);
+        prefix.run(&pool).await.unwrap();
+        let id = test_thread_id();
+        sqlx::query("INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode) VALUES (?, 'legacy.jsonl', 1, 2, 'cli', 'test-provider', '.', 'legacy', ?, ?)")
+            .bind(id.to_string())
+            .bind(crate::extract::enum_to_string(&codex_protocol::protocol::SandboxPolicy::new_read_only_policy()))
+            .bind(crate::extract::enum_to_string(&codex_protocol::protocol::AskForApproval::Never))
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO thread_goals VALUES (?, 'stable-goal-id', 'preserve objective', 'blocked', 9000, 400, 25, 1000, 2000)")
+            .bind(id.to_string()).execute(&pool).await.unwrap();
+        // Keep an old WAL reader and writer connection alive across two
+        // independent initializers, as overlapping binaries can do.
+        let mut reader = pool.begin().await.unwrap();
+        let original: (String, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT goal_id, tokens_used, time_used_seconds, created_at_ms, updated_at_ms FROM thread_goals WHERE thread_id = ?",
+        ).bind(id.to_string()).fetch_one(&mut *reader).await.unwrap();
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(
+                StateRuntime::init_inner(home.clone(), "test-provider".into(), None),
+                StateRuntime::init_inner(home.clone(), "test-provider".into(), None),
+            )
+        })
+        .await
+        .expect("concurrent goal handoff must not deadlock");
+        let runtime = first.unwrap();
+        let peer = second.unwrap();
+        let snapshot: (String, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT goal_id, tokens_used, time_used_seconds, created_at_ms, updated_at_ms FROM thread_goals WHERE thread_id = ?",
+        ).bind(id.to_string()).fetch_one(&mut *reader).await.unwrap();
+        assert_eq!(
+            snapshot, original,
+            "held reader retains its coherent old snapshot"
+        );
+        reader.commit().await.unwrap();
+        assert!(
+            sqlx::query("UPDATE thread_goals SET tokens_used = tokens_used + 1")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "old writers must be fenced before the new owner accepts edits"
+        );
+        pool.close().await;
+        let goal = runtime
+            .thread_goals
+            .get_thread_goal(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal.goal_id, "stable-goal-id");
+        assert_eq!(goal.objective, "preserve objective");
+        assert_eq!(goal.status, crate::ThreadGoalStatus::Blocked);
+        assert_eq!(goal.token_budget, Some(9000));
+        assert_eq!(goal.tokens_used, 400);
+        assert_eq!(goal.time_used_seconds, 25);
+        let transferred: (String, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT goal_id, tokens_used, time_used_seconds, created_at_ms, updated_at_ms FROM thread_goals WHERE thread_id = ?",
+        ).bind(id.to_string()).fetch_one(runtime.thread_goals.pool.as_ref()).await.unwrap();
+        assert_eq!(transferred, original);
+        runtime
+            .thread_goals
+            .replace_thread_goal(id, "new goal", crate::ThreadGoalStatus::Active, None)
+            .await
+            .unwrap();
+        peer.close().await;
+        runtime.close().await;
+        let reopened = StateRuntime::init(home, "test-provider".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .thread_goals
+                .get_thread_goal(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .objective,
+            "new goal"
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_goal_transfer_retries_equal_rows_but_retains_conflicts() {
+        let home = tempfile::tempdir().unwrap();
+        let source = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(base_sqlite_options(&home.path().join("source.sqlite")))
+            .await
+            .unwrap();
+        let target = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(base_sqlite_options(&home.path().join("target.sqlite")))
+            .await
+            .unwrap();
+        let mut legacy = runtime_goals_migrator();
+        legacy
+            .migrations
+            .to_mut()
+            .retain(|migration| migration.version == 1);
+        legacy.run(&source).await.unwrap();
+        runtime_goals_migrator().run(&target).await.unwrap();
+        sqlx::query("ALTER TABLE thread_goals RENAME TO codex_legacy_thread_goals_pending")
+            .execute(&source)
+            .await
+            .unwrap();
+        // Cross the bounded-fetch boundary and retain all accounting fields.
+        sqlx::query("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 1000) INSERT INTO codex_legacy_thread_goals_pending SELECT printf('thread-%04d', i), printf('goal-%04d', i), 'objective', 'active', NULL, i, 25, 1000, 2000 FROM n")
+            .execute(&source).await.unwrap();
+        // The destination may have committed before a process lost its source
+        // receipt. Equal rows are safe retries, not a reason to overwrite.
+        sqlx::query("INSERT INTO thread_goals VALUES ('thread-0000', 'goal-0000', 'objective', 'active', NULL, 0, 25, 1000, 2000, NULL)")
+            .execute(&target).await.unwrap();
+        sqlx::query("INSERT INTO thread_goals VALUES ('thread-1000', 'new-goal', 'new objective', 'paused', NULL, 7, 8, 3000, 4000, NULL)")
+            .execute(&target).await.unwrap();
+        let error = transfer_legacy_goals(&source, &target).await.unwrap_err();
+        assert!(error.to_string().contains("legacy goal transfer conflict"));
+        let source_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM codex_legacy_thread_goals_pending")
+                .fetch_one(&source)
+                .await
+                .unwrap();
+        assert_eq!(source_count, 1001, "conflict retains the entire source");
+        let target_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_goals")
+            .fetch_one(&target)
+            .await
+            .unwrap();
+        assert_eq!(
+            target_count, 2,
+            "partial destination changes must roll back"
+        );
+        let newer: String = sqlx::query_scalar(
+            "SELECT objective FROM thread_goals WHERE thread_id = 'thread-1000'",
+        )
+        .fetch_one(&target)
+        .await
+        .unwrap();
+        assert_eq!(newer, "new objective");
+        sqlx::query("DELETE FROM thread_goals WHERE thread_id = 'thread-1000'")
+            .execute(&target)
+            .await
+            .unwrap();
+        transfer_legacy_goals(&source, &target).await.unwrap();
+        type Goal = (
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            i64,
+            i64,
+            i64,
+            i64,
+        );
+        let retained: Vec<Goal> = sqlx::query_as(
+            "SELECT * FROM codex_legacy_thread_goals_transferred ORDER BY thread_id",
+        )
+        .fetch_all(&source)
+        .await
+        .unwrap();
+        let copied: Vec<Goal> = sqlx::query_as("SELECT * FROM thread_goals ORDER BY thread_id")
+            .fetch_all(&target)
+            .await
+            .unwrap();
+        assert_eq!(copied, retained);
+        sqlx::query("DELETE FROM thread_goals")
+            .execute(&target)
+            .await
+            .unwrap();
+        transfer_legacy_goals(&source, &target).await.unwrap();
+        let cleared: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM thread_goals")
+            .fetch_one(&target)
+            .await
+            .unwrap();
+        assert_eq!(
+            cleared, 0,
+            "completed handoffs must not resurrect explicitly cleared goals"
+        );
+        source.close().await;
+        target.close().await;
+    }
+
     async fn test_runtime() -> std::sync::Arc<StateRuntime> {
         StateRuntime::init(unique_temp_dir(), "test-provider".to_string())
             .await
@@ -644,13 +1027,18 @@ mod tests {
         };
         assert_eq!(expected, updated);
 
-        let accounted = runtime.thread_goals().account_thread_goal_usage(
-            thread_id, 12, 30, GoalAccountingMode::ActiveOrStopped, None,
-        ).await.expect("account paused in-flight usage");
+        let accounted = runtime
+            .thread_goals()
+            .account_thread_goal_usage(thread_id, 12, 30, GoalAccountingMode::ActiveOrStopped, None)
+            .await
+            .expect("account paused in-flight usage");
         let GoalAccountingOutcome::Updated(accounted) = accounted else {
             panic!("paused goal should account in-flight usage");
         };
-        assert_eq!((accounted.time_used_seconds, accounted.tokens_used), (12, 30));
+        assert_eq!(
+            (accounted.time_used_seconds, accounted.tokens_used),
+            (12, 30)
+        );
         let replaced = runtime
             .thread_goals()
             .replace_thread_goal(
@@ -1279,30 +1667,66 @@ END
         let runtime = test_runtime().await;
         let thread_id = test_thread_id();
         upsert_test_thread(&runtime, thread_id).await;
-        for status in [crate::ThreadGoalStatus::Paused, crate::ThreadGoalStatus::Blocked] {
+        for status in [
+            crate::ThreadGoalStatus::Paused,
+            crate::ThreadGoalStatus::Blocked,
+        ] {
             for token_budget in [None, Some(Some(40))] {
-                runtime.thread_goals().replace_thread_goal(
-                    thread_id, "stay within budget", crate::ThreadGoalStatus::Active, Some(40),
-                ).await.expect("replace goal");
-                let outcome = runtime.thread_goals().account_thread_goal_usage(
-                    thread_id, 1, 50, GoalAccountingMode::ActiveOnly, None,
-                ).await.expect("account usage");
+                runtime
+                    .thread_goals()
+                    .replace_thread_goal(
+                        thread_id,
+                        "stay within budget",
+                        crate::ThreadGoalStatus::Active,
+                        Some(40),
+                    )
+                    .await
+                    .expect("replace goal");
+                let outcome = runtime
+                    .thread_goals()
+                    .account_thread_goal_usage(
+                        thread_id,
+                        1,
+                        50,
+                        GoalAccountingMode::ActiveOnly,
+                        None,
+                    )
+                    .await
+                    .expect("account usage");
                 let GoalAccountingOutcome::Updated(budget_limited) = outcome else {
                     panic!("budget crossing should update the goal");
                 };
-                assert_eq!(budget_limited.status, crate::ThreadGoalStatus::BudgetLimited);
-                let updated = runtime.thread_goals().update_thread_goal(thread_id, GoalUpdate {
-                    objective: None,
-                    status: Some(status),
-                    token_budget,
-                    expected_goal_id: None,
-                }).await.expect("update goal").expect("goal exists");
+                assert_eq!(
+                    budget_limited.status,
+                    crate::ThreadGoalStatus::BudgetLimited
+                );
+                let updated = runtime
+                    .thread_goals()
+                    .update_thread_goal(
+                        thread_id,
+                        GoalUpdate {
+                            objective: None,
+                            status: Some(status),
+                            token_budget,
+                            expected_goal_id: None,
+                        },
+                    )
+                    .await
+                    .expect("update goal")
+                    .expect("goal exists");
                 let expected = crate::ThreadGoal {
                     updated_at: updated.updated_at,
                     ..budget_limited
                 };
                 assert_eq!(updated, expected, "{status:?}, {token_budget:?}");
-                assert_eq!(runtime.thread_goals().get_thread_goal(thread_id).await.unwrap(), Some(expected));
+                assert_eq!(
+                    runtime
+                        .thread_goals()
+                        .get_thread_goal(thread_id)
+                        .await
+                        .unwrap(),
+                    Some(expected)
+                );
             }
         }
         runtime.close().await;

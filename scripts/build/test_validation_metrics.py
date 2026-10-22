@@ -1,4 +1,5 @@
 """Validation ledger regression tests; no Cargo builds or test binaries."""
+
 from __future__ import annotations
 
 import contextlib
@@ -23,37 +24,115 @@ from scripts.build.test_rust_test_runner import RunnerTestCase
 def record(run_id="run-1", **updates):
     ledger = metrics.ValidationMetrics(["run-target", "example"], clock=lambda: 10)
     value = ledger.record
-    value.update(run_id=run_id, started_at="2026-10-04T10:00:00+00:00",
-                 finished_at="2026-10-04T10:00:10+00:00",
-                 outcome="passed", lifecycle_seconds=10)
+    value.update(
+        run_id=run_id,
+        started_at="2026-10-04T10:00:00+00:00",
+        finished_at="2026-10-04T10:00:10+00:00",
+        outcome="passed",
+        lifecycle_seconds=10,
+    )
     value["proof"]["obligations"] = ["example"]
     value.update(updates)
     return value
 
 
 class SummaryTest(unittest.TestCase):
+    def test_wall_rollback_retains_monotonic_work_without_chronology_claims(self):
+        clock = iter([100, 102])
+        observer = metrics.ValidationMetrics(["owned"], clock=lambda: next(clock))
+        observer.record["started_at"] = "9999-01-01T00:00:00+00:00"
+        with contextlib.redirect_stderr(io.StringIO()):
+            observer.finish("passed")
+        value = observer.record
+        value.update(
+            started_at="2026-10-04T10:00:00+00:00",
+            finished_at="2026-10-04T09:59:55+00:00",
+        )
+        later = copy.deepcopy(value)
+        later.update(
+            run_id="later",
+            started_at="2026-10-04T10:01:00+00:00",
+            finished_at="2026-10-04T10:01:02+00:00",
+            reason="redundant",
+            reason_basis={"prior_run_id": value["run_id"]},
+        )
+        report = metrics.summarize([value, later])
+        self.assertEqual(report["work"]["lifecycle"]["seconds"], 4)
+        self.assertEqual(report["wall_clock_status"][value["run_id"]], "regressed")
+        self.assertEqual(report["wall_clock_status"]["later"], "ordered")
+        self.assertEqual(report["repeat_observations"], [])
+        self.assertEqual(report["redundant_reruns"], 0)
+
+    def test_outer_envelope_does_not_doublecount_the_inner_runner(self):
+        outer = record(
+            "request",
+            producer="rust_build_status",
+            lifecycle_seconds=15,
+            parent_run_id=None,
+            executed=True,
+            queued=False,
+        )
+        inner = record("runner", parent_run_id="request", lifecycle_seconds=10)
+        busy = record(
+            "busy",
+            producer="rust_build_status",
+            outcome="busy",
+            lifecycle_seconds=2,
+            parent_run_id=None,
+            executed=False,
+            queued=False,
+        )
+        report = metrics.summarize([outer, inner, busy, copy.deepcopy(outer)])
+        self.assertEqual(report["requests"], 2)
+        self.assertEqual(report["launches"], 1)
+        self.assertEqual(report["request_outcomes"], {"busy": 1, "passed": 1})
+        self.assertEqual(report["work"]["request_lifecycle"]["seconds"], 17)
+        self.assertEqual(report["work"]["lifecycle"]["seconds"], 10)
+        self.assertEqual(report["child_commands"], 0)
+        self.assertEqual(report["launches_producing_current_proof"], 0)
+
     def test_successful_validation_work_is_not_elapsed_time_to_proof(self):
-        failure = record(outcome="failed", lifecycle_seconds=60,
-                         finished_at="2026-10-04T10:01:00+00:00")
-        success = record("success", input_coverage="complete", input_digest="a" * 64,
-                         started_at="2026-10-04T10:02:00+00:00",
-                         finished_at="2026-10-04T10:02:10+00:00")
-        success["proof"].update(status="passed", freshness="current", coverage="verified",
-                                freshness_basis={"revision": "r1"})
+        failure = record(
+            outcome="failed",
+            lifecycle_seconds=60,
+            finished_at="2026-10-04T10:01:00+00:00",
+        )
+        success = record(
+            "success",
+            input_coverage="complete",
+            input_digest="a" * 64,
+            started_at="2026-10-04T10:02:00+00:00",
+            finished_at="2026-10-04T10:02:10+00:00",
+        )
+        success["proof"].update(
+            status="passed",
+            freshness="current",
+            coverage="verified",
+            freshness_basis={"revision": "r1"},
+        )
         report = metrics.summarize([failure, success])
         self.assertNotIn("time_to_current_proof", report["work"])
-        self.assertEqual(report["work"]["successful_current_validation_lifecycle"]["seconds"], 10)
+        self.assertEqual(
+            report["work"]["successful_current_validation_lifecycle"]["seconds"], 10
+        )
         self.assertEqual(report["work"]["lifecycle"]["seconds"], 70)
         overlap = copy.deepcopy(success)
         overlap["run_id"] = "overlap"
         report = metrics.summarize([success, overlap])
-        self.assertEqual(report["work"]["successful_current_validation_lifecycle"]["seconds"], 20)
+        self.assertEqual(
+            report["work"]["successful_current_validation_lifecycle"]["seconds"], 20
+        )
         self.assertTrue(any("turn timing" in text for text in report["limitations"]))
 
     def test_unknown_is_not_zero_or_current_proof(self):
         value = record()
-        value["commands"] = [{"wall_seconds": 7, "reported_build_seconds": 5,
-                              "reported_test_seconds": .5}]
+        value["commands"] = [
+            {
+                "wall_seconds": 7,
+                "reported_build_seconds": 5,
+                "reported_test_seconds": 0.5,
+            }
+        ]
         value["phases"]["admission"] = 1
         report = metrics.summarize([value, copy.deepcopy(value)])
         self.assertEqual(report["launches"], 1)
@@ -77,30 +156,55 @@ class SummaryTest(unittest.TestCase):
             with self.subTest(duration=duration), self.assertRaises(ValueError):
                 metrics.summarize([record(lifecycle_seconds=duration)])
 
-    def test_repeat_observations_do_not_infer_causal_reason_from_incomplete_history(self):
+    def test_repeat_observations_do_not_infer_causal_reason_from_incomplete_history(
+        self,
+    ):
         for outcome in ("failed", "cancelled", "timed_out"):
             previous = record(outcome=outcome)
-            current = record("run-2", started_at="2026-10-04T10:01:00+00:00",
-                             finished_at="2026-10-04T10:01:10+00:00")
+            current = record(
+                "run-2",
+                started_at="2026-10-04T10:01:00+00:00",
+                finished_at="2026-10-04T10:01:10+00:00",
+            )
             report = metrics.summarize([current, previous])
             self.assertEqual(report["reasons"], {"unknown": 2})
             self.assertEqual(report["justified_reruns"], 0)
-            self.assertEqual(report["repeat_observations"][0]["previous_outcome"], outcome)
+            self.assertEqual(
+                report["repeat_observations"][0]["previous_outcome"], outcome
+            )
             current["proof"]["obligations"] = ["unrelated"]
-            self.assertEqual(metrics.summarize([previous, current])["repeat_observations"], [])
+            self.assertEqual(
+                metrics.summarize([previous, current])["repeat_observations"], []
+            )
             current["proof"]["obligations"] = ["example"]
             previous["finished_at"] = "2026-10-04T10:02:00+00:00"
-            self.assertEqual(metrics.summarize([previous, current])["repeat_observations"], [])
+            self.assertEqual(
+                metrics.summarize([previous, current])["repeat_observations"], []
+            )
 
     def test_current_proof_redundancy_and_reuse_are_separate_dimensions(self):
-        previous = record(input_coverage="complete", input_digest="a" * 64, prerequisite_ids=[])
-        previous["proof"].update(status="passed", freshness="current", coverage="verified",
-                                 freshness_basis={"revision": "r1"}, covered_paths=["src"])
+        previous = record(
+            input_coverage="complete", input_digest="a" * 64, prerequisite_ids=[]
+        )
+        previous["proof"].update(
+            status="passed",
+            freshness="current",
+            coverage="verified",
+            freshness_basis={"revision": "r1"},
+            covered_paths=["src"],
+        )
         current = copy.deepcopy(previous)
-        current.update(run_id="run-2", started_at="2026-10-04T10:01:00+00:00",
-                       finished_at="2026-10-04T10:01:10+00:00", reason="redundant",
-                       reason_basis={"prior_run_id": "run-1", "prior_proof_current_at_launch": True,
-                                     "no_repeat_requirement": True})
+        current.update(
+            run_id="run-2",
+            started_at="2026-10-04T10:01:00+00:00",
+            finished_at="2026-10-04T10:01:10+00:00",
+            reason="redundant",
+            reason_basis={
+                "prior_run_id": "run-1",
+                "prior_proof_current_at_launch": True,
+                "no_repeat_requirement": True,
+            },
+        )
         report = metrics.summarize([current, previous])
         self.assertEqual(report["redundant_reruns"], 1)
         self.assertEqual(report["launches_producing_current_proof"], 1)
@@ -123,10 +227,15 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(report["proof_freshness"], {"unknown": 1})
         value.update(input_coverage="complete", input_digest="a" * 64)
         value["proof"].update(coverage="verified", freshness_basis={"revision": "r1"})
-        self.assertEqual(metrics.summarize([value])["launches_producing_current_proof"], 1)
+        self.assertEqual(
+            metrics.summarize([value])["launches_producing_current_proof"], 1
+        )
         for section, field in (
-            (None, "input_coverage"), (None, "input_digest"),
-            ("proof", "coverage"), ("proof", "freshness_basis"), ("proof", "obligations"),
+            (None, "input_coverage"),
+            (None, "input_digest"),
+            ("proof", "coverage"),
+            ("proof", "freshness_basis"),
+            ("proof", "obligations"),
         ):
             with self.subTest(section=section, field=field):
                 incomplete = copy.deepcopy(value)
@@ -136,17 +245,30 @@ class SummaryTest(unittest.TestCase):
                 self.assertEqual(report["proof_freshness"], {"unknown": 1})
 
     def test_reason_and_proof_are_independent_and_timestamps_are_normalized(self):
-        value = record(reason="inputs_changed", reason_basis={"changed_inputs": ["src/a"]})
+        value = record(
+            reason="inputs_changed", reason_basis={"changed_inputs": ["src/a"]}
+        )
         report = metrics.summarize([value])
         self.assertEqual(report["justified_reruns"], 1)
         self.assertEqual(report["launches_producing_current_proof"], 0)
-        second = record("run-2", started_at="2026-10-04T06:01:00-04:00",
-                        finished_at="2026-10-04T06:01:10-04:00")
+        second = record(
+            "run-2",
+            started_at="2026-10-04T06:01:00-04:00",
+            finished_at="2026-10-04T06:01:10-04:00",
+        )
         report = metrics.summarize([second, value])
         self.assertEqual([r["run_id"] for r in report["records"]], ["run-1", "run-2"])
-        for malformed in (None, [], {"kind": metrics.KIND}, record(reason_basis=[]),
-                          record(started_at="2026-10-04T10:00:00")):
-            with self.subTest(malformed=malformed), self.assertRaises((ValueError, KeyError)):
+        for malformed in (
+            None,
+            [],
+            {"kind": metrics.KIND},
+            record(reason_basis=[]),
+            record(started_at="2026-10-04T10:00:00"),
+        ):
+            with (
+                self.subTest(malformed=malformed),
+                self.assertRaises((ValueError, KeyError)),
+            ):
                 metrics.summarize([malformed])
 
 
@@ -163,11 +285,24 @@ class PersistenceTest(unittest.TestCase):
             reference = json.loads(stderr.getvalue())
             raw = ledger.path.read_bytes()
             self.assertEqual(reference["sha256"], hashlib.sha256(raw).hexdigest())
-            output = json.dumps({"stderr": stderr.getvalue(), "stdout": "Ran 123 tests in 12.0s\nOK"})
+            output = json.dumps(
+                {"stderr": stderr.getvalue(), "stdout": "Ran 123 tests in 12.0s\nOK"}
+            )
             rollout = root / "rollout.jsonl"
-            rollout.write_text(json.dumps({"type": "response_item", "payload": {
-                "type": "function_call_output", "call_id": "call-1", "output": output,
-            }}) + "\n", encoding="utf-8")
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": "call-1",
+                            "output": output,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             records, coverage, unresolved = metrics.read_inputs([root])
             self.assertEqual(len(coverage), 2)
             self.assertEqual(unresolved, [])
@@ -192,7 +327,9 @@ class PersistenceTest(unittest.TestCase):
 
     def test_retention_failure_preserves_inline_ledger(self):
         ledger = metrics.ValidationMetrics(["test"])
-        with mock.patch.object(metrics, "write_json_atomic", side_effect=OSError("unavailable")):
+        with mock.patch.object(
+            metrics, "write_json_atomic", side_effect=OSError("unavailable")
+        ):
             with contextlib.redirect_stderr(io.StringIO()):
                 ledger.bind(Path("unused"))
         self.assertIsNone(ledger.path)
@@ -225,7 +362,10 @@ class PersistenceTest(unittest.TestCase):
         # range used for timing reports. Reject them like other bad durations,
         # rather than leaking a conversion traceback from the CLI.
         for location in ("lifecycle", "phase", "command"):
-            with self.subTest(location=location), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(location=location),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 value = record()
                 if location == "lifecycle":
                     value["lifecycle_seconds"] = 2**2048
@@ -236,7 +376,10 @@ class PersistenceTest(unittest.TestCase):
                 path = Path(temporary) / "validation-fixture.json"
                 path.write_text(json.dumps(value), encoding="utf-8")
                 stdout, stderr = io.StringIO(), io.StringIO()
-                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with (
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                ):
                     self.assertEqual(metrics.main([str(path), "--json"]), 2)
                 self.assertEqual(stdout.getvalue(), "")
                 self.assertIn("duration", stderr.getvalue())
@@ -247,15 +390,24 @@ class PersistenceTest(unittest.TestCase):
             path = Path(temporary) / "rollout.jsonl"
             rows = []
             for index, kind in enumerate(kinds):
-                rows.append({"type": "response_item", "payload": {
-                    "type": "function_call_output",
-                    "output": json.dumps({
-                        "kind": kind,
-                        "stdout": json.dumps(record(f"run-{index}")),
-                        "arguments": json.dumps(record("not-an-output")),
-                    }),
-                }})
-            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+                rows.append(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "output": json.dumps(
+                                {
+                                    "kind": kind,
+                                    "stdout": json.dumps(record(f"run-{index}")),
+                                    "arguments": json.dumps(record("not-an-output")),
+                                }
+                            ),
+                        },
+                    }
+                )
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(metrics.main([str(path), "--json"]), 0)
@@ -276,20 +428,33 @@ class PersistenceTest(unittest.TestCase):
             invalid_ledger = root / "not-a-ledger.json"
             invalid_ledger.write_bytes(b"[]")
             bad_reference = {
-                "kind": metrics.REF_KIND, "path": str(invalid_ledger),
-                "bytes": 2, "sha256": hashlib.sha256(b"[]").hexdigest(),
+                "kind": metrics.REF_KIND,
+                "path": str(invalid_ledger),
+                "bytes": 2,
+                "sha256": hashlib.sha256(b"[]").hexdigest(),
                 "run_id": "invalid",
             }
             malformed = [
                 {"type": "response_item", "payload": value}
                 for value in (None, [], "text", 1)
             ]
-            malformed.extend({"type": "response_item", "payload": {
-                "type": "function_call_output", "output": packet,
-            }} for packet in (bad_reference, {**bad_reference, "path": []}))
+            malformed.extend(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "output": packet,
+                    },
+                }
+                for packet in (bad_reference, {**bad_reference, "path": []})
+            )
             malformed.append({"type": "rollout_payload_artifact", "payload": None})
             good = record("surviving-run")
-            rows = [*malformed, {"type": "response_item", "payload": {"type": []}}, good]
+            rows = [
+                *malformed,
+                {"type": "response_item", "payload": {"type": []}},
+                good,
+            ]
             raw = "".join(json.dumps(row) + "\n" for row in rows).encode()
             path = root / "rollout.jsonl"
             path.write_bytes(raw)
@@ -299,18 +464,29 @@ class PersistenceTest(unittest.TestCase):
             report = json.loads(output.getvalue())
             self.assertEqual(report["records"], [good])
             self.assertEqual(report["launches"], 1)
-            self.assertEqual([row["line"] for row in report["unresolved"]],
-                             list(range(1, len(malformed) + 1)))
+            self.assertEqual(
+                [row["line"] for row in report["unresolved"]],
+                list(range(1, len(malformed) + 1)),
+            )
             self.assertTrue(all(row["error"] for row in report["unresolved"]))
-            self.assertEqual(report["coverage"], [{
-                "path": str(path), "records": len(rows), "bytes": len(raw),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-            }])
+            self.assertEqual(
+                report["coverage"],
+                [
+                    {
+                        "path": str(path),
+                        "records": len(rows),
+                        "bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                ],
+            )
 
     def test_source_strings_are_not_metrics(self):
         value = record()
         self.assertEqual(list(metrics._packets({"arguments": json.dumps(value)})), [])
-        self.assertEqual(list(metrics._packets("test result: ok. 4 passed; 0 failed")), [])
+        self.assertEqual(
+            list(metrics._packets("test result: ok. 4 passed; 0 failed")), []
+        )
 
 
 class RunnerMetricsTest(RunnerTestCase):
@@ -323,34 +499,81 @@ class RunnerMetricsTest(RunnerTestCase):
         def execute(args, **kwargs):
             if outcome in {"cancelled", "timed_out", "cleanup_failed"}:
                 raise runner.RunnerError("fixture", outcome=outcome)
-            return subprocess.CompletedProcess(args, 1 if outcome == "failed" else 0,
-                "", "Finished test profile in 2s\nSummary [ 0.2s] 1 tests run: 1 passed\n")
+            return subprocess.CompletedProcess(
+                args,
+                1 if outcome == "failed" else 0,
+                "",
+                "Finished test profile in 2s\nSummary [ 0.2s] 1 tests run: 1 passed\n",
+            )
 
         instance.executor = execute
 
         def target(*args, **kwargs):
-            instance._checked(["cargo", "nextest", "run"], env={}, capture=runner.CAPTURE_BOTH)
+            instance._checked(
+                ["cargo", "nextest", "run"], env={}, capture=runner.CAPTURE_BOTH
+            )
             return {"example": ["test"]}
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(runner.Manifest, "load", return_value=instance.manifest))
-            stack.enter_context(mock.patch.object(runner, "load_metadata", return_value=instance.metadata))
-            stack.enter_context(mock.patch.object(runner, "RustTestRunner", return_value=instance))
-            stack.enter_context(mock.patch.object(instance, "run_target", side_effect=target))
-            stack.enter_context(mock.patch.object(runner, "execution_dependency_manifest",
-                return_value={"coverage": "declared_not_exhaustive", "automatic_replay_allowed": False}))
+            stack.enter_context(
+                mock.patch.object(
+                    runner.Manifest, "load", return_value=instance.manifest
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    runner, "load_metadata", return_value=instance.metadata
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(runner, "RustTestRunner", return_value=instance)
+            )
+            stack.enter_context(
+                mock.patch.object(instance, "run_target", side_effect=target)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    runner,
+                    "execution_dependency_manifest",
+                    return_value={
+                        "coverage": "declared_not_exhaustive",
+                        "automatic_replay_allowed": False,
+                    },
+                )
+            )
             if admission_error is not None:
-                stack.enter_context(mock.patch.object(rust_build_status, "reserve_rust_test_target", side_effect=admission_error))
+                stack.enter_context(
+                    mock.patch.object(
+                        rust_build_status,
+                        "reserve_rust_test_target",
+                        side_effect=admission_error,
+                    )
+                )
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
-            code = runner.main(["--manifest", str(manifest), "--admission-timeout-seconds", str(wait_seconds),
-                                "run-target", "core_all", "-E", "test(one)"])
-        reference = next(json.loads(line) for line in stderr.getvalue().splitlines()
-                         if line.startswith('{"bytes":') and metrics.REF_KIND in line)
+            code = runner.main(
+                [
+                    "--manifest",
+                    str(manifest),
+                    "--admission-timeout-seconds",
+                    str(wait_seconds),
+                    "run-target",
+                    "core_all",
+                    "-E",
+                    "test(one)",
+                ]
+            )
+        reference = next(
+            json.loads(line)
+            for line in stderr.getvalue().splitlines()
+            if line.startswith('{"bytes":') and metrics.REF_KIND in line
+        )
         value = json.loads(Path(reference["path"]).read_text())
         return code, value, stdout.getvalue()
 
-    def test_real_dispatch_links_success_receipt_and_lifecycle_without_claiming_freshness(self):
+    def test_real_dispatch_links_success_receipt_and_lifecycle_without_claiming_freshness(
+        self,
+    ):
         code, value, stdout = self.invoke()
         self.assertEqual(code, 0)
         receipt = json.loads(stdout)
@@ -364,7 +587,7 @@ class RunnerMetricsTest(RunnerTestCase):
         self.assertIsNotNone(value["phases"]["admission"])
         self.assertIsNotNone(value["phases"]["preparation"])
         self.assertEqual(value["commands"][0]["reported_build_seconds"], 2)
-        self.assertEqual(value["commands"][0]["reported_test_seconds"], .2)
+        self.assertEqual(value["commands"][0]["reported_test_seconds"], 0.2)
         self.assertIsNone(value["commands"][0]["cleanup_seconds"])
         self.assertFalse(rust_build_status.cargo_lock_is_busy(self.target_dir))
 
@@ -389,7 +612,7 @@ class RunnerMetricsTest(RunnerTestCase):
 
     def test_busy_and_expired_wait_preserve_pending_selection_without_execution(self):
         with rust_build_status.reserve_rust_test_target(self.target_dir):
-            for wait in (0, .02):
+            for wait in (0, 0.02):
                 with self.subTest(wait=wait):
                     code, value, stdout = self.invoke(wait_seconds=wait)
                     self.assertEqual(code, 75)
@@ -401,10 +624,21 @@ class RunnerMetricsTest(RunnerTestCase):
                     self.assertEqual(value["proof"]["completed_tests"], {})
                     status = value["admission"]
                     self.assertEqual(status["selected_targets"], ["core_all"])
-                    self.assertEqual(status["invocation"][-4:], ["run-target", "core_all", "-E", "test(one)"])
-                    for flag in ("executed", "queued", "automatic_retry", "automatic_resume"):
+                    self.assertEqual(
+                        status["invocation"][-4:],
+                        ["run-target", "core_all", "-E", "test(one)"],
+                    )
+                    for flag in (
+                        "executed",
+                        "queued",
+                        "automatic_retry",
+                        "automatic_resume",
+                    ):
                         self.assertIs(status[flag], False)
-                    self.assertEqual(metrics.summarize([value])["launches_producing_current_proof"], 0)
+                    self.assertEqual(
+                        metrics.summarize([value])["launches_producing_current_proof"],
+                        0,
+                    )
             self.assertTrue(rust_build_status.cargo_lock_is_busy(self.target_dir))
         # A later explicit invocation executes once; nothing ran in the background.
         code, value, _ = self.invoke()
@@ -420,8 +654,15 @@ class RunnerMetricsTest(RunnerTestCase):
             with self.subTest(timeout=timeout):
                 try:
                     runner._default_executor(
-                        [sys.executable, "-c", "import time; time.sleep(5)" if timeout else "print('ok')"],
-                        cwd=self.temp_dir, env=env, capture=runner.CAPTURE_BOTH, timings=timings,
+                        [
+                            sys.executable,
+                            "-c",
+                            "import time; time.sleep(5)" if timeout else "print('ok')",
+                        ],
+                        cwd=self.temp_dir,
+                        env=env,
+                        capture=runner.CAPTURE_BOTH,
+                        timings=timings,
                     )
                 except runner.RunnerError as error:
                     self.assertTrue(timeout)
@@ -434,4 +675,3 @@ class RunnerMetricsTest(RunnerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -128,6 +128,7 @@ impl SessionStartupPrewarmHandle {
         let age_at_first_turn = started_at.elapsed();
 
         let resolution = if cancellation_token.is_cancelled() {
+            startup_timing.cutoff_speculative_prewarm("cancelled");
             task.abort();
             let _ = task.await;
             SessionStartupPrewarmResolution::Cancelled
@@ -136,6 +137,7 @@ impl SessionStartupPrewarmHandle {
         } else {
             // A speculative startup request must never delay ordinary dispatch. Reuse it only
             // when it has already completed; otherwise the regular turn owns the transport.
+            startup_timing.cutoff_speculative_prewarm("not_ready");
             task.abort();
             drop(task);
             info!("startup websocket prewarm was not ready at first-turn handoff");
@@ -273,10 +275,16 @@ impl Session {
     /// transport configuration are stable. Tool and prompt construction intentionally do
     /// not participate in this key or gate this work.
     pub(crate) async fn schedule_startup_transport_preconnect(self: &Arc<Self>) {
+        let cancellation = self.startup_cancellation.clone();
         if !self.services.model_client.startup_websocket_enabled() {
             let model_client = self.services.model_client.clone();
             let task = tokio::spawn(async move {
-                if let Err(err) = model_client.prewarm_auth().await {
+                let auth = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
+                    auth = model_client.prewarm_auth() => auth,
+                };
+                if let Err(err) = auth {
                     warn!("startup auth prewarm failed: {err:#}");
                 }
                 Ok(model_client.new_speculative_session())
@@ -311,14 +319,18 @@ impl Session {
                 &model_info,
             );
             let mut client_session = model_client.new_speculative_session();
-            let result = client_session
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(CodexErr::TurnAborted),
+                result = client_session
                 .preconnect_websocket(
                     &model_info,
                     service_tier,
                     &session_telemetry,
                     &responses_metadata,
                 )
-                .await;
+                => result,
+            };
             startup_timing.record_prewarm_status(if result.is_ok() {
                 "transport_ready"
             } else {
@@ -340,6 +352,7 @@ impl Session {
         let session_telemetry = self.services.session_telemetry.clone();
         let started_at = Instant::now();
         let startup_prewarm_session = Arc::clone(self);
+        let cancellation = self.startup_cancellation.clone();
         // HTTP authentication remains session-owned until shutdown. Preparing a
         // router must neither wait for it nor abort it by dropping its handle.
         let startup_transport = if self.services.model_client.startup_websocket_enabled() {
@@ -348,12 +361,16 @@ impl Session {
             None
         };
         let startup_prewarm = tokio::spawn(async move {
-            let result = schedule_startup_prewarm_inner(
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Ok(None),
+                result = schedule_startup_prewarm_inner(
                 startup_prewarm_session,
                 base_instructions,
                 startup_transport,
             )
-            .await;
+                => result,
+            };
             let status = match &result {
                 Ok(Some(_)) => "ready",
                 Ok(None) => "disabled",
@@ -381,17 +398,21 @@ impl Session {
     /// Warms the code-mode host in the background so the first cell of the
     /// first turn does not wait for isolate and host startup. This is
     /// independent of tool-router and model prewarm above.
-    pub(crate) fn schedule_code_mode_prewarm(self: &Arc<Self>, config: &Config) {
-        if !(config.features.enabled(Feature::CodeMode)
-            || config.features.enabled(Feature::CodeModeOnly))
-            || !self.services.code_mode_service.is_available()
-        {
+    pub(crate) fn schedule_code_mode_prewarm(
+        self: &Arc<Self>,
+        turn: &crate::session::turn_context::TurnContext,
+    ) {
+        if !code_mode_prewarm_enabled(turn) {
             return;
         }
         let session = Arc::clone(self);
         tokio::spawn(async move {
             let started_at = Instant::now();
-            let result = session.services.code_mode_service.prewarm().await;
+            let result = tokio::select! {
+                biased;
+                _ = session.startup_cancellation.cancelled() => return,
+                result = session.services.code_mode_service.prewarm() => result,
+            };
             let status = if result.is_ok() { "ready" } else { "failed" };
             session.services.session_telemetry.record_startup_phase(
                 CODE_MODE_PREWARM_PHASE,
@@ -437,6 +458,12 @@ async fn resolve_startup_transport(
     }
 }
 
+fn code_mode_prewarm_enabled(turn: &crate::session::turn_context::TurnContext) -> bool {
+    turn.code_mode_available
+        && crate::tools::effective_tool_mode(turn)
+            != codex_protocol::openai_models::ToolMode::Direct
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -445,6 +472,32 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     struct DropSignal(Arc<AtomicBool>);
+
+    #[tokio::test]
+    async fn code_mode_prewarm_uses_resolved_model_mode_and_availability() {
+        use codex_protocol::openai_models::ToolMode;
+
+        let (_, mut turn) = crate::session::tests::make_session_and_context().await;
+        for (flags, model_mode, available, expected) in [
+            (true, Some(ToolMode::Direct), true, false),
+            (false, Some(ToolMode::CodeMode), true, true),
+            (false, Some(ToolMode::CodeModeOnly), true, true),
+            (true, None, true, true),
+            (false, None, true, false),
+            (true, Some(ToolMode::CodeMode), false, false),
+            (false, Some(ToolMode::CodeModeOnly), false, false),
+        ] {
+            let config = Arc::make_mut(&mut turn.config);
+            config
+                .features
+                .set_enabled(Feature::CodeMode, flags)
+                .unwrap();
+            config.features.disable(Feature::CodeModeOnly).unwrap();
+            turn.model_info.tool_mode = model_mode;
+            turn.code_mode_available = available;
+            assert_eq!(code_mode_prewarm_enabled(&turn), expected);
+        }
+    }
 
     #[tokio::test]
     async fn non_websocket_startup_prepares_router_without_a_model_request() {
@@ -632,6 +685,9 @@ async fn schedule_startup_prewarm_inner(
     let startup_turn_context = session
         .new_startup_prewarm_turn_with_sub_id(INITIAL_SUBMIT_ID.to_owned())
         .await;
+    // Reuse the exact resolved model used for startup planning; feature flags
+    // alone do not determine whether the model exposes code-mode execution.
+    session.schedule_code_mode_prewarm(startup_turn_context.as_ref());
     startup_turn_context.session_telemetry.record_startup_phase(
         "startup_prewarm_create_turn_context",
         prewarm_started_at.elapsed(),
@@ -639,12 +695,23 @@ async fn schedule_startup_prewarm_inner(
     );
 
     let startup_cancellation_token = CancellationToken::new();
-    let planning_generation = session.services.planning_generation();
+    let mut planning_generation = session.services.planning_generation();
     let built_tools_started_at = Instant::now();
     // Startup prewarm runs before run_turn and needs its own tool-building snapshot.
-    let step_context = session
+    let mut step_context = session
         .capture_step_context(Arc::clone(&startup_turn_context))
         .await?;
+    let captured_generation = session.services.planning_generation();
+    if captured_generation != planning_generation {
+        // The first capture may publish the MCP runtime's selected scope,
+        // advancing the generation. Like pending-turn planning, recapture once
+        // so the router is built from a snapshot taken wholly within the
+        // generation it is keyed to.
+        planning_generation = captured_generation;
+        step_context = session
+            .capture_step_context(Arc::clone(&startup_turn_context))
+            .await?;
+    }
     let startup_router = built_tools(
         session.as_ref(),
         &step_context,

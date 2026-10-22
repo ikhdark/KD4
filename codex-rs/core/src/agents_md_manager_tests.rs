@@ -263,6 +263,13 @@ fn environment_snapshot_with_environment(
     }
 }
 
+/// Thread environments keep an inherited `local` handle only while it is the
+/// manager's registration; snapshot reconciliation retires any other instance
+/// as replaced. Register the controlled environment so step refreshes read it.
+fn manager_registering(environment: &Arc<Environment>) -> Arc<EnvironmentManager> {
+    Arc::new(EnvironmentManager::default_for_tests_with_local_environment(Arc::clone(environment)))
+}
+
 #[tokio::test]
 async fn repository_stable_context_reuse_is_scoped_to_one_manager() {
     let root = tempfile::tempdir().expect("workspace");
@@ -563,7 +570,7 @@ async fn step_refresh_overlaps_preparation_and_finishes_after_preparation_failur
         filesystem.clone(),
     ));
     let thread_environments = ThreadEnvironments::new(
-        Arc::new(EnvironmentManager::default_for_tests()),
+        manager_registering(&environment),
         default_user_shell(),
         ShellSnapshot::disabled(),
         environment_snapshot_with_environment(&config.cwd, 3, environment),
@@ -611,13 +618,14 @@ async fn step_refresh_timeout_keeps_preparation_scope_and_releases_gate() {
     let environment = Arc::new(Environment::default_for_tests_with_filesystem(
         filesystem.clone(),
     ));
+    let environment_manager = manager_registering(&environment);
     let environments = environment_snapshot_with_environment(&config.cwd, 3, environment);
     let manager = AgentsMdManager::new(None);
     let cached = manager
         .refresh_and_observe_shared(&config, &environments)
         .await;
     let thread_environments = ThreadEnvironments::new(
-        Arc::new(EnvironmentManager::default_for_tests()),
+        environment_manager,
         default_user_shell(),
         ShellSnapshot::disabled(),
         environments,
@@ -673,7 +681,7 @@ async fn cancelling_step_refresh_drops_preparation_and_releases_gate() {
         filesystem.clone(),
     ));
     let thread_environments = ThreadEnvironments::new(
-        Arc::new(EnvironmentManager::default_for_tests()),
+        manager_registering(&environment),
         default_user_shell(),
         ShellSnapshot::disabled(),
         environment_snapshot_with_environment(&config.cwd, 3, environment),
@@ -838,7 +846,91 @@ async fn content_and_missing_higher_precedence_file_invalidate_cache() {
 }
 
 #[tokio::test]
+async fn resumed_sources_require_matching_environment_scope() {
+    use crate::context::world_state::PreviousSectionState;
+    use crate::context::world_state::WorldStateSection;
+
+    let root = tempfile::tempdir().unwrap();
+    let doc = root.path().join("AGENTS.md");
+    fs::write(&doc, "Never edit protected.txt.").unwrap();
+    let config = config_for(&root).await;
+    let filesystem = Arc::new(ControlledFileSystem::new(
+        AbsolutePathBuf::from_absolute_path(&doc).unwrap(),
+    ));
+    let environment = Arc::new(Environment::default_for_tests_with_filesystem(
+        filesystem.clone(),
+    ));
+    let environments = environment_snapshot_with_environment(&config.cwd, 1, environment);
+    let manager = AgentsMdManager::new(None);
+    let accepted = manager.refresh_and_observe(&config, &environments).await;
+    let saved = serde_json::to_value(
+        crate::context::world_state::AgentsMdState::new_cached(
+            accepted.loaded.as_deref(),
+            accepted.stable_context.as_ref(),
+            accepted.freshness,
+        )
+        .snapshot(),
+    )
+    .unwrap();
+
+    for change in ["generation", "environment_id", "owner", "legacy"] {
+        let mut current = environments.clone();
+        let mut snapshot = saved.clone();
+        match change {
+            "generation" => current.generation += 1,
+            "environment_id" => current.turn_environments[0].environment_id = "other".into(),
+            "owner" => {
+                current.turn_environments[0] = TurnEnvironment::new(
+                    "local".into(),
+                    Arc::new(Environment::default_for_tests_with_filesystem(
+                        filesystem.clone(),
+                    )),
+                    PathUri::from_abs_path(&config.cwd),
+                    None,
+                );
+            }
+            "legacy" => {
+                snapshot["source_snapshot"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("observation_scope");
+            }
+            _ => unreachable!(),
+        }
+        let manager = AgentsMdManager::new(Some(UserInstructions {
+            text: "Current global instructions.".into(),
+            source: AbsolutePathBuf::from_absolute_path(root.path().join("global.md")).unwrap(),
+        }));
+        manager
+            .restore_repository_snapshot(&config, &current, &snapshot)
+            .await;
+        assert!(
+            manager.get_loaded().await.is_none(),
+            "{change} must not relabel old sources"
+        );
+        filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
+        let observation = manager.refresh_and_observe(&config, &current).await;
+        assert_eq!(observation.freshness, AgentsMdFreshness::IncompleteRead);
+        let state = crate::context::world_state::AgentsMdState::new_cached(
+            observation.loaded.as_deref(),
+            observation.stable_context.as_ref(),
+            observation.freshness,
+        )
+        .with_unavailable_fallback(|| Some(snapshot));
+        let fragments = state.render_fragments(PreviousSectionState::Absent);
+        assert_eq!(fragments.len(), 2);
+        let body = fragments[0].render();
+        assert!(body.contains("Never edit protected.txt."));
+        assert!(body.contains("Current global instructions."));
+        assert!(body.contains("not the current cwd"));
+        assert_eq!(fragments[1].role(), "developer");
+        assert!(fragments[1].render().contains("cached_may_be_stale"));
+    }
+}
+
+#[tokio::test]
 async fn a_failed_instruction_file_does_not_hide_a_sibling_change_or_deletion() {
+    use crate::context::world_state::WorldStateSection;
     let root = tempfile::tempdir().unwrap();
     fs::create_dir(root.path().join(".git")).unwrap();
     let child = root.path().join("child");
@@ -859,13 +951,37 @@ async fn a_failed_instruction_file_does_not_hide_a_sibling_change_or_deletion() 
             filesystem.clone(),
         )),
     );
-    let manager = AgentsMdManager::new(None);
-    manager.refresh_and_observe(&config, &environments).await;
+    let global = UserInstructions {
+        text: "old global".into(),
+        source: AbsolutePathBuf::from_absolute_path(root.path().join("global.md")).unwrap(),
+    };
+    let manager = AgentsMdManager::new(Some(global.clone()));
+    let accepted = manager.refresh_and_observe(&config, &environments).await;
+    let snapshot = serde_json::to_value(
+        crate::context::world_state::AgentsMdState::new_cached(
+            accepted.loaded.as_deref(),
+            accepted.stable_context.as_ref(),
+            accepted.freshness,
+        )
+        .snapshot(),
+    )
+    .unwrap();
+    // A fresh owner must retain unavailable accepted project sources while
+    // still accepting current global and sibling corrections.
+    let manager = AgentsMdManager::new(Some(UserInstructions {
+        text: "fresh global".into(),
+        ..global
+    }));
+    manager
+        .restore_repository_snapshot(&config, &environments, &snapshot)
+        .await;
     fs::write(&parent_doc, "parent new restriction").unwrap();
     filesystem.set_next_project_read(NextProjectRead::Fail(io::ErrorKind::PermissionDenied));
     let changed = manager.refresh_and_observe(&config, &environments).await;
     assert_eq!(changed.freshness, AgentsMdFreshness::CachedFallback);
     let text = changed.loaded.unwrap().text();
+    assert!(text.contains("fresh global"));
+    assert!(!text.contains("old global"));
     assert!(text.contains("parent new restriction"));
     assert!(!text.contains("parent old"));
     assert!(text.contains("child retained"));

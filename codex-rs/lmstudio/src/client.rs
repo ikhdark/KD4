@@ -94,7 +94,7 @@ impl LMStudioClient {
             Ok(resp)
         } else {
             Err(io::Error::other(format!(
-                "Server returned error: {} {LMSTUDIO_CONNECTION_ERROR}",
+                "LM Studio answered /models with HTTP {}. Check the configured endpoint and server error; authentication or route configuration may need attention.",
                 resp.status()
             )))
         }
@@ -152,25 +152,14 @@ impl LMStudioClient {
     }
 
     async fn models_from_response(response: HttpResponse) -> io::Result<Vec<String>> {
-        let json: serde_json::Value = response.json().await.map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("JSON parse error: {e}"))
-        })?;
-        json["data"]
-            .as_array()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "No 'data' array in response")
-            })?
-            .iter()
-            .map(|model| {
-                model["id"]
-                    .as_str()
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid model id in response")
-                    })
-            })
-            .collect()
+        let value = response
+            .json()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        codex_model_provider_info::local::parse_model_ids(
+            codex_model_provider_info::ProviderKind::LmStudio,
+            &value,
+        )
     }
 
     // Find lms on PATH, falling back to LM Studio's per-user install location.
@@ -394,7 +383,7 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Server returned error: 404")
+                .contains("LM Studio answered /models with HTTP 404")
         );
     }
 
@@ -566,5 +555,4 @@ mod tests {
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
-
 }

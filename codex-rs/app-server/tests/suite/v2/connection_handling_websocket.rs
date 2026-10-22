@@ -130,7 +130,12 @@ exit 0
     let delivered = timeout(
         SIGNAL_TIMEOUT,
         Command::new("powershell.exe")
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"])
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+            ])
             .arg(encoded_script)
             .env("CODEX_TEST_CTRL_C_PID", pid.to_string())
             .creation_flags(CREATE_NO_WINDOW)
@@ -806,7 +811,8 @@ async fn spawn_websocket_server_with_options(
     extra_args: &[String],
     originator_override: OriginatorOverride<'_>,
 ) -> Result<(WebSocketServerProcess, SocketAddr)> {
-    let mut cmd = websocket_server_command(codex_home, listen_url, extra_args, originator_override)?;
+    let mut cmd =
+        websocket_server_command(codex_home, listen_url, extra_args, originator_override)?;
     let mut process = WebSocketServerProcess::spawn(&mut cmd)
         .context("failed to spawn websocket app-server process")?;
 
@@ -1241,7 +1247,9 @@ async fn websocket_read_deadlines_are_not_reset_by_unrelated_frames() -> Result<
             match reader_kind {
                 0 => read_jsonrpc_message(&mut client).await.map(|_| ()),
                 1 => read_response_for_id(&mut client, 7).await.map(|_| ()),
-                2 => read_notification_for_method(&mut client, "wanted").await.map(|_| ()),
+                2 => read_notification_for_method(&mut client, "wanted")
+                    .await
+                    .map(|_| ()),
                 3 => read_response_and_notification_for_method(&mut client, 7, "wanted")
                     .await
                     .map(|_| ()),
@@ -1261,21 +1269,28 @@ async fn websocket_read_deadlines_are_not_reset_by_unrelated_frames() -> Result<
                 // cannot time out the read before that evidence arrives.
                 timeout(Duration::from_secs(2), async {
                     if reader_kind != 0 {
-                        server.send(WebSocketMessage::Text(
-                            r#"{"method":"unrelated","params":{}}"#.into(),
-                        )).await?;
+                        server
+                            .send(WebSocketMessage::Text(
+                                r#"{"method":"unrelated","params":{}}"#.into(),
+                            ))
+                            .await?;
                     }
                     let payload = vec![round];
-                    server.send(WebSocketMessage::Ping(payload.clone().into())).await?;
+                    server
+                        .send(WebSocketMessage::Ping(payload.clone().into()))
+                        .await?;
                     let reply = server.next().await.context("peer closed before Pong")??;
                     if reply != WebSocketMessage::Pong(payload.into()) {
                         bail!("expected matching Pong, got {reply:?}");
                     }
                     Ok::<(), anyhow::Error>(())
-                }).await.context("timed out exercising unrelated frame handling")??;
+                })
+                .await
+                .context("timed out exercising unrelated frame handling")??;
             }
             Ok::<(), anyhow::Error>(())
-        }.await;
+        }
+        .await;
         if exercised.is_err() {
             reader.abort();
             let _ = reader.await;
@@ -1328,7 +1343,9 @@ async fn websocket_read_cancellation_and_expired_deadline_preserve_queued_frames
     drop(pending);
     let expected = json!({"id": 7, "result": {"sentinel": "preserved"}});
     server.send(WebSocketMessage::Pong(vec![1].into())).await?;
-    server.send(WebSocketMessage::Text(expected.to_string().into())).await?;
+    server
+        .send(WebSocketMessage::Text(expected.to_string().into()))
+        .await?;
 
     // Prove transport data is already ready; an expired deadline must still win
     // without consuming either the unrelated frame or the following response.
@@ -1341,8 +1358,7 @@ async fn websocket_read_cancellation_and_expired_deadline_preserve_queued_frames
         .await
         .expect_err("already queued frames must not bypass an expired deadline");
     assert!(error.to_string().contains("timed out"), "{error:#}");
-    let response = timeout(Duration::from_secs(2), read_response_for_id(&mut client, 7))
-        .await??;
+    let response = timeout(Duration::from_secs(2), read_response_for_id(&mut client, 7)).await??;
     assert_eq!(serde_json::to_value(response)?, expected);
 
     server.close(None).await?;

@@ -116,7 +116,6 @@ fn thread_sources_round_trip_as_scalar_labels() {
     }
 }
 
-
 #[test]
 fn thread_turns_list_params_accepts_items_view() {
     let params = serde_json::from_value::<ThreadTurnsListParams>(json!({
@@ -303,8 +302,14 @@ fn thread_items_list_round_trips() {
 #[test]
 fn thread_list_params_accepts_single_or_multiple_cwds() {
     for (wire, expected) in [
-        (json!("/workspace"), ThreadListCwdFilter::One("/workspace".into())),
-        (json!(["/workspace", "/other-workspace"]), ThreadListCwdFilter::Many(vec!["/workspace".into(), "/other-workspace".into()])),
+        (
+            json!("/workspace"),
+            ThreadListCwdFilter::One("/workspace".into()),
+        ),
+        (
+            json!(["/workspace", "/other-workspace"]),
+            ThreadListCwdFilter::Many(vec!["/workspace".into(), "/other-workspace".into()]),
+        ),
     ] {
         let params: ThreadListParams = serde_json::from_value(json!({"cwd": wire})).unwrap();
         assert_eq!(params.cwd, Some(expected));
@@ -338,6 +343,7 @@ fn collab_agent_state_maps_interrupted_status() {
     assert_eq!(
         CollabAgentState::from(CoreAgentStatus::Interrupted),
         CollabAgentState {
+            stop_cause: None,
             status: CollabAgentStatus::Interrupted,
             message: None,
             surfaced_result: None,
@@ -360,6 +366,7 @@ fn collab_agent_state_preserves_authoritative_surfaced_result() {
             surfaced_result: surfaced_result.clone(),
         }),
         CollabAgentState {
+            stop_cause: None,
             status: CollabAgentStatus::Completed,
             message: Some("done".to_string()),
             surfaced_result: Some(surfaced_result),
@@ -379,6 +386,7 @@ fn collab_agent_state_legacy_wire_shape_omits_optional_terminal_metadata() {
     assert_eq!(
         state,
         CollabAgentState {
+            stop_cause: None,
             status: CollabAgentStatus::Running,
             message: None,
             surfaced_result: None,
@@ -388,101 +396,6 @@ fn collab_agent_state_legacy_wire_shape_omits_optional_terminal_metadata() {
     assert_eq!(
         serde_json::to_value(state).expect("collab agent state should serialize"),
         json!({"status": "running", "message": null})
-    );
-}
-
-#[test]
-fn external_agent_config_plugins_details_round_trip() {
-    let item: ExternalAgentConfigMigrationItem = serde_json::from_value(json!({
-        "itemType": "PLUGINS",
-        "description": "Install supported plugins from Claude settings",
-        "cwd": absolute_path_string("repo"),
-        "details": {
-            "plugins": [
-                {
-                    "marketplaceName": "team-marketplace",
-                    "pluginNames": ["asana"]
-                }
-            ]
-        }
-    }))
-    .expect("plugins migration item should deserialize");
-
-    assert_eq!(
-        item,
-        ExternalAgentConfigMigrationItem {
-            item_type: ExternalAgentConfigMigrationItemType::Plugins,
-            description: "Install supported plugins from Claude settings".to_string(),
-            cwd: Some(PathBuf::from(absolute_path_string("repo"))),
-            details: Some(MigrationDetails {
-                plugins: vec![PluginsMigration {
-                    marketplace_name: "team-marketplace".to_string(),
-                    plugin_names: vec!["asana".to_string()],
-                }],
-                ..Default::default()
-            }),
-        }
-    );
-    assert_eq!(
-        serde_json::to_value(&item).expect("plugins migration item should serialize"),
-        json!({
-            "itemType": "PLUGINS",
-            "description": "Install supported plugins from Claude settings",
-            "cwd": absolute_path_string("repo"),
-            "details": {
-                "plugins": [
-                    {
-                        "marketplaceName": "team-marketplace",
-                        "pluginNames": ["asana"]
-                    }
-                ],
-                "skills": [],
-                "sessions": [],
-                "mcpServers": [],
-                "hooks": [],
-                "subagents": [],
-                "commands": []
-            }
-        })
-    );
-}
-
-#[test]
-fn external_agent_config_import_params_accept_legacy_plugin_details() {
-    let params: ExternalAgentConfigImportParams = serde_json::from_value(json!({
-        "migrationItems": [{
-            "itemType": "PLUGINS",
-            "description": "Install supported plugins from Claude settings",
-            "cwd": absolute_path_string("repo"),
-            "details": {
-                "plugins": [
-                    {
-                        "marketplaceName": "team-marketplace",
-                        "pluginNames": ["asana"]
-                    }
-                ]
-            }
-        }]
-    }))
-    .expect("legacy plugin import params should deserialize");
-
-    assert_eq!(
-        params,
-        ExternalAgentConfigImportParams {
-            migration_items: vec![ExternalAgentConfigMigrationItem {
-                item_type: ExternalAgentConfigMigrationItemType::Plugins,
-                description: "Install supported plugins from Claude settings".to_string(),
-                cwd: Some(PathBuf::from(absolute_path_string("repo"))),
-                details: Some(MigrationDetails {
-                    plugins: vec![PluginsMigration {
-                        marketplace_name: "team-marketplace".to_string(),
-                        plugin_names: vec!["asana".to_string()],
-                    }],
-                    ..Default::default()
-                }),
-            }],
-            source: None,
-        }
     );
 }
 
@@ -807,9 +720,12 @@ fn canonical_permission_entries_override_legacy_roots_even_when_empty() {
         assert_eq!(granted.entries.len(), entries.len());
         if let Some(entry) = granted.entries.first() {
             assert_eq!(entry.access, CoreFileSystemAccessMode::Deny);
-            assert_eq!(entry.path, CoreFileSystemPath::Special {
-                value: CoreFileSystemSpecialPath::Root,
-            });
+            assert_eq!(
+                entry.path,
+                CoreFileSystemPath::Special {
+                    value: CoreFileSystemSpecialPath::Root,
+                }
+            );
         }
         assert_eq!(granted.glob_scan_max_depth, NonZeroUsize::new(3));
     }
@@ -826,15 +742,23 @@ fn permission_grants_resolve_relative_paths_against_selected_environment_cwd() {
     ] {
         let profile: GrantedPermissionProfile = serde_json::from_value(json!({
             "fileSystem": file_system,
-        })).unwrap();
-        let resolved = profile.into_core_with_cwd(&cwd).unwrap().file_system.unwrap();
-        assert_eq!(resolved.entries, vec![CoreFileSystemSandboxEntry {
-            path: CoreFileSystemPath::Path {
-                path: PathUri::parse("file:///selected-environment/workspace/data/input.txt")
-                    .unwrap(),
-            },
-            access: CoreFileSystemAccessMode::Read,
-        }]);
+        }))
+        .unwrap();
+        let resolved = profile
+            .into_core_with_cwd(&cwd)
+            .unwrap()
+            .file_system
+            .unwrap();
+        assert_eq!(
+            resolved.entries,
+            vec![CoreFileSystemSandboxEntry {
+                path: CoreFileSystemPath::Path {
+                    path: PathUri::parse("file:///selected-environment/workspace/data/input.txt")
+                        .unwrap(),
+                },
+                access: CoreFileSystemAccessMode::Read,
+            }]
+        );
     }
 }
 
@@ -1745,6 +1669,10 @@ fn process_notifications_round_trip() {
     assert_eq!(decoded, delta);
 
     let exited = ProcessExitedNotification {
+        stdout_base64: None,
+        stderr_base64: None,
+        stdout_capture: None,
+        stderr_capture: None,
         process_handle: "proc-1".to_string(),
         exit_code: 0,
         stdout: "out".to_string(),
@@ -2806,6 +2734,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     );
 
     let command_item = TurnItem::CommandExecution(CommandExecutionItem {
+        environment: None,
         output_metadata: None,
         id: "exec-1".to_string(),
         process_id: Some("pid-1".to_string()),
@@ -2832,6 +2761,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     assert_eq!(
         ThreadItem::from(command_item),
         ThreadItem::CommandExecution {
+            environment: None,
             output_metadata: None,
             stdout: Some("done\n".to_string()),
             stderr: Some(String::new()),
@@ -2947,6 +2877,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
             agents_states: [(
                 receiver_thread_id.to_string(),
                 CollabAgentState {
+                    stop_cause: None,
                     status: CollabAgentStatus::Completed,
                     message: None,
                     surfaced_result: None,
@@ -2987,6 +2918,8 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     });
 
     let expected_search_item = WebSearchItem {
+        status: None,
+        error: None,
         id: "search-1".to_string(),
         query: "docs".to_string(),
         action: Some(WebSearchAction::Search {
@@ -3007,6 +2940,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     );
 
     let image_view_item = TurnItem::ImageView(ImageViewItem {
+        environment: None,
         id: "view-image-1".to_string(),
         path: PathUri::from_abs_path(&test_path_buf("/tmp/view-image.png").abs()),
     });
@@ -3014,12 +2948,14 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     assert_eq!(
         ThreadItem::from(image_view_item),
         ThreadItem::ImageView {
+            environment: None,
             id: "view-image-1".to_string(),
             path: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp/view-image.png").abs()),
         }
     );
 
     let file_change_item = TurnItem::FileChange(FileChangeItem {
+        environment: None,
         id: "patch-1".to_string(),
         changes: [(
             PathBuf::from("README.md"),
@@ -3038,6 +2974,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
     assert_eq!(
         ThreadItem::from(file_change_item),
         ThreadItem::FileChange {
+            environment: None,
             id: "patch-1".to_string(),
             changes: vec![FileUpdateChange {
                 path: "README.md".to_string(),
@@ -3159,6 +3096,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
 #[test]
 fn core_windows_command_execution_uses_windows_display_quoting() {
     let command_item = TurnItem::CommandExecution(CommandExecutionItem {
+        environment: None,
         output_metadata: None,
         id: "exec-windows".to_string(),
         process_id: None,
@@ -4139,7 +4077,6 @@ fn codex_error_info_serializes_active_turn_not_steerable_turn_kind_in_camel_case
     );
 }
 
-
 #[test]
 fn dynamic_tool_response_serializes_text_and_image_content_items() {
     let value = serde_json::to_value(DynamicToolCallResponse {
@@ -4601,4 +4538,30 @@ fn out_of_band_elicitation_lease_uses_an_explicit_token() {
         .is_err(),
         "lease tokens must use the server-issued string form"
     );
+}
+#[test]
+fn image_provenance_survives_canonical_and_legacy_projection() {
+    let provenance = codex_protocol::items::EnvironmentProvenance {
+        environment_id: "remote".into(),
+        owner_id: "registration:session-A".into(),
+    };
+    let core = codex_protocol::items::TurnItem::ImageView(codex_protocol::items::ImageViewItem {
+        id: "image-A".into(),
+        environment: Some(provenance.clone()),
+        path: codex_utils_path_uri::PathUri::parse("file:///C:/work/result.png").unwrap(),
+    });
+    let legacy = core.as_legacy_events(false);
+    let codex_protocol::protocol::EventMsg::ViewImageToolCall(event) = &legacy[0] else {
+        panic!("image event")
+    };
+    assert_eq!(event.environment.as_ref(), Some(&provenance));
+    let super::ThreadItem::ImageView { environment, .. } = super::ThreadItem::from(core) else {
+        panic!("image item")
+    };
+    assert_eq!(environment, Some(provenance));
+    let old: codex_protocol::items::ImageViewItem = serde_json::from_value(serde_json::json!({
+        "id":"legacy", "path":"file:///C:/work/result.png"
+    }))
+    .unwrap();
+    assert_eq!(old.environment, None);
 }

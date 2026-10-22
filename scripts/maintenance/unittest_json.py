@@ -47,6 +47,7 @@ def content_identity(test):
     """Read a fresh source observation; deliberately do not hash dependencies."""
     method = getattr(test, getattr(test, "_testMethodName", ""), None)
     try:
+        method = inspect.unwrap(method)
         path = inspect.getsourcefile(method)
         if path is None:
             return None
@@ -57,7 +58,7 @@ def content_identity(test):
             "path": str(Path(path).resolve()),
             "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         }
-    except (OSError, TypeError, IndexError):
+    except (OSError, TypeError, IndexError, ValueError):
         return None
 
 
@@ -67,12 +68,14 @@ class JsonResult(unittest.TextTestResult):
         self.record_content = record_content
         self.records = []
         self.active = {}
+        self.body_methods = {}
 
     def startTest(self, test):
         super().startTest(test)
         record = {
             "name": test.id(),
             "started": True,
+            "body_started": False,
             "outcome": "incomplete",
             "failure_type": None,
             "content_before": content_identity(test) if self.record_content else None,
@@ -81,6 +84,17 @@ class JsonResult(unittest.TextTestResult):
         }
         self.active[id(test)] = record
         self.records.append(record)
+        # Instrument only this instance's supported lifecycle seam. In
+        # IsolatedAsyncioTestCase it is reached after asyncSetUp as well.
+        original = test._callTestMethod
+        previous = vars(test).get("_callTestMethod")
+        self.body_methods[id(test)] = (previous, "_callTestMethod" in vars(test))
+
+        def call_body(method):
+            record["body_started"] = True
+            return original(method)
+
+        test._callTestMethod = call_body
 
     def event(self, test, outcome, err=None, reason=None, *, parent=None):
         failure_type = None
@@ -100,6 +114,7 @@ class JsonResult(unittest.TextTestResult):
             "failure_type": failure_type,
             "traceback": self._exc_info_to_string(err, test) if err else None,
             "reason": reason,
+            "skip_origin": None,
         }
         owner = parent or getattr(test, "test_case", test)
         record = self.active.get(id(owner))
@@ -108,6 +123,7 @@ class JsonResult(unittest.TextTestResult):
             record = {
                 "name": test.id(),
                 "started": False,
+                "body_started": False,
                 "outcome": outcome,
                 "failure_type": failure_type,
                 "content_before": None,
@@ -115,6 +131,24 @@ class JsonResult(unittest.TextTestResult):
                 "events": [],
             }
             self.records.append(record)
+        if outcome == "skipped":
+            method = getattr(owner, getattr(owner, "_testMethodName", ""), None)
+            policy = getattr(type(owner), "__unittest_skip__", False) or getattr(
+                method, "__unittest_skip__", False
+            )
+            standard_run = getattr(type(owner), "run", None) in (
+                unittest.TestCase.run,
+                unittest.IsolatedAsyncioTestCase.run,
+            )
+            event["skip_origin"] = (
+                "policy"
+                if policy and not record["body_started"]
+                else "after_body_entry"
+                if record["body_started"]
+                else "setup"
+                if not record["started"] or standard_run
+                else "unknown"
+            )
         record["events"].append(event)
         priority = {
             "incomplete": -1,
@@ -164,7 +198,14 @@ class JsonResult(unittest.TextTestResult):
 
     def stopTest(self, test):
         record = self.active.pop(id(test))
-        record["content_after"] = content_identity(test) if self.record_content else None
+        previous, existed = self.body_methods.pop(id(test))
+        if existed:
+            test._callTestMethod = previous
+        else:
+            del test._callTestMethod
+        record["content_after"] = (
+            content_identity(test) if self.record_content else None
+        )
         super().stopTest(test)
 
 
@@ -183,7 +224,7 @@ def problem(kind, message, detail=None):
 class JsonProgram(unittest.TestProgram):
     """Reuse unittest's parser and TestLoader, inspecting its actual selection."""
 
-    def __init__(self, argv, *, record_content=True):
+    def __init__(self, argv, *, record_content=True, coalesce_selectors=False):
         self.names = []
         self.problems = []
         self.json_result = None
@@ -193,15 +234,83 @@ class JsonProgram(unittest.TestProgram):
         class SelectionLoader(unittest.TestLoader):
             def loadTestsFromNames(self, names, module=None):
                 suites = []
+                seen = {}
+
+                def leaves(suite):
+                    for test in suite:
+                        if isinstance(test, unittest.TestSuite):
+                            yield from leaves(test)
+                        else:
+                            yield test
+
                 for name in names:
                     suite = self.loadTestsFromName(name, module)
                     # A deliberate -k filter may exclude whole modules. Without
                     # one, each explicit selection must contribute a test.
                     if not self.testNamePatterns and suite.countTestCases() == 0:
-                        program.problems.append(problem(
-                            "selection", f"No tests selected by explicit selector: {name}"
-                        ))
-                    suites.append(suite)
+                        program.problems.append(
+                            problem(
+                                "selection",
+                                f"No tests selected by explicit selector: {name}",
+                            )
+                        )
+                    if not coalesce_selectors:
+                        suites.append(suite)
+                        continue
+                    tests = list(leaves(suite))
+                    counts = Counter(test.id() for test in tests)
+                    duplicates = sorted(
+                        key for key, count in counts.items() if count > 1
+                    )
+                    if duplicates:
+                        program.problems.append(
+                            problem(
+                                "selection",
+                                f"Duplicate test identities within {name}: {duplicates}",
+                            )
+                        )
+                    contribution = []
+                    for test in tests:
+                        identity = (
+                            type(test),
+                            getattr(
+                                type(test), getattr(test, "_testMethodName", ""), None
+                            ),
+                            vars(test).copy(),
+                        )
+                        if test.id() in seen:
+                            if seen[test.id()] != identity:
+                                program.problems.append(
+                                    problem(
+                                        "selection",
+                                        f"Conflicting test identity: {test.id()}",
+                                    )
+                                )
+                        else:
+                            seen[test.id()] = identity
+                            contribution.append(test)
+                    admitted = {id(test) for test in contribution}
+
+                    def retain(node):
+                        if not isinstance(node, unittest.TestSuite):
+                            return node if id(node) in admitted else None
+                        if all(id(test) in admitted for test in leaves(node)):
+                            return node  # Preserve custom suite execution semantics.
+                        if type(node) is not unittest.TestSuite:
+                            program.problems.append(
+                                problem(
+                                    "selection",
+                                    "Cannot coalesce overlapping custom suites; request disjoint selectors",
+                                )
+                            )
+                            return self.suiteClass()
+                        return self.suiteClass(
+                            child
+                            for test in node
+                            if (child := retain(test)) is not None
+                        )
+
+                    suites.append(retain(suite))
                 return self.suiteClass(suites)
 
         super().__init__(
@@ -235,7 +344,9 @@ class JsonProgram(unittest.TestProgram):
         class JsonRunner(unittest.TextTestRunner):
             def _makeResult(self):
                 result = JsonResult(
-                    self.stream, self.descriptions, self.verbosity,
+                    self.stream,
+                    self.descriptions,
+                    self.verbosity,
                     record_content=program.record_content,
                 )
                 program.json_result = result
@@ -243,6 +354,18 @@ class JsonProgram(unittest.TestProgram):
 
         self.testRunner = JsonRunner
         super().runTests()
+
+
+def verification_observed(record):
+    # Lifecycle entry alone is not body entry. Setup skips and unsupported
+    # custom lifecycles cannot certify the selected required work.
+    return not any(
+        event["skip_origin"] in {"setup", "unknown"} for event in record["events"]
+    ) and (
+        record["body_started"]
+        or record["outcome"] in BAD_OUTCOMES
+        or any(event["skip_origin"] == "policy" for event in record["events"])
+    )
 
 
 def report_for(argv, program, problems):
@@ -280,6 +403,7 @@ def report_for(argv, program, problems):
         and not problems
         and not (result and result.active)
         and all(record["outcome"] != "incomplete" for record in records)
+        and all(verification_observed(record) for record in records)
     )
     successful = bool(
         complete
@@ -287,7 +411,7 @@ def report_for(argv, program, problems):
         and not any(record["outcome"] in BAD_OUTCOMES for record in records)
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "runner": "unittest",
         "content_identity_scope": CONTENT_SCOPE,
         "reusable_validation_receipt": False,
@@ -312,7 +436,7 @@ def validate_report(payload):
 
     require(isinstance(payload, dict), "expected an object")
     require(
-        type(payload.get("schema_version")) is int and payload["schema_version"] == 1,
+        type(payload.get("schema_version")) is int and payload["schema_version"] == 2,
         "schema_version",
     )
     require(payload.get("runner") == "unittest", "runner")
@@ -365,6 +489,11 @@ def validate_report(payload):
             isinstance(record.get("name"), str) and bool(record["name"]), "test name"
         )
         require(type(record.get("started")) is bool, "test started")
+        require(type(record.get("body_started")) is bool, "test body_started")
+        require(
+            not record["body_started"] or record["started"],
+            "body without lifecycle start",
+        )
         require(
             isinstance(record.get("outcome"), str) and record["outcome"] in OUTCOMES,
             "test outcome",
@@ -394,6 +523,21 @@ def validate_report(payload):
         )
         for event in events:
             require(isinstance(event, dict), "event")
+            require("skip_origin" in event, "skip provenance missing")
+            require(
+                event.get("skip_origin")
+                in (None, "policy", "setup", "after_body_entry", "unknown"),
+                "skip origin",
+            )
+            require(
+                (event.get("skip_origin") is not None)
+                == (event.get("outcome") == "skipped"),
+                "skip provenance",
+            )
+            if event.get("skip_origin") == "after_body_entry":
+                require(record["body_started"], "skip without body entry")
+            if event.get("skip_origin") in {"policy", "setup"}:
+                require(not record["body_started"], "pre-body skip after body entry")
             require(
                 isinstance(event.get("name"), str) and bool(event["name"]), "event name"
             )
@@ -466,6 +610,7 @@ def validate_report(payload):
         and not selection["duplicates"]
         and not payload["errors"]
         and all(record["outcome"] != "incomplete" for record in records)
+        and all(verification_observed(record) for record in records)
     )
     require(
         payload["complete"] == complete, "complete disagrees with execution coverage"
@@ -503,6 +648,9 @@ def main(argv=None):
     execution_only = argv[:1] == ["--execution-only"]
     if execution_only:
         argv = argv[1:]
+    coalesce_selectors = argv[:1] == ["--coalesce-selectors"]
+    if coalesce_selectors:
+        argv = argv[1:]
     output = diagnostic_stdout()
     sys.path.insert(0, os.getcwd())
     program = None
@@ -515,7 +663,11 @@ def main(argv=None):
         else:
             # Retain the program even if loading/execution raises.
             program = JsonProgram.__new__(JsonProgram)
-            program.__init__(argv, record_content=not execution_only)
+            program.__init__(
+                argv,
+                record_content=not execution_only,
+                coalesce_selectors=coalesce_selectors,
+            )
     except KeyboardInterrupt:
         problems.append(
             problem(

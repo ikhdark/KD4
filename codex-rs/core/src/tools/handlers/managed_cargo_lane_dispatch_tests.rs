@@ -315,8 +315,12 @@ async fn exercise_dispatch(tool: &str) {
                 std::iter::once(root.to_path_buf()).chain(std::env::split_paths(&inherited_path)),
             )
             .unwrap();
-            policy.r#set.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
-            policy.r#set.insert("PATH".into(), path.into_string().unwrap());
+            policy
+                .r#set
+                .retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+            policy
+                .r#set
+                .insert("PATH".into(), path.into_string().unwrap());
         }
         if !target.is_empty() {
             policy

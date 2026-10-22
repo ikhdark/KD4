@@ -13,9 +13,8 @@ pub(crate) const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run raw JavaScript, not JS
 - To call a tool not described here, filter `ALL_TOOL_NAMES` or `ALL_TOOLS` locally, then use `resolve_tool(name)` and call it in the same cell; resolution retains the full contract when required. Do not infer arguments from a name.
 
 Optional helpers:
-- `await read_files(paths)`: read up to 32 files at once; returns `{path,status,value?,reason?}` per path.
+- `await read_files(paths, {full?, concurrency?})`: read 1–32 paths; returns `{path,status,value?,reason?}` per path. `value` contains `{initial,pages,file_complete}`. Default `full:false` keeps the initial selection; for already-required full reading, `full:true` recovers the retained snapshot within bounded limits. Check every status and `file_complete` before claiming full byte coverage, not semantic review.
 - `await search_files(pattern, {path?, glob?, lines?, max_per_file?, ignore_case?, fixed?, hidden?, no_ignore?})`: ripgrep without a shell, returning `{files:[{path,count,lines?}], match_count, complete}` sorted by path; `lines` adds up to `max_per_file` (default 10) `{line,text}` per file.
-- `await tools.list_files({path, include?, exclude?, exclude_directories?, max_depth?, max_entries?})`: tree walk with basename patterns, no gitignore (default depth 8, 2000 entries), returning `{entries:[{path,kind}], truncated, complete}`.
 - `await await_command(r)`: wait until a command that returned a live `session_id` exits; resolves to `{terminal, observations}` and throws on failure with that object on the error's `.evidence`.
 - `await run_graph([{id, deps?, run: async (deps) => value, accept: async (value) => boolean}], {concurrency?, targets?})`: cell-local DAG (1–256 nodes, concurrency 1–16, default 4) returning `{[id]: {status, value}}`. If a node fails, its dependents are skipped and it throws with `.results` after all started work settles.
 - `notify(value)` queues a model-visible message without yielding; `image(value, detail?)` emits an image from a `data:` URI, a `view_image` result or an MCP `{ type: "image" }` block.
@@ -73,6 +72,9 @@ mod tests {
     #[test]
     fn compact_base_contract_keeps_its_budget_when_helpers_are_added() {
         let description = build_exec_tool_description(true, true, &[]);
+        // Environment-backed examples are appended by the planner only when
+        // the corresponding built-in is in the effective nested catalog.
+        assert!(!description.contains("tools.list_files"));
         let helpers_start = description.find("- `await read_files(").unwrap();
         let helpers_end = description.find("- `await run_graph(").unwrap();
         let helpers_bytes = helpers_end - helpers_start;

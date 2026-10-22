@@ -93,20 +93,41 @@ fn receipt_index_preserves_first_counterparts_and_rejects_incompatible_orphans()
         function_call("orphan", "missing"),
     ];
     let index = tool_receipt_index(&items);
+    // Two outstanding calls share the ID, so the output closes neither: a
+    // duplicate legacy ID is ambiguous, never receipt evidence
+    // (`tool_occurrence::pairs`).
+    for position in 0..items.len() {
+        assert_eq!(
+            complete_tool_receipt_indices(&items, &index, position),
+            None,
+            "{position}"
+        );
+    }
+    // A unique call keeps its first counterpart. An output of another kind and
+    // a later reuse of the closed ID do not pair with it.
+    let items = vec![
+        function_call("first", "same"),
+        custom_tool_call_output("wrong-kind", "same", "receipt"),
+        function_call_output("output", "same", "receipt"),
+        function_call("reused", "same"),
+        function_call("orphan", "missing"),
+    ];
+    let index = tool_receipt_index(&items);
     assert_eq!(
         complete_tool_receipt_indices(&items, &index, 0),
-        Some(vec![0, 3])
+        Some(vec![0, 2])
     );
     assert_eq!(
-        complete_tool_receipt_indices(&items, &index, 1),
-        Some(vec![1, 3])
+        complete_tool_receipt_indices(&items, &index, 2),
+        Some(vec![0, 2])
     );
-    assert_eq!(
-        complete_tool_receipt_indices(&items, &index, 3),
-        Some(vec![0, 3])
-    );
-    assert_eq!(complete_tool_receipt_indices(&items, &index, 2), None);
-    assert_eq!(complete_tool_receipt_indices(&items, &index, 4), None);
+    for position in [1, 3, 4] {
+        assert_eq!(
+            complete_tool_receipt_indices(&items, &index, position),
+            None,
+            "{position}"
+        );
+    }
 }
 
 fn custom_tool_call_output(id: &str, call_id: &str, output: &str) -> ResponseItem {
@@ -236,29 +257,45 @@ fn receipt_prefix_search_matches_linear_reference_and_survives_recompaction() {
 
 #[test]
 fn serialized_namespace_receipts_preserve_callable_names_and_legacy_versions() {
-    use codex_tools::{LoadableToolSpec, ResponsesApiNamespace, ResponsesApiNamespaceTool, ResponsesApiTool};
+    use codex_tools::LoadableToolSpec;
+    use codex_tools::ResponsesApiNamespace;
+    use codex_tools::ResponsesApiNamespaceTool;
+    use codex_tools::ResponsesApiTool;
     let namespace = LoadableToolSpec::Namespace(ResponsesApiNamespace {
-        name: "apps".into(), description: String::new(),
-        tools: ["search", "fetch"].into_iter().map(|name| {
-            ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-                name: name.into(), description: String::new(), strict: false,
-                defer_loading: None, output_schema: None,
-                parameters: codex_tools::JsonSchema::object(Default::default(), None, None),
+        name: "apps".into(),
+        description: String::new(),
+        tools: ["search", "fetch"]
+            .into_iter()
+            .map(|name| {
+                ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                    name: name.into(),
+                    description: String::new(),
+                    strict: false,
+                    defer_loading: None,
+                    output_schema: None,
+                    parameters: codex_tools::JsonSchema::object(Default::default(), None, None),
+                })
             })
-        }).collect(),
+            .collect(),
     });
     let mut items = tool_search_group("namespace");
     if let ResponseItem::ToolSearchOutput { tools, .. } = &mut items[1] {
         *tools = vec![serde_json::to_value(namespace).unwrap()];
     }
     let (_, call, output) = remote_tool_search_receipt_group(&items, &[0, 1], true).unwrap();
-    let ResponseItem::ToolSearchOutput { tools, .. } = &output else { unreachable!() };
+    let ResponseItem::ToolSearchOutput { tools, .. } = &output else {
+        unreachable!()
+    };
     let receipt = parse_remote_tool_search_receipt(&tools[0]).unwrap();
     assert_eq!(receipt.result_count, 1);
     assert_eq!(receipt.callable_count, Some(2));
-    assert_eq!(receipt.ordered_tool_identities, vec!["apps.search", "apps.fetch"]);
+    assert_eq!(
+        receipt.ordered_tool_identities,
+        vec!["apps.search", "apps.fetch"]
+    );
     assert!(receipt.is_valid("namespace", "completed", "client"));
-    let (_, _, again) = remote_tool_search_receipt_group(&[call.clone(), output.clone()], &[0, 1], true).unwrap();
+    let (_, _, again) =
+        remote_tool_search_receipt_group(&[call.clone(), output.clone()], &[0, 1], true).unwrap();
     assert_eq!(again, output);
 
     let mut legacy = receipt;
@@ -266,16 +303,29 @@ fn serialized_namespace_receipts_preserve_callable_names_and_legacy_versions() {
     legacy.callable_count = None;
     legacy.ordered_tool_identities = vec!["apps".into()];
     legacy.receipt_id = remote_tool_search_receipt_id(
-        &legacy.call_id, &legacy.status, &legacy.execution, &legacy.arguments,
-        &legacy.result_set_sha256, legacy.result_count, None, legacy.omitted_result_count,
-        legacy.complete, legacy.omitted_identity_count, &legacy.ordered_tool_identities);
+        &legacy.call_id,
+        &legacy.status,
+        &legacy.execution,
+        &legacy.arguments,
+        &legacy.result_set_sha256,
+        legacy.result_count,
+        None,
+        legacy.omitted_result_count,
+        legacy.complete,
+        legacy.omitted_identity_count,
+        &legacy.ordered_tool_identities,
+    );
     assert!(legacy.is_valid("namespace", "completed", "client"));
     let mut old_output = output;
     if let ResponseItem::ToolSearchOutput { tools, .. } = &mut old_output {
         *tools = vec![serde_json::json!({"type": TOOL_SEARCH_RECEIPT_KIND, "receipt": legacy})];
     }
-    let (_, _, old_again) = remote_tool_search_receipt_group(&[call, old_output.clone()], &[0, 1], true).unwrap();
-    assert_eq!(old_again, old_output, "recompaction cannot invent lost callable knowledge");
+    let (_, _, old_again) =
+        remote_tool_search_receipt_group(&[call, old_output.clone()], &[0, 1], true).unwrap();
+    assert_eq!(
+        old_again, old_output,
+        "recompaction cannot invent lost callable knowledge"
+    );
 }
 
 #[tokio::test]

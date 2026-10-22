@@ -386,8 +386,6 @@ mod tests {
         assert!(!users_path.exists());
     }
 
-
-
     #[test]
     fn preserving_proxy_settings_uses_the_existing_marker() {
         let marker = SetupMarker {

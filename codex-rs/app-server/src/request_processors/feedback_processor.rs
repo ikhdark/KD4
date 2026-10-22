@@ -186,6 +186,7 @@ impl FeedbackRequestProcessor {
                     if seen_attachment_paths.insert(rollout_path.clone()) {
                         attachment_paths.push(FeedbackAttachmentPath {
                             path: rollout_path,
+                            hydrate_rollout: true,
                             attachment_filename_override: None,
                         });
                     }
@@ -202,6 +203,7 @@ impl FeedbackRequestProcessor {
                     if seen_attachment_paths.insert(extra_log_file.clone()) {
                         attachment_paths.push(FeedbackAttachmentPath {
                             path: extra_log_file,
+                            hydrate_rollout: false,
                             attachment_filename_override: None,
                         });
                     }
@@ -278,6 +280,7 @@ fn windows_sandbox_log_attachment(codex_home: &Path) -> Option<FeedbackAttachmen
     sandbox_log_path
         .is_file()
         .then_some(FeedbackAttachmentPath {
+            hydrate_rollout: false,
             path: sandbox_log_path,
             attachment_filename_override: Some(WINDOWS_SANDBOX_LOG_ATTACHMENT_FILENAME.to_string()),
         })

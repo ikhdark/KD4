@@ -253,21 +253,23 @@ pub async fn determine_streamable_http_auth_status_without_discovery(
     store_mode: OAuthCredentialsStoreMode,
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Result<Option<McpAuthState>> {
-    Ok(match auth_status_before_discovery(
-        codex_home,
-        server_name,
-        url,
-        bearer_token_env_var,
-        http_headers,
-        env_http_headers,
-        store_mode,
-        keyring_backend_kind,
+    Ok(
+        match auth_status_before_discovery(
+            codex_home,
+            server_name,
+            url,
+            bearer_token_env_var,
+            http_headers,
+            env_http_headers,
+            store_mode,
+            keyring_backend_kind,
+        )
+        .await?
+        {
+            AuthStatusCheck::Complete(status) => Some(status),
+            AuthStatusCheck::Discover(_) => None,
+        },
     )
-    .await?
-    {
-        AuthStatusCheck::Complete(status) => Some(status),
-        AuthStatusCheck::Discover(_) => None,
-    })
 }
 
 // These arguments mirror the persisted MCP configuration fields and are kept

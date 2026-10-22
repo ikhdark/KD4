@@ -483,7 +483,6 @@ fn filter_experimental_type_fields_ts_contents(
     Ok(prune_unused_type_imports(content))
 }
 
-
 fn experimental_methods() -> HashSet<&'static str> {
     EXPERIMENTAL_CLIENT_METHODS
         .iter()
@@ -2757,7 +2756,6 @@ mod tests {
         Ok(())
     }
 
-
     #[test]
     fn build_schema_bundle_rewrites_root_helper_refs_to_namespaced_defs() -> Result<()> {
         let bundle = build_schema_bundle(vec![
@@ -3171,7 +3169,6 @@ permissionProfile?: string | null};
         );
         Ok(())
     }
-
 
     #[test]
     fn generate_json_filters_experimental_fields_and_methods() -> Result<()> {

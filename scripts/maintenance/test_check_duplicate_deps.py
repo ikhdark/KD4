@@ -24,7 +24,10 @@ class CheckDuplicateDepsTest(unittest.TestCase):
                             return subprocess.CompletedProcess(command, 7)
                         return subprocess.CompletedProcess(command, 0)
 
-                    self.assertEqual(check_duplicate_deps.check_dependency_policy([], runner=runner), 1)
+                    self.assertEqual(
+                        check_duplicate_deps.check_dependency_policy([], runner=runner),
+                        1,
+                    )
                     self.assertEqual(len(calls), 4)
                     self.assertIn("--locked", calls[1])
                     self.assertIn("--locked", calls[2])

@@ -194,7 +194,11 @@ fn non_replayable_redirect_is_not_followed_regardless_of_target_scheme() {
 #[test]
 fn redirect_credentials_are_retained_only_for_the_same_origin() {
     for (previous, next, retain_credentials) in [
-        ("https://example.com/start", "https://example.com:443/next", true),
+        (
+            "https://example.com/start",
+            "https://example.com:443/next",
+            true,
+        ),
         (
             "https://example.com:8080/start",
             "https://example.com:8080/next",
@@ -222,10 +226,22 @@ fn redirect_credentials_are_retained_only_for_the_same_origin() {
             (AUTHORIZATION, HeaderValue::from_static("Bearer secret")),
             (COOKIE, HeaderValue::from_static("session=secret")),
             (http::header::HOST, HeaderValue::from_static("example.com")),
-            (http::header::PROXY_AUTHORIZATION, HeaderValue::from_static("Basic secret")),
-            (http::header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=private")),
-            (http::header::HeaderName::from_static("cookie2"), HeaderValue::from_static("session=legacy-secret")),
-            (http::header::ACCEPT, HeaderValue::from_static("application/json")),
+            (
+                http::header::PROXY_AUTHORIZATION,
+                HeaderValue::from_static("Basic secret"),
+            ),
+            (
+                http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=private"),
+            ),
+            (
+                http::header::HeaderName::from_static("cookie2"),
+                HeaderValue::from_static("session=legacy-secret"),
+            ),
+            (
+                http::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            ),
         ]);
         let mut expected = headers.clone();
         if !retain_credentials {
@@ -238,8 +254,7 @@ fn redirect_credentials_are_retained_only_for_the_same_origin() {
         remove_sensitive_headers(&mut headers, &previous, &next);
 
         assert_eq!(
-            headers,
-            expected,
+            headers, expected,
             "credential handling for {previous} -> {next}"
         );
     }
@@ -261,7 +276,10 @@ fn redirect_strips_provider_bound_credentials_without_guessing_header_names() {
             secret.set_sensitive(true);
             headers.append(name, secret);
         }
-        headers.insert(http::header::ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
         remove_sensitive_headers(&mut headers, &original, &target);
         for name in ["api-key", "x-api-key", "arbitrary-provider-credential"] {
             assert_eq!(headers.contains_key(name), same_origin(&original, &target));

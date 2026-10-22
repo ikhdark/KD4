@@ -227,12 +227,10 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
             &mut primary,
             "thread/resume",
             10,
-            Some(serde_json::to_value(
-                ThreadResumeParams {
-                    thread_id: thread_id.clone(),
-                    ..Default::default()
-                },
-            )?),
+            Some(serde_json::to_value(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            })?),
         )
         .await?;
         let initial: ThreadResumeResponse =
@@ -243,38 +241,27 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
             &mut primary,
             "thread/archive",
             11,
-            Some(serde_json::to_value(
-                ThreadArchiveParams {
-                    thread_id: thread_id.clone(),
-                },
-            )?),
+            Some(serde_json::to_value(ThreadArchiveParams {
+                thread_id: thread_id.clone(),
+            })?),
         )
         .await?;
-        let (archived, _) = read_response_and_notification_for_method(
-            &mut primary,
-            11,
-            "thread/archived",
-        )
-        .await?;
+        let (archived, _) =
+            read_response_and_notification_for_method(&mut primary, 11, "thread/archived").await?;
         let _: ThreadArchiveResponse = to_response(archived)?;
 
         send_request(
             &mut primary,
             "thread/unarchive",
             12,
-            Some(serde_json::to_value(
-                ThreadUnarchiveParams {
-                    thread_id: thread_id.clone(),
-                },
-            )?),
+            Some(serde_json::to_value(ThreadUnarchiveParams {
+                thread_id: thread_id.clone(),
+            })?),
         )
         .await?;
-        let (unarchived, _) = read_response_and_notification_for_method(
-            &mut primary,
-            12,
-            "thread/unarchived",
-        )
-        .await?;
+        let (unarchived, _) =
+            read_response_and_notification_for_method(&mut primary, 12, "thread/unarchived")
+                .await?;
         let unarchived: ThreadUnarchiveResponse = to_response(unarchived)?;
         assert_eq!(unarchived.thread.id, thread_id);
         assert_eq!(unarchived.thread.status, ThreadStatus::NotLoaded);
@@ -283,12 +270,10 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
             &mut secondary,
             "thread/resume",
             13,
-            Some(serde_json::to_value(
-                ThreadResumeParams {
-                    thread_id: thread_id.clone(),
-                    ..Default::default()
-                },
-            )?),
+            Some(serde_json::to_value(ThreadResumeParams {
+                thread_id: thread_id.clone(),
+                ..Default::default()
+            })?),
         )
         .await?;
         let resumed: ThreadResumeResponse =
@@ -300,24 +285,18 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
             &mut secondary,
             "turn/start",
             14,
-            Some(serde_json::to_value(
-                TurnStartParams {
-                    thread_id: thread_id.clone(),
-                    input: vec![UserInput::Text {
-                        text: "secondary turn".to_string(),
-                        text_elements: Vec::new(),
-                    }],
-                    ..Default::default()
-                },
-            )?),
+            Some(serde_json::to_value(TurnStartParams {
+                thread_id: thread_id.clone(),
+                input: vec![UserInput::Text {
+                    text: "secondary turn".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                ..Default::default()
+            })?),
         )
         .await?;
-        let (started, completed) = read_response_and_notification_for_method(
-            &mut secondary,
-            14,
-            "turn/completed",
-        )
-        .await?;
+        let (started, completed) =
+            read_response_and_notification_for_method(&mut secondary, 14, "turn/completed").await?;
         let started: TurnStartResponse = to_response(started)?;
         let completed: TurnCompletedNotification =
             serde_json::from_value(completed.params.context("turn/completed params")?)?;
@@ -339,9 +318,7 @@ async fn thread_archive_clears_stale_subscriptions_before_resume() -> Result<()>
             &mut primary,
             "thread/unsubscribe",
             15,
-            Some(serde_json::to_value(
-                ThreadUnsubscribeParams { thread_id },
-            )?),
+            Some(serde_json::to_value(ThreadUnsubscribeParams { thread_id })?),
         )
         .await?;
         let unsubscribed: ThreadUnsubscribeResponse =

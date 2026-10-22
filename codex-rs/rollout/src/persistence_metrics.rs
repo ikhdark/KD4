@@ -247,6 +247,7 @@ fn rollout_item_type(item: &RolloutItem) -> Cow<'static, str> {
         RolloutItem::Compacted(_) => Cow::Borrowed("compacted"),
         RolloutItem::TurnContext(_) => Cow::Borrowed("turn_context"),
         RolloutItem::WorldState(_) => Cow::Borrowed("world_state"),
+        RolloutItem::AdditionalContextState { .. } => Cow::Borrowed("additional_context_state"),
         RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => Cow::Owned(format!(
             "event.item_completed.{}",
             turn_item_type(&event.item)

@@ -800,11 +800,27 @@ async fn prepared_one_shot_cancels_blocked_output_and_preserves_terminal_deliver
             child_cancel: child_cancel.clone(),
             submitted: false,
         };
-        let one_shot = prepared.submit_once(Vec::new(), None).await.unwrap();
-        let submitted = timeout(Duration::from_secs(1), rx_child_sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // submit_once waits for turn-start admission; acknowledge it as the
+        // child's submission loop does (handlers::user_input_or_turn_inner).
+        let (one_shot, submitted) = timeout(Duration::from_secs(1), async {
+            tokio::join!(prepared.submit_once(Vec::new(), None), async {
+                let submitted = rx_child_sub.recv().await.unwrap();
+                child
+                    .session
+                    .task_start_state
+                    .lock()
+                    .await
+                    .pending_start_only_admissions
+                    .remove(&submitted.submission.id)
+                    .expect("start admission is registered before the input is enqueued")
+                    .send(Ok(()))
+                    .unwrap();
+                submitted
+            })
+        })
+        .await
+        .expect("one-shot submission was never admitted");
+        let one_shot = one_shot.unwrap();
         assert!(matches!(submitted.submission.op, Op::UserInput { .. }));
         assert!(one_shot.submit(Op::Interrupt).await.is_err());
 
@@ -891,4 +907,85 @@ async fn prepared_one_shot_cancels_blocked_output_and_preserves_terminal_deliver
             assert!(one_shot.next_event().await.is_err());
         }
     }
+}
+
+#[tokio::test]
+async fn prepared_one_shot_rejects_input_dropped_for_a_dead_child_loop() {
+    let (tx_child_sub, rx_child_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_child_events, rx_child_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (session, ctx, _rx_evt) = crate::session::tests::make_session_and_context_with_rx().await;
+    let (termination_tx, termination_rx) = oneshot::channel();
+    let session_loop_termination =
+        crate::session::session_loop_termination_from_handle(tokio::spawn(async move {
+            let _ = termination_rx.await;
+        }));
+    let child = Arc::new(Codex {
+        tx_sub: tx_child_sub,
+        rx_event: rx_child_events,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: session_loop_termination.clone(),
+    });
+    let (tx_outer_events, rx_outer_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_outer_ops, rx_outer_ops) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let child_cancel = CancellationToken::new();
+    let delegate_liveness = child_cancel.child_token();
+    cancel_delegate_when_session_loop_terminates(&child, delegate_liveness.clone());
+    let events = tokio::spawn(forward_events(
+        Arc::clone(&child),
+        tx_outer_events,
+        Arc::clone(&session),
+        ctx,
+        delegate_liveness.clone(),
+    ));
+    let ops = tokio::spawn(forward_ops(
+        Arc::clone(&child),
+        rx_outer_ops,
+        delegate_liveness,
+    ));
+    let prepared = PreparedCodexOneShot {
+        io: Codex {
+            tx_sub: tx_outer_ops,
+            rx_event: rx_outer_events,
+            agent_status: child.agent_status.clone(),
+            session: Arc::clone(&session),
+            session_loop_termination,
+        },
+        child_cancel,
+        submitted: false,
+    };
+
+    // The child's loop is gone (its mailbox is closed) before the proxy notices.
+    // The proxy accepts the one-shot input, cannot forward it and drops it, so no
+    // submission loop will ever acknowledge or reject its turn-start admission.
+    drop(rx_child_sub);
+    let submitted = tokio::spawn(prepared.submit_once(Vec::new(), None));
+    timeout(Duration::from_secs(5), async {
+        ops.await.expect("forward_ops join error");
+        events.await.expect("forward_events join error");
+    })
+    .await
+    .expect("delegate proxy did not close after dropping the input");
+    termination_tx.send(()).expect("termination receiver alive");
+
+    let submitted = timeout(Duration::from_secs(5), submitted)
+        .await
+        .expect("the one-shot start admission must observe the dead child loop")
+        .expect("one-shot submission task panicked");
+    match submitted {
+        Err(CodexErr::InternalAgentDied) => {}
+        Err(other) => panic!("unexpected start admission error: {other:?}"),
+        Ok(_) => panic!("input dropped by the proxy cannot be admitted"),
+    }
+    assert!(
+        session
+            .task_start_state
+            .lock()
+            .await
+            .pending_start_only_admissions
+            .is_empty(),
+        "the orphaned admission sender must not stay parked in the child session"
+    );
+    drop(tx_child_events);
 }

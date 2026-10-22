@@ -1,4 +1,5 @@
 use crate::SkillsService;
+mod removal;
 use crate::agent::AgentControl;
 use crate::agent::control::AgentExecutionGuard;
 use crate::attestation::AttestationProvider;
@@ -204,11 +205,12 @@ pub struct ThreadShutdownReport {
     pub completed: Vec<ThreadId>,
     pub submit_failed: Vec<ThreadId>,
     pub timed_out: Vec<ThreadId>,
+    pub failures: Vec<(ThreadId, String)>,
 }
 
 enum ShutdownOutcome {
     Complete,
-    SubmitFailed,
+    SubmitFailed(String),
     TimedOut,
 }
 
@@ -291,8 +293,6 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
     pub(crate) agent_control: AgentControl,
     pub(crate) session_source: SessionSource,
     pub(crate) parent_thread_id: Option<ThreadId>,
-    pub(crate) inherited_environments: Option<TurnEnvironmentSnapshot>,
-    pub(crate) inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
 }
 
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
@@ -302,6 +302,7 @@ pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     pub(crate) model_http_clients: Arc<crate::client::SharedModelHttpClients>,
     thread_registry_leases: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<AsyncMutex<()>>>>,
+    removing_threads: Arc<std::sync::Mutex<HashSet<ThreadId>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_created_instances: std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<CodexThread>>>,
     auth_manager: Arc<AuthManager>,
@@ -358,16 +359,18 @@ pub fn thread_store_from_config(
 ) -> Arc<dyn ThreadStore> {
     match &config.experimental_thread_store {
         ThreadStoreConfig::Local => {
-            if config
-                .features
-                .enabled(Feature::LocalThreadStoreCompression)
-            {
-                codex_rollout::spawn_rollout_compression_worker(config.codex_home.to_path_buf());
-            }
-            Arc::new(LocalThreadStore::new(
-                LocalThreadStoreConfig::from_config(config),
-                state_db,
-            ))
+            let store =
+                LocalThreadStore::new(LocalThreadStoreConfig::from_config(config), state_db);
+            Arc::new(
+                if config
+                    .features
+                    .enabled(Feature::LocalThreadStoreCompression)
+                {
+                    store.with_compression_worker()
+                } else {
+                    store
+                },
+            )
         }
         ThreadStoreConfig::InMemory { id } => InMemoryThreadStore::for_id(id),
     }
@@ -641,6 +644,7 @@ impl ThreadManager {
                 thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),
+                removing_threads: Default::default(),
                 models_manager: build_models_manager(config, auth_manager.clone()),
                 models_manager_provider_id: config.model_provider_id.clone(),
                 models_manager_provider: config.model_provider.clone(),
@@ -782,6 +786,7 @@ impl ThreadManager {
                 thread_registry_leases: std::sync::Mutex::new(HashMap::new()),
                 thread_created_tx,
                 thread_created_instances: std::sync::Mutex::new(HashMap::new()),
+                removing_threads: Default::default(),
                 models_manager_provider_id: OPENAI_PROVIDER_ID.to_string(),
                 models_manager_provider: provider.clone(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
@@ -1022,36 +1027,9 @@ impl ThreadManager {
         &self,
         thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
-        let mut subtree_thread_ids = Vec::new();
-        let mut seen_thread_ids = HashSet::new();
-        subtree_thread_ids.push(thread_id);
-        seen_thread_ids.insert(thread_id);
-
-        if let Some(agent_graph_store) = self.state.agent_graph_store() {
-            for descendant_id in agent_graph_store
-                .list_thread_spawn_descendants(thread_id, /*status_filter*/ None)
-                .await
-                .map_err(|err| {
-                    CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
-                })?
-            {
-                if seen_thread_ids.insert(descendant_id) {
-                    subtree_thread_ids.push(descendant_id);
-                }
-            }
-        }
-
-        for descendant_id in self
-            .agent_control()
-            .list_live_agent_subtree_thread_ids(thread_id)
-            .await?
-        {
-            if seen_thread_ids.insert(descendant_id) {
-                subtree_thread_ids.push(descendant_id);
-            }
-        }
-
-        Ok(subtree_thread_ids)
+        self.state
+            .reconciled_agent_subtree(thread_id, Vec::new())
+            .await
     }
 
     /// Builds the default option set used by [`Self::start_thread`].
@@ -1192,38 +1170,14 @@ impl ThreadManager {
         explicit_overrides: PersistedThreadSettingsOverrideMask,
         persist_snapshot: bool,
     ) -> CodexResult<()> {
-        let current = new_thread.thread.config_snapshot().await;
-        let collaboration_mode = settings.collaboration_mode.as_ref().map(|mode| {
-            mode.with_updates(
-                explicit_overrides.model.then(|| current.model.clone()),
-                explicit_overrides
-                    .reasoning_effort
-                    .then(|| current.reasoning_effort.clone()),
-                /*developer_instructions*/ None,
+        self.state
+            .restore_reconstructed_runtime_settings(
+                new_thread,
+                settings,
+                explicit_overrides,
+                persist_snapshot,
             )
-        });
-        if collaboration_mode.is_some() || settings.windows_sandbox_level.is_some() {
-            new_thread
-                .thread
-                .codex
-                .session
-                .update_settings(SessionSettingsUpdate {
-                    collaboration_mode,
-                    windows_sandbox_level: settings.windows_sandbox_level,
-                    ..Default::default()
-                })
-                .await
-                .map_err(invalid_reconstructed_setting)?;
-        }
-        if persist_snapshot {
-            new_thread
-                .thread
-                .codex
-                .session
-                .persist_thread_settings_snapshot()
-                .await?;
-        }
-        Ok(())
+            .await
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -1276,6 +1230,7 @@ impl ThreadManager {
             });
         self.validate_environment_selections(&environments)?;
         let agent_control = self.agent_control();
+        let recovery_control = agent_control.clone();
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
@@ -1328,6 +1283,24 @@ impl ThreadManager {
                 );
             }
             return Err(err);
+        }
+        if new_thread.thread.multi_agent_version() == Some(MultiAgentVersion::V2)
+            && new_thread
+                .thread
+                .session_source
+                .parent_thread_id()
+                .is_none()
+        {
+            recovery_control.register_session_root(new_thread.thread_id, None);
+            if let Err(error) = recovery_control
+                .restore_cold_descendants(new_thread.thread_id)
+                .await
+            {
+                self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
+                    .await;
+                let _ = new_thread.thread.shutdown_and_wait().await;
+                return Err(error);
+            }
         }
         Ok(new_thread)
     }
@@ -1478,33 +1451,41 @@ impl ThreadManager {
 
         let mut shutdowns = threads
             .into_iter()
-            .map(|(thread_id, thread)| async move {
-                let outcome = match tokio::time::timeout(timeout, thread.shutdown_and_wait()).await
-                {
-                    Ok(Ok(())) => ShutdownOutcome::Complete,
-                    Ok(Err(_)) => ShutdownOutcome::SubmitFailed,
-                    Err(_) => ShutdownOutcome::TimedOut,
-                };
-                (thread_id, thread, outcome)
+            .map(|(thread_id, thread)| {
+                let state = Arc::clone(&self.state);
+                // One retained owner spans shutdown, accepted work, and exact-
+                // instance registry retirement. The same budget observes all of it.
+                let owner = tokio::spawn(async move {
+                    let shutdown_result = thread.shutdown_and_wait().await;
+                    let drain_result = thread.wait_until_drained().await;
+                    shutdown_result?;
+                    drain_result?;
+                    state.remove_thread_if_same(&thread_id, &thread).await;
+                    CodexResult::Ok(())
+                });
+                async move {
+                    let outcome = match tokio::time::timeout(timeout, owner).await {
+                        Ok(Ok(Ok(()))) => ShutdownOutcome::Complete,
+                        Ok(Ok(Err(error))) => ShutdownOutcome::SubmitFailed(error.to_string()),
+                        Ok(Err(error)) => ShutdownOutcome::SubmitFailed(error.to_string()),
+                        Err(_) => ShutdownOutcome::TimedOut,
+                    };
+                    (thread_id, outcome)
+                }
             })
             .collect::<FuturesUnordered<_>>();
         let mut report = ThreadShutdownReport::default();
-        let mut completed_threads = Vec::new();
-
-        while let Some((thread_id, thread, outcome)) = shutdowns.next().await {
+        while let Some((thread_id, outcome)) = shutdowns.next().await {
             match outcome {
                 ShutdownOutcome::Complete => {
                     report.completed.push(thread_id);
-                    completed_threads.push((thread_id, thread));
                 }
-                ShutdownOutcome::SubmitFailed => report.submit_failed.push(thread_id),
+                ShutdownOutcome::SubmitFailed(error) => {
+                    report.submit_failed.push(thread_id);
+                    report.failures.push((thread_id, error));
+                }
                 ShutdownOutcome::TimedOut => report.timed_out.push(thread_id),
             }
-        }
-
-        for (thread_id, thread) in completed_threads {
-            // A concurrent resume may already have installed a replacement runtime.
-            self.state.remove_thread_if_same(&thread_id, &thread).await;
         }
 
         report
@@ -1720,7 +1701,34 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
-    pub(crate) async fn fork_context_token_limit(&self, config: &Config) -> CodexResult<Option<i64>> {
+    pub(crate) async fn enqueue_queue_only_communication(
+        &self,
+        thread_id: ThreadId,
+        queue: &crate::session::InputQueue,
+        communication: codex_protocol::protocol::InterAgentCommunication,
+    ) -> CodexResult<String> {
+        debug_assert!(!communication.trigger_turn);
+        let id = uuid::Uuid::now_v7().to_string();
+        if let Some(log) = &self.ops_log
+            && let Ok(mut log) = log.lock()
+        {
+            log.push((
+                thread_id,
+                Op::InterAgentCommunication {
+                    communication: communication.clone(),
+                },
+            ));
+        }
+        if queue.enqueue_mailbox_communication(communication).await? {
+            crate::agent_communication::emit_agent_communication_receive(&id);
+        }
+        Ok(id)
+    }
+
+    pub(crate) async fn fork_context_token_limit(
+        &self,
+        config: &Config,
+    ) -> CodexResult<Option<i64>> {
         let manager = models_manager_for_config(
             &self.models_manager,
             &self.models_manager_provider_id,
@@ -1728,14 +1736,20 @@ impl ThreadManagerState {
             config,
             Arc::clone(&self.auth_manager),
         );
-        let model = manager.get_default_model(
-            &config.model,
-            false,
-            codex_models_manager::manager::RefreshStrategy::Offline,
-            config.http_client_factory(),
-        ).await?;
-        let info = manager.get_model_info(&model, &config.to_models_manager_config()).await;
-        Ok(info.auto_compact_token_limit().or(info.resolved_context_window()))
+        let model = manager
+            .get_default_model(
+                &config.model,
+                false,
+                codex_models_manager::manager::RefreshStrategy::Offline,
+                config.http_client_factory(),
+            )
+            .await?;
+        let info = manager
+            .get_model_info(&model, &config.to_models_manager_config())
+            .await;
+        Ok(info
+            .auto_compact_token_limit()
+            .or(info.resolved_context_window()))
     }
 
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
@@ -1751,6 +1765,99 @@ impl ThreadManagerState {
                 (!thread.session_source.is_internal()).then_some(*thread_id)
             })
             .collect()
+    }
+
+    /// List parent-child edges for currently loaded thread-spawn agents.
+    pub(crate) async fn reconciled_agent_subtree(
+        &self,
+        root: ThreadId,
+        extra_edges: Vec<(ThreadId, ThreadId)>,
+    ) -> CodexResult<Vec<ThreadId>> {
+        self.agent_subtree(root, extra_edges, true).await
+    }
+
+    /// Best-effort membership for shutdown when durable reads fail. Callers must
+    /// retain/report that failure rather than certify a complete subtree.
+    pub(crate) async fn retained_agent_subtree(
+        &self,
+        root: ThreadId,
+        extra_edges: Vec<(ThreadId, ThreadId)>,
+    ) -> CodexResult<Vec<ThreadId>> {
+        self.agent_subtree(root, extra_edges, false).await
+    }
+
+    async fn agent_subtree(
+        &self,
+        root: ThreadId,
+        extra_edges: Vec<(ThreadId, ThreadId)>,
+        use_durable_graph: bool,
+    ) -> CodexResult<Vec<ThreadId>> {
+        let registries = {
+            let threads = self.threads.read().await;
+            let mut seen = HashSet::new();
+            threads
+                .values()
+                .filter_map(|thread| {
+                    let registry = thread.codex.session.services.agent_control.registry();
+                    seen.insert(Arc::as_ptr(registry))
+                        .then(|| Arc::clone(registry))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut parents = extra_edges
+            .into_iter()
+            .map(|(parent, child)| (child, parent))
+            .collect::<HashMap<_, _>>();
+        for registry in registries {
+            parents.extend(
+                registry
+                    .known_spawn_edges()
+                    .into_iter()
+                    .map(|(parent, child)| (child, parent)),
+            );
+        }
+        // A loaded source is newer evidence than a retained registry entry.
+        parents.extend(
+            self.list_live_thread_spawn_edges()
+                .await
+                .into_iter()
+                .map(|(parent, child)| (child, parent)),
+        );
+        let mut edges = parents
+            .into_iter()
+            .map(|(child, parent)| (parent, child))
+            .collect::<Vec<_>>();
+        if use_durable_graph && let Some(store) = self.agent_graph_store() {
+            edges = store
+                .list_reconciled_thread_spawn_edges(root, edges)
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "failed to reconcile thread-spawn descendants: {err}"
+                    ))
+                })?;
+        }
+        let mut children = HashMap::<ThreadId, Vec<ThreadId>>::new();
+        for (parent, child) in edges {
+            children.entry(parent).or_default().push(child);
+        }
+        let mut result = vec![root];
+        let mut seen = HashSet::from([root]);
+        let mut level = vec![root];
+        while !level.is_empty() {
+            let mut next = Vec::new();
+            for parent in level {
+                for child in children.remove(&parent).unwrap_or_default() {
+                    if seen.insert(child) {
+                        next.push(child);
+                    }
+                }
+            }
+            next.sort_by_key(ToString::to_string);
+            result.extend(next.iter().copied());
+            level = next;
+        }
+        Ok(result)
     }
 
     /// List parent-child edges for currently loaded thread-spawn agents.
@@ -1794,9 +1901,22 @@ impl ThreadManagerState {
             .map_err(|err| stored_thread_read_error(thread_id, err))
     }
 
-    /// Send an operation to a thread by ID.
-    pub(crate) async fn send_op(&self, thread_id: ThreadId, op: Op) -> CodexResult<String> {
+    pub(crate) async fn send_op_with_instance(
+        &self,
+        thread_id: ThreadId,
+        op: Op,
+    ) -> CodexResult<(Arc<CodexThread>, CodexResult<String>)> {
         let thread = self.get_thread(thread_id).await?;
+        let result = self.send_op_to_instance(thread_id, &thread, op).await;
+        Ok((thread, result))
+    }
+
+    pub(crate) async fn send_op_to_instance(
+        &self,
+        thread_id: ThreadId,
+        thread: &Arc<CodexThread>,
+        op: Op,
+    ) -> CodexResult<String> {
         if let Some(ops_log) = &self.ops_log
             && let Ok(mut log) = ops_log.lock()
         {
@@ -1810,16 +1930,17 @@ impl ThreadManagerState {
         thread_id: ThreadId,
         op: Op,
         execution_guard: Option<AgentExecutionGuard>,
-    ) -> CodexResult<String> {
+    ) -> CodexResult<(Arc<CodexThread>, CodexResult<String>)> {
         let thread = self.get_thread(thread_id).await?;
         if let Some(ops_log) = &self.ops_log
             && let Ok(mut log) = ops_log.lock()
         {
             log.push((thread_id, op.clone()));
         }
-        thread
+        let result = thread
             .submit_with_preacquired_execution_guard(op, execution_guard)
-            .await
+            .await;
+        Ok((thread, result))
     }
 
     /// Remove a thread from the manager by ID, returning it when present.
@@ -1838,6 +1959,32 @@ impl ThreadManagerState {
         thread_id: &ThreadId,
         expected_thread: &Arc<CodexThread>,
     ) -> bool {
+        self.remove_thread_if_same_with_cleanup(thread_id, expected_thread, || {})
+            .await
+    }
+
+    /// Keep replacement publication fenced until the old instance's dependent state is retired.
+    pub(crate) async fn cleanup_thread_if_absent(
+        &self,
+        thread_id: ThreadId,
+        cleanup: impl FnOnce(),
+    ) -> bool {
+        let _lease = self.acquire_thread_registry_lease(thread_id).await;
+        let threads = self.threads.read().await;
+        if threads.contains_key(&thread_id) {
+            return false;
+        }
+        cleanup();
+        true
+    }
+
+    /// Keep replacement publication fenced until the old instance's dependent state is retired.
+    pub(crate) async fn remove_thread_if_same_with_cleanup(
+        &self,
+        thread_id: &ThreadId,
+        expected_thread: &Arc<CodexThread>,
+        cleanup: impl FnOnce(),
+    ) -> bool {
         let _thread_registry_lease = self.acquire_thread_registry_lease(*thread_id).await;
         let mut threads = self.threads.write().await;
         if !threads
@@ -1848,6 +1995,8 @@ impl ThreadManagerState {
         }
         threads.remove(thread_id);
         self.forget_thread_created_instance_if_same(thread_id, expected_thread);
+        drop(threads);
+        cleanup();
         true
     }
 
@@ -1890,7 +2039,10 @@ impl ThreadManagerState {
         })
     }
 
-    async fn acquire_thread_registry_lease(&self, thread_id: ThreadId) -> OwnedMutexGuard<()> {
+    pub(crate) async fn acquire_thread_registry_lease(
+        &self,
+        thread_id: ThreadId,
+    ) -> OwnedMutexGuard<()> {
         let thread_registry_lease = {
             let mut leases = self
                 .thread_registry_leases
@@ -2143,6 +2295,47 @@ impl ThreadManagerState {
         .await
     }
 
+    async fn restore_reconstructed_runtime_settings(
+        &self,
+        new_thread: &NewThread,
+        settings: &PersistedThreadSettings,
+        explicit_overrides: PersistedThreadSettingsOverrideMask,
+        persist_snapshot: bool,
+    ) -> CodexResult<()> {
+        let current = new_thread.thread.config_snapshot().await;
+        let collaboration_mode = settings.collaboration_mode.as_ref().map(|mode| {
+            mode.with_updates(
+                explicit_overrides.model.then(|| current.model.clone()),
+                explicit_overrides
+                    .reasoning_effort
+                    .then(|| current.reasoning_effort.clone()),
+                /*developer_instructions*/ None,
+            )
+        });
+        if collaboration_mode.is_some() || settings.windows_sandbox_level.is_some() {
+            new_thread
+                .thread
+                .codex
+                .session
+                .update_settings(SessionSettingsUpdate {
+                    collaboration_mode,
+                    windows_sandbox_level: settings.windows_sandbox_level,
+                    ..Default::default()
+                })
+                .await
+                .map_err(invalid_reconstructed_setting)?;
+        }
+        if persist_snapshot {
+            new_thread
+                .thread
+                .codex
+                .session
+                .persist_thread_settings_snapshot()
+                .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn resume_thread_with_history_with_source(
         &self,
         options: ResumeThreadWithHistoryOptions,
@@ -2153,13 +2346,50 @@ impl ThreadManagerState {
             agent_control,
             session_source,
             parent_thread_id,
-            inherited_environments,
-            inherited_exec_policy,
         } = options;
-        let environments =
-            default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd);
+        // Restore the child's persisted identity and settings, not the sender's.
+        let persisted = resolve_persisted_thread_settings(
+            &initial_history,
+            &mut ThreadSettingsReconstruction::default(),
+        );
+        let config = apply_reconstructed_settings_to_config_async(config, &persisted).await?;
+        if !tokio::fs::metadata(config.cwd.as_path())
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "child workspace is unavailable: {}",
+                config.cwd.display(),
+            )));
+        }
+        let environments = persisted
+            .environments
+            .as_ref()
+            .map(|settings| settings.environments.clone())
+            // Legacy histories have no saved selection; only those use defaults.
+            .unwrap_or_else(|| {
+                default_thread_environment_selections(
+                    self.environment_manager.as_ref(),
+                    &config.cwd,
+                )
+            });
+        let mut seen = HashSet::new();
+        for selection in &environments {
+            if !seen.insert(&selection.environment_id)
+                || self
+                    .environment_manager
+                    .get_environment(&selection.environment_id)
+                    .is_none()
+            {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "invalid persisted child environment `{}`",
+                    selection.environment_id,
+                )));
+            }
+        }
         let thread_source = initial_history.get_resumed_thread_source();
-        Box::pin(self.spawn_thread_with_source(
+        let new_thread = Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
             /*history_mode*/ None,
@@ -2172,15 +2402,33 @@ impl ThreadManagerState {
             thread_source,
             Vec::new(),
             /*metrics_service_name*/ None,
-            inherited_environments,
-            inherited_exec_policy,
+            /*inherited_environments*/ None,
+            /*inherited_exec_policy*/ None,
             /*parent_trace*/ None,
             environments,
             /*thread_extension_init*/ ExtensionDataInit::default(),
             /*supports_openai_form_elicitation*/ false,
             /*user_shell_override*/ None,
         ))
-        .await
+        .await?;
+        if new_thread.was_already_running {
+            return Ok(new_thread);
+        }
+        if let Err(error) = self
+            .restore_reconstructed_runtime_settings(
+                &new_thread,
+                &persisted,
+                PersistedThreadSettingsOverrideMask::default(),
+                false,
+            )
+            .await
+        {
+            self.remove_thread_if_same(&new_thread.thread_id, &new_thread.thread)
+                .await;
+            let _ = new_thread.thread.shutdown_and_wait().await;
+            return Err(error);
+        }
+        Ok(new_thread)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2277,8 +2525,8 @@ impl ThreadManagerState {
         allow_provider_model_fallback: bool,
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
-        session_source: SessionSource,
-        parent_thread_id: Option<ThreadId>,
+        mut session_source: SessionSource,
+        mut parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
         thread_source: Option<ThreadSource>,
         dynamic_tools: Vec<codex_protocol::dynamic_tools::DynamicToolSpec>,
@@ -2318,11 +2566,30 @@ impl ThreadManagerState {
                 threads.remove(&resumed.conversation_id);
             }
         }
+        if parent_thread_id.is_none()
+            && let InitialHistory::Resumed(resumed) = &initial_history
+            && let Ok(stored) = self
+                .read_stored_thread(codex_thread_store::ReadThreadParams {
+                    thread_id: resumed.conversation_id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
+            && let Some(current_parent) = stored.parent_thread_id
+        {
+            parent_thread_id = Some(current_parent);
+            if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) = &mut session_source
+            {
+                *parent_thread_id = current_parent;
+            }
+        }
         let user_instructions = self
             .user_instructions_for_spawn(&session_source, parent_thread_id, forked_from_thread_id)
             .await;
         let parent_rollout_thread_trace = self
-            .parent_rollout_thread_trace_for_source(&session_source, &initial_history)
+            .parent_rollout_thread_trace_for_source(&session_source)
             .await;
         let tracked_session_source = session_source.clone();
         let multi_agent_version = self
@@ -2438,16 +2705,40 @@ impl ThreadManagerState {
             }
         };
 
+        let removal_blocked;
         {
             let _thread_registry_lease = self.acquire_thread_registry_lease(thread_id).await;
             let mut threads = self.threads.write().await;
-            if let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id) {
+            {
+                let removing = self
+                    .removing_threads
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                removal_blocked = removing.contains(&thread_id)
+                    || session_source
+                        .parent_thread_id()
+                        .is_some_and(|parent| removing.contains(&parent));
+            }
+            if !removal_blocked
+                && let std::collections::hash_map::Entry::Vacant(e) = threads.entry(thread_id)
+            {
                 let thread = Arc::new(CodexThread::new(
                     codex,
                     session_configured.clone(),
                     session_configured.rollout_path.clone(),
                     session_source,
                 ));
+                if thread.multi_agent_version() == Some(MultiAgentVersion::V2) {
+                    thread
+                        .codex
+                        .session
+                        .services
+                        .agent_control
+                        .remember_input_queue(
+                            thread_id,
+                            Arc::clone(&thread.codex.session.input_queue),
+                        );
+                }
                 e.insert(thread.clone());
                 return Ok(NewThread {
                     thread_id,
@@ -2460,6 +2751,14 @@ impl ThreadManagerState {
 
         if let Err(err) = codex.shutdown_and_wait().await {
             warn!("failed to shut down duplicate thread {thread_id}: {err}");
+        }
+        if removal_blocked {
+            if rollback_persistence_on_error {
+                rollback_created_thread_persistence(&self.thread_store, thread_id).await;
+            }
+            return Err(CodexErr::InvalidRequest(format!(
+                "thread {thread_id} or its parent is being deleted"
+            )));
         }
         Err(CodexErr::InvalidRequest(format!(
             "thread {thread_id} is already running"
@@ -2489,22 +2788,15 @@ impl ThreadManagerState {
     async fn parent_rollout_thread_trace_for_source(
         &self,
         session_source: &SessionSource,
-        initial_history: &InitialHistory,
     ) -> codex_rollout_trace::ThreadTraceContext {
-        // A fresh v2 child belongs to the same rollout tree as its parent, so
-        // session startup derives its child trace from the parent's thread
-        // context. Resumed children already have a prior `ThreadStarted` event
-        // for this thread id; deriving a child trace during resume would write
-        // that start event again and make the bundle unreplayable.
+        // Fresh and cold-reloaded children share their parent's bundle. Session
+        // startup chooses an original start or an explicit resumed activation.
         let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id, ..
         }) = session_source
         else {
             return codex_rollout_trace::ThreadTraceContext::disabled();
         };
-        if matches!(initial_history, InitialHistory::Resumed(_)) {
-            return codex_rollout_trace::ThreadTraceContext::disabled();
-        }
         // Parent lookup can fail if the parent was closed or released between
         // spawn preparation and session construction. Tracing is diagnostic, so
         // that race should not block child creation; the child simply starts
@@ -2586,7 +2878,7 @@ fn truncate_before_nth_user_message(
             .active_turn_start_index
             .or_else(|| user_positions.last().copied())
         {
-            items[..cut_idx].to_vec()
+            truncation::carry_source_integrity_notice(&items, items[..cut_idx].to_vec())
         } else {
             items
         }
@@ -2694,7 +2986,11 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
         ends_mid_turn: !rollout_items[last_user_position + 1..].iter().any(|item| {
             matches!(
                 item,
-                RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                RolloutItem::EventMsg(
+                    EventMsg::TurnComplete(_)
+                        | EventMsg::TurnAborted(_)
+                        | EventMsg::ImportedTurnClosed(_)
+                )
             )
         }),
         active_turn_id: None,
@@ -2706,10 +3002,20 @@ fn implicit_legacy_turn_is_unfinished(
     rollout_items: &[RolloutItem],
     active_turn_start_index: usize,
 ) -> bool {
-    if !matches!(
-        rollout_items.get(active_turn_start_index),
-        Some(RolloutItem::EventMsg(EventMsg::UserMessage(_)))
-    ) {
+    // Legacy input opens the implicit turn itself, or joins the raw user item
+    // that opened it as that item's mirror.
+    let has_legacy_input = match rollout_items.get(active_turn_start_index) {
+        Some(RolloutItem::EventMsg(EventMsg::UserMessage(_))) => true,
+        Some(RolloutItem::ResponseItem(item))
+            if crate::context_manager::is_user_turn_boundary(item) =>
+        {
+            rollout_items[active_turn_start_index + 1..]
+                .iter()
+                .any(|item| matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_))))
+        }
+        _ => false,
+    };
+    if !has_legacy_input {
         return false;
     }
 
@@ -2722,7 +3028,11 @@ fn implicit_legacy_turn_is_unfinished(
                     if !message.message.is_empty()
             ) || matches!(
                 item,
-                RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+                RolloutItem::EventMsg(
+                    EventMsg::TurnComplete(_)
+                        | EventMsg::TurnAborted(_)
+                        | EventMsg::ImportedTurnClosed(_)
+                )
             )
         })
 }
@@ -2799,7 +3109,7 @@ fn truncate_to_last_sampling_boundary(
     if retained.is_empty() {
         InitialHistory::New
     } else {
-        InitialHistory::Forked(retained)
+        InitialHistory::Forked(truncation::carry_source_integrity_notice(items, retained))
     }
 }
 

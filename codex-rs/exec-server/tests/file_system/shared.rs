@@ -4,6 +4,7 @@ use codex_exec_server::CopyOptions;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::FILE_READ_CHUNK_SIZE;
 use codex_exec_server::FileMetadata;
+use codex_exec_server::FileMutationOutcome;
 use codex_exec_server::ReadDirectoryEntry;
 use codex_exec_server::RemoveOptions;
 use codex_exec_server::WalkEntry;
@@ -70,7 +71,10 @@ async fn file_system_get_metadata_reports_files_and_directories(
     std::fs::write(&file_path, "hello")?;
     std::fs::create_dir(&directory_path)?;
     let modified = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_123);
-    std::fs::File::options().write(true).open(&file_path)?.set_modified(modified)?;
+    std::fs::File::options()
+        .write(true)
+        .open(&file_path)?
+        .set_modified(modified)?;
     let native_file = std::fs::metadata(&file_path)?;
     let native_directory = std::fs::metadata(&directory_path)?;
 
@@ -88,7 +92,10 @@ async fn file_system_get_metadata_reports_files_and_directories(
             is_file: true,
             is_symlink: false,
             size: 5,
-            created_at_ms: native_file.created()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
+            created_at_ms: native_file
+                .created()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64,
             modified_at_ms: 1_600_000_000_123,
         }
     );
@@ -108,8 +115,14 @@ async fn file_system_get_metadata_reports_files_and_directories(
             is_file: false,
             is_symlink: false,
             size: native_directory.len(),
-            created_at_ms: native_directory.created()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
-            modified_at_ms: native_directory.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
+            created_at_ms: native_directory
+                .created()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64,
+            modified_at_ms: native_directory
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64,
         }
     );
     assert!(directory_metadata.modified_at_ms > 0);
@@ -418,6 +431,7 @@ async fn file_system_walk_returns_a_bounded_tree(
     assert_eq!(
         outcome,
         WalkOutcome {
+            no_follow_enforced: true,
             applied_filters: None,
             entries: vec![
                 WalkEntry {
@@ -467,12 +481,17 @@ async fn file_system_walk_returns_a_bounded_tree(
     assert_eq!(
         shallow,
         WalkOutcome {
+            no_follow_enforced: true,
             applied_filters: None,
             entries: root_entries.clone(),
             errors: Vec::new(),
             truncated: true,
-            unexplored: vec![codex_file_system::WalkStop { path: PathUri::from_host_native_path(&nested_dir)?,
-                reason: "depth_limit".into(), effective_limit: 0, partially_examined: false }],
+            unexplored: vec![codex_file_system::WalkStop {
+                path: PathUri::from_host_native_path(&nested_dir)?,
+                reason: "depth_limit".into(),
+                effective_limit: 0,
+                partially_examined: false
+            }],
         }
     );
 
@@ -494,12 +513,17 @@ async fn file_system_walk_returns_a_bounded_tree(
     assert_eq!(
         directory_bounded,
         WalkOutcome {
+            no_follow_enforced: true,
             applied_filters: None,
             entries: root_entries.clone(),
             errors: Vec::new(),
             truncated: true,
-            unexplored: vec![codex_file_system::WalkStop { path: PathUri::from_host_native_path(&nested_dir)?,
-                reason: "directory_limit".into(), effective_limit: 1, partially_examined: false }],
+            unexplored: vec![codex_file_system::WalkStop {
+                path: PathUri::from_host_native_path(&nested_dir)?,
+                reason: "directory_limit".into(),
+                effective_limit: 1,
+                partially_examined: false
+            }],
         }
     );
 
@@ -554,7 +578,7 @@ async fn file_system_walk_honors_read_sandbox(
     let denied_dir = readable_root.join("denied");
     std::fs::create_dir_all(&denied_dir)?;
     std::fs::write(denied_dir.join("secret.txt"), "denied")?;
-    let sandbox = read_only_sandbox_with_denied(readable_root, denied_dir.clone());
+    let sandbox = read_only_sandbox_with_denied(readable_root.clone(), denied_dir.clone());
     let options = WalkOptions {
         max_depth: 1,
         max_directories: 2,
@@ -575,12 +599,10 @@ async fn file_system_walk_honors_read_sandbox(
         )
         .await;
     assert!(
-        denied
-            .as_ref()
-            .map_or_else(
-                |error| error.kind() == std::io::ErrorKind::PermissionDenied,
-                |outcome| outcome.entries.is_empty(),
-            ),
+        denied.as_ref().map_or_else(
+            |error| error.kind() == std::io::ErrorKind::PermissionDenied,
+            |outcome| outcome.entries.is_empty(),
+        ),
         "mode={implementation}: walk of a denied directory returned {denied:?}"
     );
 
@@ -595,6 +617,7 @@ async fn file_system_walk_honors_read_sandbox(
     assert_eq!(
         outcome,
         WalkOutcome {
+            no_follow_enforced: true,
             entries: vec![WalkEntry {
                 path: PathUri::from_host_native_path(file_path)?,
                 kind: WalkEntryKind::File,
@@ -605,6 +628,22 @@ async fn file_system_walk_honors_read_sandbox(
             applied_filters: None,
         }
     );
+
+    // Ancestor traversal grants must not override content denials on a sibling
+    // outside the readable root, even after the allowed walk has prepared ACLs.
+    let sibling = tmp.path().join("denied-sibling");
+    std::fs::create_dir(&sibling)?;
+    let sibling_file = sibling.join("secret.txt");
+    std::fs::write(&sibling_file, "outside")?;
+    let sibling_sandbox = read_only_sandbox_with_denied(readable_root, sibling);
+    let error = file_system
+        .read_file(
+            &PathUri::from_host_native_path(sibling_file)?,
+            Some(&sibling_sandbox),
+        )
+        .await
+        .expect_err("ancestor handle grants must not bypass a sibling content denial");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 
     Ok(())
 }
@@ -718,7 +757,10 @@ async fn file_system_sandboxed_metadata_and_read_allow_readable_root(
     std::fs::write(&file_path, "sandboxed hello")?;
     let sandbox = read_only_sandbox(allowed_dir);
     let modified = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_123);
-    std::fs::File::options().write(true).open(&file_path)?.set_modified(modified)?;
+    std::fs::File::options()
+        .write(true)
+        .open(&file_path)?
+        .set_modified(modified)?;
     let native_file = std::fs::metadata(&file_path)?;
 
     let metadata = file_system
@@ -732,7 +774,10 @@ async fn file_system_sandboxed_metadata_and_read_allow_readable_root(
             is_file: true,
             is_symlink: false,
             size: 15,
-            created_at_ms: native_file.created()?.duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64,
+            created_at_ms: native_file
+                .created()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64,
             modified_at_ms: 1_600_000_000_123,
         }
     );
@@ -911,6 +956,174 @@ async fn file_system_sandboxed_write_allows_additional_write_root(
     assert_eq!(std::fs::read(&file_path)?, b"created");
 
     Ok(())
+}
+
+#[test_case(FileSystemImplementation::Local ; "local")]
+#[test_case(FileSystemImplementation::Remote ; "remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_system_conditional_mutation_honors_preimage_inside_and_outside_sandbox(
+    implementation: FileSystemImplementation,
+) -> Result<()> {
+    let context = create_file_system_context(implementation).await?;
+    let file_system = context.file_system;
+
+    let tmp = TempDir::new()?;
+    let readable_dir = tmp.path().join("readable");
+    let writable_dir = tmp.path().join("writable");
+    std::fs::create_dir_all(&readable_dir)?;
+    std::fs::create_dir_all(&writable_dir)?;
+    let mut sandbox = read_only_sandbox(readable_dir.clone());
+    let additional_permissions = AdditionalPermissionProfile {
+        network: None,
+        file_system: Some(FileSystemPermissions::from_read_write_roots(
+            /*read*/ None,
+            Some(vec![absolute_path(writable_dir.clone())]),
+        )),
+    };
+    let native_permissions: PermissionProfile = sandbox.permissions.clone().try_into()?;
+    sandbox.permissions = PermissionProfile::from_runtime_permissions_with_enforcement(
+        native_permissions.enforcement(),
+        &effective_file_system_sandbox_policy(
+            &native_permissions.file_system_sandbox_policy(),
+            Some(&additional_permissions),
+        ),
+        effective_network_sandbox_policy(
+            native_permissions.network_sandbox_policy(),
+            Some(&additional_permissions),
+        ),
+    )
+    .into();
+
+    // apply_patch commits through this boundary in every environment, including
+    // platform-sandboxed and remote ones.
+    for (name, sandbox) in [("unsandboxed", None), ("sandboxed", Some(&sandbox))] {
+        let file_path = writable_dir.join(format!("{name}.txt"));
+        std::fs::write(&file_path, b"old")?;
+        let path = PathUri::from_host_native_path(&file_path)?;
+        let context = || format!("{name} mode={implementation}");
+
+        let stale = file_system
+            .mutate_file_if_matches(
+                &path,
+                Some(b"stale".to_vec()),
+                Some(b"new".to_vec()),
+                sandbox,
+            )
+            .await
+            .with_context(context)?;
+        assert!(
+            matches!(stale, FileMutationOutcome::Conflict),
+            "{}",
+            context()
+        );
+        assert_eq!(std::fs::read(&file_path)?, b"old", "{}", context());
+
+        let created_path = writable_dir.join(format!("{name}-created.txt"));
+        let created = file_system
+            .mutate_file_if_matches(
+                &PathUri::from_host_native_path(&created_path)?,
+                /*expected*/ None,
+                Some(b"created".to_vec()),
+                sandbox,
+            )
+            .await
+            .with_context(context)?;
+        assert!(
+            matches!(created, FileMutationOutcome::Committed),
+            "{}",
+            context()
+        );
+        assert_eq!(std::fs::read(&created_path)?, b"created", "{}", context());
+
+        // The sandbox token cannot give a new file the replaced file's owner or
+        // DACL. Replacement must still commit without changing that security.
+        let security = sandbox.map(|_| file_security(&file_path)).transpose()?;
+        let replaced = file_system
+            .mutate_file_if_matches(&path, Some(b"old".to_vec()), Some(b"new".to_vec()), sandbox)
+            .await
+            .with_context(context)?;
+        assert!(
+            matches!(replaced, FileMutationOutcome::Committed),
+            "{}",
+            context()
+        );
+        assert_eq!(std::fs::read(&file_path)?, b"new", "{}", context());
+        if let Some(security) = security {
+            assert_eq!(file_security(&file_path)?, security, "{}", context());
+        }
+
+        let deleted = file_system
+            .mutate_file_if_matches(&path, Some(b"new".to_vec()), None, sandbox)
+            .await
+            .with_context(context)?;
+        assert!(
+            matches!(deleted, FileMutationOutcome::Committed),
+            "{}",
+            context()
+        );
+        assert!(!file_path.exists(), "{}", context());
+
+        if let Some(sandbox) = sandbox {
+            // Outside the writable roots, replacement still fails closed.
+            let read_only_path = readable_dir.join("read-only.txt");
+            std::fs::write(&read_only_path, b"old")?;
+            let error = file_system
+                .mutate_file_if_matches(
+                    &PathUri::from_host_native_path(&read_only_path)?,
+                    Some(b"old".to_vec()),
+                    Some(b"new".to_vec()),
+                    Some(sandbox),
+                )
+                .await
+                .expect_err("a read-only root must not be replaced");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{}",
+                context()
+            );
+            assert_eq!(std::fs::read(&read_only_path)?, b"old", "{}", context());
+        }
+    }
+
+    Ok(())
+}
+
+/// Owner, group and DACL exactly as stored for the file.
+fn file_security(path: &Path) -> Result<Vec<u32>> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::GROUP_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::GetFileSecurityW;
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let information =
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    let mut needed = 0;
+    // SAFETY: the path is NUL-terminated; a null buffer only queries the size.
+    unsafe {
+        GetFileSecurityW(
+            path.as_ptr(),
+            information,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    anyhow::ensure!(
+        needed > 0,
+        "querying the security descriptor size failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut descriptor = vec![0_u32; (needed as usize).div_ceil(size_of::<u32>())];
+    let buffer = descriptor.as_mut_ptr().cast();
+    // SAFETY: the DWORD-aligned buffer holds at least `needed` bytes.
+    let read = unsafe { GetFileSecurityW(path.as_ptr(), information, buffer, needed, &mut needed) };
+    if read == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(descriptor)
 }
 
 #[test_case(FileSystemImplementation::Local ; "local")]

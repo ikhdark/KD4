@@ -17,11 +17,119 @@ const completed = {
 };
 
 describe("Thread", () => {
+  it.each([
+    { type: "turn.completed" },
+    { type: "turn.completed", usage: "invalid" },
+    { type: "turn.completed", usage: [] },
+    { ...completed, usage: { ...completed.usage, input_tokens: -1 } },
+    { ...completed, usage: { ...completed.usage, output_tokens: 1.5 } },
+    { type: "item.completed", item: { id: "x", type: "agent_message", text: 17 } },
+    { type: "turn.failed", error: "bad" },
+    null,
+  ])("rejects malformed critical envelopes: %j", async (bad) => {
+    const exec = {
+      async *run() {
+        yield JSON.stringify(bad);
+      },
+    } as unknown as CodexExec;
+    await expect(new Thread(exec, {}, {}).run("hello")).rejects.toBeInstanceOf(TurnRunError);
+  });
+
+  it("seals the result but accepts fatal invocation evidence after completion", async () => {
+    const item = { id: "before", type: "agent_message", text: "BEFORE" };
+    const fatal = {
+      type: "error",
+      message: "unsaved",
+      code: "session_persistence_unconfirmed",
+      phase: "finalization",
+    };
+    for (const late of [
+      { type: "item.completed", item: { ...item, id: "late", text: "AFTER" } },
+      fatal,
+    ]) {
+      const exec = {
+        async *run() {
+          for (const event of [{ type: "item.completed", item }, completed, late])
+            yield JSON.stringify(event);
+        },
+      } as unknown as CodexExec;
+      await expect(new Thread(exec, {}, {}).run("hello")).rejects.toMatchObject({
+        finalResponse: "BEFORE",
+        items: [item],
+        terminal: completed,
+        ...(late === fatal
+          ? { streamError: { message: "unsaved", code: fatal.code, phase: fatal.phase } }
+          : {}),
+      });
+    }
+  });
+
+  it("returns plan-only text, preserves agent precedence and honest missing usage", async () => {
+    for (const withAgent of [false, true]) {
+      const exec = {
+        async *run() {
+          if (withAgent)
+            yield JSON.stringify({
+              type: "item.completed",
+              item: { id: "a", type: "agent_message", text: "answer" },
+            });
+          yield JSON.stringify({
+            type: "item.completed",
+            item: { id: "p", type: "plan", text: "Plan α\nVerify β" },
+          });
+          yield JSON.stringify({ type: "turn.completed", usage: null });
+        },
+      } as unknown as CodexExec;
+      const turn = await new Thread(exec, {}, {}).run("hello");
+      expect(turn.finalResponse).toBe(withAgent ? "answer" : "Plan α\nVerify β");
+      expect(turn.usage).toBeNull();
+    }
+  });
+
+  it("accepts equivalent UUID spellings but rejects identity switches", async () => {
+    const id = "12345678-1234-4234-8234-123456789abc";
+    for (const returned of [
+      id.toUpperCase().replace(/-/g, ""),
+      "aaaaaaaa-1234-4234-8234-123456789abc",
+    ]) {
+      const exec = {
+        async *run() {
+          yield JSON.stringify({ type: "thread.started", thread_id: returned });
+          yield JSON.stringify(completed);
+        },
+      } as unknown as CodexExec;
+      const result = new Thread(exec, {}, {}, id).run("hello");
+      if (returned.startsWith("a")) await expect(result).rejects.toThrow("thread identity changed");
+      else await expect(result).resolves.toMatchObject({ usage: completed.usage });
+    }
+  });
+
+  it("passes unknown future events through streamed parsing", async () => {
+    const future = { type: "future.notification", version_hint: 42 };
+    const exec = {
+      async *run() {
+        yield JSON.stringify(future);
+        yield JSON.stringify(completed);
+      },
+    } as unknown as CodexExec;
+    const { events } = await new Thread(exec, {}, {}).runStreamed("hello");
+    const received = [];
+    for await (const event of events) received.push(event);
+    expect(received).toEqual([future, completed]);
+  });
+
   it.each(["turn.failed", "turn.completed"] as const)(
-    "rejects another terminal after %s without replacing its accounting", async (type) => {
-      const first = type === "turn.failed"
-        ? { type, error: { message: "original failure" }, usage: null, timing: { duration_ms: 0 } }
-        : completed;
+    "rejects another terminal after %s without replacing its accounting",
+    async (type) => {
+      const first =
+        type === "turn.failed"
+          ? {
+              type,
+              error: { message: "original failure" },
+              usage: null,
+              timing: { duration_ms: 0 },
+            }
+          : completed;
       const exec = {
         async *run(): AsyncGenerator<string> {
           yield JSON.stringify(first);
@@ -36,47 +144,99 @@ describe("Thread", () => {
     },
   );
 
-  it.each([undefined, null, { duration_ms: 0 }])("preserves timing availability: %j", async (timing) => {
-    const exec = { async *run() { yield JSON.stringify({ ...completed, ...(timing === undefined ? {} : { timing }) }); } } as unknown as CodexExec;
-    const result = await new Thread(exec, {}, {}).run("hello");
-    expect(result.timing).toEqual(timing);
-    expect("timing" in result).toBe(timing !== undefined);
-  });
+  it.each([undefined, null, { duration_ms: 0 }])(
+    "preserves timing availability: %j",
+    async (timing) => {
+      const exec = {
+        async *run() {
+          yield JSON.stringify({ ...completed, ...(timing === undefined ? {} : { timing }) });
+        },
+      } as unknown as CodexExec;
+      const result = await new Thread(exec, {}, {}).run("hello");
+      expect(result.timing).toEqual(timing);
+      expect("timing" in result).toBe(timing !== undefined);
+    },
+  );
 
   it("retains partial results and terminal accounting across error then nonzero exit", async () => {
     const item = { id: "partial", type: "agent_message", text: "partial" };
-    const terminal = { type: "turn.failed", error: { message: "lost" }, disposition: "transport_lost", usage: null, timing: { duration_ms: 0 } };
+    const terminal = {
+      type: "turn.failed",
+      error: { message: "lost" },
+      disposition: "transport_lost",
+      usage: null,
+      timing: { duration_ms: 0 },
+    };
     const cause = new Error("Codex Exec exited with code 1");
-    const exec = { async *run() {
-      for (const event of [{ type: "thread.started", thread_id: "failure-thread" }, { type: "item.completed", item }, { type: "error", message: "transport" }, terminal]) yield JSON.stringify(event);
-      throw cause;
-    } } as unknown as CodexExec;
-    try { await new Thread(exec, {}, {}).run("hello"); throw new Error("expected failure"); }
-    catch (error) {
+    const exec = {
+      async *run() {
+        for (const event of [
+          { type: "thread.started", thread_id: "failure-thread" },
+          { type: "item.completed", item },
+          { type: "error", message: "transport" },
+          terminal,
+        ])
+          yield JSON.stringify(event);
+        throw cause;
+      },
+    } as unknown as CodexExec;
+    try {
+      await new Thread(exec, {}, {}).run("hello");
+      throw new Error("expected failure");
+    } catch (error) {
       expect(error).toBeInstanceOf(TurnRunError);
-      expect(error).toMatchObject({ threadId: "failure-thread", items: [item], finalResponse: "partial", terminal, cause, usage: null, disposition: "transport_lost", timing: { duration_ms: 0 } });
+      expect(error).toMatchObject({
+        threadId: "failure-thread",
+        items: [item],
+        finalResponse: "partial",
+        terminal,
+        cause,
+        usage: null,
+        disposition: "transport_lost",
+        timing: { duration_ms: 0 },
+      });
     }
   });
 
   it("aborts a fatal producer that never sends terminal accounting", async () => {
     jest.useFakeTimers();
     let aborted = false;
-    const exec = { async *run({ signal }: { signal: AbortSignal }) {
-      yield JSON.stringify({ type: "error", message: "fatal" });
-      await new Promise<void>(resolve => signal.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true }));
-    } } as unknown as CodexExec;
+    const exec = {
+      async *run({ signal }: { signal: AbortSignal }) {
+        yield JSON.stringify({ type: "error", message: "fatal" });
+        await new Promise<void>((resolve) =>
+          signal.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              resolve();
+            },
+            { once: true },
+          ),
+        );
+      },
+    } as unknown as CodexExec;
     try {
-      const result = expect(new Thread(exec, {}, {}).run("hello")).rejects.toMatchObject({ message: "fatal", terminal: undefined });
+      const result = expect(new Thread(exec, {}, {}).run("hello")).rejects.toMatchObject({
+        message: "fatal",
+        terminal: undefined,
+      });
       await jest.advanceTimersByTimeAsync(1_000);
       await result;
       expect(aborted).toBe(true);
-    } finally { jest.useRealTimers(); }
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it.each([
     { events: [] },
     { events: [{ type: "turn.started" }] },
-    { events: [{ type: "item.completed", item: { id: "partial", type: "agent_message", text: "partial" } }] },
+    {
+      events: [
+        { type: "item.completed", item: { id: "partial", type: "agent_message", text: "partial" } },
+      ],
+    },
   ])("rejects an incomplete stream: %j", async ({ events }) => {
     let schemaPath: string | undefined;
     const exec = {
@@ -85,8 +245,9 @@ describe("Thread", () => {
         for (const event of events) yield JSON.stringify(event);
       },
     } as unknown as CodexExec;
-    await expect(new Thread(exec, {}, {}).run("hello", { outputSchema: {} }))
-      .rejects.toThrow("Incomplete turn stream");
+    await expect(new Thread(exec, {}, {}).run("hello", { outputSchema: {} })).rejects.toThrow(
+      "Incomplete turn stream",
+    );
     await expect(fs.stat(schemaPath!)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -101,18 +262,15 @@ describe("Thread", () => {
     { toJSON: () => [] },
     { toJSON: () => null },
     { toJSON: () => "{}" },
-  ])(
-    "rejects a non-object output schema before starting exec: %j",
-    async (outputSchema) => {
-      const exec = { run: jest.fn() };
-      const thread = new Thread(exec as unknown as CodexExec, {}, {});
+  ])("rejects a non-object output schema before starting exec: %j", async (outputSchema) => {
+    const exec = { run: jest.fn() };
+    const thread = new Thread(exec as unknown as CodexExec, {}, {});
 
-      await expect(thread.run("hello", { outputSchema })).rejects.toThrow(
-        "outputSchema must be a plain JSON object",
-      );
-      expect(exec.run).not.toHaveBeenCalled();
-    },
-  );
+    await expect(thread.run("hello", { outputSchema })).rejects.toThrow(
+      "outputSchema must be a plain JSON object",
+    );
+    expect(exec.run).not.toHaveBeenCalled();
+  });
 
   it.each([{}, Object.assign(Object.create(null), { type: "object" })])(
     "writes and removes a plain output schema: %j",
@@ -218,11 +376,7 @@ describe("Thread", () => {
 
   it("preserves compaction lifecycle events and collects the completed item once", async () => {
     const item: ContextCompactionItem = { id: "item_0", type: "context_compaction" };
-    const events = [
-      { type: "item.started", item },
-      { type: "item.completed", item },
-      completed,
-    ];
+    const events = [{ type: "item.started", item }, { type: "item.completed", item }, completed];
     const exec = {
       async *run(): AsyncGenerator<string> {
         for (const event of events) yield JSON.stringify(event);

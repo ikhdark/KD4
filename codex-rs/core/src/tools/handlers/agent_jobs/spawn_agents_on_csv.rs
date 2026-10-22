@@ -41,8 +41,6 @@ impl SpawnAgentsOnCsvHandler {
             payload,
             ..
         } = invocation;
-        let turn = Arc::clone(&step_context.turn);
-
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
@@ -52,7 +50,7 @@ impl SpawnAgentsOnCsvHandler {
             }
         };
 
-        handle(session, turn, arguments, cancellation_token)
+        handle(session, step_context, arguments, cancellation_token)
             .await
             .map(boxed_tool_output)
     }
@@ -79,10 +77,36 @@ impl CoreToolRuntime for SpawnAgentsOnCsvHandler {
 /// `report_agent_job_result`, then exported to CSV on completion.
 pub async fn handle(
     session: Arc<Session>,
-    turn: Arc<TurnContext>,
+    step: Arc<StepContext>,
     arguments: String,
     cancellation_token: CancellationToken,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
+    if matches!(step.turn.session_source, SessionSource::SubAgent(_)) {
+        return Err(FunctionCallError::RespondToModel(
+            "nested CSV jobs are unsupported: ask the root agent to run spawn_agents_on_csv; subagents may hold the capacity needed by their batch".to_string(),
+        ));
+    }
+    // The foreground is only an observer. Dropping it cancels the independently
+    // tracked owner, never the run/cleanup task itself (including admission).
+    let cancellation_token = cancellation_token.child_token();
+    let _cancel_on_drop = cancellation_token.clone().drop_guard();
+    let owner_session = session.clone();
+    session
+        .terminal_tasks
+        .spawn(
+            async move { handle_owned(owner_session, step, arguments, cancellation_token).await },
+        )
+        .await
+        .map_err(|error| FunctionCallError::Fatal(format!("agent job owner failed: {error}")))?
+}
+
+async fn handle_owned(
+    session: Arc<Session>,
+    step: Arc<StepContext>,
+    arguments: String,
+    cancellation_token: CancellationToken,
+) -> Result<FunctionToolOutput, FunctionCallError> {
+    let turn = &step.turn;
     let args: SpawnAgentsOnCsvArgs = parse_arguments(arguments.as_str())?;
     if args.instruction.trim().is_empty() {
         return Err(FunctionCallError::RespondToModel(
@@ -93,7 +117,7 @@ pub async fn handle(
         validate_agent_job_output_schema(schema)?;
     }
 
-    let cwd = single_local_environment_cwd(&turn)?;
+    let cwd = single_local_environment_cwd(&step.environments)?;
     let db = required_state_db(&session)?;
     let input_path = cwd.join(args.csv_path);
     let input_path_display = input_path.display().to_string();
@@ -127,7 +151,7 @@ pub async fn handle(
     })?;
 
     let mut items = Vec::with_capacity(rows.len());
-    let mut seen_ids = HashSet::new();
+    let mut item_ids = JobItemIds::default();
     for (idx, row) in rows.into_iter().enumerate() {
         if row.len() != headers.len() {
             let row_index = idx + 2;
@@ -145,12 +169,7 @@ pub async fn handle(
         let base_item_id = source_id
             .clone()
             .unwrap_or_else(|| format!("row-{row_index}"));
-        let mut item_id = base_item_id.clone();
-        let mut suffix = 2usize;
-        while !seen_ids.insert(item_id.clone()) {
-            item_id = format!("{base_item_id}-{suffix}");
-            suffix = suffix.saturating_add(1);
-        }
+        let item_id = item_ids.allocate(base_item_id)?;
 
         let row_object = headers
             .iter()
@@ -166,6 +185,13 @@ pub async fn handle(
     }
 
     let job_id = Uuid::new_v4().to_string();
+    let mut cleanup = AgentJobCleanupOwner {
+        session: session.clone(),
+        db: db.clone(),
+        job_id: job_id.clone(),
+        active_items: HashMap::new(),
+        armed: true,
+    };
     let output_csv_path = args.output_csv_path.map_or_else(
         || default_output_csv_path(&input_path, job_id.as_str()),
         |path| cwd.join(path),
@@ -197,7 +223,11 @@ pub async fn handle(
         })?;
 
     let requested_concurrency = args.max_concurrency.or(args.max_workers);
-    let options = match build_runner_options(&session, &turn, requested_concurrency).await {
+    let options_result = tokio::select! {
+        options = build_runner_options(&session, &step, requested_concurrency) => options,
+        _ = cancellation_token.cancelled() => Err(FunctionCallError::RespondToModel("agent job cancelled during setup".to_string())),
+    };
+    let options = match options_result {
         Ok(options) => Some(options),
         Err(_) if cancellation_token.is_cancelled() => {
             db.mark_agent_job_cancelled(job_id.as_str(), PARENT_TOOL_CANCELLATION_REASON)
@@ -239,7 +269,7 @@ pub async fn handle(
                     ))
                 })?;
         }
-        let mut active_items = HashMap::new();
+        let active_items = &mut cleanup.active_items;
         if let Err(err) = run_agent_job_loop(
             session.clone(),
             turn.clone(),
@@ -247,7 +277,7 @@ pub async fn handle(
             job_id.clone(),
             options,
             cancellation_token,
-            &mut active_items,
+            active_items,
         )
         .await
         {
@@ -277,7 +307,7 @@ pub async fn handle(
                 session.clone(),
                 db.clone(),
                 job_id.as_str(),
-                &mut active_items,
+                active_items,
                 cleanup_reason,
             )
             .await
@@ -413,21 +443,18 @@ pub async fn handle(
             },
         }));
     }
+    cleanup.armed = false;
     Ok(output)
 }
 
-fn single_local_environment_cwd(turn: &TurnContext) -> Result<AbsolutePathBuf, FunctionCallError> {
-    let [turn_environment] = turn.environments.turn_environments.as_slice() else {
+pub(super) fn single_local_environment_cwd(
+    environments: &TurnEnvironmentSnapshot,
+) -> Result<AbsolutePathBuf, FunctionCallError> {
+    let Some(turn_environment) = environments.single_local_environment() else {
         return Err(FunctionCallError::RespondToModel(
             "spawn_agents_on_csv requires exactly one local environment".to_string(),
         ));
     };
-
-    if turn_environment.environment.is_remote() {
-        return Err(FunctionCallError::RespondToModel(
-            "spawn_agents_on_csv is not supported for remote environments".to_string(),
-        ));
-    }
 
     // TODO(anp): Migrate spawn_agents_on_csv filesystem access to PathUri before enabling it for
     // remote environments.

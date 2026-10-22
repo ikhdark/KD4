@@ -79,7 +79,7 @@
     },
     "walkComplete": {
       "default": false,
-      "description": "True only after scanning finishes without omitting paths. A completed notification with this still false indicates an incomplete traversal.",
+      "description": "True only after scanning and current-query matching finish without omissions. False during matching, or when limits, cancellation or errors interrupt search.",
       "type": "boolean"
     }
   },

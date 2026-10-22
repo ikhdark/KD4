@@ -21,11 +21,17 @@ async fn offline_model_info_preserves_or_overrides_tool_output_limits() {
             ..Default::default()
         };
         assert_eq!(
-            manager.get_model_info("gpt-5.5", &config).await.truncation_policy,
+            manager
+                .get_model_info("gpt-5.5", &config)
+                .await
+                .truncation_policy,
             TruncationPolicyConfig::tokens(tokens)
         );
         assert_eq!(
-            manager.get_model_info("gpt-5.2", &config).await.truncation_policy,
+            manager
+                .get_model_info("gpt-5.2", &config)
+                .await
+                .truncation_policy,
             TruncationPolicyConfig::bytes(bytes)
         );
     }

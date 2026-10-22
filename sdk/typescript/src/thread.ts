@@ -5,6 +5,7 @@ import { ThreadItem } from "./items";
 import { ThreadOptions } from "./threadOptions";
 import { TurnOptions } from "./turnOptions";
 import { createOutputSchemaFile } from "./outputSchemaFile";
+import { canonicalThreadId, validateThreadEvent } from "./eventValidation";
 
 /** Completed turn. */
 export type Turn = {
@@ -15,6 +16,7 @@ export type Turn = {
   timing?: TurnCompletedEvent["timing"];
   /** Authoritative typed result when a tool directly completes the turn. */
   surfacedResult?: TurnCompletedEvent["surfaced_result"];
+  finalAnswer?: NonNullable<TurnCompletedEvent["timing"]>["finalAnswer"];
 };
 
 /** Alias for `Turn` to describe the result of `run()`. */
@@ -35,9 +37,15 @@ export class TurnRunError extends Error {
     super(message, options);
   }
 
-  get usage() { return this.terminal?.usage; }
-  get timing() { return this.terminal?.timing; }
-  get disposition() { return this.terminal?.type === "turn.failed" ? this.terminal.disposition : undefined; }
+  get usage() {
+    return this.terminal?.usage;
+  }
+  get timing() {
+    return this.terminal?.timing;
+  }
+  get disposition() {
+    return this.terminal?.type === "turn.failed" ? this.terminal.disposition : undefined;
+  }
 }
 
 /** The result of the `runStreamed` method. */
@@ -67,6 +75,7 @@ export class Thread {
   private _options: CodexOptions;
   private _id: string | null;
   private _threadOptions: ThreadOptions;
+  private _running = false;
 
   /** Returns the ID of the thread. Populated after the first turn starts. */
   public get id(): string | null {
@@ -95,43 +104,78 @@ export class Thread {
     input: Input,
     turnOptions: TurnOptions = {},
   ): AsyncGenerator<ThreadEvent> {
-    const { schemaPath, cleanup } = await createOutputSchemaFile(turnOptions.outputSchema);
+    if (this._running) {
+      throw new Error(
+        "A turn is already running on this Thread; finish or close its stream before starting another.",
+      );
+    }
+    this._running = true;
     try {
-      const options = this._threadOptions;
-      const { prompt, images } = normalizeInput(input);
-      const generator = this._exec.run({
-        input: prompt,
-        baseUrl: this._options.baseUrl,
-        apiKey: this._options.apiKey,
-        threadId: this._id,
-        images,
-        model: options?.model,
-        sandboxMode: options?.sandboxMode,
-        workingDirectory: options?.workingDirectory,
-        skipGitRepoCheck: options?.skipGitRepoCheck,
-        outputSchemaFile: schemaPath,
-        modelReasoningEffort: options?.modelReasoningEffort,
-        signal: turnOptions.signal,
-        networkAccessEnabled: options?.networkAccessEnabled,
-        webSearchMode: options?.webSearchMode,
-        webSearchEnabled: options?.webSearchEnabled,
-        approvalPolicy: options?.approvalPolicy,
-        additionalDirectories: options?.additionalDirectories,
-      });
-      for await (const item of generator) {
-        let parsed: ThreadEvent;
-        try {
-          parsed = JSON.parse(item) as ThreadEvent;
-        } catch (error) {
-          throw new Error(`Failed to parse item: ${item}`, { cause: error });
+      const { schemaPath, cleanup } = await createOutputSchemaFile(turnOptions.outputSchema);
+      try {
+        const options = this._threadOptions;
+        const { prompt, images } = normalizeInput(input);
+        const generator = this._exec.run({
+          input: prompt,
+          baseUrl: this._options.baseUrl,
+          apiKey: this._options.apiKey,
+          threadId: this._id,
+          images,
+          model: options?.model,
+          sandboxMode: options?.sandboxMode,
+          workingDirectory: options?.workingDirectory,
+          skipGitRepoCheck: options?.skipGitRepoCheck,
+          outputSchemaFile: schemaPath,
+          modelReasoningEffort: options?.modelReasoningEffort,
+          signal: turnOptions.signal,
+          networkAccessEnabled: options?.networkAccessEnabled,
+          webSearchMode: options?.webSearchMode,
+          webSearchEnabled: options?.webSearchEnabled,
+          approvalPolicy: options?.approvalPolicy,
+          additionalDirectories: options?.additionalDirectories,
+        });
+        let terminalSeen = false;
+        let establishedId = this._id === null ? null : canonicalThreadId(this._id);
+        for await (const item of generator) {
+          let parsed: ThreadEvent;
+          try {
+            parsed = validateThreadEvent(JSON.parse(item));
+          } catch (error) {
+            throw new Error(`Failed to parse item: ${item}`, { cause: error });
+          }
+          if (
+            terminalSeen &&
+            (parsed.type === "thread.started" ||
+              parsed.type === "turn.started" ||
+              parsed.type === "item.started" ||
+              parsed.type === "item.updated" ||
+              parsed.type === "item.completed" ||
+              parsed.type === "item.progress" ||
+              parsed.type === "turn.completed" ||
+              parsed.type === "turn.failed")
+          ) {
+            throw new Error(
+              parsed.type === "turn.completed" || parsed.type === "turn.failed"
+                ? "Invalid turn stream: multiple terminal events received"
+                : "Invalid turn stream: lifecycle mutation after terminal",
+            );
+          }
+          if (parsed.type === "thread.started") {
+            const identity = canonicalThreadId(parsed.thread_id) ?? parsed.thread_id;
+            if (establishedId !== null && establishedId !== identity) {
+              throw new Error("Invalid turn stream: thread identity changed");
+            }
+            establishedId = identity;
+            this._id = parsed.thread_id;
+          }
+          terminalSeen ||= parsed.type === "turn.completed" || parsed.type === "turn.failed";
+          yield parsed;
         }
-        if (parsed.type === "thread.started") {
-          this._id = parsed.thread_id;
-        }
-        yield parsed;
+      } finally {
+        await cleanup();
       }
     } finally {
-      await cleanup();
+      this._running = false;
     }
   }
 
@@ -141,11 +185,16 @@ export class Thread {
     const abort = () => controller.abort(turnOptions.signal?.reason);
     if (turnOptions.signal?.aborted) abort();
     else turnOptions.signal?.addEventListener("abort", abort, { once: true });
-    const generator = this.runStreamedInternal(input, { ...turnOptions, signal: controller.signal });
+    const generator = this.runStreamedInternal(input, {
+      ...turnOptions,
+      signal: controller.signal,
+    });
     const items: ThreadItem[] = [];
     const partialItems = new Map<string, ThreadItem>();
     let partialResponse = "";
     let finalResponse: string = "";
+    let agentMessageSeen = false;
+    let explicitFinalSeen = false;
     let usage: Usage | null = null;
     let surfacedResult: Turn["surfacedResult"];
     let terminal: TurnFailedEvent | TurnCompletedEvent | undefined;
@@ -169,29 +218,45 @@ export class Thread {
           // erase an already observed failure while we drain trailing output.
           throw new Error("Invalid turn stream: multiple terminal events received");
         }
-        if (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") {
+        if (
+          event.type === "item.started" ||
+          event.type === "item.updated" ||
+          event.type === "item.completed"
+        ) {
           partialItems.set(event.item.id, event.item);
           if (event.item.type === "agent_message") partialResponse = event.item.text;
         }
-      if (event.type === "item.completed") {
-        if (event.item.type === "agent_message") {
-          finalResponse = event.item.text;
+        if (event.type === "item.completed") {
+          if (
+            event.item.type === "agent_message" &&
+            event.item.phase !== "commentary" &&
+            (!explicitFinalSeen || event.item.phase === "final_answer")
+          ) {
+            agentMessageSeen = true;
+            explicitFinalSeen ||= event.item.phase === "final_answer";
+            finalResponse = event.item.text;
+          } else if (event.item.type === "plan" && !agentMessageSeen) {
+            finalResponse = event.item.text;
+            partialResponse = event.item.text;
+          }
+          items.push(event.item);
+        } else if (event.type === "turn.completed") {
+          terminal = event;
+          usage = event.usage;
+          if (event.surfaced_result) {
+            surfacedResult = event.surfaced_result;
+            finalResponse = surfacedResult.canonicalMessage ?? "";
+          } else if (event.timing?.finalAnswer !== undefined) {
+            finalResponse = event.timing.finalAnswer.message?.text ?? "";
+          }
+        } else if (event.type === "turn.failed") {
+          terminal = event;
+          boundFailureDrain();
+        } else if (event.type === "error") {
+          const { type: _type, ...error } = event;
+          streamError ??= error;
+          boundFailureDrain();
         }
-        items.push(event.item);
-      } else if (event.type === "turn.completed") {
-        terminal = event;
-        usage = event.usage;
-        if (event.surfaced_result) {
-          surfacedResult = event.surfaced_result;
-          finalResponse = surfacedResult.canonicalMessage ?? "";
-        }
-      } else if (event.type === "turn.failed") {
-        terminal = event;
-        boundFailureDrain();
-      } else if (event.type === "error") {
-        streamError ??= { message: event.message };
-        boundFailureDrain();
-      }
       }
     } catch (error) {
       cause = error;
@@ -200,12 +265,38 @@ export class Thread {
       turnOptions.signal?.removeEventListener("abort", abort);
     }
     if (streamError || terminal?.type !== "turn.completed" || cause !== undefined) {
-      const message = terminal?.type === "turn.failed" ? terminal.error.message
-        : streamError?.message ?? (cause && typeof cause === "object" && "message" in cause && typeof cause.message === "string" ? cause.message : cause !== undefined ? String(cause)
-          : "Incomplete turn stream: turn.completed event not received");
-      throw new TurnRunError(message, this._id, [...partialItems.values()], partialResponse || finalResponse, terminal, streamError, { cause });
+      const message =
+        terminal?.type === "turn.failed"
+          ? terminal.error.message
+          : (streamError?.message ??
+            (cause &&
+            typeof cause === "object" &&
+            "message" in cause &&
+            typeof cause.message === "string"
+              ? cause.message
+              : cause !== undefined
+                ? String(cause)
+                : "Incomplete turn stream: turn.completed event not received"));
+      throw new TurnRunError(
+        message,
+        this._id,
+        [...partialItems.values()],
+        partialResponse || finalResponse,
+        terminal,
+        streamError,
+        { cause },
+      );
     }
-    return { items, finalResponse, usage, ...("timing" in terminal ? { timing: terminal.timing } : {}), ...(surfacedResult ? { surfacedResult } : {}) };
+    return {
+      items,
+      finalResponse,
+      usage,
+      ...("timing" in terminal ? { timing: terminal.timing } : {}),
+      ...(terminal.timing?.finalAnswer !== undefined
+        ? { finalAnswer: terminal.timing.finalAnswer }
+        : {}),
+      ...(surfacedResult ? { surfacedResult } : {}),
+    };
   }
 }
 

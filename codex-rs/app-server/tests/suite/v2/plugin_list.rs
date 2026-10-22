@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::ChatGptAuthFixture;
@@ -39,7 +40,6 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
 use wiremock::matchers::query_param_is_missing;
-use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_CURATED_PLUGIN_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -372,8 +372,15 @@ async fn plugin_list_rejects_relative_cwds() -> Result<()> {
     )
     .await??;
 
-    assert_eq!(err.error.code, -32600);
-    assert!(err.error.message.contains("Invalid request"));
+    // A relative cwd fails parameter decoding: JSON-RPC invalid params.
+    assert_eq!(err.error.code, -32602);
+    assert!(
+        err.error
+            .message
+            .contains("Invalid parameters for plugin/list"),
+        "unexpected error: {}",
+        err.error.message
+    );
     Ok(())
 }
 
@@ -511,7 +518,9 @@ async fn plugin_list_returns_empty_when_workspace_codex_plugins_disabled() -> Re
     std::fs::create_dir_all(repo_root.path().join(".agents/plugins"))?;
     std::fs::create_dir_all(repo_root.path().join("demo-plugin/.codex-plugin"))?;
     std::fs::write(
-        repo_root.path().join("demo-plugin/.codex-plugin/plugin.json"),
+        repo_root
+            .path()
+            .join("demo-plugin/.codex-plugin/plugin.json"),
         r#"{"name":"demo-plugin"}"#,
     )?;
     write_plugins_enabled_config_with_base_url(
@@ -3976,12 +3985,20 @@ fn cached_remote_catalog_ignores_unpublished_temporary_files() -> Result<()> {
     let mut staged = tempfile::NamedTempFile::new_in(&cache_dir)?;
     std::io::Write::write_all(staged.as_file_mut(), b"{")?;
 
-    assert_eq!(cached_remote_catalog_plugin_ids(home.path())?, vec!["retained"]);
+    assert_eq!(
+        cached_remote_catalog_plugin_ids(home.path())?,
+        vec!["retained"]
+    );
     drop(staged);
-    assert_eq!(cached_remote_catalog_plugin_ids(home.path())?, vec!["retained"]);
+    assert_eq!(
+        cached_remote_catalog_plugin_ids(home.path())?,
+        vec!["retained"]
+    );
     std::fs::write(published, "{")?;
-    assert!(cached_remote_catalog_plugin_ids(home.path()).is_err(),
-        "invalid published snapshots must not be hidden as pending refreshes");
+    assert!(
+        cached_remote_catalog_plugin_ids(home.path()).is_err(),
+        "invalid published snapshots must not be hidden as pending refreshes"
+    );
     Ok(())
 }
 

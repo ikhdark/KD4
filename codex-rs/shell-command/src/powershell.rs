@@ -35,6 +35,28 @@ pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
     };
 
     let trimmed = extracted.script.trim_start();
+    // Using/parameter/advanced-script preambles have placement rules. When
+    // comments, attributes or a BOM hide the insertion point, leave the source
+    // intact rather than adding a statement or introducing a new scope.
+    let first_word = trimmed
+        .split(|ch: char| !ch.is_alphanumeric())
+        .next()
+        .unwrap_or_default();
+    if trimmed.starts_with(['#', '[', '\u{feff}'])
+        || [
+            "using",
+            "param",
+            "dynamicparam",
+            "begin",
+            "process",
+            "end",
+            "clean",
+        ]
+        .iter()
+        .any(|word| first_word.eq_ignore_ascii_case(word))
+    {
+        return command.to_vec();
+    }
     let script = if trimmed.starts_with(UTF8_OUTPUT_PREFIX) {
         extracted.script.to_string()
     } else {
@@ -143,6 +165,13 @@ pub fn parse_powershell_command_into_plain_commands(
 pub fn is_standalone_powershell_command(script: &str) -> bool {
     try_parse_powershell_ast_analysis("pwsh", script)
         .is_some_and(|analysis| analysis.standalone_command)
+}
+
+/// Inspect one literal native command, including canonical decimal integers.
+/// This proof is only for resource admission: it must not authorize direct
+/// execution rewrites or authenticate runner receipts.
+pub fn standalone_powershell_inspection_argv(script: &str) -> Option<Vec<String>> {
+    try_parse_powershell_ast_analysis("pwsh", script)?.inspection_argv
 }
 
 /// Parse an exact-shape PowerShell command only when profiles are disabled, as required by
@@ -697,6 +726,53 @@ mod tests {
     }
 
     #[test]
+    fn inspection_preserves_numeric_cargo_arguments_without_direct_execution_proof() {
+        let script = "cargo nextest run --target-dir 'C:\\work tree\\target' --profile local --workspace --no-fail-fast --retries 0 --failure-output immediate";
+        assert_eq!(
+            super::standalone_powershell_inspection_argv(script),
+            Some(
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--target-dir",
+                    r"C:\work tree\target",
+                    "--profile",
+                    "local",
+                    "--workspace",
+                    "--no-fail-fast",
+                    "--retries",
+                    "0",
+                    "--failure-output",
+                    "immediate",
+                ]
+                .map(str::to_string)
+                .to_vec()
+            )
+        );
+        assert!(
+            crate::validation::standalone_powershell_argv(script).is_none(),
+            "inspection must not authenticate a runner receipt"
+        );
+        for script in [
+            "cargo build --target-dir output --jobs 0; Write-Output done",
+            "cargo build --target-dir output --jobs 0 | Out-Null",
+            "cargo build --target-dir output --jobs 0 > result.txt",
+            "cargo build --target-dir $output --jobs 0",
+            "cargo build --target-dir ~/output --jobs 0",
+            "cargo build --target-dir:output --jobs 0",
+            "cargo build --target-dir output --jobs 0x10",
+            "cargo build --target-dir output --jobs 01",
+            "cargo build --target-dir output --jobs $(Get-Content jobs.txt)",
+        ] {
+            assert!(
+                super::standalone_powershell_inspection_argv(script).is_none(),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
     fn direct_candidate_contains_semantic_native_argument_values() {
         let pwsh = try_find_pwsh_executable_blocking()
             .expect("PowerShell 7 (pwsh.exe) is required to verify this behavior");
@@ -892,5 +968,29 @@ mod tests {
             None
         );
         fs::remove_dir_all(&shadow_dir).expect("remove shadow dir");
+    }
+}
+
+#[cfg(test)]
+mod audit36_preamble_regressions {
+    use super::*;
+
+    #[test]
+    fn source_preparation_does_not_precede_legal_script_preambles() {
+        for script in [
+            "using namespace System.Text; Write-Output ok",
+            "# comment\nusing namespace System.Text\nWrite-Output ok",
+            "\u{feff}using namespace System.Text; Write-Output ok",
+            "param($value) Write-Output $value",
+            "[CmdletBinding()] param() Write-Output ok",
+            "begin { Write-Output ok } process { $_ }",
+        ] {
+            let command = vec!["pwsh".into(), "-Command".into(), script.into()];
+            assert_eq!(prefix_powershell_script_with_utf8(&command), command);
+            assert_eq!(
+                prefix_powershell_script_with_utf8(&prefix_powershell_script_with_utf8(&command)),
+                command
+            );
+        }
     }
 }

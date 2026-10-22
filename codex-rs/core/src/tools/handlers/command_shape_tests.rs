@@ -497,7 +497,7 @@ fn failure_advisory_respects_the_active_powershell_script_mode() {
     )
     .expect("Measure-Object binding failures should get a targeted hint");
 
-    assert!(advisory.contains("Measure-Object expects property names"));
+    assert!(advisory.contains("Older PowerShell hosts require property names"));
     assert!(advisory.contains("ForEach-Object"));
 
     // Only the parameter-binding hint depends on the mode: it recommends

@@ -93,8 +93,8 @@ pub fn item_event_to_server_notification(
                 sender_thread_id: begin_event.sender_thread_id.to_string(),
                 receiver_thread_ids: Vec::new(),
                 prompt: Some(begin_event.prompt),
-                model: Some(begin_event.model),
-                reasoning_effort: Some(begin_event.reasoning_effort),
+                model: begin_event.model,
+                reasoning_effort: begin_event.reasoning_effort,
                 agents_states: HashMap::new(),
             };
             ServerNotification::ItemStarted(ItemStartedNotification {
@@ -132,8 +132,8 @@ pub fn item_event_to_server_notification(
                 sender_thread_id: end_event.sender_thread_id.to_string(),
                 receiver_thread_ids,
                 prompt: Some(end_event.prompt),
-                model: Some(end_event.model),
-                reasoning_effort: Some(end_event.reasoning_effort),
+                model: end_event.model,
+                reasoning_effort: end_event.reasoning_effort,
                 agents_states,
             };
             ServerNotification::ItemCompleted(ItemCompletedNotification {
@@ -445,7 +445,8 @@ pub fn item_event_to_server_notification(
         }
         EventMsg::ExecCommandOutputDelta(exec_command_output_delta_event) => {
             let item_id = exec_command_output_delta_event.call_id;
-            let decoding_lossy = std::str::from_utf8(&exec_command_output_delta_event.chunk).is_err();
+            let decoding_lossy =
+                std::str::from_utf8(&exec_command_output_delta_event.chunk).is_err();
             let delta =
                 String::from_utf8_lossy(&exec_command_output_delta_event.chunk).into_owned();
             ServerNotification::CommandExecutionOutputDelta(
@@ -596,7 +597,9 @@ mod tests {
             };
             let receiver_id = event.receiver_thread_id.to_string();
             let notification = item_event_to_server_notification(
-                EventMsg::CollabResumeEnd(event.clone()), "thread-2", "turn-2",
+                EventMsg::CollabResumeEnd(event.clone()),
+                "thread-2",
+                "turn-2",
             );
             assert_item_completed_server_notification(
                 notification,
@@ -613,12 +616,18 @@ mod tests {
                         prompt: None,
                         model: None,
                         reasoning_effort: None,
-                        agents_states: [(receiver_id, CollabAgentState {
-                            status: state_status,
-                            message,
-                            surfaced_result: None,
-                            last_agent_message,
-                        })].into_iter().collect(),
+                        agents_states: [(
+                            receiver_id,
+                            CollabAgentState {
+                                stop_cause: None,
+                                status: state_status,
+                                message,
+                                surfaced_result: None,
+                                last_agent_message,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
                     },
                 },
             );
@@ -635,8 +644,12 @@ mod tests {
         ] {
             let notification = item_event_to_server_notification(
                 EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                    call_id: "command".into(), stream: stream.clone(), chunk,
-                }), "thread", "turn",
+                    call_id: "command".into(),
+                    stream: stream.clone(),
+                    chunk,
+                }),
+                "thread",
+                "turn",
             );
             assert_command_execution_output_delta_server_notification(
                 notification,

@@ -26,6 +26,7 @@ pub struct SkillListQuery {
     pub continuation: Option<crate::catalog::SkillDiscoveryContinuation>,
     pub turn_id: String,
     pub executor_roots: Vec<SelectedCapabilityRoot>,
+    pub bound_executor_roots: Vec<codex_exec_server::ResolvedSelectedCapabilityRoot>,
     pub host_snapshot: Option<Arc<HostSkillsSnapshot>>,
     pub include_host_skills: bool,
     pub include_bundled_skills: bool,
@@ -51,8 +52,8 @@ pub type SkillProviderFuture<'a, T> =
 /// provider must be read through the same provider/authority rather
 /// than converted into an ambient local path.
 /// Reads must reject foreign authorities and return the exact requested resource identity.
-/// Successful executor catalogs are stable for a selected root for the thread lifetime;
-/// turn IDs and client handles are request context, not executor snapshot invalidators.
+/// Successful executor catalogs are stable for the same bound root and environment instance;
+/// turn IDs and transient availability do not invalidate a successful snapshot.
 /// Orchestrator catalogs and contents are stable within the MCP client cache generation.
 pub trait SkillProvider: Send + Sync {
     fn list(&self, query: SkillListQuery) -> SkillProviderFuture<'_, SkillCatalog>;

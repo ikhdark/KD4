@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import threading
 
@@ -13,6 +14,100 @@ from openai_codex.generated.v2_all import (
     TurnStartResponse,
 )
 from openai_codex.models import Notification, UnknownNotification
+
+
+def test_cancelled_start_receipt_cannot_close_replacement(monkeypatch: pytest.MonkeyPatch) -> None:
+    import openai_codex.async_client as async_module
+
+    async def scenario() -> None:
+        entered, release, exited = threading.Event(), threading.Event(), threading.Event()
+        original_future = async_module.Future
+        ids = iter(range(100))
+
+        class ReceiptGate(original_future):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fixture_id = next(ids)
+
+            def set_result(self, result: object) -> None:
+                if self.fixture_id == 0:
+                    entered.set()
+                    assert release.wait(5), "release the old startup receipt"
+                super().set_result(result)
+                if self.fixture_id == 1:
+                    exited.set()
+
+        monkeypatch.setattr(async_module, "Future", ReceiptGate)
+        client = AsyncCodexClient(
+            CodexConfig(
+                launch_args_override=(
+                    sys.executable,
+                    "-B",
+                    "-u",
+                    "-c",
+                    "import sys; sys.stdin.read()",
+                ),
+                operation_timeout_s=5,
+            )
+        )
+        old = asyncio.create_task(client.start())
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            old_proc = client._sync._proc
+            old.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await old
+            await client.close()
+            assert old_proc is not None and old_proc.poll() is not None
+            await client.start()
+            replacement = client._sync._proc
+            router, epoch = client._sync._router, client.process_epoch
+            release.set()
+            assert await asyncio.to_thread(exited.wait, 3)
+            assert replacement is not None and replacement.poll() is None
+            assert client._sync._proc is replacement
+            assert client._sync._router is router and client.process_epoch == epoch
+        finally:
+            release.set()
+            await asyncio.gather(old, return_exceptions=True)
+            await client.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), 15))
+
+
+def test_late_cleanup_failure_is_reported_once(caplog: pytest.LogCaptureFixture) -> None:
+    async def scenario() -> None:
+        client = AsyncCodexClient(CodexConfig(max_in_flight_requests=1))
+        entered, release = threading.Event(), threading.Event()
+
+        def work() -> str:
+            entered.set()
+            assert release.wait(5)
+            return "receipt"
+
+        def cleanup(_receipt: str) -> None:
+            raise RuntimeError("cleanup sentinel")
+
+        operation = asyncio.create_task(client._run_sync(work, cleanup))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        finally:
+            release.set()
+        # Observe actual worker-slot release, not merely cleanup entry.
+        assert await asyncio.to_thread(client._worker_slots.acquire, True, 3)
+        client._worker_slots.release()
+        assert await client._call_sync(lambda: "reused") == "reused"
+
+    with caplog.at_level(logging.ERROR, logger="openai_codex.async_client"):
+        asyncio.run(asyncio.wait_for(scenario(), 10))
+    reports = [
+        record for record in caplog.records if "Background SDK cleanup failed" in record.message
+    ]
+    assert len(reports) == 1
+    assert "epoch=0" in reports[0].message and "RuntimeError" in reports[0].message
 
 
 def test_async_client_allows_concurrent_transport_calls() -> None:

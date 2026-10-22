@@ -15,6 +15,7 @@ use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::default_client::originator;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::ProviderKind;
 use codex_model_provider_info::WireApi;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::test_support::test_models_response as bundled_models_response;
@@ -295,6 +296,8 @@ async fn non_openai_responses_requests_omit_item_passthrough_metadata() {
     let mut provider =
         built_in_model_providers(/* openai_base_url */ /*openai_base_url*/ None)["openai"].clone();
     provider.name = "Test Responses".to_string();
+    // OpenAI behavior follows the trusted registration kind, not the display name.
+    provider.kind = ProviderKind::Custom;
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider.supports_websockets = false;
     let codex = test_codex()
@@ -497,10 +500,16 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
 async fn response_item_ids_are_sent_for_persisted_remote_v2_compaction_items() -> anyhow::Result<()>
 {
     let server = MockServer::start().await;
+    // Both turns deliver a final answer; an empty completion would spend the
+    // next scripted response on the bounded missing-answer repair.
     let response_mock = mount_sse_sequence(
         &server,
         vec![
-            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "before answer"),
+                ev_completed("resp-1"),
+            ]),
             sse(vec![
                 json!({
                     "type": "response.output_item.done",
@@ -511,7 +520,11 @@ async fn response_item_ids_are_sent_for_persisted_remote_v2_compaction_items() -
                 }),
                 ev_completed("resp-compact"),
             ]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "after answer"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;
@@ -1358,7 +1371,9 @@ async fn send_provider_auth_request_with_preconnect(
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: preconnect,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     let codex_home = TempDir::new().unwrap();
@@ -1595,10 +1610,15 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
     // Mock server
     let server = MockServer::start().await;
 
+    // A final answer keeps the turn to this one request (no missing-answer repair).
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(
-            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+            sse(vec![
+                ev_response_created("resp1"),
+                ev_assistant_message("msg1", "hello"),
+                ev_completed("resp1"),
+            ]),
             "text/event-stream",
         );
 
@@ -1999,15 +2019,17 @@ async fn skills_append_to_developer_message() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let request = resp_mock.single_request();
-    let developer_messages = request.message_input_texts("developer");
-    let developer_text = developer_messages.join("\n\n");
+    // The skill catalog is discovery data, not policy: it is sent with the user
+    // role, while skill-usage guidance stays in the developer context.
+    let catalog_messages = request.message_input_texts("user");
+    let catalog_text = catalog_messages.join("\n\n");
     assert!(
-        developer_text.contains("## Skills"),
-        "expected skills section present: {developer_messages:?}"
+        catalog_text.contains("## Skills"),
+        "expected skills section present: {catalog_messages:?}"
     );
     assert!(
-        developer_text.contains("- demo — build charts — skill:"),
-        "expected opaque skill catalog entry: {developer_messages:?}"
+        catalog_text.contains("- demo — build charts — skill:"),
+        "expected opaque skill catalog entry: {catalog_messages:?}"
     );
     let _codex_home_guard = codex_home;
 }
@@ -2017,9 +2039,14 @@ async fn skill_catalog_reports_omissions_under_budget_pressure() {
     require_network!();
     let server = MockServer::start().await;
 
+    // A final answer keeps the turn free of the missing-answer repair request.
     let resp_mock = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+        sse(vec![
+            ev_response_created("resp1"),
+            ev_assistant_message("msg1", "done"),
+            ev_completed("resp1"),
+        ]),
     )
     .await;
 
@@ -2083,15 +2110,16 @@ async fn skill_catalog_reports_omissions_under_budget_pressure() {
     }
 
     let request = resp_mock.single_request();
-    let developer_messages = request.message_input_texts("developer");
-    let developer_text = developer_messages.join("\n\n");
+    // The skill catalog is discovery data sent with the user role.
+    let catalog_messages = request.message_input_texts("user");
+    let catalog_text = catalog_messages.join("\n\n");
     assert!(
-        developer_text.contains("<skills_instructions>"),
-        "budgeted catalogs must retain omission/discovery guidance: {developer_messages:?}"
+        catalog_text.contains("<skills_instructions>"),
+        "budgeted catalogs must retain omission/discovery guidance: {catalog_messages:?}"
     );
     let included = (0..SKILL_COUNT)
         .filter(|index| {
-            developer_text
+            catalog_text
                 .lines()
                 .any(|line| line.starts_with(&format!("- s{index:02} — ")))
         })
@@ -2101,13 +2129,13 @@ async fn skill_catalog_reports_omissions_under_budget_pressure() {
         "exercise partial omission"
     );
     assert!(
-        developer_text.contains(&format!(
+        catalog_text.contains(&format!(
             "Catalog incomplete: {} additional skills omitted",
             SKILL_COUNT - included
         )),
-        "omission notice must account for all authored skills: {developer_messages:?}"
+        "omission notice must account for all authored skills: {catalog_messages:?}"
     );
-    assert!(developer_text.contains("read_file(path=\"skill:catalog\")"));
+    assert!(catalog_text.contains("read_file(path=\"skill:catalog\")"));
     let _codex_home_guard = codex_home;
     let _codex_home_parent_guard = codex_home_parent;
 }
@@ -2441,6 +2469,8 @@ async fn sequential_cutoff_is_omitted_for_non_openai_provider() -> anyhow::Resul
     let TestCodex { codex, .. } = test_codex()
         .with_config(|config| {
             config.model_provider.name = "mock".to_string();
+            // OpenAI behavior follows the trusted registration kind, not the name.
+            config.model_provider.kind = ProviderKind::Custom;
             let _ = config
                 .features
                 .enable(Feature::ConcurrentReasoningSummaries);
@@ -2910,7 +2940,9 @@ async fn azure_responses_request_includes_store_and_omits_item_ids() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     let codex_home = TempDir::new().unwrap();
@@ -3108,10 +3140,11 @@ async fn token_count_includes_rate_limits_snapshot() {
     require_network!();
     let server = MockServer::start().await;
 
-    let sse_body = sse(vec![ev_completed_with_tokens(
-        "resp_rate",
-        /*total_tokens*/ 123,
-    )]);
+    // A final answer keeps the turn to the single expected request.
+    let sse_body = sse(vec![
+        ev_assistant_message("msg_rate", "done"),
+        ev_completed_with_tokens("resp_rate", /*total_tokens*/ 123),
+    ]);
 
     let response = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
@@ -3170,7 +3203,23 @@ async fn token_count_includes_rate_limits_snapshot() {
         EventMsg::TokenCount(ev) => ev,
         _ => unreachable!(),
     };
-    // Assert full JSON for the final token count event (usage + rate limits)
+    // Assert full JSON for the final token count event (usage + rate limits).
+    // Coverage counts the one usage receipt and which components it reported:
+    // input/output/total are present, while the null detail objects report
+    // neither cached input, reasoning output, nor a cache-write class.
+    let receipt_coverage = json!({
+        "receipts": 1,
+        "reported_receipts": 1,
+        "cache_write_input_tokens": 0,
+        "cache_write_receipts": 0,
+        "input_tokens": 1,
+        "cached_input_tokens": 0,
+        "output_tokens": 1,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1,
+        "invalid_receipts": 0,
+        "saturated": false
+    });
     let final_json = serde_json::to_value(&final_payload).unwrap();
     pretty_assertions::assert_eq!(
         final_json,
@@ -3181,14 +3230,16 @@ async fn token_count_includes_rate_limits_snapshot() {
                     "cached_input_tokens": 0,
                     "output_tokens": 0,
                     "reasoning_output_tokens": 0,
-                    "total_tokens": 123
+                    "total_tokens": 123,
+                    "coverage": receipt_coverage
                 },
                 "last_token_usage": {
                     "input_tokens": 123,
                     "cached_input_tokens": 0,
                     "output_tokens": 0,
                     "reasoning_output_tokens": 0,
-                    "total_tokens": 123
+                    "total_tokens": 123,
+                    "coverage": receipt_coverage
                 },
                 // Default model is gpt-5.4 in tests → 95% usable context window
                 "model_context_window": 258400
@@ -3351,11 +3402,14 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
     );
     // The first overflow permits one compaction recovery before surfacing a
     // repeated overflow. Provide that response instead of an accidental 404.
+    // The seed turn delivers a final answer; otherwise its missing-answer
+    // repair would consume the first scripted overflow.
     let requests = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
                 ev_response_created("resp_seed"),
+                ev_assistant_message("msg_seed", "seeded"),
                 ev_completed("resp_seed"),
             ]),
             overflow.clone(),
@@ -3432,7 +3486,10 @@ async fn context_window_error_sets_total_tokens_to_model_window() -> anyhow::Res
         info.estimated_context_tokens,
         Some(EFFECTIVE_CONTEXT_WINDOW)
     );
-    assert_eq!(info.total_token_usage.total_tokens, 0, "overflow is not billed usage");
+    assert_eq!(
+        info.total_token_usage.total_tokens, 0,
+        "overflow is not billed usage"
+    );
 
     let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
     let expected_context_window_message = CodexErr::ContextWindowExceeded.to_string();
@@ -3569,7 +3626,11 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(
-            sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+            sse(vec![
+                ev_response_created("resp1"),
+                ev_assistant_message("msg1", "hello"),
+                ev_completed("resp1"),
+            ]),
             "text/event-stream",
         );
 
@@ -3617,7 +3678,9 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     // Init session
@@ -3646,7 +3709,12 @@ async fn azure_overrides_assign_properties_used_for_responses_url() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let EventMsg::TurnComplete(completed) =
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await
+    else {
+        unreachable!("predicate requires terminal completion");
+    };
+    assert_eq!(completed.error, None);
 }
 
 fn create_dummy_codex_auth() -> CodexAuth {

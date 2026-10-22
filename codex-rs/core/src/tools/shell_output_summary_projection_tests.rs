@@ -1,6 +1,34 @@
 //! Shell output summaries as projected through codex-core's exec output paths.
 use crate::tools::shell_output_summary::*;
 
+#[test]
+fn audit132_fatal_compiler_diagnostic_survives_shell_consumers_and_validation_range() {
+    let diagnostic = "src/main.c:1:10: fatal error: required_header.h: No such file or directory";
+    let raw = format!(
+        "{}\n{diagnostic}\n{}",
+        "building item\n".repeat(5000),
+        "cleanup item\n".repeat(5000)
+    );
+    let output = codex_protocol::exec_output::ExecToolCallOutput {
+        exit_code: 1,
+        stdout: codex_protocol::exec_output::StreamOutput::new(raw.clone()),
+        stderr: codex_protocol::exec_output::StreamOutput::new(String::new()),
+        aggregated_output: codex_protocol::exec_output::StreamOutput::new(raw.clone()),
+        duration: std::time::Duration::ZERO,
+        timed_out: false,
+    };
+    let projected = crate::tools::project_exec_output_text_with_budget(
+        &output,
+        codex_utils_output_truncation::TruncationPolicy::Tokens(4000),
+        Some(4000),
+        Some("gcc main.c"),
+    );
+    assert!(projected.text.contains(diagnostic));
+    let range =
+        crate::tools::handlers::validation_diagnostic_range("diagnostics", raw.as_bytes()).unwrap();
+    assert_eq!(raw.lines().nth(range.start_line - 1), Some(diagnostic));
+}
+
 fn compiler_record(message: &str) -> String {
     serde_json::json!({"reason":"compiler-message", "message": {
         "level":"error", "message":message,
@@ -84,7 +112,9 @@ fn structured_diagnostics_replace_the_lossy_summary_and_keep_fixes() {
 
 #[test]
 fn verified10_compiler_recovery_uses_canonical_crlf_and_unicode_bytes() {
-    use crate::tools::context::{ExecCommandToolOutput, ToolOutput, ToolPayload};
+    use crate::tools::context::ExecCommandToolOutput;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
     use crate::unified_exec::ProcessOutputSnapshot;
     use codex_utils_output_truncation::TruncationPolicy;
     use std::sync::Arc;
@@ -151,7 +181,8 @@ fn verified10_compiler_recovery_uses_canonical_crlf_and_unicode_bytes() {
 
 #[test]
 fn compiler_json_uses_complete_stdout_and_keeps_stderr_independent() {
-    use codex_protocol::exec_output::{ExecToolCallOutput, StreamOutput};
+    use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_protocol::exec_output::StreamOutput;
     use codex_utils_output_truncation::TruncationPolicy;
 
     let stdout = compiler_record("authoritative stdout failure");
@@ -227,9 +258,12 @@ fn compiler_json_uses_complete_stdout_and_keeps_stderr_independent() {
 
 #[test]
 fn rustc_stderr_diagnostics_keep_constraints_through_both_output_paths() {
-    use crate::tools::context::{ExecCommandToolOutput, ToolOutput, ToolPayload};
+    use crate::tools::context::ExecCommandToolOutput;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
     use crate::unified_exec::ProcessOutputSnapshot;
-    use codex_protocol::exec_output::{ExecToolCallOutput, StreamOutput};
+    use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_protocol::exec_output::StreamOutput;
     use codex_utils_output_truncation::TruncationPolicy;
     use std::sync::Arc;
 
@@ -395,7 +429,9 @@ fn rustc_stderr_diagnostics_keep_constraints_through_both_output_paths() {
 
 #[test]
 fn unified_exec_compiler_streams_do_not_replay_prior_poll_output() {
-    use crate::tools::context::{ExecCommandToolOutput, ToolOutput, ToolPayload};
+    use crate::tools::context::ExecCommandToolOutput;
+    use crate::tools::context::ToolOutput;
+    use crate::tools::context::ToolPayload;
     use crate::unified_exec::ProcessOutputSnapshot;
     use codex_utils_output_truncation::TruncationPolicy;
     use std::sync::Arc;

@@ -54,9 +54,7 @@ pub fn hoist_shared_fragments(
     for fragment in fragments {
         for (hint, rendered) in &fragment.candidates {
             // Repeated numeric bounds can pay for an alias even when short.
-            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES
-                && !rendered.starts_with("number /*")
-            {
+            if rendered.len() < FRAGMENT_HOIST_MIN_BYTES && !rendered.starts_with("number /*") {
                 continue;
             }
             let slot = hints.entry(rendered.as_str()).or_default();
@@ -677,10 +675,18 @@ fn annotate_schema_constraints(
     }
     if let Some(value) = map.get("default") {
         let value = sanitize_comment(&render_bounded_literal(value, budget)?);
-        annotations.push(format!("default annotation: {value}; not automatically applied on omission"));
+        annotations.push(format!(
+            "default annotation: {value}; not automatically applied on omission"
+        ));
     }
     if !map.contains_key("type") {
-        for keyword in ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"] {
+        for keyword in [
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "multipleOf",
+        ] {
             if let Some(value) = map.get(keyword) {
                 let value = sanitize_comment(&render_bounded_literal(value, budget)?);
                 annotations.push(format!("{keyword} (numbers only): {value}"));
@@ -694,10 +700,24 @@ fn annotate_schema_constraints(
     // projection. Preserve the authoritative schema through the existing
     // incomplete-projection recovery path rather than silently dropping them.
     for keyword in [
-        "not", "if", "then", "else", "$dynamicRef", "$recursiveRef",
-        "uniqueItems", "contains", "minContains", "maxContains", "unevaluatedItems",
-        "minProperties", "maxProperties", "propertyNames", "unevaluatedProperties",
-        "dependentRequired", "dependentSchemas", "dependencies",
+        "not",
+        "if",
+        "then",
+        "else",
+        "$dynamicRef",
+        "$recursiveRef",
+        "uniqueItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "unevaluatedItems",
+        "minProperties",
+        "maxProperties",
+        "propertyNames",
+        "unevaluatedProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        "dependencies",
     ] {
         if map.contains_key(keyword) {
             budget.incomplete = true;
@@ -730,11 +750,21 @@ fn render_json_schema_type_keyword(
 }
 
 fn render_numeric_schema(map: &serde_json::Map<String, JsonValue>, integer: bool) -> String {
-    let safe = map.get("minimum").or_else(|| map.get("exclusiveMinimum"))
-        .and_then(JsonValue::as_f64).is_some_and(|bound| bound >= -9_007_199_254_740_991.0)
-        && map.get("maximum").or_else(|| map.get("exclusiveMaximum"))
-            .and_then(JsonValue::as_f64).is_some_and(|bound| bound <= 9_007_199_254_740_991.0);
-    let numeric_type = if integer && !safe { "(number | bigint)" } else { "number" };
+    let safe = map
+        .get("minimum")
+        .or_else(|| map.get("exclusiveMinimum"))
+        .and_then(JsonValue::as_f64)
+        .is_some_and(|bound| bound >= -9_007_199_254_740_991.0)
+        && map
+            .get("maximum")
+            .or_else(|| map.get("exclusiveMaximum"))
+            .and_then(JsonValue::as_f64)
+            .is_some_and(|bound| bound <= 9_007_199_254_740_991.0);
+    let numeric_type = if integer && !safe {
+        "(number | bigint)"
+    } else {
+        "number"
+    };
     let mut constraints = Vec::new();
     if integer {
         constraints.push("integer".to_string());
@@ -769,14 +799,23 @@ fn render_json_schema_array(
     }
     // Draft-07 and 2019-09 apply schema-valued `items` to every element. Their
     // unknown `prefixItems` must not turn that constraint into a tail-only rule.
-    let legacy_items = root.get("$schema").and_then(JsonValue::as_str).is_some_and(|dialect| {
-        matches!(dialect.trim_end_matches('#'),
-            "http://json-schema.org/draft-07/schema" | "https://json-schema.org/draft-07/schema"
-                | "http://json-schema.org/draft/2019-09/schema" | "https://json-schema.org/draft/2019-09/schema")
-    });
+    let legacy_items = root
+        .get("$schema")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|dialect| {
+            matches!(
+                dialect.trim_end_matches('#'),
+                "http://json-schema.org/draft-07/schema"
+                    | "https://json-schema.org/draft-07/schema"
+                    | "http://json-schema.org/draft/2019-09/schema"
+                    | "https://json-schema.org/draft/2019-09/schema"
+            )
+        });
     let has_prefix_items = !legacy_items && map.contains_key("prefixItems");
     // `items: [...]` is the tuple spelling used by older schema drafts.
-    let prefix = has_prefix_items.then(|| map.get("prefixItems")).flatten()
+    let prefix = has_prefix_items
+        .then(|| map.get("prefixItems"))
+        .flatten()
         .and_then(JsonValue::as_array)
         .or_else(|| map.get("items").and_then(JsonValue::as_array));
     let trailing = if has_prefix_items {

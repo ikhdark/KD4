@@ -69,7 +69,7 @@ async fn bounded_read_capability_is_cached_only_for_its_connection() {
             .await
             .expect_err("unsupported");
         assert!(
-            matches!(error, ExecServerError::Server { code: -32601, message }
+            matches!(error, ExecServerError::Server { code: -32601, message, .. }
             if message == "error -32601")
         );
     }

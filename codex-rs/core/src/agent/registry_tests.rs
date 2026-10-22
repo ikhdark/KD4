@@ -615,3 +615,30 @@ fn task_metadata_bounds_previews_and_batch_lookup_selects_requested_threads() {
         Some("small message")
     );
 }
+#[test]
+fn duplicate_concrete_id_cannot_replace_identity_or_leak_capacity() {
+    for named in [false, true] {
+        let registry = Arc::new(AgentRegistry::default());
+        let id = ThreadId::new();
+        registry
+            .reserve_spawn_slot(Some(2))
+            .unwrap()
+            .commit(agent_metadata(id))
+            .unwrap();
+        let mut duplicate = registry.reserve_spawn_slot(Some(2)).unwrap();
+        let path = agent_path("/root/duplicate");
+        if named {
+            duplicate.reserve_agent_path(&path).unwrap();
+        }
+        let mut metadata = agent_metadata(id);
+        metadata.agent_path = named.then_some(path.clone());
+        assert!(duplicate.commit(metadata).is_err());
+        assert_eq!(registry.live_agents().len(), 1);
+        assert_eq!(registry.agent_id_for_path(&path), None);
+        registry.release_spawned_thread(id);
+        let first = registry.reserve_spawn_slot(Some(2)).unwrap();
+        let second = registry.reserve_spawn_slot(Some(2)).unwrap();
+        assert!(registry.reserve_spawn_slot(Some(2)).is_err());
+        drop((first, second));
+    }
+}

@@ -15,6 +15,7 @@ fn native_read_builder_resolves_relative_path() {
     use codex_utils_absolute_path::test_support::test_path_buf;
     let cwd = test_path_buf("/workspace").abs();
     let item = build_command_execution_begin_item(&ExecCommandBeginEvent {
+        environment: None,
         call_id: "read-1".into(),
         process_id: None,
         turn_id: "turn-1".into(),

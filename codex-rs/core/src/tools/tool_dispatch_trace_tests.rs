@@ -75,6 +75,9 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
         ToolCallTimingLineage::default(),
         snapshot.clone(),
     );
+    // Dispatch marks the current request row; a dispatch without a request
+    // wait is an invalid transition, so open the following request first.
+    drop(turn_timing.begin_model_request_wait());
     turn_timing.mark_model_request_dispatched();
     let recorded = turn_timing.complete_snapshot().protocol_timing();
     let boundaries = recorded
@@ -124,7 +127,8 @@ fn tool_lifecycle_uses_one_clock_and_records_all_boundaries() {
 
 #[test]
 fn live_gate_phases_clear_only_after_the_last_owner_resumes_or_cancels() {
-    use codex_protocol::protocol::{EventMsg, HarnessPhase};
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::HarnessPhase;
     for (start, end, phase) in [
         (
             ToolLifecycleBoundary::ResourceResolutionStart,
@@ -282,6 +286,40 @@ async fn dispatch_timing_separates_item_poll_gate_authorization_and_handler_boun
     assert_eq!(snapshot.workspace_evidence_after_ms, Some(4));
     assert_eq!(snapshot.post_handler_ms, Some(5));
     assert_eq!(snapshot.total_duration_ms, Some(85));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_read_admission_excludes_validation_and_is_committed_only_on_replay() {
+    let accepted = tokio::time::Instant::now();
+    let timing = ToolDispatchTiming::new(accepted, false);
+    timing.mark_first_poll();
+    tokio::time::advance(std::time::Duration::from_millis(2)).await;
+    let admission = timing.capture_gate_admission();
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        timing
+            .snapshot(tokio::time::Instant::now())
+            .parallel_gate_wait_ms,
+        None
+    );
+    timing.mark_captured_gate_admission(admission);
+    let snapshot = timing.snapshot(tokio::time::Instant::now());
+    assert_eq!(snapshot.parallel_gate_wait_ms, Some(2));
+    assert!(snapshot.parallel_gate_admitted);
+    assert_eq!(snapshot.handler_duration_ms, None);
+    assert_eq!(snapshot.exec_request_to_spawn_ms, None);
+
+    let fallback = ToolDispatchTiming::new(tokio::time::Instant::now(), false);
+    fallback.mark_first_poll();
+    let _rejected_replay = fallback.capture_gate_admission();
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    fallback.mark_parallel_gate_admitted();
+    assert_eq!(
+        fallback
+            .snapshot(tokio::time::Instant::now())
+            .parallel_gate_wait_ms,
+        Some(50)
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -870,8 +908,26 @@ async fn terminal_trace_handoff_does_not_wait_for_start_and_survives_cancellatio
     let context = started.started_context().await.unwrap();
     let tasks = invocation.session.terminal_tasks.clone();
     let (sender, receiver) = tokio::sync::watch::channel(None);
+    let observations =
+        Arc::new(codex_utils_pty::process_observation::ProcessStartRecorder::default());
+    codex_utils_pty::process_observation::ProcessObservationContext::new(
+        Arc::clone(&observations),
+        "delayed-observation".into(),
+    )
+    .scope(async {
+        // A backend acknowledgment fixture, not a local OS creation claim.
+        codex_utils_pty::process_observation::observe_process_start(
+            "fixture_backend",
+            codex_utils_pty::process_observation::ProcessRole::RequestedRoot,
+            None,
+            Some("fixture-root".into()),
+        );
+    })
+    .await;
     let delayed = super::ToolDispatchTrace {
         state: Some(Arc::new(super::EnabledToolDispatchTrace {
+            process_observations: Some(observations),
+            _permit: Arc::clone(&started.state.as_ref().unwrap()._permit),
             context: receiver,
             terminal_tasks: tasks.clone(),
             terminal_recording: Arc::new(std::sync::Once::new()),
@@ -898,5 +954,19 @@ async fn terminal_trace_handoff_does_not_wait_for_start_and_survives_cancellatio
         ExecutionStatus::Failed
     );
     assert_eq!(replayed.tool_calls.len(), 1);
+    assert_eq!(
+        replayed.tool_calls["delayed"]
+            .process_observations
+            .as_ref()
+            .unwrap()["requested_root_starts_observed"],
+        1
+    );
+    assert!(
+        replayed.tool_calls["delayed"]
+            .process_observations
+            .as_ref()
+            .unwrap()["descendant_starts"]
+            .is_null()
+    );
     Ok(())
 }

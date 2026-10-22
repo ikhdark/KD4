@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::RootOptions;
 use anyhow::Context;
 use clap::Parser;
 use codex_api::ApiError;
@@ -58,7 +59,6 @@ use codex_protocol::protocol::AskForApproval;
 use codex_terminal_detection::TerminalInfo;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
-use codex_tui::Cli as TuiCli;
 use codex_utils_cli::CliConfigOverrides;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -295,7 +295,7 @@ impl DoctorCheck {
 pub async fn run_doctor(
     command: DoctorCommand,
     root_config_overrides: CliConfigOverrides,
-    interactive: &TuiCli,
+    interactive: &RootOptions,
     arg0_paths: &Arg0DispatchPaths,
 ) -> anyhow::Result<()> {
     let report = build_report(&command, root_config_overrides, interactive, arg0_paths).await;
@@ -326,7 +326,7 @@ pub async fn run_doctor(
 async fn build_report(
     command: &DoctorCommand,
     root_config_overrides: CliConfigOverrides,
-    interactive: &TuiCli,
+    interactive: &RootOptions,
     arg0_paths: &Arg0DispatchPaths,
 ) -> DoctorReport {
     let progress = doctor_progress(command.json);
@@ -537,8 +537,23 @@ async fn build_report(
 
 async fn load_config(
     root_config_overrides: CliConfigOverrides,
-    interactive: &TuiCli,
+    interactive: &RootOptions,
     arg0_paths: &Arg0DispatchPaths,
+) -> anyhow::Result<Config> {
+    load_config_for_home(
+        root_config_overrides,
+        interactive,
+        arg0_paths,
+        find_codex_home()?.to_path_buf(),
+    )
+    .await
+}
+
+async fn load_config_for_home(
+    root_config_overrides: CliConfigOverrides,
+    interactive: &RootOptions,
+    arg0_paths: &Arg0DispatchPaths,
+    codex_home: PathBuf,
 ) -> anyhow::Result<Config> {
     let mut cli_kv_overrides = root_config_overrides
         .parse_overrides()
@@ -550,12 +565,38 @@ async fn load_config(
         ));
     }
 
-    let overrides = ConfigOverrides {
+    let mut overrides = ConfigOverrides {
         ephemeral: Some(true),
         ..config_overrides_from_interactive(interactive, arg0_paths)
     };
+    if interactive.oss {
+        // Resolve the configured OSS default from the same layers/cwd as the
+        // final build, before provider-specific diagnostics select an endpoint.
+        let config_cwd = interactive
+            .cwd
+            .as_deref()
+            .map(codex_utils_absolute_path::AbsolutePathBuf::relative_to_current_dir)
+            .transpose()?;
+        let bootstrap = codex_core::config::load_config_toml_with_layer_stack(
+            &codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&codex_home)?,
+            config_cwd.as_ref(),
+            cli_kv_overrides.clone(),
+            codex_config::ConfigLoadOptions {
+                strict_config: interactive.strict_config,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let provider = codex_core::config::resolve_oss_provider(
+            interactive.oss_provider.as_deref(),
+            &bootstrap.config_toml,
+        );
+        (overrides.model, overrides.model_provider) =
+            super::debug_prompt_oss_overrides(true, interactive.model.clone(), provider)?;
+    }
 
     ConfigBuilder::default()
+        .codex_home(codex_home)
         .cli_overrides(cli_kv_overrides)
         .harness_overrides(overrides)
         .strict_config(interactive.strict_config)
@@ -565,7 +606,7 @@ async fn load_config(
 }
 
 fn config_overrides_from_interactive(
-    interactive: &TuiCli,
+    interactive: &RootOptions,
     arg0_paths: &Arg0DispatchPaths,
 ) -> ConfigOverrides {
     let approval_policy = if interactive.dangerously_bypass_approvals_and_sandbox {
@@ -1928,15 +1969,16 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
     push_terminal_env_values(&mut details, &inputs, TERMINAL_DIMENSION_ENV_VARS);
     details.push(format!("color output: {}", color_output_summary(&inputs)));
     push_terminal_env_values(&mut details, &inputs, COLOR_ENV_VARS);
-    let terminfo_warning = push_terminfo_details(&mut details, &inputs);
+    let terminfo_failures = push_terminfo_details(&mut details, &inputs);
     let locale = effective_locale(&inputs);
-    if let Some(locale) = locale.as_ref() {
+    if let Some((source, locale)) = locale.as_ref() {
         details.push(format!("effective locale: {locale}"));
+        details.push(format!("locale source: {source}"));
     }
     push_presence_env_values(&mut details, &inputs, REMOTE_TERMINAL_ENV_VARS);
     details.extend(inputs.windows_console_details.iter().cloned());
 
-    let locale_warning = locale.as_deref().is_some_and(is_non_utf8_locale);
+    let locale_warning = locale.filter(|(_, value)| is_non_utf8_locale(value));
     let mut issues = Vec::new();
     if matches!(name, TerminalName::Dumb) {
         issues.push(
@@ -1950,8 +1992,7 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
             .field("TERM"),
         );
     }
-    if locale_warning {
-        let measured = locale.unwrap_or_else(|| "unknown".to_string());
+    if let Some((source, measured)) = locale_warning {
         issues.push(
             DoctorIssue::new(
                 CheckStatus::Warning,
@@ -1959,20 +2000,19 @@ fn terminal_check_from_inputs(inputs: TerminalCheckInputs) -> DoctorCheck {
             )
             .measured(measured)
             .expected("UTF-8 locale, for example en_US.UTF-8")
-            .remedy("export LANG=en_US.UTF-8 or another UTF-8 locale")
+            .remedy(format!("Set {source} to a supported UTF-8 locale, or remove that override so the next locale variable can take effect; then rerun codex doctor."))
             .field("effective locale"),
         );
     }
-    if terminfo_warning {
+    for (source, path) in terminfo_failures {
         issues.push(
             DoctorIssue::new(
                 CheckStatus::Fail,
                 "TERMINFO unreadable - terminal capabilities are unknown",
             )
             .expected("readable terminfo file or directory")
-            .remedy("check that $TERMINFO points to a readable directory")
-            .field("TERMINFO")
-            .field("TERMINFO_DIRS entry"),
+            .remedy(format!("Fix the reported unreadable {source} path ({}), or remove that stale override; then rerun codex doctor.", path.display()))
+            .field(source),
         );
     }
     issues.extend(terminal_size_issues(&inputs));
@@ -2092,13 +2132,18 @@ fn color_output_summary(inputs: &TerminalCheckInputs) -> String {
     format!("disabled ({reason})")
 }
 
-fn push_terminfo_details(details: &mut Vec<String>, inputs: &TerminalCheckInputs) -> bool {
-    let mut has_warning = false;
+fn push_terminfo_details(
+    details: &mut Vec<String>,
+    inputs: &TerminalCheckInputs,
+) -> Vec<(&'static str, PathBuf)> {
+    let mut failures = Vec::new();
     if let Some(raw) = inputs.env_value("TERMINFO") {
         let path = PathBuf::from(raw);
         let (status, warning) = terminal_path_readiness(&path);
         details.push(format!("TERMINFO: {} ({status})", path.display()));
-        has_warning |= warning;
+        if warning {
+            failures.push(("TERMINFO", path));
+        }
     }
     if let Some(raw) = inputs.env_value("TERMINFO_DIRS") {
         for path in env::split_paths(raw).filter(|path| !path.as_os_str().is_empty()) {
@@ -2107,12 +2152,14 @@ fn push_terminfo_details(details: &mut Vec<String>, inputs: &TerminalCheckInputs
                 "TERMINFO_DIRS entry: {} ({status})",
                 path.display()
             ));
-            has_warning |= warning;
+            if warning {
+                failures.push(("TERMINFO_DIRS entry", path));
+            }
         }
     } else if inputs.env_present("TERMINFO_DIRS") {
         details.push("TERMINFO_DIRS: present".to_string());
     }
-    has_warning
+    failures
 }
 
 fn terminal_path_readiness(path: &Path) -> (String, bool) {
@@ -2131,10 +2178,12 @@ fn terminal_path_readiness(path: &Path) -> (String, bool) {
     }
 }
 
-fn effective_locale(inputs: &TerminalCheckInputs) -> Option<String> {
-    LOCALE_ENV_VARS
-        .iter()
-        .find_map(|name| inputs.env_value(name).map(ToString::to_string))
+fn effective_locale(inputs: &TerminalCheckInputs) -> Option<(&'static str, String)> {
+    LOCALE_ENV_VARS.iter().find_map(|name| {
+        inputs
+            .env_value(name)
+            .map(|value| (*name, value.to_string()))
+    })
 }
 
 fn is_non_utf8_locale(locale: &str) -> bool {
@@ -2223,9 +2272,22 @@ async fn state_check(config: &Config) -> DoctorCheck {
             ));
         }
     }
-    let mut corrupt = false;
+    let mut corrupt_remedies = Vec::new();
     for db in codex_state::runtime_db_paths(&config.sqlite_home) {
-        corrupt |= sqlite_integrity_detail(&mut details, &mut failures, db.label, &db.path).await;
+        if sqlite_integrity_detail(&mut details, &mut failures, db.label, &db.path).await {
+            let recovery = match db.label {
+                "state DB" => {
+                    "Restart can reconstruct some rollout metadata, but reconstruction may be incomplete and does not restore unrelated database contents."
+                }
+                "goals DB" => {
+                    "Restart can create a fresh goals database, but saved goals are not guaranteed to be restored; completed state backfill does not restore them. Verify or explicitly restore required goals."
+                }
+                _ => {
+                    "Restart can create a fresh database, but historical logs are not reconstructed. Restore required history from a verified backup."
+                }
+            };
+            corrupt_remedies.push(format!("{} ({}): preserve a backup of the damaged database and its SQLite sidecars before recovery. {recovery} Keep the backup.", db.label, db.path.display()));
+        }
     }
     let codex_home = config.codex_home.clone();
     match tokio::task::spawn_blocking(move || {
@@ -2254,8 +2316,8 @@ async fn state_check(config: &Config) -> DoctorCheck {
         .any(|detail| codex_state::sqlite_error_detail_is_lock(detail));
     details.extend(failures);
     let mut check = DoctorCheck::new("state.paths", "state", status, summary).details(details);
-    if corrupt {
-        check = check.remediation("Move only the damaged SQLite database aside, then restart the interactive CLI or app server so it can rebuild from saved data.");
+    if !corrupt_remedies.is_empty() {
+        check = check.remediation(corrupt_remedies.join(" "));
     } else if locked {
         check = check.remediation(
             "Close other Codex processes using the database, then rerun codex doctor.",
@@ -2273,11 +2335,12 @@ async fn sqlite_integrity_detail(
     label: &str,
     path: &Path,
 ) -> bool {
+    details.push(format!("{label}: {}", path.display()));
     match tokio::fs::metadata(path).await {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
             failures.push(format!(
-                "{label}: {} is not a regular database file",
+                "{label} integrity: {} is not a regular database file",
                 path.display()
             ));
             return false;
@@ -2287,7 +2350,7 @@ async fn sqlite_integrity_detail(
             return false;
         }
         Err(err) => {
-            failures.push(format!("{label}: {} ({err})", path.display()));
+            failures.push(format!("{label} integrity: {} ({err})", path.display()));
             return false;
         }
     }
@@ -2463,6 +2526,7 @@ async fn websocket_reachability_check(
                 "Responses WebSocket provider setup failed",
                 details,
                 format!("provider setup failed: {err}"),
+                "Inspect the provider setup error and correct the affected provider configuration.",
             );
         }
     };
@@ -2480,6 +2544,7 @@ async fn websocket_reachability_check(
                 "Responses WebSocket endpoint could not be built",
                 details,
                 format!("endpoint build failed: {err}"),
+                "Correct the active provider base URL and WebSocket endpoint configuration described by the error.",
             );
         }
     }
@@ -2491,6 +2556,7 @@ async fn websocket_reachability_check(
                 "Responses WebSocket auth could not be resolved",
                 details,
                 format!("auth resolution failed: {err}"),
+                "Resolve the reported authentication or credential configuration error, then rerun codex doctor.",
             );
         }
     };
@@ -2553,11 +2619,13 @@ async fn websocket_reachability_check(
             "Responses WebSocket failed; HTTPS fallback may still work",
             details,
             websocket_error_detail(&err),
+            "Check proxy, VPN, firewall, DNS, custom CA, and WebSocket policy support.",
         ),
         Err(_) => websocket_probe_warning(
             "Responses WebSocket timed out; HTTPS fallback may still work",
             details,
             "handshake timed out".to_string(),
+            "Check proxy, VPN, firewall, DNS, custom CA, and WebSocket policy support.",
         ),
     }
 }
@@ -2566,6 +2634,7 @@ fn websocket_probe_warning(
     summary: &'static str,
     mut details: Vec<String>,
     error_detail: String,
+    remediation: &'static str,
 ) -> DoctorCheck {
     details.push(error_detail);
     DoctorCheck::new(
@@ -2575,7 +2644,7 @@ fn websocket_probe_warning(
         summary,
     )
     .details(details)
-    .remediation("Check proxy, VPN, firewall, DNS, custom CA, and WebSocket policy support.")
+    .remediation(remediation)
 }
 
 fn websocket_error_detail(err: &ApiError) -> String {
@@ -3225,6 +3294,62 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn oss_default_and_explicit_selection_reach_doctor_config() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "oss_provider = 'ollama'\n").unwrap();
+        for (args, expected_provider, expected_model) in [
+            (
+                vec!["codex", "--oss"],
+                "ollama",
+                codex_utils_oss::get_default_model_for_oss_provider("ollama"),
+            ),
+            (
+                vec![
+                    "codex",
+                    "--oss",
+                    "--local-provider",
+                    "lmstudio",
+                    "--model",
+                    "chosen",
+                ],
+                "lmstudio",
+                Some("chosen"),
+            ),
+        ] {
+            let mut interactive = RootOptions::try_parse_from(args).unwrap();
+            interactive.shared.cwd = Some(cwd.path().to_path_buf());
+            let config = load_config_for_home(
+                CliConfigOverrides::default(),
+                &interactive,
+                &Arg0DispatchPaths::default(),
+                home.path().to_path_buf(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(config.model_provider_id, expected_provider);
+            assert_eq!(config.model.as_deref(), expected_model);
+            assert!(config.ephemeral);
+        }
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        let mut interactive = RootOptions::try_parse_from(["codex", "--oss"]).unwrap();
+        interactive.shared.cwd = Some(cwd.path().to_path_buf());
+        let error = load_config_for_home(
+            CliConfigOverrides::default(),
+            &interactive,
+            &Arg0DispatchPaths::default(),
+            home.path().to_path_buf(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No default OSS provider configured")
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_only_report_skips_config_and_unrelated_checks() {
         let command = DoctorCommand::parse_from(["doctor", "--json", "--runtime-only"]);
         let report = build_report(
@@ -3233,7 +3358,7 @@ mod tests {
                 // A full report would try to parse this and emit config.load.
                 raw_overrides: vec!["not-a-key-value-override".to_string()],
             },
-            &TuiCli::parse_from(["codex"]),
+            &RootOptions::parse_from(["codex"]),
             &Arg0DispatchPaths {
                 codex_self_exe: None,
             },
@@ -3471,7 +3596,7 @@ mod tests {
 
     #[test]
     fn config_overrides_from_interactive_preserves_global_options() {
-        let interactive = TuiCli::parse_from([
+        let interactive = RootOptions::parse_from([
             "codex",
             "--oss",
             "--local-provider",
@@ -3520,9 +3645,15 @@ mod tests {
         let redacted: DoctorIssue = redacted_json_issue(&issue);
         assert_eq!(redacted.severity, CheckStatus::Warning);
         assert_eq!(redacted.cause, "https://example.com/mcp is unreachable");
-        assert_eq!(redacted.measured.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(
+            redacted.measured.as_deref(),
+            Some("https://example.com/mcp")
+        );
         assert_eq!(redacted.expected.as_deref(), Some("reachable"));
-        assert_eq!(redacted.remedy.as_deref(), Some("Open https://example.com/help."));
+        assert_eq!(
+            redacted.remedy.as_deref(),
+            Some("Open https://example.com/help.")
+        );
         assert_eq!(redacted.fields, vec!["endpoint"]);
     }
 
@@ -3853,6 +3984,7 @@ mod tests {
     #[test]
     fn stored_auth_validation_rejects_missing_api_key() {
         let auth = AuthDotJson {
+            oauth_context: None,
             auth_mode: Some(AuthMode::ApiKey),
             openai_api_key: None,
             tokens: None,
@@ -3872,6 +4004,7 @@ mod tests {
     #[test]
     fn stored_auth_validation_rejects_missing_chatgpt_tokens() {
         let auth = AuthDotJson {
+            oauth_context: None,
             auth_mode: None,
             openai_api_key: None,
             tokens: None,
@@ -3893,6 +4026,7 @@ mod tests {
     #[test]
     fn stored_auth_validation_handles_personal_access_token() {
         let mut auth = AuthDotJson {
+            oauth_context: None,
             auth_mode: None,
             openai_api_key: None,
             tokens: None,
@@ -3916,6 +4050,7 @@ mod tests {
     #[test]
     fn provider_reachability_mode_uses_api_key_auth() {
         let api_key_auth = AuthDotJson {
+            oauth_context: None,
             auth_mode: Some(AuthMode::ApiKey),
             openai_api_key: Some("sk-test".to_string()),
             tokens: None,
@@ -4019,7 +4154,10 @@ mod tests {
     fn provider_reachability_skips_route_probe_for_bedrock() {
         for (bedrock, expected) in [
             (true, None),
-            (false, Some("https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/models")),
+            (
+                false,
+                Some("https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/models"),
+            ),
         ] {
             let plan = provider_reachability_plan_from_parts(
                 ProviderAuthReachabilityMode::NotRequired,
@@ -4202,12 +4340,15 @@ mod tests {
         std::fs::write(&db.path, vec![b'x'; 4096]).unwrap();
         let check = state_check(&config).await;
         assert_eq!(check.status, CheckStatus::Fail);
+        // Corruption advice is per database and backup-first.
+        let remediation = check.remediation.as_deref().unwrap();
         assert!(
-            check
-                .remediation
-                .as_deref()
-                .unwrap()
-                .contains("damaged SQLite")
+            remediation.contains(&format!(
+                "{} ({}): preserve a backup of the damaged database",
+                db.label,
+                db.path.display()
+            )),
+            "{remediation}"
         );
     }
 
@@ -4333,14 +4474,20 @@ mod tests {
             // end by timing out however slowly this thread is scheduled.
             let mut head_stream = accept_probe(&listener);
             let mut request = String::new();
-            std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut head_stream), &mut request)
-                .expect("read HEAD request line");
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(&mut head_stream),
+                &mut request,
+            )
+            .expect("read HEAD request line");
             assert_eq!(request, "HEAD /mcp HTTP/1.1\r\n");
 
             let mut get_stream = accept_probe(&listener);
             request.clear();
-            std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut get_stream), &mut request)
-                .expect("read GET request line");
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(&mut get_stream),
+                &mut request,
+            )
+            .expect("read GET request line");
             assert_eq!(request, "GET /mcp HTTP/1.1\r\n");
             get_stream
                 .write_all(
@@ -4447,7 +4594,13 @@ mod tests {
 
     #[test]
     fn should_enable_color_respects_terminal_inputs() {
-        assert!(!should_enable_color(false, false, Some("xterm-256color"), true, false));
+        assert!(!should_enable_color(
+            false,
+            false,
+            Some("xterm-256color"),
+            true,
+            false
+        ));
         assert!(should_enable_color(
             /*no_color_flag*/ false,
             /*no_color_env*/ false,
@@ -4586,8 +4739,22 @@ mod tests {
         assert!(check.details.contains(&"effective locale: C".to_string()));
         assert_eq!(
             check.issues[0].remedy.as_deref(),
-            Some("export LANG=en_US.UTF-8 or another UTF-8 locale")
+            Some(
+                "Set LANG to a supported UTF-8 locale, or remove that override so the next locale variable can take effect; then rerun codex doctor."
+            )
         );
+    }
+
+    #[test]
+    fn locale_remedy_targets_the_winning_override() {
+        let mut inputs = terminal_inputs();
+        set_terminal_env(&mut inputs, "LC_ALL", "C");
+        set_terminal_env(&mut inputs, "LANG", "en_US.UTF-8");
+        let check = terminal_check_from_inputs(inputs);
+        assert_eq!(check.status, CheckStatus::Warning);
+        let remedy = check.issues[0].remedy.as_deref().expect("locale remedy");
+        assert!(remedy.starts_with("Set LC_ALL "));
+        assert!(!remedy.starts_with("Set LANG "));
     }
 
     #[test]
@@ -4610,10 +4777,9 @@ mod tests {
                 .iter()
                 .any(|detail| detail.starts_with("TERMINFO: ") && detail.ends_with(" (missing)"))
         );
-        assert_eq!(
-            check.issues[0].remedy.as_deref(),
-            Some("check that $TERMINFO points to a readable directory")
-        );
+        let remedy = check.issues[0].remedy.as_deref().expect("repair advice");
+        assert!(remedy.contains("unreadable TERMINFO path"));
+        assert!(remedy.contains(&missing.display().to_string()));
     }
 
     #[test]

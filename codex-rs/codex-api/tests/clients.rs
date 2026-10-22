@@ -559,7 +559,9 @@ async fn streaming_client_does_not_replay_ambiguous_transport_error() -> Result<
             },
         )
         .await;
-    let error = result.err().expect("ambiguous dispatch must fail without replay");
+    let error = result
+        .err()
+        .expect("ambiguous dispatch must fail without replay");
     assert!(matches!(
         &error,
         ApiError::ProviderFailure { code, message }

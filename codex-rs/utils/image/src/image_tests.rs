@@ -10,6 +10,85 @@ use image::metadata::Orientation;
 
 const TEST_RGB_ICC_PROFILE: &[u8] = b"0123456789abcdefRGB ";
 const TEST_CMYK_ICC_PROFILE: &[u8] = b"0123456789abcdefCMYK";
+fn png_test_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+    chunk.extend_from_slice(&kind);
+    chunk.extend_from_slice(data);
+    let mut crc = !0u32;
+    for byte in &chunk[4..] {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    chunk.extend_from_slice(&(!crc).to_be_bytes());
+    chunk
+}
+
+#[test]
+fn resize_retains_png_gamma_without_relabeling_samples() {
+    let gamma = png_test_chunk(*b"gAMA", &100_000u32.to_be_bytes());
+    for width in [64, 2050] {
+        let mut source = image_bytes(
+            &ImageBuffer::from_pixel(width, 2, Rgba([128, 128, 128, 255])),
+            ImageFormat::Png,
+        );
+        source.splice(33..33, gamma.iter().copied());
+        let prepared = load_for_prompt_bytes(
+            Path::new("linear.png"),
+            source.clone(),
+            PromptImageMode::ResizeToFit,
+        )
+        .unwrap();
+        assert_eq!(prepared.source_dimensions, (width, 2));
+        assert_eq!((prepared.width, prepared.height), (width.min(2048), 2));
+        assert!(
+            prepared
+                .bytes
+                .windows(gamma.len())
+                .any(|bytes| bytes == gamma)
+        );
+        let pixels = image::load_from_memory(&prepared.bytes).unwrap().to_rgba8();
+        assert!(pixels.pixels().all(|pixel| pixel.0 == [128, 128, 128, 255]));
+        if width == 64 {
+            assert_eq!(prepared.bytes.as_ref(), source);
+        }
+    }
+}
+
+#[test]
+fn preparation_distinguishes_animated_and_static_gif() {
+    for frames in [1, 2] {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for color in [[255, 0, 0, 255], [0, 255, 0, 255]]
+                .into_iter()
+                .take(frames)
+            {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                        3,
+                        2,
+                        Rgba(color),
+                    )))
+                    .unwrap();
+            }
+        }
+        let prepared =
+            load_for_prompt_bytes(Path::new("animation.gif"), bytes, PromptImageMode::Original)
+                .unwrap();
+        assert_eq!(prepared.animation_present, frames == 2);
+        assert_eq!(prepared.mime, "image/png");
+        assert!(
+            image::load_from_memory(&prepared.bytes)
+                .unwrap()
+                .to_rgba8()
+                .pixels()
+                .all(|pixel| pixel.0 == [255, 0, 0, 255])
+        );
+    }
+}
 const ROTATE_90_EXIF: &[u8] = &[
     0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00, 0x01, 0x00,
     0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -177,7 +256,12 @@ fn downscales_tall_image_to_fit_square_bounds() {
     assert_eq!(processed.width, 512);
     assert_eq!(processed.height, MAX_DIMENSION);
     assert_eq!(processed.mime, "image/png");
-    assert_eq!(image::load_from_memory(&processed.bytes).unwrap().dimensions(), (512, 2048));
+    assert_eq!(
+        image::load_from_memory(&processed.bytes)
+            .unwrap()
+            .dimensions(),
+        (512, 2048)
+    );
 }
 
 #[test]
@@ -324,7 +408,12 @@ fn data_url_processing_converts_gif_to_png() {
         image::guess_format(&processed.bytes).expect("detect processed format"),
         ImageFormat::Png
     );
-    assert_eq!(image::load_from_memory(&processed.bytes).unwrap().to_rgba8(), image);
+    assert_eq!(
+        image::load_from_memory(&processed.bytes)
+            .unwrap()
+            .to_rgba8(),
+        image
+    );
 }
 
 #[test]
@@ -359,7 +448,12 @@ fn resize_with_limits_respects_dimension_and_patch_budgets() {
     .expect("process image with explicit limits");
 
     assert_eq!((processed.width, processed.height), (1600, 1600));
-    assert_eq!(image::load_from_memory(&processed.bytes).unwrap().dimensions(), (1600, 1600));
+    assert_eq!(
+        image::load_from_memory(&processed.bytes)
+            .unwrap()
+            .dimensions(),
+        (1600, 1600)
+    );
 }
 
 #[test]
@@ -419,6 +513,8 @@ fn bounds_cache_by_encoded_byte_size() {
         mime: "image/png",
         width: 1,
         height: 1,
+        source_dimensions: (1, 1),
+        animation_present: false,
     };
 
     cache_image(&cache, key(1), image(3), /*byte_capacity*/ 5);
@@ -545,4 +641,141 @@ fn decoded_image_size_is_limited_before_allocation() {
             ..
         })
     ));
+}
+
+#[test]
+fn processing_budget_includes_asymmetric_resize_scratch() {
+    let budget = MAX_IMAGE_METADATA_BYTES * 2 + 100_000;
+    assert!(
+        check_processing_budget(
+            8_192,
+            ColorType::L8,
+            (8_192, 1),
+            (512, 1),
+            100,
+            true,
+            budget
+        )
+        .is_err()
+    );
+    assert!(
+        check_processing_budget(
+            8_192,
+            ColorType::L8,
+            (1, 8_192),
+            (1, 512),
+            100,
+            true,
+            budget
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn opaque_screenshots_are_not_charged_premultiplied_alpha_scratch() {
+    // A 6K RGBA screenshot resized to fit. Opaque pixels take the plain resize;
+    // only translucent ones need the premultiplied f32 copies.
+    let source = (6016, 3384);
+    let target = prompt_image_output_dimensions_for_limits(
+        source.0,
+        source.1,
+        PromptImageResizeLimits {
+            max_dimension: MAX_DIMENSION,
+            max_patches: usize::MAX,
+        },
+    );
+    let decoded = u64::from(source.0) * u64::from(source.1) * 4;
+    let check = |live_bytes| {
+        check_processing_budget(
+            live_bytes,
+            ColorType::Rgba8,
+            source,
+            target,
+            8 * 1024 * 1024,
+            true,
+            MAX_IMAGE_PROCESSING_BYTES,
+        )
+    };
+    assert!(check(decoded).is_ok());
+    assert!(check(decoded + premultiplied_alpha_scratch(source, target)).is_err());
+}
+
+#[test]
+fn compressed_metadata_is_bounded_before_decode_and_dimension_probes() {
+    for (size, oversized) in [(1024, false), (MAX_IMAGE_METADATA_BYTES as usize + 1, true)] {
+        let mut profile = vec![0; size];
+        profile[16..20].copy_from_slice(b"RGB ");
+        let mut bytes = Vec::new();
+        let mut encoder = PngEncoder::new(&mut bytes);
+        encoder.set_icc_profile(profile).unwrap();
+        encoder
+            .write_image(&[1, 2, 3], 1, 1, ColorType::Rgb8.into())
+            .unwrap();
+        assert!(bytes.len() < MAX_PROMPT_IMAGE_SOURCE_BYTES);
+        let dimensions = prompt_image_dimensions(&bytes);
+        assert_eq!(dimensions.is_err(), oversized);
+        let prepared = load_for_prompt_bytes(
+            Path::new("metadata.png"),
+            bytes.clone(),
+            PromptImageMode::Original,
+        );
+        assert_eq!(prepared.is_err(), oversized);
+        if !oversized {
+            assert_eq!(dimensions.unwrap(), (1, 1));
+            assert_eq!(
+                prepared.unwrap().bytes.as_ref(),
+                bytes.as_slice(),
+                "valid source stays byte-preserving"
+            );
+        }
+    }
+}
+
+#[test]
+fn transparent_hidden_rgb_does_not_change_resized_visible_colors() {
+    for format in [ImageFormat::Png, ImageFormat::WebP] {
+        for grayscale in [false, true] {
+            let mut outputs = Vec::new();
+            for hidden in [0, 255] {
+                let image = ImageBuffer::from_fn(1024, 1, |x, _| {
+                    if x % 2 == 0 {
+                        Rgba([255, 0, 0, 255])
+                    } else {
+                        Rgba([hidden, 0, 0, 0])
+                    }
+                });
+                let dynamic = DynamicImage::ImageRgba8(image);
+                let dynamic = if grayscale {
+                    DynamicImage::ImageLumaA8(dynamic.to_luma_alpha8())
+                } else {
+                    dynamic
+                };
+                let mut bytes = Cursor::new(Vec::new());
+                dynamic.write_to(&mut bytes, format).unwrap();
+                let output = load_for_prompt_bytes(
+                    Path::new("alpha"),
+                    bytes.into_inner(),
+                    PromptImageMode::ResizeWithLimits(PromptImageResizeLimits {
+                        max_dimension: 512,
+                        max_patches: 256,
+                    }),
+                )
+                .unwrap();
+                outputs.push(image::load_from_memory(&output.bytes).unwrap().to_rgba8());
+            }
+            for (a, b) in outputs[0].pixels().zip(outputs[1].pixels()) {
+                for background in [0_u32, 127, 255] {
+                    for c in 0..3 {
+                        let composite = |p: &Rgba<u8>| {
+                            (u32::from(p[c]) * u32::from(p[3])
+                                + background * (255 - u32::from(p[3])))
+                                / 255
+                        };
+                        assert!(composite(a).abs_diff(composite(b)) <= 1);
+                    }
+                }
+            }
+        }
+    }
 }

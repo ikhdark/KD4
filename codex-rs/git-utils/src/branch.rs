@@ -47,6 +47,20 @@ pub fn merge_base_with_head(
     Ok(Some(merge_base))
 }
 
+/// Resolve only commit objects, rejecting options, missing revisions, trees and blobs.
+pub fn resolve_commit(repo_root: &Path, revision: &str) -> Result<String, GitToolingError> {
+    run_git_for_stdout(
+        repo_root,
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{revision}^{{commit}}"),
+        ],
+        None,
+    )
+}
+
 fn resolve_branch_ref(repo_root: &Path, branch: &str) -> Result<Option<String>, GitToolingError> {
     let rev = run_git_for_stdout(
         repo_root,
@@ -239,5 +253,4 @@ mod tests {
 
         Ok(())
     }
-
 }

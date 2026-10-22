@@ -233,7 +233,9 @@ async fn thread_archive_move_failure_leaves_thread_resumable() -> Result<()> {
     // move leaves the durable thread active and resumable, not a live writer.
     drop(_rollout_lock);
     let loaded_id = mcp
-        .send_thread_loaded_list_request(codex_app_server_protocol::ThreadLoadedListParams::default())
+        .send_thread_loaded_list_request(
+            codex_app_server_protocol::ThreadLoadedListParams::default(),
+        )
         .await?;
     let response = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -245,12 +247,17 @@ async fn thread_archive_move_failure_leaves_thread_resumable() -> Result<()> {
         !loaded.data.contains(&thread.id),
         "the thread was unloaded before the move was attempted"
     );
-    let resume_id = mcp.send_thread_resume_request(ThreadResumeParams {
-        thread_id: thread.id.clone(),
-        ..Default::default()
-    }).await?;
-    let response = timeout(DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(resume_id))).await??;
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread.id.clone(),
+            ..Default::default()
+        })
+        .await?;
+    let response = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
     let resumed: ThreadResumeResponse = to_response(response)?;
     assert_eq!(resumed.thread.id, thread.id);
     send_turn_and_wait(&mut mcp, &thread.id, "still resumable").await?;
@@ -607,8 +614,6 @@ async fn thread_archive_succeeds_when_spawned_descendant_is_missing() -> Result<
 
     Ok(())
 }
-
-
 
 async fn send_turn_and_wait(mcp: &mut TestAppServer, thread_id: &str, text: &str) -> Result<()> {
     let turn_id = mcp

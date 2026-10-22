@@ -128,9 +128,19 @@ async fn add_streamable_http_persists_transport_and_oauth_options() -> Result<()
     let url = format!("{}/mcp", server.uri());
     for (extra, token, client_id, resource) in [
         (vec![], None, None, None),
-        (vec!["--bearer-token-env-var", "GITHUB_TOKEN"], Some("GITHUB_TOKEN"), None, None),
         (
-            vec!["--oauth-client-id", "eci-prd-pub-codex-123", "--oauth-resource", "https://resource.example.com"],
+            vec!["--bearer-token-env-var", "GITHUB_TOKEN"],
+            Some("GITHUB_TOKEN"),
+            None,
+            None,
+        ),
+        (
+            vec![
+                "--oauth-client-id",
+                "eci-prd-pub-codex-123",
+                "--oauth-resource",
+                "https://resource.example.com",
+            ],
             None,
             Some("eci-prd-pub-codex-123"),
             Some("https://resource.example.com"),

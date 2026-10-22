@@ -13,6 +13,7 @@ use crate::auth::storage::FileAuthStorage;
 
 fn api_key_auth() -> AuthDotJson {
     AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test-key".to_string()),
         tokens: None,
@@ -25,6 +26,7 @@ fn api_key_auth() -> AuthDotJson {
 
 fn bedrock_only_auth() -> AuthDotJson {
     AuthDotJson {
+        oauth_context: None,
         auth_mode: None,
         openai_api_key: None,
         tokens: None,
@@ -69,6 +71,7 @@ async fn login_with_bedrock_api_key_replaces_openai_auth() -> anyhow::Result<()>
 
     let loaded = storage.load()?.expect("auth should be stored");
     let expected = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::BedrockApiKey),
         openai_api_key: None,
         tokens: None,

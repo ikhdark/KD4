@@ -168,7 +168,8 @@ mod tests {
             ("max_output_tokens", 1),
             ("max_output_tokens", 2),
         ] {
-            let source = format!("// @exec: {{\"{field}\":1,\"{field}\":{second}}}\ntext('must not run')");
+            let source =
+                format!("// @exec: {{\"{field}\":1,\"{field}\":{second}}}\ntext('must not run')");
             let error = parse_exec_source(&source).expect_err(&source);
             assert!(
                 error.starts_with("exec pragma has an invalid field value:"),
@@ -230,12 +231,18 @@ mod tests {
             assert_eq!(parsed.code, "text('answer');");
         }
         for value in ["null", "1", "\"true\"", "[]", "{}"] {
-            assert!(parse_exec_source(&format!(
-                "// @exec: {{\"deliver\":{value}}}\ntext('must not execute');"
-            )).is_err());
+            assert!(
+                parse_exec_source(&format!(
+                    "// @exec: {{\"deliver\":{value}}}\ntext('must not execute');"
+                ))
+                .is_err()
+            );
         }
-        assert!(parse_exec_source(
-            "// @exec: {\"deliver\":true,\"deliver\":true}\ntext('must not execute');"
-        ).is_err());
+        assert!(
+            parse_exec_source(
+                "// @exec: {\"deliver\":true,\"deliver\":true}\ntext('must not execute');"
+            )
+            .is_err()
+        );
     }
 }

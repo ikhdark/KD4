@@ -520,7 +520,10 @@ class SharedValidation(unittest.TestCase):
             "live validation fixture was overwritten: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(contender.is_err(), "competing validation must not be admitted");
+        assert!(
+            contender.is_err(),
+            "competing validation must not be admitted"
+        );
         assert_eq!(
             std::fs::read_to_string(temp.path().join("shared-output")).unwrap(),
             "owner"
@@ -543,9 +546,10 @@ class SharedValidation(unittest.TestCase):
         let python = ["python", "-m", "pytest", "tests"].map(str::to_string);
         let (first, second) = (ThreadId::new(), ThreadId::new());
         let first_python = ValidationOwner::for_command(first, &python);
-        let held = acquire_workspace_validation(temp.path(), "python -m pytest tests", first_python)
-            .await
-            .unwrap();
+        let held =
+            acquire_workspace_validation(temp.path(), "python -m pytest tests", first_python)
+                .await
+                .unwrap();
         // Test modules and plugins may compile or write shared fixtures. The
         // interpreter name is not evidence that their resources are isolated.
         let foreign = acquire_workspace_validation(
@@ -555,11 +559,17 @@ class SharedValidation(unittest.TestCase):
         )
         .await
         .unwrap_err();
-        assert!(foreign.contains("belongs to another session or agent"), "{foreign}");
+        assert!(
+            foreign.contains("belongs to another session or agent"),
+            "{foreign}"
+        );
         let duplicate = acquire_workspace_validation(temp.path(), "python -m pytest", first_python)
             .await
             .unwrap_err();
-        assert!(duplicate.contains("Resume the existing operation"), "{duplicate}");
+        assert!(
+            duplicate.contains("Resume the existing operation"),
+            "{duplicate}"
+        );
         let cargo = acquire_workspace_validation(temp.path(), "cargo test", cargo_owner(first))
             .await
             .unwrap_err();
@@ -573,8 +583,14 @@ class SharedValidation(unittest.TestCase):
             .unwrap_err();
         assert!(foreign.contains("\"cargo test\""), "{foreign}");
         assert!(foreign.contains("This validation did not run"), "{foreign}");
-        assert!(foreign.contains("belongs to another session or agent"), "{foreign}");
-        assert!(!foreign.contains("Resume the existing operation"), "{foreign}");
+        assert!(
+            foreign.contains("belongs to another session or agent"),
+            "{foreign}"
+        );
+        assert!(
+            !foreign.contains("Resume the existing operation"),
+            "{foreign}"
+        );
         drop(cargo);
         assert!(
             acquire_workspace_validation(temp.path(), "cargo check", cargo_owner(second))

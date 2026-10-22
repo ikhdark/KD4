@@ -359,6 +359,9 @@ impl Default for GoalAccountingState {
     }
 }
 
+/// Signed component-wise difference. The rebase baseline in `record_token_usage`
+/// can be negative; `TokenUsage::difference` clamps at zero and would drop
+/// unflushed usage. Goal accounting does not read receipt coverage.
 fn usage_difference(current: &TokenUsage, previous: &TokenUsage) -> TokenUsage {
     TokenUsage {
         input_tokens: current.input_tokens.saturating_sub(previous.input_tokens),
@@ -370,6 +373,7 @@ fn usage_difference(current: &TokenUsage, previous: &TokenUsage) -> TokenUsage {
             .reasoning_output_tokens
             .saturating_sub(previous.reasoning_output_tokens),
         total_tokens: current.total_tokens.saturating_sub(previous.total_tokens),
+        coverage: None,
     }
 }
 

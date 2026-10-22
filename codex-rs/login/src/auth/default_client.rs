@@ -258,10 +258,21 @@ pub fn create_client_pool(
     http_client_factory: HttpClientFactory,
     route_class: ClientRouteClass,
 ) -> RouteAwareClientPool {
+    create_client_pool_with_headers(http_client_factory, route_class, default_headers())
+}
+
+/// Builds from the same header snapshot a caller uses to identify its cached pool.
+pub fn create_client_pool_with_headers(
+    http_client_factory: HttpClientFactory,
+    route_class: ClientRouteClass,
+    headers: HeaderMap,
+) -> RouteAwareClientPool {
     RouteAwareClientPool::with_builder(
         http_client_factory,
         route_class,
-        default_http_client_builder(),
+        HttpClientBuilder::new()
+            .default_headers(headers)
+            .with_chatgpt_cloudflare_cookie_store(),
     )
 }
 
@@ -348,26 +359,45 @@ fn build_default_client(
 }
 
 /// Builds an HTTP client for an auth endpoint without Codex default headers.
+pub(crate) fn create_raw_auth_client_pool(
+    auth_route_config: &AuthRouteConfig,
+) -> RouteAwareClientPool {
+    RouteAwareClientPool::with_builder(
+        auth_route_config.http_client_factory().clone(),
+        ClientRouteClass::Auth,
+        HttpClientBuilder::new().without_request_logging(),
+    )
+}
+
+pub(crate) fn create_default_auth_client_pool(
+    auth_route_config: &AuthRouteConfig,
+) -> RouteAwareClientPool {
+    let pool = RouteAwareClientPool::with_builder(
+        auth_route_config.http_client_factory().clone(),
+        ClientRouteClass::Auth,
+        default_http_client_builder().without_request_logging(),
+    );
+    if is_sandboxed() {
+        pool.with_direct_routing()
+    } else {
+        pool
+    }
+}
+
+/// Builds a fixed client for an auth endpoint. Redirects are deliberately not followed;
+/// multi-request auth flows must use the route-aware pools above.
 pub(crate) fn create_raw_auth_client(
     endpoint: &str,
     auth_route_config: &AuthRouteConfig,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-    auth_route_config
-        .http_client_factory()
-        .build_client_without_request_logging(endpoint, ClientRouteClass::Auth)
-}
-
-/// Reads custom CA files and builds the transport away from the async runtime.
-pub(crate) async fn create_raw_auth_client_async(
-    endpoint: &str,
-    auth_route_config: &AuthRouteConfig,
-) -> std::io::Result<HttpClient> {
-    let endpoint = endpoint.to_owned();
-    let auth_route_config = auth_route_config.clone();
-    tokio::task::spawn_blocking(move || create_raw_auth_client(&endpoint, &auth_route_config))
-        .await
-        .map_err(std::io::Error::other)?
-        .map_err(Into::into)
+    HttpClientBuilder::new()
+        .without_request_logging()
+        .without_redirects()
+        .build_respecting_outbound_proxy_policy(
+            auth_route_config.http_client_factory(),
+            endpoint,
+            ClientRouteClass::Auth,
+        )
 }
 
 /// Builds the default Codex HTTP client wrapper for an auth endpoint.
@@ -393,7 +423,9 @@ pub(crate) async fn create_default_auth_client(
     };
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let builder = default_http_client_builder().without_request_logging();
+        let builder = default_http_client_builder()
+            .without_request_logging()
+            .without_redirects();
         if matches!(
             factory.outbound_proxy_policy(),
             OutboundProxyPolicy::ReqwestDefault

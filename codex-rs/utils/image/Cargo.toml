@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+flate2 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "png", "gif", "webp"] }
 codex-utils-cache = { workspace = true }
 mime_guess = { workspace = true }

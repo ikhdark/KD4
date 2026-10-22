@@ -81,6 +81,8 @@ class _Operation:
     cancelled: threading.Event
     proc: subprocess.Popen[str] | None
     router: MessageRouter
+    epoch: int = 0
+    generation_bound: bool = False
 
 
 @dataclass(slots=True)
@@ -124,6 +126,10 @@ def _params_dict(
         )
         if not isinstance(dumped, dict):
             raise TypeError("Expected model_dump() to return dict")
+        # Only this nullable setting has preserve/clear semantics. Other None
+        # defaults must remain omitted, including defaults supplied by wrappers.
+        if "service_tier" in params.model_fields_set and params.service_tier is None:
+            dumped["serviceTier"] = None
         return dumped
     if isinstance(params, dict):
         return params
@@ -262,6 +268,9 @@ class CodexClient:
     ) -> None:
         self.config = config or CodexConfig()
         self._approval_handler = approval_handler or self._default_approval_handler
+        # Permits survive transport restart and are released only when the real
+        # callback returns. A blocked old callback cannot mint replacement workers.
+        self._server_request_slots = threading.BoundedSemaphore(4)
         self._proc: subprocess.Popen[str] | None = None
         self._process_epoch = 0
         self._lifecycle_lock = threading.Lock()
@@ -279,6 +288,7 @@ class CodexClient:
         self._stderr_truncated = False
         self._stderr_thread: threading.Thread | None = None
         self._reader_thread: threading.Thread | None = None
+        self._exit_thread: threading.Thread | None = None
 
     def _new_router(self) -> MessageRouter:
         return MessageRouter(
@@ -299,12 +309,14 @@ class CodexClient:
             return
         if not control and not self._operation_slots.acquire(blocking=False):
             raise CodexError("in-flight operation limit exceeded")
-        operation = _Operation(
-            time.monotonic() + self.config.operation_timeout_s,
-            cancelled if cancelled is not None else threading.Event(),
-            self._proc,
-            self._router,
-        )
+        with self._lifecycle_lock:
+            operation = _Operation(
+                time.monotonic() + self.config.operation_timeout_s,
+                cancelled if cancelled is not None else threading.Event(),
+                self._proc,
+                self._router,
+                self._process_epoch,
+            )
         self._operation_local.current = operation
         try:
             yield operation
@@ -312,6 +324,22 @@ class CodexClient:
             del self._operation_local.current
             if not control:
                 self._operation_slots.release()
+
+    @contextmanager
+    def _cleanup_operation(self, origin: _Operation) -> Iterator[None]:
+        # Cleanup gets a fresh deadline, but never a replacement transport.
+        self._operation_local.current = _Operation(
+            time.monotonic() + self.config.operation_timeout_s,
+            threading.Event(),
+            origin.proc,
+            origin.router,
+            origin.epoch,
+            generation_bound=True,
+        )
+        try:
+            yield
+        finally:
+            del self._operation_local.current
 
     def _check_operation(self, operation: _Operation) -> float:
         remaining = operation.deadline - time.monotonic()
@@ -360,6 +388,7 @@ class CodexClient:
                     self._reader_thread,
                     self._stderr_thread,
                     self._writer_thread,
+                    self._exit_thread,
                 )
             ):
                 raise TransportClosedError("previous transport workers have not stopped")
@@ -412,21 +441,37 @@ class CodexClient:
             operation = getattr(self._operation_local, "current", None)
             if operation is not None and operation.proc is None:
                 operation.proc, operation.router = proc, router
+                operation.epoch = self._process_epoch
             self._start_stderr_drain_thread(proc)
             self._start_reader_thread(proc, router)
+            self._start_exit_observer(proc, router, self._reader_thread)
 
     def close(self) -> None:
         with self._lifecycle_lock:
+            operation = getattr(self._operation_local, "current", None)
+            if (
+                operation is not None
+                and operation.generation_bound
+                and (operation.proc is not self._proc or operation.epoch != self._process_epoch)
+            ):
+                return
             if self._proc is None or self._closing:
                 return
             self._closing = True
             proc, router = self._proc, self._router
             stopped, writes = self._stopped, self._writes
-            threads = (self._writer_thread, self._stderr_thread, self._reader_thread)
+            threads = (
+                self._writer_thread,
+                self._stderr_thread,
+                self._reader_thread,
+                self._exit_thread,
+            )
             stopped.set()
         deadline = time.monotonic() + self.config.shutdown_timeout_s
         try:
-            router.fail_all(TransportClosedError("Codex process was closed"), discard_completed=True)
+            router.fail_all(
+                TransportClosedError("Codex process was closed"), discard_completed=True
+            )
             # The writer owns stdin, including close/flush. Terminate first so a
             # full pipe cannot keep shutdown behind a blocked write or flush.
             while True:
@@ -461,7 +506,7 @@ class CodexClient:
                     self._proc = None
                 self._closing = False
 
-    def initialize(self) -> InitializeResponse:
+    def initialize(self, *, notification_opt_outs: tuple[str, ...] = ()) -> InitializeResponse:
         with self._operation():
             result = self.request(
                 "initialize",
@@ -473,6 +518,11 @@ class CodexClient:
                     },
                     "capabilities": {
                         "experimentalApi": self.config.experimental_api,
+                        **(
+                            {"optOutNotificationMethods": list(notification_opt_outs)}
+                            if notification_opt_outs
+                            else {}
+                        ),
                     },
                 },
                 response_model=InitializeResponse,
@@ -504,7 +554,9 @@ class CodexClient:
                 proc, router = self._proc, self._router
                 if proc is None or self._closing:
                     raise TransportClosedError("Codex process is not running")
-                if operation.proc is not None and operation.proc is not proc:
+                if (
+                    operation.proc is not None or operation.generation_bound
+                ) and operation.proc is not proc:
                     raise TransportClosedError("operation belongs to a previous transport")
                 operation.proc, operation.router = proc, router
                 request_id = str(uuid.uuid4())
@@ -556,11 +608,13 @@ class CodexClient:
     def register_turn_notifications(self, turn_id: str) -> None:
         """Start routing notifications for one turn into its dedicated queue."""
         operation = getattr(self._operation_local, "current", None)
-        self._router.register_turn(turn_id, deadline=operation.deadline if operation else None)
+        router = operation.router if operation is not None else self._router
+        router.register_turn(turn_id, deadline=operation.deadline if operation else None)
 
     def unregister_turn_notifications(self, turn_id: str) -> None:
         """Stop routing notifications for one turn into its dedicated queue."""
-        self._router.unregister_turn(turn_id)
+        operation = getattr(self._operation_local, "current", None)
+        (operation.router if operation is not None else self._router).unregister_turn(turn_id)
 
     def next_turn_notification(self, turn_id: str, timeout_s: float | None = None) -> Notification:
         """Return the next routed notification for the requested turn id."""
@@ -569,20 +623,19 @@ class CodexClient:
     def register_goal_operation(self, thread_id: str) -> _GoalOperationState:
         """Register a private thread-scoped route for a logical goal turn."""
         operation = getattr(self._operation_local, "current", None)
-        return self._router.register_goal(
-            thread_id, deadline=operation.deadline if operation else None
-        )
+        router = operation.router if operation is not None else self._router
+        return router.register_goal(thread_id, deadline=operation.deadline if operation else None)
 
     def reserve_goal_operation(self, thread_id: str) -> _GoalOperationState:
         """Reserve a private thread route before replacing its stored goal."""
         operation = getattr(self._operation_local, "current", None)
-        return self._router.reserve_goal(
-            thread_id, deadline=operation.deadline if operation else None
-        )
+        router = operation.router if operation is not None else self._router
+        return router.reserve_goal(thread_id, deadline=operation.deadline if operation else None)
 
     def unregister_goal_operation(self, state: _GoalOperationState) -> None:
         """Release routing state for one logical goal turn."""
-        self._router.unregister_goal(state)
+        operation = getattr(self._operation_local, "current", None)
+        (operation.router if operation is not None else self._router).unregister_goal(state)
 
     def next_goal_notification(
         self, state: _GoalOperationState, timeout_s: float | None = None
@@ -594,26 +647,36 @@ class CodexClient:
         self,
         params: V2LoginAccountParams | JsonObject,
     ) -> LoginAccountResponse:
-        with self._operation():
-            response = self.request(
-                "account/login/start",
-                _params_dict(params),
-                response_model=LoginAccountResponse,
-            )
-            response_root = response.root
-            if isinstance(
-                response_root,
-                ChatgptLoginAccountResponse | ChatgptDeviceCodeLoginAccountResponse,
-            ):
-                self.register_login_notifications(response_root.login_id)
-            return response
+        with self._operation() as operation:
+            router = operation.router
+            router.begin_login_start()
+            try:
+                response = self.request(
+                    "account/login/start",
+                    _params_dict(params),
+                    response_model=LoginAccountResponse,
+                )
+                response_root = response.root
+                if isinstance(
+                    response_root,
+                    ChatgptLoginAccountResponse | ChatgptDeviceCodeLoginAccountResponse,
+                ):
+                    router.register_login(response_root.login_id, deadline=operation.deadline)
+                return response
+            finally:
+                router.end_login_start()
 
     def account_login_cancel(self, login_id: str) -> CancelLoginAccountResponse:
-        return self.request(
-            "account/login/cancel",
-            {"loginId": login_id},
-            response_model=CancelLoginAccountResponse,
-        )
+        with self._operation() as operation:
+            router = operation.router
+            response = self.request(
+                "account/login/cancel",
+                {"loginId": login_id},
+                response_model=CancelLoginAccountResponse,
+            )
+            if response.status.value == "canceled":
+                router.retire_login(login_id)
+            return response
 
     def account_read(
         self,
@@ -813,7 +876,7 @@ class CodexClient:
     ) -> TurnStartResponse:
         """Start a turn and register its notification queue as early as possible."""
         with self._thread_start_lock(thread_id):
-            if self._router.has_goal(thread_id):
+            if self._operation_local.current.router.has_goal(thread_id):
                 raise InvalidRequestError(
                     -32600,
                     f"thread has an active goal operation: {thread_id}",
@@ -1025,6 +1088,44 @@ class CodexClient:
         )
         self._reader_thread.start()
 
+    def _start_exit_observer(
+        self,
+        proc: subprocess.Popen[str],
+        router: MessageRouter,
+        reader: threading.Thread | None,
+    ) -> None:
+        """Observe root exit independently of descendant-held buffered pipes.
+
+        Old I/O workers remain owned and prevent restart until they settle. Never
+        close a buffered pipe concurrently with its reader under the lifecycle lock.
+        """
+
+        def observe() -> None:
+            try:
+                code = proc.wait()
+                if reader is not None:
+                    reader.join(timeout=0.1)
+                with self._lifecycle_lock:
+                    if proc is not self._proc or router is not self._router or self._closing:
+                        return
+                    self._stopped.set()
+                incomplete = reader is not None and reader.is_alive()
+                suffix = (
+                    "; trailing output capture is incomplete; reader cleanup remains owned"
+                    if incomplete
+                    else ""
+                )
+                router.fail_all(
+                    TransportClosedError(f"Codex process exited with code {code}{suffix}")
+                )
+            except OSError as error:
+                router.fail_all(
+                    TransportClosedError(f"Codex process exit observation failed: {error}")
+                )
+
+        self._exit_thread = threading.Thread(target=observe, name="codex-exit", daemon=True)
+        self._exit_thread.start()
+
     def _reader_loop(
         self,
         proc: subprocess.Popen[str] | None = None,
@@ -1036,11 +1137,7 @@ class CodexClient:
             while True:
                 msg = self._read_message(proc)
                 if "method" in msg and "id" in msg:
-                    response = self._handle_server_request(msg)
-                    # The single reader has reserved control admission: an
-                    # approval reply must not be rejected by saturated RPC slots.
-                    with self._operation(control=True):
-                        self._write_message({"id": msg["id"], "result": response}, proc=proc)
+                    self._dispatch_server_request(msg, proc, active_router)
                     continue
                 if "method" in msg and "id" not in msg:
                     method = msg["method"]
@@ -1090,6 +1187,95 @@ class CodexClient:
                 start += 1
         rendered = tail[start:].decode("utf-8", errors="replace")
         return f"{_STDERR_TRUNCATION_MARKER}{rendered}" if truncated else rendered
+
+    def _dispatch_server_request(
+        self,
+        msg: dict[str, JsonValue],
+        proc: subprocess.Popen[str] | None,
+        router: MessageRouter,
+    ) -> None:
+        with self._lifecycle_lock:
+            epoch = self._process_epoch
+
+        def reply(payload: JsonObject) -> None:
+            # Never send an old approval onto a replacement transport. Recheck
+            # at the write owner as well, since restart can race this snapshot.
+            with self._operation(control=True) as operation:
+                with self._lifecycle_lock:
+                    if (
+                        proc is not self._proc
+                        or router is not self._router
+                        or epoch != self._process_epoch
+                        or self._closing
+                    ):
+                        return
+                    operation.proc, operation.router, operation.epoch = proc, router, epoch
+                    operation.generation_bound = True
+                    # The callback (e.g. a human approval) may outlive the
+                    # operation budget; its reply still gets a full write budget.
+                    operation.deadline = time.monotonic() + self.config.operation_timeout_s
+                self._write_message(payload, proc=proc)
+
+        if not self._server_request_slots.acquire(blocking=False):
+            reply(
+                {
+                    "id": msg["id"],
+                    "error": {
+                        "code": -32603,
+                        "message": "server-request callback capacity exhausted",
+                    },
+                }
+            )
+            return
+
+        def run() -> None:
+            try:
+                # Bind nested client operations for the entire callback, not
+                # just its final reply. Old callbacks cannot issue new RPCs on
+                # a replacement process after restart.
+                with self._operation(control=True) as operation:
+                    operation.proc, operation.router, operation.epoch = proc, router, epoch
+                    operation.generation_bound = True
+                    with self._lifecycle_lock:
+                        if (
+                            proc is not self._proc
+                            or router is not self._router
+                            or epoch != self._process_epoch
+                            or self._closing
+                        ):
+                            return
+                    try:
+                        response = self._handle_server_request(msg)
+                        if not isinstance(response, dict):
+                            raise TypeError("server-request callback must return a JSON object")
+                        # Reject malformed callback output before any bytes are
+                        # admitted to the transport, so an error reply is safe.
+                        encoded = json.dumps(response, allow_nan=False)
+                        if len(encoded.encode("utf-8")) + 128 > self.config.max_message_bytes:
+                            raise ValueError(
+                                "server-request callback response exceeds message limit"
+                            )
+                        payload = {"id": msg["id"], "result": response}
+                    except BaseException as error:
+                        payload = {
+                            "id": msg["id"],
+                            "error": {
+                                "code": -32603,
+                                "message": f"server-request callback failed: {error}"[:1024],
+                            },
+                        }
+                    reply(payload)
+            except BaseException as error:
+                if proc is not None:
+                    self._abort_transport(proc, router, error)
+            finally:
+                self._server_request_slots.release()
+
+        try:
+            threading.Thread(target=run, daemon=True, name="codex-server-request").start()
+        except BaseException:
+            self._server_request_slots.release()
+            raise
 
     def _handle_server_request(self, msg: dict[str, JsonValue]) -> JsonObject:
         method = msg["method"]
@@ -1151,7 +1337,9 @@ class CodexClient:
                     or self._stopped.is_set()
                 ):
                     raise TransportClosedError("Codex process is not running")
-                if operation.proc is not None and operation.proc is not target:
+                if (
+                    operation.proc is not None or operation.generation_bound
+                ) and operation.proc is not target:
                     raise TransportClosedError("operation belongs to a previous transport")
                 operation.proc, operation.router = target, self._router
                 self._check_operation_before_write(operation)

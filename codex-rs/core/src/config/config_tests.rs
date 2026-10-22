@@ -8002,6 +8002,25 @@ async fn model_catalog_json_rejects_empty_catalog() -> std::io::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn model_catalog_json_rejects_invalid_model_limits_with_path_and_field() -> std::io::Result<()>
+{
+    let home = TempDir::new()?;
+    let path = home.path().join("invalid-catalog.json");
+    let mut catalog = bundled_models_response()?;
+    catalog.models.truncate(1);
+    let slug = catalog.models[0].slug.clone();
+    catalog.models[0].context_window = Some(-100);
+    std::fs::write(&path, serde_json::to_vec(&catalog)?)?;
+    let error = super::load_catalog_json(&path.abs()).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    let message = error.to_string();
+    assert!(message.contains("invalid-catalog.json"));
+    assert!(message.contains(&slug));
+    assert!(message.contains("context_window"));
+    Ok(())
+}
+
 fn create_test_fixture() -> std::io::Result<PrecedenceTestFixture> {
     let toml = r#"
 model = "o3"

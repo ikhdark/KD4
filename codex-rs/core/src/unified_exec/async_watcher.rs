@@ -111,6 +111,7 @@ pub(crate) fn start_streaming_output(
         let emitted_deltas = OutputDeltaLimiter::default();
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
+        let mut finishing = false;
         let mut trailing_deadline = None;
         let output_closed_notification = output_closed_notify.notified();
         tokio::pin!(output_closed_notification);
@@ -146,7 +147,7 @@ pub(crate) fn start_streaming_output(
                             break;
                         }
 
-                    _ = exit_token.cancelled(), if grace_sleep.is_none() => {
+                    _ = exit_token.cancelled(), if grace_sleep.is_none() && !finishing => {
                         let now = Instant::now();
                         let hard_deadline = now + TRAILING_OUTPUT_GRACE;
                         trailing_deadline = Some(hard_deadline);
@@ -160,6 +161,8 @@ pub(crate) fn start_streaming_output(
                         }
                     }, if grace_sleep.is_some() => {
                         process_ref.finish_termination();
+                        finishing = true;
+                        grace_sleep = None;
                         drain_queued_output(
                             &mut receiver,
                             &mut pending,
@@ -169,7 +172,9 @@ pub(crate) fn start_streaming_output(
                             &turn_ref,
                             &emitted_deltas,
                         ).await;
-                        break;
+                        // finish releases the terminal but the native PTY
+                        // producer still owns a bounded EOF drain. Consume its
+                        // final chunks before publishing output-drained.
                     }
 
                     received = receiver.recv() => {
@@ -321,6 +326,7 @@ async fn emit_process_terminal_event(
     duration: Duration,
     source: &ToolCallSource,
     tracker: Option<&SharedTurnDiffTracker>,
+    execution_id: Option<&str>,
 ) -> Result<(), String> {
     let persistence_result = emit_exec_end_for_unified_exec(
         Arc::clone(session_ref),
@@ -340,6 +346,7 @@ async fn emit_process_terminal_event(
         duration,
         source.clone(),
         tracker.cloned(),
+        execution_id,
     )
     .await;
     if let Err(error) = &persistence_result {
@@ -409,7 +416,9 @@ pub(crate) fn spawn_exit_watcher(
             return;
         }
         let exit_observed_at = Instant::now();
-        let duration = exit_observed_at.saturating_duration_since(started_at);
+        let duration = process
+            .observed_lifetime()
+            .unwrap_or_else(|| exit_observed_at.saturating_duration_since(started_at));
         if let Some(validation_started_at) = validation_started_at {
             turn_ref
                 .turn_timing_state
@@ -417,17 +426,8 @@ pub(crate) fn spawn_exit_watcher(
                     exit_observed_at.saturating_duration_since(validation_started_at),
                 );
         }
-        if let Err(message) =
-            super::process_manager::finish_deferred_network_approval_after_process_exit_for_session(
-                Some(&session_ref),
-                network_approval,
-            )
-            .await
-        {
-            let _ = process.fail_and_terminate(message).await;
-        }
-        let failure_message = process.failure_message();
-        let exit_code = process.exit_code();
+        // Policy finalization can wait after exit. Keep both the lifecycle
+        // marker and its wait receipt at the observed exit, before that wait.
         if let Some(timing) = tool_dispatch_timing.as_ref() {
             timing.mark_exec_process_exited();
             timing.record_timer_wait(ToolLifecycleTimerWait {
@@ -445,6 +445,17 @@ pub(crate) fn spawn_exit_watcher(
                 .turn_timing_state
                 .record_background_tool_process_exit(&call_id, timing.snapshot(exit_observed_at));
         }
+        if let Err(message) =
+            super::process_manager::finish_deferred_network_approval_after_process_exit_for_session(
+                Some(&session_ref),
+                network_approval,
+            )
+            .await
+        {
+            let _ = process.fail_and_terminate(message).await;
+        }
+        let failure_message = process.failure_message();
+        let exit_code = process.exit_code();
         let completion = observe_process_exit(
             &exit_token,
             &session_ref.services.command_execution,
@@ -511,6 +522,7 @@ pub(crate) fn spawn_exit_watcher(
                 duration,
                 &source,
                 tracker.as_ref(),
+                Some(&parent_tool_execution_id.0),
             )
             .await;
             delivered_at = Some(Instant::now());
@@ -555,6 +567,7 @@ pub(crate) fn spawn_exit_watcher(
                 duration,
                 &source,
                 tracker.as_ref(),
+                Some(&parent_tool_execution_id.0),
             )
             .await;
             delivered_at = Some(Instant::now());
@@ -611,7 +624,9 @@ pub(crate) fn spawn_exit_watcher(
             turn_id = %turn_ref.sub_id,
             call_id,
             process_id,
-            terminal_event_delivered = true,
+            // Publication helpers do not acknowledge channel acceptance or
+            // client receipt. They do establish that emission was attempted.
+            terminal_event_emission_attempted = true,
             request_to_spawn_ms = lifecycle
                 .as_ref()
                 .and_then(|snapshot| snapshot.exec_request_to_spawn_ms)
@@ -622,7 +637,7 @@ pub(crate) fn spawn_exit_watcher(
                 .unwrap_or_else(|| u64::try_from(
                     exit_observed_at.saturating_duration_since(started_at).as_millis()
                 ).unwrap_or(u64::MAX)),
-            exit_to_delivery_ms = lifecycle
+            exit_to_emission_attempt_ms = lifecycle
                 .as_ref()
                 .and_then(|snapshot| snapshot.exec_exit_to_delivery_ms)
                 .unwrap_or_else(|| u64::try_from(
@@ -866,7 +881,14 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     duration: Duration,
     source: ToolCallSource,
     tracker: Option<SharedTurnDiffTracker>,
+    execution_id: Option<&str>,
 ) -> CodexResult<()> {
+    // Public command lifetime uses the same process-owned host observations for
+    // quick and background completion, not collection/drain/publication time.
+    // Without confirmed exit, retain the explicitly non-exited legacy interval.
+    let duration = process
+        .and_then(UnifiedExecProcess::observed_lifetime)
+        .unwrap_or(duration);
     let snapshot = match process {
         Some(process) => Some(process.snapshot_completion_output().await),
         None => None,
@@ -915,6 +937,24 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
                 _ => None,
             }),
     };
+    if let (Some(process_id), Some(parent), Some(process)) = (
+        process_id.as_deref().and_then(|id| id.parse::<u32>().ok()),
+        execution_id,
+        process,
+    ) {
+        session_ref
+            .services
+            .command_execution
+            .record_terminal_facts(
+                process_id,
+                parent,
+                process.session_capabilities(tty).incarnation,
+                exit_code,
+                metadata.failure_cause.as_deref(),
+                search_no_match,
+            )
+            .await;
+    }
     let (aggregated_output, stdout, stderr) = if let Some(output) = snapshot {
         (
             String::from_utf8_lossy(&output.aggregated_output).into_owned(),
@@ -957,23 +997,28 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     )
     .with_call_source(&source);
     event_ctx.observed_exit_code = Some(exit_code);
+    event_ctx.execution_id = execution_id;
     event_ctx.output_metadata = Some(&metadata);
-    ToolEmitter::unified_exec(
+    let mut emitter = ToolEmitter::unified_exec(
         &command,
         cwd,
         ExecCommandSource::UnifiedExecStartup,
         process_id,
         environment_id,
-    )
-    .emit(
-        event_ctx,
-        ToolEventStage::Success {
-            output,
-            applied_patch_delta: None,
-            formatted_output: Some(formatted_output),
-        },
-    )
-    .await
+    );
+    if let Some(environment) = process.and_then(|process| process.environment.get()) {
+        emitter = emitter.with_captured_environment(environment);
+    }
+    emitter
+        .emit(
+            event_ctx,
+            ToolEventStage::Success {
+                output,
+                applied_patch_delta: None,
+                formatted_output: Some(formatted_output),
+            },
+        )
+        .await
 }
 
 fn split_valid_utf8_prefix_with_max<'a>(

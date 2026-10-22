@@ -87,14 +87,19 @@ pub(super) fn tool_callback(
     let id = format!("tool-{}", state.next_tool_call_id);
     state.next_tool_call_id = state.next_tool_call_id.saturating_add(1);
     let event_tx = state.event_tx.clone();
-    state.pending_tool_calls.insert(id.clone(), (resolver, tool_name.clone()));
-    if event_tx.send(RuntimeEvent::ToolCall {
-        id: id.clone(),
-        name: tool_name,
-        kind: tool_kind,
-        input,
-        timeout_ms,
-    }).is_err() {
+    state
+        .pending_tool_calls
+        .insert(id.clone(), (resolver, tool_name.clone()));
+    if event_tx
+        .send(RuntimeEvent::ToolCall {
+            id: id.clone(),
+            name: tool_name,
+            kind: tool_kind,
+            input,
+            timeout_ms,
+        })
+        .is_err()
+    {
         state.pending_tool_calls.remove(&id);
         scope.terminate_execution();
     }
@@ -108,12 +113,22 @@ pub(super) fn format_tool_result_callback(
     args: v8::FunctionCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
-    let Some(name) = args.get(0).to_string(scope).map(|name| name.to_rust_string_lossy(scope)) else {
-        throw_type_error(scope, "format_tool_result requires an enabled tool name and a result");
+    let Some(name) = args
+        .get(0)
+        .to_string(scope)
+        .map(|name| name.to_rust_string_lossy(scope))
+    else {
+        throw_type_error(
+            scope,
+            "format_tool_result requires an enabled tool name and a result",
+        );
         return;
     };
     let tool = scope.get_slot::<RuntimeState>().and_then(|state| {
-        state.enabled_tools.index_of(&name).and_then(|index| state.enabled_tools.get(index))
+        state
+            .enabled_tools
+            .index_of(&name)
+            .and_then(|index| state.enabled_tools.get(index))
             .map(|tool| tool.tool_name.clone())
     });
     let Some(tool) = tool else {
@@ -132,7 +147,8 @@ pub(super) fn format_tool_result_callback(
         return;
     };
     if let Some(projected) = codex_code_mode_protocol::model_visible_tool_result(&tool, &raw)
-        && let Err(error) = super::output_projection::register(scope, value, &raw, &projected, false)
+        && let Err(error) =
+            super::output_projection::register(scope, value, &raw, &projected, false)
     {
         throw_type_error(scope, &error);
         return;
@@ -196,9 +212,7 @@ pub(super) fn console_log_callback(
         }
     }
     if let Some(state) = scope.get_slot::<RuntimeState>() {
-        state.emit_output(FunctionCallOutputContentItem::InputText {
-            text: output,
-        });
+        state.emit_output(FunctionCallOutputContentItem::InputText { text: output });
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -217,8 +231,14 @@ pub(super) fn image_callback(
         None
     } else {
         let detail = args.get(1);
-        if detail.is_string() {
-            Some(detail.to_rust_string_lossy(scope))
+        if let Ok(detail_text) = v8::Local::<v8::String>::try_from(detail) {
+            match super::value::bounded_string(scope, detail_text, 8) {
+                Ok(detail) => Some(detail),
+                Err(error) => {
+                    throw_type_error(scope, &error);
+                    return;
+                }
+            }
         } else if detail.is_null() || detail.is_undefined() {
             None
         } else {
@@ -246,6 +266,10 @@ pub(super) fn generated_image_callback(
     } else {
         args.get(0)
     };
+    let image_item = match normalize_output_image(scope, value, /*detail_override*/ None) {
+        Ok(image_item) => image_item,
+        Err(()) => return,
+    };
     let output_hint = match generated_image_output_hint(scope, value) {
         Ok(output_hint) => output_hint,
         Err(error_text) => {
@@ -253,23 +277,34 @@ pub(super) fn generated_image_callback(
             return;
         }
     };
-    let image_item = match normalize_output_image(scope, value, /*detail_override*/ None) {
-        Ok(image_item) => image_item,
-        Err(()) => return,
-    };
     if let Some(state) = scope.get_slot::<RuntimeState>() {
         state.emit_output(image_item);
-        if let Some(text) = output_hint {
+    }
+    if let Some(output_hint) = output_hint
+        && !skip_output_conversion(scope, output_hint.into())
+    {
+        let text = match super::value::bounded_string(
+            scope,
+            output_hint,
+            super::MAX_BUFFERED_OUTPUT_BYTES,
+        ) {
+            Ok(text) => text,
+            Err(error_text) => {
+                throw_type_error(scope, &error_text);
+                return;
+            }
+        };
+        if let Some(state) = scope.get_slot::<RuntimeState>() {
             state.emit_output(FunctionCallOutputContentItem::InputText { text });
         }
     }
     retval.set(v8::undefined(scope).into());
 }
 
-fn generated_image_output_hint(
-    scope: &mut v8::PinScope<'_, '_>,
+fn generated_image_output_hint<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'_, v8::Value>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<v8::Local<'s, v8::String>>, String> {
     let object = v8::Local::<v8::Object>::try_from(value)
         .map_err(|_| "generatedImage expects an image generation result object".to_string())?;
     let key = v8::String::new(scope, "output_hint")
@@ -280,10 +315,17 @@ fn generated_image_output_hint(
     if output_hint.is_undefined() {
         return Ok(None);
     }
-    if !output_hint.is_string() {
-        return Err("generatedImage output_hint must be a string when provided".to_string());
+    let output_hint = v8::Local::<v8::String>::try_from(output_hint)
+        .map_err(|_| "generatedImage output_hint must be a string when provided".to_string())?;
+    if output_hint.utf8_length(scope) > super::MAX_BUFFERED_OUTPUT_BYTES {
+        return Err(format!(
+            "payload exceeds its limit of {} bytes",
+            super::MAX_BUFFERED_OUTPUT_BYTES,
+        ));
     }
-    Ok(Some(output_hint.to_rust_string_lossy(scope)))
+    // Validate once, but keep the V8 handle until the image is charged. The
+    // text admission guard can then reject a hint without copying its payload.
+    Ok(Some(output_hint))
 }
 
 pub(super) fn store_callback(
@@ -292,7 +334,8 @@ pub(super) fn store_callback(
     _retval: v8::ReturnValue<v8::Value>,
 ) {
     let key = match args.get(0).to_string(scope) {
-        Some(key) => match super::value::bounded_string(scope, key, MAX_SESSION_STORED_VALUE_BYTES) {
+        Some(key) => match super::value::bounded_string(scope, key, MAX_SESSION_STORED_VALUE_BYTES)
+        {
             Ok(key) => key,
             Err(_) => {
                 reject_storage_limit(scope);
@@ -306,13 +349,23 @@ pub(super) fn store_callback(
     };
     let admission = scope.get_slot::<RuntimeState>().and_then(|state| {
         if (!state.stored_value_writes.contains_key(&key)
-                && state.stored_value_writes.len() >= 2 * MAX_SESSION_STORED_VALUES)
-            || (!state.stored_values.contains_key(&key) && state.stored_values.len() >= MAX_SESSION_STORED_VALUES) {
+            && state.stored_value_writes.len() >= 2 * MAX_SESSION_STORED_VALUES)
+            || (!state.stored_values.contains_key(&key)
+                && state.stored_values.len() >= MAX_SESSION_STORED_VALUES)
+        {
             return None;
         }
         let key_bytes = stored_value_entry_bytes(&key, &serde_json::Value::Null).saturating_sub(4);
-        MAX_SESSION_STORED_VALUE_BYTES.checked_sub(state.total_stored_value_bytes)
-            .and_then(|available| available.checked_add(state.stored_values.get(&key).map_or(0, |stored| stored.bytes)))
+        MAX_SESSION_STORED_VALUE_BYTES
+            .checked_sub(state.total_stored_value_bytes)
+            .and_then(|available| {
+                available.checked_add(
+                    state
+                        .stored_values
+                        .get(&key)
+                        .map_or(0, |stored| stored.bytes),
+                )
+            })
             .and_then(|available| available.checked_sub(key_bytes))
     });
     let Some(max_bytes) = admission else {
@@ -344,11 +397,15 @@ pub(super) fn store_callback(
         let mut stored = plain.clone().with_presentation(presentation);
         let previous_bytes = state.stored_values.get(&key).map(|previous| previous.bytes);
         let remaining = MAX_SESSION_STORED_VALUE_BYTES.saturating_sub(
-            state.total_stored_value_bytes.saturating_sub(previous_bytes.unwrap_or(0)),
+            state
+                .total_stored_value_bytes
+                .saturating_sub(previous_bytes.unwrap_or(0)),
         );
         // Presentation is optional; never reject an otherwise admissible value
         // merely because its display recipe would exceed the existing limit.
-        if stored.bytes > remaining { stored = plain; }
+        if stored.bytes > remaining {
+            stored = plain;
+        }
         let total_bytes = state
             .total_stored_value_bytes
             .checked_sub(previous_bytes.unwrap_or(0))
@@ -414,13 +471,17 @@ pub(super) fn load_callback(
         return;
     };
     let presentation = value.presentation.clone();
-    let Some(value) = value.serialized.as_deref()
-        .and_then(|json| super::value::serialized_json_to_v8(scope, json.get())) else {
+    let Some(value) = value
+        .serialized
+        .as_deref()
+        .and_then(|json| super::value::serialized_json_to_v8(scope, json.get()))
+    else {
         throw_type_error(scope, "failed to load stored value");
         return;
     };
     if let Some(presentation) = presentation
-        && super::output_projection::restore_stored_presentation(scope, value, &presentation).is_none()
+        && super::output_projection::restore_stored_presentation(scope, value, &presentation)
+            .is_none()
     {
         throw_type_error(scope, "failed to restore stored presentation");
         return;
@@ -437,17 +498,28 @@ pub(super) fn delete_stored_callback(
         throw_type_error(scope, "deleteStored key must be a string");
         return;
     }
-    let Some(key) = args.get(0).to_string(scope) else { return };
+    let Some(key) = args.get(0).to_string(scope) else {
+        return;
+    };
     let key = match super::value::bounded_string(scope, key, MAX_SESSION_STORED_VALUE_BYTES) {
         Ok(key) => key,
-        Err(_) => { reject_storage_limit(scope); return; }
+        Err(_) => {
+            reject_storage_limit(scope);
+            return;
+        }
     };
-    let Some(state) = scope.get_slot_mut::<RuntimeState>() else { return };
+    let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
+        return;
+    };
     // Bound transaction metadata, including deletion of absent keys.
     let deletion = StoredValue::deletion(&key);
-    let deletion_bytes = state.stored_value_writes.iter()
+    let deletion_bytes = state
+        .stored_value_writes
+        .iter()
         .filter(|(existing, value)| *existing != &key && value.deleted)
-        .fold(deletion.bytes, |total, (_, value)| total.saturating_add(value.bytes));
+        .fold(deletion.bytes, |total, (_, value)| {
+            total.saturating_add(value.bytes)
+        });
     if deletion_bytes > MAX_SESSION_STORED_VALUE_BYTES
         || (!state.stored_value_writes.contains_key(&key)
             && state.stored_value_writes.len() >= 2 * MAX_SESSION_STORED_VALUES)
@@ -473,34 +545,62 @@ pub(super) fn list_keys_callback(
     } else {
         match super::value::v8_value_to_json(scope, args.get(0)) {
             Ok(Some(value)) if value.is_object() => value,
-            _ => { throw_type_error(scope, "listKeys options must be {after?: string, limit?: number}"); return; }
+            _ => {
+                throw_type_error(
+                    scope,
+                    "listKeys options must be {after?: string, limit?: number}",
+                );
+                return;
+            }
         }
     };
     let after = options.get("after").and_then(serde_json::Value::as_str);
-    let limit = options.get("limit").map_or(Some(DEFAULT_LIST_KEYS_LIMIT), serde_json::Value::as_u64);
+    let limit = options
+        .get("limit")
+        .map_or(Some(DEFAULT_LIST_KEYS_LIMIT), serde_json::Value::as_u64);
     // A page larger than the ceiling is clamped, not rejected: the result
     // carries `next_after`, so the caller still reaches every key, and the
     // sibling `max_output_tokens` ceiling in the same contract clamps too.
     // Rejecting instead aborted the whole cell, discarding unrelated work
     // batched after the call. Zero and non-integers remain type errors: no page
     // size satisfies them, so clamping would answer a different question.
-    let Some(limit) = limit.filter(|limit| *limit > 0).map(|limit| limit.min(MAX_LIST_KEYS_LIMIT)) else {
-        throw_type_error(scope, &format!("listKeys limit must be a positive integer; it is capped at {MAX_LIST_KEYS_LIMIT}")); return;
+    let Some(limit) = limit
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(MAX_LIST_KEYS_LIMIT))
+    else {
+        throw_type_error(
+            scope,
+            &format!(
+                "listKeys limit must be a positive integer; it is capped at {MAX_LIST_KEYS_LIMIT}"
+            ),
+        );
+        return;
     };
     if options.get("after").is_some() && after.is_none() {
-        throw_type_error(scope, "listKeys after must be a string"); return;
+        throw_type_error(scope, "listKeys after must be a string");
+        return;
     }
-    let Some(state) = scope.get_slot_mut::<RuntimeState>() else { return };
+    let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
+        return;
+    };
     // Enumeration observes absence too; reject phantom writes on commit.
     state.stored_value_reads = None;
-    let mut keys = state.stored_values.keys().filter(|key| after.is_none_or(|after| key.as_str() > after)).cloned().collect::<Vec<_>>();
+    let mut keys = state
+        .stored_values
+        .keys()
+        .filter(|key| after.is_none_or(|after| key.as_str() > after))
+        .cloned()
+        .collect::<Vec<_>>();
     keys.sort();
     let more = keys.len() > limit as usize;
     keys.truncate(limit as usize);
     // Use admission's cached byte counts, including display recipes. Recovery
     // must not deserialize every retained result just to discover its cost.
     // Align sizes with keys instead of duplicating potentially large key text.
-    let entry_bytes = keys.iter().map(|key| state.stored_values[key].bytes).collect::<Vec<_>>();
+    let entry_bytes = keys
+        .iter()
+        .map(|key| state.stored_values[key].bytes)
+        .collect::<Vec<_>>();
     let result = serde_json::json!({
         "next_after": if more { keys.last().cloned() } else { None }, "keys": keys,
         "entry_bytes": entry_bytes,
@@ -525,7 +625,11 @@ pub(super) fn notify_callback(
     } else {
         args.get(0)
     };
-    let text = match super::value::serialize_output_text_with_limit(scope, value, super::value::MAX_NOTIFICATION_BYTES) {
+    let text = match super::value::serialize_output_text_with_limit(
+        scope,
+        value,
+        super::value::MAX_NOTIFICATION_BYTES,
+    ) {
         Ok(text) => text,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
@@ -556,21 +660,34 @@ pub(super) fn notify_callback(
     let id = format!("notify-{}", state.next_notification_id);
     state.next_notification_id = state.next_notification_id.saturating_add(1);
     state.pending_notifications.insert(id.clone(), resolver);
-    if state.event_tx.send(RuntimeEvent::Notify {
-        id: Some(id.clone()),
-        call_id: state.tool_call_id.clone(),
-        text,
-    }).is_err() {
+    if state
+        .event_tx
+        .send(RuntimeEvent::Notify {
+            id: Some(id.clone()),
+            call_id: state.tool_call_id.clone(),
+            text,
+        })
+        .is_err()
+    {
         state.pending_notifications.remove(&id);
         scope.terminate_execution();
     }
     retval.set(promise.into());
 }
 
-fn skip_output_conversion(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> bool {
-    let bytes = v8::Local::<v8::String>::try_from(value).map(|value| value.utf8_length(scope)).unwrap_or(0);
-    let Some(state) = scope.get_slot::<RuntimeState>() else { return false; };
-    let Some(event) = state.output_admission.reject_before_conversion(bytes) else { return false; };
+fn skip_output_conversion(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> bool {
+    let bytes = v8::Local::<v8::String>::try_from(value)
+        .map(|value| value.utf8_length(scope))
+        .unwrap_or(0);
+    let Some(state) = scope.get_slot::<RuntimeState>() else {
+        return false;
+    };
+    let Some(event) = state.output_admission.reject_before_conversion(bytes) else {
+        return false;
+    };
     if let Some(event) = event {
         let _ = state.event_tx.send(event);
     }
@@ -581,11 +698,17 @@ fn reject_unavailable_callback(
     scope: &mut v8::PinScope<'_, '_>,
     retval: &mut v8::ReturnValue<v8::Value>,
 ) -> bool {
-    if scope.get_slot::<RuntimeState>().is_some_and(|state| state.event_tx.is_closed()) {
+    if scope
+        .get_slot::<RuntimeState>()
+        .is_some_and(|state| state.event_tx.is_closed())
+    {
         scope.terminate_execution();
         return true;
     }
-    if scope.get_slot::<RuntimeState>().is_some_and(|state| !state.can_admit_callback()) {
+    if scope
+        .get_slot::<RuntimeState>()
+        .is_some_and(|state| !state.can_admit_callback())
+    {
         if let Some(resolver) = v8::PromiseResolver::new(scope) {
             let promise = resolver.get_promise(scope);
             reject_callback_limit(scope, resolver, promise, retval);
@@ -632,9 +755,9 @@ fn tool_timeout_ms(
                 return 0;
             }
             let tool = state.enabled_tools.get(tool_index);
-            if tool.is_some_and(|tool| tool.tool_name.namespace.is_none()
-                && tool.tool_name.name == "shell_command")
-                && let Some(timeout_ms) = input.and_then(|input| input["timeout_ms"].as_u64())
+            if tool.is_some_and(|tool| {
+                tool.tool_name.namespace.is_none() && tool.tool_name.name == "shell_command"
+            }) && let Some(timeout_ms) = input.and_then(|input| input["timeout_ms"].as_u64())
             {
                 return codex_code_mode_protocol::tool_owned_timeout_with_grace(timeout_ms);
             }
@@ -645,7 +768,11 @@ fn tool_timeout_ms(
                 .unwrap_or(state.default_tool_timeout_ms);
             // Zero is a host-owned policy (never a valid explicit option): the
             // invoked tool owns a longer deadline than the wrapper can express.
-            if timeout == 0 { 0 } else { timeout.clamp(1, MAX_TOOL_TIMEOUT_MS) }
+            if timeout == 0 {
+                0
+            } else {
+                timeout.clamp(1, MAX_TOOL_TIMEOUT_MS)
+            }
         })
         .ok_or_else(|| "runtime state unavailable".to_string())?;
     if args.length() < 2 || args.get(1).is_undefined() {
@@ -682,7 +809,8 @@ pub(super) fn set_timeout_callback(
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
     let timeout_id = match timers::schedule_timeout(scope, args) {
-        Ok(timeout_id) => timeout_id,
+        Ok(Some(timeout_id)) => timeout_id,
+        Ok(None) => return,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
             return;

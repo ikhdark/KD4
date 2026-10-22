@@ -7,6 +7,34 @@ use tokio::io::AsyncWriteExt;
 use super::*;
 
 #[tokio::test]
+async fn pinned_socket_generation_cannot_be_replaced_or_delete_a_sentinel() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("socket");
+    let sentinel = dir.path().join("sentinel");
+    std::fs::write(&sentinel, b"keep me").unwrap();
+    let listener = UnixListener::bind(&path).await.unwrap();
+    drop(listener);
+    let endpoint = SocketFile::open(&path).unwrap();
+    assert!(
+        std::fs::remove_file(&path).is_err(),
+        "pinned generation must exclude pathname deletion"
+    );
+    assert!(
+        std::fs::rename(&sentinel, &path).is_err(),
+        "replacement must fail while inspection owns the endpoint"
+    );
+    endpoint.remove().unwrap();
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    std::fs::rename(&sentinel, &path).unwrap();
+    assert_eq!(
+        SocketFile::open(&path).err().unwrap().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+}
+
+#[tokio::test]
 async fn prepare_private_socket_directory_creates_directory() {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let socket_dir = temp_dir.path().join("app-server-control");
@@ -50,7 +78,11 @@ async fn links_to_socket_paths_are_not_stale_socket_paths() {
         .expect("bind socket");
     std::os::windows::fs::symlink_file(&socket_path, &link_path).expect("link to socket");
 
-    assert!(is_stale_socket_path(&socket_path).await.expect("socket path check"));
+    assert!(
+        is_stale_socket_path(&socket_path)
+            .await
+            .expect("socket path check")
+    );
     assert!(
         !is_stale_socket_path(&link_path)
             .await

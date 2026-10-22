@@ -66,6 +66,7 @@ pub struct SkillPackageId(pub String);
 pub struct SkillResourceId {
     id: String,
     environment_path: Option<EnvironmentSkillResource>,
+    bound_root: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
 }
 
 impl SkillResourceId {
@@ -73,6 +74,7 @@ impl SkillResourceId {
         Self {
             id: id.into(),
             environment_path: None,
+            bound_root: None,
         }
     }
 
@@ -87,11 +89,24 @@ impl SkillResourceId {
                 environment_id: environment_id.into(),
                 path,
             }),
+            bound_root: None,
         }
     }
 
     pub fn as_str(&self) -> &str {
         &self.id
+    }
+
+    pub(crate) fn with_bound_root(
+        mut self,
+        root: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
+    ) -> Self {
+        self.bound_root = root;
+        self
+    }
+
+    pub(crate) fn bound_root(&self) -> Option<&codex_exec_server::ResolvedSelectedCapabilityRoot> {
+        self.bound_root.as_ref()
     }
 
     pub(crate) fn environment_path(&self) -> Option<(&str, &PathUri)> {

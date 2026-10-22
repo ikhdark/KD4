@@ -35,6 +35,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use crate::thread_state::ConnectionCapabilities;
 use crate::transport::CHANNEL_CAPACITY;
+use crate::transport::ConnectionOrigin;
 use crate::transport::ConnectionState;
 use crate::transport::OutboundConnectionState;
 use crate::transport::RemoteControlPolicy;
@@ -185,7 +186,8 @@ async fn finish_startup_config_loaders(
 ) -> Arc<AuthManager> {
     if let Some((previous, auth_manager)) = bootstrap
         && AuthConfig::from_config(&previous) == AuthConfig::from_config(config)
-        && previous.experimental_thread_config_endpoint == config.experimental_thread_config_endpoint
+        && previous.experimental_thread_config_endpoint
+            == config.experimental_thread_config_endpoint
     {
         // The managed-config pass already consumed these loaders. Keep its completed
         // bundle and auth owner rather than reloading credentials and spawning another
@@ -283,6 +285,23 @@ async fn shutdown_signal() -> IoResult<ShutdownSignal> {
     tokio::signal::ctrl_c()
         .await
         .map(|_| ShutdownSignal::Forceable)
+}
+
+async fn startup_shutdown_signal(signal: impl std::future::Future<Output = IoResult<()>>) {
+    if let Err(error) = signal.await {
+        tracing::warn!(%error, "startup shutdown signal listener failed; continuing admission without it");
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn startup_signal_failure_does_not_cancel_admission() {
+    let failed =
+        startup_shutdown_signal(async { Err(std::io::Error::other("listener unavailable")) });
+    tokio::pin!(failed);
+    assert!(futures::poll!(failed).is_pending());
+    startup_shutdown_signal(async { Ok(()) }).await;
 }
 
 impl ShutdownState {
@@ -547,7 +566,7 @@ pub async fn run_main(
         test_user_config_file_from_env(),
     )?;
     let (transport_event_tx, mut transport_event_rx) =
-        mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
+        mpsc::channel::<TransportEvent>(codex_app_server_transport::INGRESS_CAPACITY);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(CHANNEL_CAPACITY);
     let (outbound_control_tx, mut outbound_control_rx) =
         mpsc::channel::<OutboundControlEvent>(CHANNEL_CAPACITY);
@@ -592,14 +611,14 @@ pub async fn run_main(
             None
         }
     };
-    let (config, auth_manager) = match config_manager
+    let (config, auth_manager, config_resolved) = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
         Ok(config) => {
             let auth_manager =
                 finish_startup_config_loaders(&config_manager, &config, bootstrap).await;
-            (config, auth_manager)
+            (config, auth_manager, true)
         }
         Err(err) => {
             if strict_config {
@@ -617,18 +636,20 @@ pub async fn run_main(
             })?;
             let auth_manager =
                 install_config_loaders_from_config(&config_manager, &default_config).await;
-            (default_config, auth_manager)
+            (default_config, auth_manager, false)
         }
     };
 
     set_default_client_residency_requirement(config.enforce_residency.value());
 
-    let remote_control_policy = if config
-        .config_layer_stack
-        .requirements()
-        .allow_remote_control
-        .as_ref()
-        .is_some_and(|requirement| !requirement.value)
+    // Defaults support configuration repair, not permission to bypass unresolved policy.
+    let remote_control_policy = if !config_resolved
+        || config
+            .config_layer_stack
+            .requirements()
+            .allow_remote_control
+            .as_ref()
+            .is_some_and(|requirement| !requirement.value)
     {
         RemoteControlPolicy::DisabledByRequirements
     } else {
@@ -679,10 +700,25 @@ pub async fn run_main(
     })?;
     codex_core::otel_init::record_process_start(otel.as_ref(), OTEL_SERVICE_NAME);
     codex_core::otel_init::install_sqlite_telemetry(otel.as_ref(), OTEL_SERVICE_NAME);
+    // Admission shares one budget, with signal supervision already active while
+    // waiting. Dropping any wait releases its guards; no native lock wait survives.
+    let startup_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let startup_signal = async {
+        if runtime_options.install_shutdown_signal_handler {
+            startup_shutdown_signal(tokio::signal::ctrl_c()).await
+        } else {
+            std::future::pending::<()>().await
+        }
+    };
+    tokio::pin!(startup_signal);
     let unix_socket_startup_lock = match &transport {
         AppServerTransport::UnixSocket { socket_path } => {
             let startup_lock_path = app_server_startup_lock_path(&codex_home)?;
-            let startup_lock = acquire_app_server_startup_lock(startup_lock_path).await?;
+            let startup_lock = tokio::select! {
+                result = tokio::time::timeout_at(startup_deadline, acquire_app_server_startup_lock(startup_lock_path)) =>
+                    result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server startup admission timed out"))??,
+                _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
+            };
             prepare_control_socket_path(socket_path.as_path()).await?;
             Some(startup_lock)
         }
@@ -761,7 +797,11 @@ pub async fn run_main(
     for warning in &config_warnings {
         emit_startup_warning(warning);
     }
-    let installation_id = resolve_installation_id(&config.codex_home).await?;
+    let installation_id = tokio::select! {
+        result = tokio::time::timeout_at(startup_deadline, resolve_installation_id(&config.codex_home)) =>
+            result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server identity admission timed out"))??,
+        _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
+    };
     let transport_shutdown_token = CancellationToken::new();
     let force_shutdown_token = CancellationToken::new();
     let (shutdown_observation_tx, shutdown_observation_rx) =
@@ -786,12 +826,16 @@ pub async fn run_main(
             .await?;
         }
         AppServerTransport::UnixSocket { socket_path } => {
-            let accept_handle = start_control_socket_acceptor(
+            let accept = start_control_socket_acceptor(
                 socket_path.clone(),
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
-            )
-            .await?;
+            );
+            let accept_handle = tokio::select! {
+                result = tokio::time::timeout_at(startup_deadline, accept) =>
+                    result.map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "app-server endpoint admission timed out"))??,
+                _ = &mut startup_signal => return Err(std::io::Error::new(ErrorKind::Interrupted, "app-server startup cancelled")),
+            };
             transport_accept_handles.push(accept_handle);
         }
         AppServerTransport::WebSocket { bind_address } => {
@@ -876,7 +920,18 @@ pub async fn run_main(
             ));
         }
     }
+    config_manager.bind_remote_control_handle(remote_control_handle.clone());
     transport_accept_handles.push(remote_control_accept_handle);
+    transport_accept_handles.push(tokio::spawn(
+        config_manager
+            .clone()
+            .recheck_requirements_after_identity_completion(
+                Arc::clone(&auth_manager),
+                config.chatgpt_base_url.clone(),
+                config.http_client_factory(),
+                transport_shutdown_token.clone(),
+            ),
+    ));
 
     let outbound_handle = tokio::spawn(async move {
         let mut outbound_connections = HashMap::<ConnectionId, OutboundConnectionState>::new();
@@ -955,6 +1010,9 @@ pub async fn run_main(
             .subscribe_running_turn_count();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
+        // Initialization watchdogs share `connection_cleanup_tasks`; release them
+        // when the loop exits so shutdown cleanup does not wait out their timer.
+        let init_watchdog_shutdown = CancellationToken::new();
         let mut remote_control_status_rx = remote_control_handle.status_receiver();
         let mut remote_control_status = remote_control_status_rx.borrow().clone();
         let transport_shutdown_token = transport_shutdown_token.clone();
@@ -974,7 +1032,6 @@ pub async fn run_main(
                     shutdown_state.update(running_turn_count, connections.len()),
                     ShutdownAction::Finish
                 ) {
-                    transport_shutdown_token.cancel();
                     break "shutdown_requested";
                 }
 
@@ -1019,6 +1076,22 @@ pub async fn run_main(
                                     disconnect_sender.clone(),
                                     transport_shutdown_token.clone(),
                                 );
+                                if matches!(origin, ConnectionOrigin::WebSocket)
+                                    && let Some(disconnect) = disconnect_sender.as_ref()
+                                {
+                                    let disconnect = disconnect.clone();
+                                    let initialized = Arc::clone(&connection.outbound_initialized);
+                                    let watchdog_shutdown = init_watchdog_shutdown.clone();
+                                    connection_cleanup_tasks.spawn(async move {
+                                        tokio::select! {
+                                            _ = disconnect.cancelled() => {},
+                                            _ = watchdog_shutdown.cancelled() => {},
+                                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                                                if !initialized.load(std::sync::atomic::Ordering::Acquire) { disconnect.cancel(); }
+                                            }
+                                        }
+                                    });
+                                }
                                 initialize_notification_sender
                                     .connection_opened_with_runtime(
                                         connection_id,
@@ -1189,15 +1262,11 @@ pub async fn run_main(
                 }
             };
 
+            init_watchdog_shutdown.cancel();
             let disconnect_all = shutdown_state.requested();
             shutdown_state
                 .finish_cleanup(
                     async {
-                        if disconnect_all {
-                            let _ = outbound_control_tx
-                                .send(OutboundControlEvent::DisconnectAll)
-                                .await;
-                        }
                         processor.account_processor.cancel_active_login().await;
                         futures::future::join_all(
                             connections.values().map(|connection_state| {
@@ -1208,6 +1277,14 @@ pub async fn run_main(
                         connection_cleanup_tasks.drain().await;
                         processor.drain_background_tasks().await;
                         processor.thread_processor.shutdown_threads().await;
+                        processor.thread_processor.wait_for_background_tasks().await;
+                        processor.finish_shutdown_delivery().await;
+                        if disconnect_all {
+                            let _ = outbound_control_tx
+                                .send(OutboundControlEvent::DisconnectAll)
+                                .await;
+                            transport_shutdown_token.cancel();
+                        }
                     },
                     async {
                         if graceful_signal_restart_enabled {

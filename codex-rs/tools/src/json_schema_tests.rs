@@ -7,20 +7,32 @@ use super::parse_tool_input_schema_without_compaction;
 
 #[test]
 fn schema_guidance_preserves_utf8_and_escapes() {
-    let guidance = format!("{}Use milliseconds, not seconds. 界\n\t\\", "x".repeat(5_500));
+    let guidance = format!(
+        "{}Use milliseconds, not seconds. 界\n\t\\",
+        "x".repeat(5_500)
+    );
     let schema = parse_tool_input_schema(&serde_json::json!({
         "type": "object", "description": guidance,
         "properties": {"quoted\"field": {"type": "string", "description": guidance}}
-    })).unwrap();
+    }))
+    .unwrap();
     assert_eq!(schema.description.as_ref(), Some(&guidance));
-    assert_eq!(schema.properties.unwrap()["quoted\"field"].description.as_ref(), Some(&guidance));
+    assert_eq!(
+        schema.properties.unwrap()["quoted\"field"]
+            .description
+            .as_ref(),
+        Some(&guidance)
+    );
 }
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 
 #[test]
 fn ingestion_preserves_schema_contracts_through_rendering() {
-    let guidance = format!("{}Tail restriction: values are milliseconds; never retry mutations blindly.", "guide ".repeat(1000));
+    let guidance = format!(
+        "{}Tail restriction: values are milliseconds; never retry mutations blindly.",
+        "guide ".repeat(1000)
+    );
     let input = serde_json::json!({
         "$schema":"https://json-schema.org/draft/2020-12/schema", "$id":"https://example.test/tool",
         "type":"object", "description":guidance,
@@ -34,11 +46,20 @@ fn ingestion_preserves_schema_contracts_through_rendering() {
             "resource":{"$id":"child", "$ref":"#/$defs/n"}
         }, "$defs":{"n":{"type":"number"}}
     });
-    let dynamic = crate::parse_dynamic_tool(&codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
-        name:"contract".into(), description:"contract".into(), input_schema:input.clone(), defer_loading:true,
-    }).unwrap();
-    let mcp = crate::parse_mcp_tool(&rmcp::model::Tool::new("contract", "contract",
-        std::sync::Arc::new(rmcp::model::object(input.clone())))).unwrap();
+    let dynamic =
+        crate::parse_dynamic_tool(&codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
+            name: "contract".into(),
+            description: "contract".into(),
+            input_schema: input.clone(),
+            defer_loading: true,
+        })
+        .unwrap();
+    let mcp = crate::parse_mcp_tool(&rmcp::model::Tool::new(
+        "contract",
+        "contract",
+        std::sync::Arc::new(rmcp::model::object(input.clone())),
+    ))
+    .unwrap();
     for tool in [dynamic, mcp] {
         let lowered = serde_json::to_value(tool.input_schema).unwrap();
         assert_eq!(lowered, input);
@@ -46,7 +67,9 @@ fn ingestion_preserves_schema_contracts_through_rendering() {
         assert!(rendered.contains("format: \"date-time\""));
         assert!(rendered.contains("format: \"uri\""));
         assert!(rendered.contains("when?: string"));
-        assert!(rendered.contains("default annotation: null; not automatically applied on omission"));
+        assert!(
+            rendered.contains("default annotation: null; not automatically applied on omission")
+        );
         assert!(rendered.contains("minimum (numbers only): 2"));
         assert!(rendered.contains("(number /* minimum: 2 */) & (number)"));
         assert!(rendered.contains("nested $id resource not projected"));
@@ -57,7 +80,8 @@ fn ingestion_preserves_schema_contracts_through_rendering() {
 #[test]
 fn untyped_nested_constraints_preserve_all_instance_types() {
     for constraint in [
-        serde_json::json!({"minimum":2}), serde_json::json!({"items":{"type":"string"}}),
+        serde_json::json!({"minimum":2}),
+        serde_json::json!({"items":{"type":"string"}}),
         serde_json::json!({"properties":{"x":{"type":"string"}}}),
     ] {
         let input = serde_json::json!({"type":"object", "properties":{"value":constraint}});
@@ -66,12 +90,17 @@ fn untyped_nested_constraints_preserve_all_instance_types() {
         // arrays and objects without introducing a second schema validator.
         assert_eq!(lowered, input);
     }
-    for dialect in ["http://json-schema.org/draft-07/schema#", "https://json-schema.org/draft/2020-12/schema"] {
+    for dialect in [
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft/2020-12/schema",
+    ] {
         let input = serde_json::json!({"$schema":dialect, "$defs":{"n":{"type":"number"}},
             "$ref":"#/$defs/n", "type":"number", "minimum":2});
         let lowered = serde_json::to_value(parse_tool_input_schema(&input).unwrap()).unwrap();
-        assert_eq!(codex_code_mode::render_json_schema_to_typescript(&lowered),
-            codex_code_mode::render_json_schema_to_typescript(&input));
+        assert_eq!(
+            codex_code_mode::render_json_schema_to_typescript(&lowered),
+            codex_code_mode::render_json_schema_to_typescript(&input)
+        );
     }
 }
 
@@ -408,7 +437,10 @@ fn parse_tool_input_schema_preserves_nested_empty_schema() {
             BTreeMap::from([(
                 "metadata".to_string(),
                 JsonSchema {
-                    properties: Some(BTreeMap::from([("extra".to_string(), JsonSchema::default())])),
+                    properties: Some(BTreeMap::from([(
+                        "extra".to_string(),
+                        JsonSchema::default()
+                    )])),
                     ..Default::default()
                 }
             )]),
@@ -1188,9 +1220,13 @@ fn parse_large_tool_input_schema_preserves_oversized_field_descriptions() {
             "payload": {"type": "string", "description": "x".repeat(5_500)},
             "mode": {"type": "string", "description": "Select the processing mode."}
         }
-    })).expect("parse schema");
+    }))
+    .expect("parse schema");
     let properties = schema.properties.expect("object properties");
-    assert_eq!(properties["payload"].description.as_deref(), Some("x".repeat(5_500).as_str()));
+    assert_eq!(
+        properties["payload"].description.as_deref(),
+        Some("x".repeat(5_500).as_str())
+    );
     assert_eq!(
         properties["mode"].description.as_deref(),
         Some("Select the processing mode.")

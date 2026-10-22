@@ -73,16 +73,26 @@ mod tests {
     fn mcp_correlation_preserves_metadata_and_uses_the_bridge_wire_key() {
         let enabled = McpCallTraceContext::enabled("mcp-call-id".to_string());
         for (meta, expected) in [
-            (None, Some(json!({"codex_bridge_mcp_call_id": "mcp-call-id"}))),
-            (Some(json!({"source": "test", "codex_bridge_mcp_call_id": "old"})),
-             Some(json!({"source": "test", "codex_bridge_mcp_call_id": "mcp-call-id"}))),
-            (Some(json!({"source": "test"})),
-             Some(json!({"source": "test", "codex_bridge_mcp_call_id": "mcp-call-id"}))),
+            (
+                None,
+                Some(json!({"codex_bridge_mcp_call_id": "mcp-call-id"})),
+            ),
+            (
+                Some(json!({"source": "test", "codex_bridge_mcp_call_id": "old"})),
+                Some(json!({"source": "test", "codex_bridge_mcp_call_id": "mcp-call-id"})),
+            ),
+            (
+                Some(json!({"source": "test"})),
+                Some(json!({"source": "test", "codex_bridge_mcp_call_id": "mcp-call-id"})),
+            ),
             (Some(json!(null)), Some(json!(null))),
             (Some(json!(["value"])), Some(json!(["value"]))),
             (Some(json!(7)), Some(json!(7))),
         ] {
-            assert_eq!(McpCallTraceContext::disabled().add_request_meta(meta.clone()), meta);
+            assert_eq!(
+                McpCallTraceContext::disabled().add_request_meta(meta.clone()),
+                meta
+            );
             assert_eq!(enabled.add_request_meta(meta), expected);
         }
     }

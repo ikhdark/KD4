@@ -47,16 +47,17 @@ fn run_multi_thread_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
-    let handle = std::thread::Builder::new()
-        .name(name.to_string())
-        .spawn(move || -> Result<()> {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .thread_stack_size(8 * 1024 * 1024)
-                .enable_all()
-                .build()?
-                .block_on(Box::pin(future))
-        })?;
+    let handle =
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || -> Result<()> {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .thread_stack_size(8 * 1024 * 1024)
+                    .enable_all()
+                    .build()?
+                    .block_on(Box::pin(future))
+            })?;
     handle
         .join()
         .unwrap_or_else(|_| Err(anyhow::anyhow!("{name} thread panicked")))
@@ -122,7 +123,10 @@ async fn timed_turn(harness: &mut TracingHarness, id: i64, line: &str) -> TurnTi
 #[test]
 #[ignore = "narrow wall-clock dispatch benchmark"]
 #[serial(app_server_tracing)]
-#[expect(clippy::print_stderr, reason = "this dispatch benchmark emits machine-readable latency measurements")]
+#[expect(
+    clippy::print_stderr,
+    reason = "this dispatch benchmark emits machine-readable latency measurements"
+)]
 fn turn_start_dispatch_wall_clock_benchmark() -> Result<()> {
     run_multi_thread_with_stack("turn_start_dispatch_wall_clock_benchmark", async {
         let mut harness = TracingHarness::new().await?;
@@ -139,9 +143,8 @@ fn turn_start_dispatch_wall_clock_benchmark() -> Result<()> {
                     rows.push(timing);
                 }
             }
-            let pick = |f: fn(&TurnTiming) -> f64| {
-                median_us(&mut rows.iter().map(f).collect::<Vec<_>>())
-            };
+            let pick =
+                |f: fn(&TurnTiming) -> f64| median_us(&mut rows.iter().map(f).collect::<Vec<_>>());
             eprintln!(
                 "{}",
                 json!({
@@ -162,10 +165,17 @@ fn turn_start_dispatch_wall_clock_benchmark() -> Result<()> {
 
 #[test]
 #[ignore = "narrow CPU split of inline turn/start dispatch work"]
-#[expect(clippy::print_stderr, reason = "this dispatch benchmark emits machine-readable CPU timing measurements")]
+#[expect(
+    clippy::print_stderr,
+    reason = "this dispatch benchmark emits machine-readable CPU timing measurements"
+)]
 fn turn_start_inline_cpu_split_benchmark() {
     for (label, bytes) in PAYLOADS {
-        let line = turn_line(1, "00000000-0000-0000-0000-000000000000", &"x".repeat(bytes));
+        let line = turn_line(
+            1,
+            "00000000-0000-0000-0000-000000000000",
+            &"x".repeat(bytes),
+        );
         let (mut parse, mut typed, mut estimate) = (Vec::new(), Vec::new(), Vec::new());
         for round in 0..WARMUP_ROUNDS + MEASURED_ROUNDS * 3 {
             let start = Instant::now();
@@ -201,7 +211,10 @@ fn turn_start_inline_cpu_split_benchmark() {
 
 #[test]
 #[ignore = "narrow wall-clock queue hand-off benchmark"]
-#[expect(clippy::print_stderr, reason = "this queue benchmark emits machine-readable hand-off timing measurements")]
+#[expect(
+    clippy::print_stderr,
+    reason = "this queue benchmark emits machine-readable hand-off timing measurements"
+)]
 fn idle_thread_queue_handoff_wall_clock_benchmark() -> Result<()> {
     run_multi_thread_with_stack("idle_thread_queue_handoff_wall_clock_benchmark", async {
         let queues = RequestSerializationQueues::default();

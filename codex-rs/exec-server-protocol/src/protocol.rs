@@ -16,6 +16,19 @@ use crate::ProcessId;
 pub const INITIALIZE_METHOD: &str = "initialize";
 pub const INITIALIZED_METHOD: &str = "initialized";
 pub const EXEC_METHOD: &str = "process/start";
+/// Incarnation-bound start. Older peers reject this method before launching;
+/// never fall back to an unbound start for a public process handle.
+pub const EXEC_OWNED_METHOD: &str = "process/startOwned";
+
+/// Additive identity envelope for process operations. Legacy ID-only RPCs
+/// retain their original meaning; public process handles always send a token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedProcessParams<T> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    #[serde(flatten)]
+    pub params: T,
+}
 pub const EXEC_READ_METHOD: &str = "process/read";
 pub const EXEC_WRITE_METHOD: &str = "process/write";
 pub const EXEC_SIGNAL_METHOD: &str = "process/signal";
@@ -23,6 +36,10 @@ pub const EXEC_TERMINATE_METHOD: &str = "process/terminate";
 pub const EXEC_OUTPUT_DELTA_METHOD: &str = "process/output";
 pub const EXEC_EXITED_METHOD: &str = "process/exited";
 pub const EXEC_CLOSED_METHOD: &str = "process/closed";
+/// Output capture was lost at `throughSeq`; that sequence carries no bytes.
+pub const EXEC_OUTPUT_GAP_METHOD: &str = "process/outputGap";
+/// Process observation failed; this is not evidence of an OS exit.
+pub const EXEC_FAILED_METHOD: &str = "process/failed";
 pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
 /// Stable, size-bounded read that honors the same sandbox context as `fs/readFile`.
@@ -39,6 +56,8 @@ pub const FS_READ_DIRECTORY_METHOD: &str = "fs/readDirectory";
 pub const FS_WALK_METHOD: &str = "fs/walk";
 pub const FS_REMOVE_METHOD: &str = "fs/remove";
 pub const FS_COPY_METHOD: &str = "fs/copy";
+/// Replace or delete a file only if it still holds the expected preimage.
+pub const FS_MUTATE_FILE_IF_MATCHES_METHOD: &str = "fs/mutateFileIfMatches";
 /// JSON-RPC request method for executor-side HTTP requests.
 pub const HTTP_REQUEST_METHOD: &str = "http/request";
 /// Idempotently abandon a streaming body; older peers return method-not-found.
@@ -358,6 +377,67 @@ pub struct FsWriteFileParams {
 #[serde(rename_all = "camelCase")]
 pub struct FsWriteFileResponse {}
 
+/// Absent `expected_base64` expects no file; absent `replacement_base64` deletes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMutateFileIfMatchesParams {
+    pub path: PathUri,
+    pub expected_base64: Option<String>,
+    pub replacement_base64: Option<String>,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsMutateFileIfMatchesResponse {
+    pub outcome: FsFileMutationOutcome,
+}
+
+/// Wire form of [`codex_file_system::FileMutationOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum FsFileMutationOutcome {
+    Committed,
+    Conflict,
+    #[serde(rename_all = "camelCase")]
+    RecoveryRequired {
+        retained_path: std::path::PathBuf,
+        message: String,
+    },
+}
+
+impl From<codex_file_system::FileMutationOutcome> for FsFileMutationOutcome {
+    fn from(outcome: codex_file_system::FileMutationOutcome) -> Self {
+        match outcome {
+            codex_file_system::FileMutationOutcome::Committed => Self::Committed,
+            codex_file_system::FileMutationOutcome::Conflict => Self::Conflict,
+            codex_file_system::FileMutationOutcome::RecoveryRequired {
+                retained_path,
+                message,
+            } => Self::RecoveryRequired {
+                retained_path,
+                message,
+            },
+        }
+    }
+}
+
+impl From<FsFileMutationOutcome> for codex_file_system::FileMutationOutcome {
+    fn from(outcome: FsFileMutationOutcome) -> Self {
+        match outcome {
+            FsFileMutationOutcome::Committed => Self::Committed,
+            FsFileMutationOutcome::Conflict => Self::Conflict,
+            FsFileMutationOutcome::RecoveryRequired {
+                retained_path,
+                message,
+            } => Self::RecoveryRequired {
+                retained_path,
+                message,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsCreateDirectoryParams {
@@ -375,6 +455,9 @@ pub struct FsCreateDirectoryResponse {}
 pub struct FsGetMetadataParams {
     pub path: PathUri,
     pub sandbox: Option<FileSystemSandboxContext>,
+    /// Opt in to a directory policy query; ordinary metadata pays no extra I/O.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_directory_case_sensitivity: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +469,9 @@ pub struct FsGetMetadataResponse {
     pub size: u64,
     pub created_at_ms: i64,
     pub modified_at_ms: i64,
+    /// Absent for legacy peers, unsupported filesystems, or ordinary requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_case_sensitive: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -597,6 +683,20 @@ pub struct ExecClosedNotification {
     /// Final output assessment; absent when diagnostics were incomplete or the peer is legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_denied: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecOutputGapNotification {
+    pub process_id: ProcessId,
+    pub through_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecFailedNotification {
+    pub process_id: ProcessId,
+    pub message: String,
 }
 
 mod base64_bytes {
@@ -860,5 +960,37 @@ mod tests {
         .expect("legacy exited notification should deserialize");
 
         assert_eq!(notification.sandbox_denied, None);
+    }
+
+    #[test]
+    fn directory_case_policy_is_optional_and_explicit() {
+        let params: super::FsGetMetadataParams = serde_json::from_value(serde_json::json!({
+            "path": "file:///C:/repo", "sandbox": null,
+        }))
+        .unwrap();
+        assert_eq!(params.include_directory_case_sensitivity, None);
+        assert!(
+            serde_json::to_value(&params)
+                .unwrap()
+                .get("includeDirectoryCaseSensitivity")
+                .is_none()
+        );
+        let legacy = serde_json::json!({
+            "isDirectory": true, "isFile": false, "isSymlink": false,
+            "size": 0, "createdAtMs": 0, "modifiedAtMs": 0,
+        });
+        let mut response: super::FsGetMetadataResponse =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(response.directory_case_sensitive, None);
+        assert_eq!(serde_json::to_value(&response).unwrap(), legacy);
+        for sensitive in [false, true] {
+            response.directory_case_sensitive = Some(sensitive);
+            let wire = serde_json::to_value(&response).unwrap();
+            assert_eq!(wire["directoryCaseSensitive"], sensitive);
+            assert_eq!(
+                serde_json::from_value::<super::FsGetMetadataResponse>(wire).unwrap(),
+                response
+            );
+        }
     }
 }

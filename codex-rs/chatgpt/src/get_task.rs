@@ -19,9 +19,12 @@ pub(crate) async fn get_task(config: &Config, task_id: String) -> anyhow::Result
         .await
         .ok_or_else(|| anyhow::anyhow!("ChatGPT auth not available"))?;
     let http_clients = chatgpt_http_clients(config);
-    let task_id = crate::workspace_settings::encode_path_segment(&task_id);
-    let path = format!("/wham/tasks/{task_id}");
-    chatgpt_get_request(&config.chatgpt_base_url, &auth, &http_clients, path).await
+    let encoded = crate::workspace_settings::encode_path_segment(&task_id);
+    let path = format!("/wham/tasks/{encoded}");
+    let details: GetTaskResponse =
+        chatgpt_get_request(&config.chatgpt_base_url, &auth, &http_clients, path).await?;
+    details.validate_task_id(&task_id)?;
+    Ok(details)
 }
 
 #[cfg(test)]

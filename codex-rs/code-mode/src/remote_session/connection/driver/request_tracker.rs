@@ -23,6 +23,7 @@ pub(super) enum CancellationAction {
 
 pub(super) struct RequestTracker {
     pending: HashMap<RequestId, PendingRequest>,
+    control_deadlines: HashMap<RequestId, tokio::time::Instant>,
     unclaimed_executes: HashMap<RequestId, UnclaimedExecute>,
     initial_responses: HashMap<RequestId, InitialResponse>,
     deferred_waits: VecDeque<DeferredWait>,
@@ -33,6 +34,7 @@ impl RequestTracker {
     pub(super) fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            control_deadlines: HashMap::new(),
             unclaimed_executes: HashMap::new(),
             initial_responses: HashMap::new(),
             deferred_waits: VecDeque::new(),
@@ -73,6 +75,15 @@ impl RequestTracker {
                 && !self.unclaimed_executes.contains_key(&id),
             "cannot reuse a live code-mode request ID: {id:?}"
         );
+        let timeout = match &pending {
+            PendingRequest::Terminate { .. } => Some(super::super::TERMINATE_TIMEOUT),
+            PendingRequest::ShutdownSession { .. } => Some(super::super::SHUTDOWN_SESSION_TIMEOUT),
+            _ => None,
+        };
+        if let Some(timeout) = timeout {
+            self.control_deadlines
+                .insert(id, tokio::time::Instant::now() + timeout);
+        }
         let replaced = self.pending.insert(id, pending);
         debug_assert!(replaced.is_none());
         if let Some(cancellation) = self
@@ -85,7 +96,12 @@ impl RequestTracker {
     }
 
     pub(super) fn remove_pending(&mut self, id: RequestId) -> Option<PendingRequest> {
+        self.control_deadlines.remove(&id);
         self.pending.remove(&id)
+    }
+
+    pub(super) fn next_control_deadline(&self) -> Option<tokio::time::Instant> {
+        self.control_deadlines.values().copied().min()
     }
 
     pub(super) fn insert_initial_response(&mut self, id: RequestId, response: InitialResponse) {
@@ -193,6 +209,7 @@ impl RequestTracker {
     }
 
     pub(super) fn fail_all(&mut self, reason: &str) {
+        self.control_deadlines.clear();
         for (_, pending) in self.pending.drain() {
             pending.fail(reason.to_string());
         }

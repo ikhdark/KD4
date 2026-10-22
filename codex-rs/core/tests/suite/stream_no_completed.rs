@@ -43,7 +43,11 @@ async fn retries_on_early_close() {
     require_network!();
 
     let incomplete_sse = sse_incomplete();
-    let completed_sse = responses::sse_completed("resp_ok");
+    let completed_sse = responses::sse(vec![
+        responses::ev_response_created("resp_ok"),
+        responses::ev_assistant_message("msg_ok", "hello"),
+        responses::ev_completed("resp_ok"),
+    ]);
 
     let (server, _) = start_streaming_sse_server(vec![
         vec![StreamingSseChunk {
@@ -82,7 +86,9 @@ async fn retries_on_early_close() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     let TestCodex { codex, .. } = test_codex()
@@ -492,16 +498,29 @@ async fn interrupt_completes_partial_assistant_and_plan_before_turn_aborted() {
 async fn plan_mode_empty_final_item_preserves_streamed_prose() {
     require_network!();
 
-    let (server, _) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
-        gate: None,
-        body: responses::sse(vec![
-            responses::ev_response_created("resp_empty_final"),
-            responses::ev_message_item_added("assistant-empty-final", ""),
-            responses::ev_output_text_delta("I will inspect the stream.\n"),
-            responses::ev_assistant_message("assistant-empty-final", ""),
-            responses::ev_completed("resp_empty_final"),
-        ]),
-    }]])
+    // Streamed content is provisional. The empty completed item closes the displayed
+    // prose but is not a final answer, so the turn spends its single bounded
+    // missing-answer repair.
+    let (server, _) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("resp_empty_final"),
+                responses::ev_message_item_added("assistant-empty-final", ""),
+                responses::ev_output_text_delta("I will inspect the stream.\n"),
+                responses::ev_assistant_message("assistant-empty-final", ""),
+                responses::ev_completed("resp_empty_final"),
+            ]),
+        }],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("resp_repair"),
+                responses::ev_assistant_message("assistant-repair", "First, inspect the stream."),
+                responses::ev_completed("resp_repair"),
+            ]),
+        }],
+    ])
     .await;
     let test = test_codex()
         .with_config(|config| {
@@ -575,10 +594,10 @@ async fn plan_mode_empty_final_item_preserves_streamed_prose() {
             _ => None,
         })
         .collect();
-    assert_eq!(starts.len(), 1);
+    assert_eq!(starts.len(), 2, "the streamed item and the repair answer");
     assert_eq!(
         completions.len(),
-        1,
+        2,
         "an empty final payload must still close the started item once"
     );
     let (start_index, start, started_item) = starts[0];
@@ -588,6 +607,21 @@ async fn plan_mode_empty_final_item_preserves_streamed_prose() {
     assert_eq!(start.turn_id, terminal.turn_id);
     assert_eq!(completed.turn_id, terminal.turn_id);
     assert!(start_index < completed_index && completed_index < events.len() - 1);
+    let (repair_start_index, repair_start, repair_started) = starts[1];
+    let (repair_completed_index, repair_completed, repair_item) = completions[1];
+    assert_eq!(repair_started.id, "assistant-repair");
+    assert_eq!(repair_item.id, repair_started.id);
+    assert_eq!(repair_start.turn_id, terminal.turn_id);
+    assert_eq!(repair_completed.turn_id, terminal.turn_id);
+    assert!(completed_index < repair_start_index && repair_start_index < repair_completed_index);
+    assert!(matches!(
+        repair_item.content.as_slice(),
+        [AgentMessageContent::Text { text }] if text == "First, inspect the stream."
+    ));
+    assert_eq!(
+        terminal.last_agent_message.as_deref(),
+        Some("First, inspect the stream.")
+    );
     let mut visible_text = String::new();
     for (index, event) in events.iter().enumerate() {
         if let EventMsg::AgentMessageContentDelta(delta) = event {
@@ -602,7 +636,9 @@ async fn plan_mode_empty_final_item_preserves_streamed_prose() {
         completed_item.content.as_slice(),
         [AgentMessageContent::Text { text }] if text == "I will inspect the stream.\n"
     ));
-    assert_eq!(server.requests().await.len(), 1);
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2, "one bounded repair, not silent success");
+    assert!(String::from_utf8_lossy(&requests[1]).contains("missing-answer repair"));
     server.shutdown().await;
 }
 
@@ -627,12 +663,15 @@ async fn reasoning_closure_preserves_partial_text_and_final_authority() {
                 responses::ev_reasoning_text_delta("has not finished"),
             ];
             if normal_done {
+                // A reasoning-only completion is not a final answer; answer so the turn
+                // does not spend its bounded missing-answer repair on another request.
                 response_events.extend([
                     responses::ev_reasoning_item(
                         "reasoning-partial",
                         &["Final summary"],
                         &["Final raw content"],
                     ),
+                    responses::ev_assistant_message("final-answer", "The stream is complete."),
                     responses::ev_completed("resp_reasoning_partial"),
                 ]);
             }

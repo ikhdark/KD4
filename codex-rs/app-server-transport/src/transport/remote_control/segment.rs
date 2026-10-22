@@ -19,10 +19,10 @@ pub(super) const REMOTE_CONTROL_SEGMENT_MAX_BYTES: usize = 150 * 1024;
 pub(super) const REMOTE_CONTROL_REASSEMBLED_MAX_BYTES: usize = 100 * 1024 * 1024;
 pub(super) const REMOTE_CONTROL_SEGMENT_COUNT_MAX: usize = 1024;
 const REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_COUNT: usize = 128;
+const REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_BYTES: usize = REMOTE_CONTROL_REASSEMBLED_MAX_BYTES;
 
 #[derive(Debug)]
 struct ClientSegmentAssembly {
-    stream_id: StreamId,
     metadata: ClientSegmentMetadata,
     raw: Vec<u8>,
     next_segment_id: usize,
@@ -38,7 +38,8 @@ struct ClientSegmentMetadata {
 
 #[derive(Default)]
 pub(super) struct ClientSegmentReassembler {
-    assemblies: HashMap<ClientId, ClientSegmentAssembly>,
+    assemblies: HashMap<(ClientId, StreamId), ClientSegmentAssembly>,
+    reserved_bytes: usize,
 }
 
 pub(super) enum ClientSegmentObservation {
@@ -120,40 +121,30 @@ impl ClientSegmentReassembler {
         }
 
         let now = Instant::now();
-        match self.assemblies.get(&envelope.client_id) {
-            Some(assembly) if assembly.stream_id != stream_id => {
-                warn!(
-                    client_id = envelope.client_id.0.as_str(),
-                    "resetting segmented remote-control client envelope after stream change"
-                );
-                self.assemblies.insert(
-                    envelope.client_id.clone(),
-                    ClientSegmentAssembly {
-                        stream_id: stream_id.clone(),
-                        metadata: metadata.clone(),
-                        raw: Vec::new(),
-                        next_segment_id: 0,
-                        last_chunk_seen_at: now,
-                    },
-                );
+        let key = (envelope.client_id.clone(), stream_id.clone());
+        if !self.assemblies.contains_key(&key) {
+            if segment_id != 0
+                || message_size_bytes
+                    > REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_BYTES.saturating_sub(self.reserved_bytes)
+            {
+                return ClientSegmentObservation::Dropped;
             }
-            Some(_) => {}
-            None => {
-                self.evict_assemblies_if_full();
-                self.assemblies.insert(
-                    envelope.client_id.clone(),
-                    ClientSegmentAssembly {
-                        stream_id: stream_id.clone(),
-                        metadata: metadata.clone(),
-                        raw: Vec::new(),
-                        next_segment_id: 0,
-                        last_chunk_seen_at: now,
-                    },
-                );
-            }
+            self.evict_assemblies_if_full();
+            // Reserve the declared final size, not just the currently decoded
+            // prefix. Independent streams share the existing aggregate ceiling.
+            self.reserved_bytes += message_size_bytes;
+            self.assemblies.insert(
+                key.clone(),
+                ClientSegmentAssembly {
+                    metadata: metadata.clone(),
+                    raw: Vec::new(),
+                    next_segment_id: 0,
+                    last_chunk_seen_at: now,
+                },
+            );
         }
         let result = {
-            let Some(assembly) = self.assemblies.get_mut(&envelope.client_id) else {
+            let Some(assembly) = self.assemblies.get_mut(&key) else {
                 warn!(
                     client_id = envelope.client_id.0.as_str(),
                     "dropping segmented remote-control client envelope without assembly"
@@ -253,7 +244,15 @@ impl ClientSegmentReassembler {
     }
 
     pub(super) fn invalidate_client(&mut self, client_id: &ClientId) {
-        self.assemblies.remove(client_id);
+        let keys = self
+            .assemblies
+            .keys()
+            .filter(|(client, _)| client == client_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (client, stream) in keys {
+            self.remove_assembly(&client, &stream);
+        }
     }
 
     pub(super) fn should_ignore_chunk(
@@ -263,27 +262,26 @@ impl ClientSegmentReassembler {
         seq_id: u64,
         segment_id: usize,
     ) -> bool {
-        self.assemblies.get(client_id).is_some_and(|assembly| {
-            assembly.stream_id == *stream_id
-                && (seq_id < assembly.metadata.seq_id
-                    || (seq_id == assembly.metadata.seq_id
-                        && segment_id < assembly.next_segment_id))
-        })
+        self.assemblies
+            .get(&(client_id.clone(), stream_id.clone()))
+            .is_some_and(|assembly| {
+                seq_id < assembly.metadata.seq_id
+                    || (seq_id == assembly.metadata.seq_id && segment_id < assembly.next_segment_id)
+            })
     }
 
     fn remove_assembly(&mut self, client_id: &ClientId, stream_id: &StreamId) {
-        if self
+        if let Some(assembly) = self
             .assemblies
-            .get(client_id)
-            .is_some_and(|assembly| &assembly.stream_id == stream_id)
+            .remove(&(client_id.clone(), stream_id.clone()))
         {
-            self.assemblies.remove(client_id);
+            self.reserved_bytes -= assembly.metadata.message_size_bytes;
         }
     }
 
     fn evict_assemblies_if_full(&mut self) {
         while self.assemblies.len() >= REMOTE_CONTROL_SEGMENT_ASSEMBLY_MAX_COUNT {
-            let Some(client_id) = self
+            let Some((client_id, stream_id)) = self
                 .assemblies
                 .iter()
                 .min_by_key(|(_, assembly)| assembly.last_chunk_seen_at)
@@ -291,7 +289,7 @@ impl ClientSegmentReassembler {
             else {
                 return;
             };
-            self.assemblies.remove(&client_id);
+            self.remove_assembly(&client_id, &stream_id);
         }
     }
 }

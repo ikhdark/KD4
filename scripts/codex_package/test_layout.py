@@ -385,7 +385,13 @@ class CopyFileForStagingTest(unittest.TestCase):
                         "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
                     }
                     for role, source in zip(
-                        ["entrypoint", "code-mode-host", "ripgrep", "command-runner", "sandbox-setup"],
+                        [
+                            "entrypoint",
+                            "code-mode-host",
+                            "ripgrep",
+                            "command-runner",
+                            "sandbox-setup",
+                        ],
                         sources,
                     )
                 },

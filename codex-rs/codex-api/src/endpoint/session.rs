@@ -126,12 +126,13 @@ impl<T: HttpTransport> EndpointSession<T> {
             self.provider.retry.to_policy(),
             self.request_telemetry.clone(),
             make_request,
-            |req| {
+            |req, _attempt| {
                 let auth = self.auth.clone();
                 let transport = &self.transport;
                 async move {
                     let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
-                    transport.execute(req).await
+                    codex_client::with_dispatch_guard(auth.dispatch_guard(), transport.execute(req))
+                        .await
                 }
             },
         )
@@ -192,7 +193,8 @@ impl<T: HttpTransport> EndpointSession<T> {
                 let transport = &self.transport;
                 async move {
                     let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
-                    transport.execute(req).await
+                    codex_client::with_dispatch_guard(auth.dispatch_guard(), transport.execute(req))
+                        .await
                 }
             },
         )
@@ -233,20 +235,30 @@ impl<T: HttpTransport> EndpointSession<T> {
             self.provider.retry.to_policy(),
             self.request_telemetry.clone(),
             make_request,
-            |req| {
+            |req, attempt| {
                 let auth = self.auth.clone();
                 let transport = &self.transport;
                 let header_deadline_elapsed = &header_deadline_elapsed;
+                let request_telemetry = self.request_telemetry.clone();
                 async move {
                     let req = auth.apply_auth(req).await.map_err(TransportError::from)?;
+                    if let Some(telemetry) = request_telemetry {
+                        telemetry.on_request_dispatched_attempt(attempt);
+                    }
                     // Authentication and safe pre-dispatch retry backoff are
                     // not response silence. Give each dispatch its own budget.
-                    tokio::time::timeout(header_timeout, transport.stream(req))
-                        .await
-                        .unwrap_or_else(|_| {
-                            header_deadline_elapsed.store(true, Ordering::Relaxed);
-                            Err(TransportError::Timeout)
-                        })
+                    tokio::time::timeout(
+                        header_timeout,
+                        codex_client::with_dispatch_guard(
+                            auth.dispatch_guard(),
+                            transport.stream(req),
+                        ),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        header_deadline_elapsed.store(true, Ordering::Relaxed);
+                        Err(TransportError::Timeout)
+                    })
                 }
             },
         )
@@ -375,7 +387,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn header_deadline_excludes_authentication_and_safe_retry_backoff() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         use std::time::Duration;
 
         struct DelayedAuth(AtomicUsize);
@@ -438,6 +451,97 @@ mod tests {
         );
         assert_eq!(auth.0.load(Ordering::SeqCst), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_ordinals_match_transport_entries_after_auth_and_safe_retries() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        struct Recorder(Mutex<Vec<u64>>);
+        impl RequestTelemetry for Recorder {
+            fn on_request_dispatched_attempt(&self, attempt: u64) {
+                self.0.lock().unwrap().push(attempt);
+            }
+            fn on_request(
+                &self,
+                _: u64,
+                _: Option<http::StatusCode>,
+                _: Option<&TransportError>,
+                _: Duration,
+            ) {
+            }
+        }
+        struct ProbeAuth {
+            fail_first: bool,
+            calls: AtomicUsize,
+        }
+        impl crate::auth::AuthProvider for ProbeAuth {
+            fn add_auth_headers(&self, _: &mut HeaderMap) {}
+            fn apply_auth(&self, request: Request) -> crate::auth::AuthProviderFuture<'_> {
+                Box::pin(async move {
+                    if self.calls.fetch_add(1, Ordering::SeqCst) == 0 && self.fail_first {
+                        return Err(crate::auth::AuthError::Transient("not ready".into()));
+                    }
+                    Ok(request)
+                })
+            }
+        }
+        struct ProbeTransport {
+            fail_first: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        impl HttpTransport for ProbeTransport {
+            async fn execute(&self, _: Request) -> Result<Response, TransportError> {
+                unreachable!("stream only")
+            }
+            async fn stream(&self, _: Request) -> Result<StreamResponse, TransportError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 && self.fail_first {
+                    return Err(TransportError::PreDispatch("not sent".into()));
+                }
+                Ok(StreamResponse {
+                    status: http::StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    bytes: Box::pin(futures::stream::empty()),
+                })
+            }
+        }
+        for auth_failure in [false, true] {
+            let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let session = EndpointSession::new(
+                ProbeTransport {
+                    fail_first: !auth_failure,
+                    calls: calls.clone(),
+                },
+                Provider {
+                    name: "attempt identity fixture".into(),
+                    base_url: "http://127.0.0.1".into(),
+                    query_params: None,
+                    headers: HeaderMap::new(),
+                    retry: crate::provider::RetryConfig {
+                        max_retries: 1,
+                        base_delay: Duration::ZERO,
+                        retry_429: false,
+                        retry_5xx: false,
+                        retry_transport: true,
+                    },
+                    stream_idle_timeout: Duration::from_secs(1),
+                },
+                Arc::new(ProbeAuth {
+                    fail_first: auth_failure,
+                    calls: AtomicUsize::new(0),
+                }),
+            )
+            .with_request_telemetry(Some(recorder.clone()));
+            session
+                .stream_encoded_json_with(Method::POST, "responses", HeaderMap::new(), None, |_| {})
+                .await
+                .expect("safe retry succeeds");
+            let observed = recorder.0.lock().unwrap();
+            assert_eq!(*observed, if auth_failure { vec![1] } else { vec![0, 1] });
+            assert_eq!(observed.len(), calls.load(Ordering::SeqCst));
+        }
     }
 
     #[tokio::test(start_paused = true)]

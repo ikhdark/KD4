@@ -49,6 +49,7 @@ async fn handle_resume_agent(
     let receiver_thread_id = ThreadId::from_string(&args.id).map_err(|err| {
         FunctionCallError::RespondToModel(format!("invalid agent id {}: {err:?}", args.id))
     })?;
+    admit_agent_target(&session, &turn, receiver_thread_id).await?;
     let receiver_agent = session
         .services
         .agent_control

@@ -16,6 +16,97 @@ use codex_keyring_store::tests::MockKeyringStore;
 use keyring::Error as KeyringError;
 
 #[test]
+fn conditional_commits_reject_logout_replacement_and_identical_relogin() -> anyhow::Result<()> {
+    for mode in [
+        AuthCredentialsStoreMode::File,
+        AuthCredentialsStoreMode::Ephemeral,
+    ] {
+        for relogin in [false, true] {
+            let home = tempdir()?;
+            let old = create_auth_storage(home.path().into(), mode, AuthKeyringBackendKind::Direct);
+            let current =
+                create_auth_storage(home.path().into(), mode, AuthKeyringBackendKind::Direct);
+            let original = auth_with_prefix("original");
+            old.save(&original)?;
+            assert_eq!(old.load()?, Some(original.clone()));
+            current.delete()?;
+            if relogin {
+                current.save(&original)?;
+            }
+            let error = old
+                .save_if_unchanged(Some(&original), &auth_with_prefix("late"))
+                .unwrap_err();
+            assert!(is_auth_changed(&error));
+            assert_eq!(current.load()?, relogin.then_some(original));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn conditional_commit_contention_is_bounded_and_retryable() -> anyhow::Result<()> {
+    let home = tempdir()?;
+    let storage = create_auth_storage(
+        home.path().into(),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::Direct,
+    );
+    let original = auth_with_prefix("original");
+    let replacement = auth_with_prefix("replacement");
+    storage.save(&original)?;
+    storage.load()?;
+    let lock = codex_file_system::acquire_atomic_write_lock(&home.path().join("auth-lifecycle"))?;
+    assert_eq!(
+        storage
+            .save_if_unchanged(Some(&original), &replacement)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(lock);
+    storage.save_if_unchanged(Some(&original), &replacement)?;
+    assert_eq!(storage.load()?, Some(replacement));
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FailedPreferredWrite(Option<AuthDotJson>);
+
+impl AuthStorageBackend for FailedPreferredWrite {
+    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        Ok(self.0.clone())
+    }
+    fn save(&self, _: &AuthDotJson) -> std::io::Result<()> {
+        Err(std::io::Error::other("injected preferred write failure"))
+    }
+    fn delete(&self) -> std::io::Result<bool> {
+        Ok(false)
+    }
+}
+
+#[test]
+fn auto_fallback_requires_a_known_empty_preferred_store() -> anyhow::Result<()> {
+    for existing in [None, Some(auth_with_prefix("account-a"))] {
+        let home = tempdir()?;
+        let storage = AutoAuthStorage {
+            keyring_storage: Arc::new(FailedPreferredWrite(existing.clone())),
+            file_storage: Arc::new(FileAuthStorage::new(home.path().into())),
+        };
+        let replacement = auth_with_prefix("account-b");
+        let saved = storage.save(&replacement);
+        if existing.is_some() {
+            assert!(saved.is_err());
+            assert_eq!(storage.load()?, existing);
+            assert_eq!(storage.file_storage.load()?, None);
+        } else {
+            saved?;
+            assert_eq!(storage.load()?, Some(replacement));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn file_storage_failed_replace_preserves_committed_credentials() -> anyhow::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     let home = tempdir()?;
@@ -42,6 +133,7 @@ fn file_storage_save_and_load_preserve_auth_dot_json() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("test-key".to_string()),
         tokens: None,
@@ -78,6 +170,7 @@ async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
         "chatgpt_account_is_fedramp": false,
     }));
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::AgentIdentity),
         openai_api_key: None,
         tokens: None,
@@ -110,6 +203,7 @@ async fn file_storage_round_trips_registered_agent_identity_auth() -> anyhow::Re
         task_id: Some("task-id".to_string()),
     };
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: None,
@@ -152,6 +246,7 @@ async fn file_storage_loads_empty_agent_identity_email_as_none() -> anyhow::Resu
     assert_eq!(
         loaded,
         Some(AuthDotJson {
+            oauth_context: None,
             auth_mode: Some(AuthMode::Chatgpt),
             openai_api_key: None,
             tokens: None,
@@ -179,6 +274,7 @@ async fn file_storage_writes_missing_agent_identity_email_as_empty_string() -> a
     let codex_home = tempdir()?;
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: None,
@@ -212,6 +308,7 @@ async fn file_storage_round_trips_personal_access_token_auth() -> anyhow::Result
     let codex_home = tempdir()?;
     let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::PersonalAccessToken),
         openai_api_key: None,
         tokens: None,
@@ -263,6 +360,7 @@ async fn file_storage_loads_agent_identity_as_jwt() -> anyhow::Result<()> {
 fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test-key".to_string()),
         tokens: None,
@@ -294,6 +392,7 @@ fn ephemeral_storage_save_load_delete_is_in_memory_only() -> anyhow::Result<()> 
         AuthKeyringBackendKind::default(),
     );
     let auth_dot_json = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-ephemeral".to_string()),
         tokens: None,
@@ -422,6 +521,7 @@ fn id_token_with_prefix(prefix: &str) -> IdTokenInfo {
 
 fn auth_with_prefix(prefix: &str) -> AuthDotJson {
     AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some(format!("{prefix}-api-key")),
         tokens: Some(TokenData {
@@ -454,6 +554,7 @@ fn secrets_keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Resu
         Arc::new(mock_keyring.clone()),
     );
     let expected = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("sk-test".to_string()),
         tokens: None,
@@ -587,6 +688,7 @@ fn secrets_keyring_auth_storage_save_persists_and_removes_fallback_file() -> any
     let auth_file = get_auth_file(codex_home.path());
     std::fs::write(&auth_file, "stale")?;
     let auth = AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: Some(TokenData {
@@ -708,7 +810,7 @@ fn auto_auth_storage_load_uses_file_when_keyring_empty() -> anyhow::Result<()> {
 }
 
 #[test]
-fn auto_auth_storage_load_falls_back_when_keyring_errors() -> anyhow::Result<()> {
+fn auto_auth_storage_load_preserves_unavailable_preferred_authority() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
     let storage = AutoAuthStorage::new(
@@ -725,8 +827,11 @@ fn auto_auth_storage_load_falls_back_when_keyring_errors() -> anyhow::Result<()>
     let expected = auth_with_prefix("fallback");
     storage.file_storage.save(&expected)?;
 
-    let loaded = storage.load()?;
-    assert_eq!(loaded, Some(expected));
+    assert!(
+        storage.load().is_err(),
+        "an unreadable preferred account must not select another fallback account"
+    );
+    assert_eq!(storage.file_storage.load()?, Some(expected));
     Ok(())
 }
 
@@ -750,34 +855,27 @@ fn auto_auth_storage_save_prefers_keyring() -> anyhow::Result<()> {
 }
 
 #[test]
-fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()> {
+fn auto_auth_storage_save_rejects_indeterminate_preferred_authority() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
     let storage = AutoAuthStorage::new(
         codex_home.path().to_path_buf(),
         Arc::new(mock_keyring.clone()),
-        AuthKeyringBackendKind::Secrets,
+        AuthKeyringBackendKind::Direct,
     );
-    let key = compute_keyring_account(codex_home.path());
+    let key = compute_store_key(codex_home.path())?;
+    // The mock error is consumed by save. Keep the preferred authority unreadable
+    // on the subsequent load as well, rather than proving that it is absent.
+    mock_keyring.save(KEYRING_SERVICE, &key, "invalid auth json")?;
     mock_keyring.set_error(&key, KeyringError::Invalid("error".into(), "save".into()));
 
     let auth = auth_with_prefix("fallback");
-    storage.save(&auth)?;
-
-    let auth_file = get_auth_file(codex_home.path());
     assert!(
-        auth_file.exists(),
-        "fallback auth.json should be created when keyring save fails"
+        storage.save(&auth).is_err(),
+        "unavailable preferred state cannot authorize fallback"
     );
-    let saved = storage
-        .file_storage
-        .load()?
-        .context("fallback auth should exist")?;
-    assert_eq!(saved, auth);
-    assert!(
-        mock_keyring.saved_value(&key).is_none(),
-        "keyring should not contain value when save fails"
-    );
+    assert!(!get_auth_file(codex_home.path()).exists());
+    assert_eq!(mock_keyring.saved_value(&key).as_deref(), Some("invalid auth json"));
     Ok(())
 }
 

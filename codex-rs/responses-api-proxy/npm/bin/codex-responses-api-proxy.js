@@ -2,6 +2,7 @@
 // Entry point for the Codex responses API proxy binary.
 
 import { spawn } from "node:child_process";
+import { constants } from "node:os";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -57,41 +58,77 @@ const binaryPath = path.join(
   process.platform === "win32" ? `${binaryBaseName}.exe` : binaryBaseName,
 );
 
-const child = spawn(binaryPath, process.argv.slice(2), {
-  stdio: "inherit",
-});
-
-child.on("error", (err) => {
-  console.error(err);
-  process.exit(1);
-});
-
-const forwardSignal = (signal) => {
-  if (!child.killed) {
-    try {
-      child.kill(signal);
-    } catch {
-      /* ignore */
-    }
-  }
-};
-
-["SIGINT", "SIGTERM", "SIGHUP"].forEach((sig) => {
-  process.on(sig, () => forwardSignal(sig));
-});
-
-const childResult = await new Promise((resolve) => {
-  child.on("exit", (code, signal) => {
-    if (signal) {
-      resolve({ type: "signal", signal });
-    } else {
-      resolve({ type: "code", exitCode: code ?? 1 });
-    }
+// Keep these lifecycle rules synchronized with codex-cli/bin/codex.js. The
+// proxy is staged independently, so it cannot import the main package's files.
+async function runNative() {
+  const child = spawn(binaryPath, process.argv.slice(2), {
+    stdio: "inherit",
   });
-});
 
-if (childResult.type === "signal") {
-  process.kill(process.pid, childResult.signal);
-} else {
-  process.exit(childResult.exitCode);
+  const signalHandlers = new Map(
+    ["SIGINT", "SIGTERM", "SIGHUP"].map((signal) => [
+      signal,
+      () => forwardSignal(signal),
+    ]),
+  );
+  const removeSignalHandlers = () => {
+    for (const [signal, handler] of signalHandlers) {
+      process.off(signal, handler);
+    }
+  };
+  const exitForSignal = (signal) => {
+    removeSignalHandlers();
+    if (process.platform === "win32") {
+      const signalNumber = constants.signals[signal];
+      process.exit(signalNumber === undefined ? 1 : 128 + signalNumber);
+    }
+    process.kill(process.pid, signal);
+  };
+  const forwardSignal = (signal) => {
+    // Windows console Ctrl-C already reaches the native child. TerminateProcess
+    // would prevent its own handler from completing; mirror its eventual exit.
+    if (process.platform === "win32" && signal === "SIGINT") {
+      return;
+    }
+    let detail = "the child process may still be running";
+    try {
+      if (child.kill(signal)) {
+        return;
+      }
+    } catch (error) {
+      detail = error.message ?? String(error);
+    }
+    console.error(
+      `Unable to forward ${signal} to responses-api-proxy: ${detail}.`,
+    );
+    exitForSignal(signal);
+  };
+  for (const [signal, handler] of signalHandlers) {
+    process.on(signal, handler);
+  }
+
+  let childResult;
+  try {
+    childResult = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => {
+        resolve(signal ? { signal } : { exitCode: code ?? 1 });
+      });
+    });
+  } finally {
+    removeSignalHandlers();
+  }
+
+  if (childResult.signal) {
+    exitForSignal(childResult.signal);
+  } else {
+    process.exit(childResult.exitCode);
+  }
 }
+
+await runNative().catch((error) => {
+  console.error(
+    `responses-api-proxy could not start: ${error.message ?? String(error)}`,
+  );
+  process.exitCode = 1;
+});

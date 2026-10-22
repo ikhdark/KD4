@@ -32,32 +32,65 @@ async fn legacy_numeric_receipt_snapshot_recovers_exact_handle() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.json");
     let event = crate::session_runtime::CellEvent::Completed {
-        content_items: Vec::new(), error_text: None, output_loss: None,
+        content_items: Vec::new(),
+        error_text: None,
+        output_loss: None,
     };
-    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({
-        "version": 6, "revision": 1, "completed_call_id": "legacy-call", "values": {},
-        "completed_cells": {"1": event}, "completed_cell_order": ["1"], "next_cell_id": 2,
-    })).unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 6, "revision": 1, "completed_call_id": "legacy-call", "values": {},
+            "completed_cells": {"1": event}, "completed_cell_order": ["1"], "next_cell_id": 2,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let restored = InProcessCodeModeSession::new();
     let id = cell_id("g2:1");
     let expected = RuntimeResponse::Result {
-        cell_id: id.clone(), content_items: Vec::new(), error_text: None, output_loss: None,
+        cell_id: id.clone(),
+        content_items: Vec::new(),
+        error_text: None,
+        output_loss: None,
     };
-    assert_eq!(restored.wait(WaitRequest {
-        cell_id: id, yield_time_ms: 1,
-        recovery: Some(crate::ReceiptRecovery { path: path.clone(), terminal_only: true }),
-    }).await.unwrap(), WaitOutcome::LiveCell(expected));
+    assert_eq!(
+        restored
+            .wait(WaitRequest {
+                cell_id: id,
+                yield_time_ms: 1,
+                recovery: Some(crate::ReceiptRecovery {
+                    path: path.clone(),
+                    terminal_only: true
+                }),
+            })
+            .await
+            .unwrap(),
+        WaitOutcome::LiveCell(expected)
+    );
     let mut request = execute_request("text('new incarnation');");
     request.state_path = Some(path.clone());
     request.yield_time_ms = Some(60_000);
     let started = restored.execute(request).await.unwrap();
     let new_id = started.cell_id.clone();
     assert_ne!(new_id, cell_id("1"));
-    assert!(matches!(started.initial_response().await.unwrap(), RuntimeResponse::Result { error_text: None, .. }));
-    let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(matches!(
+        started.initial_response().await.unwrap(),
+        RuntimeResponse::Result {
+            error_text: None,
+            ..
+        }
+    ));
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(snapshot["version"], 7);
-    assert!(snapshot["completed_cells"].get("1").is_some(), "legacy receipt identity must remain exact");
-    assert!(snapshot["completed_cells"].get(new_id.as_str()).is_some(), "new receipt must retain its qualified identity");
+    assert!(
+        snapshot["completed_cells"].get("1").is_some(),
+        "legacy receipt identity must remain exact"
+    );
+    assert!(
+        snapshot["completed_cells"].get(new_id.as_str()).is_some(),
+        "new receipt must retain its qualified identity"
+    );
     restored.shutdown().await.unwrap();
 }
 
@@ -75,10 +108,21 @@ async fn first_wait_restores_receipt_without_starting_a_cell() {
     service.shutdown().await.unwrap();
     drop(service);
     let restored = InProcessCodeModeSession::new();
-    let recovery = Some(crate::ReceiptRecovery { path, terminal_only: false });
-    assert_eq!(restored.wait(WaitRequest {
-        cell_id: id, yield_time_ms: 1, recovery,
-    }).await.unwrap(), WaitOutcome::LiveCell(original));
+    let recovery = Some(crate::ReceiptRecovery {
+        path,
+        terminal_only: false,
+    });
+    assert_eq!(
+        restored
+            .wait(WaitRequest {
+                cell_id: id,
+                yield_time_ms: 1,
+                recovery,
+            })
+            .await
+            .unwrap(),
+        WaitOutcome::LiveCell(original)
+    );
     restored.shutdown().await.unwrap();
 }
 
@@ -91,13 +135,15 @@ async fn terminated_receipt_recovers_without_cancelled_values_or_replayed_effect
         settled: tokio::sync::Notify::new(),
     });
     let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-    let mut request = execute_request(r#"
+    let mut request = execute_request(
+        r#"
 store("cancelled", true);
 const receipt = await tools.exec_command({sentinel: "settled"});
 text(receipt);
 await notify("settled");
 await new Promise(() => {});
-"#);
+"#,
+    );
     request.enabled_tools = vec![exec_command_definition()].into();
     request.state_path = Some(path.clone());
     request.yield_time_ms = Some(60_000);
@@ -105,23 +151,53 @@ await new Promise(() => {});
     let id = started.cell_id.clone();
     // Wait for the nested invocation and buffered evidence, without observing
     // (and consuming) that evidence before cancellation.
-    tokio::time::timeout(Duration::from_secs(5), delegate.settled.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), delegate.settled.notified())
+        .await
+        .unwrap();
     let terminal = service.terminate(id.clone()).await.unwrap();
-    let WaitOutcome::LiveCell(RuntimeResponse::Terminated { ref content_items, .. }) = terminal else {
+    let WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+        ref content_items, ..
+    }) = terminal
+    else {
         panic!("expected termination");
     };
     assert!(content_items.iter().any(|item| matches!(item,
         FunctionCallOutputContentItem::InputText { text } if text.contains("settled"))));
+    // A loaded publisher can settle after terminate's short observation bound.
+    // The initial response then carries a transient durability warning, while
+    // the recovered snapshot is the confirmed receipt without that warning.
+    let persisted_content_items = content_items
+        .iter()
+        .filter(|item| {
+            !matches!(item, FunctionCallOutputContentItem::InputText { text }
+                if text.starts_with("Termination receipt durability is unconfirmed"))
+        })
+        .cloned()
+        .collect();
     drop(started);
     service.shutdown().await.unwrap();
     drop(service);
     // The same counting delegate, so a replayed effect would be recorded.
     let restored = InProcessCodeModeSession::with_delegate(delegate.clone());
-    assert_eq!(restored.wait(WaitRequest {
-        cell_id: id, yield_time_ms: 1,
-        recovery: Some(crate::ReceiptRecovery { path: path.clone(), terminal_only: false }),
-    }).await.unwrap(), terminal);
-    let snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        restored
+            .wait(WaitRequest {
+                cell_id: id.clone(),
+                yield_time_ms: 1,
+                recovery: Some(crate::ReceiptRecovery {
+                    path: path.clone(),
+                    terminal_only: false
+                }),
+            })
+            .await
+            .unwrap(),
+        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: id,
+            content_items: persisted_content_items,
+        })
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert!(snapshot["values"].get("cancelled").is_none());
     assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     restored.shutdown().await.unwrap();
@@ -131,13 +207,23 @@ await new Promise(() => {});
 async fn stale_receipt_lookup_cannot_alias_a_new_nondurable_cell() {
     let directory = tempfile::tempdir().unwrap();
     let service = InProcessCodeModeSession::new();
-    let started = service.execute(execute_request("text('new cell');")).await.unwrap();
+    let started = service
+        .execute(execute_request("text('new cell');"))
+        .await
+        .unwrap();
     let id = started.cell_id.clone();
     started.initial_response().await.unwrap();
-    let outcome = service.wait(WaitRequest {
-        cell_id: id, yield_time_ms: 1,
-        recovery: Some(crate::ReceiptRecovery { path: directory.path().join("absent.json"), terminal_only: true }),
-    }).await.unwrap();
+    let outcome = service
+        .wait(WaitRequest {
+            cell_id: id,
+            yield_time_ms: 1,
+            recovery: Some(crate::ReceiptRecovery {
+                path: directory.path().join("absent.json"),
+                terminal_only: true,
+            }),
+        })
+        .await
+        .unwrap();
     assert!(matches!(outcome, WaitOutcome::MissingCell(_)));
     service.shutdown().await.unwrap();
 }
@@ -148,11 +234,21 @@ struct ReceiptEffectDelegate {
 }
 
 impl CodeModeSessionDelegate for ReceiptEffectDelegate {
-    fn invoke_tool<'a>(&'a self, _: CodeModeNestedToolCall, _: NestedCancellation) -> ToolInvocationFuture<'a> {
+    fn invoke_tool<'a>(
+        &'a self,
+        _: CodeModeNestedToolCall,
+        _: NestedCancellation,
+    ) -> ToolInvocationFuture<'a> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async { Ok(serde_json::json!({"receipt": "settled"})) })
     }
-    fn notify<'a>(&'a self, _: String, _: CellId, _: String, _: CancellationToken) -> NotificationFuture<'a> {
+    fn notify<'a>(
+        &'a self,
+        _: String,
+        _: CellId,
+        _: String,
+        _: CancellationToken,
+    ) -> NotificationFuture<'a> {
         self.settled.notify_one();
         Box::pin(async { Ok(()) })
     }
@@ -160,11 +256,21 @@ impl CodeModeSessionDelegate for ReceiptEffectDelegate {
 }
 
 impl CodeModeSessionDelegate for OutputBudgetDelegate {
-    fn invoke_tool<'a>(&'a self, invocation: CodeModeNestedToolCall, _cancel: NestedCancellation) -> ToolInvocationFuture<'a> {
+    fn invoke_tool<'a>(
+        &'a self,
+        invocation: CodeModeNestedToolCall,
+        _cancel: NestedCancellation,
+    ) -> ToolInvocationFuture<'a> {
         Box::pin(async move { Ok(serde_json::json!(invocation.buffered_output_bytes)) })
     }
 
-    fn notify<'a>(&'a self, _call_id: String, _cell_id: CellId, _text: String, _cancel: CancellationToken) -> NotificationFuture<'a> {
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancel: CancellationToken,
+    ) -> NotificationFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 
@@ -174,10 +280,13 @@ impl CodeModeSessionDelegate for OutputBudgetDelegate {
 #[tokio::test]
 async fn nested_budget_counts_printed_output_not_unprinted_results() {
     let service = InProcessCodeModeSession::with_delegate(Arc::new(OutputBudgetDelegate));
-    let response = execute(&service, ExecuteRequest {
-        enabled_tools: vec![exec_command_definition()].into(),
-        yield_time_ms: None,
-        ..execute_request(r#"
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            enabled_tools: vec![exec_command_definition()].into(),
+            yield_time_ms: None,
+            ..execute_request(
+                r#"
 const first = await tools.exec_command({});
 const second = await tools.exec_command({});
 if (first !== 0 || second !== 0) throw Error('unprinted results consumed budget');
@@ -185,8 +294,11 @@ text('x'.repeat(3000));
 const used = await tools.exec_command({});
 if (used < 3000) throw Error('printed output not counted');
 text('budget accounting passed');
-"#)
-    }).await;
+"#,
+            )
+        },
+    )
+    .await;
     assert!(result_text(&response).ends_with("budget accounting passed"));
 }
 
@@ -270,15 +382,24 @@ fn runtime_request_preserves_nested_timeout_policy_independently_of_yield() {
         (None, 60_000),
         (Some(0), 0),
         (Some(75_000), 75_000),
-        (Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS), codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS),
-        (Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS + 1), codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS),
+        (
+            Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS),
+            codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS,
+        ),
+        (
+            Some(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS + 1),
+            codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS,
+        ),
     ] {
         let request = runtime_request(ExecuteRequest {
             yield_time_ms: Some(120_000),
             default_tool_timeout_ms,
             ..execute_request("text('done');")
         });
-        assert_eq!(request.default_tool_timeout_ms, expected, "{default_tool_timeout_ms:?}");
+        assert_eq!(
+            request.default_tool_timeout_ms, expected,
+            "{default_tool_timeout_ms:?}"
+        );
         assert_eq!(request.source, "text('done');");
     }
 }
@@ -516,26 +637,34 @@ text(JSON.stringify({ names: ALL_TOOL_NAMES, resolved: resolve_tool("sample_tool
 async fn tool_callables_reuse_cell_catalog_but_not_changed_capabilities() {
     let service = InProcessCodeModeSession::new();
     for description in ["first schema", "changed schema"] {
-        let response = execute(&service, ExecuteRequest {
-            enabled_tools: vec![ToolDefinition {
-                description: description.into(),
-                ..exec_command_definition()
-            }].into(),
-            source: r#"
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                enabled_tools: vec![ToolDefinition {
+                    description: description.into(),
+                    ..exec_command_definition()
+                }]
+                .into(),
+                source: r#"
 const resolved = resolve_tool("exec_command");
 if (resolved !== tools.exec_command || resolved !== exec || resolved !== shell)
     throw new Error("callable was reconstructed");
 tools.exec_command = null;
 if (resolve_tool("exec_command") !== resolved) throw new Error("resolver trusted mutable tools");
 text(resolved.description);
-"#.into(),
-            ..execute_request("")
-        }).await;
+"#
+                .into(),
+                ..execute_request("")
+            },
+        )
+        .await;
         assert_eq!(result_text(&response), description);
     }
-    let response = execute(&service, execute_request(
-        "text(resolve_tool('exec_command') === undefined)"
-    )).await;
+    let response = execute(
+        &service,
+        execute_request("text(resolve_tool('exec_command') === undefined)"),
+    )
+    .await;
     assert_eq!(result_text(&response), "true");
 }
 
@@ -550,7 +679,8 @@ async fn discovered_tools_are_callable_and_namespace_aliases_keep_exact_dispatch
                 tool_name: ToolName::plain("web__run"),
                 description: "web schema".into(),
                 ..exec_command_definition()
-            }].into(),
+            }]
+            .into(),
             source: r#"
 const web = await resolve_tool("web__run");
 text({name: web.name, description: web.description, metadata: JSON.parse(JSON.stringify(web))});
@@ -653,7 +783,8 @@ async fn resolve_tool_accepts_the_namespace_identity_reported_by_tool_search() {
                 // One identity registered twice must not dispatch arbitrarily.
                 namespaced("mcp__dup__first", "mcp__dup", "run"),
                 namespaced("mcp__dup__second", "mcp__dup", "run"),
-            ].into(),
+            ]
+            .into(),
             source: r#"
 const fetch = resolve_tool("mcp__github._fetch");
 text({name: fetch.name, description: fetch.description});
@@ -800,8 +931,11 @@ async fn oversized_store_rejects_all_writes_from_the_cell() {
 #[tokio::test]
 async fn rejected_store_can_compact_settled_evidence_without_rerunning_producers() {
     let session = InProcessCodeModeSession::new();
-    let response = execute(&session, ExecuteRequest {
-        source: format!(r#"
+    let response = execute(
+        &session,
+        ExecuteRequest {
+            source: format!(
+                r#"
             let producers = 0;
             const batch = await Promise.allSettled([Promise.resolve(++producers)]);
             store("prior", "preserved");
@@ -811,24 +945,48 @@ async fn rejected_store_can_compact_settled_evidence_without_rerunning_producers
             if (!rejected || producers !== 1) throw new Error("admission fixture failed");
             store("batch", batch);
             text("retained");
-        "#, MAX_SESSION_STORED_VALUE_BYTES + 1),
-        yield_time_ms: None,
-        ..execute_request("")
-    }).await;
-    assert!(matches!(response, RuntimeResponse::Result { error_text: None, .. }), "{response:?}");
-    let response = execute(&session, ExecuteRequest {
-        source: r#"text([load("prior"), load("batch")]);"#.to_string(),
-        yield_time_ms: None,
-        ..execute_request("")
-    }).await;
-    let RuntimeResponse::Result { error_text: None, content_items, .. } = response else {
+        "#,
+                MAX_SESSION_STORED_VALUE_BYTES + 1
+            ),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            response,
+            RuntimeResponse::Result {
+                error_text: None,
+                ..
+            }
+        ),
+        "{response:?}"
+    );
+    let response = execute(
+        &session,
+        ExecuteRequest {
+            source: r#"text([load("prior"), load("batch")]);"#.to_string(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    let RuntimeResponse::Result {
+        error_text: None,
+        content_items,
+        ..
+    } = response
+    else {
         panic!("compacted evidence must commit: {response:?}");
     };
     let [FunctionCallOutputContentItem::InputText { text }] = content_items.as_slice() else {
         panic!("expected retained evidence");
     };
-    assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap(),
-        serde_json::json!(["preserved", [{"status":"fulfilled","value":1}]]));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text).unwrap(),
+        serde_json::json!(["preserved", [{"status":"fulfilled","value":1}]])
+    );
 }
 
 #[tokio::test]
@@ -1046,8 +1204,10 @@ text("second");"#
 #[tokio::test]
 async fn date_and_intl_format_with_icu_data() {
     let service = InProcessCodeModeSession::new();
-    let response = execute(&service, ExecuteRequest {
-        source: r#"
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: r#"
 const date = new Date("2025-01-02T03:04:05Z");
 const options = {
   weekday: "long", month: "long", day: "numeric",
@@ -1056,18 +1216,27 @@ const options = {
 };
 text(date.toLocaleString("fr-FR", options));
 text(new Intl.DateTimeFormat("fr-FR", options).format(date));
-"#.into(),
-        yield_time_ms: None,
-        ..execute_request("")
-    }).await;
-    assert_eq!(response, RuntimeResponse::Result {
-        output_loss: None,
-        cell_id: response_cell_id(&response),
-        content_items: vec![FunctionCallOutputContentItem::InputText {
-            text: "jeudi 2 janvier \u{e0} 03:04:05".into(),
-        }; 2],
-        error_text: None,
-    });
+"#
+            .into(),
+            yield_time_ms: None,
+            ..execute_request("")
+        },
+    )
+    .await;
+    assert_eq!(
+        response,
+        RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: response_cell_id(&response),
+            content_items: vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "jeudi 2 janvier \u{e0} 03:04:05".into(),
+                };
+                2
+            ],
+            error_text: None,
+        }
+    );
     service.shutdown().await.unwrap();
 }
 
@@ -1423,7 +1592,13 @@ async fn wait_reports_missing_cell_separately_from_runtime_results() {
         .await
         .unwrap();
 
-    let WaitOutcome::MissingCell(RuntimeResponse::Result { cell_id: id, content_items, error_text: Some(error), output_loss }) = response else {
+    let WaitOutcome::MissingCell(RuntimeResponse::Result {
+        cell_id: id,
+        content_items,
+        error_text: Some(error),
+        output_loss,
+    }) = response
+    else {
         panic!("expected missing-cell receipt");
     };
     assert_eq!(id, cell_id("missing"));

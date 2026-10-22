@@ -273,13 +273,17 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
             )
             with (
                 self.subTest(stderr=stderr),
-                mock.patch.object(dev_env_doctor, "run_owned", return_value=completed) as run,
+                mock.patch.object(
+                    dev_env_doctor, "run_owned", return_value=completed
+                ) as run,
             ):
                 self.assertEqual(
                     dev_env_doctor.run_version(["pnpm", "--version"]), "10.34.0"
                 )
                 self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
-                self.assertEqual(run.call_args.kwargs["env"]["RUSTUP_AUTO_INSTALL"], "0")
+                self.assertEqual(
+                    run.call_args.kwargs["env"]["RUSTUP_AUTO_INSTALL"], "0"
+                )
 
     def test_run_version_uses_stderr_when_stdout_is_empty(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -443,10 +447,20 @@ class VscodeRuntimeProofTest(unittest.TestCase):
             return path
 
         with (
-            mock.patch.object(vscode_runtime_proof.shutil, "which", return_value=paths[0]),
-            mock.patch.object(vscode_runtime_proof, "desktop_target", return_value=paths[1]),
-            mock.patch.object(vscode_runtime_proof, "extension_candidates", return_value=paths[2:] + [paths[0]]),
-            mock.patch.object(vscode_runtime_proof, "run_version", side_effect=version) as run,
+            mock.patch.object(
+                vscode_runtime_proof.shutil, "which", return_value=paths[0]
+            ),
+            mock.patch.object(
+                vscode_runtime_proof, "desktop_target", return_value=paths[1]
+            ),
+            mock.patch.object(
+                vscode_runtime_proof,
+                "extension_candidates",
+                return_value=paths[2:] + [paths[0]],
+            ),
+            mock.patch.object(
+                vscode_runtime_proof, "run_version", side_effect=version
+            ) as run,
         ):
             probes = vscode_runtime_proof.build_probes(True)
         self.assertEqual(run.call_count, 4)
@@ -549,8 +563,12 @@ class VscodeRuntimeProofTest(unittest.TestCase):
             home = Path(temp_dir)
             extensions = home / ".vscode" / "extensions"
             # Create in reverse order so filesystem insertion order cannot pass.
-            for relative in ("z-extension/codex.exe", "a-extension/codex.exe",
-                             "a-extension/codex", "a-extension/unrelated.exe"):
+            for relative in (
+                "z-extension/codex.exe",
+                "a-extension/codex.exe",
+                "a-extension/codex",
+                "a-extension/unrelated.exe",
+            ):
                 binary = extensions / relative
                 binary.parent.mkdir(parents=True, exist_ok=True)
                 binary.write_bytes(b"")
@@ -562,9 +580,15 @@ class VscodeRuntimeProofTest(unittest.TestCase):
                     with self.subTest(limit=limit):
                         matches = vscode_runtime_proof.extension_candidates(limit=limit)
                         self.assertEqual(
-                            [Path(path).relative_to(extensions).as_posix() for path in matches],
-                            ["a-extension/codex", "a-extension/codex.exe",
-                             "z-extension/codex.exe"][:limit],
+                            [
+                                Path(path).relative_to(extensions).as_posix()
+                                for path in matches
+                            ],
+                            [
+                                "a-extension/codex",
+                                "a-extension/codex.exe",
+                                "z-extension/codex.exe",
+                            ][:limit],
                         )
 
     def test_extension_candidates_skip_vsix_staging_folders(self) -> None:
@@ -771,36 +795,66 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 ({}, ["$/properties/PATH/type:removed"]),
             ):
                 with self.subTest(existing=existing, replacement=replacement):
-                    current = {**baseline, "properties": {**(existing or {}), "PATH": replacement}}
+                    current = {
+                        **baseline,
+                        "properties": {**(existing or {}), "PATH": replacement},
+                    }
                     # PATH previously used the map's string contract. Naming
                     # it must not silently change values accepted on the wire.
                     self.assertEqual(compare(baseline, current), expected)
 
         for fallback, replacement, issue in (
-            ({"$ref": "#/definitions/Text"}, {"$ref": "#/definitions/Count"}, "$/properties/PATH/$ref:changed"),
-            ({"type": "object", "properties": {"value": {"type": "string"}}},
-             {"type": "object", "properties": {"value": {"type": "integer"}}},
-             "$/properties/PATH/properties/value/type:changed"),
+            (
+                {"$ref": "#/definitions/Text"},
+                {"$ref": "#/definitions/Count"},
+                "$/properties/PATH/$ref:changed",
+            ),
+            (
+                {"type": "object", "properties": {"value": {"type": "string"}}},
+                {"type": "object", "properties": {"value": {"type": "integer"}}},
+                "$/properties/PATH/properties/value/type:changed",
+            ),
         ):
             baseline = {"additionalProperties": fallback}
-            self.assertEqual(compare(baseline, {**baseline, "properties": {"PATH": fallback}}), [])
-            self.assertEqual(compare(baseline, {**baseline, "properties": {"PATH": replacement}}), [issue])
+            self.assertEqual(
+                compare(baseline, {**baseline, "properties": {"PATH": fallback}}), []
+            )
+            self.assertEqual(
+                compare(baseline, {**baseline, "properties": {"PATH": replacement}}),
+                [issue],
+            )
 
     def test_typed_map_guard_preserves_optional_property_policy(self):
         compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
         # The existing stable API policy permits optional fields on ordinary
-        # objects. Only an explicitly constrained map has a prior value type.
-        for fallback in (None, True, False, {}, {"description": "unconstrained"}):
+        # open objects. Closed response decoders reject even optional additions.
+        for fallback in (None, True, {}, {"description": "unconstrained"}):
             baseline = {"type": "object"}
             if fallback is not None:
                 baseline["additionalProperties"] = fallback
             current = {**baseline, "properties": {"tag": {"type": "string"}}}
             self.assertEqual(compare(baseline, current), [])
-            self.assertEqual(compare(baseline, {**current, "required": ["tag"]}), ["$/required:added"])
+            self.assertEqual(
+                compare(baseline, {**current, "required": ["tag"]}),
+                ["$/required:added"],
+            )
+        closed = {"type": "object", "additionalProperties": False}
+        self.assertEqual(compare(closed, closed), [])
+        self.assertEqual(
+            compare(closed, {**closed, "properties": {"tag": {"type": "string"}}}),
+            ["$/properties/tag:added"],
+        )
         # Literal data that resembles schema keywords is not a schema object.
         self.assertEqual(
-            compare({"const": {"additionalProperties": {"type": "string"}}},
-                    {"const": {"additionalProperties": {"type": "string"}, "properties": {"PATH": {"type": "integer"}}}}),
+            compare(
+                {"const": {"additionalProperties": {"type": "string"}}},
+                {
+                    "const": {
+                        "additionalProperties": {"type": "string"},
+                        "properties": {"PATH": {"type": "integer"}},
+                    }
+                },
+            ),
             ["$/const/properties:added"],
         )
 
@@ -814,13 +868,27 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             schema.parent.mkdir(parents=True)
             schema.write_text(json.dumps(current), encoding="utf-8")
             with (
-                mock.patch.object(app_server_schema_runtime_check, "load_schema_at_baseline", return_value=baseline),
+                mock.patch.object(
+                    app_server_schema_runtime_check,
+                    "load_schema_at_baseline",
+                    return_value=baseline,
+                ),
                 contextlib.redirect_stdout(io.StringIO()),
                 contextlib.redirect_stderr(io.StringIO()) as error,
             ):
-                self.assertEqual(app_server_schema_runtime_check.run_stable_compatibility_check(root, "contract"), 1)
+                self.assertEqual(
+                    app_server_schema_runtime_check.run_stable_compatibility_check(
+                        root, "contract"
+                    ),
+                    1,
+                )
                 self.assertIn(issue, error.getvalue())
-                self.assertEqual(app_server_schema_runtime_check.run_stable_compatibility_check(root, "contract", [issue]), 0)
+                self.assertEqual(
+                    app_server_schema_runtime_check.run_stable_compatibility_check(
+                        root, "contract", [issue]
+                    ),
+                    0,
+                )
             self.assertEqual(json.loads(schema.read_text(encoding="utf-8")), current)
 
     def test_membership_order_is_not_a_schema_break_but_membership_changes_are(self):
@@ -859,8 +927,16 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
     def test_command_launch_errors_preserve_exit_classification(self) -> None:
         for module in (config_schema_check, app_server_schema_runtime_check):
             for command, error, expected in (
-                ("cargo", FileNotFoundError(2, "No such file or directory", "cargo"), 127),
-                ("just", FileNotFoundError(2, "No such file or directory", "just"), 127),
+                (
+                    "cargo",
+                    FileNotFoundError(2, "No such file or directory", "cargo"),
+                    127,
+                ),
+                (
+                    "just",
+                    FileNotFoundError(2, "No such file or directory", "just"),
+                    127,
+                ),
                 ("tool", PermissionError("denied"), 1),
             ):
                 with (
@@ -871,7 +947,9 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 ):
                     self.assertEqual(module.run([command], cwd=Path.cwd()), expected)
                     run.assert_called_once_with([command], cwd=Path.cwd())
-                    self.assertIn(f"Could not run {command}: {error}", stderr.getvalue())
+                    self.assertIn(
+                        f"Could not run {command}: {error}", stderr.getvalue()
+                    )
                     self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_new_constraint_maps_remain_breaking_changes(self):
@@ -914,6 +992,155 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 ),
                 [f"$/{keyword}:changed"],
             )
+
+    def test_combinator_members_use_additive_rules_but_union_edits_break(self):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+
+        def member(tag, **properties):
+            return {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": [tag]},
+                    "id": {"type": "string"},
+                    **properties,
+                },
+                "required": ["id", "type"],
+            }
+
+        optional = {"anyOf": [{"$ref": "#/definitions/Provenance"}, {"type": "null"}]}
+        for keyword in ("oneOf", "anyOf", "allOf", "prefixItems"):
+            baseline = {keyword: [member("a"), member("b")]}
+            with self.subTest(keyword=keyword):
+                # An optional field on an existing open member is as additive
+                # as on a standalone object; ThreadItem variants gain such fields.
+                self.assertEqual(
+                    compare(
+                        baseline,
+                        {keyword: [member("a", environment=optional), member("b")]},
+                    ),
+                    [],
+                )
+                for current in (
+                    [member("a"), member("b"), member("c")],
+                    [member("a")],
+                    [member("b"), member("a")],
+                    [
+                        {**member("a"), "required": ["environment", "id", "type"]},
+                        member("b"),
+                    ],
+                    [
+                        member("a", type={"type": "string", "enum": ["a", "c"]}),
+                        member("b"),
+                    ],
+                    [member("a", id={"type": "integer"}), member("b")],
+                    [
+                        {"allOf": [member("a"), {"not": {"required": ["error"]}}]},
+                        member("b"),
+                    ],
+                ):
+                    self.assertEqual(
+                        compare(baseline, {keyword: current}), [f"$/{keyword}:changed"]
+                    )
+                closed = {**member("a"), "additionalProperties": False}
+                self.assertEqual(
+                    compare(
+                        {keyword: [closed]},
+                        {
+                            keyword: [
+                                {
+                                    **closed,
+                                    "properties": {
+                                        **closed["properties"],
+                                        "environment": optional,
+                                    },
+                                }
+                            ]
+                        },
+                    ),
+                    [f"$/{keyword}:changed"],
+                )
+
+    def test_negated_schemas_report_additive_looking_edits(self):
+        compare = app_server_schema_runtime_check.stable_schema_compatibility_issues
+        # A narrower `not` schema accepts more values, so member and property
+        # additions there are breaks; annotations remain ignored.
+        envelope = {"not": {"anyOf": [{"required": ["result"], "title": "Result"}]}}
+        self.assertEqual(
+            compare(
+                envelope,
+                {"not": {"anyOf": [{"required": ["result"], "title": "Renamed"}]}},
+            ),
+            [],
+        )
+        self.assertEqual(
+            compare(
+                envelope,
+                {
+                    "not": {
+                        "anyOf": [
+                            {
+                                "required": ["result"],
+                                "properties": {"result": {"type": "null"}},
+                            }
+                        ]
+                    }
+                },
+            ),
+            ["$/not:changed"],
+        )
+        self.assertEqual(
+            compare(
+                {"not": {"properties": {}}},
+                {"not": {"properties": {"result": {"type": "null"}}}},
+            ),
+            ["$/not:changed"],
+        )
+
+    def test_additive_union_member_passes_public_compatibility_check(self):
+        search = {
+            "type": "object",
+            "properties": {"type": {"type": "string", "enum": ["webSearch"]}},
+            "required": ["type"],
+        }
+        baseline = {"definitions": {"v2": {"ThreadItem": {"oneOf": [search]}}}}
+        current = {
+            "definitions": {
+                "v2": {
+                    "ThreadItem": {
+                        "oneOf": [
+                            {
+                                **search,
+                                "properties": {
+                                    **search["properties"],
+                                    "status": {"type": ["string", "null"]},
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            schema = root / app_server_schema_runtime_check.STABLE_SCHEMA_BUNDLE
+            schema.parent.mkdir(parents=True)
+            schema.write_text(json.dumps(current), encoding="utf-8")
+            with (
+                mock.patch.object(
+                    app_server_schema_runtime_check,
+                    "load_schema_at_baseline",
+                    return_value=baseline,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as error,
+            ):
+                self.assertEqual(
+                    app_server_schema_runtime_check.run_stable_compatibility_check(
+                        root, "contract"
+                    ),
+                    0,
+                )
+            self.assertEqual(error.getvalue(), "")
 
     def test_logged_command_quotes_arguments_with_spaces(self) -> None:
         stdout = io.StringIO()
@@ -1151,6 +1378,7 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 "sdk/python/scripts/generate.py",
                 "sdk/python/pyproject.toml",
                 "sdk/python/tests/test_contract_generation.py",
+                "scripts/common/generated_output_lock.py",
                 "codex-rs/app-server-protocol/schema/json/contract.json",
             )
             for relative in files:
@@ -1257,7 +1485,9 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
                 )
             self.assertEqual(
                 compare(before, after),
-                ["$/const/required:changed"] if keyword == "const" else ["$/enum:changed"],
+                ["$/const/required:changed"]
+                if keyword == "const"
+                else ["$/enum:changed"],
             )
         self.assertEqual(
             compare(
@@ -1274,9 +1504,12 @@ class SchemaWorkflowRegressionTest(unittest.TestCase):
         old = {"type": "object"}
         new = {"type": "object", "properties": {"label": {"type": "string"}}}
         self.assertEqual(compare(old, new), [])
-        self.assertEqual(compare(old, {**new, "required": ["label"]}), ["$/required:added"])
         self.assertEqual(
-            compare(old, {**new, "additionalProperties": False}), ["$/additionalProperties:added"]
+            compare(old, {**new, "required": ["label"]}), ["$/required:added"]
+        )
+        self.assertEqual(
+            compare(old, {**new, "additionalProperties": False}),
+            ["$/additionalProperties:added"],
         )
         self.assertEqual(
             compare(

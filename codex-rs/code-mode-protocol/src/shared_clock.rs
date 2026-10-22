@@ -80,8 +80,8 @@ mod tests {
     #[test]
     fn shared_monotonic_clock_is_available_and_advances() {
         let outer_start = std::time::Instant::now();
-        let first = shared_monotonic_now()
-            .expect("a supported platform exposes a shared monotonic source");
+        let first =
+            shared_monotonic_now().expect("a supported platform exposes a shared monotonic source");
         let inner_start = std::time::Instant::now();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let minimum_elapsed = inner_start.elapsed();

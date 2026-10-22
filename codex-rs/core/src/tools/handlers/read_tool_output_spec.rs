@@ -215,6 +215,7 @@ pub(crate) fn read_tool_output_output_schema(mut selector_schema: JsonSchema) ->
         "properties": {
             "artifact_id": {"type": "string"},
             "canonical_sha256": {"type": "string"},
+            "historical_authenticity": {"type": "string", "enum": ["authenticated", "unverified"], "description": "Whether retained bytes match a producer-time digest. Independent of complete delivery, full capture, or current workspace freshness. Missing legacy receipts are unverified."},
             "canonical_bytes": {"type": "integer", "minimum": 0},
             "retained_bytes": {"type": "integer", "minimum": 0},
             "complete": {"type": "boolean"},

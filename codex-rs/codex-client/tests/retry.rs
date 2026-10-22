@@ -188,13 +188,17 @@ async fn retry_budget_counts_retries_after_the_initial_request() {
         let attempts = Arc::new(AtomicU64::new(0));
         let attempts_for_op = attempts.clone();
 
-        let result = run_with_retry(retry_policy(max_retries), request, move |_request, attempt| {
-            let attempts = attempts_for_op.clone();
-            async move {
-                assert_eq!(attempts.fetch_add(1, Ordering::Relaxed), attempt);
-                Err::<(), _>(TransportError::Network("network unavailable".to_string()))
-            }
-        })
+        let result = run_with_retry(
+            retry_policy(max_retries),
+            request,
+            move |_request, attempt| {
+                let attempts = attempts_for_op.clone();
+                async move {
+                    assert_eq!(attempts.fetch_add(1, Ordering::Relaxed), attempt);
+                    Err::<(), _>(TransportError::Network("network unavailable".to_string()))
+                }
+            },
+        )
         .await;
 
         assert!(

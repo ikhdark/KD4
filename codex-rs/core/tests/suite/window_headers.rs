@@ -34,9 +34,20 @@ async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork(
                 ev_assistant_message("msg-2", "summary"),
                 ev_completed("resp-2"),
             ]),
-            sse(vec![ev_completed("resp-3")]),
-            sse(vec![ev_completed("resp-4")]),
-            sse(vec![ev_completed("resp-5")]),
+            // Turn-ending responses answer; an empty completion spends the bounded
+            // missing-answer repair on another request.
+            sse(vec![
+                ev_assistant_message("msg-3", "after compact reply"),
+                ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-4", "after resume reply"),
+                ev_completed("resp-4"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-5", "after fork reply"),
+                ev_completed("resp-5"),
+            ]),
         ],
     )
     .await;

@@ -61,11 +61,10 @@ impl SessionTask for RegularTask {
                 collaboration_mode_kind: ctx.collaboration_mode.mode,
             });
             sess.send_event(ctx.as_ref(), event).await;
-            sess.set_server_reasoning_included(/*included*/ false).await;
             let mut next_input = input;
             let mut logical_generation_budget = LogicalGenerationBudget::default();
             loop {
-                let turn_result = run_turn(
+                let turn_result = Box::pin(run_turn(
                     Arc::clone(&sess),
                     Arc::clone(&ctx),
                     Arc::clone(&turn_extension_data),
@@ -73,7 +72,7 @@ impl SessionTask for RegularTask {
                     None,
                     &mut logical_generation_budget,
                     cancellation_token.child_token(),
-                )
+                ))
                 .instrument(run_turn_span.clone())
                 .await?;
                 if !should_reenter_regular_task(
@@ -82,6 +81,11 @@ impl SessionTask for RegularTask {
                 )
                 .await
                 {
+                    // Hooks and pending-input admission have selected the final owner.
+                    // Surfaced candidates already passed this exact prepared contract;
+                    // ordinary (including absent) finals must satisfy it too. A turn that
+                    // already recorded a terminal error has no final; keep that cause.
+                    validate_final_response(&ctx, &turn_result).await?;
                     // Completion metadata is not a transcript item. Publish direct
                     // answers through the normal persisted message lifecycle so
                     // clients see them both live and when reopening the thread.
@@ -90,6 +94,7 @@ impl SessionTask for RegularTask {
                         .as_ref()
                         .and_then(|result| result.canonical_message.as_ref())
                     {
+                        ctx.turn_timing_state.record_direct_final_content();
                         sess.record_response_item_and_emit_turn_item(
                             &ctx,
                             ResponseItem::Message {
@@ -112,6 +117,26 @@ impl SessionTask for RegularTask {
     }
 }
 
+async fn validate_final_response(
+    ctx: &TurnContext,
+    result: &TurnTaskResult,
+) -> codex_protocol::error::Result<()> {
+    if result.surfaced_result.is_none()
+        && result.required_tool_terminal.is_none()
+        && let Some(schema) = ctx.final_output_json_schema.as_ref()
+        && ctx.terminal_error.lock().await.is_none()
+    {
+        schema
+            .validate_text(result.last_agent_message.as_deref())
+            .map_err(|error| {
+                codex_protocol::error::CodexErr::Fatal(format!(
+                    "Final response violates the output schema: {error}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
 async fn should_reenter_regular_task<F>(turn_result: &TurnTaskResult, has_pending_input: F) -> bool
 where
     F: Future<Output = bool>,
@@ -131,6 +156,45 @@ mod tests {
     use super::*;
     use crate::tools::context::RequiredToolTerminal;
     use crate::tools::context::RequiredToolTerminalCause;
+
+    #[tokio::test]
+    async fn required_tool_terminal_preserves_its_cause_with_an_output_schema() {
+        let (_session, mut ctx) = crate::session::tests::make_session_and_context().await;
+        ctx.final_output_json_schema = Some(
+            crate::session::turn_context::PreparedOutputSchema::prepare(
+                serde_json::json!({"type":"object", "required":["answer"],
+                "properties":{"answer":{"type":"string"}}, "additionalProperties":false}),
+            )
+            .unwrap(),
+        );
+        for cause in [
+            RequiredToolTerminalCause::Blocked,
+            RequiredToolTerminalCause::Failure,
+        ] {
+            let result = TurnTaskResult {
+                required_tool_terminal: Some(RequiredToolTerminal {
+                    call_id: "required-call".into(),
+                    cause,
+                    message: "required tool stopped the turn".into(),
+                }),
+                ..Default::default()
+            };
+            validate_final_response(&ctx, &result)
+                .await
+                .expect("a terminal tool cause is not a schema-invalid final answer");
+        }
+        assert!(
+            validate_final_response(&ctx, &TurnTaskResult::default())
+                .await
+                .is_err(),
+            "ordinary missing finals still violate the output contract"
+        );
+        let valid = TurnTaskResult {
+            last_agent_message: Some(r#"{"answer":"done"}"#.into()),
+            ..Default::default()
+        };
+        validate_final_response(&ctx, &valid).await.unwrap();
+    }
 
     #[tokio::test]
     async fn terminal_results_do_not_poll_pending_input_for_same_turn_reentry() {

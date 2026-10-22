@@ -23,7 +23,9 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
-    def test_preparing_and_interrupted_failed_bundle_recovery_is_idempotent(self) -> None:
+    def test_preparing_and_interrupted_failed_bundle_recovery_is_idempotent(
+        self,
+    ) -> None:
         for phase in ("Preparing", "Recovering"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -40,18 +42,35 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
                     (failed / "codex.exe").write_bytes(b"failed new bundle")
                     # Crash after rollback was restored, before failed-root cleanup.
                 journal = root / ".install.codex-local-publish.transaction.json"
-                journal.write_text(json.dumps({
-                    "SchemaVersion": 1, "TransactionId": "fixture", "Phase": phase,
-                    "InstallDir": str(install), "StageRoot": str(stage),
-                    "RollbackRoot": str(rollback), "HadPreviousInstall": True,
-                    "JournalPath": str(journal), "Entries": [],
-                }), encoding="utf-8")
-                command = (f". {ps_single_quote(SCRIPT)} -ImportOnly; "
-                           f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}; "
-                           f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}")
-                result = subprocess.run([self.shell, "-NoProfile", "-Command", command],
-                                        env=clean_env(), capture_output=True, text=True,
-                                        check=False, timeout=RUN_TIMEOUT_SECONDS)
+                journal.write_text(
+                    json.dumps(
+                        {
+                            "SchemaVersion": 1,
+                            "TransactionId": "fixture",
+                            "Phase": phase,
+                            "InstallDir": str(install),
+                            "StageRoot": str(stage),
+                            "RollbackRoot": str(rollback),
+                            "HadPreviousInstall": True,
+                            "JournalPath": str(journal),
+                            "Entries": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                command = (
+                    f". {ps_single_quote(SCRIPT)} -ImportOnly; "
+                    f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}; "
+                    f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}"
+                )
+                result = subprocess.run(
+                    [self.shell, "-NoProfile", "-Command", command],
+                    env=clean_env(),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=RUN_TIMEOUT_SECONDS,
+                )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual((install / "codex.exe").read_bytes(), b"previous")
                 self.assertFalse(stage.exists())
@@ -64,7 +83,10 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
         # named by the journal and its transaction-specific sibling directories.
         for phase in ("Applying", "Committed"):
             for field in ("InstallDir", "StageRoot", "RollbackRoot"):
-                with self.subTest(phase=phase, field=field), tempfile.TemporaryDirectory() as directory:
+                with (
+                    self.subTest(phase=phase, field=field),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
                     root = Path(directory)
                     install = root / "install"
                     stage = root / ".install.bundle.fixture"
@@ -75,27 +97,50 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
                         (path / "keep.txt").write_bytes(path.name.encode())
                     journal = root / ".install.codex-local-publish.transaction.json"
                     metadata = {
-                        "SchemaVersion": 1, "TransactionId": "fixture", "Phase": phase,
-                        "InstallDir": str(install), "StageRoot": str(stage),
-                        "RollbackRoot": str(rollback), "HadPreviousInstall": True,
-                        "JournalPath": str(journal), "Entries": [],
+                        "SchemaVersion": 1,
+                        "TransactionId": "fixture",
+                        "Phase": phase,
+                        "InstallDir": str(install),
+                        "StageRoot": str(stage),
+                        "RollbackRoot": str(rollback),
+                        "HadPreviousInstall": True,
+                        "JournalPath": str(journal),
+                        "Entries": [],
                     }
                     metadata[field] = str(unrelated)
                     journal.write_text(json.dumps(metadata), encoding="utf-8")
-                    before = {str(path.relative_to(root)): path.read_bytes()
-                              for path in root.rglob("*") if path.is_file()}
+                    before = {
+                        str(path.relative_to(root)): path.read_bytes()
+                        for path in root.rglob("*")
+                        if path.is_file()
+                    }
                     result = subprocess.run(
-                        [self.shell, "-NoProfile", "-Command",
-                         f". {ps_single_quote(SCRIPT)} -ImportOnly; "
-                         f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}"],
-                        env=clean_env(), capture_output=True, text=True,
-                        check=False, timeout=RUN_TIMEOUT_SECONDS,
+                        [
+                            self.shell,
+                            "-NoProfile",
+                            "-Command",
+                            f". {ps_single_quote(SCRIPT)} -ImportOnly; "
+                            f"Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)}",
+                        ],
+                        env=clean_env(),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=RUN_TIMEOUT_SECONDS,
                     )
-                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertIn("Cannot recover runtime bundle transaction", result.stderr)
+                    self.assertNotEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    self.assertIn(
+                        "Cannot recover runtime bundle transaction", result.stderr
+                    )
                     self.assertEqual(
-                        {str(path.relative_to(root)): path.read_bytes()
-                         for path in root.rglob("*") if path.is_file()}, before,
+                        {
+                            str(path.relative_to(root)): path.read_bytes()
+                            for path in root.rglob("*")
+                            if path.is_file()
+                        },
+                        before,
                     )
 
     def test_unrelated_executable_is_rejected_before_install(self) -> None:
@@ -122,7 +167,9 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
         source = SCRIPT.read_text(encoding="utf-8")
         start = source.index("function Restart-CodexDesktop {")
         end = source.index("\nfunction ", start + 1)
-        isolated_script = self.repo_root / "scripts" / "install" / "publish-local-codex.ps1"
+        isolated_script = (
+            self.repo_root / "scripts" / "install" / "publish-local-codex.ps1"
+        )
         isolated_script.parent.mkdir(parents=True, exist_ok=True)
         # Only the external Desktop action is substituted. Run the real
         # transaction, commit, cleanup and terminal error handling unchanged.
@@ -215,15 +262,28 @@ Set-PSBreakpoint -Command Get-CachedLocalPublishFileSha256 -Action {{
     def test_late_source_mutation_is_rejected_before_bundle_activation(self) -> None:
         artifacts = (
             ("codex", self.source_exe, Path("codex.exe")),
-            ("codeModeHost", self.source_code_mode_host, Path("codex-code-mode-host.exe")),
-            ("windowsSandboxSetup", self.source_windows_sandbox_setup,
-             Path("codex-resources/codex-windows-sandbox-setup.exe")),
-            ("commandRunner", self.source_command_runner,
-             Path("codex-resources/codex-command-runner.exe")),
+            (
+                "codeModeHost",
+                self.source_code_mode_host,
+                Path("codex-code-mode-host.exe"),
+            ),
+            (
+                "windowsSandboxSetup",
+                self.source_windows_sandbox_setup,
+                Path("codex-resources/codex-windows-sandbox-setup.exe"),
+            ),
+            (
+                "commandRunner",
+                self.source_command_runner,
+                Path("codex-resources/codex-command-runner.exe"),
+            ),
         )
         for name, source, relative in artifacts:
             for target_state in ("missing", "changed", "unchanged"):
-                with self.subTest(artifact=name, target_state=target_state), tempfile.TemporaryDirectory() as directory:
+                with (
+                    self.subTest(artifact=name, target_state=target_state),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
                     root = Path(directory)
                     install = root / "install"
                     before = {}
@@ -231,8 +291,13 @@ Set-PSBreakpoint -Command Get-CachedLocalPublishFileSha256 -Action {{
                         for _, artifact_source, artifact_relative in artifacts:
                             target = install / artifact_relative
                             target.parent.mkdir(parents=True, exist_ok=True)
-                            content = artifact_source.read_bytes() + b"old installed bytes"
-                            if target_state == "unchanged" and artifact_relative == relative:
+                            content = (
+                                artifact_source.read_bytes() + b"old installed bytes"
+                            )
+                            if (
+                                target_state == "unchanged"
+                                and artifact_relative == relative
+                            ):
                                 content = artifact_source.read_bytes()
                             target.write_bytes(content)
                             before[artifact_relative] = content
@@ -251,18 +316,33 @@ Set-PSBreakpoint -Command Activate-CodexRuntimeBundleTransaction -Action {{
 }} | Out-Null
 & {ps_single_quote(SCRIPT)} -SkipBuild -FastProof -RepoRoot {ps_single_quote(self.repo_root)} `
     -SourceBundleManifest {ps_single_quote(manifest)} -InstallDir {ps_single_quote(install)} `
-    -LocalCodexHome {ps_single_quote(root / 'home')} -BackupDir {ps_single_quote(root / 'backups')}
+    -LocalCodexHome {ps_single_quote(root / "home")} -BackupDir {ps_single_quote(root / "backups")}
 """
                     try:
                         result = subprocess.run(
-                            [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-                            env=clean_env(), capture_output=True, text=True,
-                            check=False, timeout=RUN_TIMEOUT_SECONDS,
+                            [
+                                self.shell,
+                                "-NoProfile",
+                                "-ExecutionPolicy",
+                                "Bypass",
+                                "-Command",
+                                command,
+                            ],
+                            env=clean_env(),
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=RUN_TIMEOUT_SECONDS,
                         )
-                        self.assertEqual(source.read_bytes(), original + b"changed after verification")
+                        self.assertEqual(
+                            source.read_bytes(),
+                            original + b"changed after verification",
+                        )
                     finally:
                         source.write_bytes(original)
-                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
                     self.assertIn(
                         f"Cannot stage runtime bundle: verified SHA-256 mismatch for {name}.",
                         " ".join(result.stderr.split()),
@@ -271,44 +351,69 @@ Set-PSBreakpoint -Command Activate-CodexRuntimeBundleTransaction -Action {{
                     self.assertNotIn("postPublishVerify:", result.stdout)
                     self.assertNotIn("publishCommitted: true", result.stdout)
                     self.assertEqual(
-                        {path.relative_to(install): path.read_bytes()
-                         for path in install.rglob("*") if path.is_file()}, before,
+                        {
+                            path.relative_to(install): path.read_bytes()
+                            for path in install.rglob("*")
+                            if path.is_file()
+                        },
+                        before,
                     )
                     if target_state == "missing":
                         self.assertFalse(install.exists())
                     else:
                         self.assert_proof_value(
-                            result.stdout, f"{name}BinaryChanged",
+                            result.stdout,
+                            f"{name}BinaryChanged",
                             "false" if target_state == "unchanged" else "true",
                         )
                     self.assert_no_publish_temps(install)
 
     def test_staging_requires_verified_artifact_digest(self) -> None:
         for digest in (None, "", "not-a-sha256"):
-            with self.subTest(digest=digest), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(digest=digest),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 install = root / "install"
                 install.mkdir()
                 target = install / "codex.exe"
                 target.write_bytes(b"old")
-                expected = "" if digest is None else f"ExpectedSha256 = {ps_single_quote(digest)};"
+                expected = (
+                    ""
+                    if digest is None
+                    else f"ExpectedSha256 = {ps_single_quote(digest)};"
+                )
                 command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
 $entry = [pscustomobject]@{{
     Name = 'codex'; SourcePath = {ps_single_quote(self.source_exe)}; {expected}
-    TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(root / 'codex.bak')}
+    TargetPath = {ps_single_quote(target)}; BackupPath = {ps_single_quote(root / "codex.bak")}
     HadPreviousTarget = $true; Changed = $true
 }}
-New-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(root / '.install.codex-local-publish.transaction.json')} `
+New-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(root / ".install.codex-local-publish.transaction.json")} `
     -InstallDir {ps_single_quote(install)} -Entries @($entry)
 """
                 result = subprocess.run(
-                    [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-                    env=clean_env(), capture_output=True, text=True,
-                    check=False, timeout=RUN_TIMEOUT_SECONDS,
+                    [
+                        self.shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        command,
+                    ],
+                    env=clean_env(),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=RUN_TIMEOUT_SECONDS,
                 )
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("verified SHA-256 is missing or invalid for codex", " ".join(result.stderr.split()))
+                self.assertIn(
+                    "verified SHA-256 is missing or invalid for codex",
+                    " ".join(result.stderr.split()),
+                )
                 self.assertEqual(target.read_bytes(), b"old")
                 self.assertFalse((root / "codex.bak").exists())
                 self.assert_no_publish_temps(install)
@@ -431,13 +536,20 @@ Write-CodexPublishTransactionJournal -Transaction $transaction
             # $transaction variable left to substitute for the durable journal.
             result = subprocess.run(
                 [
-                    self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
                     f". {ps_single_quote(SCRIPT)} -ImportOnly; "
                     f"if (-not (Recover-CodexRuntimeBundleTransaction -JournalPath {ps_single_quote(journal)})) "
                     "{ throw 'recovery did not run' }",
                 ],
-                text=True, capture_output=True, check=False,
-                env=clean_env(), timeout=RUN_TIMEOUT_SECONDS,
+                text=True,
+                capture_output=True,
+                check=False,
+                env=clean_env(),
+                timeout=RUN_TIMEOUT_SECONDS,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(target.read_bytes(), b"old")

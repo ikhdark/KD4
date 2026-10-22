@@ -15,6 +15,7 @@ pub fn is_persisted_rollout_item(item: &RolloutItem, history_mode: ThreadHistory
         RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::AdditionalContextState { .. }
         | RolloutItem::ToolManifest(_)
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::SessionMeta(_) => true,
@@ -106,13 +107,16 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
             // Legacy assistant events lack IDs; keep their canonical item for output recovery.
             // Legacy compaction markers also lack the canonical item's metadata.
             // Other legacy items are retained only when they lack a raw/legacy equivalent.
+            // Extension compatibility events can omit canonical status and errors.
             matches!(history_mode, ThreadHistoryMode::Paginated)
-                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_) | TurnItem::ContextCompaction(_))
+                || matches!(&event.item, TurnItem::Extension(_))
+                || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_) | TurnItem::AgentMessage(_) | TurnItem::CommandExecution(_) | TurnItem::ContextCompaction(_) | TurnItem::UserMessage(_) | TurnItem::DynamicToolCall(_) | TurnItem::CollabAgentToolCall(_) | TurnItem::ImageView(_))
                 || matches!(&event.item, TurnItem::DynamicToolCall(item)
                     if item.namespace.as_deref() == Some("codex.internal") && item.tool == "code_mode_cell")
         }
-        EventMsg::ItemStarted(event) => matches!(&event.item, TurnItem::DynamicToolCall(item)
-            if item.namespace.as_deref() == Some("codex.internal") && item.tool == "code_mode_cell"),
+        EventMsg::ItemStarted(event) => matches!(&event.item, TurnItem::CommandExecution(item)
+            if item.process_id.is_some()) || matches!(&event.item,
+                TurnItem::DynamicToolCall(_) | TurnItem::CollabAgentToolCall(_) | TurnItem::ImageView(_)),
         EventMsg::TokenCount(_)
         | EventMsg::PlanUpdate(_)
         | EventMsg::ThreadGoalUpdated(_)
@@ -120,6 +124,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::TurnAborted(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::TurnComplete(_)
+        | EventMsg::ImportedTurnClosed(_)
         // These have no completed TurnItem equivalent. Preserve failures and
         // host interventions in both history modes for replay and diagnosis.
         | EventMsg::Error(_)
@@ -321,14 +326,13 @@ mod tests {
                         omitted_text: Some(omitted_text),
                     },
                 );
-                let completed = EventMsg::ItemCompleted(
-                    codex_protocol::protocol::ItemCompletedEvent {
+                let completed =
+                    EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
                         thread_id: codex_protocol::ThreadId::default(),
                         turn_id: "turn-1".into(),
                         completed_at_ms: 0,
                         item,
-                    },
-                );
+                    });
                 // The emitter sends the canonical completion before its legacy mirror.
                 live_items.push(RolloutItem::EventMsg(completed.clone()));
                 expected.push(RolloutItem::EventMsg(completed.clone()));
@@ -400,4 +404,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn web_search_terminal_metadata_is_durable_in_both_history_modes() {
+        for (status, error) in [
+            ("completed", None),
+            ("failed", Some("search request failed")),
+            ("cancelled", Some("search cancelled")),
+        ] {
+            let item = serde_json::from_value(json!({
+                "type": "Extension",
+                "kind": "web.search",
+                "id": "search-1",
+                "query": "query",
+                "action": { "type": "search", "query": "query", "queries": null },
+                "status": status,
+                "error": error,
+            }))
+            .unwrap();
+            let completed = RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                codex_protocol::protocol::ItemCompletedEvent {
+                    thread_id: codex_protocol::ThreadId::default(),
+                    turn_id: "turn-1".into(),
+                    completed_at_ms: 0,
+                    item,
+                },
+            ));
+            let expected = vec![completed];
+            for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+                let persisted = persisted_rollout_items(&expected, history_mode);
+                let replayed: Vec<RolloutItem> =
+                    serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(replayed).unwrap(),
+                    serde_json::to_value(&expected).unwrap()
+                );
+            }
+        }
+    }
 }

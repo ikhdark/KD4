@@ -452,7 +452,7 @@
       "description": "Write stdin bytes to a running `command/exec` session, close stdin, or both.",
       "properties": {
         "closeStdin": {
-          "description": "Close stdin after writing `deltaBase64`, if present.",
+          "description": "Close input after queued bytes. Unix PTYs send canonical VEOF (including flushing a partial line); raw/disabled-VEOF terminals return an error. Terminal EOF is not a permanent pipe half-close.",
           "type": "boolean"
         },
         "deltaBase64": {
@@ -4743,7 +4743,7 @@
           ]
         },
         "cwd": {
-          "description": "Override the working directory for this turn and subsequent turns.",
+          "description": "Override the legacy host working directory for this and subsequent turns. When `environments` is omitted, only a selected local environment is retargeted; remote cwd values and an explicitly empty selection are preserved.",
           "type": [
             "string",
             "null"

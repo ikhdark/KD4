@@ -74,9 +74,14 @@ impl CodeModeElicitationHarness {
             loop {
                 match self.test.codex.next_event().await?.msg {
                     EventMsg::ApplyPatchApprovalRequest(approval) => return Ok(approval),
-                    EventMsg::Error(error) => anyhow::bail!("error before patch approval: {error:?}"),
+                    EventMsg::Error(error) => {
+                        anyhow::bail!("error before patch approval: {error:?}")
+                    }
                     EventMsg::TurnComplete(completed) if completed.turn_id == self.turn_id => {
-                        anyhow::bail!("turn completed before patch approval: {:?}", completed.error);
+                        anyhow::bail!(
+                            "turn completed before patch approval: {:?}",
+                            completed.error
+                        );
                     }
                     _ => {}
                 }

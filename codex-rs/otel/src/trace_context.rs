@@ -416,10 +416,13 @@ mod tests {
         for parent in [None, Some("not-a-traceparent")] {
             for state in [None, Some("vendor=value")] {
                 assert!(context_from_trace_headers(parent, state).is_none());
-                assert!(context_from_w3c_trace_context(&W3cTraceContext {
-                    traceparent: parent.map(str::to_string),
-                    tracestate: state.map(str::to_string),
-                }).is_none());
+                assert!(
+                    context_from_w3c_trace_context(&W3cTraceContext {
+                        traceparent: parent.map(str::to_string),
+                        tracestate: state.map(str::to_string),
+                    })
+                    .is_none()
+                );
             }
         }
     }
@@ -435,10 +438,13 @@ mod tests {
         assert_eq!(current_span_trace_id(), None);
         let span = trace_span!("test_span");
         let expected_trace_id = "00000000000000000000000000000001";
-        assert!(super::set_parent_from_w3c_trace_context(&span, &W3cTraceContext {
-            traceparent: Some(format!("00-{expected_trace_id}-0000000000000002-01")),
-            tracestate: None,
-        }));
+        assert!(super::set_parent_from_w3c_trace_context(
+            &span,
+            &W3cTraceContext {
+                traceparent: Some(format!("00-{expected_trace_id}-0000000000000002-01")),
+                tracestate: None,
+            }
+        ));
         let _entered = span.enter();
         let trace_id = current_span_trace_id().expect("trace id");
 

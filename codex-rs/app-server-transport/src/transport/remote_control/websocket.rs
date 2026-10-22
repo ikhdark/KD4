@@ -2,9 +2,11 @@ use super::CurrentRemoteControlEnrollment;
 use super::REMOTE_CONTROL_INSTALLATION_ID_HEADER;
 use super::RemoteControlEnrollmentSelection;
 use super::RemoteControlPairingPersistenceKey;
+use super::RemoteControlPolicyDecision;
 use super::desired_state::RemoteControlDesiredState;
 use super::desired_state::acquire_persistence_lock;
 use super::desired_state::desired_state_from_persisted_enrollment;
+use super::policy_admits_current_identity;
 use super::protocol::ClientEnvelope;
 use super::protocol::ClientEvent;
 use super::protocol::ClientId;
@@ -34,7 +36,7 @@ use axum::http::HeaderValue;
 use base64::Engine;
 use codex_app_server_protocol::RemoteControlConnectionStatus;
 use codex_app_server_protocol::RemoteControlStatusChangedNotification;
-use codex_core::retry::backoff;
+use codex_client::capped_backoff;
 use codex_http_client::RouteAwareClientPool;
 use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_login::AuthManager;
@@ -335,6 +337,7 @@ pub(crate) struct RemoteControlWebsocket {
     desired_state_rx: watch::Receiver<RemoteControlDesiredState>,
     desired_state_persistence_lock: Arc<Semaphore>,
     http_clients: RouteAwareClientPool,
+    policy_rx: Option<watch::Receiver<RemoteControlPolicyDecision>>,
 }
 
 pub(crate) struct RemoteControlWebsocketConfig {
@@ -461,6 +464,9 @@ pub(super) struct RemoteControlConnectOptions<'a> {
     desired_state_tx: &'a watch::Sender<RemoteControlDesiredState>,
     desired_state_persistence_lock: &'a Semaphore,
     http_clients: &'a RouteAwareClientPool,
+    /// Managed-requirements decision that must admit the current identity before any backend
+    /// contact for its account.
+    policy: Option<&'a watch::Receiver<RemoteControlPolicyDecision>>,
 }
 
 impl RemoteControlWebsocket {
@@ -513,7 +519,18 @@ impl RemoteControlWebsocket {
             desired_state_rx,
             desired_state_persistence_lock: channels.desired_state_persistence_lock,
             http_clients: config.http_clients,
+            policy_rx: None,
         }
+    }
+
+    /// Holds backend contact until the managed-requirements decision on `policy_rx` admits the
+    /// current identity, and retries a held connection attempt when that decision changes.
+    pub(crate) fn with_policy(
+        mut self,
+        policy_rx: watch::Receiver<RemoteControlPolicyDecision>,
+    ) -> Self {
+        self.policy_rx = Some(policy_rx);
+        self
     }
 
     #[expect(
@@ -837,6 +854,11 @@ impl RemoteControlWebsocket {
         };
 
         loop {
+            // Mark the decision seen before this attempt checks it, so a decision recorded later
+            // wakes an attempt held for managed requirements.
+            if let Some(policy_rx) = self.policy_rx.as_mut() {
+                policy_rx.mark_unchanged();
+            }
             let subscribe_cursor = self.state.lock().await.subscribe_cursor.clone();
             let enrollment = self.current_enrollment.snapshot();
             info!(
@@ -862,6 +884,7 @@ impl RemoteControlWebsocket {
                 desired_state_tx: &self.desired_state_tx,
                 desired_state_persistence_lock: &self.desired_state_persistence_lock,
                 http_clients: &self.http_clients,
+                policy: self.policy_rx.as_ref(),
             };
             let auth_context = RemoteControlAuthContext {
                 auth_manager: &self.auth_manager,
@@ -967,6 +990,9 @@ impl RemoteControlWebsocket {
                             self.auth_recovery = self.auth_manager.unauthorized_recovery();
                             self.reconnect_attempt = 0;
                             info!("retrying app-server remote control websocket after auth changed");
+                        }
+                        () = wait_for_policy_change(&mut self.policy_rx) => {
+                            info!("retrying app-server remote control websocket after managed requirements changed");
                         }
                         _ = tokio::time::sleep(reconnect_delay) => {}
                     }
@@ -1492,7 +1518,12 @@ fn build_remote_control_websocket_request(
 }
 
 fn next_reconnect_delay(reconnect_attempt: &mut u64) -> std::time::Duration {
-    let reconnect_delay = backoff(*reconnect_attempt).min(REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
+    let reconnect_delay = capped_backoff(
+        std::time::Duration::from_millis(200),
+        (*reconnect_attempt).max(1),
+        std::time::Duration::from_secs(30),
+    )
+    .min(REMOTE_CONTROL_RECONNECT_BACKOFF_CAP);
     if reconnect_delay < REMOTE_CONTROL_RECONNECT_BACKOFF_CAP {
         *reconnect_attempt = (*reconnect_attempt).saturating_add(1);
     }
@@ -1508,6 +1539,20 @@ fn reconnect_delay_after_connection_end(
         ConnectionEndReason::ConnectionWorkerStopped
     )
     .then(|| next_reconnect_delay(reconnect_attempt))
+}
+
+/// Resolves when the managed-requirements decision changes. A websocket driven without a policy
+/// (as unit tests do) never wakes here.
+async fn wait_for_policy_change(
+    policy_rx: &mut Option<watch::Receiver<RemoteControlPolicyDecision>>,
+) {
+    let Some(policy_rx) = policy_rx else {
+        return std::future::pending().await;
+    };
+    if policy_rx.changed().await.is_err() {
+        // The handle and its monitor own the sender for as long as this websocket runs.
+        std::future::pending::<()>().await;
+    }
 }
 
 pub(super) async fn connect_remote_control_websocket(
@@ -1682,6 +1727,18 @@ async fn prepare_remote_control_enrollment(
             return Err(err);
         }
     };
+    if connect_options
+        .policy
+        .is_some_and(|policy| !policy_admits_current_identity(policy, auth_context.auth_manager))
+    {
+        // The managed-requirements decision predates this account id (or denies remote
+        // control). Contact no backend for the account until a decision for the current policy
+        // epoch admits it; the connect loop retries when the decision changes.
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "remote control is waiting for managed requirements for the current account",
+        ));
+    }
     let enrollment_account_id = enrollment.as_ref().map(|enrollment| &enrollment.account_id);
     if enrollment_account_id.is_some_and(|account_id| account_id != &auth.account_id) {
         resolve_desired_state_after_account_change(
@@ -2309,7 +2366,9 @@ mod tests {
             }
             mark_recovery_auth_change_seen(&mut auth_change_rx, before_recovery);
             assert_eq!(
-                auth_change_rx.has_changed().expect("auth watch should remain open"),
+                auth_change_rx
+                    .has_changed()
+                    .expect("auth watch should remain open"),
                 changes == 2,
             );
             assert_eq!(*auth_change_rx.borrow(), changes);
@@ -2358,6 +2417,7 @@ mod tests {
         let fake_jwt = format!("{header_b64}.{payload_b64}.sig");
 
         AuthDotJson {
+            oauth_context: None,
             auth_mode: Some(AuthMode::Chatgpt),
             openai_api_key: None,
             tokens: Some(TokenData {
@@ -2432,6 +2492,7 @@ mod tests {
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
                 http_clients: &test_http_clients(),
+                policy: None,
             },
             &status_publisher,
         )
@@ -2502,6 +2563,7 @@ mod tests {
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
                 http_clients: &test_http_clients(),
+                policy: None,
             },
             &status_publisher,
         )
@@ -2593,6 +2655,7 @@ mod tests {
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
                 http_clients: &test_http_clients(),
+                policy: None,
             },
             &status_publisher,
         )
@@ -2698,6 +2761,7 @@ mod tests {
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
                 http_clients: &test_http_clients(),
+                policy: None,
             },
             &status_publisher,
         )
@@ -2816,6 +2880,7 @@ mod tests {
                             desired_state_tx: &desired_state_tx,
                             desired_state_persistence_lock: &persistence_lock,
                             http_clients: &http_clients,
+                            policy: None,
                         },
                         &status_publisher,
                     ));
@@ -2919,6 +2984,7 @@ mod tests {
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
                 http_clients: &test_http_clients(),
+                policy: None,
             },
             &status_publisher,
         )
@@ -2975,6 +3041,7 @@ mod tests {
                 desired_state_tx: &enabled_desired_state_sender(),
                 desired_state_persistence_lock: &Semaphore::new(1),
                 http_clients: &test_http_clients(),
+                policy: None,
             },
             &status_publisher,
         )
@@ -3157,9 +3224,10 @@ mod tests {
             }
         });
 
-        timeout(TEST_HTTP_ACCEPT_TIMEOUT, status_rx.wait_for(|status| {
-            status.status == RemoteControlConnectionStatus::Errored
-        }))
+        timeout(
+            TEST_HTTP_ACCEPT_TIMEOUT,
+            status_rx.wait_for(|status| status.status == RemoteControlConnectionStatus::Errored),
+        )
         .await
         .expect("connection failure should enter reconnect backoff")
         .expect("status publisher should remain live");
@@ -3177,7 +3245,9 @@ mod tests {
 
         status_publisher.publish_environment_id(/*environment_id*/ None);
         assert!(
-            !status_rx.has_changed().expect("status watch should remain open")
+            !status_rx
+                .has_changed()
+                .expect("status watch should remain open")
         );
 
         status_publisher.publish_environment_id(Some("env_first".to_string()));
@@ -3197,7 +3267,9 @@ mod tests {
 
         status_publisher.publish_environment_id(Some("env_first".to_string()));
         assert!(
-            !status_rx.has_changed().expect("status watch should remain open")
+            !status_rx
+                .has_changed()
+                .expect("status watch should remain open")
         );
 
         status_publisher.publish_status(RemoteControlConnectionStatus::Connected);
@@ -3248,7 +3320,9 @@ mod tests {
 
         status_publisher.publish_environment_id(Some("env_disabled".to_string()));
         assert!(
-            !status_rx.has_changed().expect("status watch should remain open")
+            !status_rx
+                .has_changed()
+                .expect("status watch should remain open")
         );
     }
 
@@ -3903,12 +3977,20 @@ mod tests {
         retained.sort_unstable();
         assert_eq!(
             retained,
-            vec![("client-1", "stream-1", 4), ("client-1", "stream-2", 3), ("client-2", "stream-1", 2)]
+            vec![
+                ("client-1", "stream-1", 4),
+                ("client-1", "stream-2", 3),
+                ("client-2", "stream-1", 2)
+            ]
         );
         assert_eq!(*used_rx.borrow(), 3);
         outbound_buffer.ack(&client_1, &stream_1, 4, None);
         assert_eq!(*used_rx.borrow(), 2);
-        assert!(!outbound_buffer.buffer_by_stream.contains_key(&(client_1, stream_1)));
+        assert!(
+            !outbound_buffer
+                .buffer_by_stream
+                .contains_key(&(client_1, stream_1))
+        );
     }
 
     #[test]
@@ -4194,8 +4276,13 @@ mod tests {
         // A complete, valid message: only the wire size can cause the drop.
         let raw = br#"{"jsonrpc":"2.0","method":"initialized"}"#;
         let chunk = client_chunk_envelope(
-            "client-1", "stream-1", /*seq_id*/ 4, /*segment_id*/ 0,
-            /*segment_count*/ 1, raw.len(), raw,
+            "client-1",
+            "stream-1",
+            /*seq_id*/ 4,
+            /*segment_id*/ 0,
+            /*segment_count*/ 1,
+            raw.len(),
+            raw,
         );
 
         assert!(matches!(

@@ -1,9 +1,12 @@
 pub use connection_manager::McpConnectionManager;
+pub mod event_queue;
 pub use connection_manager::McpServerCollection;
 pub use connection_manager::McpServerCollectionError;
 pub use connection_manager::tool_is_model_visible;
 pub use elicitation::ElicitationLifecycle;
 pub use elicitation::ElicitationRequestRouter;
+pub use elicitation::StartupElicitationHandler;
+pub use elicitation::StartupElicitationRoute;
 pub use resource_client::McpResourceClient;
 pub use resource_client::McpResourceClientCacheKey;
 pub use resource_client::McpResourcePage;

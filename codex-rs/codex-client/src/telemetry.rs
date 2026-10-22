@@ -42,6 +42,28 @@ pub struct TransportPhaseObservation {
 
 /// API-specific request telemetry.
 pub trait RequestTelemetry: Send + Sync {
+    /// Authentication/preparation finished; the client is handing the request
+    /// to its transport. This is not proof of network or provider receipt.
+    fn on_request_dispatched(&self) {}
+
+    /// The zero-based retry-loop attempt that actually reached transport entry.
+    /// Authentication-only failures do not call this. The default preserves
+    /// existing observers that do not need physical retry identity.
+    fn on_request_dispatched_attempt(&self, _attempt: u64) {
+        self.on_request_dispatched();
+    }
+
+    /// The polled attempt was abandoned before headers/error were returned.
+    /// No response status or provider usage is implied.
+    fn on_request_cancelled(&self, attempt: u64, duration: Duration) {
+        self.on_request(
+            attempt,
+            None,
+            Some(&TransportError::Network("request cancelled".into())),
+            duration,
+        );
+    }
+
     /// Called with truthful per-stage observations. Phases hidden inside the
     /// HTTP implementation are reported as unavailable instead of receiving a
     /// fabricated duration or reuse result.

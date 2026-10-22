@@ -19,7 +19,6 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::managed_network_requirements_loader;
 use core_test_support::require_network;
-use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_function_call;
@@ -103,6 +102,30 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
         "[package]\nname = \"validation-route-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
     )?;
     let permission = PermissionProfile::Disabled;
+    let command = json!({
+        "cmd": "cargo test --offline -p validation-route-fixture --lib --target-dir target validates_current_source -- --nocapture",
+        "workdir": fixture,
+        "yield_time_ms": 1000,
+        "max_output_tokens": 2000,
+    });
+    // A turn may not end while its own validation is live (audit 115), so each
+    // revision polls inside one turn. The log holds the active revision and the
+    // model requests that revision's turn sent.
+    let log = std::sync::Arc::new(std::sync::Mutex::new(("", Vec::<Value>::new())));
+    let responder_log = std::sync::Arc::clone(&log);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses$"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = request
+                .body_json::<Value>()
+                .expect("model request must be JSON");
+            let revision = responder_log.lock().unwrap().0;
+            let reply = validation_turn_reply(revision, &command, &body);
+            responder_log.lock().unwrap().1.push(body);
+            core_test_support::responses::sse_response(reply)
+        })
+        .mount(&server)
+        .await;
     for (revision, value, expected_success) in [("failing", 1, false), ("repaired", 2, true)] {
         fs::write(
             fixture.join("src/lib.rs"),
@@ -110,107 +133,117 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
                 "#[test]\nfn validates_current_source() {{\n println!(\"fixture revision: {revision}\");\n assert_eq!({value}, 2);\n}}\n"
             ),
         )?;
-        let mut tool = "exec_command";
-        let mut args = json!({
-            "cmd": "cargo test --offline -p validation-route-fixture --lib --target-dir target validates_current_source -- --nocapture",
-            "workdir": fixture,
-            "yield_time_ms": 1000,
-            "max_output_tokens": 2000,
-        });
-        let mut output = String::new();
-        let mut terminal_exit = None;
-        for attempt in 0..20 {
-            let call_id = format!("cargo-{revision}-{attempt}");
-            let request_log = mount_sse_sequence(
-                &server,
-                vec![
-                    sse(vec![
-                        ev_response_created("run"),
-                        ev_function_call(&call_id, tool, &args.to_string()),
-                        ev_completed("run"),
-                    ]),
-                    sse(vec![
-                        ev_assistant_message("observed", "Observed command output."),
-                        ev_completed("observed"),
-                    ]),
-                ],
-            )
-            .await;
-            submit_unified_exec_turn(
-                &test,
-                "Run the fixture validation and observe its current result.",
-                permission.clone(),
-            )
-            .await?;
-            let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
-                &test.codex,
-                |event| matches!(event, EventMsg::TurnComplete(_)),
-                Duration::from_secs(120),
-            )
-            .await
-            else {
-                unreachable!("completion predicate");
-            };
+        *log.lock().unwrap() = (revision, Vec::new());
+        submit_unified_exec_turn(
+            &test,
+            "Run the fixture validation and observe its current result.",
+            permission.clone(),
+        )
+        .await?;
+        let EventMsg::TurnComplete(completed) = wait_for_event_with_timeout(
+            &test.codex,
+            |event| matches!(event, EventMsg::TurnComplete(_)),
+            Duration::from_secs(120),
+        )
+        .await
+        else {
+            unreachable!("completion predicate");
+        };
+        let bodies = std::mem::take(&mut log.lock().unwrap().1);
+        if expected_success {
             assert!(completed.error.is_none(), "{completed:?}");
-            assert_eq!(
-                completed.last_agent_message.as_deref(),
-                Some("Observed command output.")
+        } else {
+            // No Git baseline proves that the cargo run left the fixture's
+            // sources unchanged (it is not in a repository), so its effects
+            // count as a source change and the current failure is owned work
+            // (audit 115): after the one bounded repair request the turn is not
+            // accepted as task success. Reporting an observed failure is
+            // accepted only when the turn provably changed no sources.
+            let error = completed
+                .error
+                .as_ref()
+                .context("an unresolved current failure must not be accepted")?;
+            assert!(
+                error
+                    .message
+                    .contains("Known current work remains unresolved"),
+                "{completed:?}"
             );
-            let requests = request_log.requests();
-            assert_eq!(
-                requests.len(),
-                2,
-                "the model must receive each command result"
+            let repair = bodies.last().context("bounded repair request")?.to_string();
+            assert!(
+                repair.contains("Known current work prevents final acceptance"),
+                "{repair}"
             );
-            let bodies = requests
+            assert!(
+                repair.contains("Resolve current failed validation"),
+                "{repair}"
+            );
+        }
+        assert_eq!(
+            completed.last_agent_message.as_deref(),
+            Some("Observed command output.")
+        );
+        let prefix = format!("cargo-{revision}-");
+        let calls = bodies
+            .last()
+            .and_then(|body| body["input"].as_array())
+            .context("model request input")?
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter_map(|item| item["call_id"].as_str())
+            .filter(|call_id| call_id.starts_with(&prefix))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies.len(),
+            calls.len() + if expected_success { 1 } else { 2 },
+            "the model must receive each command result; a current failure adds one bounded repair"
+        );
+        for body in &bodies {
+            let surface = body["tools"].as_array().context("model-visible tools")?;
+            let names = surface
                 .iter()
-                .map(ResponsesRequest::body_json)
+                .filter_map(|tool| tool["name"].as_str())
                 .collect::<Vec<_>>();
-            for body in &bodies {
-                let surface = body["tools"].as_array().context("model-visible tools")?;
-                let names = surface
-                    .iter()
-                    .filter_map(|tool| tool["name"].as_str())
-                    .collect::<Vec<_>>();
-                assert!(names.contains(&"exec_command"));
-                assert!(names.contains(&"write_stdin"));
-                for absent in [
-                    "semantic_context",
-                    "workspace_validation",
-                    "workspace_transaction",
-                ] {
-                    assert!(
-                        !names.contains(&absent),
-                        "unexpected callable {absent}: {names:?}"
-                    );
-                    // Check embedded Code Mode definitions too, without treating
-                    // prose references in other tools as callable registration.
-                    for tool in surface {
-                        if tool["name"] == "exec" {
-                            let description = tool["description"].as_str().unwrap_or_default();
-                            assert!(!description.contains(&format!("### {absent}\n")));
-                            assert!(!description.contains(&format!("{absent}(args:")));
-                        }
+            assert!(names.contains(&"exec_command"));
+            assert!(names.contains(&"write_stdin"));
+            for absent in [
+                "semantic_context",
+                "workspace_validation",
+                "workspace_transaction",
+            ] {
+                assert!(
+                    !names.contains(&absent),
+                    "unexpected callable {absent}: {names:?}"
+                );
+                // Check embedded Code Mode definitions too, without treating
+                // prose references in other tools as callable registration.
+                for tool in surface {
+                    if tool["name"] == "exec" {
+                        let description = tool["description"].as_str().unwrap_or_default();
+                        assert!(!description.contains(&format!("### {absent}\n")));
+                        assert!(!description.contains(&format!("{absent}(args:")));
                     }
                 }
             }
-            let outputs = collect_tool_outputs(&bodies)?;
+        }
+        let outputs = collect_tool_outputs(&bodies)?;
+        let mut output = String::new();
+        let mut terminal_exit = None;
+        for (index, call_id) in calls.iter().enumerate() {
             let result = outputs
-                .get(&call_id)
+                .get(call_id)
                 .context("command result was not model-visible")?;
             output.push_str(&result.output);
-            if let Some(exit) = result.exit_code {
-                terminal_exit = Some(exit);
+            if index + 1 == calls.len() {
+                terminal_exit = result.exit_code;
                 assert!(result.process_id.is_none());
-                break;
+            } else {
+                assert!(
+                    result.exit_code.is_none(),
+                    "only the last poll may be terminal: {result:?}"
+                );
             }
-            let session_id = result
-                .process_id
-                .as_ref()
-                .context("live command needs a session ID")?
-                .parse::<u32>()?;
-            tool = "write_stdin";
-            args = json!({"session_id": session_id, "incarnation": result.incarnation, "yield_time_ms": 1000, "max_output_tokens": 2000});
         }
         let exit = terminal_exit.context("validation must finish, not leave a live process")?;
         assert_eq!(exit == 0, expected_success, "exit {exit}: {output}");
@@ -244,6 +277,74 @@ async fn cargo_validation_failure_then_current_pass_without_workspace_tools() ->
     );
     assert!(!test.config.codex_home.join("validation-cache").exists());
     Ok(())
+}
+
+/// Scripted model for one validation turn, decided from the request alone so a
+/// retried request gets the same reply. It launches the command, polls the live
+/// process until the terminal result is model-visible, then answers. A request
+/// after that answer (the completion gate's bounded repair) gets the same answer.
+fn validation_turn_reply(revision: &str, command: &Value, body: &Value) -> String {
+    let prefix = format!("cargo-{revision}-");
+    let latest = body["input"]
+        .as_array()
+        .expect("model request input must be an array")
+        .iter()
+        .rev()
+        .find(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"]
+                    .as_str()
+                    .is_some_and(|call_id| call_id.starts_with(&prefix))
+        });
+    let Some(latest) = latest else {
+        let call_id = format!("{prefix}0");
+        return sse(vec![
+            ev_response_created(&call_id),
+            ev_function_call(&call_id, "exec_command", &command.to_string()),
+            ev_completed(&call_id),
+        ]);
+    };
+    let result = parse_unified_exec_output(
+        extract_output_text(latest).expect("command result must be text"),
+    )
+    .expect("command result must be unified exec output");
+    if result.exit_code.is_some() {
+        return sse(vec![
+            ev_response_created("observed"),
+            ev_assistant_message("observed", "Observed command output."),
+            ev_completed("observed"),
+        ]);
+    }
+    let attempt = latest["call_id"]
+        .as_str()
+        .and_then(|call_id| call_id.strip_prefix(&prefix))
+        .and_then(|attempt| attempt.parse::<usize>().ok())
+        .expect("scripted call ID");
+    assert!(
+        attempt < 40,
+        "validation must finish, not leave a live process"
+    );
+    let session_id = result
+        .process_id
+        .as_deref()
+        .expect("live command needs a session ID")
+        .parse::<u32>()
+        .expect("session IDs are numeric");
+    let incarnation = result
+        .incarnation
+        .expect("a poll must name the live process incarnation");
+    let args = json!({
+        "session_id": session_id,
+        "incarnation": incarnation,
+        "yield_time_ms": 1000,
+        "max_output_tokens": 2000,
+    });
+    let call_id = format!("{prefix}{}", attempt + 1);
+    sse(vec![
+        ev_response_created(&call_id),
+        ev_function_call(&call_id, "write_stdin", &args.to_string()),
+        ev_completed(&call_id),
+    ])
 }
 
 fn extract_output_text(item: &Value) -> Option<&str> {

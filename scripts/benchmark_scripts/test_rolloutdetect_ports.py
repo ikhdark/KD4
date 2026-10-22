@@ -1,4 +1,5 @@
 """Validation-ledger regression retained with its KD4 producer."""
+
 import unittest
 
 
@@ -9,7 +10,11 @@ class RolloutDetectPortsTest(unittest.TestCase):
 
         row = record()
         row.update(input_coverage="complete", input_digest="digest")
-        row["proof"].update(freshness="current", freshness_basis={"source": "fixture"}, coverage="verified")
+        row["proof"].update(
+            freshness="current",
+            freshness_basis={"source": "fixture"},
+            coverage="verified",
+        )
         row["proof"].pop("status")
         report = metrics.summarize([row])
         self.assertEqual(report["launches"], 1)

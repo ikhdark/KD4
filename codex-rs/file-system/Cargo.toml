@@ -29,3 +29,4 @@ doctest = false
 
 [dev-dependencies]
 futures = { workspace = true, features = ["executor"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization"] }

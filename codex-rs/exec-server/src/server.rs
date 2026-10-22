@@ -34,6 +34,15 @@ pub async fn run_main_with_telemetry(
     transport::run_transport(listen_url, runtime_paths, telemetry).await
 }
 
+pub async fn run_main_with_shutdown(
+    listen_url: &str,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    shutdown: crate::ExecServerShutdown,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    transport::run_transport_with_shutdown(listen_url, runtime_paths, telemetry, shutdown).await
+}
+
 #[cfg(test)]
 mod tests {
     use opentelemetry::trace::TracerProvider as _;

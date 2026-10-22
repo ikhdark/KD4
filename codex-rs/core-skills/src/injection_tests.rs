@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 fn make_skill(name: &str, path: &str) -> SkillMetadata {
     SkillMetadata {
+        source: None,
         name: name.to_string(),
         description: format!("{name} skill"),
         short_description: None,
@@ -32,7 +33,11 @@ fn mention_name_predicates_share_namespaced_ascii_grammar() {
     for byte in 0_u8..=u8::MAX {
         let expected = allowed.contains(&byte);
         assert_eq!(is_mention_name_char(byte), expected, "byte {byte:#04x}");
-        assert_eq!(is_mention_name_char_char(char::from(byte)), expected, "char {byte:#04x}");
+        assert_eq!(
+            is_mention_name_char_char(char::from(byte)),
+            expected,
+            "char {byte:#04x}"
+        );
     }
     assert!(!is_mention_name_char_char('界'));
 }
@@ -51,7 +56,12 @@ fn linked_skill_mention(name: &str, unix_path: &str) -> String {
 fn skill_injection_renders_as_the_context_fragment() {
     for (scope, role, label, contents) in [
         (SkillScope::System, "system", "system", "Review carefully."),
-        (SkillScope::Admin, "developer", "admin", "Keep review comments concise."),
+        (
+            SkillScope::Admin,
+            "developer",
+            "admin",
+            "Keep review comments concise.",
+        ),
         (SkillScope::Repo, "user", "repo", "Review carefully."),
         (SkillScope::User, "user", "user", "Review carefully."),
     ] {
@@ -63,9 +73,12 @@ fn skill_injection_renders_as_the_context_fragment() {
         };
         assert_eq!(skill.role(), role);
         assert_eq!(skill.markers(), ("<skill>", "</skill>"));
-        assert_eq!(skill.body(), format!(
-            "\n<name>review</name>\n<path>/tmp/review/SKILL.md</path>\n<scope>{label}</scope>\n{contents}\n"
-        ));
+        assert_eq!(
+            skill.body(),
+            format!(
+                "\n<name>review</name>\n<path>/tmp/review/SKILL.md</path>\n<scope>{label}</scope>\n{contents}\n"
+            )
+        );
     }
 }
 
@@ -168,14 +181,23 @@ async fn selected_host_resolution_is_authoritative_after_file_changes() {
 #[test]
 fn text_mentions_skill_requires_exact_boundary() {
     for (text, names) in [
-        ("use $notion-research-doc please", vec!["notion-research-doc"]),
+        (
+            "use $notion-research-doc please",
+            vec!["notion-research-doc"],
+        ),
         ("($notion-research-doc)", vec!["notion-research-doc"]),
         ("$notion-research-doc.", vec!["notion-research-doc"]),
         ("$notion-research-docs", vec!["notion-research-docs"]),
-        ("$notion-research-doc_extra", vec!["notion-research-doc_extra"]),
+        (
+            "$notion-research-doc_extra",
+            vec!["notion-research-doc_extra"],
+        ),
         ("$alpha-skill", vec!["alpha-skill"]),
         ("$alpha-skillx", vec!["alpha-skillx"]),
-        ("$alpha-skillx and later $alpha-skill ", vec!["alpha-skillx", "alpha-skill"]),
+        (
+            "$alpha-skillx and later $alpha-skill ",
+            vec!["alpha-skillx", "alpha-skill"],
+        ),
     ] {
         assert_mentions(text, &names, &[]);
     }
@@ -190,16 +212,32 @@ fn text_mentions_skill_handles_many_dollars_without_looping() {
 #[test]
 fn extract_tool_mentions_handles_plain_and_linked_mentions() {
     for (text, names, paths) in [
-        ("use $alpha and [$beta](/tmp/beta)", vec!["alpha", "beta"], vec!["/tmp/beta"]),
+        (
+            "use $alpha and [$beta](/tmp/beta)",
+            vec!["alpha", "beta"],
+            vec!["/tmp/beta"],
+        ),
         ("use $PATH and $alpha", vec!["alpha"], vec![]),
         ("use [$HOME](/tmp/skill)", vec![], vec![]),
         ("use $XDG_CONFIG_HOME and $beta", vec!["beta"], vec![]),
         ("[beta](/tmp/beta)", vec![], vec![]),
         ("[$beta] /tmp/beta", vec!["beta"], vec![]),
         ("[$beta]()", vec!["beta"], vec![]),
-        ("use [$beta]   ( /tmp/beta )", vec!["beta"], vec!["/tmp/beta"]),
-        ("use $alpha.skill and $beta_extra", vec!["alpha", "beta_extra"], vec![]),
-        ("use $slack:search and $alpha", vec!["alpha", "slack:search"], vec![]),
+        (
+            "use [$beta]   ( /tmp/beta )",
+            vec!["beta"],
+            vec!["/tmp/beta"],
+        ),
+        (
+            "use $alpha.skill and $beta_extra",
+            vec!["alpha", "beta_extra"],
+            vec![],
+        ),
+        (
+            "use $slack:search and $alpha",
+            vec!["alpha", "slack:search"],
+            vec![],
+        ),
     ] {
         assert_mentions(text, &names, &paths);
     }
@@ -213,13 +251,42 @@ fn markdown_examples_do_not_invoke_skills() {
         "```rust\n$danger\n```\n$safe",
         "~~~~\n[$danger](skill:danger)\n~~~~\n$safe",
         "    $danger\n$safe",
-        "> $danger\n$safe",
+        "> $danger\n\n$safe",
         "\\$danger $safe",
     ] {
         assert_mentions(text, &["safe"], &[]);
     }
     assert_mentions("```\n$danger", &[], &[]);
     assert_mentions("[$safe](skill:safe)", &["safe"], &["skill:safe"]);
+}
+
+#[tokio::test]
+async fn quoted_markdown_does_not_select_or_read_skill_instructions() {
+    let skill = make_skill("danger", "/nonexistent/danger/SKILL.md");
+    for text in [
+        "Explain this excerpt:\n\n> The README says use\n$danger\n\nDo not invoke it.",
+        "> $danger\n$safe",
+        "> nested\n> - quoted\n>   [$danger](skill:danger)",
+        "文档\n\n> quoted\n[$danger](skill:danger)",
+        "~~~text\n$danger",
+        "    [$danger](skill:danger)",
+    ] {
+        assert_mentions(text, &[], &[]);
+        let selected = collect_mentions(
+            &[UserInput::Text {
+                text: text.to_string(),
+                text_elements: Vec::new(),
+            }],
+            std::slice::from_ref(&skill),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let plan = plan_skill_injections(&selected, None).await;
+        assert!(selected.is_empty());
+        assert!(plan.injections.items.is_empty());
+        assert!(plan.injections.warnings.is_empty());
+        assert!(plan.invocations.is_empty());
+    }
 }
 
 #[test]
@@ -258,7 +325,10 @@ fn linked_mentions_preserve_balanced_parentheses_and_exact_end_offsets() {
             assert!(mentions.plain_names.is_empty());
         }
     }
-    for text in ["[$sample](/tmp/(open/SKILL.md)", "[$sample](/tmp/(nested)/SKILL.md"] {
+    for text in [
+        "[$sample](/tmp/(open/SKILL.md)",
+        "[$sample](/tmp/(nested)/SKILL.md",
+    ] {
         assert_eq!(parse_linked_tool_mention(text, 0, '$'), None);
     }
 }
@@ -478,4 +548,3 @@ fn collect_explicit_skill_mentions_skips_missing_path_with_no_fallback() {
         );
     }
 }
-

@@ -327,14 +327,28 @@ mod tests {
         assert_eq!(doctor_report_tags(&report), expected);
         let mut legacy_report = report.clone();
         legacy_report["checks"] = Value::Array(
-            report["checks"].as_object().expect("keyed checks").values().cloned().collect(),
+            report["checks"]
+                .as_object()
+                .expect("keyed checks")
+                .values()
+                .cloned()
+                .collect(),
         );
         assert_eq!(doctor_report_tags(&legacy_report), expected);
-        for value in ["é".repeat(MAX_DOCTOR_TAG_VALUE_LEN), "x".repeat(MAX_DOCTOR_TAG_VALUE_LEN)] {
+        for value in [
+            "é".repeat(MAX_DOCTOR_TAG_VALUE_LEN),
+            "x".repeat(MAX_DOCTOR_TAG_VALUE_LEN),
+        ] {
             assert_eq!(truncate_tag_value(&value), value);
             assert_eq!(
                 truncate_tag_value(&format!("{value}x")),
-                format!("{}...", value.chars().take(MAX_DOCTOR_TAG_VALUE_LEN - 3).collect::<String>())
+                format!(
+                    "{}...",
+                    value
+                        .chars()
+                        .take(MAX_DOCTOR_TAG_VALUE_LEN - 3)
+                        .collect::<String>()
+                )
             );
         }
     }

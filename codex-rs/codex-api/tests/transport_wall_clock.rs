@@ -79,6 +79,8 @@ enum Script {
 #[derive(Default)]
 struct Observations {
     scripts: VecDeque<Script>,
+    connections: usize,
+    completions: usize,
     /// Instant the complete request was read, and its body bytes on the wire.
     requests: Vec<(Instant, u64)>,
     /// Paced: one mark per flushed event. Burst and large item: write start and end.
@@ -93,12 +95,31 @@ impl Server {
         self.0.lock().unwrap().scripts.push_back(script);
     }
 
-    fn request_read(&self, wire_bytes: u64) -> Script {
+    fn request_read(&self, wire_bytes: u64) -> (Script, usize) {
         let read_at = Instant::now();
         let mut observations = self.0.lock().unwrap();
         observations.requests.push((read_at, wire_bytes));
         observations.marks.clear();
-        observations.scripts.pop_front().unwrap_or(Script::Complete)
+        (
+            observations.scripts.pop_front().unwrap_or(Script::Complete),
+            observations.requests.len(),
+        )
+    }
+
+    fn connected(&self) {
+        self.0.lock().unwrap().connections += 1;
+    }
+    fn completing(&self) {
+        self.0.lock().unwrap().completions += 1;
+    }
+    fn assert_reused(&self, requests: usize) {
+        let observed = self.0.lock().unwrap();
+        assert_eq!(
+            observed.connections, 1,
+            "fixture must use one physical connection"
+        );
+        assert_eq!(observed.requests.len(), requests);
+        assert_eq!(observed.completions, requests);
     }
 
     fn mark(&self) {
@@ -197,19 +218,26 @@ async fn serve_websocket(socket: TcpStream, server: Server, deflate: bool) {
         tokio_tungstenite::accept_async_with_config(socket, Some(server_ws_config(deflate)))
             .await
             .unwrap();
+    server.connected();
     let mut consumed = 0;
     while let Some(Ok(message)) = ws.next().await {
         let Message::Text(_) = message else {
             continue;
         };
         let total = read.load(Ordering::Relaxed);
-        let script = server.request_read(total - consumed);
+        let (script, ordinal) = server.request_read(total - consumed);
+        let response = FixtureResponse::new(ordinal, script);
         consumed = total;
+        for event in response.prefix() {
+            ws.send(Message::Text(event.into())).await.unwrap();
+        }
         match script {
             Script::Complete => {}
             Script::Paced { events, gap } => {
                 for index in 0..events {
-                    ws.send(Message::Text(delta(index).into())).await.unwrap();
+                    ws.send(Message::Text(response.delta(index).into()))
+                        .await
+                        .unwrap();
                     server.mark();
                     tokio::time::sleep(gap).await;
                 }
@@ -217,23 +245,38 @@ async fn serve_websocket(socket: TcpStream, server: Server, deflate: bool) {
             Script::Burst { events } => {
                 server.mark();
                 for index in 0..events {
-                    ws.feed(Message::Text(delta(index).into())).await.unwrap();
+                    ws.feed(Message::Text(response.delta(index).into()))
+                        .await
+                        .unwrap();
                 }
                 ws.flush().await.unwrap();
                 server.mark();
             }
             Script::LargeItem { bytes } => {
-                let item = large_item(bytes);
+                assert_eq!(
+                    response.text.as_ref().unwrap().len(),
+                    corpus_slice(0, bytes).len()
+                );
+                let item = response.done().unwrap();
                 server.mark();
                 ws.send(Message::Text(item.into())).await.unwrap();
                 server.mark();
             }
         }
-        ws.send(Message::Text(completed().into())).await.unwrap();
+        if !matches!(script, Script::LargeItem { .. })
+            && let Some(done) = response.done()
+        {
+            ws.send(Message::Text(done.into())).await.unwrap();
+        }
+        server.completing();
+        ws.send(Message::Text(response.completed().into()))
+            .await
+            .unwrap();
     }
 }
 
 async fn serve_http(socket: TcpStream, server: Server) {
+    server.connected();
     let mut socket = BufReader::new(socket);
     let mut line = String::new();
     let mut discard = vec![0; 64 * KIB];
@@ -260,7 +303,8 @@ async fn serve_http(socket: TcpStream, server: Server) {
             socket.read_exact(&mut discard[..read]).await.unwrap();
             remaining -= read;
         }
-        let script = server.request_read(content_length as u64);
+        let (script, ordinal) = server.request_read(content_length as u64);
+        let response = FixtureResponse::new(ordinal, script);
         let stream = socket.get_mut();
         stream
             .write_all(
@@ -268,11 +312,14 @@ async fn serve_http(socket: TcpStream, server: Server) {
             )
             .await
             .unwrap();
+        for event in response.prefix() {
+            write_chunk(stream, sse(&event).as_bytes()).await;
+        }
         match script {
             Script::Complete => {}
             Script::Paced { events, gap } => {
                 for index in 0..events {
-                    write_chunk(stream, sse(&delta(index)).as_bytes()).await;
+                    write_chunk(stream, sse(&response.delta(index)).as_bytes()).await;
                     server.mark();
                     tokio::time::sleep(gap).await;
                 }
@@ -280,14 +327,18 @@ async fn serve_http(socket: TcpStream, server: Server) {
             Script::Burst { events } => {
                 let mut body = Vec::new();
                 for index in 0..events {
-                    push_chunk(&mut body, sse(&delta(index)).as_bytes());
+                    push_chunk(&mut body, sse(&response.delta(index)).as_bytes());
                 }
                 server.mark();
                 stream.write_all(&body).await.unwrap();
                 server.mark();
             }
             Script::LargeItem { bytes } => {
-                let event = sse(&large_item(bytes));
+                assert_eq!(
+                    response.text.as_ref().unwrap().len(),
+                    corpus_slice(0, bytes).len()
+                );
+                let event = sse(&response.done().unwrap());
                 server.mark();
                 for piece in event.as_bytes().chunks(16 * KIB) {
                     write_chunk(stream, piece).await;
@@ -295,7 +346,13 @@ async fn serve_http(socket: TcpStream, server: Server) {
                 server.mark();
             }
         }
-        write_chunk(stream, sse(&completed()).as_bytes()).await;
+        if !matches!(script, Script::LargeItem { .. })
+            && let Some(done) = response.done()
+        {
+            write_chunk(stream, sse(&done).as_bytes()).await;
+        }
+        server.completing();
+        write_chunk(stream, sse(&response.completed()).as_bytes()).await;
         stream.write_all(b"0\r\n\r\n").await.unwrap();
     }
 }
@@ -316,24 +373,57 @@ fn sse(data: &str) -> String {
     format!("data: {data}\n\n")
 }
 
-fn delta(index: usize) -> String {
-    json!({"type": "response.output_text.delta", "delta": index.to_string()}).to_string()
+struct FixtureResponse {
+    id: String,
+    item_id: String,
+    text: Option<String>,
 }
 
-fn large_item(bytes: usize) -> String {
-    json!({
-        "type": "response.output_item.done",
-        "item": {
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": corpus_slice(0, bytes)}],
-        },
-    })
-    .to_string()
-}
+impl FixtureResponse {
+    fn new(ordinal: usize, script: Script) -> Self {
+        let text = match script {
+            Script::Complete => None,
+            Script::Paced { events, .. } | Script::Burst { events } => {
+                Some((0..events).map(|i| i.to_string()).collect())
+            }
+            Script::LargeItem { bytes } => Some(corpus_slice(0, bytes).to_string()),
+        };
+        Self {
+            id: format!("resp-{ordinal}"),
+            item_id: format!("msg-{ordinal}"),
+            text,
+        }
+    }
 
-fn completed() -> String {
-    json!({"type": "response.completed", "response": {"id": "resp-loopback"}}).to_string()
+    fn item(&self, text: &str) -> serde_json::Value {
+        json!({"id":self.item_id,"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})
+    }
+
+    fn prefix(&self) -> Vec<String> {
+        let mut events =
+            vec![json!({"type":"response.created","response":{"id":self.id}}).to_string()];
+        if self.text.is_some() {
+            events.push(json!({"type":"response.output_item.added","response_id":self.id,"output_index":0,"item":self.item("")}).to_string());
+        }
+        events
+    }
+
+    fn delta(&self, index: usize) -> String {
+        json!({"type":"response.output_text.delta","response_id":self.id,"item_id":self.item_id,"output_index":0,"delta":index.to_string()}).to_string()
+    }
+
+    fn done(&self) -> Option<String> {
+        self.text.as_ref().map(|text| json!({"type":"response.output_item.done","response_id":self.id,"output_index":0,"item":self.item(text)}).to_string())
+    }
+
+    fn completed(&self) -> String {
+        let output = self
+            .text
+            .iter()
+            .map(|text| self.item(text))
+            .collect::<Vec<_>>();
+        json!({"type":"response.completed","response":{"id":self.id,"output":output}}).to_string()
+    }
 }
 
 /// Non-repeating workspace source text, so compression ratios resemble real requests.
@@ -355,7 +445,7 @@ fn corpus() -> &'static str {
         }
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut files = Vec::new();
-        for crate_dir in ["core", "tui", "app-server", "protocol"] {
+        for crate_dir in ["core", "app-server", "protocol"] {
             collect(&root.join(crate_dir).join("src"), &mut files);
         }
         files.sort();
@@ -514,6 +604,8 @@ impl Mark {
 struct Delivery {
     deltas: Vec<Instant>,
     item: Option<Instant>,
+    text: Option<String>,
+    response_id: String,
 }
 
 /// Collects delivery instants and checks that deltas arrive complete and in order.
@@ -521,6 +613,8 @@ async fn consume(mut stream: ResponseStream, expected_deltas: usize) -> Delivery
     let mut deltas = Vec::with_capacity(expected_deltas);
     let mut item = None;
     let mut completions = 0;
+    let mut text = None;
+    let mut response_id = String::new();
     while let Some(event) = stream.next().await {
         let delivered_at = Instant::now();
         match event.expect("loopback stream must not fail") {
@@ -528,14 +622,49 @@ async fn consume(mut stream: ResponseStream, expected_deltas: usize) -> Delivery
                 assert_eq!(delta.parse::<usize>().unwrap(), deltas.len(), "delta order");
                 deltas.push(delivered_at);
             }
-            ResponseEvent::OutputItemDone(_) => item = Some(delivered_at),
-            ResponseEvent::Completed { .. } => completions += 1,
+            ResponseEvent::OutputItemDone(ResponseItem::Message { content, .. }) => {
+                assert!(
+                    item.replace(delivered_at).is_none(),
+                    "exactly one final item"
+                );
+                text = Some(
+                    content
+                        .into_iter()
+                        .map(|part| match part {
+                            ContentItem::OutputText { text } => text,
+                            _ => panic!("unexpected fixture output"),
+                        })
+                        .collect::<String>(),
+                );
+            }
+            ResponseEvent::Completed {
+                response_id: id, ..
+            } => {
+                completions += 1;
+                response_id = id;
+            }
             _ => {}
         }
     }
     assert_eq!(deltas.len(), expected_deltas);
     assert_eq!(completions, 1);
-    Delivery { deltas, item }
+    if expected_deltas > 0 {
+        assert_eq!(
+            text.as_deref(),
+            Some(
+                (0..expected_deltas)
+                    .map(|i| i.to_string())
+                    .collect::<String>()
+                    .as_str()
+            )
+        );
+    }
+    Delivery {
+        deltas,
+        item,
+        text,
+        response_id,
+    }
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -602,7 +731,7 @@ async fn http_dispatch_wall_clock() {
                     .await
                     .unwrap();
                 let headers_at = Instant::now();
-                consume(stream, 0).await;
+                assert!(consume(stream, 0).await.text.is_none());
                 let (read_at, wire_bytes) = server.last_request();
                 if iteration >= WARMUP {
                     build.push(dispatched.get() - started);
@@ -633,6 +762,7 @@ async fn websocket_dispatch_wall_clock() {
             move |socket| serve_websocket(socket, server.clone(), deflate)
         });
         let connection = ws_connection(address).await;
+        let mut requests = 0;
         for bytes in DISPATCH_SIZES {
             let (mut encode, mut queue, mut send, mut to_server) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -645,7 +775,7 @@ async fn websocket_dispatch_wall_clock() {
                 let stream = connection
                     .stream_request_with_dispatch_ready(
                         &request,
-                        iteration > 0,
+                        requests > 0,
                         None,
                         {
                             let queued = queued.clone();
@@ -660,7 +790,8 @@ async fn websocket_dispatch_wall_clock() {
                     .await
                     .unwrap();
                 let sent_at = Instant::now();
-                consume(stream, 0).await;
+                assert!(consume(stream, 0).await.text.is_none());
+                requests += 1;
                 let (read_at, wire_bytes) = server.last_request();
                 if iteration >= WARMUP {
                     encode.push(queued.get() - started);
@@ -680,6 +811,7 @@ async fn websocket_dispatch_wall_clock() {
                 summary(to_server),
             ));
         }
+        server.assert_reused(DISPATCH_SIZES.len() * (WARMUP + SAMPLES));
     }
 }
 
@@ -695,6 +827,9 @@ where
         Script::Complete | Script::LargeItem { .. } => 0,
     };
     let delivery = consume(start().await, expected).await;
+    if let Script::LargeItem { bytes } = script {
+        assert_eq!(delivery.text.as_deref(), Some(corpus_slice(0, bytes)));
+    }
     (server.marks(), delivery)
 }
 
@@ -786,15 +921,74 @@ async fn websocket_delivery_wall_clock() {
             move |socket| serve_websocket(socket, server.clone(), deflate)
         });
         let connection = Arc::new(ws_connection(address).await);
+        let mut reused = false;
         delivery_benchmarks(&format!("websocket deflate={deflate}"), &server, || {
             let connection = Arc::clone(&connection);
+            let connection_reused = std::mem::replace(&mut reused, true);
             async move {
                 connection
-                    .stream_request(ws_request(4 * KIB, 0), true, None)
+                    .stream_request(ws_request(4 * KIB, 0), connection_reused, None)
                     .await
                     .unwrap()
             }
         })
         .await;
+        server.assert_reused(2 + 5 + 3 * 5);
     }
+}
+
+#[tokio::test]
+async fn websocket_fixture_reuses_one_socket_with_complete_identified_output() {
+    let server = Server::default();
+    let address = spawn_server({
+        let server = server.clone();
+        move |socket| serve_websocket(socket, server.clone(), false)
+    });
+    let connection = ws_connection(address).await;
+    let mut ids = Vec::new();
+    for reused in [false, true] {
+        server.script(Script::Burst { events: 3 });
+        let delivery = consume(
+            connection
+                .stream_request(ws_request(0, 0), reused, None)
+                .await
+                .unwrap(),
+            3,
+        )
+        .await;
+        assert_eq!(delivery.text.as_deref(), Some("012"));
+        ids.push(delivery.response_id);
+        assert!(!connection.is_closed().await);
+    }
+    assert_ne!(ids[0], ids[1]);
+    server.assert_reused(2);
+}
+
+#[tokio::test]
+async fn ambiguous_legacy_websocket_fixture_still_retires_the_socket() {
+    let address = spawn_server(|socket| async move {
+        let mut ws =
+            tokio_tungstenite::accept_async_with_config(socket, Some(server_ws_config(true)))
+                .await
+                .unwrap();
+        assert!(matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+        ws.send(Message::Text(
+            json!({"type":"response.completed","response":{"id":"legacy"}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+    });
+    let connection = ws_connection(address).await;
+    consume(
+        connection
+            .stream_request(ws_request(0, 0), false, None)
+            .await
+            .unwrap(),
+        0,
+    )
+    .await;
+    assert!(connection.is_closed().await);
 }

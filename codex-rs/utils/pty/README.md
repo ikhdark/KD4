@@ -18,10 +18,12 @@ background descendants.
 - `combine_output_receivers(stdout_rx, stderr_rx)` → lossy `broadcast::Receiver<Vec<u8>>`. Slow
   consumers can lag and lose chunks, so use the split receivers for exact output.
 - `ProcessHandle` exposes:
-  - `writer_sender()` → `mpsc::Sender<Vec<u8>>` (stdin) and `close_stdin()`
+  - `writer_sender()` → `mpsc::Sender<Vec<u8>>` (stdin); `close_stdin()` drops the owner's sender
+  - `close_stdin_ordered().await` acknowledges pipe input close or canonical Unix VEOF after
+    queued input; raw/disabled-VEOF terminals return an error. Drop external sender clones first.
   - `resize(TerminalSize)` and `signal(ProcessSignal)`
   - `has_exited()` and `exit_code()`
-  - `request_terminate()` kills the process tree and leaves the readers draining
+  - `request_terminate()` cancels the Windows Job or Unix initial process group and leaves readers draining
   - `finish()` releases an exited child without signalling it; `terminate()` does both
   - `release_pty_after_exit()` closes stdin and releases the pseudoconsole
 - `conpty_supported()` → `bool` (Windows build check; always true elsewhere)
@@ -34,8 +36,14 @@ Output can arrive after the exit notification, so drain the split receivers unti
 Pipe output closes once every holder of the child's pipe handles exits. ConPTY keeps its output
 pipe open until the pseudoconsole is released, so the PTY waiter releases it when the root exits;
 the reader then delivers the final frame and closes. `finish()` aborts pipe readers because
-descendants can hold inherited handles indefinitely, but lets a ConPTY reader drain for up to two
-seconds.
+descendants can hold inherited handles indefinitely, but lets native PTY readers drain for up to
+two seconds. `output_capture()` records native EOF separately from forced reader shutdown;
+receiver closure alone does not certify complete capture.
+
+Unix `signal(Interrupt)` uses the PTY foreground group on Linux; platforms without an
+identity-safe terminal signal operation report Unsupported. Pipe interrupts retain group semantics.
+Canonical terminal EOF uses the configured VEOF twice to flush a partial line before an empty
+read. This is terminal input, not a permanent pipe half-close, and raw mode cannot provide it.
 
 ## Usage example
 

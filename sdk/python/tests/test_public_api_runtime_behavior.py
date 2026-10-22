@@ -55,7 +55,7 @@ def test_codex_init_failure_closes_client(monkeypatch: pytest.MonkeyPatch) -> No
         def start(self) -> None:
             return None
 
-        def initialize(self) -> InitializeResponse:
+        def initialize(self, **kwargs) -> InitializeResponse:
             return InitializeResponse.model_validate({})
 
         def close(self) -> None:
@@ -78,7 +78,7 @@ def test_async_codex_init_failure_closes_client() -> None:
         async def fake_start() -> None:
             return None
 
-        async def fake_initialize() -> InitializeResponse:
+        async def fake_initialize(**kwargs) -> InitializeResponse:
             return InitializeResponse.model_validate({})
 
         async def fake_close() -> None:
@@ -112,7 +112,7 @@ def test_async_codex_initializes_only_once_under_concurrency() -> None:
             nonlocal start_calls
             start_calls += 1
 
-        async def fake_initialize() -> InitializeResponse:
+        async def fake_initialize(**kwargs) -> InitializeResponse:
             nonlocal initialize_calls
             initialize_calls += 1
             ready.set()

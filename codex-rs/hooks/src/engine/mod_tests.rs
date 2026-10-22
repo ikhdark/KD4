@@ -84,7 +84,10 @@ fn assert_whole_hook_instruction_spill(visible: &str, original: &str) {
     let (_, path) = visible
         .split_once("Full hook output saved to: ")
         .expect("complete instructions must have a recovery source");
-    assert_eq!(fs::read(path).expect("recover hook instructions"), original.as_bytes());
+    assert_eq!(
+        fs::read(path).expect("recover hook instructions"),
+        original.as_bytes()
+    );
     fs::remove_file(path).expect("remove recovered test output");
 }
 
@@ -155,13 +158,24 @@ async fn stop_exit_two_never_admits_truncated_instructions() {
             } else {
                 assert!(fragment.text.contains("instruction is incomplete"));
                 assert!(fragment.text.contains("entire instruction was omitted"));
-                assert!(fragment.text.contains("no complete recovery source is available"));
-                assert!(fragment.text.contains("Do not automatically replay the hook"));
+                assert!(
+                    fragment
+                        .text
+                        .contains("no complete recovery source is available")
+                );
+                assert!(
+                    fragment
+                        .text
+                        .contains("Do not automatically replay the hook")
+                );
                 assert!(!fragment.text.contains("instruction-prefix"));
                 assert!(!fragment.text.contains("instruction-suffix"));
                 assert!(!fragment.text.contains("Full hook output saved to:"));
                 assert!(fragment.text.len() < 1024);
-                assert_eq!(outcome.block_reason.as_deref(), Some(fragment.text.as_str()));
+                assert_eq!(
+                    outcome.block_reason.as_deref(),
+                    Some(fragment.text.as_str())
+                );
             }
             assert_eq!(
                 completed.run.entries,
@@ -188,7 +202,8 @@ async fn stopped_post_tool_feedback_spills_whole_instructions() {
         "reason": instruction,
     });
     fs::write(temp.path().join("hook-output.txt"), output.to_string()).expect("hook output");
-    let mut engine = scoped_engine_for(HookEventName::PostToolUse, codex_config::HookRunScope::Turn);
+    let mut engine =
+        scoped_engine_for(HookEventName::PostToolUse, codex_config::HookRunScope::Turn);
     #[cfg(windows)]
     let command = "type hook-output.txt & exit /b 0";
     #[cfg(not(windows))]
@@ -809,19 +824,23 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
     assert_eq!(outcome.hook_events.len(), 1);
     assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Completed);
     let log_contents = fs::read_to_string(log_path).expect("read managed hook log");
-    let payload: serde_json::Value = serde_json::from_str(&log_contents).expect("one input payload");
-    assert_eq!(payload, serde_json::json!({
-        "session_id": session_id.to_string(),
-        "turn_id": "turn-1",
-        "transcript_path": null,
-        "cwd": expected_cwd,
-        "hook_event_name": "PreToolUse",
-        "model": "gpt-test",
-        "permission_mode": "default",
-        "tool_name": "Bash",
-        "tool_use_id": "tool-1",
-        "tool_input": {"command": "echo hello"},
-    }));
+    let payload: serde_json::Value =
+        serde_json::from_str(&log_contents).expect("one input payload");
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "session_id": session_id.to_string(),
+            "turn_id": "turn-1",
+            "transcript_path": null,
+            "cwd": expected_cwd,
+            "hook_event_name": "PreToolUse",
+            "model": "gpt-test",
+            "permission_mode": "default",
+            "tool_name": "Bash",
+            "tool_use_id": "tool-1",
+            "tool_input": {"command": "echo hello"},
+        })
+    );
 }
 
 #[tokio::test]
@@ -1176,24 +1195,36 @@ async fn user_once_per_state_cannot_suppress_managed_hook_dispatches() {
         .expect("config layer stack")
     };
     let initial = stack_with_state(serde_json::json!({}));
-    let discovered = super::discovery::discover_handlers(
-        Some(&initial), Vec::new(), Vec::new(), false,
-    );
+    let discovered =
+        super::discovery::discover_handlers(Some(&initial), Vec::new(), Vec::new(), false);
     let entry = &discovered.hook_entries[0];
     assert!(entry.is_managed);
     let stack = stack_with_state(serde_json::json!({
         (entry.key.clone()): {"once_per": "session"}
     }));
     let engine = ClaudeHooksEngine::new(
-        true, false, Some(&stack), Vec::new(), Vec::new(),
-        CommandShell { program: String::new(), args: Vec::new() },
+        true,
+        false,
+        Some(&stack),
+        Vec::new(),
+        Vec::new(),
+        CommandShell {
+            program: String::new(),
+            args: Vec::new(),
+        },
     );
     let session_id = ThreadId::new();
     // Like user `enabled = false`, a user-supplied run limit must not disable
     // a managed policy handler on later matching tool calls.
     for turn in ["turn-1", "turn-2"] {
-        let outcome = engine.run_pre_tool_use(scoped_request(session_id, turn, "tool")).await;
-        assert_eq!(outcome.hook_events.len(), 1, "managed handler must run in {turn}");
+        let outcome = engine
+            .run_pre_tool_use(scoped_request(session_id, turn, "tool"))
+            .await;
+        assert_eq!(
+            outcome.hook_events.len(),
+            1,
+            "managed handler must run in {turn}"
+        );
         assert_eq!(outcome.hook_events[0].run.status, HookRunStatus::Completed);
     }
 }
@@ -1757,7 +1788,8 @@ fn managed_only_policy_filters_json_toml_and_plugin_hooks_even_when_trust_is_byp
         root.join("hooks.json"),
         serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [{
             "type": "command", "command": "echo json"
-        }]}]}}).to_string(),
+        }]}]}})
+        .to_string(),
     )
     .expect("write hooks.json");
     let plugin_sources = vec![PluginHookSource {

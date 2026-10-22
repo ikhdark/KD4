@@ -83,7 +83,7 @@ fn check(
                 command,
             )
             .and_then(|(_, script)| {
-                codex_shell_command::validation::standalone_powershell_argv(script)
+                codex_shell_command::powershell::standalone_powershell_inspection_argv(script)
             }),
             ShellType::Bash | ShellType::Sh | ShellType::Zsh => command
                 .last()
@@ -126,8 +126,15 @@ fn check(
                 cwd,
             ));
         }
-        if parsed.is_none() && !inspection_only && args.iter().any(|script| visibly_builds(script))
-        {
+        let visible_build = match shell {
+            ShellType::Bash | ShellType::Sh | ShellType::Zsh => args.last().is_some_and(|script| {
+                codex_shell_command::bash::possible_command_argvs(script)
+                    .iter()
+                    .any(|argv| visibly_builds_argv(argv, 0))
+            }),
+            _ => args.iter().any(|script| visibly_builds(script)),
+        };
+        if parsed.is_none() && !inspection_only && visible_build {
             return Err(rejected_build(
                 "Cannot resolve a raw Cargo build's effective target through this script, which names a Cargo build token but could not be parsed into separate commands. Reissue it as standalone argv, or as a command whose program is recognizably read-only, so the effective target can be resolved.",
                 cwd,
@@ -619,32 +626,51 @@ fn workspace_root(
     Ok(directory.to_path_buf())
 }
 
-fn resolved(path: &Path) -> PathBuf {
-    // Resolve the longest existing ancestor, including junctions, then append
-    // absent children. Lexical normalization alone would miss a lane alias.
-    if let Ok(path) = dunce::canonicalize(path) {
-        return path;
-    }
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                result.pop();
+fn resolved(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| rejected("Cannot resolve the current directory."))?
+            .join(path)
+    };
+    // Canonicalize the ORIGINAL existing prefix, before removing any '..'.
+    // alias/../absent follows alias first, just as the filesystem does.
+    for ancestor in absolute.ancestors() {
+        if let Ok(mut base) = dunce::canonicalize(ancestor) {
+            let suffix = absolute
+                .strip_prefix(ancestor)
+                .map_err(|_| rejected("Cannot resolve the Cargo directory suffix."))?;
+            for component in suffix.components() {
+                match component {
+                    // Resolving through an absent component would require
+                    // creating it first. Do not guess away a later symlink.
+                    Component::ParentDir => {
+                        return Err(rejected(
+                            "Cannot prove ownership through an absent parent traversal.",
+                        ));
+                    }
+                    Component::CurDir => {}
+                    other => base.push(other.as_os_str()),
+                }
             }
-            Component::CurDir => {}
-            other => result.push(other.as_os_str()),
+            return Ok(base);
+        }
+        // Permission failures/dangling links are not evidence of absence.
+        if let Err(error) = std::fs::symlink_metadata(ancestor)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(rejected("Cannot establish Cargo directory ownership."));
+        }
+        if std::fs::symlink_metadata(ancestor).is_ok() {
+            return Err(rejected("Cannot canonicalize an existing Cargo directory."));
         }
     }
-    for ancestor in result.ancestors() {
-        if let Ok(base) = dunce::canonicalize(ancestor) {
-            return base.join(result.strip_prefix(ancestor).unwrap_or(Path::new("")));
-        }
-    }
-    result
+    Err(rejected("Cannot establish Cargo directory ownership."))
 }
 
 fn managed_target(path: &Path) -> Result<Option<PathBuf>, String> {
-    let path = resolved(path);
+    let path = resolved(path)?;
     for root in path.ancestors() {
         // The existing lane owner publishes this marker for default and custom
         // roots. Honor it anywhere, independent of checkout, crate or lane name.
@@ -655,7 +681,7 @@ fn managed_target(path: &Path) -> Result<Option<PathBuf>, String> {
         }
         // Preserve the pre-marker core lane reservation in older checkouts.
         if root.join("codex-rs/.config/kd4-rust-tests.toml").is_file() {
-            let lane = resolved(&root.join("codex-rs/target/lanes/core-tests"));
+            let lane = resolved(&root.join("codex-rs/target/lanes/core-tests"))?;
             let protected = if cfg!(windows) {
                 Path::new(&path.to_string_lossy().to_ascii_lowercase())
                     .starts_with(lane.to_string_lossy().to_ascii_lowercase())
@@ -819,81 +845,41 @@ fn read_only_inspection_program(program: &str) -> bool {
 }
 
 fn visibly_builds(script: &str) -> bool {
-    // Statement/block separators are retained as words so a Cargo name can
-    // be told apart from a Cargo invocation: only a name in command position
-    // starts a build. Quoted newlines/braces remain data; preserve the existing
-    // treatment of other operators, including command substitutions. Commas
-    // and assignments separate words, not commands, so process lists such as
-    // `Get-Process cargo,rustc` do not become invocations.
-    let mut words: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    for ch in script.chars() {
-        if matches!(ch, '\'' | '"') {
-            if quote == Some(ch) {
-                quote = None;
-            } else if quote.is_none() {
-                quote = Some(ch);
-            }
-        }
-        if matches!(ch, ';' | '|' | '&' | '(' | ')')
-            || (quote.is_none() && matches!(ch, '{' | '}' | '\r' | '\n'))
-        {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            words.push(ch.to_string());
-        } else if ch.is_whitespace() || matches!(ch, '{' | '}' | ',' | '=' | '\'' | '"') {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(ch);
-        }
+    visibly_builds_at_depth(script, 0)
+}
+
+fn visibly_builds_at_depth(script: &str, depth: usize) -> bool {
+    if depth > 4 {
+        return true;
     }
-    if !current.is_empty() {
-        words.push(current);
+    super::possible_powershell_commands(script)
+        .iter()
+        .any(|argv| visibly_builds_argv(argv, depth))
+}
+
+fn visibly_builds_argv(argv: &[String], depth: usize) -> bool {
+    if depth > 4 {
+        return true;
     }
-    words.iter().enumerate().any(|(index, word)| {
-        if !program_name(word).eq_ignore_ascii_case("cargo") {
-            return false;
-        }
-        // Command position: script start, or just after a separator or a
-        // PowerShell/sh call operator.
-        let in_command_position = match index.checked_sub(1).and_then(|prev| words.get(prev)) {
-            None => true,
-            Some(previous) => matches!(
-                previous.as_str(),
-                ";" | "|"
-                    | "&"
-                    | "("
-                    | ")"
-                    | "{"
-                    | "}"
-                    | "\r"
-                    | "\n"
-                    | "&&"
-                    | "||"
-                    | "."
-                    | "exec"
-                    | "command"
-            ),
+    if potential_build(argv) {
+        return true;
+    }
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    let binary = program_name(program).to_ascii_lowercase();
+    if matches!(binary.as_str(), "env" | "command" | "time" | "exec") {
+        use codex_shell_command::validation::ExecutionWrapper;
+        use codex_shell_command::validation::decode_execution_wrapper;
+        return match decode_execution_wrapper(&binary, args) {
+            ExecutionWrapper::Child(index) => visibly_builds_argv(&args[index..], depth + 1),
+            ExecutionWrapper::NonExecution | ExecutionWrapper::Opaque => false,
         };
-        if !in_command_position {
-            return false;
-        }
-        let rest = words[index..]
+    }
+    matches!(binary.as_str(), "iex" | "invoke-expression")
+        && args
             .iter()
-            .take_while(|word| {
-                !matches!(
-                    word.as_str(),
-                    ";" | "|" | "&" | "(" | ")" | "{" | "}" | "\r" | "\n"
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        potential_build(&rest)
-    })
+            .any(|source| visibly_builds_at_depth(source, depth + 1))
 }
 
 #[cfg(test)]
@@ -1474,6 +1460,35 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn numeric_powershell_cargo_arguments_still_resolve_managed_targets() {
+        let root = fixture();
+        let cwd = root.path().join("codex-rs");
+        let env = HashMap::from([(
+            "CARGO_HOME".into(),
+            root.path().join("cargo-home").display().to_string(),
+        )]);
+        for (target, managed) in [
+            (root.path().join("ordinary-output"), false),
+            (cwd.join("target/lanes/core-tests"), true),
+        ] {
+            let script = format!(
+                "cargo nextest run --target-dir '{}' --profile local --workspace --no-fail-fast --retries 0 --failure-output immediate",
+                target.display().to_string().replace('\'', "''"),
+            );
+            let result = check(&["pwsh".into(), "-Command".into(), script], &cwd, &env, 0);
+            if managed {
+                let error = result.unwrap_err();
+                assert!(error.contains("Effective target directory"), "{error}");
+                assert!(!error.contains("through this script"), "{error}");
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+            }
+            assert!(!target.exists(), "admission must not create build output");
+        }
+    }
+
     #[test]
     fn build_rejection_remediation_follows_the_lane_marker() {
         // A marked tree must not be told that no repository-specific runner is
@@ -1506,5 +1521,49 @@ mod tests {
                 .contains("ordinary Rust workspaces do not require a repository-specific runner"),
             "unmarked workspace keeps neutral advice: {neutral}"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit36_lane_regressions {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_output_after_symlink_parent_agrees_with_create_destination() {
+        let fixture = tempfile::tempdir().unwrap();
+        let managed = fixture.path().join("managed");
+        let unmanaged = fixture.path().join("unmanaged");
+        std::fs::create_dir_all(managed.join("nested")).unwrap();
+        std::fs::create_dir_all(&unmanaged).unwrap();
+        std::fs::write(managed.join(".codex-cargo-lanes-root"), "").unwrap();
+        std::os::unix::fs::symlink(managed.join("nested"), unmanaged.join("alias")).unwrap();
+        let request = unmanaged.join("alias/../fresh-output");
+        let predicted = resolved(&request).unwrap();
+        assert_eq!(
+            predicted,
+            dunce::canonicalize(&managed).unwrap().join("fresh-output")
+        );
+        std::fs::create_dir_all(&request).unwrap();
+        assert_eq!(predicted, dunce::canonicalize(&request).unwrap());
+        assert_eq!(
+            managed_target(&request).unwrap(),
+            Some(dunce::canonicalize(&managed).unwrap())
+        );
+    }
+
+    #[test]
+    fn quoted_powershell_separators_are_data_but_subexpressions_remain_active() {
+        for script in [
+            "$env:EXAMPLE='example; cargo build'; Write-Output $env:EXAMPLE",
+            "$env:EXAMPLE=\"example; cargo build\"; Write-Output $env:EXAMPLE",
+            "# cargo build\nWrite-Output ok",
+        ] {
+            assert!(!visibly_builds(script), "{script}");
+        }
+        assert!(visibly_builds("Write-Output \"$(cargo build)\""));
+        assert!(visibly_builds(
+            "$env:CARGO_TARGET_DIR='managed'; cargo build"
+        ));
     }
 }

@@ -241,16 +241,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reused.region(), "us-west-2");
-        let managed = BedrockApiKeyAuth { api_key: "rotated".into(), region: "eu-west-1".into() };
+        let managed = BedrockApiKeyAuth {
+            api_key: "rotated".into(),
+            region: "eu-west-1".into(),
+        };
         let method = resolve_auth_method(
             Some(&managed),
-            &ModelProviderAwsAuthInfo { profile: None, region: None },
+            &ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            },
             BedrockEndpoint::Runtime,
             &cell,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(method.region(), "eu-west-1");
         assert_eq!(
-            method.into_provider(BedrockEndpoint::Runtime).to_auth_headers()[http::header::AUTHORIZATION],
+            method
+                .into_provider(BedrockEndpoint::Runtime)
+                .to_auth_headers()[http::header::AUTHORIZATION],
             "Bearer rotated",
         );
         assert_eq!(cell.get().unwrap().region(), "us-west-2");
@@ -258,11 +268,19 @@ mod tests {
         let untouched = tokio::sync::OnceCell::new();
         resolve_auth_method(
             Some(&managed),
-            &ModelProviderAwsAuthInfo { profile: None, region: None },
+            &ModelProviderAwsAuthInfo {
+                profile: None,
+                region: None,
+            },
             BedrockEndpoint::Runtime,
             &untouched,
-        ).await.unwrap();
-        assert!(untouched.get().is_none(), "managed auth must not initialize the SDK context");
+        )
+        .await
+        .unwrap();
+        assert!(
+            untouched.get().is_none(),
+            "managed auth must not initialize the SDK context"
+        );
     }
 
     #[tokio::test]
@@ -280,7 +298,11 @@ mod tests {
             for _ in 0..20 {
                 let start = std::time::Instant::now();
                 if reuse {
-                    let _ = cell.get_or_try_init(|| AwsAuthContext::load(config.clone())).await.unwrap().clone();
+                    let _ = cell
+                        .get_or_try_init(|| AwsAuthContext::load(config.clone()))
+                        .await
+                        .unwrap()
+                        .clone();
                 } else {
                     let _ = AwsAuthContext::load(config.clone()).await.unwrap();
                 }

@@ -964,7 +964,9 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
         |req: &wiremock::Request| {
             req.url.path() == "/v1/responses"
                 && core_test_support::responses::request_has_last_message_input_text(
-                    req, "user", CHILD_PROMPT,
+                    req,
+                    "user",
+                    CHILD_PROMPT,
                 )
         },
         sse(vec![
@@ -1026,7 +1028,9 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
             .find(|request| {
                 request.url.path() == "/v1/responses"
                     && core_test_support::responses::request_has_last_message_input_text(
-                        request, "user", CHILD_PROMPT,
+                        request,
+                        "user",
+                        CHILD_PROMPT,
                     )
             })
         {
@@ -1043,12 +1047,15 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
                 let model = child.config_snapshot().await.model;
                 let mut terminal_events = Vec::new();
                 for _ in 0..64 {
-                    let Some(Ok(event)) = futures::FutureExt::now_or_never(child.next_event()) else {
+                    let Some(Ok(event)) = futures::FutureExt::now_or_never(child.next_event())
+                    else {
                         break;
                     };
                     match event.msg {
                         EventMsg::Error(error) => terminal_events.push(format!("error: {error:?}")),
-                        EventMsg::TurnComplete(completed) => terminal_events.push(format!("completed: error={:?}", completed.error)),
+                        EventMsg::TurnComplete(completed) => {
+                            terminal_events.push(format!("completed: error={:?}", completed.error))
+                        }
                         _ => {}
                     }
                 }
@@ -1069,7 +1076,9 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
                     )
                 })
                 .collect::<Vec<_>>();
-            anyhow::bail!("timed out waiting for forked child request; children={child_diagnostics:?}; observed={observed:?}");
+            anyhow::bail!(
+                "timed out waiting for forked child request; children={child_diagnostics:?}; observed={observed:?}"
+            );
         }
         sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())))
             .await;
@@ -1198,6 +1207,7 @@ async fn spawn_agent_instruction_only_role_keeps_built_in_model_defaults() -> Re
                 config.agent_roles.insert(
                     "custom".to_string(),
                     AgentRoleConfig {
+                        config_snapshot: Default::default(),
                         description: Some("Instruction-only role".to_string()),
                         config_file: Some(role_path.to_path_buf()),
                         nickname_candidates: None,
@@ -1808,6 +1818,7 @@ async fn spawn_agent_role_overrides_requested_model_and_reasoning_settings() -> 
                 config.agent_roles.insert(
                     "custom".to_string(),
                     AgentRoleConfig {
+                        config_snapshot: Default::default(),
                         description: Some("Custom role".to_string()),
                         config_file: Some(role_path.to_path_buf()),
                         nickname_candidates: None,
@@ -1866,6 +1877,7 @@ async fn spawn_agent_tool_description_mentions_role_locked_settings() -> Result<
             config.agent_roles.insert(
                 "custom".to_string(),
                 AgentRoleConfig {
+                    config_snapshot: Default::default(),
                     description: Some("Custom role".to_string()),
                     config_file: Some(role_path.to_path_buf()),
                     nickname_candidates: None,

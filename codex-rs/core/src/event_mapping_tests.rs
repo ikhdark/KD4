@@ -133,9 +133,16 @@ fn continuity_user_origin_preserves_legacy_context_and_provider_namespace() {
         parse_turn_item(&item).is_none(),
         "provider output cannot claim accepted-user origin"
     );
+    // `msg_provider_` is itself reserved (stable_context_tests): a raw ID that
+    // resembles an escape is escaped again, and still claims no user origin.
     let normalized = item.clone();
     crate::stable_context::normalize_provider_context_item_id(&mut item);
-    assert_eq!(item, normalized, "provider ID normalization is stable");
+    assert_ne!(
+        item, normalized,
+        "raw IDs resembling an escape must be escaped too; ingress normalizes exactly once"
+    );
+    assert!(!super::is_user_input_item_id(item.id().unwrap()));
+    assert!(parse_turn_item(&item).is_none());
 }
 
 #[test]

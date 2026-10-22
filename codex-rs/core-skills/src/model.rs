@@ -38,6 +38,8 @@ pub fn skill_scope_label(scope: SkillScope) -> &'static str {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillMetadata {
+    /// Bound non-host source. The owner is retained for the catalog lifetime.
+    pub source: Option<SkillSource>,
     pub name: String,
     pub description: String,
     pub short_description: Option<String>,
@@ -48,6 +50,12 @@ pub struct SkillMetadata {
     pub path_to_skills_md: AbsolutePathBuf,
     pub scope: SkillScope,
     pub plugin_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SkillSource {
+    pub(crate) root: AbsolutePathBuf,
+    pub(crate) file_system: crate::service::FileSystemIdentity,
 }
 
 impl SkillMetadata {
@@ -107,7 +115,8 @@ pub struct SkillLoadOutcome {
 
 impl SkillLoadOutcome {
     pub fn is_skill_enabled(&self, skill: &SkillMetadata) -> bool {
-        !self.disabled_paths.contains(&skill.path_to_skills_md)
+        // Configured disabled native paths are host-owned, not remote aliases.
+        skill.source.is_some() || !self.disabled_paths.contains(&skill.path_to_skills_md)
     }
 
     pub fn is_skill_allowed_for_implicit_invocation(&self, skill: &SkillMetadata) -> bool {
@@ -132,6 +141,9 @@ impl SkillLoadOutcome {
         &self,
         skill: &SkillMetadata,
     ) -> Option<Arc<dyn ExecutorFileSystem>> {
+        if let Some(source) = &skill.source {
+            return Some(Arc::clone(&source.file_system.0));
+        }
         self.file_systems_by_skill_path
             .get(&skill.path_to_skills_md)
     }
@@ -234,6 +246,12 @@ pub fn skill_catalog_id(skill: &SkillMetadata) -> String {
     let canonical_host_locator = PathUri::from_abs_path(&skill.path_to_skills_md).to_string();
     let mut hasher = Sha256::new();
     hasher.update(SKILL_CATALOG_ID_DOMAIN);
+    if let Some(source) = &skill.source {
+        // This locator is bound to an in-memory catalog, not durable source proof.
+        hasher.update(b"bound-executor-source");
+        hasher.update((Arc::as_ptr(&source.file_system.0).cast::<()>() as usize).to_be_bytes());
+        hasher.update(source.root.as_path().to_string_lossy().as_bytes());
+    }
     for part in [
         source_kind,
         scope,
@@ -274,6 +292,7 @@ mod catalog_id_tests {
 
     fn skill(name: &str, path: &str, scope: SkillScope, plugin_id: Option<&str>) -> SkillMetadata {
         SkillMetadata {
+            source: None,
             name: name.to_string(),
             description: "description".to_string(),
             short_description: None,

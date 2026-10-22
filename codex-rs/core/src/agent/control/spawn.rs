@@ -342,14 +342,17 @@ fn send_with_restarting_worker<T>(
     Err(job)
 }
 
+/// Returns the job when no cleanup worker accepts it. Only that rare fallback
+/// allocates; the common result stays pointer-sized instead of carrying the job.
 fn schedule_pending_spawn_cleanup(
     job: PendingSpawnCleanupJob,
-) -> Result<(), PendingSpawnCleanupJob> {
+) -> Result<(), Box<PendingSpawnCleanupJob>> {
     send_with_restarting_worker(
         pending_spawn_cleanup_sender_state(),
         start_pending_spawn_cleanup_worker,
         job,
     )
+    .map_err(Box::new)
 }
 
 impl PendingSpawnCleanup {
@@ -539,6 +542,7 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         // so they must rebuild context on their first child turn.
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => preserve_reference_context_item,
         RolloutItem::Compacted(_)
+        | RolloutItem::AdditionalContextState { .. }
         | RolloutItem::SamplingBoundary(_)
         | RolloutItem::EventMsg(_)
         | RolloutItem::SessionMeta(_) => true,
@@ -913,7 +917,9 @@ impl AgentControl {
             let thread = match state.get_thread(thread_id).await {
                 Ok(thread) => thread,
                 Err(CodexErr::ThreadNotFound(_)) => {
-                    self.forget_v2_residency(thread_id);
+                    state
+                        .cleanup_thread_if_absent(thread_id, || self.forget_v2_residency(thread_id))
+                        .await;
                     match state.get_thread(thread_id).await {
                         Ok(_) => continue,
                         Err(CodexErr::ThreadNotFound(_)) => return Ok(false),
@@ -922,8 +928,13 @@ impl AgentControl {
                 }
                 Err(err) => return Err(err),
             };
-            if !thread.is_running() && state.remove_thread_if_same(&thread_id, &thread).await {
-                self.forget_v2_residency(thread_id);
+            if !thread.is_running()
+                && state
+                    .remove_thread_if_same_with_cleanup(&thread_id, &thread, || {
+                        self.forget_v2_residency(thread_id)
+                    })
+                    .await
+            {
                 match state.get_thread(thread_id).await {
                     Ok(_) => continue,
                     Err(CodexErr::ThreadNotFound(_)) => return Ok(false),
@@ -937,8 +948,12 @@ impl AgentControl {
                 continue;
             }
             if !thread.is_running() {
-                if state.remove_thread_if_same(&thread_id, &thread).await {
-                    self.forget_v2_residency(thread_id);
+                if state
+                    .remove_thread_if_same_with_cleanup(&thread_id, &thread, || {
+                        self.forget_v2_residency(thread_id)
+                    })
+                    .await
+                {
                     match state.get_thread(thread_id).await {
                         Ok(_) => continue,
                         Err(CodexErr::ThreadNotFound(_)) => return Ok(false),
@@ -953,7 +968,9 @@ impl AgentControl {
                 }
                 Ok(_) => continue,
                 Err(CodexErr::ThreadNotFound(_)) => {
-                    self.forget_v2_residency(thread_id);
+                    state
+                        .cleanup_thread_if_absent(thread_id, || self.forget_v2_residency(thread_id))
+                        .await;
                     match state.get_thread(thread_id).await {
                         Ok(_) => continue,
                         Err(CodexErr::ThreadNotFound(_)) => return Ok(false),
@@ -1022,12 +1039,6 @@ impl AgentControl {
         let parent_thread_id = initial_history
             .get_resumed_parent_thread_id()
             .or(stored_parent_thread_id);
-        let inherited_environments = self
-            .inherited_environments_for_source(state, Some(&session_source))
-            .await;
-        let inherited_exec_policy = self
-            .inherited_exec_policy_for_source(state, Some(&session_source), &config)
-            .await;
 
         match state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
@@ -1036,8 +1047,6 @@ impl AgentControl {
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
-                inherited_environments,
-                inherited_exec_policy,
             })
             .await
         {
@@ -1126,6 +1135,24 @@ impl AgentControl {
             .as_ref()
             .map(|token| &token.session_source)
             .or(session_source.as_ref());
+        let mut child_control = self.clone();
+        if child_control.inherited_validation_task_scope.is_none()
+            && let Some(parent) = options.parent_thread_id.or(match effective_source {
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    ..
+                })) => Some(*parent_thread_id),
+                _ => None,
+            })
+            && let Some(store) = self.task_coordinator().store()
+        {
+            child_control.inherited_validation_task_scope = store
+                .validation_task_scope(&parent.to_string())
+                .await
+                .map_err(|error| {
+                    CodexErr::Fatal(format!("failed to capture parent validation task: {error}"))
+                })?;
+        }
         if options.fork_mode.is_some() {
             if options.fork_parent_spawn_call_id.is_none() {
                 return Err(CodexErr::Fatal(
@@ -1185,6 +1212,13 @@ impl AgentControl {
                 agent_max_threads
             };
             let mut reservation = self.state.reserve_spawn_slot(reservation_max_threads)?;
+            // Bulk workers keep their reporting source label, but their explicit
+            // parent participates in the existing tree fence and retained graph.
+            if options.agent_job_binding.is_some()
+                && let Some(parent) = options.parent_thread_id
+            {
+                reservation.reserve_parent_thread(parent)?;
+            }
             let (session_source, agent_metadata) = match session_source {
                 Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                     parent_thread_id,
@@ -1228,9 +1262,13 @@ impl AgentControl {
         };
         let notification_source = session_source.clone();
         let inheritance = SpawnAgentThreadInheritance {
-            environments: self
-                .inherited_environments_for_source(&state, session_source.as_ref())
-                .await,
+            environments: match &options.captured_environments {
+                Some(captured) => Some(captured.clone()),
+                None => {
+                    self.inherited_environments_for_source(&state, session_source.as_ref())
+                        .await
+                }
+            },
             exec_policy: self
                 .inherited_exec_policy_for_source(&state, session_source.as_ref(), &config)
                 .await,
@@ -1239,7 +1277,7 @@ impl AgentControl {
         // The same `AgentControl` is sent to spawn the thread.
         let new_thread = match (session_source, options.fork_mode.as_ref(), inheritance) {
             (Some(session_source), Some(_), inheritance) => {
-                Box::pin(self.spawn_forked_thread(
+                Box::pin(child_control.spawn_forked_thread(
                     &state,
                     config,
                     session_source,
@@ -1250,11 +1288,16 @@ impl AgentControl {
                 .await?
             }
             (Some(session_source), None, inheritance) => {
+                // Legacy callers supply ownership in ThreadSpawn rather than
+                // SpawnAgentOptions. Persist that creation parent as well.
+                let parent_thread_id = options
+                    .parent_thread_id
+                    .or_else(|| session_source.parent_thread_id());
                 Box::pin(state.spawn_new_thread_with_source(
                     config.clone(),
-                    self.clone(),
+                    child_control.clone(),
                     session_source,
-                    options.parent_thread_id,
+                    parent_thread_id,
                     /*forked_from_thread_id*/ None,
                     /*thread_source*/ Some(ThreadSource::Subagent),
                     /*metrics_service_name*/ None,
@@ -1264,7 +1307,7 @@ impl AgentControl {
                 ))
                 .await?
             }
-            (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), self.clone())).await?,
+            (None, _, _) => Box::pin(state.spawn_new_thread(config.clone(), child_control)).await?,
         };
         let mut pending_cleanup = PendingSpawnCleanup::new(
             self.clone(),
@@ -1318,7 +1361,25 @@ impl AgentControl {
                 )
                 .await;
             match bound {
-                Ok(true) => {}
+                Ok(true) => {
+                    if !new_thread.thread.config_snapshot().await.ephemeral
+                        && let Some(parent) = options.parent_thread_id
+                        && let Some(graph) = state.agent_graph_store()
+                        && let Err(error) = graph
+                            .upsert_thread_spawn_edge(
+                                parent,
+                                new_thread.thread_id,
+                                codex_agent_graph_store::ThreadSpawnEdgeStatus::Open,
+                            )
+                            .await
+                    {
+                        return Err(pending_cleanup
+                            .rollback(CodexErr::Fatal(format!(
+                                "failed to publish bulk worker parent: {error}"
+                            )))
+                            .await);
+                    }
+                }
                 Ok(false) => {
                     return Err(pending_cleanup
                         .rollback(CodexErr::Fatal(format!(
@@ -1669,17 +1730,21 @@ impl AgentControl {
                 Vec::new()
             };
         let preserve_reference_context_item = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
-        forked_rollout_items.retain(|item| {
-            keep_forked_rollout_item(item, preserve_reference_context_item)
-                && !matches!(
-                    item,
-                    RolloutItem::ResponseItem(response_item)
-                        if is_multi_agent_v2_usage_hint_message(
-                            response_item,
-                            &multi_agent_v2_usage_hint_texts_to_filter,
+        forked_rollout_items =
+            crate::thread_rollout_truncation::filter_rollout_preserving_rollbacks(
+                forked_rollout_items,
+                |item| {
+                    keep_forked_rollout_item(item, preserve_reference_context_item)
+                        && !matches!(
+                            item,
+                            RolloutItem::ResponseItem(response_item)
+                                if is_multi_agent_v2_usage_hint_message(
+                                    response_item,
+                                    &multi_agent_v2_usage_hint_texts_to_filter,
+                                )
                         )
-                )
-        });
+                },
+            );
         for item in &mut forked_rollout_items {
             if let RolloutItem::Compacted(compacted) = item
                 && let Some(replacement_history) = compacted.replacement_history.as_mut()
@@ -1771,6 +1836,17 @@ impl AgentControl {
         if config.multi_agent_version_from_features() == MultiAgentVersion::V2
             || resumed_multi_agent_version == MultiAgentVersion::V2
         {
+            if resumed_multi_agent_version == MultiAgentVersion::V2 {
+                self.register_session_root(
+                    resumed_thread_id,
+                    state
+                        .get_thread(resumed_thread_id)
+                        .await?
+                        .session_source
+                        .parent_thread_id(),
+                );
+                self.restore_cold_descendants(resumed_thread_id).await?;
+            }
             return Ok(resumed_thread_id);
         }
         let Some(agent_graph_store) = state.agent_graph_store() else {
@@ -1895,7 +1971,7 @@ impl AgentControl {
                 &config,
             )
             .await;
-        let session_source = if multi_agent_version == MultiAgentVersion::V2 {
+        let mut session_source = if multi_agent_version == MultiAgentVersion::V2 {
             initial_history
                 .get_resumed_session_sources()
                 .map(|(source, _)| source)
@@ -1903,6 +1979,16 @@ impl AgentControl {
         } else {
             session_source
         };
+        if multi_agent_version == MultiAgentVersion::V2
+            && let Some(current_parent) = parent_thread_id
+            && let SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) = &mut session_source
+        {
+            *parent_thread_id = current_parent;
+        }
+        // Current ownership is separate from immutable creation lineage.
+        let parent_thread_id = session_source.parent_thread_id().or(parent_thread_id);
         let uses_v2_residency = multi_agent_version == MultiAgentVersion::V2
             && is_v2_resident_session_source(&session_source);
         if uses_v2_residency && self.state.agent_metadata_for_thread(thread_id).is_some() {
@@ -1923,7 +2009,11 @@ impl AgentControl {
                         Err(CodexErr::ThreadNotFound(_))
                     )
                 {
-                    self.state.release_spawned_thread(registered_thread_id);
+                    state
+                        .cleanup_thread_if_absent(registered_thread_id, || {
+                            self.state.release_spawned_thread(registered_thread_id);
+                        })
+                        .await;
                 }
             }
         }
@@ -1960,12 +2050,6 @@ impl AgentControl {
             None
         };
         let notification_source = session_source.clone();
-        let inherited_environments = self
-            .inherited_environments_for_source(&state, Some(&session_source))
-            .await;
-        let inherited_exec_policy = self
-            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
-            .await;
 
         let resumed_thread = state
             .resume_thread_with_history_with_source(ResumeThreadWithHistoryOptions {
@@ -1974,10 +2058,15 @@ impl AgentControl {
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
-                inherited_environments,
-                inherited_exec_policy,
             })
             .await?;
+        if resumed_thread.was_already_running {
+            // The existing runtime's owner owns registration, listeners and cleanup.
+            // These unused RAII reservations must not count or shut down a borrowed child.
+            drop(reservation);
+            drop(residency_slot);
+            return Ok((resumed_thread.thread_id, multi_agent_version));
+        }
         let mut pending_cleanup = PendingSpawnCleanup::new(
             self.clone(),
             Arc::clone(&resumed_thread.thread),
@@ -1988,21 +2077,38 @@ impl AgentControl {
         );
         let mut agent_metadata = agent_metadata;
         agent_metadata.agent_id = Some(resumed_thread.thread_id);
-        #[expect(
-            clippy::expect_used,
-            reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
-        )]
-        let reservation = pending_cleanup
-            .capacity
-            .reservation
-            .as_mut()
-            .expect("resumed child retains its uncommitted spawn reservation");
-        if let Err(err) = reservation.try_commit(agent_metadata.clone()) {
-            return Err(pending_cleanup.rollback(err).await);
+        if parent_thread_id.is_none() && !notification_source.is_non_root_agent() {
+            // A resumed root owns no child capacity and must have exactly one identity entry.
+            drop(pending_cleanup.capacity.reservation.take());
+            self.state.register_root_thread(resumed_thread.thread_id);
+            agent_metadata.agent_path = Some(AgentPath::root());
+        } else {
+            #[expect(
+                clippy::expect_used,
+                reason = "PendingSpawnCleanup owns the reservation until this commit consumes it"
+            )]
+            let reservation = pending_cleanup
+                .capacity
+                .reservation
+                .as_mut()
+                .expect("resumed child retains its uncommitted spawn reservation");
+            if let Err(err) = reservation.try_commit(agent_metadata.clone()) {
+                return Err(pending_cleanup.rollback(err).await);
+            }
+            drop(pending_cleanup.capacity.reservation.take());
         }
-        drop(pending_cleanup.capacity.reservation.take());
         if let Some(residency_slot) = pending_cleanup.capacity.residency_slot.take() {
             residency_slot.commit(resumed_thread.thread_id);
+        }
+        if let Err(error) = self
+            .persist_thread_spawn_edge_for_source(
+                resumed_thread.thread.as_ref(),
+                resumed_thread.thread_id,
+                Some(&notification_source),
+            )
+            .await
+        {
+            return Err(pending_cleanup.rollback(error).await);
         }
         pending_cleanup.disarm();
         self.watch_loaded_typed_actor(agent_metadata.agent_path.clone(), &resumed_thread);
@@ -2026,26 +2132,6 @@ impl AgentControl {
                 agent_metadata.agent_path.clone(),
             );
         }
-        if let Err(error) = self
-            .persist_thread_spawn_edge_for_source(
-                resumed_thread.thread.as_ref(),
-                resumed_thread.thread_id,
-                Some(&notification_source),
-            )
-            .await
-        {
-            let shutdown_result = self.shutdown_live_agent(resumed_thread.thread_id).await;
-            return match shutdown_result {
-                Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {
-                    Err(error)
-                }
-                Err(shutdown_error) => Err(CodexErr::Fatal(format!(
-                    "{error}; cleanup of resumed agent {} failed: {shutdown_error}",
-                    resumed_thread.thread_id
-                ))),
-            };
-        }
-
         Ok((resumed_thread.thread_id, multi_agent_version))
     }
 }

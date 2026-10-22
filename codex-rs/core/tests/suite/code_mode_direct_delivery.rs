@@ -854,7 +854,9 @@ async fn delivery_cannot_hide_failure_yield_overflow_or_sibling_work() -> Result
 }
 /// Closing the last checklist obligation is bookkeeping, not another inference
 /// boundary. Evidence and plan closure may share the final execution cell.
-#[test_case::test_case(false; "unfinished_obligation_is_advisory")]
+/// An unfinished obligation blocks final acceptance (audit 115): it gets one
+/// bounded repair request, and the scripted repair cell closes the plan.
+#[test_case::test_case(false; "unfinished_obligation_continues")]
 #[test_case::test_case(true; "evidence_and_plan_close_deliver_immediately")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn completion_audit_plan_closure_uses_existing_evidence(close_plan: bool) -> Result<()> {
@@ -906,7 +908,11 @@ text('Required work completed.');"#), ev_completed("fallback"),
     assert!(completed.surfaced_result.is_some());
     assert_eq!(
         completed.last_agent_message.as_deref(),
-        Some("verified result")
+        Some(if close_plan {
+            "verified result"
+        } else {
+            "Required work completed."
+        })
     );
     let assessment = completed
         .timing
@@ -917,7 +923,12 @@ text('Required work completed.');"#), ev_completed("fallback"),
         .unwrap();
     assert!(assessment.failed_checks.is_empty());
     assert!(assessment.verification_gaps.is_empty());
-    assert_eq!(assessment.advisories.is_empty(), close_plan);
+    // Both paths finish with every plan obligation closed.
+    assert!(
+        assessment.advisories.is_empty(),
+        "{:?}",
+        assessment.advisories
+    );
     assert_eq!(
         server
             .received_requests()
@@ -926,7 +937,7 @@ text('Required work completed.');"#), ev_completed("fallback"),
             .iter()
             .filter(|request| request.url.path().contains("responses"))
             .count(),
-        1
+        if close_plan { 1 } else { 2 }
     );
     Ok(())
 }

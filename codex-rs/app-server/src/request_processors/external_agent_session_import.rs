@@ -496,13 +496,8 @@ mod tests {
         assert_eq!(calls.delete_thread, 1);
     }
 
-    async fn materialized_local_rollback_fixture() -> (
-        TempDir,
-        LocalThreadStore,
-        StateDbHandle,
-        ThreadId,
-        PathBuf,
-    ) {
+    async fn materialized_local_rollback_fixture()
+    -> (TempDir, LocalThreadStore, StateDbHandle, ThreadId, PathBuf) {
         let root = TempDir::new().expect("tempdir");
         let codex_home = root.path().join("codex-home");
         let sqlite_home = root.path().join("sqlite-home");
@@ -617,7 +612,9 @@ mod tests {
         assert_eq!(state_db.get_thread(thread_id).await.unwrap(), Some(before));
 
         sqlx::query("DROP TRIGGER reject_import_rollback")
-            .execute(&mut connection).await.unwrap();
+            .execute(&mut connection)
+            .await
+            .unwrap();
         rollback_imported_session(&thread_store, Some(&state_db), thread_id)
             .await
             .expect("retry rollback");
@@ -639,7 +636,10 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut connection).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut connection)
+            .await
+            .unwrap();
         let deleting_store = thread_store.clone();
         let deleting_db = state_db.clone();
         let task = tokio::spawn(async move {
@@ -659,7 +659,10 @@ mod tests {
         task.abort();
         assert!(task.await.expect_err("cancelled waiter").is_cancelled());
         assert!(!rollout_path.exists());
-        sqlx::query("ROLLBACK").execute(&mut connection).await.unwrap();
+        sqlx::query("ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .unwrap();
         connection.close().await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             while thread_store.live_rollout_path(thread_id).await.is_ok() {

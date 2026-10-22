@@ -59,7 +59,7 @@ const RECONNECTABLE_CLOSE_MARKER: &str = " (reconnectable close)";
 
 impl ApiError {
     /// A complete frame violated the provider protocol; replay is not recovery.
-    pub(crate) fn invalid_response(message: impl Into<String>) -> Self {
+    pub fn invalid_response(message: impl Into<String>) -> Self {
         Self::ProviderFailure {
             code: Some("invalid_response".to_string()),
             message: message.into(),

@@ -191,8 +191,9 @@ mod tests {
                 FeedbackDiagnostics::collect_from_pairs(pairs),
                 FeedbackDiagnostics {
                     diagnostics: vec![FeedbackDiagnostic {
-                        headline: "Proxy environment variables are set and may affect connectivity."
-                            .to_string(),
+                        headline:
+                            "Proxy environment variables are set and may affect connectivity."
+                                .to_string(),
                         details,
                     }],
                 }

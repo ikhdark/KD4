@@ -47,7 +47,9 @@ pub fn resolve_symlink_write_paths(path: &Path) -> io::Result<SymlinkWritePaths>
         let next = if target.is_absolute() {
             AbsolutePathBuf::from_absolute_path(&target)
         } else if let Some(parent) = current.parent() {
-            Ok(AbsolutePathBuf::resolve_path_against_base(&target, parent))
+            Ok(AbsolutePathBuf::resolve_literal_path_against_base(
+                &target, parent,
+            ))
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -87,13 +89,43 @@ pub fn acquire_atomic_write_lock(write_path: &Path) -> io::Result<AtomicWriteLoc
     Ok(AtomicWriteLock { file })
 }
 
+/// Lock the resolved destination, then recheck aliases before reading or writing.
+/// All cooperative config writers must use the same physical target lock.
+pub fn acquire_resolved_atomic_write_lock(
+    path: &Path,
+) -> io::Result<(SymlinkWritePaths, AtomicWriteLock)> {
+    let resolve = || -> io::Result<SymlinkWritePaths> {
+        let mut paths = resolve_symlink_write_paths(path)?;
+        let parent = paths.write_path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "write target has no parent")
+        })?;
+        std::fs::create_dir_all(parent)?;
+        let name = paths.write_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "write target has no file name")
+        })?;
+        paths.write_path = std::fs::canonicalize(parent)?.join(name);
+        paths.read_path = Some(paths.write_path.clone());
+        Ok(paths)
+    };
+    let paths = resolve()?;
+    let lock = acquire_atomic_write_lock(&paths.write_path)?;
+    if resolve()?.write_path != paths.write_path {
+        return Err(io::Error::other(
+            "write target changed while acquiring its persistence lock; retry the edit",
+        ));
+    }
+    Ok((paths, lock))
+}
+
 /// Attempts the same transaction lock without waiting for another writer.
 /// `None` means contention; filesystem errors are still reported to the caller.
 pub fn try_acquire_atomic_write_lock(write_path: &Path) -> io::Result<Option<AtomicWriteLock>> {
     let file = open_atomic_write_lock(write_path)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(Some(AtomicWriteLock { file })),
-        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => Ok(None),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
@@ -126,8 +158,13 @@ pub fn write_bytes_atomically(write_path: &Path, contents: &[u8]) -> io::Result<
 
 /// Durable replacement retaining the destination's permissions and Windows DACL.
 /// Resolve symlinks before calling. Pre-publication failures retain the old file.
-pub fn write_bytes_atomically_preserving_permissions(write_path: &Path, contents: &[u8]) -> io::Result<()> {
-    stage_and_replace_preserving(write_path, true, true, |temporary| temporary.write_all(contents))
+pub fn write_bytes_atomically_preserving_permissions(
+    write_path: &Path,
+    contents: &[u8],
+) -> io::Result<()> {
+    stage_and_replace_preserving(write_path, true, true, |temporary| {
+        temporary.write_all(contents)
+    })
 }
 
 /// Same-directory replacement without durability barriers or parent creation.
@@ -148,7 +185,7 @@ fn stage_and_replace(
     sync: bool,
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
-    stage_and_replace_preserving(write_path, sync, !sync, write)
+    stage_and_replace_preserving(write_path, sync, true, write)
 }
 
 fn stage_and_replace_preserving(
@@ -172,7 +209,10 @@ fn stage_and_replace_preserving(
         match std::fs::metadata(write_path) {
             Ok(metadata) => {
                 if metadata.permissions().readonly() {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "destination is read-only"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "destination is read-only",
+                    ));
                 }
                 Some(metadata.permissions())
             }
@@ -216,7 +256,7 @@ fn stage_and_replace_preserving(
 // ownership and the DACL too, before any replacement can make the new file live.
 // Inability to read or install the descriptor is a failure, not permission to
 // replace a protected file with a differently secured temporary file.
-fn copy_file_security(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn copy_file_security(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
     use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
@@ -272,11 +312,7 @@ fn copy_file_security(source: &Path, destination: &Path) -> io::Result<()> {
     let mut revision = 0;
     // SAFETY: GetFileSecurityW initialized the descriptor and outputs are valid.
     if unsafe {
-        GetSecurityDescriptorControl(
-            descriptor.as_mut_ptr().cast(),
-            &mut control,
-            &mut revision,
-        )
+        GetSecurityDescriptorControl(descriptor.as_mut_ptr().cast(), &mut control, &mut revision)
     } == 0
     {
         return Err(io::Error::last_os_error());
@@ -329,16 +365,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn durable_replacement_preserves_protected_destination_dacl() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        use windows_sys::Win32::Security::GetFileSecurityW;
+        use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
+        use windows_sys::Win32::Security::SetFileSecurityW;
+        fn security(path: &[u16]) -> Vec<u32> {
+            let mut needed = 0;
+            // SAFETY: terminated path and writable size output; null buffer queries its size.
+            unsafe {
+                GetFileSecurityW(
+                    path.as_ptr(),
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut needed,
+                );
+            }
+            assert!(needed > 0);
+            let mut descriptor = vec![0u32; (needed as usize).div_ceil(size_of::<u32>())];
+            // SAFETY: aligned descriptor is large enough for the queried byte count.
+            assert_ne!(
+                unsafe {
+                    GetFileSecurityW(
+                        path.as_ptr(),
+                        DACL_SECURITY_INFORMATION,
+                        descriptor.as_mut_ptr().cast(),
+                        needed,
+                        &mut needed,
+                    )
+                },
+                0
+            );
+            descriptor
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        std::fs::write(&target, "original").unwrap();
+        let wide: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
+        let mut original = security(&wide);
+        // Make the target descriptor differ from a new temporary file's inherited policy.
+        // SAFETY: initialized descriptor and terminated target path remain live.
+        assert_ne!(
+            unsafe {
+                SetFileSecurityW(
+                    wide.as_ptr(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    original.as_mut_ptr().cast(),
+                )
+            },
+            0
+        );
+        let protected = security(&wide);
+        for sync in [true, false] {
+            write_bytes_atomically_impl(&target, b"replacement", sync).unwrap();
+            assert_eq!(security(&wide), protected);
+            assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        }
+    }
+
+    #[test]
     fn nonblocking_transaction_lock_observes_contention_and_releases_on_drop() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("config.toml");
         let first = acquire_atomic_write_lock(&destination).unwrap();
-        assert!(try_acquire_atomic_write_lock(&destination).unwrap().is_none());
+        assert!(
+            try_acquire_atomic_write_lock(&destination)
+                .unwrap()
+                .is_none()
+        );
         drop(first);
-        let second = try_acquire_atomic_write_lock(&destination).unwrap().expect("released lock");
-        assert!(try_acquire_atomic_write_lock(&destination).unwrap().is_none());
+        let second = try_acquire_atomic_write_lock(&destination)
+            .unwrap()
+            .expect("released lock");
+        assert!(
+            try_acquire_atomic_write_lock(&destination)
+                .unwrap()
+                .is_none()
+        );
         drop(second);
-        assert!(try_acquire_atomic_write_lock(&destination).unwrap().is_some());
+        assert!(
+            try_acquire_atomic_write_lock(&destination)
+                .unwrap()
+                .is_some()
+        );
         assert!(try_acquire_atomic_write_lock(Path::new("")).is_err());
     }
 
@@ -350,7 +461,8 @@ mod tests {
         let error = stage_and_replace(&destination, false, |file| {
             file.write_all(b"partial new contents")?;
             Err(io::Error::other("injected mid-write failure"))
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("injected mid-write"));
         assert_eq!(std::fs::read(&destination).unwrap(), b"entire old contents");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);

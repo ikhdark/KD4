@@ -40,6 +40,7 @@ from typing import Callable, Sequence
 
 from scripts.benchmark_scripts.benchmark_agents import harbor_python
 from scripts.common.process_owner import OwnedThreadPoolExecutor, run_owned
+from scripts.common.atomic_json import write_json_atomic
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -83,13 +84,9 @@ SCRIPT_CANDIDATE_SUFFIXES = frozenset((*SCRIPT_KIND_BY_SUFFIX, ".bat", ".cmd", "
 SCRIPT_LINE_ADVISORY_THRESHOLD = 1_000
 JSON_WORKER_MAX_BYTES = 16 * 1024 * 1024
 ORACLE_TIMEOUT_SECONDS = 30
-SCRIPT_AUDIT_PACKAGE_COMMAND = (
-    "node scripts/maintenance/run-python.js scripts/maintenance/root_maintenance.py audit-scripts"
-)
+SCRIPT_AUDIT_PACKAGE_COMMAND = "node scripts/maintenance/run-python.js scripts/maintenance/root_maintenance.py audit-scripts"
 SCRIPT_AUDIT_JUST_RECIPE = "audit-scripts *args:"
-SCRIPT_AUDIT_JUST_COMMAND = (
-    '"{{ justfile_directory() }}/scripts/maintenance/root_maintenance.py" audit-scripts {args}'
-)
+SCRIPT_AUDIT_JUST_COMMAND = '"{{ justfile_directory() }}/scripts/maintenance/root_maintenance.py" audit-scripts {args}'
 POWERSHELL_PARSE_ALL_SCRIPT = (
     "$failed = $false; "
     "foreach ($path in $paths) { "
@@ -321,7 +318,9 @@ UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
 # Several script owners intentionally use aggregate test modules instead of a
 # same-stem test file. Keep that routing explicit so changed PowerShell
 # helpers and shared Python utilities do not receive syntax-only validation.
-REPORT_REGRESSIONS = "scripts.maintenance.test_report_script_regressions.ScriptReportRegressions"
+REPORT_REGRESSIONS = (
+    "scripts.maintenance.test_report_script_regressions.ScriptReportRegressions"
+)
 VALIDATION_REGRESSIONS = (
     "scripts.maintenance.test_report_script_regressions.Report26ValidationRegressions"
 )
@@ -347,11 +346,15 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.build.test_rust_test_runner",
     ),
     "codex-cli/bin/codex.js": ("scripts.build.test_build_tooling_policy",),
-    "codex-cli/scripts/build_npm_package.py": ("scripts.codex_package.test_stage_npm_packages",),
+    "codex-cli/scripts/build_npm_package.py": (
+        "scripts.codex_package.test_stage_npm_packages",
+    ),
     "codex-rs/config/scripts/generate-proto.ps1": (
         "scripts.schemas.test_generate_config_proto",
     ),
-    "codex-rs/scripts/nextest_windows_stack.py": ("scripts.build.test_build_tooling_policy",),
+    "codex-rs/scripts/nextest_windows_stack.py": (
+        "scripts.build.test_build_tooling_policy",
+    ),
     "codex-rs/scripts/setup-windows.ps1": ("scripts.build.test_build_tooling",),
     "scripts/schemas/app_server_schema_runtime_check.py": (
         "scripts.maintenance.test_dev_environment",
@@ -378,8 +381,12 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/build/cargo-lane-patterns.ps1": ("scripts.build.test_cargo_lane",),
     "scripts/build/cargo-lane-trash-cleanup.ps1": ("scripts.build.test_cargo_lane",),
     "scripts/build/cargo-lane.ps1": ("scripts.build.test_cargo_lane",),
-    "scripts/build/cargo-workspace-analyzer.ps1": ("scripts.build.test_build_tooling_policy",),
-    "scripts/build/common-rust-env.ps1": ("scripts.build.test_build_tooling_performance",),
+    "scripts/build/cargo-workspace-analyzer.ps1": (
+        "scripts.build.test_build_tooling_policy",
+    ),
+    "scripts/build/common-rust-env.ps1": (
+        "scripts.build.test_build_tooling_performance",
+    ),
     "scripts/codex_package/rg": (
         "scripts.codex_package.test_dotslash",
         "scripts.codex_package.test_ripgrep",
@@ -404,13 +411,17 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         f"{VALIDATION_REGRESSIONS}.test_lock_waits_for_release_and_distinguishes_timeout_from_io_error",
         f"{VALIDATION_REGRESSIONS}.test_lock_waiter_never_writes_to_an_empty_owned_file",
     ),
-    "scripts/maintenance/dev_env_doctor.py": ("scripts.maintenance.test_dev_environment",),
+    "scripts/maintenance/dev_env_doctor.py": (
+        "scripts.maintenance.test_dev_environment",
+    ),
     "scripts/maintenance/format.py": (
         "scripts.build.test_build_tooling",
         f"{VALIDATION_REGRESSIONS}.test_finite_results_reach_schema_and_formatter_callers",
     ),
     "scripts/maintenance/git_doctor.py": ("scripts.maintenance.test_dev_environment",),
-    "scripts/build/invoke-rust-perf-env.ps1": ("scripts.build.test_build_tooling_performance",),
+    "scripts/build/invoke-rust-perf-env.ps1": (
+        "scripts.build.test_build_tooling_performance",
+    ),
     "scripts/install/install.ps1": ("scripts.build.test_build_tooling_policy",),
     "scripts/build/just-shell.py": ("scripts.build.test_build_tooling",),
     "scripts/benchmark_scripts/rollout_snapshot.py": (
@@ -432,7 +443,9 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.install.test_publish_local_codex_dry_run",
         "scripts.install.test_publish_local_codex_freshness",
     ),
-    "scripts/common/process_owner.py": ("scripts.maintenance.test_report_script_regressions",),
+    "scripts/common/process_owner.py": (
+        "scripts.maintenance.test_report_script_regressions",
+    ),
     "scripts/maintenance/root_maintenance.py": (
         f"{REPORT_REGRESSIONS}.test_changed_tests_and_adjacent_production_across_owned_roots",
         f"{REPORT_REGRESSIONS}.test_report_regressions_follow_their_changed_owners_once",
@@ -442,9 +455,10 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         f"{REPORT_REGRESSIONS}.test_recent_overflow_survives_expired_base",
         "scripts.build.test_rust_test_admission",
     ),
-    "scripts/build/rust_build_status_support.py": ("scripts.build.test_build_tooling_storage",),
+    "scripts/build/rust_build_status_support.py": (
+        "scripts.build.test_build_tooling_storage",
+    ),
     "scripts/maintenance/run-python.js": ("scripts.build.test_build_tooling_policy",),
-    "scripts/build/rust_packages.py": ("scripts.build.test_build_tooling_policy",),
     "scripts/build/rust_test_runner.py": (
         f"{REPORT_REGRESSIONS}.test_nextest_progress_counter_and_binary_identity",
         "scripts.build.test_rust_test_admission",
@@ -462,7 +476,9 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         f"{REPORT_REGRESSIONS}.test_npm_cancellation_restores_all_outputs_and_clears_journal",
         f"{REPORT_REGRESSIONS}.test_npm_recovery_rejects_unowned_backup_before_mutation",
     ),
-    "scripts/codex_package/stage_npm_archives.py": ("scripts.codex_package.test_stage_npm_packages",),
+    "scripts/codex_package/stage_npm_archives.py": (
+        "scripts.codex_package.test_stage_npm_packages",
+    ),
     "scripts/common/tool_versions.py": ("scripts.build.test_build_tooling_storage",),
     "scripts/maintenance/vscode_runtime_proof.py": (
         "scripts.maintenance.test_dev_environment",
@@ -645,14 +661,9 @@ def python_test_targets(modules: Sequence[str], changed: Sequence[str]) -> list[
     )
     if not selected and not changed:
         return python_unittest_targets()
-    selected = sorted(set(selected))
-    return [
-        target
-        for target in selected
-        if not any(
-            target.startswith(parent + ".") for parent in selected if parent != target
-        )
-    ]
+    # A module's load_tests hook need not include a dotted child selector.
+    # Only the worker's actual loaded leaves can establish overlap.
+    return sorted(set(selected))
 
 
 def changed_production_script_requires_test(path_text: str) -> bool:
@@ -788,7 +799,8 @@ def script_audit_context_issues() -> list[str]:
 
 
 def script_audit_findings(
-    *, kind_by_target: dict[str, str] | None = None,
+    *,
+    kind_by_target: dict[str, str] | None = None,
     oracle_sources: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]]:
     errors: list[str] = []
@@ -926,7 +938,11 @@ def script_audit_commands(
                         "python",
                         "scripts/maintenance/root_maintenance.py",
                         "test-python",
-                        *(arg for target in selected_tests for arg in ("--module", target)),
+                        *(
+                            arg
+                            for target in selected_tests
+                            for arg in ("--module", target)
+                        ),
                     ),
                 )
 
@@ -1031,7 +1047,9 @@ def _is_syntax_check(item: tuple[str, tuple[str, ...]]) -> bool:
     # uv may synchronize its environment/cache, and tests may mutate shared state.
     label, _command = item
     return label in {
-        "PowerShell syntax", "justfile PowerShell syntax", "justfile Python syntax"
+        "PowerShell syntax",
+        "justfile PowerShell syntax",
+        "justfile Python syntax",
     } or label.startswith("JavaScript syntax:")
 
 
@@ -1039,8 +1057,10 @@ def _run_syntax_check(command: Sequence[str], output) -> int:
     executable = which(command[0]) or command[0]
     try:
         return run_owned(
-            [executable, *command[1:]], cwd=REPO_ROOT,
-            stdout=output, stderr=subprocess.STDOUT,
+            [executable, *command[1:]],
+            cwd=REPO_ROOT,
+            stdout=output,
+            stderr=subprocess.STDOUT,
         ).returncode
     except OSError as error:
         output.write(f"Could not run {command[0]}: {error}\n".encode("utf-8"))
@@ -1072,7 +1092,9 @@ def _audit_command_results(commands):
         with ExitStack() as stack:
             logs = [stack.enter_context(tempfile.TemporaryFile()) for _ in batch]
             groups = [[i] for i, item in enumerate(batch) if _is_syntax_check(item)]
-            python_checks = [i for i, item in enumerate(batch) if not _is_syntax_check(item)]
+            python_checks = [
+                i for i, item in enumerate(batch) if not _is_syntax_check(item)
+            ]
             if python_checks:
                 groups.insert(0, python_checks)
 
@@ -1094,7 +1116,9 @@ def _audit_command_results(commands):
                 print(decoder.decode(b"", final=True), end="", flush=True)
 
             try:
-                with OwnedThreadPoolExecutor(max_workers=min(4, len(groups))) as executor:
+                with OwnedThreadPoolExecutor(
+                    max_workers=min(4, len(groups))
+                ) as executor:
                     for label, _command in batch:
                         print(f"[RUN] {label}", flush=True)
                     futures = {}
@@ -1125,37 +1149,71 @@ def _run_json_worker(command, *, request=None, timeout=None):
             stdin.seek(0)
         executable = which(command[0]) or command[0]
         result = run_owned(
-            [executable, *command[1:]], cwd=REPO_ROOT, timeout=timeout,
-            stdin=stdin, stdout=stdout,
+            [executable, *command[1:]],
+            cwd=REPO_ROOT,
+            timeout=timeout,
+            stdin=stdin,
+            stdout=stdout,
         )
         if stdout.seek(0, os.SEEK_END) > JSON_WORKER_MAX_BYTES:
-            raise ValueError("JSON worker report exceeds the 16 MiB limit; result unverified")
+            raise ValueError(
+                "JSON worker report exceeds the 16 MiB limit; result unverified"
+            )
         stdout.seek(0)
         return result.returncode, json.load(stdout)
 
 
-def _print_oracle_advisories(sources: dict[str, str], expected: set[str]) -> None:
-    print("[ORACLE] Advisory only: static input snapshot, not test execution or coverage proof.")
+def _print_oracle_advisories(
+    sources: dict[str, str],
+    expected: set[str],
+    report_path: Path | None = None,
+) -> bool:
+    print(
+        "[ORACLE] Advisory only: static input snapshot, not test execution or coverage proof."
+    )
     try:
         if set(sources) != expected:
-            raise ValueError("incomplete Python input snapshot (unreadable input or source budget exceeded)")
+            raise ValueError(
+                "incomplete Python input snapshot (unreadable input or source budget exceeded)"
+            )
         if not sources:
             raise ValueError("no Python sources selected")
         code, report = _run_json_worker(
-            [sys.executable, "-I", "-B", str(SCRIPTS_ROOT / "maintenance" / "python_test_oracles.py")],
-            request={"sources": sources}, timeout=ORACLE_TIMEOUT_SECONDS,
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(SCRIPTS_ROOT / "maintenance" / "python_test_oracles.py"),
+            ],
+            request={"sources": sources},
+            timeout=ORACLE_TIMEOUT_SECONDS,
         )
         if code != 0:
             raise ValueError(f"oracle worker exited {code}")
-        if not isinstance(report, dict) or report.get("schema_version") != 1 or any(
-            not isinstance(report.get(key), list)
-            for key in ("diagnostics", "unknown", "limitations")
-        ) or any(type(report.get(key)) is not bool for key in ("parse_complete", "analysis_complete")):
+        if (
+            not isinstance(report, dict)
+            or report.get("schema_version") != 1
+            or any(
+                not isinstance(report.get(key), list)
+                for key in ("diagnostics", "unknown", "limitations")
+            )
+            or any(
+                type(report.get(key)) is not bool
+                for key in ("parse_complete", "analysis_complete")
+            )
+        ):
             raise ValueError("invalid oracle report")
-        if report.get("language") != "python" or report.get("advisory_only") is not True or report["analysis_complete"]:
-            raise ValueError("oracle report must describe incomplete advisory-only Python analysis")
+        if (
+            report.get("language") != "python"
+            or report.get("advisory_only") is not True
+            or report["analysis_complete"]
+        ):
+            raise ValueError(
+                "oracle report must describe incomplete advisory-only Python analysis"
+            )
         if any(
-            not isinstance(item, dict) or not isinstance(item.get("path"), str)
+            not isinstance(item, dict)
+            or not isinstance(item.get("path"), str)
             or not isinstance(item.get("reason"), str)
             for item in [*report["diagnostics"], *report["unknown"]]
         ) or not all(isinstance(item, str) for item in report["limitations"]):
@@ -1163,29 +1221,67 @@ def _print_oracle_advisories(sources: dict[str, str], expected: set[str]) -> Non
         # Compare the exact UTF-8 input bytes, not mtimes or a cached receipt.
         # New/unselected files are outside this explicitly named input snapshot.
         changed = [
-            target for target, text in sources.items()
+            target
+            for target, text in sources.items()
             if (REPO_ROOT / target).read_bytes() != text.encode("utf-8")
         ]
         if changed:
-            raise ValueError("source changed during oracle analysis: " + ", ".join(changed))
+            raise ValueError(
+                "source changed during oracle analysis: " + ", ".join(changed)
+            )
     except (OSError, ValueError, subprocess.SubprocessError, TimeoutError) as error:
         print(f"[ORACLE ADVISORY] Analysis unverified: {error}", flush=True)
-        return
+        return report_path is None
+    if report_path is not None:
+        try:
+            write_json_atomic(report_path, report)
+        except (OSError, ValueError) as error:
+            print(f"[FAIL] Cannot retain oracle report: {error}", flush=True)
+            return False
     print(
         f"[ORACLE] {len(sources)} unchanged input(s); "
         f"{len(report['diagnostics'])} finding(s); {len(report['unknown'])} unresolved item(s); "
         f"parse_complete={report['parse_complete']}; analysis_complete={report['analysis_complete']}.",
         flush=True,
     )
+    if report_path is not None:
+        # Counts cover every entry; examples are deliberately bounded. Never
+        # rerun analysis or discard the captured machine snapshot to render it.
+        from collections import Counter
+
+        for key in ("diagnostics", "unknown"):
+            counts = Counter(
+                str(item.get("code", item.get("reason", "unknown")))
+                for item in report[key]
+            )
+            categories = sorted(counts.items())
+            for category, count in categories[:20]:
+                print(f"[ORACLE {key}] {category[:200]}: {count}")
+            print(
+                f"[ORACLE {key}] {len(categories)} categories; "
+                f"{sum(count for _, count in categories[20:])} items in omitted categories"
+            )
+            for item in report[key][:5]:
+                print(f"[ORACLE example] {json.dumps(item, sort_keys=True)[:1000]}")
+            print(f"[ORACLE {key}] {max(0, len(report[key]) - 5)} examples omitted")
+        print(f"[ORACLE] Complete report: {report_path}")
+        return True
     for diagnostic in report["diagnostics"]:
         print("[ORACLE ADVISORY] " + json.dumps(diagnostic, sort_keys=True), flush=True)
     for unknown in report["unknown"]:
         print("[ORACLE UNKNOWN] " + json.dumps(unknown, sort_keys=True), flush=True)
     for limitation in report["limitations"]:
         print(f"[ORACLE LIMITATION] {limitation}", flush=True)
+    return True
 
 
-def run_script_audit(*, include_tests: bool, strict: bool, oracles: bool = False) -> int:
+def run_script_audit(
+    *,
+    include_tests: bool,
+    strict: bool,
+    oracles: bool = False,
+    oracle_report: Path | None = None,
+) -> int:
     audit_targets = script_source_targets()
     kind_by_target = script_kind_map()
     inventory: dict[str, int] = {}
@@ -1210,10 +1306,17 @@ def run_script_audit(*, include_tests: bool, strict: bool, oracles: bool = False
     )
     errors.extend(hygiene_errors)
     if oracles:
-        _print_oracle_advisories(
+        retained = _print_oracle_advisories(
             oracle_sources,
-            {target for target in audit_targets if kind_by_target.get(target) == "python"},
+            {
+                target
+                for target in audit_targets
+                if kind_by_target.get(target) == "python"
+            },
+            **({"report_path": oracle_report} if oracle_report is not None else {}),
         )
+        if retained is False:
+            errors.append("Oracle report could not be verified and retained")
     test_targets = script_audit_test_targets() if include_tests else []
     commands, missing_tools = script_audit_commands(
         include_tests=include_tests,
@@ -1273,13 +1376,18 @@ def run(command: Sequence[str]) -> int:
 
 def _emit_python_test_report(environments, errors, *, json_output=True) -> int:
     reports = [environment["report"] for environment in environments]
-    complete = bool(reports) and not errors and all(report["complete"] for report in reports)
+    complete = (
+        bool(reports) and not errors and all(report["complete"] for report in reports)
+    )
     successful = complete and all(report["successful"] for report in reports)
     payload = {
-        "schema_version": 1, "runner": "root_maintenance.unittest",
-        "complete": complete, "successful": successful,
+        "schema_version": 1,
+        "runner": "root_maintenance.unittest",
+        "complete": complete,
+        "successful": successful,
         "tests_run": sum(report["tests_run"] for report in reports),
-        "environments": environments, "errors": errors,
+        "environments": environments,
+        "errors": errors,
         "content_identity_scope": "authored_test_body_observation_only",
         "reusable_validation_receipt": False,
     }
@@ -1300,10 +1408,18 @@ def _emit_python_test_report(environments, errors, *, json_output=True) -> int:
             )
         for error in errors:
             print(error, file=sys.stderr)
-    return 0 if successful else 2 if errors or any(report["errors"] for report in reports) else 1
+    return (
+        0
+        if successful
+        else 2
+        if errors or any(report["errors"] for report in reports)
+        else 1
+    )
 
 
-def _run_python_tests_json(ordinary_targets, harbor_targets, *, json_output=True) -> int:
+def _run_python_tests_json(
+    ordinary_targets, harbor_targets, *, json_output=True
+) -> int:
     from scripts.maintenance.unittest_json import validate_report
 
     environments, errors = [], []
@@ -1312,12 +1428,22 @@ def _run_python_tests_json(ordinary_targets, harbor_targets, *, json_output=True
         if not targets:
             continue
         try:
-            prefix = [*UV_RUN_SCRIPTS, "python"] if name == "scripts" else [str(harbor_python())]
+            prefix = (
+                [*UV_RUN_SCRIPTS, "python"]
+                if name == "scripts"
+                else [str(harbor_python())]
+            )
             selection_args = [*targets, *([] if json_output else ["-v"])]
-            code, report = _run_json_worker([
-                *prefix, "-B", str(SCRIPTS_ROOT / "maintenance" / "unittest_json.py"),
-                *([] if json_output else ["--execution-only"]), *selection_args,
-            ])
+            code, report = _run_json_worker(
+                [
+                    *prefix,
+                    "-B",
+                    str(SCRIPTS_ROOT / "maintenance" / "unittest_json.py"),
+                    *([] if json_output else ["--execution-only"]),
+                    "--coalesce-selectors",
+                    *selection_args,
+                ]
+            )
             validate_report(report)
             if (code == 0) != (report["complete"] and report["successful"]):
                 raise ValueError(f"exit status {code} disagrees with worker report")
@@ -1327,15 +1453,23 @@ def _run_python_tests_json(ordinary_targets, harbor_targets, *, json_output=True
             if seen_names & names:
                 raise ValueError("duplicate test identities across interpreter groups")
             seen_names.update(names)
-            environments.append({"environment": name, "targets": list(targets),
-                                 "exit_code": code, "report": report})
+            environments.append(
+                {
+                    "environment": name,
+                    "targets": list(targets),
+                    "exit_code": code,
+                    "report": report,
+                }
+            )
         except (OSError, ValueError, subprocess.SubprocessError, TimeoutError) as error:
             message = f"{name} Python test result unverified: {error}"
             if json_output:
                 print(message, file=sys.stderr)
             errors.append(message)
     if not ordinary_targets and not harbor_targets:
-        errors.append("No matching Python tests selected; zero tests is not a successful result.")
+        errors.append(
+            "No matching Python tests selected; zero tests is not a successful result."
+        )
     return _emit_python_test_report(environments, errors, json_output=json_output)
 
 
@@ -1345,12 +1479,15 @@ def run_python_tests(targets: Sequence[str], *, json_output: bool = False) -> in
     # lightweight maintenance environment or silently skipping missing tooling.
     harbor_module = "scripts.benchmark_scripts.test_harbor_windows_codex"
     harbor_targets = [
-        target for target in targets
+        target
+        for target in targets
         if target == harbor_module or target.startswith(harbor_module + ".")
     ]
     ordinary_targets = [target for target in targets if target not in harbor_targets]
     return _run_python_tests_json(
-        ordinary_targets, harbor_targets, json_output=json_output,
+        ordinary_targets,
+        harbor_targets,
+        json_output=json_output,
     )
 
 
@@ -1373,7 +1510,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     python_test = subparsers.add_parser("test-python")
     python_test.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="Emit one structured result across interpreters; reject zero tests. Test diagnostics go to stderr.",
     )
     python_test.add_argument(
@@ -1406,8 +1544,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat optimization advisories such as large or syntax-only scripts as failures.",
     )
     script_audit.add_argument(
-        "--oracles", action="store_true",
+        "--oracles",
+        action="store_true",
         help="Add static Python assertion advisories; never promoted by --strict and never proof of test coverage.",
+    )
+    script_audit.add_argument(
+        "--oracle-report",
+        type=Path,
+        help="Atomically retain the complete oracle JSON and print a bounded summary; requires --oracles.",
     )
     return parser
 
@@ -1436,7 +1580,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         changed_paths = resolved_changed_paths(args.changed)
         if changed_paths is None:
             if args.json:
-                return _emit_python_test_report([], ["Changed-path discovery failed; selection unverified."])
+                return _emit_python_test_report(
+                    [], ["Changed-path discovery failed; selection unverified."]
+                )
             return 2
         targets = (
             python_test_targets(args.module, changed_paths)
@@ -1456,15 +1602,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             if args.json:
-                return _emit_python_test_report([], ["No focused test route for " + ", ".join(uncovered)])
+                return _emit_python_test_report(
+                    [], ["No focused test route for " + ", ".join(uncovered)]
+                )
             return 2
         return run_python_tests(targets, json_output=args.json)
 
     if args.command == "audit-scripts":
+        if args.oracle_report is not None and not args.oracles:
+            print("--oracle-report requires --oracles", file=sys.stderr)
+            return 2
         return run_script_audit(
             include_tests=not args.quick,
             strict=args.strict,
             oracles=args.oracles,
+            **(
+                {"oracle_report": args.oracle_report}
+                if args.oracle_report is not None
+                else {}
+            ),
         )
 
     raise AssertionError(f"unhandled command: {args.command}")

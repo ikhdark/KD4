@@ -58,6 +58,11 @@ impl LegacyAppPathString {
         convention: PathConvention,
     ) -> Result<Self, LegacyAppPathStringError> {
         if let Some(path_bytes) = path.opaque_fallback_bytes() {
+            if path.infer_path_convention() != Some(convention) {
+                return Err(LegacyAppPathStringError::OpaqueFallback {
+                    path: path.to_string(),
+                });
+            }
             return render_opaque_fallback(path, &path_bytes, convention).map(Self);
         }
         match convention {
@@ -186,6 +191,15 @@ fn render_opaque_fallback(
     path_bytes: &[u8],
     convention: PathConvention,
 ) -> Result<String, LegacyAppPathStringError> {
+    // A tagged Windows fallback can begin with '/' as UTF-16LE. Its bytes
+    // must not be rendered as POSIX text (with embedded NULs).
+    if convention == PathConvention::Posix
+        && path.infer_path_convention() == Some(PathConvention::Windows)
+    {
+        return Err(LegacyAppPathStringError::OpaqueFallback {
+            path: path.to_string(),
+        });
+    }
     let rendered = match convention {
         PathConvention::Posix if path_bytes.starts_with(b"/") => {
             Some(String::from_utf8_lossy(path_bytes).into_owned())

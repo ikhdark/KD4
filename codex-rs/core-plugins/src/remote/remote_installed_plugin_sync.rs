@@ -620,6 +620,16 @@ fn remove_stale_remote_plugin_caches_since(
             }
 
             let cache_path = entry.path();
+            let _entry_lock = match crate::store::try_lock_plugin_cache_entry(&cache_path) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "failed to own stale plugin cache entry {}: {error}",
+                        cache_path.display()
+                    ));
+                }
+            };
             if cache_path.is_dir() {
                 fs::remove_dir_all(&cache_path).map_err(|err| {
                     format!(
@@ -1194,7 +1204,11 @@ mod tests {
         .expect("valid plugin id");
         let store = PluginStore::new(codex_home.path().to_path_buf());
         store
-            .install_with_version(write_source("1.0.0"), plugin_id.clone(), "1.0.0".to_string())
+            .install_with_version(
+                write_source("1.0.0"),
+                plugin_id.clone(),
+                "1.0.0".to_string(),
+            )
             .expect("install previous version");
         // A direct install registers only its plugin name, then stages beside the plugin root.
         let mutation = mark_remote_plugin_cache_mutation_in_flight_inner(

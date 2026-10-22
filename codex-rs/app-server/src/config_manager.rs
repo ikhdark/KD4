@@ -66,6 +66,7 @@ pub(crate) struct ConfigManager {
     thread_config_loader: Arc<RwLock<Arc<dyn ThreadConfigLoader>>>,
     load_cache: Arc<RwLock<Option<ConfigLoadCacheEntry>>>,
     load_generation: Arc<AtomicU64>,
+    remote_control_handle: Arc<RwLock<Option<crate::transport::RemoteControlHandle>>>,
     #[cfg(test)]
     config_build_count: Arc<AtomicUsize>,
 }
@@ -91,6 +92,7 @@ impl ConfigManager {
             thread_config_loader: Arc::new(RwLock::new(thread_config_loader)),
             load_cache: Arc::new(RwLock::new(None)),
             load_generation: Arc::new(AtomicU64::new(0)),
+            remote_control_handle: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             config_build_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -152,8 +154,8 @@ impl ConfigManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = std::mem::replace(&mut *guard, loader);
-        drop(guard);
         self.invalidate_load_cache();
+        drop(guard);
         // Loader-owned values may have destructors; never run them while a
         // publication lock is held or before the new value invalidates the cache.
         drop(previous);
@@ -183,15 +185,133 @@ impl ConfigManager {
     }
 
     pub(crate) async fn sync_default_client_residency_requirement(&self) {
+        let generation = self.policy_generation();
+        let policy_target = self
+            .remote_control_handle
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .and_then(|handle| handle.policy_auth_epoch().ok().map(|epoch| (handle, epoch)));
         match self.load_latest_config(/*fallback_cwd*/ None).await {
             Ok(config) => {
-                set_default_client_residency_requirement(config.enforce_residency.value());
+                let _ = self.with_current_policy(generation, || {
+                    set_default_client_residency_requirement(config.enforce_residency.value());
+                });
+                if self.validate_policy_generation(generation).is_ok()
+                    && let Some((handle, epoch)) = policy_target
+                {
+                    let denied = config
+                        .config_layer_stack
+                        .requirements()
+                        .allow_remote_control
+                        .as_ref()
+                        .is_some_and(|requirement| !requirement.value);
+                    handle.update_policy(
+                        epoch,
+                        if denied {
+                            crate::transport::RemoteControlPolicy::DisabledByRequirements
+                        } else {
+                            crate::transport::RemoteControlPolicy::Allowed
+                        },
+                    );
+                }
             }
             Err(err) => warn!(
                 error = %err,
                 "failed to sync default client residency requirement after auth refresh"
             ),
         }
+    }
+
+    pub(crate) fn bind_remote_control_handle(&self, handle: crate::transport::RemoteControlHandle) {
+        *self
+            .remote_control_handle
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    }
+
+    pub(crate) fn policy_generation(&self) -> u64 {
+        self.load_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn validate_policy_generation(&self, generation: u64) -> std::io::Result<()> {
+        self.with_current_policy(generation, || ())
+    }
+
+    fn with_current_policy<T>(
+        &self,
+        generation: u64,
+        publish: impl FnOnce() -> T,
+    ) -> std::io::Result<T> {
+        let loader = self
+            .cloud_config_bundle
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.policy_generation() != generation {
+            return Err(std::io::Error::other(
+                "configuration changed before managed policy admission; retry the request",
+            ));
+        }
+        loader
+            .publish_if_current(publish)
+            .map_err(std::io::Error::other)
+    }
+
+    pub(crate) async fn complete_auth_transition(
+        &self,
+        auth_manager: Arc<AuthManager>,
+        chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+    ) {
+        self.replace_cloud_config_bundle_loader(
+            auth_manager,
+            chatgpt_base_url,
+            http_client_factory,
+        );
+        self.sync_default_client_residency_requirement().await;
+    }
+
+    /// Re-checks managed requirements whenever the current login completes a missing account
+    /// id. Cloud requirements are fetched per account, yet such a completion runs no explicit
+    /// auth transition, so remote control holds backend contact for the completed account until
+    /// this re-check records a decision for it, and a denial disables remote control.
+    pub(crate) async fn recheck_requirements_after_identity_completion(
+        self,
+        auth_manager: Arc<AuthManager>,
+        chatgpt_base_url: String,
+        http_client_factory: codex_http_client::HttpClientFactory,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let mut auth_changes = auth_manager.auth_change_receiver();
+        loop {
+            if self.remote_control_policy_recheck_pending() {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = self.complete_auth_transition(
+                        Arc::clone(&auth_manager),
+                        chatgpt_base_url.clone(),
+                        http_client_factory.clone(),
+                    ) => {}
+                }
+            }
+            // A failed re-check leaves remote control held; the next auth change retries it.
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                changed = auth_changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn remote_control_policy_recheck_pending(&self) -> bool {
+        self.remote_control_handle
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(crate::transport::RemoteControlHandle::policy_recheck_pending)
     }
 
     pub(crate) async fn load_latest_config(
@@ -330,13 +450,19 @@ impl ConfigManager {
             fallback_cwd: fallback_cwd.clone(),
         };
         let generation = self.load_generation.load(Ordering::Acquire);
-        if let Ok(cache) = self.load_cache.read()
+        self.validate_policy_generation(generation)?;
+        let cached_config = if let Ok(cache) = self.load_cache.read()
             && let Some(entry) = cache.as_ref()
             && entry.generation == generation
             && entry.key == cache_key
             && entry.loaded_at.elapsed() <= CONFIG_LOAD_CACHE_TTL
         {
-            return Ok(entry.config.clone());
+            Some(entry.config.clone())
+        } else {
+            None
+        };
+        if let Some(config) = cached_config {
+            return self.with_current_policy(generation, || config);
         }
 
         #[cfg(test)]
@@ -354,17 +480,17 @@ impl ConfigManager {
             .await?;
         self.apply_runtime_feature_enablement(&mut config);
         self.apply_arg0_paths(&mut config);
-        if let Ok(mut cache) = self.load_cache.write()
-            && self.load_generation.load(Ordering::Acquire) == generation
-        {
-            *cache = Some(ConfigLoadCacheEntry {
-                key: cache_key,
-                generation,
-                loaded_at: Instant::now(),
-                config: config.clone(),
-            });
-        }
-        Ok(config)
+        self.with_current_policy(generation, || {
+            if let Ok(mut cache) = self.load_cache.write() {
+                *cache = Some(ConfigLoadCacheEntry {
+                    key: cache_key,
+                    generation,
+                    loaded_at: Instant::now(),
+                    config: config.clone(),
+                });
+            }
+            config
+        })
     }
 
     pub(crate) async fn load_config_layers_for_cwd(
@@ -379,7 +505,11 @@ impl ConfigManager {
         cwd: Option<AbsolutePathBuf>,
     ) -> std::io::Result<ConfigLayerStack> {
         let thread_config_loader = self.current_thread_config_loader();
-        load_config_layers_state(
+        let generation = self.policy_generation();
+        self.validate_policy_generation(generation)?;
+        let loader = self.current_cloud_config_bundle();
+        let candidate_generation = loader.candidate_generation();
+        let layers = load_config_layers_state(
             LOCAL_FS.as_ref(),
             &self.codex_home,
             cwd,
@@ -387,11 +517,18 @@ impl ConfigManager {
             codex_config::ConfigLoadOptions {
                 loader_overrides: self.loader_overrides.clone(),
                 strict_config: self.strict_config,
-                cloud_config_bundle: self.current_cloud_config_bundle(),
+                cloud_config_bundle: loader.clone(),
             },
             thread_config_loader.as_ref(),
         )
-        .await
+        .await;
+        match layers {
+            Ok(layers) => self.with_current_policy(generation, || layers),
+            Err(err) => {
+                loader.reject_candidate(candidate_generation);
+                Err(err)
+            }
+        }
     }
 
     fn apply_runtime_feature_enablement(&self, config: &mut Config) {
@@ -753,6 +890,169 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn effective_semantic_failure_retires_the_candidate_and_allows_correction() {
+        let home = TempDir::new().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let loader = CloudConfigBundleLoader::retryable(move || {
+            let index = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Ok(Some(codex_config::CloudConfigBundle {
+                    config_toml: Default::default(),
+                    requirements_toml: codex_config::CloudRequirementsTomlBundle {
+                        enterprise_managed: vec![codex_config::CloudRequirementsFragment {
+                            id: "approval-policy".into(),
+                            name: "managed approvals".into(),
+                            contents: if index == 0 {
+                                "allowed_approval_policies = []"
+                            } else {
+                                "allowed_approval_policies = [\"on-request\"]"
+                            }
+                            .into(),
+                        }],
+                    },
+                }))
+            }
+        });
+        let manager = ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::without_managed_config_for_tests(),
+            loader,
+        );
+        let cwd = Some(home.path().to_path_buf());
+        assert!(manager.load_latest_config(cwd.clone()).await.is_err());
+        let config = manager
+            .load_latest_config(cwd)
+            .await
+            .expect("corrected managed candidate");
+        assert_eq!(
+            config
+                .config_layer_stack
+                .requirements_toml()
+                .allowed_approval_policies,
+            Some(vec![codex_protocol::protocol::AskForApproval::OnRequest])
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_obsolete_config_build_is_not_returned_or_cached() {
+        let home = TempDir::new().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered_task = entered.clone();
+        let release_task = release.clone();
+        let loader = CloudConfigBundleLoader::new(async move {
+            entered_task.notify_one();
+            release_task.notified().await;
+            Ok(Some(codex_config::CloudConfigBundle {
+                config_toml: codex_config::CloudConfigTomlBundle {
+                    enterprise_managed: vec![codex_config::CloudConfigFragment {
+                        id: "retired".into(),
+                        name: "retired account".into(),
+                        contents: "model_context_window = 123456".into(),
+                    }],
+                },
+                requirements_toml: Default::default(),
+            }))
+        });
+        let manager = ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::without_managed_config_for_tests(),
+            loader,
+        );
+        let previous_generation = manager.policy_generation();
+        let task_manager = manager.clone();
+        let cwd = home.path().to_path_buf();
+        let task = tokio::spawn(async move { task_manager.load_latest_config(Some(cwd)).await });
+        entered.notified().await;
+        let auth =
+            AuthManager::from_auth_for_testing(codex_login::CodexAuth::from_api_key("sk-fixture"));
+        manager
+            .complete_auth_transition(
+                auth,
+                "http://127.0.0.1:1".into(),
+                codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            )
+            .await;
+        release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert!(
+            manager
+                .validate_policy_generation(previous_generation)
+                .is_err()
+        );
+        let config = manager
+            .load_latest_config(Some(home.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert_ne!(config.model_context_window, Some(123456));
+    }
+
+    #[tokio::test]
+    async fn composed_config_semantics_validate_after_legal_higher_layer_repair() {
+        let home = TempDir::new().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let loader = CloudConfigBundleLoader::retryable(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok(Some(codex_config::CloudConfigBundle {
+                    config_toml: codex_config::CloudConfigTomlBundle {
+                        enterprise_managed: vec![
+                            codex_config::CloudConfigFragment {
+                                id: "high".into(),
+                                name: "max".into(),
+                                contents: "[features.multi_agent_v2]\nmax_wait_timeout_ms = 60000"
+                                    .into(),
+                            },
+                            codex_config::CloudConfigFragment {
+                                id: "low".into(),
+                                name: "default".into(),
+                                contents:
+                                    "[features.multi_agent_v2]\ndefault_wait_timeout_ms = 120000"
+                                        .into(),
+                            },
+                        ],
+                    },
+                    requirements_toml: Default::default(),
+                }))
+            }
+        });
+        let manager = ConfigManager::new_for_tests(
+            home.path().to_path_buf(),
+            vec![],
+            LoaderOverrides::without_managed_config_for_tests(),
+            loader,
+        );
+        assert!(
+            manager
+                .load_latest_config(Some(home.path().to_path_buf()))
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .load_with_cli_overrides(
+                    &[(
+                        "features.multi_agent_v2.max_wait_timeout_ms".into(),
+                        TomlValue::Integer(180000)
+                    )],
+                    None,
+                    ConfigOverrides::default(),
+                    Some(home.path().to_path_buf())
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     fn manager_with_published_authorities(codex_home: &Path) -> ConfigManager {

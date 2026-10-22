@@ -27,7 +27,6 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::command_preflight::preflight_invocation_for_kd4_runtime;
 use crate::tools::handlers::command_search::classify_rg_search_with_repository;
-use crate::tools::handlers::command_search::observe_rg_search_scope_state_with_freshness;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_search_repository_root;
@@ -257,7 +256,7 @@ impl ShellCommandHandler {
         &self,
         mut invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let Some(turn_environment) = crate::tools::handlers::wait_for_tool_environment(
+        let Some(turn_environment) = crate::tools::handlers::wait_for_observed_tool_environment(
             &invocation.step_context.environments,
             None,
             &invocation.cancellation_token,
@@ -341,7 +340,10 @@ impl ShellCommandHandler {
             turn.config.permissions.allow_login_shell,
         );
         let use_login_shell = Self::resolve_use_login_shell(params.login, allow_login_shell)?;
-        let session_shell = session.user_shell();
+        let session_shell = session
+            .shell_for_environment(&turn_environment)
+            .await
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
         let original_safety_shell = resolve_command_shell_async(
             &original_invocation,
             &turn_environment,
@@ -485,7 +487,7 @@ impl ShellCommandHandler {
             .with_workspace_identity(workspace_identity.as_deref());
             let search_command = safety_command.clone();
             let search_cwd = exec_params.cwd.clone();
-            let mut search = crate::tools::run_blocking_command_analysis(move || {
+            let search = crate::tools::run_blocking_command_analysis(move || {
                 classify_rg_search_with_repository(
                     &search_command,
                     shell_type,
@@ -498,13 +500,8 @@ impl ShellCommandHandler {
                 FunctionCallError::RespondToModel(format!("command search worker failed: {error}"))
             })?
             .map_err(FunctionCallError::RespondToModel)?;
-            if let Some((_, search)) = search.as_mut() {
-                observe_rg_search_scope_state_with_freshness(
-                    search,
-                    params.force_fresh.unwrap_or(false),
-                )
-                .await;
-            }
+            // Shell resolution may select aliases, functions or a replacement
+            // executable. Source scope alone cannot authorize a cached miss.
             let attempt_key = match search {
                 Some((repository, search)) => attempt_key.with_search_narrowing(
                     &turn.sub_id,
@@ -524,9 +521,16 @@ impl ShellCommandHandler {
         } else {
             None
         };
-        // Reserve before any launch; failed/cancelled attempts do not restore it.
-        turn.full_suite_budget
-            .admit(full_suite)
+        // Prelaunch rejections release this reservation; possible execution does not.
+        if full_suite {
+            turn.full_suite_budget.refresh_owned_nonexecution().await;
+        }
+        let _suite_permit = turn
+            .full_suite_budget
+            .reserve(
+                full_suite,
+                crate::validation_task::reservation_owner(&session, &turn, &call_id),
+            )
             .map_err(FunctionCallError::RespondToModel)?;
         let run_args = RunExecLikeArgs {
             max_output_tokens: params.max_output_tokens,
@@ -751,7 +755,13 @@ mod tests {
                     "fs/getMetadata" => {
                         json!({"isDirectory": true, "isFile": false, "isSymlink": false, "size": 0})
                     }
-                    "process/start" => {
+                    // Public process handles use the incarnation-bound start.
+                    "process/startOwned" => {
+                        assert!(
+                            request["params"]["incarnation"]
+                                .as_str()
+                                .is_some_and(|id| !id.is_empty())
+                        );
                         observed.lock().unwrap().push(request["params"].clone());
                         json!({"processId": request["params"]["processId"]})
                     }
@@ -772,7 +782,7 @@ mod tests {
                     ))
                     .await
                     .unwrap();
-                if request["method"] == "process/start" {
+                if request["method"] == "process/startOwned" {
                     let process_id = &request["params"]["processId"];
                     // Normal execution consumes the ordered notification stream;
                     // process/read is only the recovery path.
@@ -816,15 +826,19 @@ mod tests {
                 },
             )
             .await;
-        Arc::get_mut(&mut turn)
-            .unwrap()
-            .environments
-            .turn_environments = vec![TurnEnvironment::new(
+        let mut foreign = TurnEnvironment::new(
             "foreign".into(),
             Arc::new(codex_exec_server::Environment::create_for_tests(Some(url)).unwrap()),
             PathUri::parse("file:///workspace").unwrap(),
             None,
-        )];
+        );
+        // Ready environments are sampled with their initialized runtime, as
+        // environment resolution publishes them.
+        foreign.refresh_runtime().await.unwrap();
+        Arc::get_mut(&mut turn)
+            .unwrap()
+            .environments
+            .turn_environments = vec![foreign];
         let handler = ShellCommandHandler::new(super::ShellCommandHandlerOptions {
             foreign_environment: true,
             allow_login_shell: false,

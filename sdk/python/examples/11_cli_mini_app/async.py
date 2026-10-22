@@ -73,15 +73,15 @@ async def main() -> None:
             print()
             if status is None:
                 raise RuntimeError("stream ended without turn/completed")
-            if usage is None:
-                raise RuntimeError("stream ended without token usage")
-
             status_text = status.value
             print(f"assistant.status> {status_text}")
             if status_text == "failed":
                 print("assistant.error>", error)
 
-            print(_format_usage(usage))
+            if usage is None:
+                print("usage> unavailable for this turn")
+            else:
+                print(_format_usage(usage))
 
 
 if __name__ == "__main__":

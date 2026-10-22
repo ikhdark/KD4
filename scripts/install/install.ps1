@@ -15,7 +15,7 @@ if ([string]::IsNullOrWhiteSpace($Release)) {
 if ([string]::IsNullOrWhiteSpace($ReleaseRepository)) {
     $ReleaseRepository = "ikhdark/KD4"
 }
-$ReleaseRepository = $ReleaseRepository.Trim()
+$ReleaseRepository = $ReleaseRepository.Trim().ToLowerInvariant()
 if ($ReleaseRepository -cnotmatch '\A[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\.{1,2}\z)[A-Za-z0-9_.-]+\z') {
     throw "Invalid Codex release repository: $ReleaseRepository. Expected owner/name."
 }
@@ -153,7 +153,36 @@ function Find-ReleaseAssetMetadata {
     return [PSCustomObject]@{
         Url = $asset.browser_download_url
         Sha256 = $digestMatch.Groups[1].Value.ToLowerInvariant()
+        ReleaseId = [string]$release.id
+        AssetId = [string]$asset.id
     }
+}
+
+function Get-ReleaseArtifactIdentity {
+    param(
+        [string]$Repository,
+        [object]$PackageMetadata,
+        [object]$ChecksumMetadata
+    )
+
+    foreach ($metadata in @($PackageMetadata, $ChecksumMetadata)) {
+        if ($metadata.ReleaseId -notmatch '\A[0-9]+\z' -or $metadata.AssetId -notmatch '\A[0-9]+\z') {
+            throw 'Release metadata is missing an immutable release or asset identity.'
+        }
+    }
+    if ($PackageMetadata.ReleaseId -cne $ChecksumMetadata.ReleaseId) {
+        throw 'Release assets changed during metadata selection. Retry the install.'
+    }
+    $identity = @(
+        'codex-release-artifact-v2', $Repository.ToLowerInvariant(),
+        $PackageMetadata.ReleaseId, $PackageMetadata.AssetId, $PackageMetadata.Sha256,
+        $ChecksumMetadata.AssetId, $ChecksumMetadata.Sha256
+    ) -join "`n"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity)))).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $sha256.Dispose() }
 }
 
 function Get-ReleaseAssetMetadata {
@@ -749,6 +778,7 @@ function Test-PackageContentsAreComplete {
     } catch {
         return $false
     }
+    if ($metadata -isnot [pscustomobject]) { return $false }
     $expectedMetadata = @{
         layoutVersion = 2
         version = $ExpectedVersion
@@ -763,14 +793,19 @@ function Test-PackageContentsAreComplete {
         if ($null -eq $property -or $property.Value -cne $expectedMetadata[$key]) {
             return $false
         }
+        if ($key -eq 'layoutVersion') {
+            if ($property.Value -isnot [int] -and $property.Value -isnot [long]) { return $false }
+        }
+        elseif ($property.Value -isnot [string]) { return $false }
     }
 
-    if (
+    foreach ($key in @("bundleId", "files", "buildIdentity")) {
+        if ($null -eq $metadata.PSObject.Properties[$key]) { return $false }
+    }
+    if ($metadata.bundleId -isnot [string] -or
         $metadata.bundleId -cnotmatch "^[0-9a-f]{64}$" -or
-        $null -eq $metadata.files -or
-        @($metadata.files).Count -eq 0 -or
-        $null -eq $metadata.buildIdentity
-    ) {
+        $metadata.files -isnot [array] -or $metadata.files.Count -eq 0 -or
+        $metadata.buildIdentity -isnot [pscustomobject]) {
         return $false
     }
 
@@ -782,14 +817,23 @@ function Test-PackageContentsAreComplete {
         default { return $false }
     }
     foreach ($file in @($metadata.files)) {
+        if ($file -isnot [pscustomobject]) { return $false }
         foreach ($propertyName in @("path", "role", "size", "sha256")) {
             if ($null -eq $file.PSObject.Properties[$propertyName]) {
                 return $false
             }
         }
-        $relative = [string]$file.path
+        if ($file.path -isnot [string] -or $file.role -isnot [string] -or
+            [string]::IsNullOrWhiteSpace($file.role) -or $file.sha256 -isnot [string] -or
+            $file.sha256 -cnotmatch "^[0-9a-f]{64}$" -or
+            $file.size -isnot [ValueType] -or $file.size -is [bool] -or
+            $file.size -is [double] -or $file.size -is [decimal]) { return $false }
+        $size = 0L
+        if (-not [long]::TryParse([string]$file.size, [ref]$size) -or $size -lt 0) { return $false }
+        $relative = $file.path
         if ([string]::IsNullOrWhiteSpace($relative) -or $relative.StartsWith("/") -or
-            $relative.StartsWith("\") -or $relative -match "(^|[\\/])\.\.([\\/]|$)" -or
+            $relative.StartsWith("\") -or $relative.Contains(":") -or
+            $relative -match "(^|[\\/])\.\.?([\\/]|$)" -or
             $declared.ContainsKey($relative)) {
             return $false
         }
@@ -800,7 +844,7 @@ function Test-PackageContentsAreComplete {
         }
         $item = Get-Item -LiteralPath $path
         $digest = Get-FileSha256 -Path $path
-        if ([long]$file.size -ne $item.Length -or [string]$file.sha256 -cne $digest) {
+        if ($size -ne $item.Length -or $file.sha256 -cne $digest) {
             return $false
         }
         if ($relative.EndsWith(".exe", [StringComparison]::OrdinalIgnoreCase)) {
@@ -814,7 +858,7 @@ function Test-PackageContentsAreComplete {
             path = $relative
             role = [string]$file.role
             sha256 = [string]$file.sha256
-            size = [long]$file.size
+            size = $size
         }
     }
 
@@ -879,16 +923,27 @@ function Write-InstallMetadata {
         [string]$ReleaseDir,
         [string]$ResolvedVersion,
         [string]$Target,
-        [string]$Layout
+        [string]$Layout,
+        [string]$ArtifactIdentity,
+        [object]$PackageMetadata,
+        [object]$ChecksumMetadata
     )
 
     $metadataPath = Join-Path $ReleaseDir $InstallMetadataFile
     $tmpMetadataPath = "$metadataPath.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
     try {
         @(
+            'receiptVersion=2'
             "version=$ResolvedVersion"
             "target=$Target"
             "layout=$Layout"
+            "repository=$ReleaseRepository"
+            "releaseId=$($PackageMetadata.ReleaseId)"
+            "assetId=$($PackageMetadata.AssetId)"
+            "archiveSha256=$($PackageMetadata.Sha256)"
+            "checksumAssetId=$($ChecksumMetadata.AssetId)"
+            "checksumSha256=$($ChecksumMetadata.Sha256)"
+            "artifactIdentity=$ArtifactIdentity"
         ) | Set-Content -LiteralPath $tmpMetadataPath -Encoding UTF8
         Move-Item -LiteralPath $tmpMetadataPath -Destination $metadataPath -Force
     }
@@ -924,7 +979,10 @@ function Test-ReleaseIsComplete {
         [string]$ReleaseDir,
         [string]$ExpectedVersion,
         [string]$ExpectedTarget,
-        [string]$Layout
+        [string]$Layout,
+        [Parameter(Mandatory = $true)][string]$ArtifactIdentity,
+        [Parameter(Mandatory = $true)][object]$PackageMetadata,
+        [Parameter(Mandatory = $true)][object]$ChecksumMetadata
     )
 
     switch ($Layout) {
@@ -938,13 +996,21 @@ function Test-ReleaseIsComplete {
         }
     }
 
-    if ((Split-Path -Leaf $ReleaseDir) -ne "$ExpectedVersion-$ExpectedTarget") {
+    if ((Split-Path -Leaf $ReleaseDir) -ne "$ExpectedVersion-$ExpectedTarget-$ArtifactIdentity") {
         return $false
     }
 
     $metadataMatches = (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "version") -eq $ExpectedVersion -and
         (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "target") -eq $ExpectedTarget -and
-        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "layout") -eq $Layout
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "layout") -eq $Layout -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "receiptVersion") -ceq '2' -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "repository") -ceq $ReleaseRepository -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "artifactIdentity") -ceq $ArtifactIdentity -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "releaseId") -ceq $PackageMetadata.ReleaseId -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "assetId") -ceq $PackageMetadata.AssetId -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "archiveSha256") -ceq $PackageMetadata.Sha256 -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "checksumAssetId") -ceq $ChecksumMetadata.AssetId -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "checksumSha256") -ceq $ChecksumMetadata.Sha256
     if (-not $metadataMatches) {
         return $false
     }
@@ -1136,8 +1202,6 @@ if ($Uninstall) {
 
 $tarCommand = Get-NativeTarCommand
 $resolvedVersion = Resolve-Version
-$releaseName = "$resolvedVersion-$target"
-$releaseDir = Join-Path $releasesDir $releaseName
 
 if (-not [string]::IsNullOrWhiteSpace($currentVersion) -and $currentVersion -ne $resolvedVersion) {
     Write-Step "Updating Codex CLI from $currentVersion to $resolvedVersion"
@@ -1160,6 +1224,9 @@ $installLayout = "Package"
 if ($null -eq $packageMetadata -or $null -eq $checksumMetadata) {
     throw "Could not find Codex standalone package release assets for Codex $resolvedVersion."
 }
+$artifactIdentity = Get-ReleaseArtifactIdentity -Repository $ReleaseRepository -PackageMetadata $packageMetadata -ChecksumMetadata $checksumMetadata
+$releaseName = "$resolvedVersion-$target-$artifactIdentity"
+$releaseDir = Join-Path $releasesDir $releaseName
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-install-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 
@@ -1167,7 +1234,7 @@ try {
     Invoke-WithInstallLock -LockPath $lockPath -Script {
         Remove-StaleInstallArtifacts -ReleasesDir $releasesDir
 
-        if (-not (Test-ReleaseIsComplete -ReleaseDir $releaseDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target -Layout $installLayout)) {
+        if (-not (Test-ReleaseIsComplete -ReleaseDir $releaseDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target -Layout $installLayout -ArtifactIdentity $artifactIdentity -PackageMetadata $packageMetadata -ChecksumMetadata $checksumMetadata)) {
             if (Test-Path -LiteralPath $releaseDir) {
                 Write-WarningStep "Found incomplete existing release at $releaseDir. Reinstalling."
             }
@@ -1180,6 +1247,9 @@ try {
             Invoke-WebRequest -Uri $checksumMetadata.Url -OutFile $checksumPath
             Test-ArchiveDigest -ArchivePath $checksumPath -ExpectedDigest $checksumMetadata.Sha256
             $expectedPackageDigest = Get-PackageArchiveDigest -ManifestPath $checksumPath -AssetName $packageAsset
+            if ($expectedPackageDigest -cne $packageMetadata.Sha256) {
+                throw 'Release archive digest disagrees with the selected checksum asset.'
+            }
             Invoke-WebRequest -Uri $packageMetadata.Url -OutFile $archivePath
             Test-ArchiveDigest -ArchivePath $archivePath -ExpectedDigest $expectedPackageDigest
 
@@ -1199,7 +1269,7 @@ try {
                 throw "Downloaded Codex binary version did not match release metadata. Expected $resolvedVersion but got $stagedVersion."
             }
 
-            Write-InstallMetadata -ReleaseDir $stagingDir -ResolvedVersion $resolvedVersion -Target $target -Layout $installLayout
+            Write-InstallMetadata -ReleaseDir $stagingDir -ResolvedVersion $resolvedVersion -Target $target -Layout $installLayout -ArtifactIdentity $artifactIdentity -PackageMetadata $packageMetadata -ChecksumMetadata $checksumMetadata
 
             $repairBackup = $null
             if (Test-Path -LiteralPath $releaseDir) {

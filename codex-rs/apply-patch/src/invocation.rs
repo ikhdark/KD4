@@ -23,6 +23,10 @@ use codex_utils_path_uri::PathUri;
 use std::str::Utf8Error;
 use tree_sitter::LanguageError;
 
+#[cfg(test)]
+#[path = "endpoint_evidence_tests.rs"]
+mod endpoint_evidence_tests;
+
 const APPLY_PATCH_COMMANDS: [&str; 2] = ["apply_patch", "applypatch"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +366,30 @@ pub(crate) async fn mutation_endpoint_identity(
         match fs.canonicalize(&candidate, sandbox).await {
             Ok(resolved) => break resolved,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                // Canonicalization follows links. A present unresolved link is
+                // not a prospective lexical endpoint: publication follows it.
+                match fs.get_metadata(&candidate, sandbox).await {
+                    Ok(metadata) if metadata.is_symlink => {
+                        return Err(ApplyPatchError::IoError(IoError {
+                            context: format!(
+                                "Refusing unresolved symlink mutation endpoint {}",
+                                path.inferred_native_path_string()
+                            ),
+                            source,
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(ApplyPatchError::IoError(IoError {
+                            context: format!(
+                                "Failed to inspect mutation endpoint {}",
+                                path.inferred_native_path_string()
+                            ),
+                            source,
+                        }));
+                    }
+                }
                 let segment = candidate.basename().ok_or_else(|| {
                     ApplyPatchError::IoError(IoError {
                         context: format!(
@@ -400,15 +428,30 @@ pub(crate) async fn mutation_endpoint_identity(
         }
     };
 
-    for segment in missing_segments.iter().rev() {
-        resolved = resolved.join(segment)?;
+    let windows = resolved.infer_path_convention() == Some(PathConvention::Windows);
+    let sensitive = if windows && !missing_segments.is_empty() {
+        fs.directory_case_sensitive(&resolved, sandbox)
+            .await
+            .ok()
+            .flatten()
+            == Some(true)
+    } else {
+        !windows
+    };
+    for (index, segment) in missing_segments.iter().rev().enumerate() {
+        // Only the existing directory can prove its child-name policy. A
+        // further missing directory has no observed policy yet; keep the
+        // conservative duplicate-write guard there and for legacy providers.
+        if windows && !(index == 0 && sensitive) {
+            resolved = resolved.join(&segment.to_lowercase())?;
+        } else {
+            resolved = resolved.join(segment)?;
+        }
     }
 
-    let identity = resolved.inferred_native_path_string();
-    Ok(match resolved.infer_path_convention() {
-        Some(PathConvention::Windows) => identity.to_lowercase(),
-        _ => identity,
-    })
+    // The selected provider supplied canonical spelling. Do not fold native
+    // names or render opaque paths lossily to establish endpoint identity.
+    Ok(resolved.to_string())
 }
 
 /// Extract the heredoc body (and optional `cd` workdir) from a `bash -lc` script
@@ -580,6 +623,33 @@ mod tests {
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    #[tokio::test]
+    async fn mutation_identity_respects_the_filesystems_canonical_case() {
+        let dir = tempdir().unwrap();
+        let upper = dir.path().join("Owner.rs");
+        let lower = dir.path().join("owner.rs");
+        fs::write(&upper, "upper").unwrap();
+        fs::write(&lower, "lower").unwrap();
+        // The OS, not the implementation under review, determines whether
+        // these are aliases or distinct objects on this fixture's filesystem.
+        let same_target = fs::canonicalize(&upper).unwrap() == fs::canonicalize(&lower).unwrap();
+        let upper = mutation_endpoint_identity(
+            LOCAL_FS.as_ref(),
+            &PathUri::from_host_native_path(upper).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let lower = mutation_endpoint_identity(
+            LOCAL_FS.as_ref(),
+            &PathUri::from_host_native_path(lower).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(upper == lower, same_target);
     }
 
     #[test]
@@ -869,8 +939,14 @@ mod tests {
     async fn test_environment_header_cannot_redirect_selected_shell_environment() {
         let dir = tempdir().unwrap();
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        for header in ["", "*** Environment ID: selected\n", "*** Environment ID: other\n"] {
-            let patch = wrap_patch(&format!("{header}*** Add File: result.txt\n+selected environment"));
+        for header in [
+            "",
+            "*** Environment ID: selected\n",
+            "*** Environment ID: other\n",
+        ] {
+            let patch = wrap_patch(&format!(
+                "{header}*** Add File: result.txt\n+selected environment"
+            ));
             let result = maybe_parse_apply_patch_verified_for_environment(
                 &strs_to_strings(&["apply_patch", &patch]),
                 &cwd,
@@ -882,22 +958,32 @@ mod tests {
             if header.contains("other") {
                 assert_eq!(
                     result,
-                    MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::EnvironmentIdMismatch {
-                        patch_environment_id: "other".to_string(),
-                        selected_environment_id: "selected".to_string(),
-                    })
+                    MaybeApplyPatchVerified::CorrectnessError(
+                        ApplyPatchError::EnvironmentIdMismatch {
+                            patch_environment_id: "other".to_string(),
+                            selected_environment_id: "selected".to_string(),
+                        }
+                    )
                 );
             } else {
                 let MaybeApplyPatchVerified::Body(action) = result else {
                     panic!("expected verified patch, got {result:?}");
                 };
                 assert_eq!(action.cwd, cwd);
-                assert_eq!(action.changes(), &HashMap::from([(
-                    cwd.join("result.txt").unwrap(),
-                    ApplyPatchFileChange::Add { content: "selected environment\n".to_string() },
-                )]));
+                assert_eq!(
+                    action.changes(),
+                    &HashMap::from([(
+                        cwd.join("result.txt").unwrap(),
+                        ApplyPatchFileChange::Add {
+                            content: "selected environment\n".to_string()
+                        },
+                    )])
+                );
             }
-            assert!(!dir.path().join("result.txt").exists(), "verification must not write");
+            assert!(
+                !dir.path().join("result.txt").exists(),
+                "verification must not write"
+            );
         }
     }
 
@@ -1226,6 +1312,91 @@ mod tests {
 
         assert_duplicate_path_error(result, &cwd.join("missing.txt").unwrap());
         assert!(!dir.path().join("missing.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_verify_keeps_case_alias_guard_for_prospective_endpoints() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let patch =
+            wrap_patch("*** Add File: Missing.txt\n+first\n*** Add File: missing.txt\n+second");
+        let result =
+            verify_apply_patch_args(parse_patch(&patch).unwrap(), &cwd, LOCAL_FS.as_ref(), None)
+                .await;
+        assert_duplicate_path_error(result, &cwd.join("missing.txt").unwrap());
+        assert!(!dir.path().join("missing.txt").exists());
+        assert!(!dir.path().join("Missing.txt").exists());
+    }
+
+    #[cfg(windows)]
+    fn set_directory_case_sensitive(path: &std::path::Path, sensitive: bool) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::FILE_CASE_SENSITIVE_INFO;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::FileCaseSensitiveInfo;
+        use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        let info = FILE_CASE_SENSITIVE_INFO {
+            Flags: u32::from(sensitive),
+        };
+        // SAFETY: directory owns this handle; info has the required layout and
+        // remains valid for the exact buffer length for this synchronous call.
+        let success = unsafe {
+            SetFileInformationByHandle(
+                directory.as_raw_handle() as HANDLE,
+                FileCaseSensitiveInfo,
+                (&info as *const FILE_CASE_SENSITIVE_INFO).cast(),
+                std::mem::size_of::<FILE_CASE_SENSITIVE_INFO>() as u32,
+            )
+        };
+        assert_ne!(
+            success,
+            0,
+            "fixture requires directory case-policy support: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_verify_accepts_case_distinct_prospective_endpoints() {
+        let dir = tempdir().unwrap();
+        set_directory_case_sensitive(dir.path(), true);
+        // Native I/O is an independent control: these must be distinct objects.
+        fs::write(dir.path().join("Control"), "upper").unwrap();
+        fs::write(dir.path().join("control"), "lower").unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Control")).unwrap(),
+            "upper"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("control")).unwrap(),
+            "lower"
+        );
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let patch =
+            wrap_patch("*** Add File: Missing.txt\n+first\n*** Add File: missing.txt\n+second");
+        let result =
+            verify_apply_patch_args(parse_patch(&patch).unwrap(), &cwd, LOCAL_FS.as_ref(), None)
+                .await;
+        assert_matches!(result, MaybeApplyPatchVerified::Body(action) if action.changes.len() == 2);
+        assert!(!dir.path().join("Missing.txt").exists());
+        assert!(!dir.path().join("missing.txt").exists());
+        // Exact duplicates must still be rejected in a sensitive directory.
+        let patch =
+            wrap_patch("*** Add File: Missing.txt\n+first\n*** Add File: Missing.txt\n+second");
+        let result =
+            verify_apply_patch_args(parse_patch(&patch).unwrap(), &cwd, LOCAL_FS.as_ref(), None)
+                .await;
+        assert_duplicate_path_error(result, &cwd.join("Missing.txt").unwrap());
     }
 
     #[tokio::test]

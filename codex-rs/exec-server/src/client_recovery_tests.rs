@@ -21,51 +21,89 @@ async fn process_close_discards_buffered_later_output() {
     for recovery in [None, Some(false), Some(true)] {
         let state = SessionState::new(true);
         let mut events = state.subscribe_events();
-        assert!(!state.publish_ordered_event(ExecProcessEvent::Output(ProcessOutputChunk {
-            seq: 4,
-            stream: ExecOutputStream::Stdout,
-            chunk: b"must not follow close".to_vec().into(),
-        })).unwrap());
+        assert!(
+            !state
+                .publish_ordered_event(ExecProcessEvent::Output(ProcessOutputChunk {
+                    seq: 4,
+                    stream: ExecOutputStream::Stdout,
+                    chunk: b"must not follow close".to_vec().into(),
+                }))
+                .unwrap()
+        );
         let prefix = ProcessOutputChunk {
             seq: 1,
             stream: ExecOutputStream::Stdout,
             chunk: b"valid prefix".to_vec().into(),
         };
         if let Some(with_gap) = recovery {
-            assert!(state.recover_events(ReadResponse {
-                chunks: vec![prefix.clone()],
-                next_seq: 4,
-                exited: true,
-                exit_code: Some(7),
-                closed: true,
-                failure: None,
-                output_gap: with_gap.then_some(crate::protocol::ProcessOutputGap {
-                    through_seq: 0,
-                    exit_seq: Some(2),
-                }),
-                sandbox_denied: false,
-            }).unwrap());
+            assert!(
+                state
+                    .recover_events(ReadResponse {
+                        chunks: vec![prefix.clone()],
+                        next_seq: 4,
+                        exited: true,
+                        exit_code: Some(7),
+                        closed: true,
+                        failure: None,
+                        output_gap: with_gap.then_some(crate::protocol::ProcessOutputGap {
+                            through_seq: 0,
+                            exit_seq: Some(2),
+                        }),
+                        sandbox_denied: false,
+                    })
+                    .unwrap()
+            );
         } else {
-            assert!(!state.publish_ordered_event(ExecProcessEvent::Closed {
-                seq: 3, sandbox_denied: Some(false),
-            }).unwrap());
-            assert!(!state.publish_ordered_event(ExecProcessEvent::Exited {
-                seq: 2, exit_code: 7, sandbox_denied: Some(false),
-            }).unwrap());
-            assert!(state.publish_ordered_event(ExecProcessEvent::Output(prefix.clone())).unwrap());
+            assert!(
+                !state
+                    .publish_ordered_event(ExecProcessEvent::Closed {
+                        seq: 3,
+                        sandbox_denied: Some(false),
+                    })
+                    .unwrap()
+            );
+            assert!(
+                !state
+                    .publish_ordered_event(ExecProcessEvent::Exited {
+                        seq: 2,
+                        exit_code: 7,
+                        sandbox_denied: Some(false),
+                    })
+                    .unwrap()
+            );
+            assert!(
+                state
+                    .publish_ordered_event(ExecProcessEvent::Output(prefix.clone()))
+                    .unwrap()
+            );
         }
         for expected in [
             ExecProcessEvent::Output(prefix),
-            ExecProcessEvent::Exited { seq: 2, exit_code: 7, sandbox_denied: Some(false) },
-            ExecProcessEvent::Closed { seq: 3, sandbox_denied: Some(false) },
+            ExecProcessEvent::Exited {
+                seq: 2,
+                exit_code: 7,
+                sandbox_denied: Some(false),
+            },
+            ExecProcessEvent::Closed {
+                seq: 3,
+                sandbox_denied: Some(false),
+            },
         ] {
-            assert_eq!(tokio::time::timeout(Duration::from_secs(1), events.recv())
-                .await.unwrap().unwrap(), expected, "recovery={recovery:?}");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                expected,
+                "recovery={recovery:?}"
+            );
         }
         let next = events.recv();
         tokio::pin!(next);
-        assert!(futures::poll!(&mut next).is_pending(),
-            "Closed must not be followed by buffered output: recovery={recovery:?}");
+        assert!(
+            futures::poll!(&mut next).is_pending(),
+            "Closed must not be followed by buffered output: recovery={recovery:?}"
+        );
         let ordered = state.ordered_events.lock().unwrap();
         assert_eq!(ordered.last_published_seq, 3);
         assert!(ordered.pending.is_empty());
@@ -75,36 +113,53 @@ async fn process_close_discards_buffered_later_output() {
 
 #[tokio::test]
 async fn recovery_reads_healthy_process_while_another_reply_is_held() {
-    use codex_exec_server_protocol::JSONRPCMessage;
-    use codex_exec_server_protocol::JSONRPCResponse;
     use crate::connection::JsonRpcConnection;
     use crate::connection::JsonRpcConnectionEvent;
     use crate::connection::JsonRpcTransport;
+    use codex_exec_server_protocol::JSONRPCMessage;
+    use codex_exec_server_protocol::JSONRPCResponse;
 
     let (outgoing_tx, mut requests) = tokio::sync::mpsc::channel(16);
     let (replies, incoming_rx) = tokio::sync::mpsc::channel(16);
     let (_connected, disconnected_rx) = tokio::sync::watch::channel(false);
-    let connecting = ExecServerClient::connect(JsonRpcConnection {
-        outgoing_tx, incoming_rx, disconnected_rx,
-        task_handles: Vec::new(), transport: JsonRpcTransport::Plain,
-    }, super::super::ExecServerClientConnectOptions::default());
+    let connecting = ExecServerClient::connect(
+        JsonRpcConnection {
+            outgoing_tx,
+            incoming_rx,
+            disconnected_rx,
+            task_handles: Vec::new(),
+            transport: JsonRpcTransport::Plain,
+        },
+        super::super::ExecServerClientConnectOptions::default(),
+    );
     tokio::pin!(connecting);
     assert!(futures::poll!(&mut connecting).is_pending());
     let JSONRPCMessage::Request(initialize) = requests.recv().await.unwrap() else {
         panic!("expected initialize request");
     };
-    replies.send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(JSONRPCResponse {
-        id: initialize.id,
-        result: serde_json::json!({"sessionId": "concurrent-recovery"}),
-    }))).await.unwrap();
+    replies
+        .send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(
+            JSONRPCResponse {
+                id: initialize.id,
+                result: serde_json::json!({"sessionId": "concurrent-recovery"}),
+            },
+        )))
+        .await
+        .unwrap();
     let client = connecting.await.unwrap();
-    assert!(matches!(requests.recv().await, Some(JSONRPCMessage::Notification(_))));
+    assert!(matches!(
+        requests.recv().await,
+        Some(JSONRPCMessage::Notification(_))
+    ));
 
     let mut observations = std::collections::HashMap::new();
     for name in ["one", "two"] {
         let state = Arc::new(SessionState::new(true));
         observations.insert(name.to_string(), state.subscribe_events());
-        client.inner.insert_session(&crate::ProcessId::from(name.to_string()), state).unwrap();
+        client
+            .inner
+            .insert_session(&crate::ProcessId::from(name.to_string()), state)
+            .unwrap();
     }
     let rpc = client.rpc_client_without_recovery().unwrap();
     let recovery = client.inner.recover_processes(&rpc);
@@ -112,9 +167,13 @@ async fn recovery_reads_healthy_process_while_another_reply_is_held() {
     assert!(futures::poll!(&mut recovery).is_pending());
     let mut reads = Vec::new();
     for _ in 0..2 {
-        let message = tokio::time::timeout(Duration::from_secs(1), requests.recv()).await
-            .expect("both recovery reads must dispatch before either reply").unwrap();
-        let JSONRPCMessage::Request(request) = message else { panic!("expected read request") };
+        let message = tokio::time::timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .expect("both recovery reads must dispatch before either reply")
+            .unwrap();
+        let JSONRPCMessage::Request(request) = message else {
+            panic!("expected read request")
+        };
         assert_eq!(request.method, EXEC_READ_METHOD);
         reads.push(request);
     }
@@ -123,15 +182,31 @@ async fn recovery_reads_healthy_process_while_another_reply_is_held() {
     let params: ReadParams = serde_json::from_value(healthy.params.clone().unwrap()).unwrap();
     assert_eq!(params.after_seq, Some(0));
     let response = ReadResponse {
-        chunks: vec![ProcessOutputChunk { seq: 1, stream: ExecOutputStream::Stdout,
-            chunk: b"recovered".to_vec().into() }],
-        next_seq: 2, exited: false, exit_code: None, closed: false,
-        failure: None, output_gap: None, sandbox_denied: false,
+        chunks: vec![ProcessOutputChunk {
+            seq: 1,
+            stream: ExecOutputStream::Stdout,
+            chunk: b"recovered".to_vec().into(),
+        }],
+        next_seq: 2,
+        exited: false,
+        exit_code: None,
+        closed: false,
+        failure: None,
+        output_gap: None,
+        sandbox_denied: false,
     };
-    replies.send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(JSONRPCResponse {
-        id: healthy.id, result: serde_json::to_value(&response).unwrap(),
-    }))).await.unwrap();
-    let events = observations.get_mut(&params.process_id.to_string()).unwrap();
+    replies
+        .send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(
+            JSONRPCResponse {
+                id: healthy.id,
+                result: serde_json::to_value(&response).unwrap(),
+            },
+        )))
+        .await
+        .unwrap();
+    let events = observations
+        .get_mut(&params.process_id.to_string())
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         tokio::select! {
             _ = &mut recovery => panic!("held reply must keep recovery open"),
@@ -139,40 +214,100 @@ async fn recovery_reads_healthy_process_while_another_reply_is_held() {
                 ExecProcessEvent::Output(chunk) if chunk.seq == 1 && chunk.chunk.0 == b"recovered")),
         }
     }).await.expect("healthy process publishes its prefix without waiting for held process");
-    replies.send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(JSONRPCResponse {
-        id: held.id, result: serde_json::to_value(response).unwrap(),
-    }))).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), recovery).await.unwrap().unwrap();
+    replies
+        .send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(
+            JSONRPCResponse {
+                id: held.id,
+                result: serde_json::to_value(response).unwrap(),
+            },
+        )))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), recovery)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
 async fn output_gap_recovers_live_suffix_and_authoritative_exit() {
     let state = SessionState::new(true);
     let mut events = state.subscribe_events();
-    assert!(!state.recover_events(ReadResponse {
-        chunks: vec![ProcessOutputChunk { seq: 5, stream: ExecOutputStream::Stdout,
-            chunk: b"suffix".to_vec().into() }],
-        next_seq: 6, exited: false, exit_code: None, closed: false, failure: None,
-        output_gap: Some(crate::protocol::ProcessOutputGap { through_seq: 4, exit_seq: None }),
-        sandbox_denied: false,
-    }).unwrap());
-    assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 4 });
-    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Output(chunk) if chunk.chunk.0 == b"suffix"));
+    assert!(
+        !state
+            .recover_events(ReadResponse {
+                chunks: vec![ProcessOutputChunk {
+                    seq: 5,
+                    stream: ExecOutputStream::Stdout,
+                    chunk: b"suffix".to_vec().into()
+                }],
+                next_seq: 6,
+                exited: false,
+                exit_code: None,
+                closed: false,
+                failure: None,
+                output_gap: Some(crate::protocol::ProcessOutputGap {
+                    through_seq: 4,
+                    exit_seq: None
+                }),
+                sandbox_denied: false,
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        events.recv().await.unwrap(),
+        ExecProcessEvent::OutputGap { through_seq: 4 }
+    );
+    assert!(
+        matches!(events.recv().await.unwrap(), ExecProcessEvent::Output(chunk) if chunk.chunk.0 == b"suffix")
+    );
     assert!(state.recoverable.load(Ordering::Acquire));
     assert!(state.failed_response().is_none());
 
-    assert!(state.recover_events(ReadResponse {
-        chunks: vec![ProcessOutputChunk { seq: 9, stream: ExecOutputStream::Stdout,
-            chunk: b"tail".to_vec().into() }],
-        next_seq: 11, exited: true, exit_code: Some(7), closed: true, failure: None,
-        output_gap: Some(crate::protocol::ProcessOutputGap { through_seq: 8, exit_seq: Some(7) }),
-        sandbox_denied: false,
-    }).unwrap());
-    assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 6 });
-    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Exited { seq: 7, exit_code: 7, .. }));
-    assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 8 });
-    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Output(chunk) if chunk.seq == 9));
-    assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Closed { seq: 10, .. }));
+    assert!(
+        state
+            .recover_events(ReadResponse {
+                chunks: vec![ProcessOutputChunk {
+                    seq: 9,
+                    stream: ExecOutputStream::Stdout,
+                    chunk: b"tail".to_vec().into()
+                }],
+                next_seq: 11,
+                exited: true,
+                exit_code: Some(7),
+                closed: true,
+                failure: None,
+                output_gap: Some(crate::protocol::ProcessOutputGap {
+                    through_seq: 8,
+                    exit_seq: Some(7)
+                }),
+                sandbox_denied: false,
+            })
+            .unwrap()
+    );
+    assert_eq!(
+        events.recv().await.unwrap(),
+        ExecProcessEvent::OutputGap { through_seq: 6 }
+    );
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        ExecProcessEvent::Exited {
+            seq: 7,
+            exit_code: 7,
+            ..
+        }
+    ));
+    assert_eq!(
+        events.recv().await.unwrap(),
+        ExecProcessEvent::OutputGap { through_seq: 8 }
+    );
+    assert!(
+        matches!(events.recv().await.unwrap(), ExecProcessEvent::Output(chunk) if chunk.seq == 9)
+    );
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        ExecProcessEvent::Closed { seq: 10, .. }
+    ));
 }
 
 #[test]
@@ -201,12 +336,21 @@ async fn output_gap_rejects_missing_or_overlapping_terminal_exit() {
     for exit_seq in [None, Some(0), Some(6)] {
         let state = SessionState::new(true);
         let mut events = state.subscribe_events();
-        state.recover_events(ReadResponse {
-            chunks: Vec::new(), next_seq: 7, exited: exit_seq.is_some(),
-            exit_code: exit_seq.map(|_| 7), closed: true, failure: None,
-            output_gap: Some(crate::protocol::ProcessOutputGap { through_seq: 5, exit_seq }),
-            sandbox_denied: false,
-        }).expect_err("close cannot replace or omit the authoritative exit");
+        state
+            .recover_events(ReadResponse {
+                chunks: Vec::new(),
+                next_seq: 7,
+                exited: exit_seq.is_some(),
+                exit_code: exit_seq.map(|_| 7),
+                closed: true,
+                failure: None,
+                output_gap: Some(crate::protocol::ProcessOutputGap {
+                    through_seq: 5,
+                    exit_seq,
+                }),
+                sandbox_denied: false,
+            })
+            .expect_err("close cannot replace or omit the authoritative exit");
         {
             let next_event = events.recv();
             tokio::pin!(next_event);
@@ -217,18 +361,39 @@ async fn output_gap_rejects_missing_or_overlapping_terminal_exit() {
 
         // A rejected replay must not poison a later valid replay. The terminal
         // events occupy distinct positions after the declared evicted prefix.
-        assert!(state.recover_events(ReadResponse {
-            chunks: Vec::new(), next_seq: 7, exited: true, exit_code: Some(7),
-            closed: true, failure: None,
-            output_gap: Some(crate::protocol::ProcessOutputGap {
-                through_seq: 4, exit_seq: Some(5),
-            }),
-            sandbox_denied: false,
-        }).unwrap());
-        assert_eq!(events.recv().await.unwrap(), ExecProcessEvent::OutputGap { through_seq: 4 });
-        assert!(matches!(events.recv().await.unwrap(),
-            ExecProcessEvent::Exited { seq: 5, exit_code: 7, .. }));
-        assert!(matches!(events.recv().await.unwrap(), ExecProcessEvent::Closed { seq: 6, .. }));
+        assert!(
+            state
+                .recover_events(ReadResponse {
+                    chunks: Vec::new(),
+                    next_seq: 7,
+                    exited: true,
+                    exit_code: Some(7),
+                    closed: true,
+                    failure: None,
+                    output_gap: Some(crate::protocol::ProcessOutputGap {
+                        through_seq: 4,
+                        exit_seq: Some(5),
+                    }),
+                    sandbox_denied: false,
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            events.recv().await.unwrap(),
+            ExecProcessEvent::OutputGap { through_seq: 4 }
+        );
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ExecProcessEvent::Exited {
+                seq: 5,
+                exit_code: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ExecProcessEvent::Closed { seq: 6, .. }
+        ));
     }
 }
 
@@ -238,16 +403,36 @@ fn recovery_classifies_registry_status_and_conflict_code() {
         (http::StatusCode::TOO_MANY_REQUESTS, None, true),
         (http::StatusCode::SERVICE_UNAVAILABLE, None, true),
         (http::StatusCode::REQUEST_TIMEOUT, None, true),
-        (http::StatusCode::CONFLICT, Some("environment_offline"), true),
-        (http::StatusCode::CONFLICT, Some("registration_conflict"), false),
+        (
+            http::StatusCode::CONFLICT,
+            Some("environment_offline"),
+            true,
+        ),
+        (
+            http::StatusCode::CONFLICT,
+            Some("registration_conflict"),
+            false,
+        ),
         (http::StatusCode::CONFLICT, None, false),
         (http::StatusCode::UNAUTHORIZED, None, false),
-        (http::StatusCode::FORBIDDEN, Some("environment_offline"), false),
+        (
+            http::StatusCode::FORBIDDEN,
+            Some("environment_offline"),
+            false,
+        ),
         (http::StatusCode::NOT_FOUND, None, false),
     ] {
         let error = registry_error(status, code);
-        assert_eq!(is_retryable_registry_error(&error), expected, "{status} {code:?}");
-        assert_eq!(is_retryable_recovery_error(&error), expected, "{status} {code:?}");
+        assert_eq!(
+            is_retryable_registry_error(&error),
+            expected,
+            "{status} {code:?}"
+        );
+        assert_eq!(
+            is_retryable_recovery_error(&error),
+            expected,
+            "{status} {code:?}"
+        );
     }
 }
 #[test]

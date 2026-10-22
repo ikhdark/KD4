@@ -447,6 +447,16 @@ def copy_native_binaries(
                 shutil.rmtree(dest_component_dir)
             shutil.copytree(src_component_dir, dest_component_dir)
 
+        if CODEX_PACKAGE_COMPONENT in components_set:
+            # Source validation is not a receipt for a mutable tree's copy.
+            # Packing is permitted only after the delivered bytes validate.
+            validate_package_dir(
+                dest_target_dir,
+                PACKAGE_VARIANTS["codex"],
+                spec,
+                expected_version=expected_version,
+            )
+
     if target_filter is not None:
         missing_targets = sorted(target_filter - copied_targets)
         if missing_targets:

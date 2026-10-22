@@ -47,10 +47,15 @@ impl Default for AgentRegistry {
 #[derive(Default)]
 struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
+    // Residency is not lineage: keep the edge through cold/pathless intermediates.
+    parents: HashMap<ThreadId, ThreadId>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
     closing_threads: HashMap<ThreadId, usize>,
     parent_spawn_reservations: HashMap<ThreadId, usize>,
+    // Mail is logical-agent state, not resident-runtime state. Reuse the existing
+    // bounded queue and dedup owner instead of transferring messages on reload.
+    input_queues: HashMap<ThreadId, Arc<crate::session::InputQueue>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,6 +107,11 @@ impl AgentRegistry {
         self.capacity_updates.subscribe()
     }
 
+    pub(crate) fn notify_execution_capacity_released(&self) {
+        self.capacity_updates
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     pub(crate) fn reserve_spawn_slot(
         self: &Arc<Self>,
         max_threads: Option<usize>,
@@ -144,11 +154,30 @@ impl AgentRegistry {
                 .iter()
                 .find_map(|(key, metadata)| (metadata.agent_id == Some(thread_id)).then_some(key))
                 .cloned();
-            removed_key
+            active_agents.input_queues.remove(&thread_id);
+            let removed = removed_key
                 .and_then(|key| active_agents.agent_tree.remove(key.as_str()))
                 .is_some_and(|metadata| {
                     !metadata.agent_path.as_ref().is_some_and(AgentPath::is_root)
-                })
+                });
+            // Cold ancestors stay reachable, but explicitly closed leaf branches
+            // must not retain one edge per historical spawn forever.
+            let mut retired = thread_id;
+            while !active_agents
+                .agent_tree
+                .values()
+                .any(|agent| agent.agent_id == Some(retired))
+                && !active_agents
+                    .parents
+                    .values()
+                    .any(|parent| *parent == retired)
+            {
+                let Some(parent) = active_agents.parents.remove(&retired) else {
+                    break;
+                };
+                retired = parent;
+            }
+            removed
         };
         if removed_counted_agent {
             self.total_count.fetch_sub(1, Ordering::AcqRel);
@@ -170,6 +199,50 @@ impl AgentRegistry {
                 agent_path: Some(AgentPath::root()),
                 ..Default::default()
             });
+    }
+
+    pub(crate) fn retained_input_queue(
+        &self,
+        id: ThreadId,
+    ) -> Option<Arc<crate::session::InputQueue>> {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .input_queues
+            .get(&id)
+            .cloned()
+    }
+
+    pub(crate) fn remember_input_queue(
+        &self,
+        id: ThreadId,
+        queue: Arc<crate::session::InputQueue>,
+    ) {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .input_queues
+            .entry(id)
+            .or_insert(queue);
+    }
+
+    pub(crate) fn input_queue_for_delivery(
+        &self,
+        id: ThreadId,
+    ) -> Option<Arc<crate::session::InputQueue>> {
+        let active = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.closing_threads.contains_key(&id)
+            || !active
+                .agent_tree
+                .values()
+                .any(|agent| agent.agent_id == Some(id))
+        {
+            return None;
+        }
+        active.input_queues.get(&id).cloned()
     }
 
     pub(crate) fn agent_id_for_path(&self, agent_path: &AgentPath) -> Option<ThreadId> {
@@ -307,6 +380,24 @@ impl AgentRegistry {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("thread:{thread_id}"));
+        if active_agents
+            .agent_tree
+            .values()
+            .any(|metadata| metadata.agent_id == Some(thread_id))
+        {
+            return Err(CodexErr::UnsupportedOperation(format!(
+                "agent thread {thread_id} is already registered"
+            )));
+        }
+        if active_agents
+            .agent_tree
+            .get(&key)
+            .is_some_and(|metadata| metadata.agent_id.is_some())
+        {
+            return Err(CodexErr::UnsupportedOperation(format!(
+                "agent path `{key}` already exists"
+            )));
+        }
         if let Some(agent_nickname) = agent_metadata.agent_nickname.clone() {
             active_agents.used_agent_nicknames.insert(agent_nickname);
         }
@@ -320,7 +411,67 @@ impl AgentRegistry {
         {
             self.ever_had_live_agents.store(true, Ordering::Release);
         }
+        if let Some(parent) = parent_thread_id {
+            active_agents.parents.insert(thread_id, parent);
+        }
         active_agents.agent_tree.insert(key, agent_metadata);
+        Ok(())
+    }
+
+    pub(crate) fn known_spawn_edges(&self) -> Vec<(ThreadId, ThreadId)> {
+        self.active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .parents
+            .iter()
+            .map(|(child, parent)| (*parent, *child))
+            .collect()
+    }
+
+    pub(crate) fn restore_cold_agent(
+        &self,
+        metadata: AgentMetadata,
+        parent: ThreadId,
+    ) -> Result<()> {
+        let thread_id = metadata
+            .agent_id
+            .ok_or_else(|| CodexErr::Fatal("cold agent has no thread id".into()))?;
+        let path = metadata
+            .agent_path
+            .as_ref()
+            .ok_or_else(|| CodexErr::Fatal("cold agent has no path".into()))?
+            .to_string();
+        let mut active = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.closing_threads.contains_key(&parent)
+            || active.closing_threads.contains_key(&thread_id)
+        {
+            return Err(parent_closing_error(parent));
+        }
+        if let Some(existing) = active.agent_tree.get(&path) {
+            return if existing.agent_id == Some(thread_id) {
+                Ok(())
+            } else {
+                Err(CodexErr::Fatal(
+                    "cold agent path is owned by another thread".into(),
+                ))
+            };
+        }
+        if active
+            .agent_tree
+            .values()
+            .any(|entry| entry.agent_id == Some(thread_id))
+        {
+            return Err(CodexErr::Fatal(
+                "cold agent thread is registered at another path".into(),
+            ));
+        }
+        active.parents.insert(thread_id, parent);
+        active.agent_tree.insert(path, metadata);
+        self.total_count.fetch_add(1, Ordering::AcqRel);
+        self.ever_had_live_agents.store(true, Ordering::Release);
         Ok(())
     }
 

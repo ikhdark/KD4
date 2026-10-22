@@ -25,8 +25,7 @@
       "programs": ["python", "python3", "py"],
       "prefixes": [
         ["scripts/build/rust_test_runner.py", "run-target"],
-        ["scripts/build/rust_test_runner.py", "run-gate"],
-        ["scripts/build/rust_test_runner.py", "parity"]
+        ["scripts/build/rust_test_runner.py", "run-gate"]
       ],
       "options": {"-I": 0, "-B": 0, "-u": 0, "--manifest": 1, "--target-dir": 1, "--profile": 1, "--cargo-profile": 1, "--admission-timeout-seconds": 1},
       "allow_extra_args": true,
@@ -35,9 +34,10 @@
     },
     {
       "programs": ["just"],
+      "just_numeric_variables": ["rust_validation_wait_seconds"],
       "prefixes": [
         ["core-test"], ["core-test-fast"], ["core-test-small"], ["core-test-lane"],
-        ["_core-test-lane-reserved"], ["core-gate"], ["core-test-parity"]
+        ["core-gate"]
       ],
       "allow_extra_args": true,
       "operations": ["test"],
@@ -50,7 +50,7 @@
         ["test-lane-fast"], ["test-lane-package"], ["validate-crate-focused"],
         ["config-schema-protocol-check"], ["app-server-schema-protocol-check"],
         ["hooks-schema-check"], ["test-slow-boundaries"], ["app-server-runtime-check"],
-        ["tui-large-widget-check"], ["app-server-command-exec-check"],
+        ["app-server-command-exec-check"],
         ["app-server-process-exec-check"], ["app-server-thread-status-check"]
       ],
       "allow_extra_args": true,

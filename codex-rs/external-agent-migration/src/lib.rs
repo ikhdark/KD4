@@ -1670,25 +1670,48 @@ command = "repo-server"
                 "false-enabled":{"command":"false-enabled-server","enabled":false},
                 "not-enabled":{"command":"not-enabled-server"}
             }}"#,
-        ).expect("write mcp");
+        )
+        .expect("write mcp");
         for (settings, expected) in [
             (None, vec!["enabled", "not-enabled"]),
-            (Some(serde_json::json!({"disabledMcpjsonServers":["not-enabled"]})), vec!["enabled"]),
-            (Some(serde_json::json!({"enabledMcpjsonServers":["enabled"]})), vec!["enabled"]),
-            (Some(serde_json::json!({
-                "enabledMcpjsonServers":["enabled","explicit-disabled","false-enabled","not-enabled"],
-                "disabledMcpjsonServers":["not-enabled"]
-            })), vec!["enabled"]),
+            (
+                Some(serde_json::json!({"disabledMcpjsonServers":["not-enabled"]})),
+                vec!["enabled"],
+            ),
+            (
+                Some(serde_json::json!({"enabledMcpjsonServers":["enabled"]})),
+                vec!["enabled"],
+            ),
+            (
+                Some(serde_json::json!({
+                    "enabledMcpjsonServers":["enabled","explicit-disabled","false-enabled","not-enabled"],
+                    "disabledMcpjsonServers":["not-enabled"]
+                })),
+                vec!["enabled"],
+            ),
         ] {
-            let actual = build_mcp_config_from_external(root.path(), None, settings.as_ref()).unwrap();
-            let expected_servers = expected.into_iter().map(|name| {
-                (name.to_string(), TomlValue::Table(toml::map::Map::from_iter([
-                    ("command".to_string(), TomlValue::String(format!("{name}-server"))),
-                ])))
-            }).collect();
-            assert_eq!(actual, TomlValue::Table(toml::map::Map::from_iter([
-                ("mcp_servers".to_string(), TomlValue::Table(expected_servers)),
-            ])), "settings={settings:?}");
+            let actual =
+                build_mcp_config_from_external(root.path(), None, settings.as_ref()).unwrap();
+            let expected_servers = expected
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_string(),
+                        TomlValue::Table(toml::map::Map::from_iter([(
+                            "command".to_string(),
+                            TomlValue::String(format!("{name}-server")),
+                        )])),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                actual,
+                TomlValue::Table(toml::map::Map::from_iter([(
+                    "mcp_servers".to_string(),
+                    TomlValue::Table(expected_servers)
+                ),])),
+                "settings={settings:?}"
+            );
         }
     }
 
@@ -1704,16 +1727,44 @@ command = "repo-server"
     fn unsupported_commands_are_skipped_for_each_independent_reason() {
         let root = source_path("commands");
         for (file, content) in [
-            ("commands/this/is/a/deeply/nested/command/with/a/very/long/name.md", "---\ndescription: Review PR\n---\nReview\n"),
-            ("commands/review.md", "# Notes\n\nThis documents commands.\n"),
-            ("commands/deploy.md", "---\ndescription: Deploy\n---\nDeploy $ARGUMENTS from @release.yaml\n"),
+            (
+                "commands/this/is/a/deeply/nested/command/with/a/very/long/name.md",
+                "---\ndescription: Review PR\n---\nReview\n",
+            ),
+            (
+                "commands/review.md",
+                "# Notes\n\nThis documents commands.\n",
+            ),
+            (
+                "commands/deploy.md",
+                "---\ndescription: Deploy\n---\nDeploy $ARGUMENTS from @release.yaml\n",
+            ),
         ] {
             let document = parse_document_content(content);
-            assert!(command_skill_name_if_supported(&root, &source_path(file), &document).is_none(), "{file}: {content}");
+            assert!(
+                command_skill_name_if_supported(&root, &source_path(file), &document).is_none(),
+                "{file}: {content}"
+            );
         }
-        for body in ["$ARGUMENTS", "$1", "{{ value }}", "!`date`", "! `date`", "@release.yaml"] {
-            let document = parse_document_content(&format!("---\ndescription: Deploy\n---\n{body}\n"));
-            assert!(command_skill_name_if_supported(&root, &source_path("commands/deploy.md"), &document).is_none(), "{body}");
+        for body in [
+            "$ARGUMENTS",
+            "$1",
+            "{{ value }}",
+            "!`date`",
+            "! `date`",
+            "@release.yaml",
+        ] {
+            let document =
+                parse_document_content(&format!("---\ndescription: Deploy\n---\n{body}\n"));
+            assert!(
+                command_skill_name_if_supported(
+                    &root,
+                    &source_path("commands/deploy.md"),
+                    &document
+                )
+                .is_none(),
+                "{body}"
+            );
         }
         let supported = parse_document_content("---\ndescription: Deploy\n---\nDeploy normally\n");
         assert_eq!(
@@ -1750,8 +1801,6 @@ command = "repo-server"
             Some(description.as_str())
         );
     }
-
-
 
     #[test]
     fn commands_with_unrepresentable_runtime_controls_are_not_offered_or_imported() {

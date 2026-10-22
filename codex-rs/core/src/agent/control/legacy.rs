@@ -37,13 +37,9 @@ impl AgentControl {
 
     async fn shutdown_live_agent_to_completion(&self, agent_id: ThreadId) -> CodexResult<String> {
         let state = self.upgrade()?;
-        let Ok(thread) = state.get_thread(agent_id).await else {
-            let result = state.send_op(agent_id, Op::Shutdown {}).await;
-            let _ = state.remove_thread(&agent_id).await;
-            self.forget_v2_residency(agent_id);
-            self.state.release_spawned_thread(agent_id);
-            return result;
-        };
+        // A missing observation authorizes no retirement: a cold loader may already
+        // own this identity, or publish a replacement immediately after the lookup.
+        let thread = state.get_thread(agent_id).await?;
 
         thread.codex.session.ensure_rollout_materialized().await;
         let flush_error: Option<CodexErr> = thread
@@ -56,9 +52,11 @@ impl AgentControl {
         let shutdown_result = if matches!(thread.agent_status().await, AgentStatus::Shutdown) {
             Ok(String::new())
         } else {
-            state.send_op(agent_id, Op::Shutdown {}).await
+            state
+                .send_op_to_instance(agent_id, &thread, Op::Shutdown {})
+                .await
         };
-        thread.wait_until_terminated().await;
+        thread.wait_until_drained().await?;
 
         // Shutdown acknowledgement is bounded, but accepted terminal work can
         // outlive it. Retain the registered worker until that owner drains too.
@@ -69,10 +67,12 @@ impl AgentControl {
             .wait_for_ordered_history_commits()
             .await;
 
-        if state.remove_thread_if_same(&agent_id, &thread).await {
-            self.forget_v2_residency(agent_id);
-            self.state.release_spawned_thread(agent_id);
-        }
+        state
+            .remove_thread_if_same_with_cleanup(&agent_id, &thread, || {
+                self.forget_v2_residency(agent_id);
+                self.state.release_spawned_thread(agent_id);
+            })
+            .await;
 
         match (flush_error, shutdown_result) {
             (None, result) => result,
@@ -83,9 +83,44 @@ impl AgentControl {
         }
     }
 
+    /// After a shutdown observation timeout, wait for the existing owners instead
+    /// of starting duplicate shutdown tasks. Retained registry edges include a
+    /// descendant even if its direct parent has already been unloaded.
+    pub(crate) async fn wait_for_agent_tree_termination(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<()> {
+        let mut ids = self.live_thread_spawn_descendants(agent_id).await?;
+        ids.push(agent_id);
+        let state = self.upgrade()?;
+        for id in ids {
+            if let Ok(thread) = state.get_thread(id).await {
+                thread.wait_until_terminated().await;
+                thread.codex.session.terminal_tasks.wait().await;
+                thread
+                    .codex
+                    .session
+                    .wait_for_ordered_history_commits()
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     /// Mark `agent_id` as explicitly closed in persisted spawn-edge state, then shut down the
     /// agent and any live descendants reached from the in-memory tree.
     pub(crate) async fn close_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
+        let control = self.clone();
+        // Own the entire transition before its first durable effect, not just shutdown.
+        tokio::spawn(async move { control.close_agent_to_completion(agent_id).await })
+            .await
+            .map_err(|error| {
+                CodexErr::Fatal(format!("agent {agent_id} close task failed: {error}"))
+            })?
+    }
+
+    async fn close_agent_to_completion(&self, agent_id: ThreadId) -> CodexResult<String> {
+        let _closing_guard = self.state.begin_closing_agent_tree(agent_id);
         let state = self.upgrade()?;
         let known_agent = self.state.agent_metadata_for_thread(agent_id).is_some();
         let persistence_error = match state.get_thread(agent_id).await {
@@ -158,11 +193,26 @@ impl AgentControl {
     }
 
     async fn shutdown_agent_tree_to_completion(&self, agent_id: ThreadId) -> CodexResult<String> {
+        let state = self.upgrade()?;
         let mut closing_guard = self.state.begin_closing_agent_tree(agent_id);
+        let mut topology_error = None;
         let mut known_thread_ids = HashSet::from([agent_id]);
         let mut descendant_ids = Vec::new();
         loop {
-            let snapshot = self.live_thread_spawn_descendants(agent_id).await?;
+            let snapshot = match self.live_thread_spawn_descendants(agent_id).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // A broken graph must not prevent known live work from stopping,
+                    // nor may a partial shutdown be reported as complete.
+                    topology_error = Some(error);
+                    state
+                        .retained_agent_subtree(agent_id, self.state.known_spawn_edges())
+                        .await?
+                        .into_iter()
+                        .skip(1)
+                        .collect()
+                }
+            };
             let newly_discovered = snapshot
                 .into_iter()
                 .filter(|thread_id| known_thread_ids.insert(*thread_id))
@@ -178,7 +228,6 @@ impl AgentControl {
         shutdown_ids.push(agent_id);
         shutdown_ids.extend(descendant_ids);
 
-        let state = self.upgrade()?;
         let mut closing_threads = Vec::new();
         for thread_id in shutdown_ids.iter().copied() {
             if let Ok(thread) = state.get_thread(thread_id).await {
@@ -212,6 +261,14 @@ impl AgentControl {
                     );
                 }
             }
+        }
+        if let Some(error) = topology_error
+            && matches!(
+                result,
+                Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied)
+            )
+        {
+            result = Err(error);
         }
         tokio::spawn(async move {
             for thread in closing_threads {

@@ -8,6 +8,7 @@ mod error;
 mod id;
 mod local;
 mod model;
+mod proof;
 mod scope;
 
 pub use error::StoreError;
@@ -28,3 +29,6 @@ pub use scope::repository_workspace_id;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod suite_budget_tests;

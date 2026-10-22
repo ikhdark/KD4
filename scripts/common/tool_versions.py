@@ -50,7 +50,9 @@ def rust_toolchain_channel() -> str | None:
 
 @cache
 def cargo_lane_patterns() -> dict[str, object]:
-    pattern_path = (Path(__file__).resolve().parents[1] / "build" / "cargo_lane_patterns.json")
+    pattern_path = (
+        Path(__file__).resolve().parents[1] / "build" / "cargo_lane_patterns.json"
+    )
     data = json.loads(pattern_path.read_text(encoding="utf-8"))
     required_patterns = (
         "lane_path_pattern",

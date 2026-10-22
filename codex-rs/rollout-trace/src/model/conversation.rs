@@ -173,6 +173,16 @@ pub struct InferenceCall {
     pub thread_id: AgentThreadId,
     pub codex_turn_id: CodexTurnId,
     pub execution: ExecutionWindow,
+    /// Explicit physical result, distinct from inferred owner-end cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_terminal_status: Option<super::ExecutionStatus>,
+    /// First explicit local terminal observation, including one persisted after
+    /// owner closure. Recorder wall time is not provider completion or latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_terminal: Option<ExecutionWindow>,
+    /// Owner observation bound, retained even if a delayed physical result arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_end: Option<ExecutionWindow>,
     pub model: String,
     pub provider_name: String,
     /// Responses API response id, used by follow-up `previous_response_id` requests.
@@ -186,7 +196,8 @@ pub struct InferenceCall {
     /// Runtime tool calls whose model-visible call item came from this response.
     pub tool_call_ids_started_by_response: Vec<ToolCallId>,
     pub usage: Option<TokenUsage>,
-    pub raw_request_payload_id: RawPayloadId,
+    /// None is an explicit unavailable request body, not an empty input.
+    pub raw_request_payload_id: Option<RawPayloadId>,
     /// Full upstream response payload. `None` while running, after pre-stream
     /// failures, or when response capture was unavailable.
     pub raw_response_payload_id: Option<RawPayloadId>,
@@ -195,6 +206,11 @@ pub struct InferenceCall {
 /// Token usage summary for one inference call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// Independently reported provider total. Absent in legacy traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<codex_protocol::protocol::TokenUsageCoverage>,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub output_tokens: u64,

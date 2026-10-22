@@ -89,6 +89,7 @@ struct WebSocketListenerState {
     auth_policy: Arc<WebsocketAuthPolicy>,
     shutdown_token: CancellationToken,
     connection_tasks: TaskTracker,
+    connections: Arc<tokio::sync::Semaphore>,
 }
 
 async fn readiness_handler(State(state): State<WebSocketListenerState>) -> StatusCode {
@@ -133,11 +134,20 @@ async fn websocket_upgrade_handler(
         );
         return (err.status_code(), err.message()).into_response();
     }
+    let Ok(connection_permit) = state.connections.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            "websocket connection limit reached",
+        )
+            .into_response();
+    };
     info!(%peer_addr, "websocket client connected");
     // Track from admission, including upgrades that have not started their callback yet.
     let connection_guard = state.connection_tasks.token();
     websocket
         .on_upgrade(move |stream| async move {
+            let _connection_permit = connection_permit;
             let _connection_guard = connection_guard;
             let (websocket_writer, websocket_reader) = stream.split();
             run_websocket_connection(
@@ -188,6 +198,7 @@ fn start_websocket_acceptor_with_listener(
             auth_policy: Arc::new(auth_policy),
             shutdown_token: shutdown_token.clone(),
             connection_tasks: connection_tasks.clone(),
+            connections: Arc::new(tokio::sync::Semaphore::new(128)),
         });
     let listener_shutdown = shutdown_token.clone();
     let server = axum::serve(
@@ -241,6 +252,7 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     let registered = tokio::select! {
         biased;
         _ = disconnect_token.cancelled() => return,
+        _ = tokio::time::sleep(Duration::from_secs(30)) => return,
         result = transport_event_tx
         .send(TransportEvent::ConnectionOpened {
             connection_id,
@@ -305,8 +317,8 @@ pub(crate) async fn run_websocket_connection<M, SinkError, StreamError>(
     // Normal disconnects must reach the processor for per-connection cleanup.
     // During listener shutdown it may no longer drain ingress: retain an
     // immediately publishable close, but never hold shutdown behind a full queue.
-    if let Err(mpsc::error::TrySendError::Full(event)) = transport_event_tx
-        .try_send(TransportEvent::ConnectionClosed { connection_id })
+    if let Err(mpsc::error::TrySendError::Full(event)) =
+        transport_event_tx.try_send(TransportEvent::ConnectionClosed { connection_id })
     {
         tokio::select! {
             biased;
@@ -602,29 +614,40 @@ mod tests {
                 } else {
                     None
                 };
-                writer_tx.try_send(QueuedOutgoingMessage {
-                    message: OutgoingMessage::Response(OutgoingResponse {
-                        id: RequestId::Integer(id as i64),
-                        result,
-                    }),
-                    write_complete_tx,
-                }).unwrap();
+                writer_tx
+                    .try_send(QueuedOutgoingMessage {
+                        message: OutgoingMessage::Response(OutgoingResponse {
+                            id: RequestId::Integer(id as i64),
+                            result,
+                        }),
+                        write_complete_tx,
+                    })
+                    .unwrap();
             }
             drop(writer_tx);
-            run_websocket_outbound_loop(sink, writer_rx, control_rx, CancellationToken::new()).await;
+            run_websocket_outbound_loop(sink, writer_rx, control_rx, CancellationToken::new())
+                .await;
             for receipt in receipts {
                 receipt.await.expect("receipt follows a successful flush");
             }
             let recorded = recorded.lock().unwrap();
             let mut peer = tokio_tungstenite::tungstenite::WebSocket::from_raw_socket(
-                std::io::Cursor::new(recorded.bytes.clone()), Role::Client, None,
+                std::io::Cursor::new(recorded.bytes.clone()),
+                Role::Client,
+                None,
             );
             for message in expected {
                 let frame = peer.read().expect("every frame remains decodable");
-                assert_eq!(serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap(), message);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap(),
+                    message
+                );
             }
             assert!(peer.read().is_err(), "no duplicated frames");
-            eprintln!("websocket burst: frames={count}, payload_bytes={payload_bytes}, writes={}, flushes={}", recorded.writes, recorded.flushes);
+            eprintln!(
+                "websocket burst: frames={count}, payload_bytes={payload_bytes}, writes={}, flushes={}",
+                recorded.writes, recorded.flushes
+            );
             assert_eq!(recorded.writes, expected_writes);
             assert_eq!(recorded.flushes, expected_writes);
         }
@@ -636,9 +659,14 @@ mod tests {
 
         let recorded = Arc::new(std::sync::Mutex::new(RecordedSocketWrites::default()));
         let stream = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            RecordingSocket { recorded: Arc::clone(&recorded), fail_flush: true },
-            Role::Server, None,
-        ).await;
+            RecordingSocket {
+                recorded: Arc::clone(&recorded),
+                fail_flush: true,
+            },
+            Role::Server,
+            None,
+        )
+        .await;
         let (sink, _reader) = stream.split();
         let (writer_tx, writer_rx) = mpsc::channel(4);
         let (_control_tx, control_rx) = mpsc::channel(1);
@@ -648,29 +676,46 @@ mod tests {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 receipts.push(rx);
                 Some(tx)
-            } else { None };
-            writer_tx.try_send(QueuedOutgoingMessage {
-                message: OutgoingMessage::Response(OutgoingResponse {
-                    id: RequestId::Integer(id), result: serde_json::json!(id),
-                }), write_complete_tx,
-            }).unwrap();
+            } else {
+                None
+            };
+            writer_tx
+                .try_send(QueuedOutgoingMessage {
+                    message: OutgoingMessage::Response(OutgoingResponse {
+                        id: RequestId::Integer(id),
+                        result: serde_json::json!(id),
+                    }),
+                    write_complete_tx,
+                })
+                .unwrap();
         }
         drop(writer_tx);
         run_websocket_outbound_loop(sink, writer_rx, control_rx, CancellationToken::new()).await;
         for receipt in receipts {
-            assert!(receipt.await.is_err(), "failed or unwritten frames cannot be acknowledged");
+            assert!(
+                receipt.await.is_err(),
+                "failed or unwritten frames cannot be acknowledged"
+            );
         }
         let recorded = recorded.lock().unwrap();
         assert_eq!(recorded.writes, 1);
         assert_eq!(recorded.flushes, 1);
         let mut peer = tokio_tungstenite::tungstenite::WebSocket::from_raw_socket(
-            std::io::Cursor::new(recorded.bytes.clone()), Role::Client, None,
+            std::io::Cursor::new(recorded.bytes.clone()),
+            Role::Client,
+            None,
         );
         for id in 0..3 {
             let frame = peer.read().unwrap();
-            assert_eq!(serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap()["id"], id);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(frame.to_text().unwrap()).unwrap()["id"],
+                id
+            );
         }
-        assert!(peer.read().is_err(), "receipt boundary stops the next batch after failure");
+        assert!(
+            peer.read().is_err(),
+            "receipt boundary stops the next batch after failure"
+        );
     }
 
     #[tokio::test]

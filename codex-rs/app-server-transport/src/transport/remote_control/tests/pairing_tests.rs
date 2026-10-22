@@ -59,13 +59,25 @@ async fn auth_manager_with_replacement(
         .as_mut()
         .expect("replacement auth should include tokens")
         .access_token = "fresh-token".to_string();
-    save_auth(
-        codex_home.path(),
-        &replacement_auth,
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )
-    .expect("replacement auth should save");
+    if replacement_account_id == "account_id" {
+        // Recovery for the same account is another process rotating tokens
+        // within the login lifecycle. `save_auth` would start a replacement
+        // login, which deliberately retires policy-bound remote-control work.
+        std::fs::write(
+            codex_home.path().join("auth.json"),
+            serde_json::to_vec(&replacement_auth).expect("replacement auth should serialize"),
+        )
+        .expect("rotated auth should write");
+    } else {
+        // A different account arrives only through a new login.
+        save_auth(
+            codex_home.path(),
+            &replacement_auth,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .expect("replacement auth should save");
+    }
     auth_manager
 }
 
@@ -389,7 +401,8 @@ async fn remote_control_pairing_status_preserves_codes_auth_and_claimed_state() 
                 Some(&"Bearer remote-control-token".to_string())
             );
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&request.body).expect("status request body"),
+                serde_json::from_str::<serde_json::Value>(&request.body)
+                    .expect("status request body"),
                 if manual_code {
                     json!({ "manual_pairing_code": "ABCD-EFGH" })
                 } else {
@@ -862,7 +875,9 @@ async fn start_remote_control_pairing_rejects_mismatched_backend_enrollment() {
                 "expires_at": "3026-05-22T12:34:56Z",
             }))
             .await,
-            format!("remote control pairing returned mismatched enrollment: expected server_id=server-id, environment_id=environment-id; got server_id={server_id}, environment_id={environment_id}")
+            format!(
+                "remote control pairing returned mismatched enrollment: expected server_id=server-id, environment_id=environment-id; got server_id={server_id}, environment_id={environment_id}"
+            )
         );
     }
 }
@@ -1096,13 +1111,15 @@ async fn remote_control_handle_discards_pairing_response_after_auth_change() {
     )
     .await;
 
+    // The account change retires the in-flight pairing operation before its
+    // late response can be admitted.
     assert_eq!(
         pairing_task
             .await
             .expect("pairing task should join")
             .expect_err("stale pairing response should be discarded")
             .to_string(),
-        "remote control pairing is unavailable until enrollment completes"
+        "remote control policy identity changed"
     );
 }
 

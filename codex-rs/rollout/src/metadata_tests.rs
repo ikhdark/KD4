@@ -322,12 +322,15 @@ async fn listing_metadata_cache_recovers_after_payload_repair() {
         let dir = tempdir().expect("tempdir");
         let id = ThreadId::new();
         let parent_id = ThreadId::new();
-        let path = dir.path().join(format!("rollout-2026-01-27T12-34-56-{id}.jsonl"));
+        let shared_session_id: codex_protocol::SessionId = ThreadId::new().into();
+        let sessions = dir.path().join(SESSIONS_SUBDIR);
+        std::fs::create_dir_all(&sessions).expect("sessions directory");
+        let path = sessions.join(format!("rollout-2026-01-27T12-34-56-{id}.jsonl"));
         let session_meta = RolloutLine {
             timestamp: "2026-01-27T12:34:56Z".into(),
             item: RolloutItem::SessionMeta(SessionMetaLine {
                 meta: SessionMeta {
-                    session_id: id.into(),
+                    session_id: shared_session_id,
                     id,
                     parent_thread_id: Some(parent_id),
                     timestamp: "2026-01-27T12:34:56Z".into(),
@@ -360,47 +363,111 @@ async fn listing_metadata_cache_recovers_after_payload_repair() {
         rollout_bytes.extend(serde_json::to_vec(&user_message).unwrap());
         rollout_bytes.push(b'\n');
         std::fs::write(&path, &rollout_bytes).expect("write referencing rollout");
-        crate::payload_artifact::sync_payload_artifacts(&path).await.unwrap();
-        let original_key = extraction_cache_key(&path, "").await.expect("rollout cache key");
+        crate::payload_artifact::sync_payload_artifacts(&path)
+            .await
+            .unwrap();
+        let original_key = extraction_cache_key(&path, "")
+            .await
+            .expect("rollout cache key");
 
         if warm_healthy_cache {
             crate::list::read_thread_item_from_rollout(path.clone())
-                .await.expect("healthy listing");
+                .await
+                .expect("healthy listing");
             let (healthy, cache_hit) = extract_metadata_from_rollout_with_cache_status(&path, "")
-                .await.unwrap();
-            assert!(cache_hit, "healthy listing still supplies reconciliation metadata");
+                .await
+                .unwrap();
+            assert!(
+                cache_hit,
+                "healthy listing still supplies reconciliation metadata"
+            );
             assert_eq!(healthy.parse_errors, 0);
             assert_eq!(healthy.metadata.model_provider, "artifact-provider");
         }
 
         std::fs::write(&payload_path, b"corrupt").expect("corrupt only the sidecar");
         let damaged = crate::list::read_thread_item_from_rollout(path.clone())
-            .await.expect("inline history remains listable");
+            .await
+            .expect("inline history remains listable");
         assert_eq!(damaged.thread_id, Some(id));
         assert_eq!(damaged.model_provider, None);
         let (degraded, _) = extract_metadata_from_rollout_with_cache_status(&path, "")
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(degraded.parse_errors, 1, "one damaged metadata payload");
+        assert_eq!(degraded.unresolved_payloads, 1);
         assert_eq!(degraded.parent_thread_id, None);
+
+        let runtime = codex_state::StateRuntime::init(dir.path().to_path_buf(), String::new())
+            .await
+            .expect("fresh index");
+        backfill_sessions(runtime.as_ref(), dir.path(), "").await;
+        let pending = runtime.get_backfill_state().await.unwrap();
+        assert_eq!(pending.status, BackfillStatus::Pending);
+        assert_eq!(
+            pending.last_watermark, None,
+            "do not checkpoint the repairable gap"
+        );
+        assert!(
+            runtime
+                .list_thread_spawn_children(parent_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Simulate an older index with unknown identity and newer explicit settings.
+        // Repairing lineage/identity must not roll those settings back.
+        let mut indexed = runtime.get_thread(id).await.unwrap().unwrap();
+        indexed.updated_at = Utc::now() + chrono::Duration::hours(1);
+        indexed.model = Some("explicit-newer-model".to_owned());
+        runtime
+            .upsert_thread_preserving_timestamps(&indexed)
+            .await
+            .unwrap();
 
         // The normal publisher repairs the shared artifact without appending to
         // this rollout. Its length, mtime, and both cache paths remain unchanged.
         let repaired_reference = crate::payload_artifact::store_line(&path, &serialized)
             .expect("repair metadata payload");
         assert_eq!(repaired_reference, reference);
-        crate::payload_artifact::sync_payload_artifacts(&path).await.unwrap();
+        crate::payload_artifact::sync_payload_artifacts(&path)
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), rollout_bytes);
         assert_eq!(extraction_cache_key(&path, "").await, Some(original_key));
 
         let (recovered, cache_hit) = extract_metadata_from_rollout_with_cache_status(&path, "")
-            .await.expect("extract repaired metadata");
+            .await
+            .expect("extract repaired metadata");
         assert_eq!(recovered.parse_errors, 0, "repaired payload must be reread");
-        assert!(!cache_hit, "degraded listing must not leave reusable cache state");
+        assert!(
+            !cache_hit,
+            "degraded listing must not leave reusable cache state"
+        );
         assert_eq!(recovered.metadata.id, id);
         assert_eq!(recovered.metadata.model_provider, "artifact-provider");
-        assert_eq!(recovered.metadata.history_mode, ThreadHistoryMode::Paginated);
+        assert_eq!(
+            recovered.metadata.history_mode,
+            ThreadHistoryMode::Paginated
+        );
         assert_eq!(recovered.parent_thread_id, Some(parent_id));
-        assert_eq!(recovered.metadata.first_user_message.as_deref(), Some("retained inline preview"));
+        assert_eq!(
+            recovered.metadata.first_user_message.as_deref(),
+            Some("retained inline preview")
+        );
+        backfill_sessions(runtime.as_ref(), dir.path(), "").await;
+        assert_eq!(
+            runtime.get_backfill_state().await.unwrap().status,
+            BackfillStatus::Complete
+        );
+        assert_eq!(
+            runtime.list_thread_spawn_children(parent_id).await.unwrap(),
+            vec![id]
+        );
+        let indexed = runtime.get_thread(id).await.unwrap().unwrap();
+        assert_eq!(indexed.session_id, Some(shared_session_id));
+        assert_eq!(indexed.model.as_deref(), Some("explicit-newer-model"));
+        runtime.close().await;
     }
 }
 
@@ -748,35 +815,58 @@ async fn backfill_sessions_retries_rollout_io_failure_without_losing_checkpoint(
         .expect("initialize runtime");
     let hidden = home.join("temporarily-unavailable.jsonl");
     let mut moved = false;
-    backfill_sessions_until(runtime.as_ref(), home, "test-provider", 60, || {
-        // Discovery has completed. A real file disappearance must not become a permanent
-        // skip merely because the bounded open retries are exhausted.
-        if !moved {
-            std::fs::rename(&paths[1], &hidden).expect("hide middle rollout");
-            moved = true;
-        }
-        false
-    })
+    backfill_sessions_until(
+        runtime.as_ref(),
+        home,
+        "test-provider",
+        60,
+        &mut BackfillMemo::default(),
+        || {
+            // Discovery has completed. A real file disappearance must not become a permanent
+            // skip merely because the bounded open retries are exhausted.
+            if !moved {
+                std::fs::rename(&paths[1], &hidden).expect("hide middle rollout");
+                moved = true;
+            }
+            false
+        },
+    )
     .await;
     let state = runtime.get_backfill_state().await.expect("pending state");
     assert_eq!(state.status, BackfillStatus::Pending);
     assert_eq!(
         state.last_watermark,
-        Some(format!("sessions/rollout-2026-01-27T12-30-00-{}.jsonl", ids[0]))
+        Some(format!(
+            "sessions/rollout-2026-01-27T12-30-00-{}.jsonl",
+            ids[0]
+        ))
     );
     for (index, id) in ids.iter().enumerate() {
         let id = ThreadId::from_string(&id.to_string()).expect("thread id");
-        assert_eq!(runtime.get_thread(id).await.expect("thread").is_some(), index != 1);
+        assert_eq!(
+            runtime.get_thread(id).await.expect("thread").is_some(),
+            index != 1
+        );
     }
     std::fs::rename(&hidden, &paths[1]).expect("restore middle rollout");
     backfill_sessions(runtime.as_ref(), home, "test-provider").await;
     assert_eq!(
-        runtime.get_backfill_state().await.expect("complete state").status,
+        runtime
+            .get_backfill_state()
+            .await
+            .expect("complete state")
+            .status,
         BackfillStatus::Complete
     );
     for id in ids {
         let id = ThreadId::from_string(&id.to_string()).expect("thread id");
-        assert!(runtime.get_thread(id).await.expect("recovered thread").is_some());
+        assert!(
+            runtime
+                .get_thread(id)
+                .await
+                .expect("recovered thread")
+                .is_some()
+        );
     }
 }
 
@@ -814,6 +904,7 @@ async fn stopped_backfill_checkpoints_progress_and_releases_its_claim() {
         codex_home.as_path(),
         "test-provider",
         BACKFILL_LEASE_SECONDS,
+        &mut BackfillMemo::default(),
         || {
             checks += 1;
             checks > 1
@@ -1047,4 +1138,335 @@ async fn backfill_discovery_failure_remains_retryable() {
             .unwrap()
             .is_some()
     );
+}
+
+/// Four rollouts in watermark order. The second names its session metadata
+/// through a payload artifact that is missing, as after copying a home
+/// without `rollout-payloads` or losing a payload before it was synced.
+struct PayloadGapFixture {
+    ids: [ThreadId; 4],
+    paths: Vec<PathBuf>,
+    parent_id: ThreadId,
+    payload: PathBuf,
+    payload_bytes: Vec<u8>,
+}
+
+fn write_payload_gap_fixture(home: &Path) -> PayloadGapFixture {
+    let uuids = [
+        Uuid::from_u128(21),
+        Uuid::from_u128(22),
+        Uuid::from_u128(23),
+        Uuid::from_u128(24),
+    ];
+    let ids = uuids.map(|uuid| ThreadId::from_string(&uuid.to_string()).expect("thread id"));
+    let paths = uuids
+        .iter()
+        .enumerate()
+        .map(|(index, uuid)| {
+            write_rollout_in_sessions(
+                home,
+                &format!("2026-01-27T12-3{index}-00"),
+                &format!("2026-01-27T12:3{index}:00Z"),
+                *uuid,
+                /*git*/ None,
+            )
+        })
+        .collect::<Vec<_>>();
+    let parent_id = ThreadId::new();
+    let session_meta = RolloutLine {
+        timestamp: "2026-01-27T12:31:00Z".to_string(),
+        item: RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: ids[1].into(),
+                id: ids[1],
+                parent_thread_id: Some(parent_id),
+                timestamp: "2026-01-27T12:31:00Z".to_string(),
+                cwd: home.to_path_buf(),
+                originator: "artifact-backed metadata fixture ".repeat(1024),
+                model_provider: Some("artifact-provider".to_string()),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    };
+    let serialized = serde_json::to_vec(&session_meta).expect("serialize session metadata");
+    let mut rollout = crate::payload_artifact::store_line(&paths[1], &serialized)
+        .expect("publish metadata payload");
+    let reference: serde_json::Value = serde_json::from_slice(&rollout).expect("payload reference");
+    assert_eq!(reference["type"], crate::payload_artifact::KIND);
+    let payload = crate::payload_artifact::root(&paths[1]).join(format!(
+        "{}.json",
+        reference["payload"]["sha256"]
+            .as_str()
+            .expect("payload digest")
+    ));
+    let user_message = RolloutLine {
+        timestamp: "2026-01-27T12:31:01Z".to_string(),
+        item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: "inline preview".to_string(),
+            ..Default::default()
+        })),
+    };
+    rollout.extend(serde_json::to_vec(&user_message).expect("serialize user message"));
+    rollout.push(b'\n');
+    std::fs::write(&paths[1], rollout).expect("write referencing rollout");
+    let payload_bytes = std::fs::read(&payload).expect("published payload");
+    std::fs::remove_file(&payload).expect("lose the payload");
+    PayloadGapFixture {
+        ids,
+        paths,
+        parent_id,
+        payload,
+        payload_bytes,
+    }
+}
+
+fn append_user_message(path: &Path, message: &str) {
+    let line = RolloutLine {
+        timestamp: "2026-01-27T12:40:00Z".to_string(),
+        item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+            message: message.to_string(),
+            ..Default::default()
+        })),
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open rollout for append");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&line).expect("serialize line")
+    )
+    .expect("append line");
+}
+
+/// One unbounded pass sharing `memo`, as consecutive refreshes of one runtime do.
+async fn memo_pass(
+    runtime: &codex_state::StateRuntime,
+    home: &Path,
+    memo: &mut BackfillMemo,
+) -> BackfillPassReport {
+    backfill_sessions_until(
+        runtime,
+        home,
+        "test-provider",
+        BACKFILL_LEASE_SECONDS,
+        memo,
+        || false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn refresh_pass_rereads_nothing_while_a_payload_gap_is_unchanged() {
+    let dir = tempdir().expect("tempdir");
+    let home = dir.path();
+    let fixture = write_payload_gap_fixture(home);
+    let runtime = codex_state::StateRuntime::init(home.to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+    let before_gap = backfill_watermark_for_path(home, &fixture.paths[0]);
+    let mut memo = BackfillMemo::default();
+
+    assert_eq!(
+        memo_pass(runtime.as_ref(), home, &mut memo).await,
+        BackfillPassReport {
+            extracted: 4,
+            unchanged: 0
+        }
+    );
+    // A newly seen gap is read once more, after the payloads it names are stamped.
+    assert_eq!(
+        memo_pass(runtime.as_ref(), home, &mut memo).await,
+        BackfillPassReport {
+            extracted: 1,
+            unchanged: 2
+        }
+    );
+    // Nothing changed since, so a pass reads no rollout. Without the memo every
+    // pass re-read the gap and every rollout after it.
+    for _ in 0..2 {
+        assert_eq!(
+            memo_pass(runtime.as_ref(), home, &mut memo).await,
+            BackfillPassReport {
+                extracted: 0,
+                unchanged: 3
+            }
+        );
+        // The gap still may not certify lineage: it keeps the checkpoint before it.
+        let state = runtime.get_backfill_state().await.expect("backfill state");
+        assert_eq!(state.status, BackfillStatus::Pending);
+        assert_eq!(state.last_watermark.as_deref(), Some(before_gap.as_str()));
+    }
+    let provisional = runtime
+        .get_thread(fixture.ids[1])
+        .await
+        .expect("get gap thread")
+        .expect("the provisional row stays indexed");
+    assert_eq!(
+        provisional.first_user_message.as_deref(),
+        Some("inline preview")
+    );
+    assert!(
+        runtime
+            .list_thread_spawn_children(fixture.parent_id)
+            .await
+            .expect("list children")
+            .is_empty()
+    );
+    runtime.close().await;
+}
+
+#[tokio::test]
+async fn refresh_pass_still_reads_changed_rollouts_and_repaired_payloads() {
+    let dir = tempdir().expect("tempdir");
+    let home = dir.path();
+    let fixture = write_payload_gap_fixture(home);
+    let runtime = codex_state::StateRuntime::init(home.to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+    let mut memo = BackfillMemo::default();
+    // Reach the steady state: the first pass, then the gap's confirming read.
+    memo_pass(runtime.as_ref(), home, &mut memo).await;
+    memo_pass(runtime.as_ref(), home, &mut memo).await;
+
+    // An append after reconciliation is read again, and nothing else is.
+    append_user_message(&fixture.paths[3], "appended after reconciliation");
+    assert_eq!(
+        memo_pass(runtime.as_ref(), home, &mut memo).await,
+        BackfillPassReport {
+            extracted: 1,
+            unchanged: 2
+        }
+    );
+    let appended = runtime
+        .get_thread(fixture.ids[3])
+        .await
+        .expect("get appended thread")
+        .expect("appended thread is indexed");
+    assert_eq!(
+        appended.first_user_message.as_deref(),
+        Some("appended after reconciliation")
+    );
+
+    // Restoring the payload changes no rollout byte, yet the gap is read again.
+    std::fs::write(&fixture.payload, &fixture.payload_bytes).expect("restore payload");
+    assert_eq!(
+        memo_pass(runtime.as_ref(), home, &mut memo).await,
+        BackfillPassReport {
+            extracted: 1,
+            unchanged: 2
+        }
+    );
+    let state = runtime.get_backfill_state().await.expect("backfill state");
+    assert_eq!(state.status, BackfillStatus::Complete);
+    assert_eq!(
+        state.last_watermark,
+        Some(backfill_watermark_for_path(home, &fixture.paths[3]))
+    );
+    assert_eq!(
+        runtime
+            .list_thread_spawn_children(fixture.parent_id)
+            .await
+            .expect("list children"),
+        vec![fixture.ids[1]]
+    );
+    let repaired = runtime
+        .get_thread(fixture.ids[1])
+        .await
+        .expect("get repaired thread")
+        .expect("repaired thread is indexed");
+    assert_eq!(repaired.model_provider, "artifact-provider");
+
+    // The periodic refresh reopens complete coverage; unchanged rollouts are not read.
+    runtime
+        .request_backfill_refresh(/*minimum_age_seconds*/ 0)
+        .await
+        .expect("reopen coverage");
+    assert_eq!(
+        memo_pass(runtime.as_ref(), home, &mut memo).await,
+        BackfillPassReport {
+            extracted: 0,
+            unchanged: 4
+        }
+    );
+    assert_eq!(
+        runtime
+            .get_backfill_state()
+            .await
+            .expect("backfill state")
+            .status,
+        BackfillStatus::Complete
+    );
+    runtime.close().await;
+}
+
+#[tokio::test]
+async fn pass_remainder_confirms_a_payload_gap_only_after_an_unchanged_reread() {
+    let dir = tempdir().expect("tempdir");
+    let home = dir.path();
+    let fixture = write_payload_gap_fixture(home);
+    let runtime = codex_state::StateRuntime::init(home.to_path_buf(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+    let mut memo = BackfillMemo::default();
+
+    // A gap read once may be a transient payload read failure.
+    memo_pass(runtime.as_ref(), home, &mut memo).await;
+    assert_eq!(
+        memo.last_pass_remainder(),
+        Some(PassRemainder::UnconfirmedPayloadGaps)
+    );
+    // Read again at the same version with its payloads stamped first, it is
+    // confirmed, and stays confirmed while nothing it read changes.
+    for _ in 0..2 {
+        memo_pass(runtime.as_ref(), home, &mut memo).await;
+        assert_eq!(
+            memo.last_pass_remainder(),
+            Some(PassRemainder::ConfirmedPayloadGaps(1))
+        );
+    }
+
+    // A pass stopped after the gap leaves the rollouts after it unverified.
+    let mut checks = 0;
+    backfill_sessions_until(
+        runtime.as_ref(),
+        home,
+        "test-provider",
+        BACKFILL_LEASE_SECONDS,
+        &mut memo,
+        || {
+            checks += 1;
+            checks > 1
+        },
+    )
+    .await;
+    assert_eq!(memo.last_pass_remainder(), Some(PassRemainder::Unresolved));
+
+    // Rollouts that discovery could not list may need any repair.
+    let archived = home.join(crate::ARCHIVED_SESSIONS_SUBDIR);
+    std::fs::write(&archived, b"not a directory").expect("block archived discovery");
+    memo_pass(runtime.as_ref(), home, &mut memo).await;
+    assert_eq!(memo.last_pass_remainder(), Some(PassRemainder::Unresolved));
+    std::fs::remove_file(&archived).expect("restore archived discovery");
+
+    // A gap rollout that changed must be confirmed again.
+    append_user_message(&fixture.paths[1], "appended to the gap");
+    memo_pass(runtime.as_ref(), home, &mut memo).await;
+    assert_eq!(
+        memo.last_pass_remainder(),
+        Some(PassRemainder::UnconfirmedPayloadGaps)
+    );
+
+    // A call that cannot claim the lease reports no pass at all.
+    assert!(
+        runtime
+            .try_claim_backfill(BACKFILL_LEASE_SECONDS)
+            .await
+            .expect("claim backfill")
+    );
+    memo_pass(runtime.as_ref(), home, &mut memo).await;
+    assert_eq!(memo.last_pass_remainder(), None);
+    runtime.close().await;
 }

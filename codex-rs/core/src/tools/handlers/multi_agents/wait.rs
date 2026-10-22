@@ -72,6 +72,9 @@ impl Handler {
         let mut receiver_thread_ids = parse_agent_id_targets(args.targets)?;
         let mut seen_thread_ids = HashSet::with_capacity(receiver_thread_ids.len());
         receiver_thread_ids.retain(|thread_id| seen_thread_ids.insert(*thread_id));
+        for receiver_thread_id in &receiver_thread_ids {
+            admit_agent_target(&session, &turn, *receiver_thread_id).await?;
+        }
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
@@ -108,7 +111,7 @@ impl Handler {
             .input_queue
             .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
             .await;
-        let (mut activity_rx, mut pending_activity) = session
+        let (mut activity_rx, _) = session
             .input_queue
             .subscribe_agent_activity(turn_state.as_deref())
             .await;
@@ -204,7 +207,7 @@ impl Handler {
                         }
                     }
                 }
-                activity = next_input_activity(&mut activity_rx, &mut pending_activity) => {
+                activity = session.input_queue.next_agent_activity(turn_state.as_deref(), &mut activity_rx) => {
                     break LegacyWaitCompletion::InputActivity(activity);
                 }
                 _ = async {
@@ -327,21 +330,6 @@ enum LegacyWaitCompletion {
     Statuses(Vec<(ThreadId, AgentStatus)>),
     TimedOut,
     InputActivity(InputQueueActivity),
-}
-
-async fn next_input_activity(
-    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
-    pending_activity: &mut Option<InputQueueActivity>,
-) -> InputQueueActivity {
-    if let Some(activity) = pending_activity.take() {
-        return activity;
-    }
-    loop {
-        if activity_rx.changed().await.is_ok() {
-            return *activity_rx.borrow_and_update();
-        }
-        std::future::pending::<()>().await;
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]

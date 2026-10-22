@@ -229,8 +229,6 @@ fn send_merges_default_tags_per_line() -> Result<()> {
     Ok(())
 }
 
-
-
 // Ensures shutting down without recording metrics does not export anything.
 #[test]
 fn shutdown_without_metrics_exports_nothing() -> Result<()> {

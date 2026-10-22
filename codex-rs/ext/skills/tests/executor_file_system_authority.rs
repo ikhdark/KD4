@@ -35,6 +35,7 @@ struct SyntheticFileSystem {
     alias_root: PathUri,
     canonical_root: PathUri,
     has_plugin_manifest: bool,
+    body_override: Option<&'static str>,
 }
 
 impl SyntheticFileSystem {
@@ -54,7 +55,11 @@ impl SyntheticFileSystem {
 
     async fn read_file(&self, path: &PathUri) -> io::Result<Vec<u8>> {
         if path == &self.path("skill/SKILL.md")? {
-            Ok(SKILL_CONTENTS.as_bytes().to_vec())
+            Ok(self
+                .body_override
+                .unwrap_or(SKILL_CONTENTS)
+                .as_bytes()
+                .to_vec())
         } else if self.has_plugin_manifest && path == &self.path(".claude-plugin/plugin.json")? {
             Ok(PLUGIN_MANIFEST.as_bytes().to_vec())
         } else {
@@ -223,6 +228,7 @@ async fn skill_loading_and_reads_use_the_supplied_executor_file_system() {
                 alias_root: PathUri::from_abs_path(&alias_root),
                 canonical_root: PathUri::from_abs_path(&canonical_root),
                 has_plugin_manifest: false,
+                body_override: None,
             }),
             plugin_id: None,
             plugin_namespace: None,
@@ -261,6 +267,7 @@ async fn selected_root_id_distinguishes_identical_executor_paths() {
         .list(SkillListQuery {
             continuation: None,
             turn_id: "turn-1".to_string(),
+            bound_executor_roots: Vec::new(),
             executor_roots: ["root-a", "root-b"]
                 .into_iter()
                 .map(|id| SelectedCapabilityRoot {
@@ -320,4 +327,158 @@ fn create_local_skill_root(label: &str) -> io::Result<std::path::PathBuf> {
     std::fs::create_dir_all(&skill_dir)?;
     std::fs::write(skill_dir.join("SKILL.md"), SKILL_CONTENTS)?;
     Ok(test_root)
+}
+#[tokio::test]
+async fn identical_host_and_executor_paths_keep_separate_skill_authority() {
+    const HOST: &str = "---\nname: synthetic\ndescription: Host sentinel.\n---\nHOST_BODY\n";
+    const REMOTE: &str = "---\nname: synthetic\ndescription: Remote sentinel.\n---\nREMOTE_BODY\n";
+    let temp = tempfile::tempdir().unwrap();
+    let root = AbsolutePathBuf::from_absolute_path_checked(temp.path().join("shared")).unwrap();
+    std::fs::create_dir_all(root.join("skill")).unwrap();
+    std::fs::write(root.join("skill/SKILL.md"), HOST).unwrap();
+    let root = codex_exec_server::LOCAL_FS
+        .canonicalize(&PathUri::from_abs_path(&root), None)
+        .await
+        .unwrap()
+        .to_abs_path()
+        .unwrap();
+    let remote: Arc<dyn ExecutorFileSystem> = Arc::new(SyntheticFileSystem {
+        alias_root: PathUri::from_abs_path(&root),
+        canonical_root: PathUri::from_abs_path(&root),
+        has_plugin_manifest: false,
+        body_override: Some(REMOTE),
+    });
+    let roots = [
+        Arc::clone(&codex_exec_server::LOCAL_FS),
+        Arc::clone(&remote),
+        remote,
+    ]
+    .into_iter()
+    .map(|file_system| SkillRoot {
+        path: root.clone(),
+        scope: SkillScope::Repo,
+        file_system,
+        plugin_id: None,
+        plugin_namespace: None,
+        plugin_root: None,
+    });
+    let mut outcome = load_skills_from_roots(roots, None).await;
+    assert_eq!(
+        outcome.skills.len(),
+        2,
+        "different sources survive; same-source aliases deduplicate"
+    );
+    let host = outcome
+        .skills
+        .iter()
+        .find(|skill| skill.source.is_none())
+        .unwrap()
+        .clone();
+    let remote = outcome
+        .skills
+        .iter()
+        .find(|skill| skill.source.is_some())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        host.path_to_skills_md, remote.path_to_skills_md,
+        "the fixture must collide lexically"
+    );
+    let host_id = format!("skill:{}", codex_core_skills::skill_catalog_id(&host));
+    let remote_id = format!("skill:{}", codex_core_skills::skill_catalog_id(&remote));
+    assert_ne!(host_id, remote_id);
+    let snapshot = HostSkillsSnapshot::new(Arc::new(outcome.clone()));
+    assert_eq!(
+        snapshot
+            .read_skill_text_by_catalog_locator(&host_id)
+            .await
+            .unwrap(),
+        HOST
+    );
+    assert_eq!(
+        snapshot
+            .read_skill_text_by_catalog_locator(&remote_id)
+            .await
+            .unwrap(),
+        REMOTE
+    );
+    outcome.disabled_paths.insert(host.path_to_skills_md);
+    let disabled_host = HostSkillsSnapshot::new(Arc::new(outcome));
+    assert!(disabled_host.resolve_catalog_locator(&host_id).is_none());
+    assert!(disabled_host.resolve_catalog_locator(&remote_id).is_some());
+}
+#[tokio::test]
+async fn discovered_executor_resource_keeps_its_captured_owner_after_registry_removal() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("skill")).unwrap();
+    std::fs::write(temp.path().join("skill/SKILL.md"), SKILL_CONTENTS).unwrap();
+    let manager = Arc::new(EnvironmentManager::default_for_tests());
+    let owner = manager.get_environment("local").unwrap();
+    let root = SelectedCapabilityRoot {
+        id: "captured-root".into(),
+        location: CapabilityRootLocation::Environment {
+            environment_id: "removed-executor".into(),
+            path: PathUri::from_host_native_path(temp.path()).unwrap(),
+        },
+    };
+    let captured = std::collections::HashMap::from([("removed-executor".to_string(), Some(owner))]);
+    let bound = manager
+        .resolve_selected_capability_roots(std::slice::from_ref(&root), &captured)
+        .await;
+    assert_eq!(bound.len(), 1);
+    assert!(manager.get_environment("removed-executor").is_none());
+    let provider = ExecutorSkillProvider::new_with_restriction_product(manager, None);
+    let catalog = provider
+        .list(SkillListQuery {
+            executor_roots: vec![root],
+            bound_executor_roots: bound,
+            continuation: None,
+            turn_id: "captured-owner".into(),
+            host_snapshot: None,
+            include_host_skills: false,
+            include_bundled_skills: true,
+            include_orchestrator_skills: false,
+            mcp_resources: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(catalog.entries.len(), 1);
+    let resource = provider
+        .read(codex_skills_extension::provider::SkillReadRequest {
+            authority: catalog.entries[0].authority.clone(),
+            package: catalog.entries[0].id.clone(),
+            resource: catalog.entries[0].main_prompt.clone(),
+            host_snapshot: None,
+            mcp_resources: None,
+        })
+        .await
+        .expect("captured resource remains readable");
+    assert_eq!(resource.contents, SKILL_CONTENTS);
+}
+#[tokio::test]
+async fn native_filesystem_wrappers_preserve_host_skill_disabling_and_alias_deduplication() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("skill")).unwrap();
+    std::fs::write(temp.path().join("skill/SKILL.md"), SKILL_CONTENTS).unwrap();
+    let path = AbsolutePathBuf::from_absolute_path_checked(temp.path()).unwrap();
+    let local: Arc<dyn ExecutorFileSystem> =
+        Arc::new(codex_exec_server::LocalFileSystem::unsandboxed());
+    let roots = [Arc::clone(&codex_exec_server::LOCAL_FS), local]
+        .into_iter()
+        .map(|file_system| SkillRoot {
+            path: path.clone(),
+            scope: SkillScope::Repo,
+            file_system,
+            plugin_id: None,
+            plugin_namespace: None,
+            plugin_root: None,
+        });
+    let mut outcome = load_skills_from_roots(roots, None).await;
+    assert_eq!(outcome.skills.len(), 1);
+    let skill = outcome.skills[0].clone();
+    assert!(skill.source.is_none());
+    outcome
+        .disabled_paths
+        .insert(skill.path_to_skills_md.clone());
+    assert!(!outcome.is_skill_enabled(&skill));
 }

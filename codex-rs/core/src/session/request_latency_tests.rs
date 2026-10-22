@@ -87,6 +87,16 @@ fn completed_poll_lifecycle_wall_clock() -> Result<()> {
                     }],
                 )
                 .await?;
+            // Pending-input recording belongs to an admitted task for this turn.
+            session
+                .spawn_task(
+                    Arc::clone(&turn),
+                    Vec::new(),
+                    SignalCompletingTask {
+                        finish: CancellationToken::new(),
+                    },
+                )
+                .await;
             // Reproduce the observed multi-second storage delay, not provider
             // latency. The timer starts only if a capture is actually attempted.
             let pause = session
@@ -339,6 +349,16 @@ fn request_lifecycle_wall_clock() -> Result<()> {
                             }],
                         )
                         .await?;
+                    // Pending-input recording belongs to an admitted task for this turn.
+                    session
+                        .spawn_task(
+                            Arc::clone(&turn),
+                            Vec::new(),
+                            SignalCompletingTask {
+                                finish: CancellationToken::new(),
+                            },
+                        )
+                        .await;
                     let captures_before = session
                         .services
                         .git_workspace
@@ -422,6 +442,12 @@ fn request_lifecycle_wall_clock() -> Result<()> {
                         },
                         "digest evidence needs one capture per request; fully watched evidence needs none"
                     );
+                    // The admitted owner keeps this session, and its workspace
+                    // watches, alive. End it before the fixture deletes the workspace.
+                    drop(_blocked_capture);
+                    session
+                        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                        .await;
                 }
             }
         }
@@ -591,6 +617,16 @@ fn request_preparation_large_failure_history_wall_clock() -> Result<()> {
                 internal_chat_message_metadata_passthrough: None,
             });
             session.record_conversation_items(&turn, &history).await?;
+            // Pending-input recording belongs to an admitted task for this turn.
+            session
+                .spawn_task(
+                    Arc::clone(&turn),
+                    Vec::new(),
+                    SignalCompletingTask {
+                        finish: CancellationToken::new(),
+                    },
+                )
+                .await;
             let started = std::time::Instant::now();
             let result = tokio::time::timeout(
                 Duration::from_secs(30),

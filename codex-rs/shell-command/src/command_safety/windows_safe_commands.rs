@@ -118,14 +118,32 @@ mod tests {
     #[cfg(windows)]
     fn native_exit_guards_do_not_hide_mutations_or_stale_loop_bindings() {
         for (script, expected) in [
-            ("git diff --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }", true),
-            ("git diff; if ($LASTEXITCODE -ne 0) { Remove-Item a; exit 1 }", false),
+            (
+                "git -c core.fsmonitor=false diff --no-ext-diff --no-textconv --check; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+                true,
+            ),
+            (
+                "git diff; if ($LASTEXITCODE -ne 0) { Remove-Item a; exit 1 }",
+                false,
+            ),
             // No trailing branch name: with the stale `--list` binding this
             // would be an approved read-only query.
-            ("$x='--list'; foreach ($x in @('-D')) { $x }; git branch $x", false),
+            (
+                "$x='--list'; foreach ($x in @('-D')) { $x }; git branch $x",
+                false,
+            ),
             ("Get-ChildItem | ForEach-Object { $_.Delete() }", false),
         ] {
-            assert_eq!(is_safe_command_windows(&vec_str(&["powershell.exe", "-NoProfile", "-Command", script])), expected, "{script}");
+            assert_eq!(
+                is_safe_command_windows(&vec_str(&[
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-Command",
+                    script
+                ])),
+                expected,
+                "{script}"
+            );
         }
     }
 
@@ -133,13 +151,31 @@ mod tests {
     #[cfg(windows)]
     fn comma_lists_and_conditionals_are_safe_only_when_every_command_is() {
         for (script, expected) in [
-            ("Get-ChildItem rolloutdetect,tests -Recurse -File | Select-Object FullName,Length", true),
-            ("Get-Location; Get-ChildItem -Force -Name; if (Test-Path AGENTS.md) { Get-Content AGENTS.md }", true),
-            ("if (Test-Path a) { Get-Content a } else { Remove-Item a }", false),
+            (
+                "Get-ChildItem rolloutdetect,tests -Recurse -File | Select-Object FullName,Length",
+                true,
+            ),
+            (
+                "Get-Location; Get-ChildItem -Force -Name; if (Test-Path AGENTS.md) { Get-Content AGENTS.md }",
+                true,
+            ),
+            (
+                "if (Test-Path a) { Get-Content a } else { Remove-Item a }",
+                false,
+            ),
             ("Remove-Item a,b", false),
             ("Get-Content a,$(Remove-Item b)", false),
         ] {
-            assert_eq!(is_safe_command_windows(&vec_str(&["powershell.exe", "-NoProfile", "-Command", script])), expected, "{script}");
+            assert_eq!(
+                is_safe_command_windows(&vec_str(&[
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-Command",
+                    script
+                ])),
+                expected,
+                "{script}"
+            );
         }
     }
 
@@ -224,8 +260,8 @@ mod tests {
 
     #[test]
     fn admits_only_scalar_local_constant_bindings() {
-        let powershell = windows_powershell_path()
-            .expect("SystemRoot is required to locate Windows PowerShell");
+        let powershell =
+            windows_powershell_path().expect("SystemRoot is required to locate Windows PowerShell");
         let invoke = |script: &str| {
             is_safe_command_windows(&vec_str(&[
                 powershell.as_str(),
@@ -259,8 +295,8 @@ mod tests {
 
     #[test]
     fn allows_reviewer_verification_cmdlets_but_not_registry_mutation() {
-        let powershell = windows_powershell_path()
-            .expect("SystemRoot is required to locate Windows PowerShell");
+        let powershell =
+            windows_powershell_path().expect("SystemRoot is required to locate Windows PowerShell");
 
         {
             let script = r"Get-ItemProperty -Path HKCU:\Environment -Name Path";
@@ -307,8 +343,8 @@ mod tests {
             }
         }
 
-        let powershell = windows_powershell_path()
-            .expect("SystemRoot is required to locate Windows PowerShell");
+        let powershell =
+            windows_powershell_path().expect("SystemRoot is required to locate Windows PowerShell");
         assert!(is_safe_command_windows(&vec_str(&[
             powershell.as_str(),
             "-NoProfile",
@@ -354,7 +390,7 @@ mod tests {
             pwsh.clone(),
             "-NoProfile".to_string(),
             "-Command".to_string(),
-            "git show HEAD:foo.rs".to_string()
+            "git -c core.fsmonitor=false show --no-ext-diff --no-textconv HEAD:foo.rs".to_string()
         ]));
 
         assert!(is_safe_command_windows(&[
@@ -385,7 +421,7 @@ mod tests {
             "-NoLogo".to_string(),
             "-NoProfile".to_string(),
             "-Command".to_string(),
-            "git --no-optional-locks status".to_string(),
+            "git --no-optional-locks -c core.fsmonitor=false status".to_string(),
         ]));
         for script in [
             "git -c core.pager=cat show HEAD:foo.rs",

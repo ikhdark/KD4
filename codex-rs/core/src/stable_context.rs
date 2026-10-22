@@ -33,6 +33,12 @@ const STABLE_CONTEXT_CONTRACT_VERSION: u16 = 2;
 const STABLE_CONTEXT_HASH_DOMAIN: &[u8] = b"codex.stable-context.component.v1";
 const STABLE_CONTEXT_MANIFEST_HASH_DOMAIN: &[u8] = b"codex.stable-context.manifest.v1";
 const SKILLS_USAGE_OPEN_TAG: &str = "<skills_usage_instructions>";
+pub(crate) const SKILL_CATALOG_REMOVED: &str = "<skills_instructions state=\"removed\" />";
+pub(crate) const SKILL_USAGE_REMOVED: &str = "<skills_usage_instructions state=\"removed\" />";
+pub(crate) const PERMISSIONS_REMOVED: &str = "<permissions instructions state=\"removed\" />";
+pub(crate) const COLLABORATION_REMOVED: &str = "<collaboration_mode state=\"removed\" />";
+pub(crate) const ENVIRONMENT_REMOVED: &str = "<environment_context state=\"removed\" />";
+pub(crate) const SUBAGENTS_REMOVED: &str = "<subagents_context state=\"removed\" />";
 const SKILL_OPEN_TAG: &str = "<skill>";
 const REPOSITORY_OPEN_TAG: &str = UserInstructions::OPEN_MARKER;
 const REPOSITORY_CLOSE_TAG: &str = UserInstructions::CLOSE_MARKER;
@@ -91,14 +97,34 @@ pub(crate) fn normalize_provider_context_item_id(item: &mut ResponseItem) {
     if let ResponseItem::Message { id: Some(id), .. } = item
         && (is_trusted_stable_context_id(id)
             || crate::event_mapping::is_user_input_item_id(id)
-            || codex_rollout::is_rollout_reconstruction_notice_id(id))
+            || codex_rollout::is_rollout_reconstruction_notice_id(id)
+            || id.as_str().starts_with("msg_compaction_summary_")
+            || id.as_str().starts_with("msg_turn_advice_")
+            || id.as_str().starts_with("msg_provider_"))
     {
-        *id = ResponseItemId::with_suffix("msg", id.as_str());
+        *id = ResponseItemId::with_suffix("msg_provider", id.as_str());
     }
 }
 
 pub(crate) fn is_trusted_stable_context_item(item: &ResponseItem) -> bool {
     item.id().is_some_and(is_trusted_stable_context_id)
+}
+
+/// Resume-owned uncertainty, not a quoted warning or a provider-created message.
+/// The enclosing stable-context namespace is already reserved at provider ingress.
+pub(crate) fn is_unsettled_tool_recovery_notice(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { id: Some(id), role, .. }
+        if role == "developer" && id.as_str().starts_with("msg_sctx_unsettled_tools_"))
+}
+
+pub(crate) fn is_trusted_selected_skill_item(item: &ResponseItem) -> bool {
+    is_trusted_stable_context_item(item)
+        && matches!(item, ResponseItem::Message { role, content, .. }
+        if !content.is_empty() && content.iter().all(|part| {
+            matches!(part, ContentItem::InputText { text }
+                if classify_stable_text(role, text).is_some_and(|classification|
+                    classification.slot == StableContextSlot::SelectedSkill))
+        }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -609,6 +635,22 @@ struct StableItemSection<'a> {
     content: std::ops::Range<usize>,
 }
 
+pub(crate) fn stable_content_sections(
+    item: &ResponseItem,
+) -> Vec<(std::ops::Range<usize>, StableContextKind, &str)> {
+    stable_item_signature(item)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|section| {
+            (
+                section.content,
+                section.entry.slot.kind(),
+                section.entry.payload,
+            )
+        })
+        .collect()
+}
+
 fn stable_item_signature(item: &ResponseItem) -> Option<Vec<StableItemSection<'_>>> {
     let ResponseItem::Message { role, content, .. } = item else {
         return None;
@@ -794,8 +836,12 @@ fn project_stable_context_inner(
                 content_index += 1;
                 continue;
             };
-            if trusted_stable_context && let Some(classification) = classify_stable_text(role, text)
-            {
+            let classification = if !trusted_stable_context {
+                None
+            } else {
+                classify_stable_text(role, text)
+            };
+            if trusted_stable_context && let Some(classification) = classification {
                 contains_stable = true;
                 let payload_content_index = match classification.payload {
                     StablePayload::Inline | StablePayload::Removed => None,
@@ -978,17 +1024,19 @@ fn project_items(
     let mut keep = HashSet::<(usize, usize)>::new();
     for (slot, occurrence_index) in &latest_by_slot {
         let occurrence = &occurrences[*occurrence_index];
-        let should_keep = match slot {
-            StableContextSlot::TurnContribution(_) => !occurrence.explicitly_removed,
-            StableContextSlot::Repository => !repository_removed,
-            StableContextSlot::RepositoryObservation => repository_observation_current,
-            StableContextSlot::Collaboration => !collaboration_removed,
-            StableContextSlot::DeveloperInstructions => !developer_instructions_removed,
-            StableContextSlot::MultiAgentUsageHint => !multi_agent_usage_hint_removed,
-            slot if slot.is_skill_catalog() => true,
-            StableContextSlot::RecommendedPlugins => recommended_plugins_current,
-            _ => true,
-        };
+        let should_keep = !occurrence.explicitly_removed
+            && match slot {
+                StableContextSlot::TurnContribution(_) => !occurrence.explicitly_removed,
+                StableContextSlot::Repository => !repository_removed,
+                StableContextSlot::RepositoryObservation => repository_observation_current,
+                StableContextSlot::Collaboration => !collaboration_removed,
+                StableContextSlot::DeveloperInstructions => !developer_instructions_removed,
+                StableContextSlot::MultiAgentUsageHint => !multi_agent_usage_hint_removed,
+                StableContextSlot::SkillUsage => !occurrence.explicitly_removed,
+                slot if slot.is_skill_catalog() => !occurrence.explicitly_removed,
+                StableContextSlot::RecommendedPlugins => recommended_plugins_current,
+                _ => true,
+            };
         if should_keep {
             keep.insert((occurrence.item_index, occurrence.content_index));
         }
@@ -1060,10 +1108,16 @@ fn project_items(
             let Some(item) = items.get(occurrence.item_index) else {
                 continue;
             };
-            let text = occurrence.text(items).to_string();
-            let Some(projected_item) =
-                projected_message(item, false, vec![ContentItem::InputText { text }])
-            else {
+            let ResponseItem::Message { content, .. } = item else {
+                continue;
+            };
+            // Presence markers and their payload form one trusted source.
+            // Dropping the marker makes the projected payload unclassifiable.
+            let end = occurrence
+                .payload_content_index
+                .unwrap_or(occurrence.content_index);
+            let content = content[occurrence.content_index..=end].to_vec();
+            let Some(projected_item) = projected_message(item, false, content) else {
                 continue;
             };
             let target = if occurrence.slot.is_volatile() {
@@ -1141,8 +1195,7 @@ fn project_items(
         let occurrence = &occurrences[latest_index];
         let (prior_count, replaced) =
             prior_occurrence_summary(items, occurrences, latest_index, slot);
-        let removed = (matches!(slot, StableContextSlot::TurnContribution(_))
-            && occurrence.explicitly_removed)
+        let removed = occurrence.explicitly_removed
             || (slot == StableContextSlot::Repository && repository_removed)
             || (slot == StableContextSlot::Collaboration && collaboration_removed)
             || (slot == StableContextSlot::DeveloperInstructions && developer_instructions_removed)
@@ -1211,14 +1264,20 @@ fn projected_message(
     else {
         return None;
     };
-    Some(ResponseItem::Message {
+    let mut projected = ResponseItem::Message {
         id: if preserve_id { id.clone() } else { None },
         role: role.clone(),
         content,
         phase: phase.clone(),
         internal_chat_message_metadata_passthrough: internal_chat_message_metadata_passthrough
             .clone(),
-    })
+    };
+    // Splitting/reordering a trusted producer must not erase its origin.
+    // Use the core marker rather than duplicating an occurrence's durable ID.
+    if is_trusted_stable_context_item(item) {
+        mark_trusted_stable_context_item(&mut projected);
+    }
+    Some(projected)
 }
 
 fn prior_occurrence_summary(
@@ -1353,6 +1412,28 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
     #[cfg(test)]
     CLASSIFY_STABLE_TEXT_CALLS.with(|calls| calls.set(calls.get() + 1));
 
+    for (expected_role, marker, slot) in [
+        (
+            "developer",
+            PERMISSIONS_REMOVED,
+            StableContextSlot::Permissions,
+        ),
+        (
+            "developer",
+            COLLABORATION_REMOVED,
+            StableContextSlot::Collaboration,
+        ),
+        ("user", ENVIRONMENT_REMOVED, StableContextSlot::Environment),
+        ("user", SUBAGENTS_REMOVED, StableContextSlot::Subagents),
+    ] {
+        if role == expected_role && text == marker {
+            return Some(StableTextClassification {
+                slot,
+                payload: StablePayload::Removed,
+            });
+        }
+    }
+
     if matches!(role, "developer" | "user")
         && let Some(rest) = text.strip_prefix("<turn_context_contribution index=\"")
         && let Some((index, suffix)) = rest.split_once('"')
@@ -1405,10 +1486,46 @@ fn classify_stable_text(role: &str, text: &str) -> Option<StableTextClassificati
             StableContextSlot::RecommendedPlugins,
         ));
     }
+    // Catalog authority changed from policy to discovery data. Recognize old
+    // developer records only to retire them when the new user catalog arrives.
+    if matches!(role, "user" | "developer") {
+        for (open, close, slot) in [
+            (
+                SKILLS_INSTRUCTIONS_OPEN_TAG,
+                "</skills_instructions>",
+                StableContextSlot::SkillCatalog,
+            ),
+            (
+                EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG,
+                EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+                StableContextSlot::ExtensionSkillCatalog,
+            ),
+            (
+                ENVIRONMENT_SKILLS_INSTRUCTIONS_OPEN_TAG,
+                ENVIRONMENT_SKILLS_INSTRUCTIONS_CLOSE_TAG,
+                StableContextSlot::EnvironmentSkillCatalog,
+            ),
+        ] {
+            if marked(text, open, close) {
+                return Some(StableTextClassification::inline(slot));
+            }
+        }
+    }
     if role != "developer" {
         return None;
     }
     let trimmed = text.trim();
+    for (marker, slot) in [
+        (SKILL_CATALOG_REMOVED, StableContextSlot::SkillCatalog),
+        (SKILL_USAGE_REMOVED, StableContextSlot::SkillUsage),
+    ] {
+        if trimmed == marker {
+            return Some(StableTextClassification {
+                slot,
+                payload: StablePayload::Removed,
+            });
+        }
+    }
     if marked(
         text,
         "<repository_observation>",
@@ -1604,9 +1721,18 @@ fn stable_identity_sections(
 pub(crate) fn retractable_markers(history: &[ResponseItem]) -> Vec<&'static str> {
     let mut developer_instructions = None;
     let mut usage_hint = None;
+    let mut skill_catalog = None;
+    let mut skill_usage = None;
     for item in history.iter().rev() {
-        if developer_instructions.is_some() && usage_hint.is_some() {
+        if developer_instructions.is_some()
+            && usage_hint.is_some()
+            && skill_catalog.is_some()
+            && skill_usage.is_some()
+        {
             break;
+        }
+        if !is_trusted_stable_context_item(item) {
+            continue;
         }
         let ResponseItem::Message { role, content, .. } = item else {
             continue;
@@ -1621,6 +1747,8 @@ pub(crate) fn retractable_markers(history: &[ResponseItem]) -> Vec<&'static str>
             let latest = match classification.slot {
                 StableContextSlot::DeveloperInstructions => &mut developer_instructions,
                 StableContextSlot::MultiAgentUsageHint => &mut usage_hint,
+                StableContextSlot::SkillCatalog => &mut skill_catalog,
+                StableContextSlot::SkillUsage => &mut skill_usage,
                 _ => continue,
             };
             latest.get_or_insert(classification.payload);
@@ -1632,10 +1760,72 @@ pub(crate) fn retractable_markers(history: &[ResponseItem]) -> Vec<&'static str>
             DEVELOPER_INSTRUCTIONS_REMOVED_MARKER,
         ),
         (usage_hint, MULTI_AGENT_USAGE_HINT_REMOVED_MARKER),
+        (skill_catalog, SKILL_CATALOG_REMOVED),
+        (skill_usage, SKILL_USAGE_REMOVED),
     ]
     .into_iter()
     .filter(|(payload, _)| payload.is_some_and(|payload| payload != StablePayload::Removed))
     .map(|(_, marker)| marker)
+    .collect()
+}
+
+pub(crate) fn disabled_builtin_retractions(
+    history: &[ResponseItem],
+    permissions: bool,
+    collaboration: bool,
+    environment: bool,
+) -> Vec<ResponseItem> {
+    let mut latest = HashMap::new();
+    for item in history {
+        if let Some(signature) = stable_item_signature(item) {
+            for section in signature {
+                latest.insert(section.entry.slot, section.entry.payload);
+            }
+        }
+    }
+    [
+        (
+            permissions,
+            "developer",
+            StableContextSlot::Permissions,
+            PERMISSIONS_REMOVED,
+        ),
+        (
+            collaboration,
+            "developer",
+            StableContextSlot::Collaboration,
+            COLLABORATION_REMOVED,
+        ),
+        (
+            environment,
+            "user",
+            StableContextSlot::Environment,
+            ENVIRONMENT_REMOVED,
+        ),
+        (
+            environment,
+            "user",
+            StableContextSlot::Subagents,
+            SUBAGENTS_REMOVED,
+        ),
+    ]
+    .into_iter()
+    .filter(|&(enabled, _role, slot, marker)| {
+        !enabled && latest.get(&slot).is_some_and(|payload| *payload != marker)
+    })
+    .map(|(_enabled, role, _slot, marker)| {
+        let mut item = ResponseItem::Message {
+            id: None,
+            role: role.into(),
+            content: vec![ContentItem::InputText {
+                text: marker.into(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        mark_trusted_stable_context_item(&mut item);
+        item
+    })
     .collect()
 }
 

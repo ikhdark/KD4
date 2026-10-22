@@ -19,6 +19,37 @@ use super::wrapped_protocol_event_type;
 use crate::ExecutionStatus;
 
 #[test]
+fn audit_observability_trace_terminal_status() {
+    for failed in [false, true] {
+        let event = EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
+            turn_id: "turn".into(),
+            last_agent_message: None,
+            surfaced_result: None,
+            error: failed.then(|| codex_protocol::protocol::ErrorEvent {
+                message: "failed".into(),
+                codex_error_info: None,
+            }),
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: None,
+        });
+        let mapped = codex_turn_trace_event("thread", "turn", &event).unwrap();
+        let crate::RawTraceEventPayload::CodexTurnEnded { status, .. } = mapped.payload else {
+            panic!("expected terminal event");
+        };
+        assert_eq!(
+            status,
+            if failed {
+                ExecutionStatus::Failed
+            } else {
+                ExecutionStatus::Completed
+            }
+        );
+    }
+}
+
+#[test]
 fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()> {
     let agent_thread_id = ThreadId::new();
     let event = EventMsg::SubAgentActivity(SubAgentActivityEvent {
@@ -71,6 +102,7 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
     // Convention inference depends on the URI spelling, not the test host, so exercise both
     // Windows and POSIX paths on every platform.
     let begin = EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+        environment: None,
         call_id: "call-begin".to_string(),
         process_id: Some("process-1".to_string()),
         turn_id: "turn-1".to_string(),
@@ -82,6 +114,7 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
         interaction_input: None,
     });
     let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+        environment: None,
         output_metadata: None,
         call_id: "call-end".to_string(),
         process_id: None,
@@ -152,6 +185,7 @@ fn user_shell_exec_commands_are_not_tool_runtime_boundaries() -> anyhow::Result<
         (ExecCommandSource::UserShell, false),
     ] {
         let begin = EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            environment: None,
             call_id: "call-shell".to_string(),
             process_id: None,
             turn_id: "turn-1".to_string(),
@@ -163,6 +197,7 @@ fn user_shell_exec_commands_are_not_tool_runtime_boundaries() -> anyhow::Result<
             interaction_input: None,
         });
         let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            environment: None,
             output_metadata: None,
             call_id: "call-shell".to_string(),
             process_id: None,

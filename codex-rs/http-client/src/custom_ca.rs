@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-use codex_utils_der::first_der_item;
+use codex_utils_der::trusted_certificate_for_server_auth;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
@@ -744,8 +744,8 @@ impl ConfiguredCaBundle {
     /// Loads every certificate block from a PEM file intended for Codex CA overrides.
     ///
     /// This accepts a few common real-world variants so Codex behaves like other CA-aware tooling:
-    /// leading comments are preserved, `TRUSTED CERTIFICATE` labels are normalized to standard
-    /// certificate labels, and embedded CRLs are ignored when they are well-formed enough for the
+    /// leading comments are preserved, unrestricted `TRUSTED CERTIFICATE` labels are normalized,
+    /// nonempty AUX policies are rejected, and embedded CRLs are ignored when well-formed enough for the
     /// section iterator to classify them.
     fn parse_certificates(
         &self,
@@ -766,14 +766,12 @@ impl ConfiguredCaBundle {
             };
             match section_kind {
                 SectionKind::Certificate => {
-                    // Standard CERTIFICATE blocks already decode to the exact DER bytes reqwest
-                    // wants. Only OpenSSL TRUSTED CERTIFICATE blocks need trimming to drop any
-                    // trailing X509_AUX trust metadata before registration.
-                    let cert_der = (if trusted { first_der_item(&der) } else { Some(der.as_slice()) }).ok_or_else(|| {
-                        self.invalid_ca_file(
-                            "failed to extract certificate data from TRUSTED CERTIFICATE: invalid DER length",
-                        )
-                    })?;
+                    let cert_der = if trusted {
+                        trusted_certificate_for_server_auth(&der)
+                            .map_err(|detail| self.invalid_ca_file(detail))?
+                    } else {
+                        der.as_slice()
+                    };
                     certificates.push(CertificateDer::from(cert_der.to_vec()));
                 }
                 SectionKind::Crl if !logged_crl_presence => {
@@ -947,7 +945,10 @@ mod tests {
     fn ca_path_selection_preserves_precedence_and_source() {
         for (values, expected) in [
             (
-                vec![(CODEX_CA_CERT_ENV, "/tmp/codex.pem"), (SSL_CERT_FILE_ENV, "/tmp/fallback.pem")],
+                vec![
+                    (CODEX_CA_CERT_ENV, "/tmp/codex.pem"),
+                    (SSL_CERT_FILE_ENV, "/tmp/fallback.pem"),
+                ],
                 Some((CODEX_CA_CERT_ENV, PathBuf::from("/tmp/codex.pem"))),
             ),
             (
@@ -955,7 +956,10 @@ mod tests {
                 Some((SSL_CERT_FILE_ENV, PathBuf::from("/tmp/fallback.pem"))),
             ),
             (
-                vec![(CODEX_CA_CERT_ENV, ""), (SSL_CERT_FILE_ENV, "/tmp/fallback.pem")],
+                vec![
+                    (CODEX_CA_CERT_ENV, ""),
+                    (SSL_CERT_FILE_ENV, "/tmp/fallback.pem"),
+                ],
                 Some((SSL_CERT_FILE_ENV, PathBuf::from("/tmp/fallback.pem"))),
             ),
             (vec![], None),
@@ -1151,8 +1155,6 @@ mod tests {
         ));
     }
 
-
-
     #[test]
     fn rustls_config_reports_invalid_ca_file() {
         let temp_dir = TempDir::new().expect("tempdir");
@@ -1224,11 +1226,13 @@ mod tests {
             source_env: "TEST",
             path: "mixed.pem".into(),
         };
-        let certs = bundle.parse_certificates(b"# TRUSTED CERTIFICATE comment\n-----BEGIN CERTIFICATE-----\nMAAFAA==\n-----END CERTIFICATE-----\n-----BEGIN TRUSTED CERTIFICATE-----\nMAAFAA==\n-----END TRUSTED CERTIFICATE-----\n").expect("parse mixed PEM");
+        let certs = bundle.parse_certificates(b"# TRUSTED CERTIFICATE comment\n-----BEGIN CERTIFICATE-----\nMAAFAA==\n-----END CERTIFICATE-----\n-----BEGIN TRUSTED CERTIFICATE-----\nMAAwAA==\n-----END TRUSTED CERTIFICATE-----\n").expect("parse mixed PEM with empty AUX");
         assert_eq!(
             certs.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
             vec![&[0x30, 0, 5, 0][..], &[0x30, 0][..]]
         );
+        // Unknown/nonempty AUX must not become an unrestricted root, even alongside a plain block.
+        assert!(bundle.parse_certificates(b"-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n-----BEGIN TRUSTED CERTIFICATE-----\nMAAFAA==\n-----END TRUSTED CERTIFICATE-----\n").is_err());
     }
 
     #[test]

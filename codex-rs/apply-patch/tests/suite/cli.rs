@@ -55,8 +55,22 @@ fn test_apply_patch_cli_respects_indentation_sensitive_files() -> anyhow::Result
                 .failure();
             assert_eq!(fs::read_to_string(tmp.path().join(file))?, original);
         }
-        let patch = format!(
+        // Removed lines must match the current bytes exactly; Unicode
+        // normalization is reserved for unchanged context.
+        let normalized = format!(
             "*** Begin Patch\n*** Update File: {file}\n@@\n-    value = 'one'\n+    value = 2\n*** End Patch"
+        );
+        apply_patch_command()?
+            .arg(normalized)
+            .current_dir(tmp.path())
+            .assert()
+            .failure();
+        assert_eq!(
+            fs::read_to_string(tmp.path().join(file))?,
+            "    value = ‘one’\n"
+        );
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {file}\n@@\n-    value = ‘one’\n+    value = 2\n*** End Patch"
         );
         apply_patch_command()?
             .arg(patch)
@@ -392,7 +406,8 @@ fn test_apply_patch_cli_rejects_overlapping_eof_chunks() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_apply_patch_cli_rejects_unreadable_destination_without_committed_prefix() -> anyhow::Result<()> {
+fn test_apply_patch_cli_rejects_unreadable_destination_without_committed_prefix()
+-> anyhow::Result<()> {
     let tmp = tempdir()?;
     // An unreadable destination is only detected at its own write, after the
     // prefix was written. Rollback removes the prefix again, so the failure
@@ -413,7 +428,10 @@ fn test_apply_patch_cli_rejects_unreadable_destination_without_committed_prefix(
         0,
         "rolled-back files must not be reported: {stderr}"
     );
-    assert!(!stderr.contains("Patch failed after applying these changes:"), "{stderr}");
+    assert!(
+        !stderr.contains("Patch failed after applying these changes:"),
+        "{stderr}"
+    );
     assert!(!tmp.path().join("created.txt").exists());
     assert!(tmp.path().join("blocked").is_dir());
     Ok(())

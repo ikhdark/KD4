@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections import deque
+from collections import OrderedDict, deque
+from weakref import WeakSet, WeakValueDictionary
 
 from ._goal import _GoalOperationState
 from ._limits import _BufferBudget, _NotificationQueue
@@ -42,6 +43,11 @@ class MessageRouter:
         self._response_waiters: dict[str, queue.Queue[ResponseQueueItem]] = {}
         self._login_notifications: dict[str, _NotificationQueue] = {}
         self._pending_login_notifications: dict[str, deque[tuple[Notification, int]]] = {}
+        self._terminal_logins: set[str] = set()
+        self._detached_logins: WeakValueDictionary[str, _NotificationQueue] = WeakValueDictionary()
+        self._completed_detached_logins: WeakSet[_NotificationQueue] = WeakSet()
+        self._recent_cancelled_logins: OrderedDict[str, _NotificationQueue] = OrderedDict()
+        self._login_starts = 0
         self._turn_notifications: dict[str, _NotificationQueue] = {}
         self._pending_turn_notifications: dict[str, deque[tuple[Notification, int]]] = {}
         self._abandoned_turns: set[str] = set()
@@ -118,7 +124,12 @@ class MessageRouter:
 
         login_queue = self._notification_queue(deadline=deadline)
         with self._lock:
-            if self._failure is not None:
+            detached = self._detached_logins.get(login_id)
+            if detached is not None:
+                if self._failure is not None and detached not in self._completed_detached_logins:
+                    raise self._failure
+                return
+            if self._failure is not None and login_id not in self._terminal_logins:
                 raise self._failure
             if login_id in self._login_notifications:
                 return
@@ -127,15 +138,68 @@ class MessageRouter:
             for notification, size in pending:
                 login_queue.put_reserved(notification, size)
             self._login_notifications[login_id] = login_queue
+            if login_id in self._terminal_logins:
+                login_queue.deadline = None
+            if self._failure is not None:
+                login_queue.fail(self._failure, drain=True)
 
-    def unregister_login(self, login_id: str) -> None:
+    def unregister_login(
+        self, login_id: str, *, expected: _NotificationQueue | None = None
+    ) -> None:
         """Stop routing future notifications for one login attempt."""
 
         with self._lock:
+            if expected is not None and expected is not (
+                self._login_notifications.get(login_id) or self._detached_logins.get(login_id)
+            ):
+                return
             login_queue = self._login_notifications.pop(login_id, None)
+            detached = self._detached_logins.pop(login_id, None)
+            self._recent_cancelled_logins.pop(login_id, None)
+            login_queue = login_queue if login_queue is not None else detached
+            if login_queue is not None:
+                self._completed_detached_logins.discard(login_queue)
+            self._terminal_logins.discard(login_id)
             self._discard_pending(self._pending_login_notifications.pop(login_id, deque()))
         if login_queue is not None:
             login_queue.fail(TransportClosedError("login notifications unregistered"))
+
+    def retain_login(self, login_id: str) -> _NotificationQueue:
+        """Give a handle ownership independent of the live route budget."""
+        with self._lock:
+            notifications = self._login_notifications.get(login_id)
+            if notifications is None:
+                notifications = self._detached_logins.get(login_id)
+            if notifications is None:
+                raise RuntimeError("login notifications are no longer available")
+            return notifications
+
+    def retire_login(self, login_id: str) -> None:
+        """Retire an acknowledged cancellation without inventing its completion."""
+        with self._lock:
+            notifications = self._login_notifications.pop(login_id, None)
+            if notifications is None:
+                return
+            if login_id in self._terminal_logins:
+                self._completed_detached_logins.add(notifications)
+            self._terminal_logins.discard(login_id)
+            self._detached_logins[login_id] = notifications
+            self._recent_cancelled_logins[login_id] = notifications
+            while len(self._recent_cancelled_logins) > self._max_routes:
+                self._recent_cancelled_logins.popitem(last=False)
+
+    def begin_login_start(self) -> None:
+        with self._lock:
+            self._login_starts += 1
+
+    def end_login_start(self) -> None:
+        with self._lock:
+            self._login_starts -= 1
+            if self._login_starts == 0:
+                for login_id, pending in self._pending_login_notifications.items():
+                    self._discard_pending(pending)
+                    self._terminal_logins.discard(login_id)
+                self._pending_login_notifications.clear()
 
     def next_login_notification(
         self, login_id: str, timeout_s: float | None = None
@@ -143,9 +207,15 @@ class MessageRouter:
         """Block until the next notification for a registered login attempt."""
 
         with self._lock:
-            if self._failure is not None:
-                raise self._failure
             login_queue = self._login_notifications.get(login_id)
+            if login_queue is None:
+                login_queue = self._detached_logins.get(login_id)
+            if (
+                self._failure is not None
+                and login_id not in self._terminal_logins
+                and login_queue not in self._completed_detached_logins
+            ):
+                raise self._failure
         if login_queue is None:
             raise RuntimeError(f"login {login_id!r} is not registered for waiting")
         item = login_queue.get(timeout=timeout_s)
@@ -283,15 +353,30 @@ class MessageRouter:
                 if self._failure is not None:
                     return
                 login_queue = self._login_notifications.get(login_id)
+                detached = self._detached_logins.get(login_id)
                 if login_queue is None:
+                    login_queue = detached
+                if login_queue is None:
+                    # Unknown IDs can be early only while login/start is in flight.
+                    # A late completion for a discarded attempt must not recreate a route.
+                    if self._login_starts == 0:
+                        return
                     if login_id not in self._pending_login_notifications:
                         self._check_route_capacity("login", login_id)
                     size = self._budget.reserve(notification)
                     self._pending_login_notifications.setdefault(login_id, deque()).append(
                         (notification, size)
                     )
-                    return
-            login_queue.put(notification)
+                else:
+                    login_queue.put(notification)
+                # Only validated completions admitted to the byte budget are terminal.
+                if isinstance(notification.payload, AccountLoginCompletedNotification):
+                    if login_queue is not None:
+                        login_queue.deadline = None
+                    if detached is not None:
+                        self._completed_detached_logins.add(detached)
+                    else:
+                        self._terminal_logins.add(login_id)
             return
 
         turn_id = self._notification_turn_id(notification)
@@ -344,11 +429,32 @@ class MessageRouter:
             self._failure = exc
             response_waiters = list(self._response_waiters.values())
             self._response_waiters.clear()
-            login_queues = list(self._login_notifications.values())
-            self._login_notifications.clear()
-            for pending in self._pending_login_notifications.values():
-                self._discard_pending(pending)
-            self._pending_login_notifications.clear()
+            retained_logins = set() if discard_completed else self._terminal_logins
+            login_queues = [
+                (notifications, login_id in retained_logins)
+                for login_id, notifications in self._login_notifications.items()
+            ]
+            login_queues.extend(
+                (
+                    notifications,
+                    not discard_completed and notifications in self._completed_detached_logins,
+                )
+                for notifications in list(self._detached_logins.values())
+            )
+            if discard_completed:
+                self._detached_logins.clear()
+                self._completed_detached_logins.clear()
+                self._recent_cancelled_logins.clear()
+            self._login_notifications = {
+                login_id: notifications
+                for login_id, notifications in self._login_notifications.items()
+                if login_id in retained_logins
+            }
+            for login_id in list(self._pending_login_notifications):
+                if login_id not in retained_logins:
+                    self._discard_pending(self._pending_login_notifications.pop(login_id))
+            if discard_completed:
+                self._terminal_logins.clear()
             retained = set() if discard_completed else self._terminal_turns
             turn_queues = [
                 (notifications, turn_id in retained)
@@ -371,8 +477,8 @@ class MessageRouter:
         # forever waiting for a response that cannot arrive.
         for waiter in response_waiters:
             waiter.put(exc)
-        for login_queue in login_queues:
-            login_queue.put(exc)
+        for login_queue, drain in login_queues:
+            login_queue.fail(exc, drain=drain)
         for turn_queue, drain in turn_queues:
             turn_queue.fail(exc, drain=drain)
         for goal_operation in goal_operations:

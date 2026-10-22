@@ -30,6 +30,10 @@ use ts_rs::TS;
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub enum TurnStatus {
+    // Stable clients (including the native Desktop) know only these statuses,
+    // so imported history closes as `completed`. The alias still decodes the
+    // `imported` value earlier builds emitted; it is never serialized.
+    #[serde(alias = "imported")]
     Completed,
     Interrupted,
     Failed,
@@ -98,7 +102,9 @@ pub struct TurnStartParams {
     #[experimental("turn/start.environments")]
     #[ts(optional = nullable)]
     pub environments: Option<Vec<TurnEnvironmentParams>>,
-    /// Override the working directory for this turn and subsequent turns.
+    /// Override the legacy host working directory for this and subsequent turns.
+    /// When `environments` is omitted, only a selected local environment is
+    /// retargeted; remote cwd values and an explicitly empty selection are preserved.
     #[ts(optional = nullable)]
     pub cwd: Option<PathBuf>,
     /// Replace the thread's runtime workspace roots for this turn and

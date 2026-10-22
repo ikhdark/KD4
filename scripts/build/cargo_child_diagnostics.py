@@ -39,16 +39,43 @@ def diagnostic_command(args, env):
 def build_environment(env):
     """Keep build inputs, not unrelated credentials in the process environment."""
     names = {
-        "PATH", "PATHEXT", "HOME", "USERPROFILE", "CARGO_HOME", "RUSTUP_HOME",
-        "RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "RUSTDOCFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS", "CARGO_ENCODED_RUSTDOCFLAGS",
-        "CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "CARGO_LOG",
-        "CC", "CXX", "AR", "CFLAGS", "CXXFLAGS", "LDFLAGS", "LIB", "LIBPATH",
-        "INCLUDE", "SCCACHE_BASEDIRS", "SCCACHE_DIR", "SCCACHE_CACHE_SIZE",
+        "PATH",
+        "PATHEXT",
+        "HOME",
+        "USERPROFILE",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_ENCODED_RUSTDOCFLAGS",
+        "CARGO_TARGET_DIR",
+        "CARGO_INCREMENTAL",
+        "CARGO_LOG",
+        "CC",
+        "CXX",
+        "AR",
+        "CFLAGS",
+        "CXXFLAGS",
+        "LDFLAGS",
+        "LIB",
+        "LIBPATH",
+        "INCLUDE",
+        "SCCACHE_BASEDIRS",
+        "SCCACHE_DIR",
+        "SCCACHE_CACHE_SIZE",
     }
-    return {key: value for key, value in env.items() if key.upper() in names
-            or key.upper().startswith(("CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_TARGET_"))}
+    return {
+        key: value
+        for key, value in env.items()
+        if key.upper() in names
+        or key.upper().startswith(("CARGO_BUILD_", "CARGO_PROFILE_", "CARGO_TARGET_"))
+    }
 
 
 def _windows_api():
@@ -60,11 +87,20 @@ def _windows_api():
     kernel.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
     kernel.OpenProcess.restype = w.HANDLE
     kernel.CloseHandle.argtypes = [w.HANDLE]
-    kernel.ReadProcessMemory.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
-                                        ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    kernel.ReadProcessMemory.argtypes = [
+        w.HANDLE,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
     kernel.IsWow64Process.argtypes = [w.HANDLE, ctypes.POINTER(w.BOOL)]
-    kernel.QueryFullProcessImageNameW.argtypes = [w.HANDLE, w.DWORD, w.LPWSTR,
-                                                ctypes.POINTER(w.DWORD)]
+    kernel.QueryFullProcessImageNameW.argtypes = [
+        w.HANDLE,
+        w.DWORD,
+        w.LPWSTR,
+        ctypes.POINTER(w.DWORD),
+    ]
     return kernel
 
 
@@ -73,13 +109,24 @@ def process_snapshot(pid):
     if os.name != "nt":
         root = Path("/proc") / str(pid)
         raw = root.joinpath("environ").read_bytes()
-        env = dict(entry.decode(errors="surrogateescape").split("=", 1)
-                   for entry in raw.split(b"\0") if b"=" in entry)
-        return {"pid": pid, "image": os.readlink(root / "exe"),
-                "command_line": root.joinpath("cmdline").read_bytes().decode(errors="replace").replace("\0", " "),
-                "cwd": os.readlink(root / "cwd"), "environment": build_environment(env),
-                "environment_sha256": hashlib.sha256(raw).hexdigest(),
-                "source": "procfs", "observed_at_ns": time.time_ns()}
+        env = dict(
+            entry.decode(errors="surrogateescape").split("=", 1)
+            for entry in raw.split(b"\0")
+            if b"=" in entry
+        )
+        return {
+            "pid": pid,
+            "image": os.readlink(root / "exe"),
+            "command_line": root.joinpath("cmdline")
+            .read_bytes()
+            .decode(errors="replace")
+            .replace("\0", " "),
+            "cwd": os.readlink(root / "cwd"),
+            "environment": build_environment(env),
+            "environment_sha256": hashlib.sha256(raw).hexdigest(),
+            "source": "procfs",
+            "observed_at_ns": time.time_ns(),
+        }
     from ctypes import wintypes as w
 
     kernel = _windows_api()
@@ -101,7 +148,9 @@ def process_snapshot(pid):
         def read(address, size):
             buffer = ctypes.create_string_buffer(size)
             count = ctypes.c_size_t()
-            ok = kernel.ReadProcessMemory(handle, address, buffer, size, ctypes.byref(count))
+            ok = kernel.ReadProcessMemory(
+                handle, address, buffer, size, ctypes.byref(count)
+            )
             if not ok or count.value != size:
                 raise OSError("incomplete child memory observation")
             return buffer.raw
@@ -125,7 +174,7 @@ def process_snapshot(pid):
         for offset in range(0, 1024 * 1024, 128):
             raw.extend(read(address + offset, 128))
             for index in range(max(0, len(raw) - 130), len(raw) - 2, 2):
-                if raw[index:index + 4] == b"\0\0\0\0":
+                if raw[index : index + 4] == b"\0\0\0\0":
                     end = index + 4
                     break
             if end is not None:
@@ -133,16 +182,25 @@ def process_snapshot(pid):
         if end is None:
             raise OSError("child environment exceeds observation cap")
         raw = bytes(raw[:end])
-        env = dict(entry.split("=", 1) for entry in raw.decode("utf-16-le", errors="surrogatepass").split("\0")
-                   if "=" in entry and not entry.startswith("="))
+        env = dict(
+            entry.split("=", 1)
+            for entry in raw.decode("utf-16-le", errors="surrogatepass").split("\0")
+            if "=" in entry and not entry.startswith("=")
+        )
         image = ctypes.create_unicode_buffer(32768)
         size = w.DWORD(len(image))
         if not kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
-        return {"pid": pid, "image": image.value, "command_line": unicode_string(0x70),
-                "cwd": unicode_string(0x38), "environment": build_environment(env),
-                "environment_sha256": hashlib.sha256(raw).hexdigest(),
-                "source": "ReadProcessMemory/PEB", "observed_at_ns": time.time_ns()}
+        return {
+            "pid": pid,
+            "image": image.value,
+            "command_line": unicode_string(0x70),
+            "cwd": unicode_string(0x38),
+            "environment": build_environment(env),
+            "environment_sha256": hashlib.sha256(raw).hexdigest(),
+            "source": "ReadProcessMemory/PEB",
+            "observed_at_ns": time.time_ns(),
+        }
     finally:
         kernel.CloseHandle(handle)
 
@@ -157,17 +215,31 @@ def process_tree():
             try:
                 data = root.joinpath("stat").read_text()
                 tail = data.rsplit(")", 1)[1].split()
-                rows.append((int(root.name), int(tail[1]), data.split("(", 1)[1].rsplit(")", 1)[0]))
+                rows.append(
+                    (
+                        int(root.name),
+                        int(tail[1]),
+                        data.split("(", 1)[1].rsplit(")", 1)[0],
+                    )
+                )
             except (OSError, ValueError, IndexError):
                 continue
         return rows
     from ctypes import wintypes as w
 
     class Entry(ctypes.Structure):
-        _fields_ = [("size", w.DWORD), ("usage", w.DWORD), ("pid", w.DWORD),
-                    ("heap", ctypes.c_size_t), ("module", w.DWORD), ("threads", w.DWORD),
-                    ("parent", w.DWORD), ("priority", w.LONG), ("flags", w.DWORD),
-                    ("name", w.WCHAR * 260)]
+        _fields_ = [
+            ("size", w.DWORD),
+            ("usage", w.DWORD),
+            ("pid", w.DWORD),
+            ("heap", ctypes.c_size_t),
+            ("module", w.DWORD),
+            ("threads", w.DWORD),
+            ("parent", w.DWORD),
+            ("priority", w.LONG),
+            ("flags", w.DWORD),
+            ("name", w.WCHAR * 260),
+        ]
 
     kernel = _windows_api()
     kernel.CreateToolhelp32Snapshot.argtypes = [w.DWORD, w.DWORD]
@@ -202,19 +274,33 @@ def wait_with_diagnostics(process, *, timeout, log_path):
     attempts = {}
     observations = 0
     with Path(log_path).open("x", encoding="utf-8") as log:
-        log.write(json.dumps({"kind": "coverage", "complete": False,
-                              "reason": "sampled live children; short-lived processes may be missed"}) + "\n")
+        log.write(
+            json.dumps(
+                {
+                    "kind": "coverage",
+                    "complete": False,
+                    "reason": "sampled live children; short-lived processes may be missed",
+                }
+            )
+            + "\n"
+        )
         while True:
             try:
                 rows = process_tree()
                 descendants = {process.pid}
                 for _ in range(16):
-                    expanded = descendants | {pid for pid, parent, _ in rows if parent in descendants}
+                    expanded = descendants | {
+                        pid for pid, parent, _ in rows if parent in descendants
+                    }
                     if expanded == descendants:
                         break
                     descendants = expanded
                 for pid, _, name in rows:
-                    if pid not in descendants or pid in seen or Path(name).stem.lower() not in {"cargo", "cargo-nextest"}:
+                    if (
+                        pid not in descendants
+                        or pid in seen
+                        or Path(name).stem.lower() not in {"cargo", "cargo-nextest"}
+                    ):
                         continue
                     attempts[pid] = attempts.get(pid, 0) + 1
                     try:
@@ -225,8 +311,12 @@ def wait_with_diagnostics(process, *, timeout, log_path):
                         # Windows startup can relocate the environment between
                         # pointer and buffer reads. A later live-process sample
                         # may settle it; cap observation attempts, never builds.
-                        record = {"kind": "unverified_child", "pid": pid,
-                                  "attempt": attempts[pid], "error": str(error)}
+                        record = {
+                            "kind": "unverified_child",
+                            "pid": pid,
+                            "attempt": attempts[pid],
+                            "error": str(error),
+                        }
                         if attempts[pid] >= 3:
                             seen.add(pid)
                     log.write(json.dumps(record, ensure_ascii=True) + "\n")
@@ -234,12 +324,27 @@ def wait_with_diagnostics(process, *, timeout, log_path):
             except OSError as error:
                 # Don't substitute the intended env or retry a failing storage
                 # operation. The caller reports the diagnostic failure.
-                raise RuntimeError(f"Cargo child observation failed: {error}") from error
-            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                raise RuntimeError(
+                    f"Cargo child observation failed: {error}"
+                ) from error
+            remaining = (
+                None if deadline is None else max(0, deadline - time.monotonic())
+            )
             try:
-                code = process.wait(timeout=0.2 if remaining is None else min(0.2, remaining))
-                log.write(json.dumps({"kind": "finished", "observations": observations,
-                                      "exit_code": code, "complete": False}) + "\n")
+                code = process.wait(
+                    timeout=0.2 if remaining is None else min(0.2, remaining)
+                )
+                log.write(
+                    json.dumps(
+                        {
+                            "kind": "finished",
+                            "observations": observations,
+                            "exit_code": code,
+                            "complete": False,
+                        }
+                    )
+                    + "\n"
+                )
                 return code
             except subprocess.TimeoutExpired:
                 if deadline is not None and time.monotonic() >= deadline:

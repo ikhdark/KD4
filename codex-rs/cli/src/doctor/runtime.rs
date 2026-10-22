@@ -1020,12 +1020,21 @@ mod tests {
         for (case, expected) in [
             ("missing pid", "receipt PID 42 is not live"),
             ("client", "receipt client codex_vscode is not Codex Desktop"),
-            ("binary", "receipt executable does not match the selected binary"),
-            ("home", "receipt CODEX_HOME does not match the intended fork home"),
+            (
+                "binary",
+                "receipt executable does not match the selected binary",
+            ),
+            (
+                "home",
+                "receipt CODEX_HOME does not match the intended fork home",
+            ),
             ("schema", "unsupported schema version 2"),
             ("current pid", "receipt identifies the doctor process"),
             ("process kind", "receipt PID 42 is not an app-server"),
-            ("process path", "live receipt process is not running the selected binary"),
+            (
+                "process path",
+                "live receipt process is not running the selected binary",
+            ),
         ] {
             let mut receipt = receipt.clone();
             let mut processes = vec![process.clone()];
@@ -1042,18 +1051,19 @@ mod tests {
                 _ => unreachable!(),
             }
             assert_eq!(
-                validate_desktop_runtime_receipt(&receipt, &processes, &target, Ok(&hash), current_pid, &home),
+                validate_desktop_runtime_receipt(
+                    &receipt,
+                    &processes,
+                    &target,
+                    Ok(&hash),
+                    current_pid,
+                    &home
+                ),
                 Err(expected.to_string()),
                 "{case}"
             );
         }
     }
-
-
-
-
-
-
 
     #[test]
     fn desktop_runtime_receipt_binds_identity_to_the_selected_file_hash() {

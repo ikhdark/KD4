@@ -82,6 +82,7 @@ impl RepoFixture {
             capability_profile: profile,
             objective: "exercise pure capability policy".to_string(),
             acceptance_criteria: vec![AcceptanceCriterion {
+                evidence_policy: None,
                 id: "criterion".to_string(),
                 text: "policy is deterministic".to_string(),
             }],
@@ -253,6 +254,7 @@ fn cold_review_context_is_attempt_bound_and_structurally_excludes_worker_history
             "assignment".to_string(),
             "effective_contract".to_string(),
             "attempt_id".to_string(),
+            "target_receipt_scope".to_string(),
             "attempt_specific_diff".to_string(),
             "nearest_tests".to_string(),
             "observed_writes".to_string(),
@@ -587,18 +589,33 @@ fn cold_review_projects_amendment_without_changing_original_contract() {
     let fixture = RepoFixture::new();
     let assignment = fixture.assignment(CapabilityProfile::ScopedSourceWrite, vec![]);
     for count in [1, 2, 3] {
-        let criteria = (0..count).map(|i| codex_agent_task_store::AcceptanceCriterion {
-            id: format!("revised-{i}"), text: format!("new behavior {i}"),
-        }).collect::<Vec<_>>();
+        let criteria = (0..count)
+            .map(|i| codex_agent_task_store::AcceptanceCriterion {
+                evidence_policy: None,
+                id: format!("revised-{i}"),
+                text: format!("new behavior {i}"),
+            })
+            .collect::<Vec<_>>();
         let amendment = codex_agent_task_store::AttemptAmendment {
-            reason: "correction".into(), objective: Some("current objective".into()),
-            acceptance_criteria: Some(criteria.clone()), stop_condition: Some("current stop".into()),
+            reason: "correction".into(),
+            objective: Some("current objective".into()),
+            acceptance_criteria: Some(criteria.clone()),
+            stop_condition: Some("current stop".into()),
         };
-        let context = build_cold_review_context(fixture.path(), ColdReviewContextInput {
-            assignment: assignment.clone(), amendment: Some(amendment), attempt_id: AttemptId::new(),
-            applicable_instructions: vec![], attempt_specific_diff: String::new(), observed_writes: vec![],
-            relevant_contracts: vec![], nearest_tests: vec![],
-        }).unwrap();
+        let context = build_cold_review_context(
+            fixture.path(),
+            ColdReviewContextInput {
+                assignment: assignment.clone(),
+                amendment: Some(amendment),
+                attempt_id: AttemptId::new(),
+                applicable_instructions: vec![],
+                attempt_specific_diff: String::new(),
+                observed_writes: vec![],
+                relevant_contracts: vec![],
+                nearest_tests: vec![],
+            },
+        )
+        .unwrap();
         assert_eq!(context.assignment, assignment);
         assert_eq!(context.effective_contract.objective, "current objective");
         assert_eq!(context.effective_contract.stop_condition, "current stop");

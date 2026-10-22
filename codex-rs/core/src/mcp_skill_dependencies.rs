@@ -10,6 +10,7 @@ use codex_config::load_global_mcp_servers;
 use codex_login::default_client::is_first_party_originator;
 use codex_login::default_client::originator;
 use codex_protocol::request_user_input::RequestUserInputArgs;
+use codex_protocol::request_user_input::RequestUserInputDisposition;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
 use codex_rmcp_client::perform_oauth_login;
@@ -384,6 +385,15 @@ async fn should_install_planned_mcp_dependencies(
             response.ok_or_else(|| "MCP dependency prompt closed without a response".to_string())?
         }
     };
+    // Draft labels are not a decision when the client skipped, timed out, or
+    // failed to deliver the question. In particular, do not persist an opt-out.
+    if response.interrupted
+        || response
+            .disposition
+            .is_some_and(|disposition| disposition != RequestUserInputDisposition::Answered)
+    {
+        return Ok(false);
+    }
     let answers = response
         .answers
         .get(SKILL_MCP_DEPENDENCY_PROMPT_ID)
@@ -705,6 +715,135 @@ fn collect_missing_mcp_dependencies(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn nonanswer_dependency_effect_never_installs_or_records_an_opt_out() {
+        use codex_protocol::protocol::AskForApproval;
+        use codex_protocol::request_user_input::RequestUserInputAnswer;
+        use codex_protocol::request_user_input::RequestUserInputResponse;
+        use std::sync::Arc;
+
+        for disposition in [
+            RequestUserInputDisposition::Skipped,
+            RequestUserInputDisposition::TimedOut,
+            RequestUserInputDisposition::TransportError,
+            RequestUserInputDisposition::Interrupted,
+        ] {
+            for label in [MCP_DEPENDENCY_OPTION_INSTALL, MCP_DEPENDENCY_OPTION_SKIP] {
+                let (session, mut turn, events) =
+                    crate::session::tests::make_session_and_context_with_rx().await;
+                Arc::get_mut(&mut turn)
+                    .unwrap()
+                    .approval_policy
+                    .set(AskForApproval::OnRequest)
+                    .unwrap();
+                *session.active_turn.lock().await = Some(crate::state::ActiveTurn {
+                    terminal: Some(crate::state::TurnTerminalCoordinator::new(
+                        turn.sub_id.clone(),
+                    )),
+                    ..Default::default()
+                });
+                let config_path = turn.config.codex_home.join(codex_config::CONFIG_TOML_FILE);
+                let before = std::fs::read(&config_path).ok();
+                let config: McpServerConfig =
+                    toml::from_str("url = 'https://dependency.invalid/mcp'").unwrap();
+                let effect = PlannedMcpDependencyEffect {
+                    id: "nonanswer-probe".to_string(),
+                    missing: HashMap::from([("nonanswer-probe".to_string(), config)]),
+                    expected_inventory_keys: HashSet::new(),
+                };
+                let cancellation = CancellationToken::new();
+                let mut decision = Box::pin(apply_mcp_dependency_effect(
+                    &session,
+                    &turn,
+                    &cancellation,
+                    &effect,
+                ));
+                assert!(
+                    futures::poll!(decision.as_mut()).is_pending(),
+                    "the fixture must reach the actual prompt"
+                );
+                assert!(matches!(
+                    events.recv().await.unwrap().msg,
+                    codex_protocol::protocol::EventMsg::RequestUserInput(_)
+                ));
+                session
+                    .notify_user_input_response(
+                        &turn.sub_id,
+                        RequestUserInputResponse {
+                            answers: HashMap::from([(
+                                SKILL_MCP_DEPENDENCY_PROMPT_ID.to_string(),
+                                RequestUserInputAnswer {
+                                    answers: vec![label.to_string()],
+                                },
+                            )]),
+                            interrupted: false,
+                            disposition: Some(disposition.clone()),
+                        },
+                    )
+                    .await;
+                assert_eq!(decision.await.unwrap(), McpDependencyEffectOutcome::Skipped);
+                assert_eq!(
+                    std::fs::read(&config_path).ok(),
+                    before,
+                    "no installation config write"
+                );
+                assert!(
+                    session.mcp_dependency_prompted().await.is_empty(),
+                    "a draft skip is not an opt-out"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_dependency_install_supports_answered_and_legacy_clients() {
+        use codex_protocol::protocol::AskForApproval;
+        use codex_protocol::request_user_input::RequestUserInputAnswer;
+        use codex_protocol::request_user_input::RequestUserInputResponse;
+        use std::sync::Arc;
+        for disposition in [None, Some(RequestUserInputDisposition::Answered)] {
+            let (session, mut turn, events) =
+                crate::session::tests::make_session_and_context_with_rx().await;
+            Arc::get_mut(&mut turn)
+                .unwrap()
+                .approval_policy
+                .set(AskForApproval::OnRequest)
+                .unwrap();
+            *session.active_turn.lock().await = Some(crate::state::ActiveTurn {
+                terminal: Some(crate::state::TurnTerminalCoordinator::new(
+                    turn.sub_id.clone(),
+                )),
+                ..Default::default()
+            });
+            let missing = HashMap::new();
+            let cancellation = CancellationToken::new();
+            let mut decision = Box::pin(should_install_planned_mcp_dependencies(
+                &session,
+                &turn,
+                &missing,
+                &cancellation,
+            ));
+            assert!(futures::poll!(decision.as_mut()).is_pending());
+            events.recv().await.unwrap();
+            session
+                .notify_user_input_response(
+                    &turn.sub_id,
+                    RequestUserInputResponse {
+                        answers: HashMap::from([(
+                            SKILL_MCP_DEPENDENCY_PROMPT_ID.to_string(),
+                            RequestUserInputAnswer {
+                                answers: vec!["Install".to_string()],
+                            },
+                        )]),
+                        interrupted: false,
+                        disposition,
+                    },
+                )
+                .await;
+            assert!(decision.await.unwrap());
+        }
+    }
 
     #[tokio::test]
     async fn setup_uses_only_approved_definitions_in_the_merged_config() -> anyhow::Result<()> {

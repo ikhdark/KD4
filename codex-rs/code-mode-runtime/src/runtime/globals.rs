@@ -44,13 +44,18 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
     let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
     let text = helper_function(scope, "text", text_callback)?;
-    let format_tool_result = helper_function(scope, "format_tool_result", format_tool_result_callback)?;
+    let format_tool_result =
+        helper_function(scope, "format_tool_result", format_tool_result_callback)?;
     let image = helper_function(scope, "image", image_callback)?;
     let generated_image = helper_function(scope, "generatedImage", generated_image_callback)?;
     let store = helper_function(scope, "store", store_callback)?;
     let load = helper_function(scope, "load", load_callback)?;
     let list_keys = helper_function(scope, "listKeys", super::callbacks::list_keys_callback)?;
-    let delete_stored = helper_function(scope, "deleteStored", super::callbacks::delete_stored_callback)?;
+    let delete_stored = helper_function(
+        scope,
+        "deleteStored",
+        super::callbacks::delete_stored_callback,
+    )?;
     let notify = helper_function(scope, "notify", notify_callback)?;
     let yield_control = helper_function(scope, "yield_control", yield_control_callback)?;
     let exit = helper_function(scope, "exit", exit_callback)?;
@@ -58,7 +63,8 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "tools", tools.into())?;
     let all_tools_key = v8::String::new(scope, "ALL_TOOLS")
         .ok_or_else(|| "failed to allocate ALL_TOOLS key".to_string())?;
-    if global.set_lazy_data_property(scope, all_tools_key.into(), all_tools_callback) != Some(true) {
+    if global.set_lazy_data_property(scope, all_tools_key.into(), all_tools_callback) != Some(true)
+    {
         return Err("failed to install lazy ALL_TOOLS".to_string());
     }
     set_global(scope, global, "ALL_TOOL_NAMES", all_tool_names)?;
@@ -66,7 +72,12 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "clearTimeout", clear_timeout.into())?;
     set_global(scope, global, "setTimeout", set_timeout.into())?;
     set_global(scope, global, "text", text.into())?;
-    set_global(scope, global, "format_tool_result", format_tool_result.into())?;
+    set_global(
+        scope,
+        global,
+        "format_tool_result",
+        format_tool_result.into(),
+    )?;
     set_global(scope, global, "image", image.into())?;
     set_global(scope, global, "generatedImage", generated_image.into())?;
     set_global(scope, global, "store", store.into())?;
@@ -180,20 +191,31 @@ fn resolve_tool_callback(
     let diagnostic = if args.length() > 1 && !args.get(1).is_undefined() {
         match super::value::v8_value_to_json(scope, args.get(1)) {
             Ok(Some(options)) if options.is_object() => options["diagnostic"] == true,
-            _ => { throw_type_error(scope, "resolve_tool options must be { diagnostic?: boolean }"); return; }
+            _ => {
+                throw_type_error(
+                    scope,
+                    "resolve_tool options must be { diagnostic?: boolean }",
+                );
+                return;
+            }
         }
-    } else { false };
+    } else {
+        false
+    };
     let requested_name = (args.length() > 0 && args.get(0).is_string())
         .then(|| args.get(0).to_rust_string_lossy(scope));
     let enabled_tools = scope
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools));
-    let Some(index) = enabled_tools
-        .as_deref()
-        .and_then(|enabled_tools| requested_name.as_deref().and_then(|name| enabled_tools.resolve_requested_name(name)))
-    else {
+    let Some(index) = enabled_tools.as_deref().and_then(|enabled_tools| {
+        requested_name
+            .as_deref()
+            .and_then(|name| enabled_tools.resolve_requested_name(name))
+    }) else {
         if diagnostic {
-            let value = enabled_tools.as_deref().unwrap_or(&EnabledToolCatalog::default())
+            let value = enabled_tools
+                .as_deref()
+                .unwrap_or(&EnabledToolCatalog::default())
                 .resolution_diagnostic(requested_name.as_deref());
             match super::value::json_to_v8(scope, &value) {
                 Some(value) => retval.set(value),
@@ -227,21 +249,33 @@ fn build_tools_object<'s>(
     // Keep legacy two-part aliases, but reject collisions before installing any.
     let mut aliases = std::collections::BTreeMap::new();
     for (index, tool) in enabled_tools.iter().enumerate() {
-        let legacy = tool.global_name.split_once("__")
+        let legacy = tool
+            .global_name
+            .split_once("__")
             .filter(|(_, member)| !member.contains("__"));
-        let registered = tool.tool_name.namespace.as_deref()
+        let registered = tool
+            .tool_name
+            .namespace
+            .as_deref()
             .map(|namespace| (namespace, tool.tool_name.name.as_str()));
         for (namespace, member) in legacy.into_iter().chain(registered) {
-            if namespace.is_empty() || member.is_empty() { continue; }
-            aliases.entry((namespace, member))
+            if namespace.is_empty() || member.is_empty() {
+                continue;
+            }
+            aliases
+                .entry((namespace, member))
                 .and_modify(|owner| {
-                    if *owner != Some(index) { *owner = None; }
+                    if *owner != Some(index) {
+                        *owner = None;
+                    }
                 })
                 .or_insert(Some(index));
         }
     }
     for ((namespace, member), owner) in aliases {
-        let Some(index) = owner else { continue; };
+        let Some(index) = owner else {
+            continue;
+        };
         let tool = &enabled_tools[index];
         // Namespace aliases never shadow a canonical top-level callable.
         let namespace_key = v8::String::new(scope, namespace)
@@ -281,19 +315,28 @@ fn all_tools_callback(
     _args: v8::PropertyCallbackArguments,
     mut retval: v8::ReturnValue<v8::Value>,
 ) {
-    let enabled_tools = scope.get_slot::<RuntimeState>()
-        .map(|state| Arc::clone(&state.enabled_tools)).unwrap_or_default();
+    let enabled_tools = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| Arc::clone(&state.enabled_tools))
+        .unwrap_or_default();
     match build_all_tools_value(scope, &enabled_tools.tools) {
         Ok(value) => retval.set(value),
         Err(error) => throw_type_error(scope, &error),
     }
 }
 
-fn shared_description<'s>(scope: &mut v8::PinScope<'s, '_>, description: &str) -> Result<v8::Local<'s, v8::String>, String> {
+fn shared_description<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    description: &str,
+) -> Result<v8::Local<'s, v8::String>, String> {
     // Internalization shares description storage between callable metadata and
     // the optional discovery array within this cell's isolate.
-    v8::String::new_from_utf8(scope, description.as_bytes(), v8::NewStringType::Internalized)
-        .ok_or_else(|| "failed to allocate tool description".to_string())
+    v8::String::new_from_utf8(
+        scope,
+        description.as_bytes(),
+        v8::NewStringType::Internalized,
+    )
+    .ok_or_else(|| "failed to allocate tool description".to_string())
 }
 
 fn build_all_tools_value<'s>(
@@ -351,7 +394,8 @@ fn tool_function<'s>(
     // One callable/metadata pair per immutable catalog entry in this cell.
     // Keep it in host state, not the user-mutable `tools` object. A new cell
     // owns a new cache, so changed capabilities cannot reuse old functions.
-    let cached = scope.get_slot::<RuntimeState>()
+    let cached = scope
+        .get_slot::<RuntimeState>()
         .and_then(|state| state.tool_functions.get(&tool_index).cloned());
     if let Some(cached) = cached {
         return Ok(v8::Local::new(scope, cached));
@@ -360,7 +404,8 @@ fn tool_function<'s>(
         .get_slot::<RuntimeState>()
         .map(|state| Arc::clone(&state.enabled_tools))
         .ok_or_else(|| "missing enabled tools".to_string())?;
-    let tool = enabled_tools.get(tool_index)
+    let tool = enabled_tools
+        .get(tool_index)
         .ok_or_else(|| "missing enabled tool".to_string())?;
     let index =
         u32::try_from(tool_index).map_err(|_| "tool callback index exceeds u32".to_string())?;
@@ -387,9 +432,11 @@ fn tool_function<'s>(
         .ok_or_else(|| "failed to create tool metadata serializer".to_string())?;
     set_global(scope, function.into(), "toJSON", to_json.into())?;
     let retained = v8::Global::new(scope, function);
-    scope.get_slot_mut::<RuntimeState>()
+    scope
+        .get_slot_mut::<RuntimeState>()
         .ok_or_else(|| "missing runtime state".to_string())?
-        .tool_functions.insert(tool_index, retained);
+        .tool_functions
+        .insert(tool_index, retained);
     Ok(function)
 }
 

@@ -2,8 +2,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use codex_file_system::acquire_atomic_write_lock;
-use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::acquire_resolved_atomic_write_lock;
 use codex_file_system::write_atomically;
 use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
@@ -36,8 +35,7 @@ pub fn record_user_marketplace(
     update: &MarketplaceConfigUpdate<'_>,
 ) -> std::io::Result<()> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let _lock = acquire_atomic_write_lock(&config_path)?;
-    let write_paths = resolve_symlink_write_paths(&config_path)?;
+    let (write_paths, _lock) = acquire_resolved_atomic_write_lock(&config_path)?;
     let mut doc = read_or_create_config_document(write_paths.read_path.as_deref())?;
     upsert_marketplace(&mut doc, marketplace_name, update);
     write_atomically(&write_paths.write_path, &doc.to_string())
@@ -53,8 +51,7 @@ pub fn remove_user_marketplace_config(
     marketplace_name: &str,
 ) -> std::io::Result<RemoveMarketplaceConfigOutcome> {
     let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let _lock = acquire_atomic_write_lock(&config_path)?;
-    let write_paths = resolve_symlink_write_paths(&config_path)?;
+    let (write_paths, _lock) = acquire_resolved_atomic_write_lock(&config_path)?;
     let Some(read_path) = write_paths.read_path.as_deref() else {
         return Ok(RemoveMarketplaceConfigOutcome::NotFound);
     };

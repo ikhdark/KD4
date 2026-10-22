@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import time
 import uuid
@@ -29,16 +30,23 @@ KIND = "codex_validation_metrics_v1"
 REF_KIND = "codex_validation_metrics_ref_v1"
 PHASES = ("admission", "preparation", "provenance", "reconciliation")
 REASONS = (
-    "first_necessary_execution", "inputs_changed", "previous_stale",
-    "previous_failed", "previous_interrupted", "dependency_invalidated",
-    "redundant", "unknown",
+    "first_necessary_execution",
+    "inputs_changed",
+    "previous_stale",
+    "previous_failed",
+    "previous_interrupted",
+    "dependency_invalidated",
+    "redundant",
+    "unknown",
 )
 
 
 def digest(value):
-    return hashlib.sha256(json.dumps(
-        value, sort_keys=True, ensure_ascii=True, separators=(",", ":")
-    ).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            value, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
 
 
 class ValidationMetrics:
@@ -50,24 +58,37 @@ class ValidationMetrics:
         self.path = None
         self._owner = None
         self.record = {
-            "kind": KIND, "run_id": str(uuid.uuid4()),
-            "producer": "rust_test_runner", "mode": "executed",
-            "argv": list(argv), "command_digest": digest(list(argv)),
+            "kind": KIND,
+            "run_id": str(uuid.uuid4()),
+            "producer": "rust_test_runner",
+            "mode": "executed",
+            "argv": list(argv),
+            "command_digest": digest(list(argv)),
             "working_directory": str(Path.cwd().resolve()),
             "started_at": datetime.now(timezone.utc).isoformat(),
-            "finished_at": None, "outcome": "running",
+            "finished_at": None,
+            "outcome": "running",
+            "parent_run_id": os.environ.get("CODEX_VALIDATION_PARENT_RUN_ID"),
+            "started_monotonic_seconds": self.started,
             "lifecycle_seconds": None,
             "phases": {name: None for name in PHASES},
-            "commands": [], "prerequisite_ids": None,
-            "input_digest": None, "input_coverage": "unknown",
+            "commands": [],
+            "prerequisite_ids": None,
+            "input_digest": None,
+            "input_coverage": "unknown",
             "dependency_manifest": None,
             "proof": {
-                "obligations": [], "completed_tests": {},
-                "covered_paths": None, "coverage": "unknown",
-                "status": "unknown", "freshness": "unknown",
-                "freshness_basis": None, "reused_from_run_id": None,
+                "obligations": [],
+                "completed_tests": {},
+                "covered_paths": None,
+                "coverage": "unknown",
+                "status": "unknown",
+                "freshness": "unknown",
+                "freshness_basis": None,
+                "reused_from_run_id": None,
             },
-            "reason": "unknown", "reason_basis": None,
+            "reason": "unknown",
+            "reason_basis": None,
         }
 
     @contextmanager
@@ -81,21 +102,29 @@ class ValidationMetrics:
             )
 
     def bind(self, target_dir):
-        self.path = Path(target_dir) / "test-runner-logs" / (
-            "validation-" + self.record["run_id"] + ".json"
+        self.path = (
+            Path(target_dir)
+            / "test-runner-logs"
+            / ("validation-" + self.record["run_id"] + ".json")
         )
         # Publish an unowned checkpoint first. Maintenance never modifies these
         # legacy/unknown records; a failed initial write creates no lock files.
         self.checkpoint()
         if self.path is not None:
             from scripts.build.rust_build_status import _try_acquire_binary_file_lock
+
             try:
-                self._owner = _try_acquire_binary_file_lock(self.path.with_suffix(".owner.lock"))
+                self._owner = _try_acquire_binary_file_lock(
+                    self.path.with_suffix(".owner.lock")
+                )
                 if self._owner is not None:
                     self.record["owner_lock_version"] = 1
                     self.checkpoint()
             except OSError as error:
-                print(f"Validation metrics ownership unavailable: {error}", file=sys.stderr)
+                print(
+                    f"Validation metrics ownership unavailable: {error}",
+                    file=sys.stderr,
+                )
 
     def _release_owner(self):
         owner = getattr(self, "_owner", None)
@@ -116,7 +145,10 @@ class ValidationMetrics:
                 write_json_atomic(self.path, self.record)
             except OSError as error:
                 # Metrics must not turn passed validation into a failed command.
-                print(f"Validation metrics retention unavailable: {error}", file=sys.stderr)
+                print(
+                    f"Validation metrics retention unavailable: {error}",
+                    file=sys.stderr,
+                )
                 self.path = None
                 self._release_owner()
 
@@ -128,11 +160,17 @@ class ValidationMetrics:
 
     def command(self, argv, phase, attempt):
         row = {
-            "command_id": str(uuid.uuid4()), "argv": list(argv),
-            "command_digest": digest(list(argv)), "phase": phase,
-            "attempt": attempt, "outcome": "running", "exit_code": None,
-            "wall_seconds": None, "reported_build_seconds": None,
-            "reported_test_seconds": None, "process_wait_seconds": None,
+            "command_id": str(uuid.uuid4()),
+            "argv": list(argv),
+            "command_digest": digest(list(argv)),
+            "phase": phase,
+            "attempt": attempt,
+            "outcome": "running",
+            "exit_code": None,
+            "wall_seconds": None,
+            "reported_build_seconds": None,
+            "reported_test_seconds": None,
+            "process_wait_seconds": None,
             "cleanup_seconds": None,
         }
         self.record["commands"].append(row)
@@ -143,7 +181,9 @@ class ValidationMetrics:
         self.record["proof"]["completed_tests"] = receipts
         self.record["proof"]["obligations"] = list(obligations)
         # Exact executed test IDs are proof of execution, not current revision coverage.
-        self.record["proof"]["status"] = "passed" if any(receipts.values()) else "unknown"
+        self.record["proof"]["status"] = (
+            "passed" if any(receipts.values()) else "unknown"
+        )
 
     def finish(self, outcome):
         try:
@@ -153,7 +193,10 @@ class ValidationMetrics:
 
     def _finish(self, outcome):
         self.record["outcome"] = outcome
-        self.record["lifecycle_seconds"] = self.clock() - self.started
+        self.record["finished_monotonic_seconds"] = self.clock()
+        self.record["lifecycle_seconds"] = (
+            self.record["finished_monotonic_seconds"] - self.started
+        )
         self.record["finished_at"] = datetime.now(timezone.utc).isoformat()
         if outcome != "passed":
             self.record["proof"]["status"] = "pending" if outcome == "busy" else outcome
@@ -165,11 +208,19 @@ class ValidationMetrics:
         if raw is None:
             print(json.dumps(self.record, sort_keys=True), file=sys.stderr)
         else:
-            print(json.dumps({
-                "kind": REF_KIND, "run_id": self.record["run_id"],
-                "path": str(self.path.resolve()), "bytes": len(raw),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-            }, sort_keys=True), file=sys.stderr)
+            print(
+                json.dumps(
+                    {
+                        "kind": REF_KIND,
+                        "run_id": self.record["run_id"],
+                        "path": str(self.path.resolve()),
+                        "bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
 
 
 def maintain_ledgers(directory, *, apply=False, prune_before=None, keep=100):
@@ -180,6 +231,7 @@ def maintain_ledgers(directory, *, apply=False, prune_before=None, keep=100):
     Legacy records, failed runs and command-output logs are always preserved.
     """
     from scripts.build.rust_build_status import _try_acquire_binary_file_lock
+
     if keep < 1:
         raise ValueError("keep must preserve at least one recent ledger")
     cutoff = _timestamp(prune_before) if prune_before is not None else None
@@ -196,11 +248,23 @@ def maintain_ledgers(directory, *, apply=False, prune_before=None, keep=100):
             rows.append((path, row))
         except (OSError, ValueError, KeyError, TypeError) as error:
             errors.append({"path": str(path), "error": str(error)})
-    recent = {path for path, _ in sorted(
-        rows, key=lambda item: _timestamp(item[1]["started_at"]), reverse=True,
-    )[:keep]}
-    report = {"apply": apply, "examined": len(rows), "active": 0,
-              "unowned": 0, "abandoned": [], "pruned": [], "errors": errors}
+    recent = {
+        path
+        for path, _ in sorted(
+            rows,
+            key=lambda item: _timestamp(item[1]["started_at"]),
+            reverse=True,
+        )[:keep]
+    }
+    report = {
+        "apply": apply,
+        "examined": len(rows),
+        "active": 0,
+        "unowned": 0,
+        "abandoned": [],
+        "pruned": [],
+        "errors": errors,
+    }
     for path, observed in rows:
         if observed.get("owner_lock_version") != 1:
             report["unowned"] += 1
@@ -218,7 +282,10 @@ def maintain_ledgers(directory, *, apply=False, prune_before=None, keep=100):
             # The producer may have finished between inventory and admission.
             row = json.loads(path.read_text(encoding="utf-8"))
             _validate(row)
-            if row.get("run_id") != observed["run_id"] or row.get("owner_lock_version") != 1:
+            if (
+                row.get("run_id") != observed["run_id"]
+                or row.get("owner_lock_version") != 1
+            ):
                 raise ValueError("ledger identity changed during maintenance")
             if row.get("outcome") == "running":
                 row["outcome"] = "abandoned"
@@ -235,9 +302,13 @@ def maintain_ledgers(directory, *, apply=False, prune_before=None, keep=100):
                 if apply:
                     write_json_atomic(path, row)
                 report["abandoned"].append(str(path))
-            elif (cutoff is not None and path not in recent
-                  and row.get("outcome") == "passed" and row.get("finished_at")
-                  and _timestamp(row["finished_at"]) < cutoff):
+            elif (
+                cutoff is not None
+                and path not in recent
+                and row.get("outcome") == "passed"
+                and row.get("finished_at")
+                and _timestamp(row["finished_at"]) < cutoff
+            ):
                 if apply:
                     path.unlink()
                 report["pruned"].append(str(path))
@@ -268,7 +339,8 @@ def _sum_known(values):
     known = [v for v in values if _duration(v) is not None]
     return {
         "seconds": sum(known) if known else None,
-        "measured": len(known), "unknown": len(values) - len(known),
+        "measured": len(known),
+        "unknown": len(values) - len(known),
     }
 
 
@@ -304,15 +376,26 @@ def _validate(row):
         not isinstance(command, dict) for command in row["commands"]
     ):
         raise ValueError("commands must be a list of objects")
-    if row.get("reason_basis") is not None and not isinstance(row["reason_basis"], dict):
+    if row.get("reason_basis") is not None and not isinstance(
+        row["reason_basis"], dict
+    ):
         raise ValueError("reason_basis must be an object or null")
     _timestamp(row["started_at"])
     if row.get("finished_at") is not None:
-        if _timestamp(row["finished_at"]) < _timestamp(row["started_at"]):
-            raise ValueError("finish timestamp precedes launch")
+        _timestamp(row["finished_at"])
     _duration(row.get("lifecycle_seconds"))
     for duration in row["phases"].values():
         _duration(duration)
+
+
+def _wall_clock_status(row):
+    if row.get("finished_at") is None:
+        return "unknown"
+    return (
+        "regressed"
+        if _timestamp(row["finished_at"]) < _timestamp(row["started_at"])
+        else "ordered"
+    )
 
 
 def summarize(records):
@@ -327,18 +410,34 @@ def summarize(records):
                 raise ValueError(f"conflicting records for run_id {key}")
             duplicates += 1
         unique[key] = row
-    rows = sorted(unique.values(), key=lambda row: (_timestamp(row["started_at"]), row["run_id"]))
-    executed = [row for row in rows if row["mode"] == "executed"]
+    rows = sorted(
+        unique.values(), key=lambda row: (_timestamp(row["started_at"]), row["run_id"])
+    )
+    requests = [row for row in rows if row.get("producer") == "rust_build_status"]
+    executed = [
+        row for row in rows if row["mode"] == "executed" and row not in requests
+    ]
     reused = [row for row in rows if row["mode"] == "reused"]
-    if len(executed) + len(reused) != len(rows):
+    if len(executed) + len(reused) + len(requests) != len(rows):
         raise ValueError("mode must be executed or reused")
     commands = [command for row in executed for command in row["commands"]]
     work = {"lifecycle": _sum_known(row["lifecycle_seconds"] for row in executed)}
+    # Parent envelopes contain inner runner time. Never add the two as elapsed.
+    work["request_lifecycle"] = _sum_known(
+        row["lifecycle_seconds"]
+        for row in requests
+        if row.get("parent_run_id") not in unique
+    )
     work["unattributed_lifecycle"] = _sum_known(_unattributed(row) for row in executed)
     for phase in PHASES:
         work[phase] = _sum_known(row["phases"].get(phase) for row in executed)
-    for field in ("wall_seconds", "reported_build_seconds", "reported_test_seconds",
-                  "process_wait_seconds", "cleanup_seconds"):
+    for field in (
+        "wall_seconds",
+        "reported_build_seconds",
+        "reported_test_seconds",
+        "process_wait_seconds",
+        "cleanup_seconds",
+    ):
         work[field] = _sum_known(command.get(field) for command in commands)
     # Cargo's Finished duration is build wall time, not pure compiler CPU/wall.
     work["compile_seconds"] = {"seconds": None, "measured": 0, "unknown": len(commands)}
@@ -350,17 +449,22 @@ def summarize(records):
     repeat_observations = []
     prior_by_command = {}
     for row in rows:
+        if row in requests:
+            continue
         proof = row["proof"]
         freshness = proof["freshness"]
         # A producer must supply a revision-bound basis, not merely say "current".
         current = (
-            freshness == "current" and bool(proof.get("freshness_basis"))
+            freshness == "current"
+            and bool(proof.get("freshness_basis"))
             and row.get("input_coverage") == "complete"
             and bool(row.get("input_digest"))
             and proof.get("coverage") == "verified"
             and bool(proof.get("obligations"))
         )
-        proof_states["current" if current else "stale" if freshness == "stale" else "unknown"] += 1
+        proof_states[
+            "current" if current else "stale" if freshness == "stale" else "unknown"
+        ] += 1
         if row["mode"] == "executed":
             reason = row.get("reason", "unknown")
             if reason not in REASONS or not row.get("reason_basis"):
@@ -370,33 +474,48 @@ def summarize(records):
             command_key = (row.get("working_directory"), row["command_digest"])
             previous = prior_by_command.get(command_key)
             if (
-                reason == "unknown" and command_key[0] and previous
+                reason == "unknown"
+                and command_key[0]
+                and previous
+                and _wall_clock_status(previous) == _wall_clock_status(row) == "ordered"
                 and previous.get("finished_at")
                 and _timestamp(previous["finished_at"]) <= _timestamp(row["started_at"])
                 and previous["proof"].get("obligations") == proof.get("obligations")
                 and proof.get("obligations")
             ):
-                repeat_observations.append({
-                    "run_id": row["run_id"], "previous_observed_run_id": previous["run_id"],
-                    "previous_outcome": previous["outcome"], "causal_reason_verified": False,
-                })
+                repeat_observations.append(
+                    {
+                        "run_id": row["run_id"],
+                        "previous_observed_run_id": previous["run_id"],
+                        "previous_outcome": previous["outcome"],
+                        "causal_reason_verified": False,
+                    }
+                )
             # A redundant classification requires already-current prior proof of
             # this exact obligation/input/prerequisite identity.
             if reason == "redundant":
                 prior = unique.get(row["reason_basis"].get("prior_run_id"))
                 before = prior.get("proof", {}) if prior else {}
                 if not (
-                    prior and _timestamp(prior["started_at"]) < _timestamp(row["started_at"])
+                    prior
+                    and _wall_clock_status(prior)
+                    == _wall_clock_status(row)
+                    == "ordered"
+                    and _timestamp(prior["started_at"]) < _timestamp(row["started_at"])
                     and prior.get("finished_at")
-                    and _timestamp(prior["finished_at"]) <= _timestamp(row["started_at"])
+                    and _timestamp(prior["finished_at"])
+                    <= _timestamp(row["started_at"])
                     and prior["outcome"] == "passed"
                     and before.get("status") == "passed"
                     and row["reason_basis"].get("prior_proof_current_at_launch") is True
                     and row["reason_basis"].get("no_repeat_requirement") is True
                     and row.get("working_directory")
                     and row["working_directory"] == prior.get("working_directory")
-                    and row.get("input_coverage") == prior.get("input_coverage") == "complete"
-                    and row.get("input_digest") and row["input_digest"] == prior.get("input_digest")
+                    and row.get("input_coverage")
+                    == prior.get("input_coverage")
+                    == "complete"
+                    and row.get("input_digest")
+                    and row["input_digest"] == prior.get("input_digest")
                     and row["command_digest"] == prior["command_digest"]
                     and proof.get("obligations") == before.get("obligations")
                     and proof.get("obligations")
@@ -411,7 +530,12 @@ def summarize(records):
             reasons[reason] += 1
             classified.append((row, reason))
             prior_by_command[command_key] = row
-            if current and row["outcome"] == "passed" and proof.get("status") == "passed" and reason != "redundant":
+            if (
+                current
+                and row["outcome"] == "passed"
+                and proof.get("status") == "passed"
+                and reason != "redundant"
+            ):
                 new_current_proof += 1
                 successful_validation_work.append(row["lifecycle_seconds"])
     work["redundant_lifecycle"] = _sum_known(
@@ -420,24 +544,44 @@ def summarize(records):
     work["unclassified_lifecycle"] = _sum_known(
         row["lifecycle_seconds"] for row, reason in classified if reason == "unknown"
     )
-    work["successful_current_validation_lifecycle"] = _sum_known(successful_validation_work)
+    work["successful_current_validation_lifecycle"] = _sum_known(
+        successful_validation_work
+    )
     return {
-        "schema_version": 1, "launches": len(executed), "reuse_decisions": len(reused),
-        "child_commands": len(commands), "duplicate_records": duplicates,
+        "schema_version": 1,
+        "launches": len(executed),
+        "reuse_decisions": len(reused),
+        "requests": len(requests),
+        "request_outcomes": dict(
+            sorted(Counter(row["outcome"] for row in requests).items())
+        ),
+        "child_commands": len(commands),
+        "duplicate_records": duplicates,
         "outcomes": dict(sorted(Counter(row["outcome"] for row in executed).items())),
-        "work": work, "proof_freshness": dict(sorted(proof_states.items())),
+        "work": work,
+        "proof_freshness": dict(sorted(proof_states.items())),
         "launches_producing_current_proof": new_current_proof,
         "reasons": dict(sorted(reasons.items())),
-        "justified_reruns": sum(reasons[k] for k in (
-            "inputs_changed", "previous_stale", "previous_failed",
-            "previous_interrupted", "dependency_invalidated",
-        )),
+        "justified_reruns": sum(
+            reasons[k]
+            for k in (
+                "inputs_changed",
+                "previous_stale",
+                "previous_failed",
+                "previous_interrupted",
+                "dependency_invalidated",
+            )
+        ),
         "redundant_reruns": reasons["redundant"],
-        "classification": [{"run_id": row["run_id"], "reason": reason} for row, reason in classified],
+        "classification": [
+            {"run_id": row["run_id"], "reason": reason} for row, reason in classified
+        ],
         "repeat_observations": repeat_observations,
+        "wall_clock_status": {row["run_id"]: _wall_clock_status(row) for row in rows},
         "records": rows,
         "limitations": [
             "Ledger producer assertions are observations, not permission to reuse or skip checks.",
+            "Wall-clock regressions preserve monotonic work but cannot establish cross-run chronology or redundancy.",
             "Current means at the explicit freshness basis, not automatically at report time.",
             "Child command wall sums are work, not elapsed critical-path time.",
             "Successful current-validation lifecycle is summed work, not time to proof; use turn timing for end-to-end comparisons including failures, repair/model gaps, requests, tool calls and correctness.",
@@ -472,13 +616,25 @@ def _packets(value):
         if isinstance(kind, str) and kind in {KIND, REF_KIND}:
             yield value
         else:
-            for key in ("output", "stdout", "stderr", "text", "content", "result", "value"):
+            for key in (
+                "output",
+                "stdout",
+                "stderr",
+                "text",
+                "content",
+                "result",
+                "value",
+            ):
                 if key in value:
                     yield from _packets(value[key])
 
 
 def read_inputs(paths):
-    from scripts.benchmark_scripts.rollout_snapshot import hydrate_rollout_record, read_rollout_snapshot
+    from scripts.benchmark_scripts.rollout_snapshot import (
+        hydrate_rollout_record,
+        read_rollout_snapshot,
+    )
+
     records, coverage, unresolved = [], [], []
     candidates = set()
     for path in paths:
@@ -497,63 +653,141 @@ def read_inputs(paths):
                 for line, row, error, _ in snapshot.decoded_lines():
                     count += 1
                     if error:
-                        unresolved.append({"path": str(path), "line": line, "error": error})
+                        unresolved.append(
+                            {"path": str(path), "line": line, "error": error}
+                        )
                         continue
                     try:
                         row = hydrate_rollout_record(row, path)
                         if not isinstance(row, dict):
                             raise ValueError("rollout record must be an object")
                     except (OSError, ValueError, TypeError, KeyError) as error:
-                        unresolved.append({"path": str(path), "line": line, "error": str(error)})
+                        unresolved.append(
+                            {"path": str(path), "line": line, "error": str(error)}
+                        )
                         continue
                     if row.get("kind") == KIND:
                         records.append(row)
                     elif row.get("type") == "response_item":
                         payload = row.get("payload", {})
                         if not isinstance(payload, dict):
-                            unresolved.append({"path": str(path), "line": line,
-                                               "error": "response_item payload must be an object"})
+                            unresolved.append(
+                                {
+                                    "path": str(path),
+                                    "line": line,
+                                    "error": "response_item payload must be an object",
+                                }
+                            )
                             continue
-                        if payload.get("type") in ("function_call_output", "custom_tool_call_output"):
+                        if payload.get("type") in (
+                            "function_call_output",
+                            "custom_tool_call_output",
+                        ):
                             for packet in _packets(payload.get("output")):
                                 if packet["kind"] == KIND:
                                     records.append(packet)
                                 else:
                                     try:
                                         data = Path(packet["path"]).read_bytes()
-                                        if len(data) != packet["bytes"] or hashlib.sha256(data).hexdigest() != packet["sha256"]:
-                                            raise ValueError("validation ledger reference hash/size mismatch")
+                                        if (
+                                            len(data) != packet["bytes"]
+                                            or hashlib.sha256(data).hexdigest()
+                                            != packet["sha256"]
+                                        ):
+                                            raise ValueError(
+                                                "validation ledger reference hash/size mismatch"
+                                            )
                                         record = json.loads(data)
                                         _validate(record)
                                         if record.get("run_id") != packet["run_id"]:
-                                            raise ValueError("validation ledger reference run_id mismatch")
+                                            raise ValueError(
+                                                "validation ledger reference run_id mismatch"
+                                            )
                                         records.append(record)
-                                    except (OSError, ValueError, TypeError, KeyError) as error:
-                                        unresolved.append({"path": str(path), "line": line, "error": str(error)})
-                coverage.append({"path": str(path), "records": count, "bytes": snapshot.byte_length, "sha256": snapshot.sha256})
+                                    except (
+                                        OSError,
+                                        ValueError,
+                                        TypeError,
+                                        KeyError,
+                                    ) as error:
+                                        unresolved.append(
+                                            {
+                                                "path": str(path),
+                                                "line": line,
+                                                "error": str(error),
+                                            }
+                                        )
+                coverage.append(
+                    {
+                        "path": str(path),
+                        "records": count,
+                        "bytes": snapshot.byte_length,
+                        "sha256": snapshot.sha256,
+                    }
+                )
         else:
             data = path.read_bytes()
             records.append(json.loads(data))
-            coverage.append({"path": str(path), "records": 1, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+            coverage.append(
+                {
+                    "path": str(path),
+                    "records": 1,
+                    "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
     return records, coverage, unresolved
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("paths", type=Path, nargs="*", help="Ledger files/directories or rollout JSONL snapshots")
-    parser.add_argument("--describe", action="store_true", help="Describe metrics and their evidence requirements")
-    parser.add_argument("--json", action="store_true", help="Emit the complete machine-readable report")
-    parser.add_argument("--maintain", type=Path, help="Preview lifecycle reconciliation in one test-runner-logs directory")
-    parser.add_argument("--apply", action="store_true", help="Apply --maintain changes (default is dry-run)")
-    parser.add_argument("--prune-before", help="With --maintain, prune only successful owned ledgers finished before this timezone-aware ISO timestamp; invalidates references to those explicitly expired ledgers")
-    parser.add_argument("--keep", type=int, default=100, help="With --maintain, always retain this many newest ledgers (default 100)")
+    parser.add_argument(
+        "paths",
+        type=Path,
+        nargs="*",
+        help="Ledger files/directories or rollout JSONL snapshots",
+    )
+    parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="Describe metrics and their evidence requirements",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit the complete machine-readable report"
+    )
+    parser.add_argument(
+        "--maintain",
+        type=Path,
+        help="Preview lifecycle reconciliation in one test-runner-logs directory",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply --maintain changes (default is dry-run)",
+    )
+    parser.add_argument(
+        "--prune-before",
+        help="With --maintain, prune only successful owned ledgers finished before this timezone-aware ISO timestamp; invalidates references to those explicitly expired ledgers",
+    )
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=100,
+        help="With --maintain, always retain this many newest ledgers (default 100)",
+    )
     args = parser.parse_args(argv)
     if args.maintain is not None:
         if args.paths or args.describe:
-            parser.error("--maintain cannot be combined with report inputs or --describe")
+            parser.error(
+                "--maintain cannot be combined with report inputs or --describe"
+            )
         try:
-            report = maintain_ledgers(args.maintain, apply=args.apply,
-                                      prune_before=args.prune_before, keep=args.keep)
+            report = maintain_ledgers(
+                args.maintain,
+                apply=args.apply,
+                prune_before=args.prune_before,
+                keep=args.keep,
+            )
         except (OSError, ValueError) as error:
             parser.error(str(error))
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -561,17 +795,45 @@ def main(argv=None):
     if args.apply or args.prune_before is not None or args.keep != 100:
         parser.error("maintenance options require --maintain")
     if args.describe:
-        print(json.dumps({
-            "kind": KIND, "inputs": "explicit ledgers, ledger directories, or rollout JSONL(.zst)",
-            "producer": "rust_test_runner CLI run-target/run-gate/check-gates",
-            "identity": ["run_id", "command_digest", "input_digest", "prerequisite_ids"],
-            "work": ["admission", "preparation", "provenance", "reconciliation",
-                     "command_wall", "reported_build", "reported_test", "cleanup", "process_wait"],
-            "proof": ["obligations", "completed_tests", "covered_paths", "coverage", "status", "freshness", "reused_from_run_id"],
-            "reasons": REASONS,
-            "unknowns": "null; freshness/coverage and repeat reasons require independent evidence",
-            "compatibility": "no validation scheduling, replay, or runtime proof policy changes",
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "kind": KIND,
+                    "inputs": "explicit ledgers, ledger directories, or rollout JSONL(.zst)",
+                    "producer": "rust_test_runner CLI run-target/run-gate/check-gates",
+                    "identity": [
+                        "run_id",
+                        "command_digest",
+                        "input_digest",
+                        "prerequisite_ids",
+                    ],
+                    "work": [
+                        "admission",
+                        "preparation",
+                        "provenance",
+                        "reconciliation",
+                        "command_wall",
+                        "reported_build",
+                        "reported_test",
+                        "cleanup",
+                        "process_wait",
+                    ],
+                    "proof": [
+                        "obligations",
+                        "completed_tests",
+                        "covered_paths",
+                        "coverage",
+                        "status",
+                        "freshness",
+                        "reused_from_run_id",
+                    ],
+                    "reasons": REASONS,
+                    "unknowns": "null; freshness/coverage and repeat reasons require independent evidence",
+                    "compatibility": "no validation scheduling, replay, or runtime proof policy changes",
+                },
+                indent=2,
+            )
+        )
         return 0
     if not args.paths:
         parser.error("provide ledger/rollout paths or --describe")
@@ -586,13 +848,23 @@ def main(argv=None):
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
-        print(f"{report['launches']} launches; {report['child_commands']} child commands; {report['reuse_decisions']} reuse decisions")
+        print(
+            f"{report['launches']} launches; {report['child_commands']} child commands; {report['reuse_decisions']} reuse decisions"
+        )
         for field, metric in report["work"].items():
-            seconds = "unknown" if metric["seconds"] is None else f"{metric['seconds']:.3f}s"
-            print(f"{field}: {seconds} ({metric['measured']} measured, {metric['unknown']} unknown)")
-        print(f"Current proof: {report['launches_producing_current_proof']}; justified reruns: {report['justified_reruns']}; redundant: {report['redundant_reruns']}")
+            seconds = (
+                "unknown" if metric["seconds"] is None else f"{metric['seconds']:.3f}s"
+            )
+            print(
+                f"{field}: {seconds} ({metric['measured']} measured, {metric['unknown']} unknown)"
+            )
+        print(
+            f"Current proof: {report['launches_producing_current_proof']}; justified reruns: {report['justified_reruns']}; redundant: {report['redundant_reruns']}"
+        )
         print("Reasons: " + json.dumps(report["reasons"], sort_keys=True))
-        print(f"Coverage: {len(coverage)} inputs; {len(unresolved)} unresolved references/records")
+        print(
+            f"Coverage: {len(coverage)} inputs; {len(unresolved)} unresolved references/records"
+        )
         for limit in report["limitations"]:
             print(f"- {limit}")
     return 1 if unresolved else 0
@@ -600,4 +872,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

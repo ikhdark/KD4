@@ -240,9 +240,13 @@ fn write_file_size_error() -> JSONRPCErrorError {
 }
 
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
-    if err.kind() == io::ErrorKind::InvalidInput {
+    let mut error = if err.kind() == io::ErrorKind::InvalidInput {
         invalid_request(err.to_string())
     } else {
         internal_error(err.to_string())
+    };
+    if let Some(copy) = codex_file_system::CopyFailure::from_io_error(&err) {
+        error.data = Some(serde_json::json!({"copy": copy}));
     }
+    error
 }

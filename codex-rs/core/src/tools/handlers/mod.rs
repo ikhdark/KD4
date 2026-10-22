@@ -11,21 +11,15 @@ mod command_shape_tests;
 #[cfg(test)]
 mod command_windows_corpus_tests;
 mod current_time;
-#[cfg(test)]
-mod full_suite_dispatch_tests;
-mod get_context_remaining;
-mod get_context_remaining_spec;
-#[cfg(test)]
-mod managed_cargo_lane_dispatch_tests;
-mod new_context_window;
-mod new_context_window_spec;
-pub(crate) use get_context_remaining::GetContextRemainingHandler;
-pub(crate) use new_context_window::NewContextWindowHandler;
 mod dynamic;
 pub(crate) mod extension_tools;
+#[cfg(test)]
+mod full_suite_dispatch_tests;
 mod list_available_plugins_to_install;
 pub(crate) mod list_available_plugins_to_install_spec;
 mod list_files;
+#[cfg(test)]
+mod managed_cargo_lane_dispatch_tests;
 pub(crate) mod mcp;
 mod mcp_resource;
 pub(crate) mod mcp_resource_spec;
@@ -374,8 +368,7 @@ pub(crate) fn resolve_tool_environment<'a>(
     )
 }
 
-/// Resolve the same selected environment without forcing a model round trip
-/// while its shared startup future is still running.
+/// Read-only tools may wait for the captured environment to finish startup.
 pub(crate) async fn wait_for_tool_environment(
     environments: &TurnEnvironmentSnapshot,
     environment_id: Option<&str>,
@@ -389,7 +382,13 @@ pub(crate) async fn wait_for_tool_environment(
         None => environments.primary(),
     };
     if let Some(ready) = ready {
-        return Ok(Some(ready.clone()));
+        let mut ready = ready.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(FunctionCallError::RespondToModel("environment wait cancelled".into())),
+            result = ready.refresh_runtime() => result.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?,
+        }
+        return Ok(Some(ready));
     }
     let starting = match environment_id {
         Some(id) => environments
@@ -404,14 +403,44 @@ pub(crate) async fn wait_for_tool_environment(
     let Some(starting) = starting else {
         return resolve_tool_environment(environments, environment_id).map(Option::<&_>::cloned);
     };
-    tokio::select! {
+    let mut ready = tokio::select! {
         biased;
         _ = cancellation.cancelled() => Err(FunctionCallError::RespondToModel(
             "Cancelled while waiting for execution environment startup; no operation was started.".into())),
-        result = starting.wait_until_ready() => result.map(Some).map_err(|error|
+        result = starting.wait_until_ready() => result.map_err(|error|
             FunctionCallError::RespondToModel(format!(
                 "environment `{}` failed to start: {error}", starting.selection.environment_id))),
+    }?;
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(FunctionCallError::RespondToModel("environment wait cancelled".into())),
+        result = ready.refresh_runtime() => result.map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?,
     }
+    Ok(Some(ready))
+}
+
+/// Startup cannot retroactively authorize an action sampled without this scope's
+/// instructions. Share the existing cancellable startup wait, but never execute
+/// that action; the next sampling refresh discovers the newly ready scope.
+pub(crate) async fn wait_for_observed_tool_environment(
+    environments: &TurnEnvironmentSnapshot,
+    environment_id: Option<&str>,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<Option<TurnEnvironment>, FunctionCallError> {
+    let ready = wait_for_tool_environment(environments, environment_id, cancellation).await?;
+    if let Some(environment) = &ready
+        && !environments.turn_environments.iter().any(|sampled| {
+            sampled.environment_id == environment.environment_id
+                && sampled.cwd() == environment.cwd()
+                && sampled.owner_id() == environment.owner_id()
+        })
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "Environment `{}` became ready after this action was sampled. No operation was started. Its applicable AGENTS.md instructions were not observed for that sampling step. Reconsider the action after the next instruction refresh; do not replay it automatically.",
+            environment.environment_id,
+        )));
+    }
+    Ok(ready)
 }
 
 /// Whether a fresh inline sandbox override may reach its approval flow.

@@ -538,12 +538,12 @@ fn evidence_digest_invalidates_for_alias_coverage_even_without_novel_bytes() {
         "sha256": "hash", "ranges": [[0, 4]], "values": []
     }});
     assert_eq!(
-        control.observe_delivered_coverage(&evidence, None),
+        control.observe_delivered_coverage(&evidence, None, 0),
         Some(true)
     );
     let before = control.baselines(0);
     assert_eq!(
-        control.observe_delivered_coverage(&evidence, Some("artifact")),
+        control.observe_delivered_coverage(&evidence, Some("artifact"), 0),
         Some(false)
     );
     assert!(control.evidence_fingerprint.get().is_none());
@@ -553,7 +553,7 @@ fn evidence_digest_invalidates_for_alias_coverage_even_without_novel_bytes() {
         "sha256": "hash", "ranges": [[4, 8]], "values": []
     }});
     assert_eq!(
-        control.observe_delivered_coverage(&recovery, None),
+        control.observe_delivered_coverage(&recovery, None, 0),
         Some(true)
     );
     assert!(control.evidence_fingerprint.get().is_none());
@@ -565,7 +565,7 @@ fn evidence_digest_invalidates_for_alias_coverage_even_without_novel_bytes() {
         "sha256": "hash", "ranges": [[0, 8]], "values": []
     }});
     assert_eq!(
-        control.observe_delivered_coverage(&covered, None),
+        control.observe_delivered_coverage(&covered, None, 0),
         Some(false)
     );
 }

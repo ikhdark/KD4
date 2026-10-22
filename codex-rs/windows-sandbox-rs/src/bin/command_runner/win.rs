@@ -15,10 +15,13 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_utils_pty::JobObject;
 use codex_windows_sandbox::ConsoleMode;
+use codex_windows_sandbox::EmptyPayload;
 use codex_windows_sandbox::ErrorPayload;
 use codex_windows_sandbox::ErrorStage;
 use codex_windows_sandbox::ExitPayload;
 use codex_windows_sandbox::FramedMessage;
+use codex_windows_sandbox::IO_CHUNK_BYTES;
+use codex_windows_sandbox::IO_WINDOW_CHUNKS;
 use codex_windows_sandbox::IPC_PROTOCOL_VERSION;
 use codex_windows_sandbox::LocalSid;
 use codex_windows_sandbox::Message;
@@ -54,7 +57,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex as StdMutex;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
@@ -430,29 +437,100 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
 }
 
 /// Stream stdout/stderr from the child into Output frames.
+///
+/// Critical sections only adjust bounded counters and the stop flag and cannot
+/// panic, so a poisoned lock still guards a consistent window.
+#[derive(Default)]
+struct OutputWindow {
+    state: StdMutex<([usize; 2], bool)>,
+    changed: Condvar,
+}
+
+impl OutputWindow {
+    fn take(&self, stream: OutputStream) -> bool {
+        let index = usize::from(stream == OutputStream::Stderr);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.0[index] == IO_WINDOW_CHUNKS && !state.1 {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        if state.1 {
+            return false;
+        }
+        state.0[index] += 1;
+        true
+    }
+    fn acknowledge(&self, stream: OutputStream, chunks: usize) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let index = usize::from(stream == OutputStream::Stderr);
+        if chunks == 0 || chunks > state.0[index] {
+            return false;
+        }
+        state.0[index] -= chunks;
+        self.changed.notify_all();
+        true
+    }
+    fn stop(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct RunnerFlow {
+    writer: Arc<StdMutex<File>>,
+    output: Arc<OutputWindow>,
+}
+
+impl RunnerFlow {
+    fn send(&self, message: Message) -> bool {
+        self.writer.lock().ok().is_some_and(|mut writer| {
+            write_frame(
+                &mut *writer,
+                &FramedMessage {
+                    version: IPC_PROTOCOL_VERSION,
+                    message,
+                },
+            )
+            .is_ok()
+        })
+    }
+}
+
 fn spawn_output_reader(
     writer: Arc<StdMutex<File>>,
     handle: HANDLE,
     stream: OutputStream,
     log_dir: Option<PathBuf>,
+    window: Arc<OutputWindow>,
 ) -> std::thread::JoinHandle<()> {
     read_handle_loop(handle, move |chunk| {
-        let msg = FramedMessage {
-            version: IPC_PROTOCOL_VERSION,
-            message: Message::Output {
-                payload: OutputPayload {
-                    data_b64: encode_bytes(chunk),
-                    stream,
+        for chunk in chunk.chunks(IO_CHUNK_BYTES) {
+            // Never hold the shared pipe mutex while waiting for output admission:
+            // actual stdin write receipts use that pipe even with blocked stdout.
+            if !window.take(stream) {
+                return;
+            }
+            let msg = FramedMessage {
+                version: IPC_PROTOCOL_VERSION,
+                message: Message::Output {
+                    payload: OutputPayload {
+                        data_b64: encode_bytes(chunk),
+                        stream,
+                    },
                 },
-            },
-        };
-        if let Ok(mut guard) = writer.lock()
-            && let Err(err) = write_frame(&mut *guard, &msg)
-        {
-            log_note(
-                &format!("runner output write failed: {err}"),
-                log_dir.as_deref(),
-            );
+            };
+            if let Ok(mut guard) = writer.lock()
+                && let Err(err) = write_frame(&mut *guard, &msg)
+            {
+                window.stop();
+                log_note(
+                    &format!("runner output write failed: {err}"),
+                    log_dir.as_deref(),
+                );
+            }
         }
     })
 }
@@ -543,9 +621,10 @@ fn spawn_input_loop(
     job: Arc<JobObject>,
     process: OwnedWinHandle,
     log_dir: Option<PathBuf>,
+    flow: Option<RunnerFlow>,
 ) -> std::thread::JoinHandle<()> {
     let termination_log_dir = log_dir.clone();
-    spawn_input_loop_with_terminator(reader, stdin_handle, hpc_handle, log_dir, move || {
+    spawn_input_loop_with_terminator(reader, stdin_handle, hpc_handle, log_dir, flow, move || {
         terminate_job_or_process(&job, process.raw(), termination_log_dir.as_deref())
     })
 }
@@ -555,12 +634,21 @@ fn spawn_input_loop_with_terminator<F>(
     stdin_handle: Option<HANDLE>,
     hpc_handle: Arc<StdMutex<Option<isize>>>,
     log_dir: Option<PathBuf>,
+    flow: Option<RunnerFlow>,
     terminate_process_tree: F,
 ) -> std::thread::JoinHandle<()>
 where
     F: Fn() + Send + 'static,
 {
-    let mut stdin_tx = stdin_handle.map(|handle| spawn_stdin_writer(handle, log_dir.clone()));
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    let mut stdin_tx = stdin_handle.map(|handle| {
+        spawn_stdin_writer(
+            handle,
+            log_dir.clone(),
+            flow.clone(),
+            Arc::clone(&outstanding),
+        )
+    });
     std::thread::spawn(move || {
         loop {
             let msg = match read_frame(&mut reader) {
@@ -599,15 +687,47 @@ where
                             break;
                         }
                     };
-                    if let Some(tx) = stdin_tx.as_ref()
-                        && tx.send(Some(bytes)).is_err()
+                    if bytes.len() > IO_CHUNK_BYTES
+                        || outstanding.load(Ordering::Acquire) >= IO_WINDOW_CHUNKS
                     {
-                        stdin_tx = None;
+                        terminate_process_tree();
+                        log_note(
+                            "runner stdin window exceeded; terminating process tree",
+                            log_dir.as_deref(),
+                        );
+                        break;
+                    }
+                    if let Some(tx) = stdin_tx.as_ref() {
+                        outstanding.fetch_add(1, Ordering::AcqRel);
+                        match tx.try_send(Some(bytes)) {
+                            Ok(()) => {}
+                            // The writer stopped after the child closed its stdin and has
+                            // already reported StdinClosed; input sent before the parent
+                            // observed that is dropped like any other post-close input.
+                            Err(mpsc::TrySendError::Disconnected(_)) => stdin_tx = None,
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                terminate_process_tree();
+                                break;
+                            }
+                        }
+                    } else if let Some(flow) = &flow {
+                        let _ = flow.send(Message::StdinClosed {
+                            payload: EmptyPayload::default(),
+                        });
                     }
                 }
                 Message::CloseStdin { .. } => {
                     if let Some(tx) = stdin_tx.take() {
-                        let _ = tx.send(None);
+                        let _ = tx.try_send(None);
+                    }
+                }
+                Message::OutputAck { payload } => {
+                    if !flow
+                        .as_ref()
+                        .is_some_and(|flow| flow.output.acknowledge(payload.stream, payload.chunks))
+                    {
+                        terminate_process_tree();
+                        break;
                     }
                 }
                 Message::Resize {
@@ -654,11 +774,21 @@ where
                 }
             }
         }
+        if let Some(flow) = flow {
+            flow.output.stop();
+        }
     })
 }
 
-fn spawn_stdin_writer(handle: HANDLE, log_dir: Option<PathBuf>) -> mpsc::Sender<Option<Vec<u8>>> {
-    let (stdin_tx, stdin_rx) = mpsc::channel::<Option<Vec<u8>>>();
+fn spawn_stdin_writer(
+    handle: HANDLE,
+    log_dir: Option<PathBuf>,
+    flow: Option<RunnerFlow>,
+    outstanding: Arc<AtomicUsize>,
+) -> mpsc::SyncSender<Option<Vec<u8>>> {
+    // One reserved EOF slot; the parser never blocks on this queue. The byte
+    // window includes the chunk currently inside synchronous WriteFile.
+    let (stdin_tx, stdin_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(IO_WINDOW_CHUNKS + 1);
     let handle_addr = handle as usize;
     std::thread::spawn(move || {
         let handle = handle_addr as HANDLE;
@@ -699,6 +829,19 @@ fn spawn_stdin_writer(handle: HANDLE, log_dir: Option<PathBuf>) -> mpsc::Sender<
                 }
                 offset += written as usize;
             }
+            outstanding.fetch_sub(1, Ordering::AcqRel);
+            if let Some(flow) = &flow
+                && !flow.send(Message::StdinAck {
+                    payload: EmptyPayload::default(),
+                })
+            {
+                break;
+            }
+        }
+        if let Some(flow) = &flow {
+            let _ = flow.send(Message::StdinClosed {
+                payload: EmptyPayload::default(),
+            });
         }
         // SAFETY: Ownership of the stdin write handle was transferred to this worker, which closes
         // it exactly once after its write loop ends.
@@ -801,11 +944,13 @@ pub fn main() -> Result<()> {
         return Err(err);
     }
     let log_dir_owned = log_dir.map(Path::to_path_buf);
+    let output_window = Arc::new(OutputWindow::default());
     let out_thread = spawn_output_reader(
         Arc::clone(&pipe_write),
         stdout_handle,
         OutputStream::Stdout,
         log_dir_owned.clone(),
+        Arc::clone(&output_window),
     );
     let err_thread = if stderr_handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
         Some(spawn_output_reader(
@@ -813,6 +958,7 @@ pub fn main() -> Result<()> {
             stderr_handle,
             OutputStream::Stderr,
             log_dir_owned.clone(),
+            Arc::clone(&output_window),
         ))
     } else {
         None
@@ -825,6 +971,10 @@ pub fn main() -> Result<()> {
         Arc::clone(&job),
         control_process_handle,
         log_dir_owned,
+        Some(RunnerFlow {
+            writer: Arc::clone(&pipe_write),
+            output: output_window,
+        }),
     );
 
     let timeout = windows_wait_timeout(req.timeout_ms);
@@ -998,7 +1148,7 @@ mod tests {
                 version: IPC_PROTOCOL_VERSION,
                 message: Message::Stdin {
                     payload: StdinPayload {
-                        data_b64: encode_bytes(&vec![b'x'; 1024 * 1024]),
+                        data_b64: encode_bytes(&vec![b'x'; super::IO_CHUNK_BYTES]),
                     },
                 },
             },
@@ -1022,6 +1172,7 @@ mod tests {
             Some(stdin_write),
             Arc::new(Mutex::new(None)),
             None,
+            None,
             move || {
                 let _ = terminated_tx.send(());
             },
@@ -1032,6 +1183,87 @@ mod tests {
             .expect("control EOF must remain responsive while child stdin is blocked");
         input_thread.join().expect("join runner input loop");
         drop(stdin_read);
+        Ok(())
+    }
+
+    #[test]
+    fn late_stdin_after_child_closed_input_is_not_fatal() -> anyhow::Result<()> {
+        let stdin_frame = || FramedMessage {
+            version: IPC_PROTOCOL_VERSION,
+            message: Message::Stdin {
+                payload: StdinPayload {
+                    data_b64: encode_bytes(b"x"),
+                },
+            },
+        };
+        let mut control_read: HANDLE = std::ptr::null_mut();
+        let mut control_write: HANDLE = std::ptr::null_mut();
+        // SAFETY: Both output pointers refer to writable HANDLE slots; default security and buffer
+        // size are requested. Failure is checked before using either returned pipe end.
+        if unsafe { CreatePipe(&mut control_read, &mut control_write, ptr::null_mut(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: CreatePipe succeeded; each File takes sole ownership of one pipe end.
+        let reader = unsafe { File::from_raw_handle(control_read as _) };
+        // SAFETY: As above, for the unshared write end.
+        let mut control = unsafe { File::from_raw_handle(control_write as _) };
+        let mut stdin_read: HANDLE = std::ptr::null_mut();
+        let mut stdin_write: HANDLE = std::ptr::null_mut();
+        // SAFETY: As above; failure is checked before using either returned pipe end.
+        if unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, ptr::null_mut(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // The child has closed its stdin, so every runner write to it fails.
+        drop(OwnedWinHandle::new(stdin_read));
+        let temp_dir = tempfile::TempDir::new()?;
+        let receipts_path = temp_dir.path().join("receipts");
+        let flow = super::RunnerFlow {
+            writer: Arc::new(Mutex::new(File::create(&receipts_path)?)),
+            output: Arc::new(super::OutputWindow::default()),
+        };
+        let (terminated_tx, terminated_rx) = mpsc::channel();
+        let input_thread = spawn_input_loop_with_terminator(
+            reader,
+            Some(stdin_write),
+            Arc::new(Mutex::new(None)),
+            /*log_dir*/ None,
+            Some(flow),
+            move || {
+                let _ = terminated_tx.send(());
+            },
+        );
+        let stdin_closed_reported = || {
+            let bytes = std::fs::read(&receipts_path).unwrap_or_default();
+            let mut remaining = bytes.as_slice();
+            std::iter::from_fn(|| super::read_frame(&mut remaining).ok().flatten())
+                .any(|frame| matches!(frame.message, Message::StdinClosed { .. }))
+        };
+
+        write_frame(&mut control, &stdin_frame())?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stdin_closed_reported() {
+            assert!(
+                Instant::now() < deadline,
+                "runner did not report closed child stdin"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        // Let the stdin writer finish exiting, then deliver input the parent sent
+        // before it observed StdinClosed.
+        std::thread::sleep(Duration::from_millis(250));
+        write_frame(&mut control, &stdin_frame())?;
+        assert!(
+            terminated_rx
+                .recv_timeout(Duration::from_millis(500))
+                .is_err(),
+            "late stdin after the child closed its input terminated the process tree"
+        );
+
+        drop(control);
+        terminated_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("control EOF still terminates the process tree");
+        input_thread.join().expect("join runner input loop");
         Ok(())
     }
 
@@ -1112,6 +1344,7 @@ mod tests {
             Arc::clone(&job),
             OwnedWinHandle::duplicate(root.as_raw_handle() as HANDLE)?,
             /*log_dir*/ None,
+            /*flow*/ None,
         );
 
         // Close the original `Child` handle before delivering EOF. The input

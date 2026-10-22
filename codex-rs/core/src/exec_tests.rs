@@ -21,6 +21,62 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::ReadBuf;
 use tokio::time::timeout;
 
+#[tokio::test]
+async fn audit132_legacy_reader_retains_original_bytes_before_display_reduction() {
+    use crate::tools::command_output_artifact::capture::capture_legacy_output;
+    let home = tempfile::tempdir().unwrap();
+    for (length, gap) in [(4, false), (2 * 1024 * 1024, false), (128, true)] {
+        let mut original = vec![b'a'; length];
+        let middle = length / 2;
+        original[middle..middle + 2].copy_from_slice(&[0xff, 0x80]);
+        let (display, captured) = capture_legacy_output(home.path(), "legacy-original", async {
+            let aggregate = Arc::new(Mutex::new(OutputCapture::aggregate(Some(
+                EXEC_OUTPUT_MAX_BYTES,
+            ))));
+            read_output_into_capture(
+                ChunkedReader::new(original.chunks(8191).map(<[u8]>::to_vec)),
+                None,
+                false,
+                Arc::new(Mutex::new(OutputCapture::new(Some(EXEC_OUTPUT_MAX_BYTES)))),
+                Some(Arc::clone(&aggregate)),
+                Arc::new(OutputDeltaLimiter::default()),
+            )
+            .await
+            .unwrap();
+            if gap {
+                aggregate.lock().unwrap().mark_drain_timeout();
+            }
+            aggregate.lock().unwrap().snapshot()
+        })
+        .await;
+        let canonical = captured.canonical.expect("original capture");
+        assert_eq!(canonical.bytes, original);
+        assert_eq!(canonical.complete, !gap);
+        if length > EXEC_OUTPUT_MAX_BYTES {
+            assert!(display.truncated);
+            assert!(captured.artifact.capture_finalized_complete());
+        }
+        assert_ne!(display.from_utf8_lossy().text.as_bytes(), original);
+    }
+}
+
+#[tokio::test]
+async fn audit132_capture_failure_and_unattached_routes_never_claim_complete_bytes() {
+    use crate::tools::command_output_artifact::capture::capture_legacy_output;
+    let home = tempfile::tempdir().unwrap();
+    let (_, unattached) = capture_legacy_output(home.path(), "unattached", async {}).await;
+    assert!(unattached.canonical.is_none());
+    let blocked = home.path().join("not-a-directory");
+    std::fs::write(&blocked, "occupied").unwrap();
+    let (_, failed) = capture_legacy_output(&blocked, "failed", async {
+        let mut aggregate = OutputCapture::aggregate(Some(10));
+        aggregate.append_process_bytes(&vec![b'x'; 100_000]);
+    })
+    .await;
+    assert!(failed.canonical.is_none());
+    assert!(!failed.artifact.capture_finalized_complete());
+}
+
 #[test]
 fn expiration_timeout_milliseconds_preserve_duration_and_saturate_overflow() {
     for (duration, expected_ms) in [
@@ -324,6 +380,7 @@ async fn read_output_notifies_the_command_progress_watchdog() {
             call_id: "call".to_string(),
             tx_event,
             progress: Some(progress.clone()),
+            delivery_recovery: None,
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
@@ -342,11 +399,14 @@ async fn read_output_notifies_the_command_progress_watchdog() {
 #[tokio::test]
 async fn read_output_drains_and_retains_pipe_when_live_event_queue_is_full() {
     let (tx_event, rx_event) = async_channel::bounded(1);
+    // Outlives the stream, so only an explicit close can close the channel.
+    let session_events = tx_event.clone();
     let stream = StdoutStream {
         sub_id: "sub".to_string(),
         call_id: "call".to_string(),
         tx_event,
         progress: None,
+        delivery_recovery: None,
     };
     stream
         .tx_event
@@ -388,6 +448,10 @@ async fn read_output_drains_and_retains_pipe_when_live_event_queue_is_full() {
         1,
         "full queue should remain best-effort only"
     );
+    assert!(
+        !session_events.is_closed(),
+        "a dropped live delta must not close the session event channel"
+    );
 }
 
 #[tokio::test]
@@ -409,6 +473,7 @@ async fn read_output_preserves_utf8_codepoints_split_across_reads() {
             call_id: "call".to_string(),
             tx_event,
             progress: None,
+            delivery_recovery: None,
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
@@ -449,6 +514,7 @@ async fn read_output_makes_progress_when_pending_exceeds_read_chunk_size() {
             call_id: "call".to_string(),
             tx_event,
             progress: None,
+            delivery_recovery: None,
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,
@@ -479,6 +545,7 @@ async fn read_output_flushes_terminal_incomplete_utf8_once() {
             call_id: "call".to_string(),
             tx_event,
             progress: None,
+            delivery_recovery: None,
         }),
         /*is_stderr*/ false,
         /*max_bytes*/ None,

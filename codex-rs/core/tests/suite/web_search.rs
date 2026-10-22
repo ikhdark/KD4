@@ -64,15 +64,19 @@ async fn web_search_mode_updates_between_turns_with_permission_profile() {
     require_network!();
 
     let server = start_mock_server().await;
+    // Each turn delivers an answer; an empty response would add the turn's
+    // missing-answer repair request and consume the second turn's response.
     let resp_mock = responses::mount_sse_sequence(
         &server,
         vec![
             responses::sse(vec![
                 responses::ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "done"),
                 responses::ev_completed("resp-1"),
             ]),
             responses::sse(vec![
                 responses::ev_response_created("resp-2"),
+                responses::ev_assistant_message("msg-2", "done"),
                 responses::ev_completed("resp-2"),
             ]),
         ],

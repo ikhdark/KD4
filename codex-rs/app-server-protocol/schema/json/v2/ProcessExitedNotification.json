@@ -1,5 +1,27 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProcessOutputCaptureState": {
+      "description": "Per-stream capture facts, independent of the root process exit status. Complete capture requires `reachedEof` and neither limit flag. A closed producer without EOF can indicate read failure or forced reader shutdown.",
+      "properties": {
+        "capReached": {
+          "type": "boolean"
+        },
+        "drainTimedOut": {
+          "type": "boolean"
+        },
+        "reachedEof": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "capReached",
+        "drainTimedOut",
+        "reachedEof"
+      ],
+      "type": "object"
+    }
+  },
   "description": "Final process exit notification for `process/spawn`.",
   "properties": {
     "exitCode": {
@@ -15,17 +37,51 @@
       "description": "Buffered stderr capture.\n\nEmpty when stderr was streamed via `process/outputDelta`.",
       "type": "string"
     },
+    "stderrBase64": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "stderrCapReached": {
       "description": "Whether stderr reached `outputBytesCap`.\n\nIn streaming mode, stderr is empty and cap state is also reported on the final stderr `process/outputDelta` notification.",
       "type": "boolean"
+    },
+    "stderrCapture": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProcessOutputCaptureState"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "stdout": {
       "description": "Buffered stdout capture.\n\nEmpty when stdout was streamed via `process/outputDelta`.",
       "type": "string"
     },
+    "stdoutBase64": {
+      "description": "Exact undelivered stdout suffix, appended after streamed raw deltas. When present use these bytes, not the lossy legacy text projection.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "stdoutCapReached": {
       "description": "Whether stdout reached `outputBytesCap`.\n\nIn streaming mode, stdout is empty and cap state is also reported on the final stdout `process/outputDelta` notification.",
       "type": "boolean"
+    },
+    "stdoutCapture": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProcessOutputCaptureState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Root exit does not establish output EOF; post-exit drain is bounded independently of the execution timeout and byte cap."
     }
   },
   "required": [

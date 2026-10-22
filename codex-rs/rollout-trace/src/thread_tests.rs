@@ -266,6 +266,7 @@ fn terminal_runtime_payloads_use_terminal_runtime_payload_kind() -> anyhow::Resu
     let thread_trace =
         ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(thread_id))?;
     let begin = EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+        environment: None,
         call_id: "call-terminal".to_string(),
         process_id: Some("process-1".to_string()),
         turn_id: "turn-1".to_string(),
@@ -277,6 +278,7 @@ fn terminal_runtime_payloads_use_terminal_runtime_payload_kind() -> anyhow::Resu
         interaction_input: None,
     });
     let end = EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+        environment: None,
         output_metadata: None,
         call_id: "call-terminal".to_string(),
         process_id: Some("process-1".to_string()),
@@ -336,63 +338,215 @@ fn terminal_protocol_replay_preserves_absent_and_nonzero_exit_status() -> anyhow
             minimal_metadata(thread_id),
         )?;
         trace.record_codex_turn_started("turn-1");
-        let dispatch = trace.start_tool_dispatch_trace(|| Some(ToolDispatchInvocation {
-            thread_id: thread_id.to_string(),
-            codex_turn_id: "turn-1".into(),
-            tool_call_id: "terminal".into(),
-            tool_name: "exec_command".into(),
-            tool_namespace: None,
-            requester: crate::ToolDispatchRequester::Model {
-                model_visible_call_id: "call-1".into(),
-            },
-            payload: crate::ToolDispatchPayload::Function {
-                arguments: r#"{"cmd":"test command"}"#.into(),
-            },
-        }));
-        trace.record_tool_call_event("turn-1", &EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
-            call_id: "terminal".into(),
-            process_id: Some("process-1".into()),
-            turn_id: "turn-1".into(),
-            started_at_ms: 1,
-            command: vec!["test command".into()],
-            cwd: "file:///workspace".parse()?,
-            parsed_cmd: vec![],
-            source: ExecCommandSource::Agent,
-            interaction_input: None,
-        }));
-        trace.record_tool_call_event("turn-1", &EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-            output_metadata: None,
-            call_id: "terminal".into(),
-            process_id: Some("process-1".into()),
-            turn_id: "turn-1".into(),
-            completed_at_ms: 2,
-            command: vec!["test command".into()],
-            cwd: "file:///workspace".parse()?,
-            parsed_cmd: vec![],
-            source: ExecCommandSource::Agent,
-            interaction_input: None,
-            stdout: "captured stdout".into(),
-            stderr: "captured stderr".into(),
-            aggregated_output: "captured stdoutcaptured stderr".into(),
-            exit_code,
-            duration: Duration::from_millis(1),
-            formatted_output: "display".into(),
-            status: ExecCommandStatus::Completed,
-        }));
-        dispatch.record_completed(ExecutionStatus::Completed, crate::ToolDispatchResult::CodeModeResponse {
-            value: serde_json::json!({"output":"display"}),
+        let dispatch = trace.start_tool_dispatch_trace(|| {
+            Some(ToolDispatchInvocation {
+                thread_id: thread_id.to_string(),
+                codex_turn_id: "turn-1".into(),
+                tool_call_id: "terminal".into(),
+                tool_name: "exec_command".into(),
+                tool_namespace: None,
+                requester: crate::ToolDispatchRequester::Model {
+                    model_visible_call_id: "call-1".into(),
+                },
+                payload: crate::ToolDispatchPayload::Function {
+                    arguments: r#"{"cmd":"test command"}"#.into(),
+                },
+            })
         });
+        trace.record_tool_call_event(
+            "turn-1",
+            &EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+                environment: None,
+                call_id: "terminal".into(),
+                process_id: Some("process-1".into()),
+                turn_id: "turn-1".into(),
+                started_at_ms: 1,
+                command: vec!["test command".into()],
+                cwd: "file:///workspace".parse()?,
+                parsed_cmd: vec![],
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+            }),
+        );
+        trace.record_tool_call_event(
+            "turn-1",
+            &EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+                environment: None,
+                output_metadata: None,
+                call_id: "terminal".into(),
+                process_id: Some("process-1".into()),
+                turn_id: "turn-1".into(),
+                completed_at_ms: 2,
+                command: vec!["test command".into()],
+                cwd: "file:///workspace".parse()?,
+                parsed_cmd: vec![],
+                source: ExecCommandSource::Agent,
+                interaction_input: None,
+                stdout: "captured stdout".into(),
+                stderr: "captured stderr".into(),
+                aggregated_output: "captured stdoutcaptured stderr".into(),
+                exit_code,
+                duration: Duration::from_millis(1),
+                formatted_output: "display".into(),
+                status: ExecCommandStatus::Completed,
+            }),
+        );
+        dispatch.record_completed(
+            ExecutionStatus::Completed,
+            crate::ToolDispatchResult::CodeModeResponse {
+                value: serde_json::json!({"output":"display"}),
+            },
+        );
         let replayed = replay_bundle(single_bundle_dir(temp.path())?)?;
-        let operation = replayed.terminal_operations.values().next().expect("terminal operation");
+        let operation = replayed
+            .terminal_operations
+            .values()
+            .next()
+            .expect("terminal operation");
         let result = operation.result.as_ref().expect("runtime result");
         assert_eq!(result.exit_code, exit_code);
         assert_eq!(result.stdout, "captured stdout");
         assert_eq!(result.stderr, "captured stderr");
         assert_eq!(operation.execution.status, ExecutionStatus::Completed);
         // An operation returning without an exit code is not evidence of process exit.
-        assert_eq!(replayed.terminal_sessions["process-1"].execution.status, ExecutionStatus::Running);
+        assert_eq!(
+            replayed.terminal_sessions["process-1"].execution.status,
+            ExecutionStatus::Running
+        );
     }
     Ok(())
+}
+
+#[test]
+fn cold_child_resume_preserves_identity_and_captures_each_activation() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let parent_id = ThreadId::new();
+    let child_id = ThreadId::new();
+    let parent =
+        ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(parent_id))?;
+    let metadata = || child_metadata(parent_id, child_id);
+    let child = parent.start_child_thread_trace_or_disabled(metadata());
+    record_child_work(&child, "first");
+    child.record_ended(RolloutStatus::Completed);
+    let bundle = single_bundle_dir(temp.path())?;
+    let first = replay_bundle(&bundle)?.threads[&child_id.to_string()]
+        .execution
+        .clone();
+
+    let resumed = parent.resume_child_thread_trace_or_disabled(metadata());
+    assert!(resumed.is_enabled());
+    let live = replay_bundle(&bundle)?;
+    let child = &live.threads[&child_id.to_string()];
+    assert_eq!(child.previous_executions, vec![first.clone()]);
+    assert_eq!(child.execution.status, ExecutionStatus::Running);
+    assert!(child.execution.started_seq > first.ended_seq.unwrap());
+    record_child_work(&resumed, "second");
+    resumed.record_ended(RolloutStatus::Completed);
+    let replayed = replay_bundle(&bundle)?;
+    assert_eq!(replayed.threads.len(), 2);
+    assert_eq!(replayed.inference_calls.len(), 2);
+    assert_eq!(replayed.code_cells.len(), 2);
+    assert_eq!(replayed.codex_turns.len(), 2);
+    let child = &replayed.threads[&child_id.to_string()];
+    assert!(!child.history_before_trace);
+    assert_eq!(child.previous_executions, vec![first]);
+    assert_eq!(child.execution.status, ExecutionStatus::Completed);
+    assert!(
+        matches!(&child.origin, crate::AgentOrigin::Spawned { parent_thread_id, .. } if parent_thread_id == &parent_id.to_string())
+    );
+    assert_eq!(replayed.status, RolloutStatus::Running);
+    assert!(
+        replayed.interaction_edges.is_empty(),
+        "resume is not a new spawn or delivery"
+    );
+    Ok(())
+}
+
+#[test]
+fn historical_child_import_marks_unobserved_history_without_inventing_an_interval()
+-> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let parent_id = ThreadId::new();
+    let child_id = ThreadId::new();
+    let parent =
+        ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(parent_id))?;
+    let child = parent.resume_child_thread_trace_or_disabled(child_metadata(parent_id, child_id));
+    record_child_work(&child, "imported");
+    child.record_ended(RolloutStatus::Completed);
+    let replayed = replay_bundle(&single_bundle_dir(temp.path())?)?;
+    let child = &replayed.threads[&child_id.to_string()];
+    assert!(child.history_before_trace);
+    assert!(child.previous_executions.is_empty());
+    assert!(
+        child.execution.started_seq
+            > replayed.threads[&parent_id.to_string()]
+                .execution
+                .started_seq
+    );
+    assert_eq!(replayed.inference_calls.len(), 1);
+    assert_eq!(replayed.code_cells.len(), 1);
+    assert!(replayed.interaction_edges.is_empty());
+    Ok(())
+}
+
+#[test]
+fn resumed_trace_rejects_overlapping_runtime_owners_and_respects_trace_off() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let parent_id = ThreadId::new();
+    let child_id = ThreadId::new();
+    assert!(
+        !ThreadTraceContext::disabled()
+            .resume_child_thread_trace_or_disabled(child_metadata(parent_id, child_id))
+            .is_enabled()
+    );
+    let parent =
+        ThreadTraceContext::start_root_in_root_for_test(temp.path(), minimal_metadata(parent_id))?;
+    parent.start_child_thread_trace_or_disabled(child_metadata(parent_id, child_id));
+    parent.resume_child_thread_trace_or_disabled(child_metadata(parent_id, child_id));
+    let error =
+        replay_bundle(&single_bundle_dir(temp.path())?).expect_err("overlapping activations");
+    assert!(format!("{error:#}").contains("still active"));
+    Ok(())
+}
+
+fn child_metadata(parent_id: ThreadId, child_id: ThreadId) -> ThreadStartedTraceMetadata {
+    ThreadStartedTraceMetadata {
+        agent_path: "/root/worker".into(),
+        task_name: Some("worker".into()),
+        session_source: SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: parent_id,
+            depth: 1,
+            agent_path: Some(AgentPath::try_from("/root/worker").unwrap()),
+            agent_nickname: None,
+            agent_role: Some("worker".into()),
+        }),
+        ..minimal_metadata(child_id)
+    }
+}
+
+fn record_child_work(thread: &ThreadTraceContext, turn: &str) {
+    thread.record_codex_turn_started(turn);
+    let inference = thread
+        .inference_trace_context(turn, "model", "provider")
+        .start_attempt();
+    inference.record_started(&serde_json::json!({"input": []}));
+    let call_id = format!("call-{turn}");
+    let output = serde_json::from_value(serde_json::json!({
+        "type": "custom_tool_call", "name": "exec", "call_id": call_id, "input": "text(1)"
+    }))
+    .unwrap();
+    inference.record_completed(&format!("response-{turn}"), None, &None, &[output]);
+    let cell_id = format!("cell-{turn}");
+    let cell = thread.start_code_cell_trace(turn, cell_id.clone(), call_id, "text(1)");
+    cell.record_initial_response(
+        &codex_code_mode::RuntimeResponse::Result {
+            output_loss: None,
+            cell_id: codex_code_mode::CellId::new(cell_id),
+            content_items: vec![],
+            error_text: None,
+        },
+        true,
+    );
 }
 
 fn minimal_metadata(thread_id: ThreadId) -> ThreadStartedTraceMetadata {
@@ -473,6 +627,44 @@ fn provider_completion_survives_response_capture_failure() -> anyhow::Result<()>
 }
 
 #[test]
+fn failed_response_identity_survives_payload_storage_failure() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let thread = ThreadTraceContext::start_root_in_root_for_test(
+        temp.path(),
+        minimal_metadata(ThreadId::new()),
+    )?;
+    thread.record_codex_turn_started("turn-1");
+    let inference = thread
+        .inference_trace_context("turn-1", "model", "provider")
+        .start_attempt();
+    inference.record_started(&serde_json::json!({"input": []}));
+    let bundle = single_bundle_dir(temp.path())?;
+    // Metadata and request payloads already exist; only the response write fails.
+    fs::create_dir(bundle.join("payloads/3.json"))?;
+    let usage = codex_protocol::protocol::TokenUsage {
+        input_tokens: 100,
+        total_tokens: 100,
+        ..Default::default()
+    };
+    inference.record_failed_with_usage(
+        "failed",
+        Some("request"),
+        &[],
+        Some("response"),
+        Some(&usage),
+    );
+    inference.record_completed("late-duplicate", None, &None, &[]);
+    let replayed = replay_bundle(&bundle)?;
+    let call = replayed.inference_calls.values().next().expect("inference");
+    assert_eq!(call.execution.status, ExecutionStatus::Failed);
+    assert_eq!(call.response_id.as_deref(), Some("response"));
+    assert_eq!(call.upstream_request_id.as_deref(), Some("request"));
+    assert_eq!(call.raw_response_payload_id, None);
+    assert_eq!(call.usage, None); // Storage loss must not fabricate a receipt.
+    Ok(())
+}
+
+#[test]
 fn failed_request_capture_does_not_emit_unmatched_terminal_events() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let thread = ThreadTraceContext::start_root_in_root_for_test(
@@ -481,8 +673,10 @@ fn failed_request_capture_does_not_emit_unmatched_terminal_events() -> anyhow::R
     )?;
     thread.record_codex_turn_started("turn-1");
     let bundle = single_bundle_dir(temp.path())?;
+    // Payload 1 is the session metadata. Fail both request captures: 2 is the
+    // inference request and 4 the compaction request (3 is the inference response).
     fs::create_dir(bundle.join("payloads/2.json"))?;
-    fs::create_dir(bundle.join("payloads/3.json"))?;
+    fs::create_dir(bundle.join("payloads/4.json"))?;
     let inference = thread
         .inference_trace_context("turn-1", "model", "provider")
         .start_attempt();
@@ -494,14 +688,36 @@ fn failed_request_capture_does_not_emit_unmatched_terminal_events() -> anyhow::R
         .start_attempt(&serde_json::json!({"input": []}));
     compaction.record_completed(&[]);
     compaction.record_failed("failure");
+    // A lost request body is an explicit capture gap: each attempt keeps a
+    // started-without-payload identity, so its single terminal is never unmatched.
     let replayed = replay_bundle(&bundle)?;
-    assert!(replayed.inference_calls.is_empty());
-    assert!(replayed.compaction_requests.is_empty());
+    assert_eq!(replayed.inference_calls.len(), 1);
+    let call = replayed
+        .inference_calls
+        .values()
+        .next()
+        .expect("inference call");
+    assert_eq!(call.raw_request_payload_id, None);
+    assert!(call.raw_response_payload_id.is_some());
+    assert_eq!(call.execution.status, ExecutionStatus::Completed);
+    assert_eq!(call.response_id.as_deref(), Some("response-1"));
+    assert_eq!(replayed.compaction_requests.len(), 1);
+    let request = replayed
+        .compaction_requests
+        .values()
+        .next()
+        .expect("compaction request");
+    assert_eq!(request.raw_request_payload_id, None);
+    assert!(request.raw_response_payload_id.is_some());
+    assert_eq!(request.execution.status, ExecutionStatus::Completed);
+    assert_eq!(replayed.payload_capture_gap_count, Some(2));
+    // Rollout/thread/turn starts plus one start and one terminal per attempt;
+    // the later failures after completion append nothing.
     assert_eq!(
         fs::read_to_string(bundle.join("trace.jsonl"))?
             .lines()
             .count(),
-        3
+        7
     );
     Ok(())
 }
@@ -607,5 +823,64 @@ fn immediate_code_cell_completion_reuses_captured_payload() -> anyhow::Result<()
             < cell.execution.ended_seq.expect("runtime ended")
     );
     assert_eq!(replayed.raw_payloads.len(), 4);
+    Ok(())
+}
+#[test]
+fn compaction_receipts_survive_failure_empty_output_and_reducer_replay() -> anyhow::Result<()> {
+    use crate::CompactionResponseReceipt;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageCoverage;
+    let temp = TempDir::new()?;
+    let thread = ThreadTraceContext::start_root_in_root_for_test(
+        temp.path(),
+        minimal_metadata(ThreadId::new()),
+    )?;
+    thread.record_codex_turn_started("turn-1");
+    for completed in [false, true] {
+        let context = thread.compaction_trace_context(
+            "turn-1",
+            if completed { "ok" } else { "failed" },
+            "model",
+            "provider",
+        );
+        let attempt = context.start_attempt(&serde_json::json!({"input": []}));
+        let receipt = CompactionResponseReceipt {
+            response_id: Some("provider-response".into()),
+            sampling_request_id: Some("sampling".into()),
+            physical_attempt_id: Some(format!("attempt-{completed}")),
+            provider_completed: completed,
+            token_usage: Some(TokenUsage {
+                output_tokens: 100,
+                reasoning_output_tokens: 60,
+                coverage: Some(TokenUsageCoverage::fully_reported()),
+                ..Default::default()
+            }),
+        };
+        let result: Result<&[codex_protocol::models::ResponseItem], &str> = if completed {
+            Ok(&[])
+        } else {
+            Err("rejected checkpoint")
+        };
+        attempt.record_result_with_receipt(result, Some(&receipt));
+        attempt.record_failed("duplicate terminal must not overwrite receipt");
+    }
+    let bundle = single_bundle_dir(temp.path())?;
+    let replayed = replay_bundle(&bundle)?;
+    assert_eq!(replayed.compaction_requests.len(), 2);
+    for request in replayed.compaction_requests.values() {
+        let payload = &replayed.raw_payloads[request
+            .raw_response_payload_id
+            .as_ref()
+            .expect("receipt retained without output")];
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(bundle.join(&payload.path))?)?;
+        assert_eq!(json["receipt"]["response_id"], "provider-response");
+        assert_eq!(json["receipt"]["token_usage"]["output_tokens"], 100);
+        assert_eq!(
+            json["receipt"]["token_usage"]["reasoning_output_tokens"],
+            60
+        );
+        assert_eq!(json["output_items"], serde_json::json!([]));
+    }
     Ok(())
 }

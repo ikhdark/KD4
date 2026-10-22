@@ -173,7 +173,7 @@ pub(crate) fn create_exec_command_tool_for_policy(
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
         description: format!(
-            "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.\n\n{}\n\n{}",
+            "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain. Supports typed retained search misses (search_miss_v1): exact streams, original evidence identity, and verified validity scope; reused results execute no new process.\n\n{}\n\n{}",
             rg_search_admission_guidance(),
             filesystem_safety_guidance(),
         ),
@@ -557,6 +557,16 @@ fn unified_exec_output_schema() -> Value {
                 "required": ["tool", "arguments"]
             },
             "completion_recovered": {"type":"boolean"},
+            "execution_suppressed": {
+                "type": "boolean",
+                "description": "True for a reused negative-search receipt; no process ran for this call. Exact streams are present only with typed retained evidence."
+            },
+            "executed": {"type":"boolean"},
+            "reused": {"type":"boolean"},
+            "retained_search_miss_version": {"const":1},
+            "evidence_id": {"type":"string"},
+            "original_execution_id": {"type":"string"},
+            "validity_scope_fingerprint": {"type":"string"},
             "notice": {"type":"string"},
             "repair": {
                 "type": "string",

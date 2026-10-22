@@ -45,24 +45,48 @@ fn filtered_walk_preserves_requested_file_coverage_and_prunes_only_explicit_dire
     let fs = TestFileSystem {
         batches: Mutex::new(VecDeque::from([
             ReadDirectoryOutcome {
-                entries: ["dir", ".hidden", "a.rs", "b.rs", "a.txt", "λ.rs"].into_iter().map(entry).collect(),
-                entries_examined: 6, limit_reached: false,
+                entries: ["dir", ".hidden", "a.rs", "b.rs", "a.txt", "λ.rs"]
+                    .into_iter()
+                    .map(entry)
+                    .collect(),
+                entries_examined: 6,
+                limit_reached: false,
             },
-            ReadDirectoryOutcome { entries: vec![entry("c.rs")], entries_examined: 1, limit_reached: false },
-        ])), ..Default::default()
+            ReadDirectoryOutcome {
+                entries: vec![entry("c.rs")],
+                entries_examined: 1,
+                limit_reached: false,
+            },
+        ])),
+        ..Default::default()
     };
     let mut opts = options(20);
     opts.filters = WalkFilters {
-        include: vec!["?.rs".into()], exclude: vec!["b*".into()], exclude_directories: vec!["dir".into()],
+        include: vec!["?.rs".into()],
+        exclude: vec!["b*".into()],
+        exclude_directories: vec!["dir".into()],
     };
     let outcome = block_on(fs.walk(&root(), opts.clone(), None)).unwrap();
     assert_eq!(outcome.applied_filters, Some(opts.filters));
     assert!(!outcome.truncated);
     assert!(outcome.errors.is_empty());
-    assert_eq!(outcome.entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>(),
-        [".hidden", "a.rs", "λ.rs", ".hidden/c.rs"].map(|name| root().join(name).unwrap()));
-    assert_eq!(fs.limits.lock().unwrap().iter().map(|(path, _)| path.clone()).collect::<Vec<_>>(),
-        [root(), root().join(".hidden").unwrap()]);
+    assert_eq!(
+        outcome
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>(),
+        [".hidden", "a.rs", "λ.rs", ".hidden/c.rs"].map(|name| root().join(name).unwrap())
+    );
+    assert_eq!(
+        fs.limits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>(),
+        [root(), root().join(".hidden").unwrap()]
+    );
 }
 
 #[test]
@@ -70,8 +94,11 @@ fn filters_do_not_hide_budget_cutoffs_or_exclude_the_selected_root() {
     for limited in [false, true] {
         let fs = TestFileSystem {
             batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
-                entries: vec![entry("other.txt")], entries_examined: 1, limit_reached: limited,
-            }])), ..Default::default()
+                entries: vec![entry("other.txt")],
+                entries_examined: 1,
+                limit_reached: limited,
+            }])),
+            ..Default::default()
         };
         let mut opts = options(2);
         opts.filters.include = vec!["*.rs".into()];
@@ -80,15 +107,23 @@ fn filters_do_not_hide_budget_cutoffs_or_exclude_the_selected_root() {
         assert!(outcome.entries.is_empty());
         assert_eq!(outcome.truncated, limited);
         assert_eq!(fs.limits.lock().unwrap().len(), 1);
-        if limited { assert_eq!(outcome.unexplored[0].reason, "entry_limit"); }
+        if limited {
+            assert_eq!(outcome.unexplored[0].reason, "entry_limit");
+        }
     }
 }
 
 #[test]
 fn filters_are_bounded_and_invalid_scope_fails_before_enumeration() {
     for field in ["include", "exclude", "exclude_directories"] {
-        for patterns in [vec!["".into()], vec!["src/*.rs".into()], vec!["a\\b".into()],
-            vec!["a\0b".into()], vec!["x".repeat(257)], vec!["x".into(); 65]] {
+        for patterns in [
+            vec!["".into()],
+            vec!["src/*.rs".into()],
+            vec!["a\\b".into()],
+            vec!["a\0b".into()],
+            vec!["x".repeat(257)],
+            vec!["x".into(); 65],
+        ] {
             let fs = TestFileSystem::default();
             let mut opts = options(20);
             match field {
@@ -96,7 +131,11 @@ fn filters_are_bounded_and_invalid_scope_fails_before_enumeration() {
                 "exclude" => opts.filters.exclude = patterns,
                 _ => opts.filters.exclude_directories = patterns,
             }
-            assert_eq!(block_on(fs.walk(&root(), opts, None)).unwrap_err().kind(), io::ErrorKind::InvalidInput, "{field}");
+            assert_eq!(
+                block_on(fs.walk(&root(), opts, None)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{field}"
+            );
             assert!(fs.limits.lock().unwrap().is_empty(), "{field}");
         }
     }
@@ -111,7 +150,10 @@ fn filter_pattern_budget_is_shared_across_fields_and_counts_utf8_bytes() {
     };
     filters.validate().expect("64 total patterns are permitted");
     filters.exclude_directories.push("vendor".into());
-    assert_eq!(filters.validate().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        filters.validate().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
 
     filters = WalkFilters {
         include: vec!["界".repeat(85)],
@@ -119,21 +161,30 @@ fn filter_pattern_budget_is_shared_across_fields_and_counts_utf8_bytes() {
     };
     filters.validate().expect("255 UTF-8 bytes are permitted");
     filters.include[0].push('界');
-    assert_eq!(filters.validate().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        filters.validate().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
 }
 
 #[test]
 fn response_byte_cutoff_reports_its_effective_bound() {
     let fs = TestFileSystem {
         batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
-            entries: vec![entry(&"x".repeat(MAX_WALK_RESPONSE_BYTES))], entries_examined: 1, limit_reached: false,
-        }])), ..Default::default()
+            entries: vec![entry(&"x".repeat(MAX_WALK_RESPONSE_BYTES))],
+            entries_examined: 1,
+            limit_reached: false,
+        }])),
+        ..Default::default()
     };
     let outcome = block_on(fs.walk(&root(), options(20), None)).unwrap();
     assert!(outcome.truncated);
     assert!(outcome.entries.is_empty());
     assert_eq!(outcome.unexplored[0].reason, "response_bytes");
-    assert_eq!(outcome.unexplored[0].effective_limit, MAX_WALK_RESPONSE_BYTES);
+    assert_eq!(
+        outcome.unexplored[0].effective_limit,
+        MAX_WALK_RESPONSE_BYTES
+    );
 }
 
 fn entry(name: &str) -> ReadDirectoryEntry {
@@ -146,6 +197,15 @@ fn entry(name: &str) -> ReadDirectoryEntry {
 }
 
 impl ExecutorFileSystem for TestFileSystem {
+    fn read_directory_bounded_no_follow_for_walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        limit: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
+        // Immutable synthetic batches have no native paths or external writers.
+        self.read_directory_bounded_for_walk(path, limit, sandbox)
+    }
     fn canonicalize<'a>(
         &'a self,
         path: &'a PathUri,
@@ -387,7 +447,7 @@ fn walk_reuses_enumerated_metadata_without_followup_probes() {
         metadata_batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
             entries: ["b", "a"]
                 .into_iter()
-                .map(|name| WalkDirectoryEntry {
+                .map(|name| WalkDirectoryEntry::Entry {
                     file_name: name.into(),
                     metadata: Some(metadata),
                 })
@@ -409,6 +469,49 @@ fn walk_reuses_enumerated_metadata_without_followup_probes() {
     assert_eq!(fs.peak.load(Ordering::SeqCst), 0);
     assert_eq!(*fs.limits.lock().unwrap(), [(root(), 5)]);
     assert!(outcome.errors.is_empty());
+    assert!(!outcome.truncated);
+}
+
+#[test]
+fn unrepresentable_names_are_errors_not_metadata_probes_for_lossy_siblings() {
+    let fs = TestFileSystem {
+        metadata_batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
+            entries: vec![
+                WalkDirectoryEntry::UnrepresentableName {
+                    escaped_name: "needle-\\u{d800}.txt".into(),
+                },
+                WalkDirectoryEntry::Entry {
+                    file_name: "needle-�.txt".into(),
+                    metadata: Some(WalkEntryMetadata {
+                        is_directory: false,
+                        is_file: true,
+                        is_symlink: false,
+                    }),
+                },
+            ],
+            entries_examined: 2,
+            limit_reached: false,
+        }])),
+        ..Default::default()
+    };
+    let outcome = block_on(fs.walk(&root(), options(5), None)).unwrap();
+    assert_eq!(outcome.entries.len(), 1);
+    assert_eq!(
+        outcome.entries[0].path,
+        root().join("needle-�.txt").unwrap()
+    );
+    assert_eq!(outcome.errors.len(), 1);
+    assert_eq!(outcome.errors[0].path, root());
+    assert!(
+        outcome.errors[0]
+            .message
+            .contains("unrepresentable native entry")
+    );
+    assert_eq!(
+        fs.peak.load(Ordering::SeqCst),
+        0,
+        "neither entry needs a fallback stat"
+    );
     assert!(!outcome.truncated);
 }
 
@@ -574,12 +677,15 @@ fn walk_reports_depth_truncation_without_reading_beyond_limit() {
         ]
     );
     assert_eq!(*fs.limits.lock().unwrap(), [(root(), 20)]);
-    assert_eq!(outcome.unexplored, vec![WalkStop {
-        path: root().join("dir").unwrap(),
-        reason: "depth_limit".into(),
-        effective_limit: 0,
-        partially_examined: false,
-    }]);
+    assert_eq!(
+        outcome.unexplored,
+        vec![WalkStop {
+            path: root().join("dir").unwrap(),
+            reason: "depth_limit".into(),
+            effective_limit: 0,
+            partially_examined: false,
+        }]
+    );
 }
 
 #[test]
@@ -597,16 +703,28 @@ fn walk_directory_budget_includes_root_and_preserves_unvisited_frontier() {
     let outcome = block_on(fs.walk(&root(), opts, None)).unwrap();
     assert!(outcome.truncated);
     assert!(outcome.errors.is_empty());
-    assert_eq!(outcome.entries, vec![
-        WalkEntry { path: root().join("dir").unwrap(), kind: WalkEntryKind::Directory },
-        WalkEntry { path: root().join("file").unwrap(), kind: WalkEntryKind::File },
-    ]);
-    assert_eq!(outcome.unexplored, vec![WalkStop {
-        path: root().join("dir").unwrap(),
-        reason: "directory_limit".into(),
-        effective_limit: 1,
-        partially_examined: false,
-    }]);
+    assert_eq!(
+        outcome.entries,
+        vec![
+            WalkEntry {
+                path: root().join("dir").unwrap(),
+                kind: WalkEntryKind::Directory
+            },
+            WalkEntry {
+                path: root().join("file").unwrap(),
+                kind: WalkEntryKind::File
+            },
+        ]
+    );
+    assert_eq!(
+        outcome.unexplored,
+        vec![WalkStop {
+            path: root().join("dir").unwrap(),
+            reason: "directory_limit".into(),
+            effective_limit: 1,
+            partially_examined: false,
+        }]
+    );
     assert_eq!(*fs.limits.lock().unwrap(), [(root(), 20)]);
 }
 
@@ -616,6 +734,20 @@ fn confined_read_default_fails_closed_without_opening_streams() {
     let path = root().join("file").unwrap();
     let error = block_on(fs.read_file_bounded_confined(&path, &root(), 10, None))
         .expect_err("a backend without confinement must not use the unconfined fallback");
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+}
+
+#[test]
+fn conditional_mutation_default_fails_closed_without_a_write() {
+    let fs = TestFileSystem::default();
+    let path = root().join("file").unwrap();
+    let error = block_on(fs.mutate_file_if_matches(
+        &path,
+        Some(b"old".to_vec()),
+        Some(b"new".to_vec()),
+        None,
+    ))
+    .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
@@ -677,18 +809,35 @@ fn walk_preserves_producer_truncation_without_returned_entries() {
     assert!(outcome.entries.is_empty());
     assert!(outcome.errors.is_empty());
     assert_eq!(*fs.limits.lock().unwrap(), [(root(), 2)]);
-    assert_eq!(outcome.unexplored, vec![WalkStop { path:root(), reason:"entry_limit".into(),
-        effective_limit:2, partially_examined:true }]);
+    assert_eq!(
+        outcome.unexplored,
+        vec![WalkStop {
+            path: root(),
+            reason: "entry_limit".into(),
+            effective_limit: 2,
+            partially_examined: true
+        }]
+    );
 }
 
 #[test]
 fn walk_frontier_is_bounded_without_losing_unexplored_scope() {
     let fs = TestFileSystem {
         metadata_batches: Mutex::new(VecDeque::from([ReadDirectoryOutcome {
-            entries: (0..100).map(|index| WalkDirectoryEntry { file_name:format!("dir-{index:03}"),
-                metadata:Some(WalkEntryMetadata { is_directory:true, is_file:false, is_symlink:false }) }).collect(),
-            entries_examined:100, limit_reached:false,
-        }])), ..Default::default()
+            entries: (0..100)
+                .map(|index| WalkDirectoryEntry::Entry {
+                    file_name: format!("dir-{index:03}"),
+                    metadata: Some(WalkEntryMetadata {
+                        is_directory: true,
+                        is_file: false,
+                        is_symlink: false,
+                    }),
+                })
+                .collect(),
+            entries_examined: 100,
+            limit_reached: false,
+        }])),
+        ..Default::default()
     };
     let mut limits = options(200);
     limits.max_depth = 0;

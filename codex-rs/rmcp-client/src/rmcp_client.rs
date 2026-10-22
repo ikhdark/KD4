@@ -155,19 +155,29 @@ pub(crate) struct ElicitationPauseRegistry {
 
 impl ElicitationPauseRegistry {
     fn register(&self, state: ElicitationPauseState) -> ElicitationOperationRegistration {
-        self.operations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(state.clone());
-        ElicitationOperationRegistration { registry: self.clone(), state }
+        ElicitationOperationRegistration {
+            registry: self.clone(),
+            state,
+        }
     }
 
     pub(crate) fn enter(&self) -> Option<ElicitationPauseGuard> {
-        let operations = self.operations.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // RMCP supplies no parent-operation identity for elicitation. Its
         // progressToken identifies the incoming request, not our tools/call;
         // comparing the two directions' counters can pause the wrong call.
         // Preserve the unambiguous single-operation pause, never a client-wide
         // pause when concurrent operations make attribution unavailable.
-        let [state] = operations.as_slice() else { return None; };
+        let [state] = operations.as_slice() else {
+            return None;
+        };
         Some(state.enter())
     }
 }
@@ -189,11 +199,26 @@ mod operation_pause_tests {
         let _a = registry.register(a.clone());
         let pause = registry.enter().expect("A is the only active operation");
         let _b = registry.register(b.clone());
-        assert!(registry.enter().is_none(), "ambiguous dialogs do not pause B");
-        let held_a = active_time_timeout(Duration::from_secs(1), a.subscribe(), std::future::pending::<()>());
+        assert!(
+            registry.enter().is_none(),
+            "ambiguous dialogs do not pause B"
+        );
+        let held_a = active_time_timeout(
+            Duration::from_secs(1),
+            a.subscribe(),
+            std::future::pending::<()>(),
+        );
         tokio::pin!(held_a);
         assert!(futures::poll!(&mut held_a).is_pending());
-        assert!(active_time_timeout(Duration::from_secs(1), b.subscribe(), std::future::pending::<()>()).await.is_err());
+        assert!(
+            active_time_timeout(
+                Duration::from_secs(1),
+                b.subscribe(),
+                std::future::pending::<()>()
+            )
+            .await
+            .is_err()
+        );
         assert!(futures::poll!(&mut held_a).is_pending());
         drop(pause);
         assert!(held_a.await.is_err());
@@ -202,7 +227,10 @@ mod operation_pause_tests {
 
 impl Drop for ElicitationOperationRegistration {
     fn drop(&mut self) {
-        self.registry.operations.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.registry
+            .operations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|state| !state.timing.same_channel(&self.state.timing));
     }
 }
@@ -305,6 +333,13 @@ where
 enum ClientOperationError {
     #[error(transparent)]
     Service(#[from] rmcp::service::ServiceError),
+    #[error(
+        "MCP tools/call response unavailable; completion unknown; execution may have completed; check its state before retrying: {source}"
+    )]
+    CompletionUnknown {
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("timed out awaiting {label} after {duration:.0?}{}", if .label == "tools/call" {
         "; execution may have completed; check its state before retrying"
     } else {
@@ -349,7 +384,11 @@ struct OperationRequestTracker {
 
 impl OperationRequestTracker {
     fn new(pause_registry: ElicitationPauseRegistry) -> Self {
-        Self { current: Arc::default(), pause_state: ElicitationPauseState::new(), pause_registry }
+        Self {
+            current: Arc::default(),
+            pause_state: ElicitationPauseState::new(),
+            pause_registry,
+        }
     }
     fn register(&self, service: Arc<RunningClientService>, id: RequestId) {
         *self
@@ -550,10 +589,15 @@ struct RecoveryOwner<'a> {
 
 impl Drop for RecoveryOwner<'_> {
     fn drop(&mut self) {
-        let mut slot = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         slot.take();
         self.sender.send_if_modified(|outcome| {
-            if outcome.is_some() { return false; }
+            if outcome.is_some() {
+                return false;
+            }
             *outcome = Some(Err(Arc::new(anyhow!("MCP session recovery was cancelled"))));
             true
         });
@@ -946,13 +990,19 @@ impl RmcpClient {
         };
         let mut rmcp_params = CallToolRequestParams::new(name);
         rmcp_params.arguments = arguments;
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation_attempted = Arc::clone(&attempted);
         let result = self
             .run_service_operation("tools/call", timeout, move |service, tracker| {
                 let rmcp_params = rmcp_params.clone();
                 let meta = meta.clone();
+                let attempted = Arc::clone(&operation_attempted);
                 async move {
                     let mut options = rmcp::service::PeerRequestOptions::no_options();
                     options.meta = meta;
+                    // Once handed to the transport, a send/response error is
+                    // not proof that a possibly effectful call did not run.
+                    attempted.store(true, std::sync::atomic::Ordering::Release);
                     let result = send_tracked_request(
                         service,
                         tracker,
@@ -971,7 +1021,13 @@ impl RmcpClient {
             })
             .await;
         self.persist_oauth_tokens().await;
-        result
+        result.map_err(|source| {
+            if attempted.load(std::sync::atomic::Ordering::Acquire) && !is_timeout_error(&source) {
+                ClientOperationError::CompletionUnknown { source }.into()
+            } else {
+                source
+            }
+        })
     }
 
     pub async fn send_custom_notification(
@@ -1468,17 +1524,29 @@ impl RmcpClient {
             return Ok(());
         }
         let (mut observation, owner) = {
-            let mut slot = self.session_recovery.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = self
+                .session_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(observation) = slot.as_ref() {
                 (observation.clone(), None)
             } else {
                 let (sender, observation) = watch::channel(None);
                 *slot = Some(observation.clone());
-                (observation, Some(RecoveryOwner { slot: &self.session_recovery, sender }))
+                (
+                    observation,
+                    Some(RecoveryOwner {
+                        slot: &self.session_recovery,
+                        sender,
+                    }),
+                )
             }
         };
         if let Some(owner) = owner {
-            let outcome = self.reinitialize_session(failed_service).await.map_err(Arc::new);
+            let outcome = self
+                .reinitialize_session(failed_service)
+                .await
+                .map_err(Arc::new);
             owner.sender.send_replace(Some(outcome.clone()));
             drop(owner);
             return outcome.map_err(SharedRecoveryError::into_anyhow);
@@ -1487,7 +1555,10 @@ impl RmcpClient {
             if let Some(outcome) = observation.borrow_and_update().clone() {
                 return outcome.map_err(SharedRecoveryError::into_anyhow);
             }
-            observation.changed().await.map_err(|_| anyhow!("MCP recovery owner disappeared"))?;
+            observation
+                .changed()
+                .await
+                .map_err(|_| anyhow!("MCP recovery owner disappeared"))?;
         }
     }
 
@@ -1495,7 +1566,6 @@ impl RmcpClient {
         &self,
         failed_service: &Arc<RunningService<RoleClient, ElicitationClientService>>,
     ) -> Result<()> {
-
         {
             let guard = self.state.lock().await;
             match &*guard {

@@ -47,12 +47,15 @@ mod tests {
         ] {
             let input = format!("{prefix}text('borrowed')");
             let parsed = parse_exec_source(&input).expect("source should parse");
-            assert_eq!(parsed, ParsedExecSource {
-                code: "text('borrowed')",
-                max_output_tokens,
-                deliver: false,
-                persist: false,
-            });
+            assert_eq!(
+                parsed,
+                ParsedExecSource {
+                    code: "text('borrowed')",
+                    max_output_tokens,
+                    deliver: false,
+                    persist: false,
+                }
+            );
             assert_eq!(parsed.code.as_ptr(), input[prefix.len()..].as_ptr());
         }
     }
@@ -372,11 +375,10 @@ mod tests {
         assert!(!description.contains("Parallelize only when tools permit"));
         assert!(!description.contains("never repeat the same call/poll"));
         assert!(!description.contains("never whole files"));
-        assert!(description.contains("A truncated result names the `read_tool_output` call that returns the rest"));
-        assert_eq!(
-            crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
-            10_000,
-        );
+        assert!(description.contains(
+            "A truncated result names the `read_tool_output` call that returns the rest"
+        ));
+        assert_eq!(crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL, 10_000,);
         assert!(description.contains(&format!(
             "Output defaults to {} tokens",
             crate::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
@@ -512,9 +514,17 @@ mod tests {
     }
 
     fn assert_input_declaration(schema: serde_json::Value, expected: &str) {
-        let recovery = if ["schema projection incomplete:", "patternProperties not projected", "unprojected keyword: not"]
-            .iter().any(|marker| expected.contains(marker)) {
-            format!("\n\nAuthoritative input_schema (TypeScript projection incomplete):\n```json\n{schema}\n```")
+        let recovery = if [
+            "schema projection incomplete:",
+            "patternProperties not projected",
+            "unprojected keyword: not",
+        ]
+        .iter()
+        .any(|marker| expected.contains(marker))
+        {
+            format!(
+                "\n\nAuthoritative input_schema (TypeScript projection incomplete):\n```json\n{schema}\n```"
+            )
         } else {
             String::new()
         };
@@ -682,8 +692,6 @@ mod tests {
         assert!(!description.contains("CallToolResult"));
         assert!(!description.contains("unresolved $ref"));
     }
-
-
 
     #[test]
     fn declarations_bound_acyclic_reference_expansion_and_large_literals() {

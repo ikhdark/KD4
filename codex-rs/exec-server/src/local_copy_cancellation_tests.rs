@@ -19,6 +19,40 @@ fn cancelled_recursive_copy_preserves_existing_destination() -> io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn recursive_copy_failure_retains_effect_prefix_and_current_target_uncertainty() -> io::Result<()> {
+    let home = tempfile::tempdir()?;
+    let source = home.path().join("source");
+    let target = home.path().join("target");
+    std::fs::create_dir(&source)?;
+    std::fs::write(source.join("file"), b"new contents")?;
+    // A directory at the file destination guarantees a copy error after the
+    // destination root was created; no enumeration-order assumption is needed.
+    std::fs::create_dir_all(target.join("file"))?;
+    let error = copy_dir_recursive(
+        &source,
+        &target,
+        &source.canonicalize()?,
+        &CancellationToken::new(),
+    )
+    .unwrap_err();
+    let progress = codex_file_system::CopyFailure::from_io_error(&error).unwrap();
+    assert!(progress.target_may_have_changed);
+    assert_eq!(progress.completed_entries, 0);
+    assert!(progress.to_string().contains("no rollback"));
+    assert!(target.join("file").is_dir());
+    let cancelled_target = home.path().join("cancelled");
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let error = copy_dir_recursive(&source, &cancelled_target, &source.canonicalize()?, &cancel)
+        .unwrap_err();
+    let progress = codex_file_system::CopyFailure::from_io_error(&error).unwrap();
+    assert_eq!(progress.completed_entries, 0);
+    assert!(!progress.target_may_have_changed);
+    assert!(!cancelled_target.exists());
+    Ok(())
+}
+
 #[tokio::test]
 async fn dropping_copy_worker_stops_before_next_directory() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;

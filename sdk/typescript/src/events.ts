@@ -20,8 +20,27 @@ export type TurnStartedEvent = {
 /**
  * Token usage for the thread as of the turn's completion. The counts are
  * cumulative, so a resumed thread's usage includes its earlier turns.
+ * Numeric fields are known subtotals. Treat a component as complete only when its
+ * coverage equals receipts, all expected receipts were reported, and no saturation
+ * occurred; absent coverage or absent reported_receipts remains unknown.
  */
 export type Usage = {
+  /** Absent means legacy unknown, not fully reported. Counts are receipt coverage. */
+  coverage?: {
+    receipts: number;
+    /** Missing on legacy records; this is not inferred from the token sums. */
+    reported_receipts?: number;
+    /** Known cache-write subtotal; complete only when cache_write_receipts equals receipts. */
+    cache_write_input_tokens?: number;
+    cache_write_receipts?: number;
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+    reasoning_output_tokens: number;
+    total_tokens: number;
+    invalid_receipts: number;
+    saturated: boolean;
+  };
   /** The number of input tokens used by the thread. */
   input_tokens: number;
   /** The number of cached input tokens used by the thread. */
@@ -29,7 +48,7 @@ export type Usage = {
   /** The number of output tokens used by the thread. */
   output_tokens: number;
   /** The number of reasoning output tokens used by the thread. */
-  reasoning_output_tokens: number;
+  reasoning_output_tokens?: number;
 };
 
 /** Authoritative owner-authored result, shared by turn and child completion. */
@@ -39,12 +58,26 @@ export type SurfacedToolResult = {
   canonicalMessage?: string;
 };
 
+/** Exact answer accepted by core after completion hooks and pending-input admission. */
+export type AcceptedFinalMessage = {
+  itemId: string;
+  text: string;
+  origin: "assistant_final" | "legacy_unphased" | "plan";
+  completionAttemptId: string;
+};
+
+export type TurnTiming = Record<string, unknown> & {
+  /** Present with null message means no accepted answer; absence is legacy unknown. */
+  finalAnswer?: { message: AcceptedFinalMessage | null };
+};
+
 /** Emitted when a turn is completed. Typically right after the assistant's response. */
 export type TurnCompletedEvent = {
   type: "turn.completed";
-  usage: Usage;
+  /** Null means no accounting snapshot was received, not measured zero. */
+  usage: Usage | null;
   /** Owner-supplied timing, absent on legacy producers or null when unavailable. */
-  timing?: Record<string, unknown> | null;
+  timing?: TurnTiming | null;
   /** Authoritative tool result delivered without a final assistant message. */
   surfaced_result?: SurfacedToolResult;
 };
@@ -55,7 +88,7 @@ export type TurnFailedEvent = {
   error: ThreadError;
   disposition?: "failed" | "interrupted" | "transport_lost";
   usage?: Usage | null;
-  timing?: Record<string, unknown> | null;
+  timing?: TurnTiming | null;
 };
 
 /** Bounded incremental evidence; item.completed remains authoritative. */
@@ -101,12 +134,16 @@ export type ItemCompletedEvent = {
 /** Fatal error emitted by the stream. */
 export type ThreadError = {
   message: string;
+  code?: string;
+  phase?: string;
 };
 
 /** Represents an unrecoverable error emitted directly by the event stream. */
 export type ThreadErrorEvent = {
   type: "error";
   message: string;
+  code?: string;
+  phase?: string;
 };
 
 /** Top-level JSONL events emitted by codex exec. */

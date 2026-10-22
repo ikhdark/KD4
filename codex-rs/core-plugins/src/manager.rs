@@ -425,6 +425,8 @@ pub struct PluginsManager {
     tool_suggest_metadata_cache: ToolSuggestMetadataCache,
     remote_installed_plugins_cache: RwLock<Option<Vec<RemoteInstalledPlugin>>>,
     remote_installed_plugins_cache_generation: AtomicU64,
+    remote_installed_plugins_next_fetch: AtomicU64,
+    remote_installed_plugins_accepted_fetch: AtomicU64,
     remote_installed_plugins_cache_refresh_state: RwLock<RemoteInstalledPluginsCacheRefreshState>,
     global_remote_catalog_cache_refresh_state: RwLock<GlobalRemoteCatalogCacheRefreshState>,
     restriction_product: Option<Product>,
@@ -556,6 +558,8 @@ impl PluginsManager {
             tool_suggest_metadata_cache: ToolSuggestMetadataCache::new(),
             remote_installed_plugins_cache: RwLock::new(None),
             remote_installed_plugins_cache_generation: AtomicU64::new(0),
+            remote_installed_plugins_next_fetch: AtomicU64::new(0),
+            remote_installed_plugins_accepted_fetch: AtomicU64::new(0),
             remote_installed_plugins_cache_refresh_state: RwLock::new(
                 RemoteInstalledPluginsCacheRefreshState::default(),
             ),
@@ -1120,17 +1124,14 @@ impl PluginsManager {
         let generation = self
             .remote_installed_plugins_cache_generation
             .load(Ordering::Acquire);
+        let ticket = self.begin_remote_installed_plugins_fetch();
         let plugins = crate::remote::fetch_remote_installed_plugins(
             &remote_plugin_service_config(config),
             auth,
         )
         .await?;
-        let marketplaces = crate::remote::group_remote_installed_plugins_by_marketplaces(
-            &plugins,
-            visible_marketplaces,
-        );
         let Some(changed) =
-            self.write_remote_installed_plugins_cache_if_generation(plugins, generation)
+            self.write_remote_installed_plugins_cache_if_generation(plugins, generation, ticket)
         else {
             return Ok(self
                 .build_remote_installed_plugin_marketplaces_from_cache(visible_marketplaces)
@@ -1139,7 +1140,9 @@ impl PluginsManager {
         if changed && let Some(on_effective_plugins_changed) = on_effective_plugins_changed {
             on_effective_plugins_changed();
         }
-        Ok(marketplaces)
+        Ok(self
+            .build_remote_installed_plugin_marketplaces_from_cache(visible_marketplaces)
+            .unwrap_or_default())
     }
 
     #[cfg(test)]
@@ -1147,14 +1150,40 @@ impl PluginsManager {
         let generation = self
             .remote_installed_plugins_cache_generation
             .load(Ordering::Acquire);
-        self.write_remote_installed_plugins_cache_if_generation(plugins, generation)
+        let ticket = self.begin_remote_installed_plugins_fetch();
+        self.write_remote_installed_plugins_cache_if_generation(plugins, generation, ticket)
             .unwrap_or(false)
+    }
+
+    fn begin_remote_installed_plugins_fetch(&self) -> u64 {
+        self.remote_installed_plugins_next_fetch
+            .fetch_add(1, Ordering::AcqRel)
+            + 1
+    }
+
+    fn fence_remote_installed_plugins_fetches(&self, generation: u64) -> bool {
+        let _cache = self
+            .remote_installed_plugins_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .remote_installed_plugins_cache_generation
+            .load(Ordering::Acquire)
+            != generation
+        {
+            return false;
+        }
+        let ticket = self.begin_remote_installed_plugins_fetch();
+        self.remote_installed_plugins_accepted_fetch
+            .store(ticket, Ordering::Release);
+        true
     }
 
     fn write_remote_installed_plugins_cache_if_generation(
         &self,
         plugins: Vec<RemoteInstalledPlugin>,
         generation: u64,
+        ticket: u64,
     ) -> Option<bool> {
         let mut cache = match self.remote_installed_plugins_cache.write() {
             Ok(cache) => cache,
@@ -1164,9 +1193,16 @@ impl PluginsManager {
             .remote_installed_plugins_cache_generation
             .load(Ordering::Acquire)
             != generation
+            || ticket
+                < self
+                    .remote_installed_plugins_accepted_fetch
+                    .load(Ordering::Acquire)
         {
             return None;
         }
+        // Even an equal observation supersedes older in-flight responses.
+        self.remote_installed_plugins_accepted_fetch
+            .store(ticket, Ordering::Release);
         if cache.as_ref().is_some_and(|cache| cache.eq(&plugins)) {
             return Some(false);
         }
@@ -1181,11 +1217,15 @@ impl PluginsManager {
             .remote_installed_plugins_cache_generation
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
-        self.clear_remote_installed_plugins_cache_if_generation(generation)
+        self.clear_remote_installed_plugins_cache_if_generation(generation, None)
             .unwrap_or(false)
     }
 
-    fn clear_remote_installed_plugins_cache_if_generation(&self, generation: u64) -> Option<bool> {
+    fn clear_remote_installed_plugins_cache_if_generation(
+        &self,
+        generation: u64,
+        ticket: Option<u64>,
+    ) -> Option<bool> {
         let cache = match self.remote_installed_plugins_cache.write() {
             Ok(cache) => cache,
             Err(err) => err.into_inner(),
@@ -1194,8 +1234,18 @@ impl PluginsManager {
             .remote_installed_plugins_cache_generation
             .load(Ordering::Acquire)
             != generation
+            || ticket.is_some_and(|ticket| {
+                ticket
+                    < self
+                        .remote_installed_plugins_accepted_fetch
+                        .load(Ordering::Acquire)
+            })
         {
             return None;
+        }
+        if let Some(ticket) = ticket {
+            self.remote_installed_plugins_accepted_fetch
+                .store(ticket, Ordering::Release);
         }
         Some(self.clear_remote_installed_plugins_cache_locked(cache))
     }
@@ -1241,6 +1291,10 @@ impl PluginsManager {
         auth: Option<CodexAuth>,
         on_effective_plugins_changed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) {
+        let generation = self
+            .remote_installed_plugins_cache_generation
+            .load(Ordering::Acquire);
+        self.fence_remote_installed_plugins_fetches(generation);
         self.maybe_start_remote_installed_plugins_cache_refresh_with_notify(
             config,
             auth,
@@ -1307,8 +1361,13 @@ impl PluginsManager {
         let service_config = remote_plugin_service_config(config);
         // The bundle operation owns this account epoch, even if its callback runs
         // after logout. Never pair its captured auth with a newly sampled generation.
-        let generation = self.remote_installed_plugins_cache_generation.load(Ordering::Acquire);
+        let generation = self
+            .remote_installed_plugins_cache_generation
+            .load(Ordering::Acquire);
         Arc::new(move || {
+            if !manager.fence_remote_installed_plugins_fetches(generation) {
+                return;
+            }
             manager.schedule_remote_installed_plugins_cache_refresh(
                 RemoteInstalledPluginsCacheRefreshRequest {
                     service_config: service_config.clone(),
@@ -2550,7 +2609,11 @@ impl PluginsManager {
             // A delayed old-account callback must not replace the pending refresh
             // for the current account. The publication fence still handles an
             // invalidation racing already-admitted work.
-            if request.generation != self.remote_installed_plugins_cache_generation.load(Ordering::Acquire) {
+            if request.generation
+                != self
+                    .remote_installed_plugins_cache_generation
+                    .load(Ordering::Acquire)
+            {
                 return;
             }
             if let Some(existing_request) = state.requested.as_ref() {
@@ -2758,6 +2821,7 @@ impl PluginsManager {
                 }
             };
 
+            let ticket = self.begin_remote_installed_plugins_fetch();
             let installed_plugins = crate::remote::fetch_remote_installed_plugins(
                 &request.service_config,
                 request.auth.as_ref(),
@@ -2770,6 +2834,7 @@ impl PluginsManager {
                     let Some(changed) = self.write_remote_installed_plugins_cache_if_generation(
                         installed_plugins,
                         request.generation,
+                        ticket,
                     ) else {
                         continue;
                     };
@@ -2789,9 +2854,10 @@ impl PluginsManager {
                     RemotePluginCatalogError::AuthRequired
                     | RemotePluginCatalogError::UnsupportedAuthMode,
                 ) => {
-                    let Some(changed) =
-                        self.clear_remote_installed_plugins_cache_if_generation(request.generation)
-                    else {
+                    let Some(changed) = self.clear_remote_installed_plugins_cache_if_generation(
+                        request.generation,
+                        Some(ticket),
+                    ) else {
                         continue;
                     };
                     if changed

@@ -130,28 +130,76 @@ where
     F: FnOnce(Arg0DispatchPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
+    arg0_dispatch_or_else_with_pre_runtime(|| main_fn)
+}
+
+/// Like [`arg0_dispatch_or_else`], but prepares the async entry point after
+/// helper dispatch and dotenv loading, before creating any runtime threads.
+/// The preparation callback must not start threads if it mutates the Unix
+/// environment or performs other startup-only work.
+pub fn arg0_dispatch_or_else_with_pre_runtime<P, F, Fut>(prepare_main: P) -> anyhow::Result<()>
+where
+    P: FnOnce() -> F,
+    F: FnOnce(Arg0DispatchPaths) -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
     // Retain the TempDir so it exists for the lifetime of the invocation of
     // this executable. Admittedly, we could invoke `keep()` on it, but it
     // would be nice to avoid leaving temporary directories behind, if possible.
     let path_entry_guard = arg0_dispatch();
+    let main_fn = prepare_main();
     let current_exe = std::env::current_exe().ok();
 
     // Regular invocation. Run the async entry point on a thread with the same
     // stack budget as Tokio workers; `Runtime::block_on` otherwise runs the
     // top-level future on the caller's OS stack.
+    let (main_result_tx, main_result_rx) = std::sync::mpsc::sync_channel(1);
+    let (retired_tx, retired_rx) = std::sync::mpsc::sync_channel(1);
     let handle = std::thread::Builder::new()
         .name("codex-main".to_string())
         .stack_size(TOKIO_WORKER_STACK_SIZE_BYTES)
         .spawn(move || {
-            let runtime = build_runtime()?;
-            runtime.block_on(run_main_with_arg0_guard(
+            let runtime = match build_runtime() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = main_result_tx.send(Err(error));
+                    let _ = retired_tx.send(());
+                    return;
+                }
+            };
+            let result = runtime.block_on(run_main_with_arg0_guard(
                 path_entry_guard,
                 current_exe,
                 main_fn,
-            ))
+            ));
+            let _ = main_result_tx.send(result);
+            // Keep real runtime custody on this thread. In particular, do not
+            // claim shutdown_timeout stopped an admitted blocking filesystem effect.
+            drop(runtime);
+            let _ = retired_tx.send(());
         })?;
-    match handle.join() {
+    let result = match main_result_rx.recv() {
         Ok(result) => result,
+        Err(_) => match handle.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => anyhow::bail!("native runtime exited without a main result"),
+        },
+    };
+    if retired_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .is_err()
+    {
+        // Last-resort process boundary: returning failure lets binary main exit
+        // finitely. Pending I/O may have committed; recovery, not replay, is needed.
+        let message = "native runtime retirement exceeded 5 seconds; blocking I/O or committed effects may remain pending; recover the session before replaying work";
+        eprintln!("{message}");
+        return match result {
+            Ok(()) => Err(anyhow::anyhow!(message)),
+            Err(error) => Err(error.context(message)),
+        };
+    }
+    match handle.join() {
+        Ok(()) => result,
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
@@ -256,17 +304,10 @@ fn prepare_path_entry_for_codex_aliases(
     let lock_file = lock_session_dir(path)?;
 
     let exe = std::env::current_exe()?;
-    let exe = exe.display();
+    let batch_contents = patch_alias_batch_script(&exe);
     for filename in &[APPLY_PATCH_ARG0, MISSPELLED_APPLY_PATCH_ARG0] {
         let batch_script = path.join(format!("{filename}.bat"));
-        std::fs::write(
-            &batch_script,
-            format!(
-                r#"@echo off
-"{exe}" {CODEX_CORE_APPLY_PATCH_ARG1} %*
-"#,
-            ),
-        )?;
+        std::fs::write(&batch_script, &batch_contents)?;
     }
 
     let updated_path_env_var = path_env_with_entry(path, existing_path)?;
@@ -278,6 +319,17 @@ fn prepare_path_entry_for_codex_aliases(
         },
         updated_path_env_var,
     ))
+}
+
+fn patch_alias_batch_script(exe: &Path) -> String {
+    // Quotes do not suppress percent expansion in batch source. Delayed
+    // expansion must also be disabled before cmd reads the executable line.
+    // An inherited ERRORLEVEL environment variable masks cmd's status pseudo-
+    // variable. Clear that alias locally before capturing the helper's exit.
+    let exe = exe.display().to_string().replace('%', "%%");
+    format!(
+        "@echo off\nsetlocal DisableDelayedExpansion\nset \"ERRORLEVEL=\"\n\"{exe}\" {CODEX_CORE_APPLY_PATCH_ARG1} %*\nexit /b %ERRORLEVEL%\n"
+    )
 }
 
 fn lock_session_dir(path: &Path) -> std::io::Result<File> {

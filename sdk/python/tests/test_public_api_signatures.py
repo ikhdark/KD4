@@ -40,6 +40,7 @@ EXPECTED_ROOT_EXPORTS = [
     "TurnHandle",
     "AsyncTurnHandle",
     "TurnResult",
+    "TurnRunError",
     "Input",
     "InputItem",
     "RunInput",
@@ -176,6 +177,7 @@ def test_root_exports_turn_result() -> None:
             "items",
             "usage",
             "surfaced_result",
+            "timing",
         ],
     }
 
@@ -332,7 +334,9 @@ def test_examples_use_public_import_surfaces() -> None:
                 if module not in public_modules or (
                     name not in {None, "*"} and name not in public_modules[module]
                 ):
-                    offenders.append((str(path.relative_to(examples_root)), node.lineno, module, name))
+                    offenders.append(
+                        (str(path.relative_to(examples_root)), node.lineno, module, name)
+                    )
 
     assert offenders == []
 
@@ -486,3 +490,98 @@ def test_lifecycle_methods_are_codex_scoped() -> None:
         AsyncCodex.thread_unarchive,
     ):
         _assert_no_any_annotations(fn)
+
+
+def test_service_tier_defaults_do_not_clear_existing_settings() -> None:
+    from openai_codex._presence import UNSET
+
+    for method in (
+        Codex.thread_start,
+        Codex.thread_resume,
+        Codex.thread_fork,
+        AsyncCodex.thread_start,
+        AsyncCodex.thread_resume,
+        AsyncCodex.thread_fork,
+        Thread.turn,
+        Thread.run,
+        AsyncThread.turn,
+        AsyncThread.run,
+    ):
+        assert _keyword_default(method, "service_tier") is UNSET
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"service_tier": None}, {"service_tier": "priority"}])
+def test_sync_and_async_wrappers_preserve_service_tier_presence(kwargs) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from openai_codex.client import _params_dict
+
+    class Capture:
+        process_epoch = 0
+        _sync = SimpleNamespace(_router=object())
+        wire = None
+
+        def capture(self, params):
+            self.wire = _params_dict(params)
+            return SimpleNamespace(
+                thread=SimpleNamespace(id="thread"), turn=SimpleNamespace(id="turn")
+            )
+
+        def thread_start(self, params):
+            return self.capture(params)
+
+        def thread_resume(self, thread_id, params):
+            return self.capture(params)
+
+        def thread_fork(self, thread_id, params):
+            return self.capture(params)
+
+        def turn_start(self, thread_id, input, *, params):
+            return self.capture(params)
+
+    def check(capture):
+        assert ("serviceTier" in capture.wire) == ("service_tier" in kwargs)
+        if "service_tier" in kwargs:
+            assert capture.wire["serviceTier"] == kwargs["service_tier"]
+
+    capture = Capture()
+    codex = object.__new__(Codex)
+    codex._client = capture
+    for method, args in [
+        (codex.thread_start, ()),
+        (codex.thread_resume, ("thread",)),
+        (codex.thread_fork, ("thread",)),
+        (Thread(capture, "thread").turn, ("continue",)),
+    ]:
+        method(*args, **kwargs)
+        check(capture)
+
+    class AsyncCapture(Capture):
+        async def thread_start(self, params):
+            return self.capture(params)
+
+        async def thread_resume(self, thread_id, params):
+            return self.capture(params)
+
+        async def thread_fork(self, thread_id, params):
+            return self.capture(params)
+
+        async def turn_start(self, thread_id, input, *, params):
+            return self.capture(params)
+
+    async def run_async():
+        capture = AsyncCapture()
+        codex = object.__new__(AsyncCodex)
+        codex._client = capture
+        codex._initialized = True
+        for method, args in [
+            (codex.thread_start, ()),
+            (codex.thread_resume, ("thread",)),
+            (codex.thread_fork, ("thread",)),
+            (AsyncThread(codex, "thread").turn, ("continue",)),
+        ]:
+            await method(*args, **kwargs)
+            check(capture)
+
+    asyncio.run(run_async())

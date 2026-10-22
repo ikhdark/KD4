@@ -176,7 +176,6 @@ async fn thread_start_normalizes_legacy_dynamic_tools_into_model_request() -> Re
     Ok(())
 }
 
-
 #[tokio::test]
 async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
     let server = MockServer::start().await;
@@ -194,7 +193,9 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
         .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
-    for (dynamic_tools, expected_error) in [
+    // Malformed tool shapes fail parameter decoding (-32602); well-formed tools
+    // that violate dynamic tool rules are invalid requests (-32600).
+    for (dynamic_tools, expected_code, expected_error) in [
         (
             json!([{
                 "type": "function",
@@ -207,6 +208,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
                 },
                 "deferLoading": true,
             }]),
+            -32600,
             "hidden_tool",
         ),
         (
@@ -230,6 +232,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
                     }
                 }
             ]),
+            -32602,
             "either canonical or legacy format",
         ),
         (
@@ -248,6 +251,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
                     "exposeToContext": false
                 }]
             }]),
+            -32602,
             "either canonical or legacy format",
         ),
         (
@@ -257,6 +261,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
                 "description": "Contains no tools",
                 "tools": []
             }]),
+            -32600,
             "must contain at least one tool",
         ),
         (
@@ -290,6 +295,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
                     }]
                 }
             ]),
+            -32600,
             "duplicate dynamic tool namespace",
         ),
     ] {
@@ -308,7 +314,7 @@ async fn thread_start_rejects_invalid_dynamic_tool_inputs() -> Result<()> {
             mcp.read_stream_until_error_message(RequestId::Integer(thread_req)),
         )
         .await??;
-        assert_eq!(error.error.code, -32600);
+        assert_eq!(error.error.code, expected_code, "{expected_error}");
         assert!(
             error.error.message.contains(expected_error),
             "unexpected error: {}",

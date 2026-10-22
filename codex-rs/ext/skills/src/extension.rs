@@ -121,6 +121,7 @@ where
                     SkillListQuery {
                         continuation: None,
                         turn_id: thread_store.level_id().to_string(),
+                        bound_executor_roots: Vec::new(),
                         executor_roots: Vec::new(),
                         host_snapshot: None,
                         include_host_skills: false,
@@ -157,6 +158,7 @@ where
                     SkillListQuery {
                         continuation: None,
                         turn_id: thread_store.level_id().to_string(),
+                        bound_executor_roots: Vec::new(),
                         executor_roots: Vec::new(),
                         host_snapshot: None,
                         include_host_skills: false,
@@ -199,6 +201,7 @@ where
                     SkillListQuery {
                         continuation: None,
                         turn_id: input.turn_id.to_string(),
+                        bound_executor_roots: input.bound_selected_capability_roots.to_vec(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
                         host_snapshot: None,
                         include_host_skills: false,
@@ -230,6 +233,7 @@ where
                     SkillListQuery {
                         continuation: None,
                         turn_id: input.turn_id.to_string(),
+                        bound_executor_roots: input.bound_selected_capability_roots.to_vec(),
                         executor_roots: input.ready_selected_capability_roots.to_vec(),
                         host_snapshot: None,
                         include_host_skills: false,
@@ -297,6 +301,7 @@ where
             let query = SkillListQuery {
                 continuation: None,
                 turn_id: input.turn_id.clone(),
+                bound_executor_roots: Vec::new(),
                 executor_roots: Vec::new(),
                 host_snapshot: host_snapshot.clone(),
                 include_host_skills: true,
@@ -313,6 +318,9 @@ where
                             SkillListQuery {
                                 continuation: None,
                                 turn_id: input.turn_id.clone(),
+                                bound_executor_roots: input
+                                    .bound_selected_capability_roots
+                                    .to_vec(),
                                 executor_roots: input.ready_selected_capability_roots.clone(),
                                 host_snapshot: None,
                                 include_host_skills: false,
@@ -362,12 +370,28 @@ where
             let mut remaining_prompt_bytes = MAX_SELECTED_PROMPT_BYTES - unavailable.render().len();
             for (index, entry) in selected_entries.iter().enumerate() {
                 let host_metadata = host_snapshot.as_ref().and_then(|snapshot| {
-                    (entry.authority.kind == SkillSourceKind::Host).then(|| snapshot.outcome().skills.iter().find(|skill|
-                        skill.path_to_skills_md.to_string_lossy().replace('\\', "/") == entry.main_prompt.as_str().replace('\\', "/")
-                    ).cloned()).flatten()
+                    (entry.authority.kind == SkillSourceKind::Host)
+                        .then(|| {
+                            snapshot
+                                .outcome()
+                                .skills
+                                .iter()
+                                .find(|skill| {
+                                    skill.path_to_skills_md.to_string_lossy().replace('\\', "/")
+                                        == entry.main_prompt.as_str().replace('\\', "/")
+                                })
+                                .cloned()
+                        })
+                        .flatten()
                 });
                 if let Some(skill) = &host_metadata {
-                    injected_host_skill_prompts.record_resolution(skill.clone(), Err("Selected skill was not admitted within the instruction budget".to_string()));
+                    injected_host_skill_prompts.record_resolution(
+                        skill.clone(),
+                        Err(
+                            "Selected skill was not admitted within the instruction budget"
+                                .to_string(),
+                        ),
+                    );
                 }
                 // This extension owns the selected load, including its failure
                 // and budget outcome. Legacy injection must not bypass it.
@@ -404,9 +428,14 @@ where
                                 ),
                             );
                         }
-                        injected_host_skill_prompts.record_instruction_fragment(fragment.role(), fragment.render(), fragment.contents.clone());
+                        injected_host_skill_prompts.record_instruction_fragment(
+                            fragment.role(),
+                            fragment.render(),
+                            fragment.contents.clone(),
+                        );
                         if let Some(skill) = host_metadata {
-                            injected_host_skill_prompts.record_resolution(skill, Ok(fragment.contents.clone()));
+                            injected_host_skill_prompts
+                                .record_resolution(skill, Ok(fragment.contents.clone()));
                         }
                         fragments.push(Box::new(fragment));
                         if entry.authority.kind == SkillSourceKind::Host {
@@ -415,7 +444,8 @@ where
                     }
                     Err(message) => {
                         if let Some(skill) = host_metadata {
-                            injected_host_skill_prompts.record_resolution(skill, Err(message.clone()));
+                            injected_host_skill_prompts
+                                .record_resolution(skill, Err(message.clone()));
                         }
                         self.emit_turn_warning(
                             thread_store,

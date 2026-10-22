@@ -8,6 +8,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::require_network;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -50,6 +51,16 @@ fn developer_texts(input: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Multi-turn fixtures need final answers: an empty response triggers the
+/// single missing-answer repair request, which would consume the next turn's mock.
+fn answered_sse(id: &str) -> String {
+    sse(vec![
+        ev_response_created(id),
+        ev_assistant_message(&format!("{id}-answer"), "done"),
+        ev_completed(id),
+    ])
+}
+
 fn collab_xml(text: &str) -> String {
     format!("{COLLABORATION_MODE_OPEN_TAG}{text}{COLLABORATION_MODE_CLOSE_TAG}")
 }
@@ -64,16 +75,8 @@ async fn assert_clearing_collaboration_instructions_emits_reset(
     require_network!();
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_sse("resp-2")).await;
 
     let test = test_codex().build(&server).await?;
     let active_instructions = "instructions to clear";
@@ -357,16 +360,8 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
     require_network!();
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_sse("resp-2")).await;
 
     let test = test_codex().build(&server).await?;
     let first_text = "first instructions";
@@ -456,16 +451,8 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_sse("resp-2")).await;
 
     let test = test_codex().build(&server).await?;
     let collab_text = "same instructions";
@@ -524,8 +511,15 @@ async fn collaboration_mode_update_noop_does_not_append() -> Result<()> {
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let input = req2.single_request().input();
-    let dev_texts = developer_texts(&input);
+    let request = req2.single_request();
+    assert!(
+        request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text.as_str() == "hello 2"),
+        "req2 must capture turn 2, not turn 1's missing-answer repair"
+    );
+    let dev_texts = developer_texts(&request.input());
     let collab_text = collab_xml(collab_text);
     assert_eq!(count_messages_containing(&dev_texts, &collab_text), 1);
 
@@ -537,16 +531,8 @@ async fn collaboration_mode_update_emits_new_instruction_message_when_mode_chang
     require_network!();
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_sse("resp-2")).await;
 
     let test = test_codex().build(&server).await?;
     let default_text = "default mode instructions";
@@ -634,16 +620,8 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_sse("resp-2")).await;
 
     let mut builder = test_codex();
     let initial = builder.build(&server).await?;
@@ -688,7 +666,10 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
     );
 
     initial.codex.submit(Op::Shutdown).await?;
-    wait_for_event(&initial.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed
         .codex
@@ -705,8 +686,15 @@ async fn resume_replays_collaboration_instructions() -> Result<()> {
         .await?;
     wait_for_event(&resumed.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    let input = req2.single_request().input();
-    let dev_texts = developer_texts(&input);
+    let request = req2.single_request();
+    assert!(
+        request
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text.as_str() == "after resume"),
+        "req2 must capture the resumed turn, not the first turn's missing-answer repair"
+    );
+    let dev_texts = developer_texts(&request.input());
     let collab_text = collab_xml(collab_text);
     assert_eq!(count_messages_containing(&dev_texts, &collab_text), 1);
 

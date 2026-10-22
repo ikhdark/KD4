@@ -27,6 +27,49 @@ const PROJECTOR: &str = r#"((isProxy) => {
   const projections = new WeakMap();
   const get = projections.get.bind(projections);
   const set = projections.set.bind(projections);
+  // Canonical helper evidence is not a diagnostic preview. Clone data
+  // descriptors without invoking user code, retaining every node and control
+  // field. Storage's existing byte admission rejects an oversized snapshot
+  // before changing a key; display overflow uses canonical cell-output custody.
+  function canonicalError(error, display = false) {
+    const active = new Set();
+    function clone(value, depth = 0) {
+      if (typeof value === 'function' || typeof value === 'symbol')
+        throw new TypeError('Unsupported canonical error evidence value');
+      if (value === null || typeof value !== 'object') return value;
+      if (depth >= 128 || isProxy(value) || active.has(value))
+        throw new TypeError('Canonical error evidence is cyclic, proxied, or too deep');
+      const isError = value instanceof NativeError;
+      // Diagnostic causes can be circular or arbitrarily deep. Preserve the
+      // graph's complete node/value map while keeping those diagnostics bounded.
+      // Canonical transport/storage never accepts this lossy fallback.
+      if (display && depth > 0 && isError)
+        return descriptor(value, 'results') ? canonicalError(value, true) : errorProjection(value);
+      const proto = prototype(value);
+      if (!isError && proto !== null && proto !== objectPrototype && proto !== arrayPrototype)
+        throw new TypeError('Canonical error evidence must contain plain data');
+      active.add(value);
+      try {
+        const array = Array.isArray(value);
+        const result = array ? [] : Object.create(null);
+        if (array) result.length = descriptor(value, 'length').value;
+        const names = isError ? [...new Set(['name', 'message', 'cause', 'evidence', 'results',
+          ...keys(value).filter(key => key !== 'stack')])] : keys(value);
+        for (const key of names) {
+          if (array && key === 'length') continue;
+          let field = descriptor(value, key);
+          if (!field && isError && key === 'name') field = descriptor(proto, key);
+          if (!field) continue;
+          if (!('value' in field)) throw new TypeError('Canonical error evidence cannot contain accessors');
+          Object.defineProperty(result, key, {value: clone(field.value, depth + 1),
+            enumerable: true, writable: true, configurable: true});
+        }
+        return result;
+      } finally { active.delete(value); }
+    }
+    return clone(error);
+  }
+  let canonicalSerialization = false;
   // Display-only: retain native errors in scripts, but never print opaque {}.
   function errorProjection(error, remaining = 16384, controlsFirst = true) {
     const seen = new Set();
@@ -86,16 +129,23 @@ const PROJECTOR: &str = r#"((isProxy) => {
     }
     return bounded(error);
   }
-  // Share one bounded serializer with explicit JSON.stringify as well as text.
-  // The Error objects and successful sibling values themselves stay untouched.
+  // Helper envelopes must remain actionable at the full legal graph capacity.
+  // Do not let a diagnostic property/string budget become persisted evidence.
+  // Ordinary errors still use bounded display; all originals remain untouched.
   Object.defineProperty(NativeError.prototype, 'toJSON', {
-    value: function toJSON() { return errorProjection(this); },
+    value: function toJSON() {
+      if (canonicalSerialization) return canonicalError(this);
+      return descriptor(this, 'results') ? canonicalError(this, true) : errorProjection(this);
+    },
     writable: true, configurable: true,
   });
   function same(value, original, depth = 0) {
     if (value === original) return true;
     if (depth >= 128 || value === null || original === null ||
         typeof value !== 'object' || typeof original !== 'object') return false;
+    // Descriptor equality cannot prove serialization equivalence for a Proxy.
+    // Check before any prototype/descriptor operation could invoke its traps.
+    if (isProxy(value) || isProxy(original)) return false;
     if (prototype(value) !== prototype(original)) return false;
     const names = keys(original);
     if (keys(value).length !== names.length) return false;
@@ -147,7 +197,9 @@ const PROJECTOR: &str = r#"((isProxy) => {
       if (Array.isArray(value)) return value.flatMap(bodies);
       if (!value || typeof value !== 'object') return [];
       if (value.canonical_range && (typeof value.text === 'string' || value.data_base64)) return [value];
-      return bodies(value.results || value.value?.hydrated_ranges || []);
+      if (Array.isArray(value.results)) return bodies(value.results);
+      return value.selector?.kind === 'search' && value.status === 'ok'
+        ? bodies(value.value?.hydrated_ranges || []) : [];
     };
     const local = bodies(fragment);
     let cached = cache?.get(source);
@@ -211,7 +263,8 @@ const PROJECTOR: &str = r#"((isProxy) => {
           source_sha256: source.source_sha256 || source.canonical_sha256,
           selectors: [{kind: 'bytes', start: range.start, end: range.end}]}};
       }
-      if (item.value?.hydrated_ranges) return {...item, value: {...item.value, hydrated_ranges: resolve(item.value.hydrated_ranges)}};
+      if (item.selector?.kind === 'search' && item.status === 'ok' && item.value?.hydrated_ranges)
+        return {...item, value: {...item.value, hydrated_ranges: resolve(item.value.hydrated_ranges)}};
       return item;
     };
     return resolve(fragment);
@@ -267,7 +320,9 @@ const PROJECTOR: &str = r#"((isProxy) => {
         }
         return framed;
       });
-      if (!texts.some(body => escapes(body.text))) return undefined;
+      // Standalone registered rows have no parent envelope. Even a short or
+      // empty body needs its trusted source label, not just its text/range.
+      if (!texts.some(body => escapes(body.text)) && source === projected) return undefined;
       return {envelope: {...projected, results}, texts};
     }
     if (Array.isArray(projected.content)) {
@@ -373,12 +428,16 @@ const PROJECTOR: &str = r#"((isProxy) => {
           typeof item === 'number' && !isSafeInteger(item) &&
           integerLexeme(context.source) !== null ? toBigInt(context.source) : item);
       }
-      return stringify(value, (_key, item) => {
-        if (typeof item !== 'bigint') return item;
-        if (item < -9223372036854775808n || item > 18446744073709551615n)
-          throw new RangeError('BigInt exceeds the exact JSON integer transport range');
-        return rawJSON(item.toString());
-      });
+      const previous = canonicalSerialization;
+      if (original === 'canonical') canonicalSerialization = true;
+      try {
+        return stringify(value, (_key, item) => {
+          if (typeof item !== 'bigint') return item;
+          if (item < -9223372036854775808n || item > 18446744073709551615n)
+            throw new RangeError('BigInt exceeds the exact JSON integer transport range');
+          return rawJSON(item.toString());
+        });
+      } finally { canonicalSerialization = previous; }
     }
     if (arguments.length === 4) {
       set(value, {original, projected, sourceFragments});
@@ -498,7 +557,9 @@ fn is_proxy_callback(
     retval.set_bool(args.get(0).is_proxy());
 }
 
-pub(super) fn prepare(scope: &mut v8::PinScope<'_, '_>) -> Result<v8::Global<v8::Function>, String> {
+pub(super) fn prepare(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> Result<v8::Global<v8::Function>, String> {
     let source = v8::String::new(scope, PROJECTOR)
         .ok_or_else(|| "failed to allocate output projector".to_string())?;
     let factory = v8::Script::compile(scope, source, None)
@@ -508,14 +569,18 @@ pub(super) fn prepare(scope: &mut v8::PinScope<'_, '_>) -> Result<v8::Global<v8:
     let is_proxy = v8::Function::new(scope, is_proxy_callback)
         .ok_or_else(|| "failed to install proxy guard".to_string())?;
     let receiver = v8::undefined(scope).into();
-    let function = factory.call(scope, receiver, &[is_proxy.into()])
+    let function = factory
+        .call(scope, receiver, &[is_proxy.into()])
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
         .ok_or_else(|| "failed to initialize output projector".to_string())?;
     Ok(v8::Global::new(scope, function))
 }
 
 pub(super) fn install(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
-    if scope.get_slot::<RuntimeState>().is_some_and(|state| state.output_projector.is_some()) {
+    if scope
+        .get_slot::<RuntimeState>()
+        .is_some_and(|state| state.output_projector.is_some())
+    {
         return Ok(());
     }
     let function = prepare(scope)?;
@@ -544,7 +609,11 @@ pub(super) fn register(
     let receiver = v8::undefined(scope).into();
     let source_fragments = v8::Boolean::new(scope, source_fragments).into();
     function
-        .call(scope, receiver, &[value, original, projected, source_fragments])
+        .call(
+            scope,
+            receiver,
+            &[value, original, projected, source_fragments],
+        )
         .ok_or_else(|| "failed to register output projection".to_string())?;
     Ok(())
 }
@@ -568,7 +637,8 @@ pub(super) fn json_codec<'s>(
     value: v8::Local<'_, v8::Value>,
     mode: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    let function = scope.get_slot::<RuntimeState>()
+    let function = scope
+        .get_slot::<RuntimeState>()
         .and_then(|state| state.output_projector.as_ref())
         .map(|function| v8::Local::new(scope, function))?;
     let receiver = v8::undefined(scope).into();
@@ -581,7 +651,9 @@ pub(super) fn capture_stored_presentation(
     value: v8::Local<'_, v8::Value>,
 ) -> Option<Value> {
     let metadata = json_codec(scope, value, "capture_presentation")?;
-    super::value::v8_value_to_json(scope, metadata).ok().flatten()
+    super::value::v8_value_to_json(scope, metadata)
+        .ok()
+        .flatten()
         .filter(|value| value.as_array().is_some_and(|entries| !entries.is_empty()))
 }
 
@@ -591,7 +663,10 @@ pub(super) fn restore_stored_presentation(
     metadata: &Value,
 ) -> Option<()> {
     let metadata = json_to_v8(scope, metadata)?;
-    let function = scope.get_slot::<RuntimeState>()?.output_projector.as_ref()
+    let function = scope
+        .get_slot::<RuntimeState>()?
+        .output_projector
+        .as_ref()
         .map(|function| v8::Local::new(scope, function))?;
     let receiver = v8::undefined(scope).into();
     let mode = v8::String::new(scope, "restore_presentation")?;
@@ -628,30 +703,53 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     default_timeout_ms: None,
-                }].into(),
+                }]
+                .into(),
                 source: r#"
                     const r = await tools.exec_command({});
                     String.prototype.indexOf = () => { throw Error('reentrant indexOf'); };
                     RegExp.prototype.test = () => { throw Error('reentrant regex'); };
                     RegExp.prototype.exec = () => { throw Error('reentrant regex exec'); };
                     text(r); text([r,r]); store('raw',r);
-                "#.into(),
+                "#
+                .into(),
                 yield_time_ms: None,
                 max_output_tokens: None,
                 default_tool_timeout_ms: None,
             };
-            let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000,
-                events, Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+            let (tx, _termination) = spawn_runtime(
+                HashMap::new(),
+                request,
+                60_000,
+                events,
+                Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
+                None,
+            )
+            .await
+            .unwrap();
             let mut printed = Vec::new();
             loop {
-                match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap() {
+                match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
                     RuntimeEvent::Started => {}
-                    RuntimeEvent::ToolCall {id, ..} => tx.send(RuntimeCommand::ToolResponse {
-                        id, result:raw.clone(),
-                    }).unwrap(),
-                    RuntimeEvent::ContentItem {item:FunctionCallOutputContentItem::InputText {text}, ..} =>
-                        printed.push(text),
-                    RuntimeEvent::Result {error_text, output_loss, stored_value_writes} => {
+                    RuntimeEvent::ToolCall { id, .. } => tx
+                        .send(RuntimeCommand::ToolResponse {
+                            id,
+                            result: raw.clone(),
+                        })
+                        .unwrap(),
+                    RuntimeEvent::ContentItem {
+                        item: FunctionCallOutputContentItem::InputText { text },
+                        ..
+                    } => printed.push(text),
+                    RuntimeEvent::Result {
+                        error_text,
+                        output_loss,
+                        stored_value_writes,
+                    } => {
                         assert_eq!(error_text, None);
                         assert_eq!(output_loss, None);
                         assert_eq!(*stored_value_writes["raw"].value, raw);
@@ -664,11 +762,18 @@ mod tests {
             if printed[0].contains("[source ") {
                 assert!(printed[0].ends_with(output));
                 assert!(printed[1].ends_with(output));
-                let envelope: Value = serde_json::from_str(printed[0].split_once('\n').unwrap().0).unwrap();
+                let envelope: Value =
+                    serde_json::from_str(printed[0].split_once('\n').unwrap().0).unwrap();
                 assert_eq!(envelope["output_lines"], output.split('\n').count());
             } else {
-                assert_eq!(serde_json::from_str::<Value>(&printed[0]).unwrap()["output"], output);
-                assert_eq!(serde_json::from_str::<Value>(&printed[1]).unwrap()[1]["output"], output);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&printed[0]).unwrap()["output"],
+                    output
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(&printed[1]).unwrap()[1]["output"],
+                    output
+                );
             }
         }
     }
@@ -689,33 +794,68 @@ mod tests {
         let raw = json!({"artifact_id":"snapshot","source_sha256":"hash","results":rows});
         let (events, mut rx) = mpsc::unbounded_channel();
         let request = ExecuteRequest {
-            state_path:None, tool_call_id:"critical-path-projection".into(),
-            enabled_tools:vec![ToolDefinition {
-                name:"read_file".into(), tool_name:ToolName::plain("read_file"),
-                kind:CodeModeToolKind::Function, description:"".into(),
-                input_schema:None, output_schema:None, default_timeout_ms:None,
-            }].into(),
-            source:r#"
+            state_path: None,
+            tool_call_id: "critical-path-projection".into(),
+            enabled_tools: vec![ToolDefinition {
+                name: "read_file".into(),
+                tool_name: ToolName::plain("read_file"),
+                kind: CodeModeToolKind::Function,
+                description: "".into(),
+                input_schema: None,
+                output_schema: None,
+                default_timeout_ms: None,
+            }]
+            .into(),
+            source: r#"
                 const r = await tools.read_file({});
                 text(r.results.slice(1,81).reverse());
                 text(r.results[81]);
                 text([r.results[1],r.results[1]]);
                 r.results[0].text = 'mutated';
                 text(r.results[1]);
-            "#.into(),
-            yield_time_ms:None, max_output_tokens:None, default_tool_timeout_ms:None,
+            "#
+            .into(),
+            yield_time_ms: None,
+            max_output_tokens: None,
+            default_tool_timeout_ms: None,
         };
-        let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, events,
-            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+        let (tx, _termination) = spawn_runtime(
+            HashMap::new(),
+            request,
+            60_000,
+            events,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
+            None,
+        )
+        .await
+        .unwrap();
         let mut printed = Vec::new();
         loop {
-            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
-                RuntimeEvent::Started => {},
-                RuntimeEvent::ToolCall {id, ..} => tx.send(RuntimeCommand::ToolResponse {id, result:raw.clone()}).unwrap(),
-                RuntimeEvent::ContentItem {item:FunctionCallOutputContentItem::InputText {text}, ..} => printed.push(text),
-                RuntimeEvent::Result {error_text, output_loss, ..} => {
-                    assert_eq!(error_text, None); assert_eq!(output_loss, None); break;
-                },
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                RuntimeEvent::Started => {}
+                RuntimeEvent::ToolCall { id, .. } => tx
+                    .send(RuntimeCommand::ToolResponse {
+                        id,
+                        result: raw.clone(),
+                    })
+                    .unwrap(),
+                RuntimeEvent::ContentItem {
+                    item: FunctionCallOutputContentItem::InputText { text },
+                    ..
+                } => printed.push(text),
+                RuntimeEvent::Result {
+                    error_text,
+                    output_loss,
+                    ..
+                } => {
+                    assert_eq!(error_text, None);
+                    assert_eq!(output_loss, None);
+                    break;
+                }
                 other => panic!("unexpected event {other:?}"),
             }
         }
@@ -724,12 +864,15 @@ mod tests {
         assert!(!printed[0].contains("\"shared\":true"));
         let invalid: Value = serde_json::from_str(&printed[1]).unwrap();
         assert_eq!(invalid["shared"], true);
-        assert_eq!(invalid["recovery"]["selectors"][0]["start"], size-6);
+        assert_eq!(invalid["recovery"]["selectors"][0]["start"], size - 6);
         assert_eq!(printed[2].matches("xλ😀\n").count(), 2);
         let changed: Value = serde_json::from_str(&printed[3]).unwrap();
         assert_eq!(changed["shared"], true);
         assert!(changed.get("text").is_none());
-        assert!(changed.get("recovery").is_none(), "mutation cannot inherit snapshot provenance");
+        assert!(
+            changed.get("recovery").is_none(),
+            "mutation cannot inherit snapshot provenance"
+        );
     }
 
     /// Recorded audits repeated each whole result's path and artifact in every
@@ -740,7 +883,7 @@ mod tests {
         let raw = json!({"path":"src/lib.rs","artifact_id":"snapshot","source_sha256":"hash",
             "complete":false, "results":[
                 {"selector":{"kind":"lines","start":1,"end":1},"status":"ok","complete":true,
-                    "text":"first \"line\"\n"},
+                    "text":"alpha"},
                 {"selector":{"kind":"lines","start":2,"end":9},"status":"ok","complete":false,
                     "text":"second \"line\"\n"}]});
         let (events, mut rx) = mpsc::unbounded_channel();
@@ -751,18 +894,42 @@ mod tests {
                 kind: CodeModeToolKind::Function, description: "".into(),
                 input_schema: None, output_schema: None, default_timeout_ms: None,
             }].into(),
-            source: "const r = await tools.read_file({}); text(r); text(r.results[0]);".into(),
+            source: "const r = await tools.read_file({}); text(r); text(r.results[0]); text([r.results[0], r.results[1]]);".into(),
             yield_time_ms: None, max_output_tokens: None, default_tool_timeout_ms: None,
         };
-        let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, events,
-            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+        let (tx, _termination) = spawn_runtime(
+            HashMap::new(),
+            request,
+            60_000,
+            events,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
+            None,
+        )
+        .await
+        .unwrap();
         let mut printed = Vec::new();
         loop {
-            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
                 RuntimeEvent::Started => {}
-                RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result: raw.clone() }).unwrap(),
-                RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
-                RuntimeEvent::Result { error_text, output_loss, .. } => {
+                RuntimeEvent::ToolCall { id, .. } => tx
+                    .send(RuntimeCommand::ToolResponse {
+                        id,
+                        result: raw.clone(),
+                    })
+                    .unwrap(),
+                RuntimeEvent::ContentItem {
+                    item: FunctionCallOutputContentItem::InputText { text },
+                    ..
+                } => printed.push(text),
+                RuntimeEvent::Result {
+                    error_text,
+                    output_loss,
+                    ..
+                } => {
                     assert_eq!(error_text, None);
                     assert_eq!(output_loss, None);
                     break;
@@ -770,52 +937,110 @@ mod tests {
                 other => panic!("unexpected event {other:?}"),
             }
         }
-        let labels = |printed: &str| printed.lines()
-            .filter_map(|line| line.strip_prefix("[source ")?.strip_suffix(']'))
-            .map(|label| serde_json::from_str::<Value>(label).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(printed.len(), 2);
+        let labels = |printed: &str| {
+            printed
+                .lines()
+                .filter_map(|line| line.strip_prefix("[source ")?.strip_suffix(']'))
+                .map(|label| serde_json::from_str::<Value>(label).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(printed.len(), 3);
         let header: Value = serde_json::from_str(printed[0].lines().next().unwrap()).unwrap();
-        assert_eq!((&header["path"], &header["artifact_id"]), (&raw["path"], &raw["artifact_id"]));
+        assert_eq!(
+            (&header["path"], &header["artifact_id"]),
+            (&raw["path"], &raw["artifact_id"])
+        );
         let whole = labels(&printed[0]);
         assert_eq!(whole.len(), 2, "{}", printed[0]);
         for (label, result) in whole.iter().zip(raw["results"].as_array().unwrap()) {
-            assert!(label.get("path").is_none() && label.get("artifact_id").is_none(), "{label}");
+            assert!(
+                label.get("path").is_none() && label.get("artifact_id").is_none(),
+                "{label}"
+            );
             assert_eq!(label["selector"], result["selector"]);
         }
-        assert!(whole[0].get("complete").is_none(), "a complete body needs no flag");
-        assert_eq!(whole[1]["complete"], false, "an incomplete body stays marked");
+        assert!(
+            whole[0].get("complete").is_none(),
+            "a complete body needs no flag"
+        );
+        assert_eq!(
+            whole[1]["complete"], false,
+            "an incomplete body stays marked"
+        );
         assert!(printed[0].ends_with("second \"line\"\n"));
         let fragment = labels(&printed[1]);
         assert_eq!(fragment.len(), 1, "{}", printed[1]);
-        assert_eq!((&fragment[0]["path"], &fragment[0]["artifact_id"]), (&raw["path"], &raw["artifact_id"]));
+        assert_eq!(
+            (&fragment[0]["path"], &fragment[0]["artifact_id"]),
+            (&raw["path"], &raw["artifact_id"])
+        );
+        assert_eq!(fragment[0]["source_sha256"], "hash");
+        assert!(printed[1].ends_with("alpha"));
+        let batch = labels(&printed[2]);
+        assert_eq!(batch.len(), 2);
+        assert!(batch.iter().all(|label| label["artifact_id"] == "snapshot"));
     }
 
     #[tokio::test]
     async fn stored_presentation_avoids_an_overflow_recovery_round_trip() {
-        async fn cell(source: &str, stored: HashMap<String, StoredValue>, raw: &Value, limit: usize)
-            -> (Vec<String>, HashMap<String, StoredValue>, bool)
-        {
+        async fn cell(
+            source: &str,
+            stored: HashMap<String, StoredValue>,
+            raw: &Value,
+            limit: usize,
+        ) -> (Vec<String>, HashMap<String, StoredValue>, bool) {
             let (events, mut rx) = mpsc::unbounded_channel();
             let request = ExecuteRequest {
-                state_path: None, tool_call_id: "stored-presentation".into(),
+                state_path: None,
+                tool_call_id: "stored-presentation".into(),
                 enabled_tools: vec![ToolDefinition {
-                    name: "read_file".into(), tool_name: ToolName::plain("read_file"),
-                    kind: CodeModeToolKind::Function, description: String::new().into(),
-                    input_schema: None, output_schema: None, default_timeout_ms: None,
-                }].into(),
-                source: source.into(), yield_time_ms: None, max_output_tokens: None,
+                    name: "read_file".into(),
+                    tool_name: ToolName::plain("read_file"),
+                    kind: CodeModeToolKind::Function,
+                    description: String::new().into(),
+                    input_schema: None,
+                    output_schema: None,
+                    default_timeout_ms: None,
+                }]
+                .into(),
+                source: source.into(),
+                yield_time_ms: None,
+                max_output_tokens: None,
                 default_tool_timeout_ms: None,
             };
-            let (tx, _termination) = spawn_runtime(stored, request, 60_000, events,
-                Arc::new(OutputAdmission::new(limit)), None).await.unwrap();
+            let (tx, _termination) = spawn_runtime(
+                stored,
+                request,
+                60_000,
+                events,
+                Arc::new(OutputAdmission::new(limit)),
+                None,
+            )
+            .await
+            .unwrap();
             let mut printed = Vec::new();
             loop {
-                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
                     RuntimeEvent::Started => {}
-                    RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result: raw.clone() }).unwrap(),
-                    RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
-                    RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+                    RuntimeEvent::ToolCall { id, .. } => tx
+                        .send(RuntimeCommand::ToolResponse {
+                            id,
+                            result: raw.clone(),
+                        })
+                        .unwrap(),
+                    RuntimeEvent::ContentItem {
+                        item: FunctionCallOutputContentItem::InputText { text },
+                        ..
+                    } => printed.push(text),
+                    RuntimeEvent::Result {
+                        error_text,
+                        stored_value_writes,
+                        output_loss,
+                    } => {
                         assert_eq!(error_text, None);
                         return (printed, stored_value_writes, output_loss.is_some());
                     }
@@ -837,59 +1062,128 @@ mod tests {
         assert!(saved["plain"].presentation.is_none());
         assert!(saved["batch"].presentation.is_some());
         assert!(saved["row"].presentation.is_some());
-        assert!(serde_json::to_vec(saved["raw"].presentation.as_ref().unwrap()).unwrap().len() < 1_024,
-            "presentation must not duplicate retained source text");
+        assert!(
+            serde_json::to_vec(saved["raw"].presentation.as_ref().unwrap())
+                .unwrap()
+                .len()
+                < 1_024,
+            "presentation must not duplicate retained source text"
+        );
         let limit = serde_json::to_vec(&FunctionCallOutputContentItem::InputText {
             text: before[0].clone(),
-        }).unwrap().len() + 128;
+        })
+        .unwrap()
+        .len()
+            + 128;
         let (after, _, loss) = cell("text(load('raw'));", saved.clone(), &raw, limit).await;
         assert_eq!(after.len(), before.len());
         for (after, before) in after.iter().zip(&before) {
             let (after_metadata, after_source) = after.split_once('\n').unwrap();
             let (before_metadata, before_source) = before.split_once('\n').unwrap();
-            assert_eq!(serde_json::from_str::<Value>(after_metadata).unwrap(),
-                serde_json::from_str::<Value>(before_metadata).unwrap());
-            assert_eq!(after_source, before_source, "retained source bytes stay exact");
+            assert_eq!(
+                serde_json::from_str::<Value>(after_metadata).unwrap(),
+                serde_json::from_str::<Value>(before_metadata).unwrap()
+            );
+            assert_eq!(
+                after_source, before_source,
+                "retained source bytes stay exact"
+            );
         }
-        assert!(!loss, "trusted load must fit without an overflow/recovery call");
+        assert!(
+            !loss,
+            "trusted load must fit without an overflow/recovery call"
+        );
         let (_, _, old_loss) = cell("text(load('plain'));", saved.clone(), &raw, limit).await;
-        assert!(old_loss, "the former plain-JSON load requires overflow recovery at the same budget");
-        let (batch, _, loss) = cell("text(load('batch')); text(load('row'));", saved.clone(), &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
+        assert!(
+            old_loss,
+            "the former plain-JSON load requires overflow recovery at the same budget"
+        );
+        let (batch, _, loss) = cell(
+            "text(load('batch')); text(load('row'));",
+            saved.clone(),
+            &raw,
+            MAX_BUFFERED_OUTPUT_BYTES,
+        )
+        .await;
         assert!(!loss);
         assert!(batch.iter().all(|text| text.contains("[source ")));
         assert!(batch[1].contains("\"source_sha256\":\"sha\""));
         assert!(batch[1].contains("\"environment_id\":\"fixture-env\""));
         assert!(batch[1].contains("\"canonical_uri\":\"file:///source.rs\""));
-        let (changed, _, loss) = cell("const r=load('raw'); r.results[0].text='changed'; text(r);", saved, &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
+        let (changed, _, loss) = cell(
+            "const r=load('raw'); r.results[0].text='changed'; text(r);",
+            saved,
+            &raw,
+            MAX_BUFFERED_OUTPUT_BYTES,
+        )
+        .await;
         assert!(!loss);
-        assert_eq!(serde_json::from_str::<Value>(&changed[0]).unwrap()["results"][0]["text"], "changed");
+        assert_eq!(
+            serde_json::from_str::<Value>(&changed[0]).unwrap()["results"][0]["text"],
+            "changed"
+        );
     }
 
     #[tokio::test]
     async fn mcp_text_framing_preserves_evidence_and_avoids_recovery_after_load() {
-        async fn cell(source: &str, stored: HashMap<String, StoredValue>, raw: &Value, limit: usize)
-            -> (Vec<String>, HashMap<String, StoredValue>, bool)
-        {
+        async fn cell(
+            source: &str,
+            stored: HashMap<String, StoredValue>,
+            raw: &Value,
+            limit: usize,
+        ) -> (Vec<String>, HashMap<String, StoredValue>, bool) {
             let (events, mut rx) = mpsc::unbounded_channel();
             let request = ExecuteRequest {
-                state_path: None, tool_call_id: "mcp-presentation".into(),
+                state_path: None,
+                tool_call_id: "mcp-presentation".into(),
                 enabled_tools: vec![ToolDefinition {
-                    name: "mcp__node_repl__js".into(), tool_name: ToolName::plain("mcp__node_repl__js"),
-                    kind: CodeModeToolKind::Function, description: String::new().into(),
-                    input_schema: None, output_schema: None, default_timeout_ms: None,
-                }].into(),
-                source: source.into(), yield_time_ms: None, max_output_tokens: None,
+                    name: "mcp__node_repl__js".into(),
+                    tool_name: ToolName::plain("mcp__node_repl__js"),
+                    kind: CodeModeToolKind::Function,
+                    description: String::new().into(),
+                    input_schema: None,
+                    output_schema: None,
+                    default_timeout_ms: None,
+                }]
+                .into(),
+                source: source.into(),
+                yield_time_ms: None,
+                max_output_tokens: None,
                 default_tool_timeout_ms: None,
             };
-            let (tx, _termination) = spawn_runtime(stored, request, 60_000, events,
-                Arc::new(OutputAdmission::new(limit)), None).await.unwrap();
+            let (tx, _termination) = spawn_runtime(
+                stored,
+                request,
+                60_000,
+                events,
+                Arc::new(OutputAdmission::new(limit)),
+                None,
+            )
+            .await
+            .unwrap();
             let mut printed = Vec::new();
             loop {
-                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
                     RuntimeEvent::Started => {}
-                    RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result: raw.clone() }).unwrap(),
-                    RuntimeEvent::ContentItem { item: FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
-                    RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+                    RuntimeEvent::ToolCall { id, .. } => tx
+                        .send(RuntimeCommand::ToolResponse {
+                            id,
+                            result: raw.clone(),
+                        })
+                        .unwrap(),
+                    RuntimeEvent::ContentItem {
+                        item: FunctionCallOutputContentItem::InputText { text },
+                        ..
+                    } => printed.push(text),
+                    RuntimeEvent::Result {
+                        error_text,
+                        stored_value_writes,
+                        output_loss,
+                    } => {
                         assert_eq!(error_text, None);
                         return (printed, stored_value_writes, output_loss.is_some());
                     }
@@ -911,31 +1205,75 @@ mod tests {
         assert_eq!(*saved["raw"].value, raw);
         assert!(saved["raw"].presentation.is_some());
         assert!(saved["plain"].presentation.is_none());
-        assert!(serde_json::to_vec(saved["raw"].presentation.as_ref().unwrap()).unwrap().len() < 1_024);
+        assert!(
+            serde_json::to_vec(saved["raw"].presentation.as_ref().unwrap())
+                .unwrap()
+                .len()
+                < 1_024
+        );
         let (metadata, body) = before[0].split_once('\n').unwrap();
         let mut envelope: Value = serde_json::from_str(metadata).unwrap();
         let (header, text) = body.split_once('\n').unwrap();
-        assert_eq!(text, source, "Unicode, CRLF and escaped text must remain exact");
+        assert_eq!(
+            text, source,
+            "Unicode, CRLF and escaped text must remain exact"
+        );
         assert!(header.starts_with("[source "));
         assert!(header.contains("content[0].text"));
-        assert!(envelope["content"][0].as_object_mut().unwrap().remove("text_lines").is_some());
+        assert!(
+            envelope["content"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("text_lines")
+                .is_some()
+        );
         envelope["content"][0]["text"] = json!(text);
-        assert_eq!(envelope, raw, "all flags, annotations and non-text blocks survive");
-        let limit = serde_json::to_vec(&FunctionCallOutputContentItem::InputText { text: before[0].clone() }).unwrap().len() + 128;
+        assert_eq!(
+            envelope, raw,
+            "all flags, annotations and non-text blocks survive"
+        );
+        let limit = serde_json::to_vec(&FunctionCallOutputContentItem::InputText {
+            text: before[0].clone(),
+        })
+        .unwrap()
+        .len()
+            + 128;
         let (after, _, loss) = cell("text(load('raw'));", saved.clone(), &raw, limit).await;
         assert!(!loss);
         assert_eq!(after, before);
         let (_, _, old_loss) = cell("text(load('plain'));", saved.clone(), &raw, limit).await;
-        assert!(old_loss, "unframed JSON requires recovery at the same budget");
-        let (changed, _, loss) = cell("const r=load('raw'); r.content[0].text='changed'; text(r);", saved, &raw, MAX_BUFFERED_OUTPUT_BYTES).await;
+        assert!(
+            old_loss,
+            "unframed JSON requires recovery at the same budget"
+        );
+        let (changed, _, loss) = cell(
+            "const r=load('raw'); r.content[0].text='changed'; text(r);",
+            saved,
+            &raw,
+            MAX_BUFFERED_OUTPUT_BYTES,
+        )
+        .await;
         assert!(!loss);
         let mut expected = raw;
         expected["content"][0]["text"] = json!("changed");
-        assert_eq!(serde_json::from_str::<Value>(&changed[0]).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<Value>(&changed[0]).unwrap(),
+            expected
+        );
         let short = json!({"content":[{"type":"text","text":"short\nmessage"}],"isError":false});
-        let (printed, _, loss) = cell("text(await tools.mcp__node_repl__js({}));", HashMap::new(), &short, MAX_BUFFERED_OUTPUT_BYTES).await;
+        let (printed, _, loss) = cell(
+            "text(await tools.mcp__node_repl__js({}));",
+            HashMap::new(),
+            &short,
+            MAX_BUFFERED_OUTPUT_BYTES,
+        )
+        .await;
         assert!(!loss);
-        assert_eq!(serde_json::from_str::<Value>(&printed[0]).unwrap(), short, "small results must not grow");
+        assert_eq!(
+            serde_json::from_str::<Value>(&printed[0]).unwrap(),
+            short,
+            "small results must not grow"
+        );
     }
 
     #[tokio::test]
@@ -964,20 +1302,44 @@ mod tests {
             "#.into(),
             yield_time_ms:None, max_output_tokens:None, default_tool_timeout_ms:None,
         };
-        let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, event_tx,
-            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+        let (tx, _termination) = spawn_runtime(
+            HashMap::new(),
+            request,
+            60_000,
+            event_tx,
+            Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
+            None,
+        )
+        .await
+        .unwrap();
         let mut printed = Vec::new();
         loop {
-            match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
-                RuntimeEvent::Started => {},
-                RuntimeEvent::ToolCall { id, .. } => tx.send(RuntimeCommand::ToolResponse { id, result:raw.clone() }).unwrap(),
-                RuntimeEvent::ContentItem { item:FunctionCallOutputContentItem::InputText { text }, .. } => printed.push(text),
-                RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+            match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                RuntimeEvent::Started => {}
+                RuntimeEvent::ToolCall { id, .. } => tx
+                    .send(RuntimeCommand::ToolResponse {
+                        id,
+                        result: raw.clone(),
+                    })
+                    .unwrap(),
+                RuntimeEvent::ContentItem {
+                    item: FunctionCallOutputContentItem::InputText { text },
+                    ..
+                } => printed.push(text),
+                RuntimeEvent::Result {
+                    error_text,
+                    stored_value_writes,
+                    output_loss,
+                } => {
                     assert_eq!(error_text, None);
                     assert_eq!(output_loss, None);
                     assert_eq!(*stored_value_writes["raw"].value, raw);
                     break;
-                },
+                }
                 other => panic!("unexpected event {other:?}"),
             }
         }
@@ -985,8 +1347,15 @@ mod tests {
         assert_eq!(printed[0], printed[1]);
         assert_eq!(printed[0], printed[2]);
         assert!(printed[3].contains("annotation"));
-        assert!(!printed[..4].iter().any(|text| text.contains("exact stdout")));
-        assert!(printed[4].contains("exact stdout"), "unregistered arbitrary JSON remains exact");
+        assert!(
+            !printed[..4]
+                .iter()
+                .any(|text| text.contains("exact stdout"))
+        );
+        assert!(
+            printed[4].contains("exact stdout"),
+            "unregistered arbitrary JSON remains exact"
+        );
     }
 
     #[tokio::test]
@@ -1036,7 +1405,8 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     default_timeout_ms: None,
-                }].into(),
+                }]
+                .into(),
                 source: format!(
                     r#"
                     const r = await tools.{name}({{}});
@@ -1173,7 +1543,13 @@ mod tests {
                 recovery_envelope,
                 "fn a() {\r\n    \"x\"\r\n}",
             ),
-            ("search", "read_tool_output", search, search_envelope, source.as_str()),
+            (
+                "search",
+                "read_tool_output",
+                search,
+                search_envelope,
+                source.as_str(),
+            ),
         ] {
             let (event_tx, mut rx) = mpsc::unbounded_channel();
             let request = ExecuteRequest {
@@ -1224,7 +1600,11 @@ mod tests {
                         item: FunctionCallOutputContentItem::InputText { text },
                         ..
                     } => printed.push(text),
-                    RuntimeEvent::Result { error_text, stored_value_writes, output_loss } => {
+                    RuntimeEvent::Result {
+                        error_text,
+                        stored_value_writes,
+                        output_loss,
+                    } => {
                         assert_eq!(error_text, None);
                         assert_eq!(output_loss, None);
                         assert_eq!(*stored_value_writes["raw"].value, raw);
@@ -1233,7 +1613,17 @@ mod tests {
                     other => panic!("unexpected event {other:?}"),
                 }
             }
-            assert_eq!(printed.len(), if fixture == "command" { 3 } else if fixture == "search" { 8 } else { 7 }, "{name}");
+            assert_eq!(
+                printed.len(),
+                if fixture == "command" {
+                    3
+                } else if fixture == "search" {
+                    8
+                } else {
+                    7
+                },
+                "{name}"
+            );
             let (header, printed_body) = printed[0].split_once('\n').unwrap();
             assert_eq!(
                 serde_json::from_str::<Value>(header).unwrap(),
@@ -1251,25 +1641,43 @@ mod tests {
             );
             let (first_label, first_body) = printed_body.split_once('\n').unwrap();
             assert!(first_label.contains("\"body\":1"));
-            let rest = first_body.strip_prefix(body).unwrap().strip_prefix('\n').unwrap();
+            let rest = first_body
+                .strip_prefix(body)
+                .unwrap()
+                .strip_prefix('\n')
+                .unwrap();
             let (second_label, second_body) = rest.split_once('\n').unwrap();
             assert!(second_label.contains("\"body\":2"));
             if body.len() >= 512 {
                 assert!(second_label.contains("\"same_as_body\":1"));
                 assert!(second_body.is_empty());
-                assert_eq!(first_body.strip_suffix(rest).unwrap().trim_end_matches('\n'), body.trim_end_matches('\n'));
+                assert_eq!(
+                    first_body
+                        .strip_suffix(rest)
+                        .unwrap()
+                        .trim_end_matches('\n'),
+                    body.trim_end_matches('\n')
+                );
             } else {
                 assert_eq!(second_body, body, "{name}");
             }
-            let projected = codex_code_mode_protocol::model_visible_tool_result(&ToolName::plain(name), &raw).unwrap();
+            let projected =
+                codex_code_mode_protocol::model_visible_tool_result(&ToolName::plain(name), &raw)
+                    .unwrap();
             let old_batch = json!({"part":7,"results":[projected.clone(),projected]}).to_string();
             if fixture != "recovery" {
                 assert!(printed[1].len() < old_batch.len());
             }
-            println!("projection_audit {fixture} raw_bytes={} whole_bytes={} batch_before_bytes={} batch_after_bytes={}",
-                raw.to_string().len(), printed[0].len(), old_batch.len(), printed[1].len());
+            println!(
+                "projection_audit {fixture} raw_bytes={} whole_bytes={} batch_before_bytes={} batch_after_bytes={}",
+                raw.to_string().len(),
+                printed[0].len(),
+                old_batch.len(),
+                printed[1].len()
+            );
             if fixture != "command" {
-                let mut selected = vec![envelope["results"].clone(), envelope["results"][0].clone()];
+                let mut selected =
+                    vec![envelope["results"].clone(), envelope["results"][0].clone()];
                 if fixture == "search" {
                     selected.push(envelope["results"][0]["value"]["hydrated_ranges"].clone());
                 }
@@ -1278,16 +1686,28 @@ mod tests {
                     assert_eq!(serde_json::from_str::<Value>(header).unwrap(), *expected);
                     let (label, text) = text.split_once('\n').unwrap();
                     assert!(label.contains("artifact_id"));
-                    assert_eq!(text, body, "selected fields must preserve exact text and coverage");
+                    assert_eq!(
+                        text, body,
+                        "selected fields must preserve exact text and coverage"
+                    );
                 }
-                assert_eq!(serde_json::from_str::<Value>(&printed[2 + selected.len()]).unwrap(), raw["results"]);
-                assert_eq!(serde_json::from_str::<Value>(printed.last().unwrap()).unwrap(), raw["results"],
-                    "a changed parent must disable child projection too");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&printed[2 + selected.len()]).unwrap(),
+                    raw["results"]
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(printed.last().unwrap()).unwrap(),
+                    raw["results"],
+                    "a changed parent must disable child projection too"
+                );
                 if fixture == "search" {
                     assert!(printed[2].len() < raw["results"].to_string().len());
                 }
-                println!("projection_audit selected_{fixture} before_bytes={} after_bytes={}",
-                    raw["results"].to_string().len(), printed[2].len());
+                println!(
+                    "projection_audit selected_{fixture} before_bytes={} after_bytes={}",
+                    raw["results"].to_string().len(),
+                    printed[2].len()
+                );
             }
             // Added inert command metadata preserves the unchanged projection;
             // changed source parents still disable their fragment projections.
@@ -1299,11 +1719,16 @@ mod tests {
                 expected["extra"] = json!(1);
                 assert_eq!(serde_json::from_str::<Value>(header).unwrap(), expected);
                 assert_eq!(text.split_once('\n').unwrap().1, body);
-            } else { assert_eq!(
-                serde_json::from_str::<Value>(&printed[printed.len() - if fixture == "command" { 1 } else { 2 }]).unwrap(),
-                changed,
-                "{name}"
-            ); }
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(
+                        &printed[printed.len() - if fixture == "command" { 1 } else { 2 }]
+                    )
+                    .unwrap(),
+                    changed,
+                    "{name}"
+                );
+            }
         }
     }
 
@@ -1317,16 +1742,23 @@ mod tests {
                 {"canonical_range":{"start":0,"end":source.len()},"shared":true}]}}
         ]});
         for (name, raw, source) in [
-            ("read_tool_output", search, r#"
+            (
+                "read_tool_output",
+                search,
+                r#"
                 const r = await tools.read_tool_output({});
                 text(r); text(r.results[1]); text(r.results[1].value.hydrated_ranges[0]);
                 const bytes = r.results[0].value.hydrated_ranges[0].text;
                 if (r.results[1].value.hydrated_ranges[0].text !== undefined) throw Error('native mutated');
                 store('expected', bytes);
-            "#),
-            ("exec_command", json!({"output":"compact output", "stdout":"raw stdout ".repeat(1000),
+            "#,
+            ),
+            (
+                "exec_command",
+                json!({"output":"compact output", "stdout":"raw stdout ".repeat(1000),
                 "stderr":"raw stderr ".repeat(1000), "streams_complete":true, "exit_code":0,
-                "process_exited":true}), r#"
+                "process_exited":true}),
+                r#"
                 const r = await tools.exec_command({});
                 text(r); r.reviewed = true; text(r);
                 r.stdout = 'CHANGED'; text(r); r.stdout = 'raw stdout '.repeat(1000);
@@ -1336,32 +1768,72 @@ mod tests {
                 r.extra = new Proxy({ok:true}, {}); text(r); delete r.extra;
                 r.extra = {toJSON(){return 'CUSTOM';}}; text(r); delete r.extra;
                 r.toJSON = () => 'CUSTOM ROOT'; text(r);
-            "#),
+            "#,
+            ),
         ] {
             let (event_tx, mut rx) = mpsc::unbounded_channel();
             let request = ExecuteRequest {
-                state_path: None, tool_call_id: "verified10".into(),
+                state_path: None,
+                tool_call_id: "verified10".into(),
                 enabled_tools: vec![ToolDefinition {
-                    name:name.into(), tool_name:ToolName::plain(name), kind:CodeModeToolKind::Function,
-                    description:"".into(), input_schema:None, output_schema:None, default_timeout_ms:None,
-                }].into(), source:source.into(), yield_time_ms:None, max_output_tokens:None, default_tool_timeout_ms:None,
+                    name: name.into(),
+                    tool_name: ToolName::plain(name),
+                    kind: CodeModeToolKind::Function,
+                    description: "".into(),
+                    input_schema: None,
+                    output_schema: None,
+                    default_timeout_ms: None,
+                }]
+                .into(),
+                source: source.into(),
+                yield_time_ms: None,
+                max_output_tokens: None,
+                default_tool_timeout_ms: None,
             };
-            let (tx, _termination) = spawn_runtime(HashMap::new(), request, 60_000, event_tx,
-                Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)), None).await.unwrap();
+            let (tx, _termination) = spawn_runtime(
+                HashMap::new(),
+                request,
+                60_000,
+                event_tx,
+                Arc::new(OutputAdmission::new(MAX_BUFFERED_OUTPUT_BYTES)),
+                None,
+            )
+            .await
+            .unwrap();
             let mut printed = Vec::new();
             loop {
-                match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
-                    RuntimeEvent::Started => {},
-                    RuntimeEvent::ToolCall {id, ..} => tx.send(RuntimeCommand::ToolResponse {id, result:raw.clone()}).unwrap(),
-                    RuntimeEvent::ContentItem {item:FunctionCallOutputContentItem::InputText {text}, ..} => printed.push(text),
-                    RuntimeEvent::Result {error_text, output_loss, ..} => {
-                        assert_eq!(error_text, None); assert_eq!(output_loss, None); break;
-                    },
+                match tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    RuntimeEvent::Started => {}
+                    RuntimeEvent::ToolCall { id, .. } => tx
+                        .send(RuntimeCommand::ToolResponse {
+                            id,
+                            result: raw.clone(),
+                        })
+                        .unwrap(),
+                    RuntimeEvent::ContentItem {
+                        item: FunctionCallOutputContentItem::InputText { text },
+                        ..
+                    } => printed.push(text),
+                    RuntimeEvent::Result {
+                        error_text,
+                        output_loss,
+                        ..
+                    } => {
+                        assert_eq!(error_text, None);
+                        assert_eq!(output_loss, None);
+                        break;
+                    }
                     other => panic!("unexpected {other:?}"),
                 }
             }
             if name == "read_tool_output" {
-                let expected = raw["results"][0]["value"]["hydrated_ranges"][0]["text"].as_str().unwrap();
+                let expected = raw["results"][0]["value"]["hydrated_ranges"][0]["text"]
+                    .as_str()
+                    .unwrap();
                 assert_eq!(printed.len(), 3);
                 for (index, rendered) in printed.iter().enumerate() {
                     let (envelope, body) = rendered.split_once('\n').unwrap();
@@ -1384,8 +1856,14 @@ mod tests {
                     let value: Value = serde_json::from_str(text).unwrap();
                     assert!(value["stderr"].as_str().unwrap().starts_with("raw stderr"));
                 }
-                assert_eq!(serde_json::from_str::<Value>(&printed[2]).unwrap()["stdout"], "CHANGED");
-                assert_eq!(serde_json::from_str::<Value>(&printed[5]).unwrap()["extra"], "CUSTOM");
+                assert_eq!(
+                    serde_json::from_str::<Value>(&printed[2]).unwrap()["stdout"],
+                    "CHANGED"
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(&printed[5]).unwrap()["extra"],
+                    "CUSTOM"
+                );
                 assert_eq!(printed[6], "\"CUSTOM ROOT\"");
             }
         }

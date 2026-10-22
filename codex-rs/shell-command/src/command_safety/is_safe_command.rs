@@ -231,12 +231,23 @@ pub(crate) fn is_safe_git_command(command: &[String]) -> bool {
     let subcommand_args = &command[subcommand_idx + 1..];
 
     match subcommand {
-        "log" | "diff" | "show" => git_subcommand_args_are_read_only(subcommand_args),
+        "log" | "diff" | "show" => {
+            let options: Vec<_> = subcommand_args
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .collect();
+            git_subcommand_args_are_read_only(subcommand_args)
+                && git_fsmonitor_disabled(global_args)
+                && options.iter().any(|arg| arg.as_str() == "--no-ext-diff")
+                && options.iter().any(|arg| arg.as_str() == "--no-textconv")
+        }
         "branch" => {
             git_subcommand_args_are_read_only(subcommand_args)
                 && git_branch_is_read_only(subcommand_args)
         }
-        "status" => git_status_disables_optional_locks(global_args),
+        "status" => {
+            git_status_disables_optional_locks(global_args) && git_fsmonitor_disabled(global_args)
+        }
         other => {
             debug_assert!(false, "unexpected git subcommand from matcher: {other}");
             false
@@ -273,6 +284,15 @@ pub(crate) fn is_exact_version_probe(command: &[String]) -> bool {
 // making status safe to run concurrently with another workspace writer.
 fn git_status_disables_optional_locks(global_args: &[String]) -> bool {
     global_args.iter().any(|arg| arg == "--no-optional-locks")
+}
+
+fn git_fsmonitor_disabled(global_args: &[String]) -> bool {
+    global_args
+        .iter()
+        .any(|arg| arg == "-ccore.fsmonitor=false")
+        || global_args
+            .windows(2)
+            .any(|args| args[0] == "-c" && args[1] == "core.fsmonitor=false")
 }
 
 // Treat `git branch` as safe only when the arguments clearly indicate
@@ -363,10 +383,20 @@ fn git_matches_option_pattern(arg: &str, patterns: &[GitOptionPattern]) -> bool 
 }
 
 fn git_has_unsafe_global_option(global_args: &[String]) -> bool {
-    global_args
-        .iter()
-        .map(String::as_str)
-        .any(|arg| git_matches_option_pattern(arg, UNSAFE_GIT_GLOBAL_OPTIONS))
+    let mut args = global_args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "-ccore.fsmonitor=false" {
+            continue;
+        }
+        if arg == "-c" {
+            if args.next() != Some("core.fsmonitor=false") {
+                return true;
+            }
+        } else if git_matches_option_pattern(arg, UNSAFE_GIT_GLOBAL_OPTIONS) {
+            return true;
+        }
+    }
+    false
 }
 
 fn git_subcommand_args_are_read_only(args: &[String]) -> bool {
@@ -463,6 +493,8 @@ mod tests {
         assert!(is_safe_to_call_with_exec(&vec_str(&[
             "git",
             "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
             "status",
             "--short",
             "--branch",
@@ -492,10 +524,18 @@ mod tests {
             "--show-current",
         ])));
         assert!(!is_known_safe_command(&vec_str(&[
-            "git", "--no-pager", "branch", "-d", "feature",
+            "git",
+            "--no-pager",
+            "branch",
+            "-d",
+            "feature",
         ])));
         assert!(!is_known_safe_command(&vec_str(&[
-            "git", "-C", ".", "branch", "--show-current",
+            "git",
+            "-C",
+            ".",
+            "branch",
+            "--show-current",
         ])));
         assert!(!is_known_safe_command(&vec_str(&[
             "bash",
@@ -545,19 +585,41 @@ mod tests {
         // Git accepts these as --ext-diff, overriding --no-ext-diff and
         // executing GIT_EXTERNAL_DIFF. Approval must not depend on spelling.
         for flag in ["--ext", "--ext-d", "--ext-dif", "--ext-diff"] {
-            let argv = vec_str(&["git", "diff", "--no-ext-diff", flag]);
+            let argv = vec_str(&[
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                flag,
+            ]);
             assert!(!is_known_safe_direct_argv(&argv), "{flag}");
             assert!(!is_safe_powershell_words(&argv), "{flag}");
-            assert!(!is_known_safe_command(&vec_str(&[
-                "bash",
-                "-lc",
-                &format!("git diff --no-ext-diff {flag}"),
-            ])), "{flag}");
+            assert!(
+                !is_known_safe_command(&vec_str(&[
+                    "bash",
+                    "-lc",
+                    &format!("git -c core.fsmonitor=false diff --no-ext-diff --no-textconv {flag}"),
+                ])),
+                "{flag}"
+            );
         }
         // Disabling external programs and selecting output display characters
         // do not enable external execution or write an output file.
         for flag in ["--no-ext-diff", "--no-textconv", "--output-indicator-new=X"] {
-            assert!(is_known_safe_direct_argv(&vec_str(&["git", "diff", flag])), "{flag}");
+            assert!(
+                is_known_safe_direct_argv(&vec_str(&[
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    flag
+                ])),
+                "{flag}"
+            );
         }
     }
 
@@ -586,15 +648,39 @@ mod tests {
 
     #[test]
     fn git_subcommand_patch_flags_remain_safe() {
-        assert!(is_known_safe_command(&vec_str(&["git", "log", "-p", "-1"])));
-        assert!(is_known_safe_command(&vec_str(&["git", "diff", "-p"])));
         assert!(is_known_safe_command(&vec_str(&[
-            "git", "show", "-p", "HEAD",
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "log",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-p",
+            "-1"
+        ])));
+        assert!(is_known_safe_command(&vec_str(&[
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-p"
+        ])));
+        assert!(is_known_safe_command(&vec_str(&[
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-p",
+            "HEAD",
         ])));
         assert!(is_known_safe_command(&vec_str(&[
             "bash",
             "-lc",
-            "git log -p -1",
+            "git -c core.fsmonitor=false log --no-ext-diff --no-textconv -p -1",
         ])));
     }
 
@@ -791,6 +877,8 @@ mod tests {
         assert!(is_known_safe_command(&vec_str(&[
             r"C:\Program Files\Git\cmd\git.exe",
             "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
             "status",
         ])));
     }
@@ -807,7 +895,7 @@ mod tests {
         assert!(is_known_safe_command(&vec_str(&[
             "bash",
             "-lc",
-            "git --no-optional-locks status"
+            "git --no-optional-locks -c core.fsmonitor=false status"
         ])));
         assert!(is_known_safe_command(&vec_str(&[
             "bash",
@@ -931,6 +1019,163 @@ mod tests {
                 !is_known_safe_command(&command),
                 "expected unsafe: {command:?}"
             );
+        }
+    }
+}
+#[cfg(test)]
+mod configured_git_helper_tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn unproven_forms_require_approval_and_hardened_forms_keep_the_safe_path() {
+        for subcommand in ["diff", "log", "show"] {
+            for args in [
+                vec!["git", subcommand],
+                vec!["git", subcommand, "--no-ext-diff", "--no-textconv"],
+                vec![
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    subcommand,
+                    "--no-ext-diff",
+                ],
+                vec![
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    subcommand,
+                    "--no-textconv",
+                ],
+                vec![
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    subcommand,
+                    "--",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ],
+            ] {
+                assert!(!is_known_safe_direct_argv(&argv(&args)), "{args:?}");
+            }
+            let safe = [
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                subcommand,
+                "--no-ext-diff",
+                "--no-textconv",
+            ];
+            assert!(is_known_safe_direct_argv(&argv(&safe)));
+            for override_value in [
+                "core.fsmonitor=true",
+                "core.fsmonitor=helper",
+                "diff.external=helper",
+            ] {
+                let mut unsafe_args = argv(&safe);
+                unsafe_args.splice(3..3, ["-c".into(), override_value.into()]);
+                assert!(!is_known_safe_direct_argv(&unsafe_args));
+            }
+        }
+        assert!(!is_known_safe_direct_argv(&argv(&[
+            "git",
+            "--no-optional-locks",
+            "status"
+        ])));
+        assert!(is_known_safe_direct_argv(&argv(&[
+            "git",
+            "--no-optional-locks",
+            "-ccore.fsmonitor=false",
+            "status"
+        ])));
+    }
+
+    #[test]
+    fn helper_suppressed_git_commands_do_not_execute_configured_helpers() {
+        let home = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(home.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env(
+                    "GIT_CONFIG_GLOBAL",
+                    if cfg!(windows) { "NUL" } else { "/dev/null" },
+                )
+                .env_remove("GIT_EXTERNAL_DIFF")
+                .output()
+                .expect("Git is required for this contract fixture");
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "--quiet"]);
+        std::fs::write(home.path().join("file"), "before\n").unwrap();
+        run(&["add", "file"]);
+        std::fs::write(home.path().join("file"), "after\n").unwrap();
+        let marker = home.path().join("marker");
+        let helper = home.path().join("helper.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf ran >> '{}'\nprintf 'version2\\n'\n",
+                marker.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let helper = format!("\"{}\"", helper.display().to_string().replace('\\', "/"));
+        for (config_key, unproven, safe) in [
+            (
+                "diff.external",
+                vec!["git", "diff"],
+                vec![
+                    "git",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                ],
+            ),
+            (
+                "core.fsmonitor",
+                vec!["git", "--no-optional-locks", "status", "--porcelain"],
+                vec![
+                    "git",
+                    "--no-optional-locks",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "status",
+                    "--porcelain",
+                ],
+            ),
+        ] {
+            run(&["config", config_key, &helper]);
+            assert!(!is_known_safe_direct_argv(&argv(&unproven)));
+            run(&unproven[1..]);
+            assert!(
+                marker.exists(),
+                "fixture must actually execute {config_key}"
+            );
+            std::fs::remove_file(&marker).unwrap();
+            assert!(is_known_safe_direct_argv(&argv(&safe)));
+            run(&safe[1..]);
+            assert!(
+                !marker.exists(),
+                "safe admission must suppress {config_key}"
+            );
+            run(&["config", "--unset", config_key]);
         }
     }
 }

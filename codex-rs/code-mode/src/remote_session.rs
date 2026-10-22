@@ -20,6 +20,7 @@ use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::SessionId;
+use futures::FutureExt;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
@@ -33,6 +34,14 @@ mod connection;
 const CODE_MODE_HOST_PATH_ENV: &str = "CODEX_CODE_MODE_HOST_PATH";
 
 type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
+type PendingWait = Arc<tokio::sync::Mutex<Option<RetainedWait>>>;
+
+/// A cell wait the session keeps receiving after its observer drops.
+struct RetainedWait {
+    future: CodeModeSessionResultFuture<'static, WaitOutcome>,
+    /// Asks the host to release this observation while it is still received.
+    release: tokio_util::sync::CancellationToken,
+}
 
 /// Creates code-mode sessions backed by one lazily spawned process host.
 pub struct ProcessOwnedCodeModeSessionProvider {
@@ -143,6 +152,7 @@ impl OwnedProcessHost {
 
     async fn connection(&self) -> Result<Arc<Connection>, String> {
         if let Some(connection) = self.live_connection() {
+            connection.observe_reference();
             return Ok(connection);
         }
         let observed_failures = self
@@ -157,6 +167,7 @@ impl OwnedProcessHost {
             .await
             .map_err(|_| "code-mode host spawn coordinator closed".to_string())?;
         if let Some(connection) = self.live_connection() {
+            connection.observe_reference();
             return Ok(connection);
         }
         {
@@ -278,6 +289,9 @@ struct SessionInner {
     shutdown_requested: AtomicBool,
     shutdown_result: StdMutex<Option<ShutdownResultReceiver>>,
     retired_cleanups: StdMutex<Vec<SessionCleanup>>,
+    // Keep the receiving future, not just a successful intermediate send. A
+    // steered caller can drop its observation without discarding a host yield.
+    pending_waits: StdMutex<std::collections::HashMap<(u64, CellId), PendingWait>>,
 }
 
 /// A logical code-mode session assigned to a process-owned host.
@@ -311,6 +325,7 @@ impl ProcessOwnedCodeModeSession {
                 shutdown_requested: AtomicBool::new(false),
                 shutdown_result: StdMutex::new(None),
                 retired_cleanups: StdMutex::new(Vec::new()),
+                pending_waits: StdMutex::new(std::collections::HashMap::new()),
             }),
         }
     }
@@ -330,18 +345,114 @@ impl ProcessOwnedCodeModeSession {
         binding.connection.execute(binding.remote, request).await
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The per-cell guard owns the in-flight receiving future so a dropped observer leaves it in session custody; only waits for the same cell contend"
+    )]
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
-        binding.connection.wait(binding.remote, request).await
+        let key = (binding.remote.generation, request.cell_id.clone());
+        let pending = {
+            let mut waits = self
+                .inner
+                .pending_waits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.inner.shutdown_requested.load(Ordering::Acquire) {
+                return Err("code mode session is shutting down".into());
+            }
+            waits.retain(|(generation, _), _| *generation == key.0);
+            if !waits.contains_key(&key)
+                && waits.len() >= codex_code_mode_protocol::host::MAX_IN_FLIGHT_REQUESTS
+            {
+                return Err(
+                    "code-mode pending observation capacity reached; resume an existing cell"
+                        .into(),
+                );
+            }
+            Arc::clone(
+                waits
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
+            )
+        };
+        // Only this cell is serialized. Other cells and shutdown never wait on
+        // this mutex; dropping the observer leaves the future in session custody.
+        let mut receiving = pending.lock().await;
+        let mut retained_result = None;
+        if let Some(retained) = receiving.as_mut() {
+            // A host answer that reached the dropped observer belongs to this
+            // caller. A still-held observation must not hold this wait to its
+            // older yield deadline: release it, but keep receiving so a yield
+            // already sent by the host is delivered rather than discarded.
+            let result = match retained.future.as_mut().now_or_never() {
+                Some(result) => result,
+                None => {
+                    retained.release.cancel();
+                    retained.future.as_mut().await
+                }
+            };
+            let released = retained.release.is_cancelled();
+            *receiving = None;
+            if result.is_ok() || !released {
+                retained_result = Some(result);
+            }
+        }
+        let result = match retained_result {
+            Some(result) => result,
+            None => {
+                let release = tokio_util::sync::CancellationToken::new();
+                let host_release = release.clone();
+                let retained = receiving.insert(RetainedWait {
+                    future: Box::pin(async move {
+                        binding
+                            .connection
+                            .wait_releasable(binding.remote, request, host_release)
+                            .await
+                    }),
+                    release,
+                });
+                let result = retained.future.as_mut().await;
+                *receiving = None;
+                result
+            }
+        };
+        let mut waits = self
+            .inner
+            .pending_waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Arc::strong_count(&pending) == 2
+            && waits
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &pending))
+        {
+            waits.remove(&key);
+        }
+        result
     }
 
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
-        binding.connection.terminate(binding.remote, cell_id).await
+        let key = (binding.remote.generation, cell_id.clone());
+        let result = binding.connection.terminate(binding.remote, cell_id).await;
+        if result.is_ok() {
+            self.inner
+                .pending_waits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+        }
+        result
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
-        wait_for_watch(self.inner.request_shutdown()).await
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            wait_for_watch(self.inner.request_shutdown()),
+        )
+        .await
+        .map_err(|_| codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.to_string())?
     }
 }
 
@@ -441,6 +552,10 @@ impl SessionInner {
 
     fn request_shutdown(self: &Arc<Self>) -> ShutdownResultReceiver {
         self.shutdown_requested.store(true, Ordering::Release);
+        self.pending_waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let mut shutdown_result = self
             .shutdown_result
             .lock()
@@ -505,7 +620,21 @@ impl SessionInner {
                     return Ok(());
                 }
                 ShutdownAction::Close(binding) => {
-                    let result = binding.connection.shutdown_session(binding.remote).await;
+                    let result = loop {
+                        let result = binding
+                            .connection
+                            .shutdown_session(binding.remote.clone())
+                            .await;
+                        if result.as_ref().is_err_and(|error| {
+                            error == codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING
+                        }) {
+                            // Only re-observe close, never execution. The owned
+                            // driver and host lease survive an observer timeout.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        }
+                        break result;
+                    };
                     if result.is_err() && !binding.connection.is_alive() {
                         binding.cleanup.wait().await;
                     }

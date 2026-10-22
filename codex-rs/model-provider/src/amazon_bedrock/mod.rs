@@ -116,7 +116,10 @@ impl AmazonBedrockModelProvider {
 
     async fn api_auth(&self) -> Result<SharedAuthProvider> {
         let managed_auth = self.managed_auth();
-        Ok(self.resolve_auth_method(managed_auth.as_ref()).await?.into_provider(self.endpoint))
+        Ok(self
+            .resolve_auth_method(managed_auth.as_ref())
+            .await?
+            .into_provider(self.endpoint))
     }
 
     async fn resolve_auth_method(

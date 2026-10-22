@@ -19,6 +19,16 @@ class GenerationLockError(RuntimeError):
 
 
 def _acquire_nonblocking(handle: TextIO) -> None:
+    if os.name != "nt":
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise BlockingIOError from error
+            raise
+        return
     import msvcrt
 
     # Windows can lock beyond EOF. Never write before acquiring ownership:
@@ -33,6 +43,11 @@ def _acquire_nonblocking(handle: TextIO) -> None:
 
 
 def _release(handle: TextIO) -> None:
+    if os.name != "nt":
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
     import msvcrt
 
     handle.seek(0)

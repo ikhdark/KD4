@@ -182,7 +182,11 @@ async fn request_permissions_round_trip() -> Result<()> {
             }
         }
     }
-    assert_eq!(outputs.len(), 1, "model must receive the permission decision");
+    assert_eq!(
+        outputs.len(),
+        1,
+        "model must receive the permission decision"
+    );
     let response: codex_protocol::request_permissions::RequestPermissionsResponse =
         serde_json::from_str(&outputs[0])?;
     assert_eq!(

@@ -48,6 +48,7 @@ mod windows_impl {
     use codex_utils_absolute_path::AbsolutePathBuf;
     use std::fs::File;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -58,27 +59,29 @@ mod windows_impl {
     ///
     /// The 50 ms park bounds cancellation latency without busy-waiting.
     fn spawn_cancel_writer(
-        pipe_write: &File,
+        pipe_write: &Arc<Mutex<File>>,
         cancellation: Option<crate::WindowsSandboxCancellationToken>,
     ) -> Result<Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>> {
         let Some(cancellation) = cancellation else {
             return Ok(None);
         };
-        let mut pipe_write = pipe_write.try_clone()?;
+        let pipe_write = Arc::clone(pipe_write);
         let done = Arc::new(AtomicBool::new(false));
         let done_for_thread = Arc::clone(&done);
         let handle = std::thread::spawn(move || {
             while !done_for_thread.load(Ordering::SeqCst) {
                 if cancellation.is_cancelled() {
-                    let _ = write_frame(
-                        &mut pipe_write,
-                        &FramedMessage {
-                            version: IPC_PROTOCOL_VERSION,
-                            message: Message::Terminate {
-                                payload: EmptyPayload::default(),
+                    if let Ok(mut pipe_write) = pipe_write.lock() {
+                        let _ = write_frame(
+                            &mut *pipe_write,
+                            &FramedMessage {
+                                version: IPC_PROTOCOL_VERSION,
+                                message: Message::Terminate {
+                                    payload: EmptyPayload::default(),
+                                },
                             },
-                        },
-                    );
+                        );
+                    }
                     break;
                 }
                 std::thread::park_timeout(Duration::from_millis(50));
@@ -197,6 +200,7 @@ mod windows_impl {
                 },
             )?;
             let (pipe_write, mut pipe_read) = transport.into_files();
+            let pipe_write = Arc::new(Mutex::new(pipe_write));
             let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
 
             let mut stdout = crate::RetainedCapture::new(retained_bytes_cap);
@@ -210,20 +214,41 @@ mod windows_impl {
                 match msg.message {
                     Message::SpawnReady { .. } => {}
                     Message::Output { payload } => match decode_bytes(&payload.data_b64) {
-                        Ok(bytes) => match payload.stream {
-                            OutputStream::Stdout => {
-                                stdout.append(&bytes);
-                                if let Some(output_sink) = output_sink.as_ref() {
-                                    output_sink(crate::CaptureOutputStream::Stdout, &bytes);
+                        Ok(bytes) => {
+                            if bytes.len() > crate::ipc_framed::IO_CHUNK_BYTES {
+                                break Err(anyhow::anyhow!("runner exceeded output chunk size"));
+                            }
+                            match payload.stream {
+                                OutputStream::Stdout => {
+                                    stdout.append(&bytes);
+                                    if let Some(output_sink) = output_sink.as_ref() {
+                                        output_sink(crate::CaptureOutputStream::Stdout, &bytes);
+                                    }
+                                }
+                                OutputStream::Stderr => {
+                                    stderr.append(&bytes);
+                                    if let Some(output_sink) = output_sink.as_ref() {
+                                        output_sink(crate::CaptureOutputStream::Stderr, &bytes);
+                                    }
                                 }
                             }
-                            OutputStream::Stderr => {
-                                stderr.append(&bytes);
-                                if let Some(output_sink) = output_sink.as_ref() {
-                                    output_sink(crate::CaptureOutputStream::Stderr, &bytes);
-                                }
+                            let ack = FramedMessage {
+                                version: IPC_PROTOCOL_VERSION,
+                                message: Message::OutputAck {
+                                    payload: crate::ipc_framed::OutputCredit {
+                                        stream: payload.stream,
+                                        chunks: 1,
+                                    },
+                                },
+                            };
+                            // After a cancellation Terminate the runner stops reading control
+                            // frames and closes that pipe while output already in flight is
+                            // still delivered; it needs no further credits, and its Exit frame
+                            // (or pipe EOF) still ends this loop.
+                            if let Ok(mut pipe) = pipe_write.lock() {
+                                let _ = write_frame(&mut *pipe, &ack);
                             }
-                        },
+                        }
                         Err(err) => {
                             break Err(err);
                         }
@@ -275,14 +300,15 @@ mod windows_impl {
 
         #[test]
         fn cancellation_sends_a_terminate_frame_the_runner_accepts() -> anyhow::Result<()> {
-            let mut pipe = tempfile::tempfile()?;
+            let pipe = std::sync::Arc::new(std::sync::Mutex::new(tempfile::tempfile()?));
             let cancellation = crate::WindowsSandboxCancellationToken::new(|| true);
             let (writer, _done) =
                 spawn_cancel_writer(&pipe, Some(cancellation))?.expect("cancel writer");
             writer.join().expect("join cancel writer");
 
+            let mut pipe = pipe.lock().unwrap();
             pipe.rewind()?;
-            let frame = read_frame(&mut pipe)?.expect("runner must receive a terminate frame");
+            let frame = read_frame(&mut *pipe)?.expect("runner must receive a terminate frame");
             assert!(matches!(frame.message, Message::Terminate { .. }));
             Ok(())
         }

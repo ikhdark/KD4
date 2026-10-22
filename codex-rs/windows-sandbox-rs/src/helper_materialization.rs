@@ -426,7 +426,6 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
     use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
 
-
     #[test]
     fn destination_is_fresh_uses_size_and_mtime() {
         let tmp = TempDir::new().expect("tempdir");
@@ -445,18 +444,26 @@ mod tests {
                 .expect("set fixture timestamp");
         };
         set_modified(&source, source_time);
-        set_modified(&destination, source_time - std::time::Duration::from_secs(2));
+        set_modified(
+            &destination,
+            source_time - std::time::Duration::from_secs(2),
+        );
         assert!(!destination_is_fresh(&source, &destination).expect("stale metadata"));
 
-        set_modified(&destination, source_time + std::time::Duration::from_secs(2));
+        set_modified(
+            &destination,
+            source_time + std::time::Duration::from_secs(2),
+        );
         assert!(destination_is_fresh(&source, &destination).expect("fresh metadata"));
 
         // A newer destination of a different size is still stale.
         fs::write(&destination, b"different-size").expect("rewrite destination");
-        set_modified(&destination, source_time + std::time::Duration::from_secs(2));
+        set_modified(
+            &destination,
+            source_time + std::time::Duration::from_secs(2),
+        );
         assert!(!destination_is_fresh(&source, &destination).expect("size mismatch"));
     }
-
 
     #[test]
     fn deleted_cached_helper_path_is_invalidated() {
@@ -480,8 +487,14 @@ mod tests {
         fs::write(&source, b"runner-v1").expect("write source");
 
         let (first_path, first_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
-        assert_eq!(first_path, codex_home.join(".sandbox-bin").join("source.exe"));
-        assert_eq!(fs::read(&first_path).expect("read first helper"), b"runner-v1");
+        assert_eq!(
+            first_path,
+            codex_home.join(".sandbox-bin").join("source.exe")
+        );
+        assert_eq!(
+            fs::read(&first_path).expect("read first helper"),
+            b"runner-v1"
+        );
         assert_eq!(HelperMaterializationStatus::ReCopied, first_status);
 
         let (second_path, second_status) = resolve_exe_for_launch_with_status(&source, &codex_home);
@@ -665,7 +678,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![destination]);
     }
-
 
     #[test]
     fn copy_runner_into_shared_bin_dir() {

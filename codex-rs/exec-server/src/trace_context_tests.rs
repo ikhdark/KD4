@@ -30,7 +30,11 @@ fn creates_traceparent_header_from_current_span() {
         let traceparent = headers.get("traceparent").expect("traceparent header");
         // These fields come from the supplied parent, not the helper used by
         // the implementation to serialize its current span.
-        let fields: Vec<_> = traceparent.to_str().expect("valid header").split('-').collect();
+        let fields: Vec<_> = traceparent
+            .to_str()
+            .expect("valid header")
+            .split('-')
+            .collect();
         assert_eq!(fields.len(), 4);
         assert_eq!(fields[0], "00");
         assert_eq!(fields[1], "0123456789abcdef0123456789abcdef");

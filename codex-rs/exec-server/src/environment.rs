@@ -66,7 +66,13 @@ pub const REMOTE_ENVIRONMENT_ID: &str = "remote";
 impl EnvironmentManager {
     /// Builds a test-only manager without configured sandbox helper paths.
     pub fn default_for_tests() -> Self {
-        let local_environment = Arc::new(Environment::default_for_tests());
+        Self::default_for_tests_with_local_environment(Arc::new(Environment::default_for_tests()))
+    }
+
+    /// Builds a test-only manager whose local registration is `local_environment`,
+    /// so a test snapshot can inherit that exact instance (for example one backed
+    /// by a controlled filesystem) instead of being retired as a replacement.
+    pub fn default_for_tests_with_local_environment(local_environment: Arc<Environment>) -> Self {
         Self {
             default_environment: Some(LOCAL_ENVIRONMENT_ID.to_string()),
             environments: RwLock::new(HashMap::from([(
@@ -475,7 +481,83 @@ impl std::fmt::Debug for Environment {
     }
 }
 
+/// Cached initialized-session metadata and the process owner it describes.
+#[derive(Clone)]
+pub struct EnvironmentRuntime {
+    pub session_id: String,
+    pub incarnation: String,
+    pub info: EnvironmentInfo,
+    pub exec_backend: Arc<dyn ExecBackend>,
+    client: Option<crate::client::ExecServerClient>,
+}
+
+impl EnvironmentRuntime {
+    pub fn for_tests(
+        session_id: String,
+        info: EnvironmentInfo,
+        exec_backend: Arc<dyn ExecBackend>,
+    ) -> Self {
+        Self {
+            incarnation: session_id.clone(),
+            session_id,
+            info,
+            exec_backend,
+            client: None,
+        }
+    }
+}
+
 impl Environment {
+    fn runtime_for_client(client: crate::client::ExecServerClient) -> Option<EnvironmentRuntime> {
+        Some(EnvironmentRuntime {
+            session_id: client.session_id()?,
+            incarnation: client.instance_id().to_string(),
+            info: client.cached_environment_info()?,
+            exec_backend: Arc::new(crate::remote_process::RemoteProcess::bound(client.clone())),
+            client: Some(client),
+        })
+    }
+
+    pub fn cached_runtime(&self) -> Option<EnvironmentRuntime> {
+        Self::runtime_for_client(self.remote_client.as_ref()?.cached_client()?)
+    }
+
+    /// Freeze process, filesystem and HTTP authority to one initialized session.
+    pub fn bound_to_runtime(&self, runtime: &EnvironmentRuntime) -> Self {
+        let Some(client) = &self.remote_client else {
+            return self.clone();
+        };
+        let Some(runtime_client) = &runtime.client else {
+            return self.clone();
+        };
+        let client = client.bound(runtime_client.clone());
+        Self {
+            remote_client: Some(client.clone()),
+            exec_backend: Arc::clone(&runtime.exec_backend),
+            filesystem: Arc::new(RemoteFileSystem::new(client.clone())),
+            http_client: Arc::new(client),
+            ..self.clone()
+        }
+    }
+
+    pub async fn current_runtime(&self) -> Result<Option<EnvironmentRuntime>, ExecServerError> {
+        match &self.remote_client {
+            Some(client) => {
+                let client = client.get().await?;
+                Self::runtime_for_client(client).map(Some).ok_or_else(|| {
+                    ExecServerError::Protocol(
+                        "initialized remote runtime metadata is unavailable".into(),
+                    )
+                })
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self.readiness_result(), Some(Ok(())))
+    }
+
     /// Builds an environment from the raw `CODEX_EXEC_SERVER_URL` value.
     pub fn create(
         exec_server_url: Option<String>,

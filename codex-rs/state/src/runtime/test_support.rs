@@ -47,6 +47,8 @@ pub(super) fn test_thread_metadata(
     ThreadMetadata {
         project_id: None,
         id: thread_id,
+        session_id: None,
+        current_parent_thread_id: None,
         rollout_path: codex_home.join(format!("rollout-{thread_id}.jsonl")),
         created_at: now,
         updated_at: now,

@@ -221,7 +221,10 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
         .await?;
     assert_eq!(created.project.name, "Work");
     assert_eq!(created.project.roots, vec![ProjectRoot { path: root }]);
-    assert_eq!(created.project.metadata, BTreeMap::from([("color".to_string(), "blue".to_string())]));
+    assert_eq!(
+        created.project.metadata,
+        BTreeMap::from([("color".to_string(), "blue".to_string())])
+    );
     assert_eq!(Uuid::parse_str(&created.project.id)?.get_version_num(), 7);
 
     let read: ProjectReadResponse = server
@@ -277,6 +280,17 @@ async fn projects_persist_and_assign_threads() -> Result<()> {
     );
     assert!(ephemeral.thread.ephemeral);
     assert!(ephemeral.thread.path.is_none());
+    let reread: ThreadReadResponse = server
+        .request(|request_id| ClientRequest::ThreadRead {
+            request_id,
+            params: ThreadReadParams {
+                thread_id: ephemeral.thread.id.clone(),
+                include_turns: false,
+            },
+        })
+        .await?;
+    assert_eq!(reread.thread.project_id, ephemeral.thread.project_id);
+    assert!(reread.thread.path.is_none());
     server
         .start_turn_and_wait_for_completion(TurnStartParams {
             thread_id: started.thread.id.clone(),
@@ -1061,9 +1075,41 @@ async fn assigned_forks_inherit_projects_for_persistent_and_ephemeral_children()
     assert_eq!(response.id, RequestId::Integer(ephemeral_id));
     let ephemeral_fork: ThreadForkResponse = serde_json::from_value(response.result)?;
     let _: serde_json::Value = server.read_notification("thread/started").await?;
-    assert_eq!(ephemeral_fork.thread.project_id, Some(project.project.id));
+    assert_eq!(
+        ephemeral_fork.thread.project_id,
+        Some(project.project.id.clone())
+    );
     assert!(ephemeral_fork.thread.ephemeral);
     assert!(ephemeral_fork.thread.path.is_none());
+    let reread: ThreadReadResponse = server
+        .request(|request_id| ClientRequest::ThreadRead {
+            request_id,
+            params: ThreadReadParams {
+                thread_id: ephemeral_fork.thread.id.clone(),
+                include_turns: false,
+            },
+        })
+        .await?;
+    assert_eq!(reread.thread.project_id, ephemeral_fork.thread.project_id);
+    let _: ProjectDeleteResponse = server
+        .request(|request_id| ClientRequest::ProjectDelete {
+            request_id,
+            params: ProjectDeleteParams {
+                project_id: project.project.id.clone(),
+            },
+        })
+        .await?;
+    let cleared: ThreadReadResponse = server
+        .request(|request_id| ClientRequest::ThreadRead {
+            request_id,
+            params: ThreadReadParams {
+                thread_id: ephemeral_fork.thread.id.clone(),
+                include_turns: false,
+            },
+        })
+        .await?;
+    assert_eq!(cleared.thread.project_id, None);
+    assert!(cleared.thread.path.is_none());
     Ok(())
 }
 

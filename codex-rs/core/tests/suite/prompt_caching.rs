@@ -60,6 +60,27 @@ fn text_user_input_parts(texts: Vec<String>) -> serde_json::Value {
     })
 }
 
+const TURN_ANSWER: &str = "done";
+
+/// A completed turn that delivers a final answer. A response without one now
+/// triggers the turn's single missing-answer repair request, which would
+/// consume the next turn's scripted response.
+fn answered_turn_sse(id: &str) -> String {
+    sse(vec![
+        ev_response_created(id),
+        ev_assistant_message(&format!("msg-{id}"), TURN_ANSWER),
+        ev_completed(id),
+    ])
+}
+
+fn assistant_answer_input() -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": TURN_ANSWER }]
+    })
+}
+
 fn assert_eq_without_metadata(left: serde_json::Value, right: serde_json::Value) {
     assert_eq!(
         core_test_support::responses::strip_response_item_ids_from_json(strip_metadata_from_json(
@@ -299,16 +320,8 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
 
     let TestCodex { codex, config, .. } = test_codex()
         .with_pre_build_hook(write_global_instructions)
@@ -366,15 +379,16 @@ async fn prefixes_context_and_instructions_once_and_consistently_across_requests
     let input2 = body2["input"].as_array().expect("input array");
     assert_eq!(
         input2.len(),
-        input1.len() + 1,
-        "only the new user message should extend the unchanged prefix"
+        input1.len() + 2,
+        "only the first turn's answer and the new user message should extend the unchanged prefix"
     );
     assert_eq_without_metadata(
         serde_json::Value::Array(input2[..input1.len()].to_vec()),
         serde_json::Value::Array(input1.to_vec()),
     );
+    assert_eq_without_metadata(input2[input1.len()].clone(), assistant_answer_input());
     assert_eq_without_metadata(
-        input2[input1.len()].clone(),
+        input2[input1.len() + 1].clone(),
         text_user_input("hello 2".to_string()),
     );
 
@@ -387,16 +401,8 @@ async fn overrides_turn_context_preserve_history_and_update_cache_routing() -> a
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
 
     let TestCodex { codex, config, .. } = test_codex()
         .with_pre_build_hook(write_global_instructions)
@@ -679,16 +685,8 @@ async fn per_turn_overrides_preserve_history_and_update_cache_routing() -> anyho
     use pretty_assertions::assert_eq;
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
 
     let TestCodex { codex, .. } = test_codex()
         .with_pre_build_hook(write_global_instructions)
@@ -803,16 +801,8 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     require_network!();
 
     let server = start_mock_server().await;
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
 
     let TestCodex {
         codex,
@@ -904,15 +894,16 @@ async fn send_user_turn_with_no_changes_does_not_send_environment_context() -> a
     let input2 = body2["input"].as_array().expect("second input array");
     assert_eq!(
         input2.len(),
-        input1.len() + 1,
+        input1.len() + 2,
         "unchanged overrides must not add trailing context or duplicate input"
     );
     assert_eq_without_metadata(
         serde_json::Value::Array(input2[..input1.len()].to_vec()),
         serde_json::Value::Array(input1.clone()),
     );
+    assert_eq_without_metadata(input2[input1.len()].clone(), assistant_answer_input());
     assert_eq_without_metadata(
-        input2[input1.len()].clone(),
+        input2[input1.len() + 1].clone(),
         text_user_input("hello 2".to_string()),
     );
 
@@ -926,16 +917,8 @@ async fn send_user_turn_with_changes_sends_environment_context() -> anyhow::Resu
 
     let server = start_mock_server().await;
 
-    let req1 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let req2 = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let req1 = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let req2 = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
     let TestCodex {
         codex,
         config,

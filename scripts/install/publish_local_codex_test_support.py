@@ -101,10 +101,18 @@ def clean_env() -> dict[str, str]:
     # assertions machine-state-dependent unless they are stripped.
     # Git's repository/index/config overrides can redirect even `git -C` out
     # of a temporary checkout. No ambient Git controls belong in fixtures.
-    env = {key: value for key, value in os.environ.items()
-           if not key.upper().startswith("GIT_")}
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
     # Publish builds refuse these, so an ambient value must not decide a test.
-    for name in (*PUBLISH_ENV_VARS, "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CODEX_THREAD_ID"):
+    for name in (
+        *PUBLISH_ENV_VARS,
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CODEX_THREAD_ID",
+    ):
         env.pop(name, None)
     return env
 
@@ -715,7 +723,9 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             text=True,
             # Windows PowerShell writes redirected text in the OEM code page;
             # Python's UTF-8 mode must not decide how that pipe is decoded.
-            encoding="oem" if Path(self.shell).stem.lower() == "powershell" else "utf-8",
+            encoding="oem"
+            if Path(self.shell).stem.lower() == "powershell"
+            else "utf-8",
             capture_output=True,
             check=False,
             env=effective_env,

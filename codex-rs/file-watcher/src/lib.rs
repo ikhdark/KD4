@@ -68,6 +68,8 @@ type SubscriberId = u64;
 
 #[derive(Default)]
 struct WatchState {
+    terminal: bool,
+    pending_requests: HashSet<(SubscriberId, SubscriberWatchKey)>,
     next_subscriber_id: SubscriberId,
     path_ref_counts: HashMap<PathBuf, PathWatchCounts>,
     subscribers: HashMap<SubscriberId, SubscriberState>,
@@ -86,12 +88,17 @@ struct SubscriberWatchKey {
     /// Original path requested by the subscriber. Notifications are reported
     /// in this namespace so clients do not see canonicalization artifacts.
     requested: WatchPath,
+    /// Namespace-only guards never widen delivered content invalidations.
+    namespace_guard: bool,
 }
 
 /// Mutable per-subscriber watch state.
 struct SubscriberWatchState {
-    /// Existing path passed to the OS watcher and used for ref-counting. This
-    /// is usually `requested`, but missing targets use an existing ancestor.
+    /// Existing path passed to the OS watcher and used for ref-counting: the
+    /// canonical spelling of `requested`, or of its nearest existing directory
+    /// ancestor while `requested` is missing (see `actual_watch_path`). On
+    /// Windows that spelling carries the verbatim `\\?\` prefix, so it usually
+    /// differs from `requested`.
     actual: WatchPath,
     /// Current canonical equivalent of `requested` used to match backend
     /// events. This can change when an initially missing path appears through
@@ -132,6 +139,7 @@ struct WatchSender {
 }
 
 struct ReceiverInner {
+    closed: AtomicBool,
     changed_paths: AsyncMutex<BTreeSet<PathBuf>>,
     rescan_required: AtomicBool,
     notify: Notify,
@@ -153,7 +161,9 @@ impl Receiver {
                         rescan_required,
                     });
                 }
-                if self.inner.sender_count.load(Ordering::Acquire) == 0 {
+                if self.inner.closed.load(Ordering::Acquire)
+                    || self.inner.sender_count.load(Ordering::Acquire) == 0
+                {
                     return None;
                 }
             }
@@ -163,6 +173,12 @@ impl Receiver {
 }
 
 impl WatchSender {
+    fn close(&self) {
+        self.mark_rescan_required();
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.notify.notify_one();
+    }
+
     async fn add_changed_paths(&self, paths: &[PathBuf]) {
         if paths.is_empty() || self.inner.rescan_required.load(Ordering::Acquire) {
             return;
@@ -211,6 +227,7 @@ impl Drop for WatchSender {
 
 fn watch_channel() -> (WatchSender, Receiver) {
     let inner = Arc::new(ReceiverInner {
+        closed: AtomicBool::new(false),
         changed_paths: AsyncMutex::new(BTreeSet::new()),
         rescan_required: AtomicBool::new(false),
         notify: Notify::new(),
@@ -365,7 +382,12 @@ impl PathWatchCounts {
 
 struct FileWatcherInner {
     watcher: RecommendedWatcher,
-    /// Backend watches that are believed to be active.
+    raw_tx: mpsc::WeakSender<notify::Result<Event>>,
+    raw_overflow: Arc<AtomicBool>,
+    raw_overflow_notify: Arc<Notify>,
+    native_paths: HashMap<PathBuf, RecursiveMode>,
+    needs_rebuild: bool,
+    /// Explicit logical roots reconciled with the effective native coverage.
     watched_paths: HashMap<PathBuf, RecursiveMode>,
     /// Paths whose backend mode could not be reconciled with logical state.
     degraded_paths: HashSet<PathBuf>,
@@ -495,11 +517,38 @@ impl FileWatcherSubscriber {
         &self,
         watched_paths: Vec<WatchPath>,
     ) -> notify::Result<WatchRegistration> {
-        let watched_paths = dedupe_watched_paths(watched_paths)
-            .into_iter()
-            .map(|requested| {
+        let requested_paths = dedupe_watched_paths(watched_paths);
+        // Shared, nonrecursive guards cover each relocatable namespace component.
+        // Include both spellings: an alias and its target can move independently.
+        let mut guards = BTreeSet::new();
+        for requested in &requested_paths {
+            for root in [
+                requested.path.clone(),
+                canonical_watch_path(&requested.path),
+            ] {
+                guards.extend(root.ancestors().skip(1).map(Path::to_path_buf));
+            }
+        }
+        let requests =
+            requested_paths
+                .into_iter()
+                .map(|path| (path, false))
+                .chain(guards.into_iter().map(|path| {
+                    (
+                        WatchPath {
+                            path,
+                            recursive: false,
+                        },
+                        true,
+                    )
+                }));
+        let watched_paths = requests
+            .map(|(requested, namespace_guard)| {
                 let (actual, matched, fallback) = actual_watch_path(&requested);
-                let key = SubscriberWatchKey { requested };
+                let key = SubscriberWatchKey {
+                    requested,
+                    namespace_guard,
+                };
                 SubscriberWatchRegistration {
                     key,
                     actual,
@@ -508,11 +557,12 @@ impl FileWatcherSubscriber {
                 }
             })
             .collect::<Vec<_>>();
-        self.file_watcher.register_paths(self.id, &watched_paths)?;
+        let newly_covered_paths = self.file_watcher.register_paths(self.id, &watched_paths)?;
 
         Ok(WatchRegistration {
             file_watcher: Arc::downgrade(&self.file_watcher),
             subscriber_id: self.id,
+            newly_covered_paths,
             watched_paths: watched_paths
                 .iter()
                 .map(|watch| watch.key.clone())
@@ -538,6 +588,15 @@ pub struct WatchRegistration {
     file_watcher: std::sync::Weak<FileWatcher>,
     subscriber_id: SubscriberId,
     watched_paths: Vec<SubscriberWatchKey>,
+    newly_covered_paths: Vec<PathBuf>,
+}
+
+impl WatchRegistration {
+    /// Requested roots that had no continuously registered content owner before
+    /// this lease. Consumers must reconcile snapshots made before acquisition.
+    pub fn newly_covered_paths(&self) -> &[PathBuf] {
+        &self.newly_covered_paths
+    }
 }
 
 impl Default for WatchRegistration {
@@ -546,6 +605,7 @@ impl Default for WatchRegistration {
             file_watcher: std::sync::Weak::new(),
             subscriber_id: 0,
             watched_paths: Vec::new(),
+            newly_covered_paths: Vec::new(),
         }
     }
 }
@@ -576,13 +636,18 @@ impl FileWatcher {
         let (raw_tx, raw_rx) = mpsc::channel(RAW_EVENT_BUFFER_CAPACITY);
         let raw_overflow = Arc::new(AtomicBool::new(false));
         let raw_overflow_notify = Arc::new(Notify::new());
-        let callback_overflow = Arc::clone(&raw_overflow);
-        let callback_overflow_notify = Arc::clone(&raw_overflow_notify);
-        let watcher = notify::recommended_watcher(move |res| {
-            enqueue_raw_event(&raw_tx, &callback_overflow, &callback_overflow_notify, res);
-        })?;
+        let watcher = create_backend(
+            raw_tx.clone(),
+            Arc::clone(&raw_overflow),
+            Arc::clone(&raw_overflow_notify),
+        )?;
         let inner = FileWatcherInner {
             watcher,
+            raw_tx: raw_tx.downgrade(),
+            raw_overflow: Arc::clone(&raw_overflow),
+            raw_overflow_notify: Arc::clone(&raw_overflow_notify),
+            native_paths: HashMap::new(),
+            needs_rebuild: false,
             watched_paths: HashMap::new(),
             degraded_paths: HashSet::new(),
             #[cfg(test)]
@@ -620,11 +685,12 @@ impl FileWatcher {
         let mut watchers = SHARED_WATCHERS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        watchers.retain(|(_, watcher)| watcher.strong_count() > 0);
+        watchers.retain(|(_, watcher)| watcher.upgrade().is_some_and(|watcher| watcher.is_live()));
         if let Some(watcher) = watchers
             .iter()
             .find(|(id, _)| *id == runtime_id)
             .and_then(|(_, watcher)| watcher.upgrade())
+            .filter(|watcher| watcher.is_live())
         {
             return Ok(watcher);
         }
@@ -651,6 +717,9 @@ impl FileWatcher {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.terminal {
+            tx.close();
+        }
         let subscriber_id = state.next_subscriber_id;
         state.next_subscriber_id += 1;
         state.subscribers.insert(
@@ -672,12 +741,64 @@ impl FileWatcher {
         &self,
         subscriber_id: SubscriberId,
         watched_paths: &[SubscriberWatchRegistration],
-    ) -> notify::Result<()> {
+    ) -> notify::Result<Vec<PathBuf>> {
         let mut state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut inner_guard: Option<std::sync::MutexGuard<'_, FileWatcherInner>> = None;
+        if state.terminal {
+            return Err(notify::Error::generic("filesystem observer has terminated"));
+        }
+        let mut inner_guard = self.inner.as_ref().map(|inner| {
+            inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if inner_guard
+            .as_ref()
+            .is_some_and(|guard| guard.raw_tx.upgrade().is_none_or(|tx| tx.is_closed()))
+        {
+            state.terminal = true;
+            for subscriber in state.subscribers.values() {
+                subscriber.tx.close();
+            }
+            return Err(notify::Error::generic("filesystem observer has terminated"));
+        }
+        let newly_covered_paths = watched_paths
+            .iter()
+            .filter(|registration| {
+                !registration.key.namespace_guard
+                    && (inner_guard.as_ref().is_some_and(|guard| {
+                        guard.needs_rebuild
+                            || guard.degraded_paths.iter().any(|path| {
+                                path_namespaces_overlap(path, &registration.actual.path)
+                            })
+                    }) || state.pending_requests.iter().any(|(_, key)| {
+                        path_namespaces_overlap(
+                            &key.requested.path,
+                            &registration.key.requested.path,
+                        )
+                    }) || !state.subscribers.values().any(|subscriber| {
+                        subscriber.watched_paths.iter().any(|(key, watch)| {
+                            !key.namespace_guard
+                                && (key.requested.path == registration.key.requested.path
+                                    || (key.requested.recursive
+                                        && registration
+                                            .key
+                                            .requested
+                                            .path
+                                            .starts_with(&key.requested.path)))
+                                && (watch.matched == registration.matched
+                                    || (watch.matched.recursive
+                                        && registration
+                                            .matched
+                                            .path
+                                            .starts_with(&watch.matched.path)))
+                        })
+                    }))
+            })
+            .map(|registration| registration.key.requested.path.clone())
+            .collect();
         let mut committed = Vec::new();
 
         for registration in watched_paths {
@@ -686,11 +807,61 @@ impl FileWatcher {
                     "file watcher subscriber was removed",
                 ));
             };
-            let actual = subscriber
+            let previous = subscriber
                 .watched_paths
                 .get(&registration.key)
-                .map(|watch| watch.actual.clone())
-                .unwrap_or_else(|| registration.actual.clone());
+                .map(|watch| (watch.actual.clone(), watch.count));
+            let registration = if previous
+                .as_ref()
+                .is_some_and(|(actual, _)| *actual != registration.actual)
+            {
+                let (actual, matched, fallback) = actual_watch_path(&registration.key.requested);
+                SubscriberWatchRegistration {
+                    key: registration.key.clone(),
+                    actual,
+                    matched,
+                    fallback,
+                }
+            } else {
+                registration.clone()
+            };
+            if let Some((old_actual, count)) = previous
+                && old_actual != registration.actual
+            {
+                if !Self::apply_actual_watch_move(
+                    &mut state,
+                    &old_actual,
+                    &registration.actual,
+                    count,
+                    self.inner.as_ref(),
+                    self.reconcile_tx.as_ref(),
+                    &mut inner_guard,
+                ) {
+                    state
+                        .pending_requests
+                        .insert((subscriber_id, registration.key.clone()));
+                    for committed_watch in committed.iter().rev() {
+                        self.unregister_path_locked(
+                            &mut state,
+                            subscriber_id,
+                            committed_watch,
+                            &mut inner_guard,
+                        );
+                    }
+                    return Err(notify::Error::generic(
+                        "failed to reconcile the requested watch namespace",
+                    ));
+                }
+                if let Some(subscriber) = state.subscribers.get_mut(&subscriber_id) {
+                    if let Some(watch) = subscriber.watched_paths.get_mut(&registration.key) {
+                        watch.actual = registration.actual.clone();
+                        watch.matched = registration.matched.clone();
+                        watch.last_exists = registration.matched.path.exists();
+                    }
+                    subscriber.tx.mark_rescan_required();
+                }
+            }
+            let actual = registration.actual.clone();
             let previous_counts = state
                 .path_ref_counts
                 .get(&actual.path)
@@ -746,7 +917,7 @@ impl FileWatcher {
             committed.push(registration.key.clone());
         }
 
-        Ok(())
+        Ok(newly_covered_paths)
     }
 
     fn unregister_paths(&self, subscriber_id: SubscriberId, watched_paths: &[SubscriberWatchKey]) {
@@ -788,6 +959,15 @@ impl FileWatcher {
             }
             actual
         };
+        if state
+            .subscribers
+            .get(&subscriber_id)
+            .is_none_or(|subscriber| !subscriber.watched_paths.contains_key(subscriber_watch))
+        {
+            state
+                .pending_requests
+                .remove(&(subscriber_id, subscriber_watch.clone()));
+        }
         self.decrement_actual_watch_locked(state, &actual, 1, inner_guard);
     }
 
@@ -796,6 +976,9 @@ impl FileWatcher {
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .pending_requests
+            .retain(|(id, _)| *id != subscriber_id);
         let Some(subscriber) = state.subscribers.remove(&subscriber_id) else {
             return;
         };
@@ -882,34 +1065,106 @@ impl FileWatcher {
         };
 
         let existing_mode = guard.watched_paths.get(path).copied();
-        if existing_mode == next_mode && !guard.degraded_paths.contains(path) {
+        if existing_mode == next_mode
+            && !guard.needs_rebuild
+            && !guard.degraded_paths.contains(path)
+        {
             return Ok(());
         }
-        let Some(next_mode) = next_mode else {
-            if existing_mode.is_some() {
-                #[cfg(test)]
-                if std::mem::take(&mut guard.fail_next_unwatch) {
-                    return Err(notify::Error::generic("injected unwatch failure"));
-                }
-                guard.watcher.unwatch(path)?;
-                guard.watched_paths.remove(path);
-            }
-            guard.degraded_paths.remove(path);
-            return Ok(());
-        };
-        if !path.exists() {
+        if next_mode.is_some() && !path.exists() {
             let message = format!("watch path no longer exists: {}", path.display());
             return Err(notify::Error::generic(&message));
         }
 
-        // Watching a watched path replaces its watch, so a mode change or re-arm
-        // never leaves a window without one for other subscribers of the path.
-        // A failed replacement keeps the previous backend watch, which
-        // `watched_paths` still records.
-        Self::watch_backend(guard, path, next_mode)?;
-        guard.watched_paths.insert(path.to_path_buf(), next_mode);
+        let mut desired = guard.watched_paths.clone();
+        if let Some(mode) = next_mode {
+            desired.insert(path.to_path_buf(), mode);
+        } else {
+            desired.remove(path);
+        }
+        let effective = effective_native_paths(&desired);
+        let retires_coverage = guard
+            .native_paths
+            .iter()
+            .any(|(path, mode)| effective.get(path) != Some(mode));
+        // The injected failure models stopping a native root that leaves the
+        // effective set. A mode change stages the root's replacement instead.
+        #[cfg(test)]
+        if guard
+            .native_paths
+            .keys()
+            .any(|path| !effective.contains_key(path))
+            && std::mem::take(&mut guard.fail_next_unwatch)
+        {
+            return Err(notify::Error::generic("injected unwatch failure"));
+        }
+        if guard.needs_rebuild || retires_coverage {
+            Self::rebuild_backend(guard, &effective)?;
+        } else {
+            for (root, mode) in &effective {
+                if guard.native_paths.get(root) != Some(mode) {
+                    if let Err(err) = Self::watch_backend(guard, root, *mode) {
+                        // A failed recursive add may already have installed descendants.
+                        // Replace that uncertain instance, never accept its idempotent fast path.
+                        guard.needs_rebuild = true;
+                        let previous = effective_native_paths(&guard.watched_paths);
+                        if let Err(cleanup) = Self::rebuild_backend(guard, &previous) {
+                            warn!("failed to clean partial native registration: {cleanup}");
+                        }
+                        return Err(err);
+                    }
+                    guard.native_paths.insert(root.clone(), *mode);
+                }
+            }
+        }
+        guard.watched_paths = desired;
         guard.degraded_paths.remove(path);
         Ok(())
+    }
+
+    /// Stage complete coverage on one replacement instance before retiring the old
+    /// instance. This bypasses notify's same-mode no-op and subtree unwatch hazards.
+    fn rebuild_backend(
+        guard: &mut FileWatcherInner,
+        roots: &HashMap<PathBuf, RecursiveMode>,
+    ) -> notify::Result<()> {
+        let tx = guard
+            .raw_tx
+            .upgrade()
+            .ok_or_else(|| notify::Error::generic("filesystem observer has terminated"))?;
+        let mut watcher = create_backend(
+            tx,
+            Arc::clone(&guard.raw_overflow),
+            Arc::clone(&guard.raw_overflow_notify),
+        )?;
+        for (root, mode) in roots {
+            #[cfg(test)]
+            if guard.fail_watch_attempts > 0 {
+                guard.fail_watch_attempts -= 1;
+                return Err(notify::Error::generic("injected watch failure"));
+            }
+            watcher.watch(root, *mode)?;
+        }
+        guard.watcher = watcher;
+        guard.native_paths = roots.clone();
+        guard.needs_rebuild = false;
+        Ok(())
+    }
+
+    pub fn is_live(&self) -> bool {
+        !self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .terminal
+            && self.inner.as_ref().is_none_or(|inner| {
+                inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .raw_tx
+                    .upgrade()
+                    .is_some_and(|tx| !tx.is_closed())
+            })
     }
 
     fn watch_backend(
@@ -1007,6 +1262,31 @@ impl FileWatcher {
         state: &RwLock<WatchState>,
         inner: &Arc<Mutex<FileWatcherInner>>,
     ) -> bool {
+        let pending = {
+            let state = state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.terminal {
+                return false;
+            }
+            state
+                .pending_requests
+                .iter()
+                .map(|(_, key)| key.requested.path.clone())
+                .collect::<Vec<_>>()
+        };
+        if !pending.is_empty() {
+            let mut changes = ObservedChanges {
+                paths: pending,
+                ..Default::default()
+            };
+            changes.normalize();
+            for (subscriber, _) in Self::reconcile_subscribers(state, Some(inner), None, &changes) {
+                // Coverage is restored before the refresh hint. Retry only
+                // pending namespaces, not every unrelated recursive tree.
+                subscriber.mark_rescan_required();
+            }
+        }
         let state = state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1048,6 +1328,7 @@ impl FileWatcher {
         inner_guard
             .as_ref()
             .is_some_and(|guard| !guard.degraded_paths.is_empty())
+            || !state.pending_requests.is_empty()
     }
 
     fn apply_actual_watch_move<'a>(
@@ -1193,6 +1474,14 @@ impl FileWatcher {
                         .await;
                 }
                 if closed {
+                    let mut state = state
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.terminal = true;
+                    state.pending_requests.clear();
+                    for subscriber in state.subscribers.values() {
+                        subscriber.tx.close();
+                    }
                     break;
                 }
             }
@@ -1245,13 +1534,21 @@ impl FileWatcher {
         let WatchState {
             subscribers,
             path_ref_counts,
+            pending_requests,
             ..
         } = &mut *state;
         for (subscriber_id, subscriber) in subscribers {
             let mut changed_paths = BTreeSet::new();
             let mut rescan_required = false;
+            let guard_mapped_paths = if rescan {
+                HashMap::new()
+            } else {
+                guard_mapped_event_paths(&subscriber.watched_paths, &changes.paths)
+            };
+            let mut requested_namespace_paths = Vec::new();
             for (subscriber_watch, subscriber_watch_state) in &mut subscriber.watched_paths {
                 relevant_paths.clear();
+                requested_namespace_paths.clear();
                 if !rescan {
                     relevant_paths.extend(changes.paths.iter().filter(|event_path| {
                         event_may_affect_watch(subscriber_watch, subscriber_watch_state, event_path)
@@ -1265,13 +1562,44 @@ impl FileWatcher {
                                     || **event_path == subscriber_watch.requested.path)
                                 && event_path.is_dir())
                     }));
-                    if relevant_paths.is_empty() {
+                    // Reports only a namespace guard places, such as the entry
+                    // of an alias on the requested path. As below, a timestamp
+                    // report for a watched directory above a stable watch is
+                    // left out: the entry leading to the watch reports itself.
+                    requested_namespace_paths.extend(
+                        subscriber_watch
+                            .requested
+                            .path
+                            .ancestors()
+                            .filter_map(|requested_path| {
+                                guard_mapped_paths.get_key_value(requested_path)
+                            })
+                            .filter(|(requested_path, event_paths)| {
+                                event_paths.iter().any(|event_path| {
+                                    !event_may_affect_watch(
+                                        subscriber_watch,
+                                        subscriber_watch_state,
+                                        event_path,
+                                    ) && !(changes.root_metadata_paths.contains(*event_path)
+                                        && subscriber_watch_is_stable(
+                                            subscriber_watch,
+                                            subscriber_watch_state,
+                                        )
+                                        && **requested_path != subscriber_watch.requested.path
+                                        && path_ref_counts.contains_key(*event_path)
+                                        && event_path.is_dir())
+                                })
+                            })
+                            .map(|(requested_path, _)| requested_path),
+                    );
+                    if relevant_paths.is_empty() && requested_namespace_paths.is_empty() {
                         continue;
                     }
                 }
                 // Lost events can hide a removed or replaced root, so a rescan
                 // re-resolves every watch rather than only fallback watches.
                 let stable_descendant_event = !rescan
+                    && requested_namespace_paths.is_empty()
                     && subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
                     && relevant_paths.iter().all(|event_path| {
                         is_strict_descendant(event_path, &subscriber_watch_state.matched.path)
@@ -1304,15 +1632,15 @@ impl FileWatcher {
                     subscriber_watch_is_stable(subscriber_watch, subscriber_watch_state)
                         && subscriber_watch_state.actual == new_actual
                         && subscriber_watch_state.matched == new_matched;
-                for event_path in &relevant_paths {
+                for event_path in relevant_paths
+                    .iter()
+                    .filter(|_| !subscriber_watch.namespace_guard)
+                {
                     if unmoved_stable_watch
                         && changes.root_metadata_paths.contains(*event_path)
                         && path_ref_counts.contains_key(*event_path)
                         && (is_strict_descendant(&subscriber_watch_state.matched.path, event_path)
-                            || is_strict_descendant(
-                                &subscriber_watch.requested.path,
-                                event_path,
-                            ))
+                            || is_strict_descendant(&subscriber_watch.requested.path, event_path))
                         && event_path.is_dir()
                     {
                         continue;
@@ -1342,9 +1670,31 @@ impl FileWatcher {
                         rescan_required = true;
                     }
                 }
+                // A guard placed these reports at or above the requested path.
+                for requested_path in requested_namespace_paths
+                    .iter()
+                    .filter(|_| !subscriber_watch.namespace_guard)
+                {
+                    let changed_path = changed_path_for_matched_path(
+                        subscriber_watch,
+                        subscriber_watch_state,
+                        &subscriber_watch.requested,
+                        requested_path,
+                    );
+                    if let Some(path) = changed_path
+                        && !rescan_required
+                        && !insert_changed_path(&mut changed_paths, path)
+                    {
+                        changed_paths.clear();
+                        rescan_required = true;
+                    }
+                }
 
                 subscriber_watch_state.fallback |= fallback;
                 if subscriber_watch_state.actual == new_actual {
+                    // Re-resolution may find the target absent again. Its
+                    // existing fallback/guards now own future promotion.
+                    pending_requests.remove(&(*subscriber_id, subscriber_watch.clone()));
                     if rescan || subscriber_watch_state.matched != new_matched {
                         subscriber_watch_state.last_exists = new_matched.path.exists();
                     }
@@ -1396,8 +1746,14 @@ impl FileWatcher {
                     watch_state.last_exists = new_matched.path.exists();
                     watch_state.matched = new_matched;
                 }
+                state
+                    .pending_requests
+                    .remove(&(subscriber_id, subscriber_watch));
             } else {
                 subscriber.tx.mark_rescan_required();
+                state
+                    .pending_requests
+                    .insert((subscriber_id, subscriber_watch));
             }
         }
 
@@ -1426,12 +1782,27 @@ impl FileWatcher {
                     "failed to re-establish file watch {}: {err}",
                     root.display()
                 );
-                Self::mark_watch_degraded(root, &mut inner_guard);
-                Self::mark_subscribers_rescan_for_path(&state, root);
+                // The failed replacement was this batch's only re-arm attempt,
+                // so every referenced lost root stays degraded until reconciled;
+                // recovery then requests a rescan for each of them.
+                for lost_root in &roots_to_rearm {
+                    if state
+                        .path_ref_counts
+                        .get(lost_root)
+                        .copied()
+                        .and_then(PathWatchCounts::effective_mode)
+                        .is_some()
+                    {
+                        Self::mark_watch_degraded(lost_root, &mut inner_guard);
+                        Self::mark_subscribers_rescan_for_path(&state, lost_root);
+                    }
+                }
                 if let Some(reconcile_tx) = reconcile_tx {
                     request_reconciliation(reconcile_tx);
                 }
             }
+            // A replacement rebuilds all effective roots once per loss batch.
+            break;
         }
 
         if rescan {
@@ -1461,9 +1832,11 @@ impl FileWatcher {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
-        Self::watch_backend(guard, path, mode)?;
-        guard.watched_paths.insert(path.to_path_buf(), mode);
-        guard.degraded_paths.remove(path);
+        let _ = (path, mode);
+        guard.needs_rebuild = true;
+        let roots = effective_native_paths(&guard.watched_paths);
+        Self::rebuild_backend(guard, &roots)?;
+        guard.degraded_paths.clear();
         Ok(())
     }
 
@@ -1493,13 +1866,16 @@ impl FileWatcher {
 
     #[cfg(test)]
     pub(crate) fn watch_counts_for_test(&self, path: &Path) -> Option<(usize, usize)> {
+        // The registry uses the canonical backend spelling (including Windows
+        // verbatim prefixes), not necessarily the caller's requested spelling.
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let state = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .path_ref_counts
-            .get(path)
+            .get(&path)
             .map(|counts| (counts.non_recursive, counts.recursive))
     }
 
@@ -1517,12 +1893,64 @@ fn request_reconciliation(reconcile_tx: &mpsc::Sender<()>) {
     let _ = reconcile_tx.try_send(());
 }
 
+fn create_backend(
+    raw_tx: mpsc::Sender<notify::Result<Event>>,
+    overflow: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+) -> notify::Result<RecommendedWatcher> {
+    RecommendedWatcher::new(
+        move |event| {
+            enqueue_raw_event(&raw_tx, &overflow, &wake, event);
+        },
+        notify::Config::default().with_event_kinds(notify::EventKindMask::CORE),
+    )
+}
+
+/// Native recursive coverage subsumes child registrations, not their delivery scope.
+fn effective_native_paths(
+    paths: &HashMap<PathBuf, RecursiveMode>,
+) -> HashMap<PathBuf, RecursiveMode> {
+    let mut paths = paths.clone();
+    // Derived target guards move with canonical content roots, including after
+    // an alias retarget. Explicit requested guards protect the alias namespace.
+    let parents = paths
+        .keys()
+        .flat_map(|path| path.ancestors().skip(1).map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    for parent in parents {
+        if parent.is_dir() {
+            paths.entry(parent).or_insert(RecursiveMode::NonRecursive);
+        }
+    }
+    paths
+        .iter()
+        .filter(|(path, _)| {
+            !paths.iter().any(|(ancestor, mode)| {
+                **path != *ancestor
+                    && path.starts_with(ancestor)
+                    && *mode == RecursiveMode::Recursive
+            })
+        })
+        .map(|(path, mode)| (path.clone(), *mode))
+        .collect()
+}
+
+fn canonical_watch_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn enqueue_raw_event(
     raw_tx: &mpsc::Sender<notify::Result<Event>>,
     raw_overflow: &AtomicBool,
     raw_overflow_notify: &Notify,
     event: notify::Result<Event>,
 ) {
+    if event
+        .as_ref()
+        .is_ok_and(|event| !event.need_rescan() && !is_mutating_event(event))
+    {
+        return;
+    }
     // A backend rescan event (for example a Windows ReadDirectoryChangesW
     // overflow) means changes were discarded without identifying their paths.
     if event.as_ref().is_ok_and(|event| {
@@ -1604,7 +2032,8 @@ impl ObservedChanges {
     }
 
     fn normalize(&mut self) {
-        self.root_metadata_paths.retain(|path| !self.structural_paths.contains(path));
+        self.root_metadata_paths
+            .retain(|path| !self.structural_paths.contains(path));
         self.paths.sort_unstable();
         self.paths.dedup();
         self.lost_watch_roots.sort_unstable();
@@ -1635,12 +2064,11 @@ fn actual_watch_path(requested: &WatchPath) -> (WatchPath, WatchPath, bool) {
             .path
             .canonicalize()
             .unwrap_or_else(|_| requested.path.clone());
-        let actual = requested.clone();
         let matched = WatchPath {
             path: matched_path,
             recursive: requested.recursive,
         };
-        return (actual, matched, false);
+        return (matched.clone(), matched, false);
     }
 
     let requested_parent = requested.path.parent();
@@ -1654,7 +2082,7 @@ fn actual_watch_path(requested: &WatchPath) -> (WatchPath, WatchPath, bool) {
                 .map(|suffix| actual_path.join(suffix))
                 .unwrap_or_else(|_| requested.path.clone());
             let actual = WatchPath {
-                path: path.to_path_buf(),
+                path: actual_path,
                 recursive: false,
             };
             let matched = WatchPath {
@@ -1680,12 +2108,14 @@ fn is_strict_descendant(path: &Path, root: &Path) -> bool {
 /// Returns whether a backend event can change one subscriber watch.
 ///
 /// Every watch cares about its requested and canonical namespaces. A fallback
-/// watch also re-resolves for events its non-recursive ancestor watch reports
-/// (the ancestor or a direct child, where a missing component or symlink
-/// target can appear) and for events below the ancestor's canonical location,
-/// which cannot be mapped to the requested spelling without resolving it.
+/// watch also re-resolves for events its non-recursive ancestor watch reports:
+/// the ancestor or a direct child, where a missing component or symlink target
+/// can appear. `actual` is already that ancestor's canonical location, the
+/// spelling the backend reports, so those checks cover it directly.
 /// Unrelated events elsewhere in the watcher must not cost every fallback
-/// watch a filesystem resolution under the state lock.
+/// watch a filesystem resolution under the state lock. Reports that only a
+/// namespace guard can place are matched separately; see
+/// `guard_mapped_event_paths`.
 fn event_may_affect_watch(
     subscriber_watch: &SubscriberWatchKey,
     subscriber_watch_state: &SubscriberWatchState,
@@ -1700,32 +2130,68 @@ fn event_may_affect_watch(
         return false;
     }
     let actual = subscriber_watch_state.actual.path.as_path();
-    if event_path == actual || event_path.parent() == Some(actual) {
-        return true;
+    event_path == actual || event_path.parent() == Some(actual)
+}
+
+/// Maps backend reports into requested spellings through namespace guards.
+///
+/// A native watch reports an entry in its directory's canonical spelling. When
+/// a request differs from that spelling above an alias on its path (a Windows
+/// path without `\\?\`, macOS `/var` for `/private/var`, or an alias inside an
+/// aliased directory), the report of that alias entry, such as a retarget,
+/// matches neither the requested namespace nor the canonical one, which is the
+/// alias's target. A guard pairs a requested directory with its canonical
+/// location, so it maps a report of that directory or of one of its entries
+/// back to the requested spelling. The result maps each requested-spelling
+/// path to the reports that name it.
+fn guard_mapped_event_paths<'a>(
+    watched_paths: &HashMap<SubscriberWatchKey, SubscriberWatchState>,
+    event_paths: &'a [PathBuf],
+) -> HashMap<PathBuf, Vec<&'a Path>> {
+    let mut guards = HashMap::<&Path, Vec<&Path>>::new();
+    for (subscriber_watch, subscriber_watch_state) in watched_paths {
+        if subscriber_watch.namespace_guard
+            && subscriber_watch.requested.path != subscriber_watch_state.matched.path
+        {
+            guards
+                .entry(subscriber_watch_state.matched.path.as_path())
+                .or_default()
+                .push(subscriber_watch.requested.path.as_path());
+        }
     }
-    // `matched` is the canonical actual path joined with the requested suffix.
-    let canonical_actual = subscriber_watch
-        .requested
-        .path
-        .strip_prefix(actual)
-        .ok()
-        .and_then(|suffix| {
-            subscriber_watch_state
-                .matched
-                .path
-                .ancestors()
-                .nth(suffix.components().count())
-        });
-    canonical_actual.is_some_and(|canonical_actual| {
-        event_path.starts_with(canonical_actual) && !event_path.starts_with(actual)
-    })
+    let mut mapped = HashMap::<PathBuf, Vec<&Path>>::new();
+    if guards.is_empty() {
+        return mapped;
+    }
+    for event_path in event_paths {
+        if let Some(requested_dirs) = guards.get(event_path.as_path()) {
+            for requested_dir in requested_dirs {
+                mapped
+                    .entry(requested_dir.to_path_buf())
+                    .or_default()
+                    .push(event_path.as_path());
+            }
+        }
+        if let Some(name) = event_path.file_name()
+            && let Some(requested_dirs) = event_path.parent().and_then(|parent| guards.get(parent))
+        {
+            for requested_dir in requested_dirs {
+                mapped
+                    .entry(requested_dir.join(name))
+                    .or_default()
+                    .push(event_path.as_path());
+            }
+        }
+    }
+    mapped
 }
 
 fn subscriber_watch_is_stable(
-    subscriber_watch: &SubscriberWatchKey,
+    _subscriber_watch: &SubscriberWatchKey,
     subscriber_watch_state: &SubscriberWatchState,
 ) -> bool {
-    !subscriber_watch_state.fallback && subscriber_watch_state.actual == subscriber_watch.requested
+    subscriber_watch_state.last_exists
+        && subscriber_watch_state.actual == subscriber_watch_state.matched
 }
 
 /// Converts one raw backend event path into the subscriber-visible path.
@@ -1777,7 +2243,7 @@ fn changed_path_for_matched_path(
             subscriber_watch_state.last_exists = now_exists;
             return should_notify.then(|| requested.path.clone());
         }
-        if subscriber_watch_state.actual.path != matched.path {
+        if subscriber_watch_state.actual.path != matched.path || requested.path != matched.path {
             let should_notify = now_exists || subscriber_watch_state.last_exists;
             subscriber_watch_state.last_exists = now_exists;
             return should_notify.then(|| requested.path.clone());

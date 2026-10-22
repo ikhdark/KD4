@@ -4,7 +4,9 @@
 //! Windows, the warm host's memory after the allocation-heavy cells.
 #![allow(clippy::expect_used)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -15,6 +17,7 @@ use codex_code_mode::CodeModeSessionDelegate;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
 use codex_code_mode::ExecuteRequest;
+use codex_code_mode::FunctionCallOutputContentItem;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_code_mode::RuntimeResponse;
@@ -25,15 +28,29 @@ use codex_protocol::ToolName;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-struct EchoDelegate;
+#[derive(Default)]
+struct EchoDelegate {
+    calls: Mutex<Vec<CodeModeNestedToolCall>>,
+}
 
 impl CodeModeSessionDelegate for EchoDelegate {
     fn invoke_tool<'a>(
         &'a self,
-        _invocation: CodeModeNestedToolCall,
+        invocation: CodeModeNestedToolCall,
         _cancellation: NestedCancellation,
     ) -> ToolInvocationFuture<'a> {
-        Box::pin(async { Ok(json!({ "value": "output" })) })
+        let value = invocation
+            .input
+            .as_ref()
+            .and_then(|input| input["index"].as_u64())
+            .map(|index| index * 2 + 1);
+        // Ten calls are expected. Retain one excess receipt to reject extra
+        // work without allowing a broken workload to grow an unbounded trace.
+        let mut calls = self.calls.lock().expect("calls lock");
+        if calls.len() < 11 {
+            calls.push(invocation);
+        }
+        Box::pin(async move { Ok(json!({ "value": value })) })
     }
 
     fn notify<'a>(
@@ -51,10 +68,13 @@ impl CodeModeSessionDelegate for EchoDelegate {
 
 const EMPTY_CELL: &str = r#"text("ok");"#;
 const NESTED_CELL: &str = r#"
+let checksum = 0;
 for (let index = 0; index < 10; index += 1) {
-  await tools.echo({ index });
+  const result = await tools.echo({ index });
+  if (result.value !== index * 2 + 1) throw new Error("wrong echo response");
+  checksum += result.value;
 }
-text("ok");
+text(String(checksum));
 "#;
 const CPU_CELL: &str = r#"
 const values = Array.from({ length: 200000 }, (_, index) => (index * 7919) % 200003);
@@ -88,16 +108,149 @@ fn request(source: &str) -> ExecuteRequest {
     }
 }
 
-async fn timed_cell(session: &Arc<dyn CodeModeSession>, source: &str) -> Duration {
+fn validate_cell(
+    response: &RuntimeResponse,
+    expected_cell_id: &CellId,
+    expected: &str,
+    calls: &[CodeModeNestedToolCall],
+    nested: bool,
+) -> bool {
+    let RuntimeResponse::Result {
+        cell_id,
+        content_items,
+        error_text: None,
+        output_loss: None,
+    } = response
+    else {
+        return false;
+    };
+    if cell_id != expected_cell_id
+        || content_items
+            != &vec![FunctionCallOutputContentItem::InputText {
+                text: expected.to_string(),
+            }]
+        || calls.len() != if nested { 10 } else { 0 }
+    {
+        return false;
+    }
+    let mut ids = HashSet::new();
+    calls.iter().enumerate().all(|(index, call)| {
+        call.cell_id == *cell_id
+            && call.parent_tool_call_id.as_deref() == Some("latency")
+            && call.tool_name == ToolName::plain("echo")
+            && call.tool_kind == CodeModeToolKind::Function
+            && call.input == Some(json!({ "index": index }))
+            && !call.runtime_tool_call_id.is_empty()
+            && ids.insert(&call.runtime_tool_call_id)
+    })
+}
+
+async fn timed_cell(
+    session: &Arc<dyn CodeModeSession>,
+    delegate: &EchoDelegate,
+    source: &str,
+) -> Duration {
+    assert!(delegate.calls.lock().expect("calls lock").is_empty());
     let started_at = Instant::now();
     let started = session.execute(request(source)).await.expect("start cell");
+    let cell_id = started.cell_id.clone();
     let response = started.initial_response().await.expect("cell response");
     let elapsed = started_at.elapsed();
-    match response {
-        RuntimeResponse::Result {
-            error_text: None, ..
-        } => elapsed,
-        other => panic!("benchmark cell did not complete cleanly: {other:?}"),
+    let calls = std::mem::take(&mut *delegate.calls.lock().expect("calls lock"));
+    let expected = match source {
+        EMPTY_CELL => "ok",
+        NESTED_CELL => "100",
+        CPU_CELL => "400002",
+        ALLOC_CELL => "5388890",
+        _ => panic!("unknown benchmark workload"),
+    };
+    assert!(
+        validate_cell(&response, &cell_id, expected, &calls, source == NESTED_CELL),
+        "benchmark workload failed: {response:?}; calls: {calls:?}"
+    );
+    elapsed
+}
+
+/// Missing workload/output/receipts must never qualify as a latency sample.
+#[test]
+fn workload_oracle_rejects_missing_work() {
+    let cell_id = CellId::new("oracle".to_string());
+    let response = RuntimeResponse::Result {
+        cell_id: cell_id.clone(),
+        content_items: vec![FunctionCallOutputContentItem::InputText {
+            text: "100".to_string(),
+        }],
+        error_text: None,
+        output_loss: None,
+    };
+    let calls: Vec<_> = (0..10)
+        .map(|index| CodeModeNestedToolCall {
+            cell_id: cell_id.clone(),
+            parent_tool_call_id: Some("latency".to_string()),
+            runtime_tool_call_id: format!("call-{index}"),
+            buffered_output_bytes: 0,
+            tool_name: ToolName::plain("echo"),
+            tool_kind: CodeModeToolKind::Function,
+            input: Some(json!({ "index": index })),
+            nested_deadline: None,
+        })
+        .collect();
+    assert!(validate_cell(&response, &cell_id, "100", &calls, true));
+    assert!(!validate_cell(
+        &response,
+        &CellId::new("other".to_string()),
+        "100",
+        &calls,
+        true
+    ));
+    for count in [0, 9, 11] {
+        let mut wrong = calls.clone();
+        wrong.resize(count, calls[0].clone());
+        assert!(!validate_cell(&response, &cell_id, "100", &wrong, true));
+    }
+    for index in 0..10 {
+        let mut wrong = calls.clone();
+        wrong[index].input = Some(json!({ "index": 99 }));
+        assert!(!validate_cell(&response, &cell_id, "100", &wrong, true));
+    }
+    let mut wrong = calls.clone();
+    wrong[9] = calls[0].clone();
+    assert!(!validate_cell(&response, &cell_id, "100", &wrong, true));
+    wrong = calls.clone();
+    wrong[0].tool_name = ToolName::plain("other");
+    assert!(!validate_cell(&response, &cell_id, "100", &wrong, true));
+    for (expected, actual) in [("ok", ""), ("400002", "400001"), ("5388890", "0")] {
+        let bad = RuntimeResponse::Result {
+            cell_id: cell_id.clone(),
+            content_items: if actual.is_empty() {
+                vec![]
+            } else {
+                vec![FunctionCallOutputContentItem::InputText {
+                    text: actual.to_string(),
+                }]
+            },
+            error_text: None,
+            output_loss: None,
+        };
+        assert!(!validate_cell(&bad, &cell_id, expected, &[], false));
+    }
+    let mut errored = response.clone();
+    if let RuntimeResponse::Result { error_text, .. } = &mut errored {
+        *error_text = Some("error".to_string());
+    }
+    let mut lost = response;
+    if let RuntimeResponse::Result { output_loss, .. } = &mut lost {
+        *output_loss = Some(codex_code_mode_protocol::OutputLoss::default());
+    }
+    for bad in [
+        errored,
+        lost,
+        RuntimeResponse::Yielded {
+            cell_id: cell_id.clone(),
+            content_items: vec![],
+        },
+    ] {
+        assert!(!validate_cell(&bad, &cell_id, "100", &calls, true));
     }
 }
 
@@ -165,39 +318,41 @@ async fn host_latency_benchmark() {
     let mut cold_first_cell = Vec::new();
     for _ in 0..8 {
         let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(program.clone());
+        let delegate = Arc::new(EchoDelegate::default());
         let started_at = Instant::now();
         let session = provider
-            .create_session(Arc::new(EchoDelegate))
+            .create_session(delegate.clone())
             .await
             .expect("create session");
         cold_session.push(started_at.elapsed());
-        cold_first_cell.push(timed_cell(&session, EMPTY_CELL).await);
+        cold_first_cell.push(timed_cell(&session, &delegate, EMPTY_CELL).await);
         session.shutdown().await.expect("shutdown");
     }
 
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(program);
+    let delegate = Arc::new(EchoDelegate::default());
     let session = provider
-        .create_session(Arc::new(EchoDelegate))
+        .create_session(delegate.clone())
         .await
         .expect("create session");
     for _ in 0..5 {
-        timed_cell(&session, EMPTY_CELL).await;
+        timed_cell(&session, &delegate, EMPTY_CELL).await;
     }
     let mut empty = Vec::new();
     for _ in 0..50 {
-        empty.push(timed_cell(&session, EMPTY_CELL).await);
+        empty.push(timed_cell(&session, &delegate, EMPTY_CELL).await);
     }
     let mut nested = Vec::new();
     for _ in 0..30 {
-        nested.push(timed_cell(&session, NESTED_CELL).await);
+        nested.push(timed_cell(&session, &delegate, NESTED_CELL).await);
     }
     let mut cpu = Vec::new();
     for _ in 0..15 {
-        cpu.push(timed_cell(&session, CPU_CELL).await);
+        cpu.push(timed_cell(&session, &delegate, CPU_CELL).await);
     }
     let mut alloc = Vec::new();
     for _ in 0..5 {
-        alloc.push(timed_cell(&session, ALLOC_CELL).await);
+        alloc.push(timed_cell(&session, &delegate, ALLOC_CELL).await);
     }
     let memory = host_memory();
     session.shutdown().await.expect("shutdown");
@@ -206,6 +361,7 @@ async fn host_latency_benchmark() {
         "{}",
         json!({
             "benchmark": "code_mode_host_latency",
+            "workload_version": 2,
             "cold_create_session": summary(&mut cold_session),
             "cold_first_empty_cell": summary(&mut cold_first_cell),
             "warm_empty_cell": summary(&mut empty),

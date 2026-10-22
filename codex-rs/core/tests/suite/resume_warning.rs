@@ -22,6 +22,7 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
 use core_test_support::require_network;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -118,9 +119,15 @@ async fn resumed_model_difference_uses_model_switch_context_without_legacy_warni
     require_network!();
 
     let server = start_mock_server().await;
+    // The resumed turn answers; an empty completion spends the bounded
+    // missing-answer repair on another request.
     let response_mock = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "continued"),
+            ev_completed("resp-1"),
+        ]),
     )
     .await;
 

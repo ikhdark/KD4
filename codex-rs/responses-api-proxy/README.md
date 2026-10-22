@@ -59,11 +59,11 @@ curl --fail --silent --show-error "${PROXY_BASE_URL}/shutdown"
 ## Behavior
 
 - Reads the API key from `stdin`. All callers should pipe the key in (for example, `printenv OPENAI_API_KEY | codex-responses-api-proxy`).
-- Formats the header value as `Bearer <key>` and attempts to `mlock(2)` the memory holding that header so it is not swapped to disk.
+- Formats the header value as `Bearer <key>`. On Unix, requires `mlock(2)` to protect the header from swapping; failure stops startup before listening and zeroizes the owned header. Windows does not currently lock this memory.
 - Listens on the provided port or an ephemeral port if `--port` is not specified.
-- Accepts exactly `POST /v1/responses` (no query string). The request body is forwarded to `https://api.openai.com/v1/responses` with `Authorization: Bearer <key>` set. All original request headers (except any incoming `Authorization`) are forwarded upstream, with `Host` overridden to `api.openai.com`. For other requests, it responds with `403`.
+- Accepts exactly `POST /v1/responses` (no query string). The request body and end-to-end headers are forwarded to `https://api.openai.com/v1/responses`, replacing `Authorization` and `Host`. Incoming proxy credentials, hop-by-hop fields and all `Connection`-nominated fields are removed. For other requests, it responds with `403`.
 - Optionally writes a single-line JSON file with server info, currently `{ "port": <u16>, "pid": <u32> }`.
-- Optionally writes request/response JSON dumps to a directory. Each accepted request gets a pair of files that share a sequence/timestamp prefix, for example `000001-1846179912345-request.json` and `000001-1846179912345-response.json`. Header values are dumped in full except `Authorization` and any header whose name includes `cookie`, which are redacted. Bodies are written as parsed JSON when possible, otherwise as UTF-8 text.
+- Optionally writes request/response JSON dumps to a directory. Each accepted request gets a pair of files that share a sequence/timestamp prefix, for example `000001-1846179912345-request.json` and `000001-1846179912345-response.json`. Header values are dumped in full except `Authorization`, `Proxy-Authorization` and any header whose name includes `cookie`, which are redacted. Incoming hop-by-hop fields are omitted. Bodies are written as parsed JSON when possible, otherwise as UTF-8 text.
 - Optional `--http-shutdown` enables `GET /shutdown` to terminate the process with exit code `0`. This allows one user (e.g., `root`) to start the proxy and another unprivileged user on the host to shut it down.
 
 ## CLI
@@ -94,7 +94,7 @@ printenv AZURE_OPENAI_API_KEY | env -u AZURE_OPENAI_API_KEY codex-responses-api-
 ## Notes
 
 - Only `POST /v1/responses` is permitted. No query strings are allowed.
-- All request headers are forwarded to the upstream call (aside from overriding `Authorization` and `Host`). Response status and content-type are mirrored from upstream.
+- End-to-end request headers are forwarded, overriding `Authorization` and `Host`. Hop-by-hop and `Connection`-nominated fields are removed in both directions. Response status and content-type are mirrored from upstream.
 
 ## Hardening Details
 
@@ -105,8 +105,8 @@ Care is taken to restrict access/copying to the value of `OPENAI_API_KEY` retain
 - We then read from `stdin`, copying the contents into the buffer after `"Bearer "`.
 - After verifying the key matches `/^[a-zA-Z0-9_-]+$/` (and does not exceed the buffer), we create a `String` from that buffer (so the data is now on the heap).
 - We zero out the stack-allocated buffer using https://crates.io/crates/zeroize so it is not optimized away by the compiler.
-- We invoke `.leak()` on the `String` so we can treat its contents as a `&'static str`, as it will live for the rest of the process.
-- On UNIX, we `mlock(2)` the memory backing the `&'static str`.
+- On UNIX, we `mlock(2)` the memory backing the owned `String`. If page-size discovery or locking fails, startup stops and the header is zeroized before being dropped.
+- Only after successful locking (on UNIX) do we invoke `.leak()` on the `String`, without reallocating, to obtain a `&'static str` for the rest of the process.
 - When using the `&'static str` when building an HTTP request, we use `HeaderValue::from_static()` to avoid copying the `&str`.
 - We also invoke `.set_sensitive(true)` on the `HeaderValue`, which in theory indicates to other parts of the HTTP stack that the header should be treated with "special care" to avoid leakage:
 

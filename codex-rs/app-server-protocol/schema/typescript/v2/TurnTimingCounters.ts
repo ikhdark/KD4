@@ -10,7 +10,10 @@ import type { TurnTimingGenerationReasonCounts } from "./TurnTimingGenerationRea
 export type TurnTimingCounters = {
 /**
  * Logical workflow generations. `model_request_count` remains the
- * authoritative physical provider-attempt aggregate.
+ * authoritative physical transport-attempt aggregate in timing schema 34+:
+ * each identity is counted once at transport entry, including internal auth
+ * retries. This does not prove provider receipt. Older schemas may count
+ * only the first dispatch/readiness in a sampling row.
  */
 logicalGenerationCount: number, generationsByReason: TurnTimingGenerationReasonCounts, generationsByPurpose: TurnTimingGenerationPurposeCounts, generationsByDisposition: TurnTimingGenerationDispositionCounts,
 /**
@@ -64,7 +67,12 @@ purposeAggregates?: Array<TurnTimingGenerationPurposeAggregate>, samePurposeCont
  * Wait generations sharing coarse revisions; this does not establish that
  * the wait action, cursor, or owner state repeated.
  */
-waitGenerationsWithSameRevisionCount: number, planningGenerationCount: number, planRevisionGenerationCount: number, planningFixedPointIterationCount: number, planningInvalidationCount: number, planningSemanticEffectCount: number, planningFailureCount: number, failureSignatureCount: number, failureDiagnosisCount: number, attemptsByKind: TurnTimingAttemptKindCounts, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number,
+waitGenerationsWithSameRevisionCount: number, planningGenerationCount: number, planRevisionGenerationCount: number, planningFixedPointIterationCount: number, planningInvalidationCount: number, planningSemanticEffectCount: number, planningFailureCount: number, failureSignatureCount: number, failureDiagnosisCount: number, attemptsByKind: TurnTimingAttemptKindCounts,
+/**
+ * Bounded detail loss; diagnostics derived from request rows cover only
+ * retained detail when either eviction counter is nonzero.
+ */
+modelRequestDetailEvictionCount: number, physicalAttemptDetailEvictionCount: number, modelRequestCount: number, modelRetryCount: number, modelFallbackCount: number, toolCallCount: number, approvalWaitCount: number, permissionWaitCount: number, userInputWaitCount: number, mcpElicitationWaitCount: number, waitOnlyGenerationCount: number, internallyDrainedWaitCount: number, noProgressDirectiveCount: number, provenLoopActivationCount: number, toolRouterReuseCount: number, toolRouterRebuildCount: number, projectionSourceDependenciesReuseCount: number, projectionSourceDependenciesFallbackCount: number, toolOutputTruncationCount: number, toolOutputProjectedTokenCount: bigint, toolOutputArtifactRereadCount: number, toolOutputCanonicalByteCount: bigint, toolOutputCanonicalTokenCount: bigint, toolOutputModelByteCount: bigint, toolOutputModelTokenCount: bigint, toolOutputArtifactCreationCount: number, toolOutputArtifactReuseCount: number, toolOutputProjectionTruncationCount: number, toolOutputOmittedSectionCount: bigint, toolOutputRecoveryCallCount: number,
 /**
  * Recovery transactions performed inside code-mode cells, without a
  * separate provider tool-result generation.

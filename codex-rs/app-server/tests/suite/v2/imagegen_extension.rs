@@ -208,6 +208,7 @@ async fn standalone_image_generation_failure_emits_terminal_item() -> Result<()>
             revised_prompt: Some("paint a blue whale".to_string()),
             result: String::new(),
             saved_path: None,
+            provider_usage: None,
         })
     );
 
@@ -343,7 +344,10 @@ generatedImage(result);
     };
     assert_eq!(image.status, "completed");
     assert_eq!(image.result, RESULT);
-    assert_eq!(std::fs::read(image.saved_path.context("image must be saved")?)?, TINY_PNG_BYTES);
+    assert_eq!(
+        std::fs::read(image.saved_path.context("image must be saved")?)?,
+        TINY_PNG_BYTES
+    );
     timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),

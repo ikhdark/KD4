@@ -54,8 +54,8 @@ fn exclusive_tls_roots_select_explicit_root_policy() {
             .tls_certs_only_pem(&ca_pem.repeat(count))
             .expect("valid CA certificate bundle");
         assert_eq!(builder.tls_certs_only.as_ref().unwrap().len(), count);
-        let client = builder
-            .build_with_transport_default_proxy_using(|builder, custom_ca_policy| {
+        let client =
+            builder.build_with_transport_default_proxy_using(|builder, custom_ca_policy| {
                 assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
                 builder
                     .build()

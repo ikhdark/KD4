@@ -17,6 +17,8 @@ processId: string,
  */
 deltaBase64?: string | null,
 /**
- * Close stdin after writing `deltaBase64`, if present.
+ * Close input after queued bytes. Unix PTYs send canonical VEOF (including
+ * flushing a partial line); raw/disabled-VEOF terminals return an error.
+ * Terminal EOF is not a permanent pipe half-close.
  */
 closeStdin?: boolean, };

@@ -130,29 +130,40 @@ impl ConnectionDriver {
             match self.catalogs.get(&session.id) {
                 Some((revision, tools)) if tools == &request.enabled_tools => {
                     request.enabled_tools = Arc::from([]);
-                    Some(codex_code_mode_protocol::host::WireToolCatalog { revision: *revision, register: false })
+                    Some(codex_code_mode_protocol::host::WireToolCatalog {
+                        revision: *revision,
+                        register: false,
+                    })
                 }
                 previous => {
-                    let Some(revision) = previous.map_or(Some(1), |(revision, _)| revision.checked_add(1)) else {
-                        let _ = response_tx.send(Err("code-mode tool catalog revision exhausted; no cell started".into()));
+                    let Some(revision) =
+                        previous.map_or(Some(1), |(revision, _)| revision.checked_add(1))
+                    else {
+                        let _ = response_tx.send(Err(
+                            "code-mode tool catalog revision exhausted; no cell started".into(),
+                        ));
                         return true;
                     };
                     replacement = Some((revision, request.enabled_tools.clone()));
-                    Some(codex_code_mode_protocol::host::WireToolCatalog { revision, register: true })
+                    Some(codex_code_mode_protocol::host::WireToolCatalog {
+                        revision,
+                        register: true,
+                    })
                 }
             }
         } else {
             None
         };
-        let mut request: codex_code_mode_protocol::host::WireExecuteRequest = match request.try_into() {
-            Ok(request) => request,
-            Err(err) => {
-                let _ = response_tx.send(Err(format!(
-                    "failed to encode code-mode execute request: {err}"
-                )));
-                return true;
-            }
-        };
+        let mut request: codex_code_mode_protocol::host::WireExecuteRequest =
+            match request.try_into() {
+                Ok(request) => request,
+                Err(err) => {
+                    let _ = response_tx.send(Err(format!(
+                        "failed to encode code-mode execute request: {err}"
+                    )));
+                    return true;
+                }
+            };
         request.catalog = catalog;
         let request_id = match self.requests.allocate_id() {
             Ok(id) => id,
@@ -210,8 +221,14 @@ impl ConnectionDriver {
             return true;
         }
         if !self.receipt_recovery {
-            if request.recovery.as_ref().is_some_and(|recovery| recovery.terminal_only) {
-                let _ = response_tx.send(Err("code-mode host does not support terminal receipt recovery".into()));
+            if request
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.terminal_only)
+            {
+                let _ = response_tx.send(Err(
+                    "code-mode host does not support terminal receipt recovery".into(),
+                ));
                 return true;
             }
             // Retain the legacy V1 request shape. The normal generation fence
@@ -245,7 +262,10 @@ impl ConnectionDriver {
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
         let cell_id = request.cell_id.clone();
-        let terminal_only = request.recovery.as_ref().is_some_and(|recovery| recovery.terminal_only);
+        let terminal_only = request
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.terminal_only);
         self.send_request(
             HostRequest::Wait {
                 session_id: session.id.clone(),

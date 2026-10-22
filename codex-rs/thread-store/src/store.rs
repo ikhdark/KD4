@@ -275,6 +275,15 @@ pub trait ThreadStore: Any + Send + Sync {
         Box::pin(async move { self.update_thread_metadata(params).await.map(|_| ()) })
     }
 
+    /// True means committed; false means durable history remains usable but the
+    /// caller must retain its coalesced metadata patch for a later barrier.
+    fn update_thread_metadata_applied(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(async move { self.update_thread_metadata_ack(params).await.map(|()| true) })
+    }
+
     /// Archives a thread.
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()>;
 

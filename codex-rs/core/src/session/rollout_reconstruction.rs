@@ -19,15 +19,35 @@ pub(super) fn append_unsettled_tool_recovery(
 ) {
     let page = unsettled_tool_recovery_page(items, 0);
     if page["unresolved_count"] == 0 {
+        // A fork can contain only a replacement checkpoint. Absence of its
+        // original invocations is not proof that the inherited warning settled.
         return;
     }
-    history.push(ResponseItem::Message {
-        id: None, role: "developer".into(), phase: None,
+    let notice = ResponseItem::Message {
+        id: Some(codex_protocol::ResponseItemId::new(
+            "msg_sctx_unsettled_tools",
+        )),
+        role: "developer".into(),
+        phase: None,
         internal_chat_message_metadata_passthrough: None,
-        content: vec![ContentItem::InputText { text: format!(
-            "<unsettled_tool_recovery>\n{page}\nHandler return is not durable result delivery. These retained invocations have no available durable result; they may or may not have executed. Inspect affected targets before retrying. Null environment means the resolved environment was not recorded. Arguments are deliberately redacted. If omitted_count is nonzero, use read_file with the recovery_path and omit environment_id; this reads retained history, never repeats an operation.\n</unsettled_tool_recovery>",
-        ) }],
-    });
+        content: vec![ContentItem::InputText {
+            text: format!(
+                "<unsettled_tool_recovery>\n{page}\nHandler return is not durable result delivery. These retained invocations have no available durable result; they may or may not have executed. Inspect affected targets before retrying. Null environment means the resolved environment was not recorded. Arguments are deliberately redacted. If omitted_count is nonzero, use read_file with the recovery_path and omit environment_id; this reads retained history, never repeats an operation.\n</unsettled_tool_recovery>",
+            ),
+        }],
+    };
+    // Reopening unchanged durable source must not grow its warning. A fork
+    // may omit invocations represented only by an inherited notice, however,
+    // so a different snapshot cannot silently settle that older uncertainty.
+    if history.iter().any(|item| {
+        crate::stable_context::is_unsettled_tool_recovery_notice(item)
+            && matches!((item, &notice),
+                (ResponseItem::Message { content: old, .. }, ResponseItem::Message { content: new, .. })
+                    if old == new)
+    }) {
+        return;
+    }
+    history.push(notice);
 }
 
 pub(super) fn unsettled_tool_recovery_page(
@@ -37,6 +57,7 @@ pub(super) fn unsettled_tool_recovery_page(
     use sha2::Digest;
     use std::collections::BTreeMap;
     let mut pending = BTreeMap::new();
+    let mut unmatched = std::collections::HashMap::new();
     let mut turn = "";
     let mut cwd = None;
     let bounded = |value: &str| value.chars().take(240).collect::<String>();
@@ -71,7 +92,14 @@ pub(super) fn unsettled_tool_recovery_page(
             | ResponseItem::CustomToolCall { call_id, .. } => {
                 // Match borrowed invocation identities first. Settled calls
                 // never pay argument decoding, hashing or redaction costs.
-                pending.insert((turn, call_id.as_str()), (index, cwd, response));
+                let kind = matches!(response, ResponseItem::CustomToolCall { .. });
+                pending.insert(index, (turn, call_id.as_str(), cwd, response));
+                // Legacy raw IDs can recur within one turn. Only a unique
+                // unmatched preceding invocation can own a later result.
+                unmatched
+                    .entry((turn, kind, call_id.as_str()))
+                    .and_modify(|prior| *prior = None)
+                    .or_insert(Some(index));
             }
             ResponseItem::FunctionCallOutput {
                 call_id, output, ..
@@ -87,8 +115,11 @@ pub(super) fn unsettled_tool_recovery_page(
                     // Conservative compatibility with legacy host placeholders.
                     || output.body.to_text().is_some_and(|text|
                     text == "Tool execution completed, but its full result could not be preserved for model delivery.");
-                if !unavailable {
-                    pending.remove(&(turn, call_id.as_str()));
+                let kind = matches!(response, ResponseItem::CustomToolCallOutput { .. });
+                if let Some(Some(source)) = unmatched.remove(&(turn, kind, call_id.as_str()))
+                    && !unavailable
+                {
+                    pending.remove(&source);
                 }
             }
             _ => {}
@@ -96,8 +127,8 @@ pub(super) fn unsettled_tool_recovery_page(
     }
     let count = pending.len();
     let mut pending = pending.into_iter().collect::<Vec<_>>();
-    pending.sort_unstable_by_key(|(_, (index, _, _))| std::cmp::Reverse(*index));
-    let operations = pending.into_iter().skip(offset).take(8).map(|((turn, call_id), (index, cwd, response))| {
+    pending.sort_unstable_by_key(|(index, _)| std::cmp::Reverse(*index));
+    let operations = pending.into_iter().skip(offset).take(8).map(|(index, (turn, call_id, cwd, response))| {
         let (name, namespace, arguments) = match response {
             ResponseItem::FunctionCall { name, namespace, arguments, .. }
             | ResponseItem::CustomToolCall { name, namespace, input: arguments, .. } => (name, namespace, arguments),
@@ -240,16 +271,27 @@ pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
     pub(super) plan: Option<UpdatePlanArgs>,
     pub(super) plan_lineage: Option<crate::plan_store::PlanLineage>,
+    pub(super) accepted_input: Option<crate::plan_store::AcceptedPlanInput>,
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
+    pub(super) additional_context: crate::state::AdditionalContextStore,
+    pub(super) repository_sources: Option<serde_json::Value>,
     pub(super) window_number: u64,
     pub(super) first_window_id: Option<Uuid>,
     pub(super) previous_window_id: Option<Uuid>,
     pub(super) window_id: Option<Uuid>,
 }
 
+#[cfg(test)]
 pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<ResponseItem>) {
+    append_unified_exec_resume_invalidation_with_rollout(history, &[]);
+}
+
+pub(super) fn append_unified_exec_resume_invalidation_with_rollout(
+    history: &mut Vec<ResponseItem>,
+    rollout: &[RolloutItem],
+) {
     let unified_exec_call_ids = history
         .iter()
         .filter_map(|item| match item {
@@ -281,6 +323,33 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
         })
         .collect::<HashSet<_>>();
     let mut handles = std::collections::BTreeMap::new();
+    // Canonical lifecycle items are host-produced and persisted independently
+    // of script text. Never infer nested handles/artifacts from printed JSON.
+    for item in rollout {
+        let item = match item {
+            RolloutItem::EventMsg(EventMsg::ItemStarted(event)) => &event.item,
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => &event.item,
+            _ => continue,
+        };
+        let codex_protocol::items::TurnItem::CommandExecution(command) = item else {
+            continue;
+        };
+        let Some(id) = command
+            .process_id
+            .as_deref()
+            .and_then(|id| id.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let artifact = command
+            .output_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.raw_output_artifact_id.clone());
+        let retained = handles.entry(id).or_insert(None);
+        if artifact.is_some() {
+            *retained = artifact;
+        }
+    }
     let has_old_sessions = history.iter().fold(false, |found, item| {
         let current = match item {
             ResponseItem::FunctionCallOutput {
@@ -310,7 +379,7 @@ pub(super) fn append_unified_exec_resume_invalidation(history: &mut Vec<Response
         had_notice |= is_notice;
         !is_notice
     });
-    if !has_old_sessions && !had_notice {
+    if !has_old_sessions && !had_notice && handles.is_empty() {
         return;
     }
     let omitted = handles.len().saturating_sub(32);
@@ -385,83 +454,30 @@ fn collect_resume_handles(
     nested: bool,
     handles: &mut std::collections::BTreeMap<u32, Option<String>>,
 ) -> bool {
-    fn live(
-        states: &serde_json::Value,
-        handles: &mut std::collections::BTreeMap<u32, Option<String>>,
-    ) -> bool {
-        states.as_array().is_some_and(|states| {
-            states.iter().fold(false, |found, state| {
-                let current =
-                    matches!(state["tool"].as_str(), Some("exec_command" | "write_stdin"))
-                        && collect_command_receipt_handle(state, handles);
-                found || current
-            })
-        })
+    if nested {
+        // Legacy code-mode text has no authenticated subrecord boundaries.
+        // Invalidate conservatively without asserting printed IDs/artifacts.
+        return true;
     }
-    let collect =
-        |value: &serde_json::Value,
-         handles: &mut std::collections::BTreeMap<u32, Option<String>>| {
-            let mut found = collect_command_receipt_handle(value, handles);
-            if nested {
-                for pointer in [
-                    "/nested_commands",
-                    "/essential/nested_commands",
-                    "/result/essential/nested_commands",
-                ] {
-                    found |= value
-                        .pointer(pointer)
-                        .is_some_and(|states| live(states, handles));
-                }
-            }
-            found
-        };
-    let mut found = false;
+    // Only the direct native envelope owns these fields; stdout is nested data.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        found |= collect(&value, handles);
-        // A single JSON record was fully handled above. Re-parsing the same
-        // potentially large tool receipt as a JSON line adds no new handles.
-        if !text.contains('\n') {
-            return found;
-        }
+        return collect_command_receipt_handle(&value, handles);
     }
-    // Current code-mode packets print each process receipt as its own JSON line.
-    for line in text.lines() {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            found |= collect(&value, handles);
-        }
-        let status = line
-            .strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX)
-            .or_else(|| {
-                nested
-                    .then(|| line.strip_prefix("Running command session_id: "))
-                    .flatten()
-            });
-        if let Some(status) = status {
-            let id = status.split_once(';').map_or(status, |(id, _)| id);
-            if let Ok(id) = id.trim().parse::<u32>() {
-                handles.entry(id).or_default();
-                found = true;
-            }
-        }
-        found |= nested
-            && line
-                .strip_prefix("Script running with cell ID ")
-                .is_some_and(|id| !id.trim().is_empty());
+    // Compatibility with the native legacy status header, never stdout lines.
+    let Some(status) = text
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix(UNIFIED_EXEC_SESSION_ID_PREFIX))
+    else {
+        return false;
+    };
+    let id = status.split_once(';').map_or(status, |(id, _)| id);
+    if let Ok(id) = id.trim().parse::<u32>() {
+        handles.entry(id).or_default();
+        true
+    } else {
+        false
     }
-    if !nested {
-        return found;
-    }
-    let marker = "Nested command states (independent of script completion):\n";
-    for (index, _) in text.match_indices(marker) {
-        if index != 0 && !text[..index].ends_with('\n') {
-            continue;
-        }
-        found |= serde_json::Deserializer::from_str(&text[index + marker.len()..])
-            .into_iter::<serde_json::Value>()
-            .next()
-            .is_some_and(|value| value.as_ref().is_ok_and(|states| live(states, handles)));
-    }
-    found
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -491,8 +507,14 @@ enum TurnReferenceContextItem {
 #[derive(Debug, Default)]
 struct ActiveReplaySegment<'a> {
     turn_id: Option<String>,
+    // Outer None: no accepted boundary. Some(None): legacy/unknown provenance.
+    accepted_input: Option<Option<crate::plan_store::AcceptedPlanInput>>,
     plan: Option<UpdatePlanArgs>,
     plan_lineage: Option<crate::plan_store::PlanLineage>,
+    plan_revision: Option<String>,
+    // A donor for the already-selected newer projection is held until this
+    // segment survives rollback. It need not be this segment's newest plan.
+    plan_lineage_donor: Option<crate::plan_store::PlanLineage>,
     counts_as_user_turn: bool,
     previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
@@ -512,7 +534,9 @@ struct ReplacementCheckpoint<'a> {
 
 struct FinalizedReplayState<'items, 'state> {
     plan: &'state mut Option<UpdatePlanArgs>,
+    accepted_input: &'state mut Option<Option<crate::plan_store::AcceptedPlanInput>>,
     plan_lineage: &'state mut Option<crate::plan_store::PlanLineage>,
+    plan_revision: &'state mut Option<String>,
     base_replacement_history: &'state mut Option<&'items [ResponseItem]>,
     rollout_suffix: &'state mut &'items [RolloutItem],
     discarded_history_effect_indexes: &'state mut HashSet<usize>,
@@ -523,6 +547,7 @@ struct FinalizedReplayState<'items, 'state> {
     has_surviving_legacy_compaction_without_window_number: &'state mut bool,
     window: &'state mut Option<ReconstructedWindow>,
     pending_rollback_turns: &'state mut usize,
+    collect_inputs_only: bool,
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -536,7 +561,9 @@ fn finalize_active_segment<'a>(
 ) {
     let FinalizedReplayState {
         plan,
+        accepted_input,
         plan_lineage,
+        plan_revision,
         base_replacement_history,
         rollout_suffix,
         discarded_history_effect_indexes,
@@ -547,6 +574,7 @@ fn finalize_active_segment<'a>(
         has_surviving_legacy_compaction_without_window_number,
         window,
         pending_rollback_turns,
+        collect_inputs_only,
     } = state;
     // Thread rollback drops the newest surviving real user-message boundaries. In replay, that
     // means skipping the next finalized segments that contain a non-contextual
@@ -559,10 +587,23 @@ fn finalize_active_segment<'a>(
         return;
     }
 
+    if let Some(Some(latest)) = accepted_input.as_mut()
+        && let Some(Some(earlier)) = active_segment.accepted_input.as_ref()
+    {
+        latest.retain_earlier(earlier);
+    } else if accepted_input.is_none() {
+        *accepted_input = active_segment.accepted_input;
+    }
+    if collect_inputs_only {
+        return;
+    }
     world_state_replay.extend(active_segment.world_state_replay);
     if plan.is_none() {
         *plan = active_segment.plan;
         *plan_lineage = active_segment.plan_lineage;
+        *plan_revision = active_segment.plan_revision;
+    } else if plan_lineage.is_none() {
+        *plan_lineage = active_segment.plan_lineage_donor;
     }
     *surviving_compaction_count =
         (*surviving_compaction_count).saturating_add(active_segment.compaction_count);
@@ -608,6 +649,7 @@ impl Session {
         Self::reconstruct_rollout(
             rollout_items,
             turn_context.model_info.truncation_policy.into(),
+            Some(self.thread_id),
         )
     }
 
@@ -619,6 +661,7 @@ impl Session {
         Self::reconstruct_rollout(
             rollout_items,
             codex_utils_output_truncation::TruncationPolicy::Bytes(usize::MAX),
+            None,
         )
         .history
     }
@@ -626,6 +669,7 @@ impl Session {
     fn reconstruct_rollout(
         rollout_items: &[RolloutItem],
         truncation_policy: codex_utils_output_truncation::TruncationPolicy,
+        thread_id: Option<codex_protocol::ThreadId>,
     ) -> RolloutReconstruction {
         // A loader diagnostic describes gaps in the entire source, including missing
         // rollback markers. It must not acquire the lifecycle of whichever turn was
@@ -661,7 +705,10 @@ impl Session {
         });
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
         let mut plan = None;
+        let mut accepted_input = None;
+        let mut collect_inputs_only = false;
         let mut plan_lineage = None;
+        let mut plan_revision = None;
         let update_plan_call_ids = rollout_items
             .iter()
             .filter_map(|item| match item {
@@ -690,19 +737,93 @@ impl Session {
         // modern turn must still roll back with that turn, not independently.
         // Modern starts own membership. Terminal publication can lag a successor;
         // those terminal facts must not seed an unrelated reverse segment.
-        let first_started_turn = rollout_items.iter().position(|item| {
-            matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_)))
-        });
+        let first_started_turn = rollout_items
+            .iter()
+            .position(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnStarted(_))));
         let mut started_turn = None;
         let mut legacy_user_boundaries = HashSet::new();
+        // Canonical accepted items are persisted before their legacy fanout.
+        // The duplicate legacy event is not a newer, unknown authorization.
+        let mut accepted_legacy_duplicates = HashSet::new();
+        let mut pending_accepted_legacy = None;
+        let mut in_review = false;
+        let mut saw_review_entry = false;
+        let mut review_marker_gap = false;
+        let mut review_plan_events = HashSet::new();
+        // Rollback markers recorded before typed inter-agent delivery counted
+        // assistant-encoded mail as an instruction turn; replay them that way.
+        let mut legacy_inter_agent_mail =
+            codex_context_fragments::LegacyInterAgentMailReader::default();
+        let mut legacy_inter_agent_mail_indexes = HashSet::new();
         for (index, item) in rollout_items.iter().enumerate() {
+            if legacy_inter_agent_mail.observe(item).is_some() {
+                legacy_inter_agent_mail_indexes.insert(index);
+            }
+            match item {
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                    if matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(message)
+                        if crate::event_mapping::is_user_input_item_id(&message.id)) =>
+                {
+                    let codex_protocol::items::TurnItem::UserMessage(message) = &event.item else {
+                        unreachable!()
+                    };
+                    pending_accepted_legacy =
+                        serde_json::to_string(&message.as_legacy_user_message_event()).ok();
+                }
+                RolloutItem::EventMsg(EventMsg::UserMessage(message)) => {
+                    let legacy = serde_json::to_string(message).ok();
+                    if pending_accepted_legacy
+                        .take()
+                        .is_some_and(|canonical| legacy.as_ref() == Some(&canonical))
+                    {
+                        accepted_legacy_duplicates.insert(index);
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => pending_accepted_legacy = None,
+                _ => {}
+            }
+            // Review delegates historically forwarded ownerless checklist
+            // events. Only retained review markers establish foreign ownership;
+            // ordinary legacy PlanUpdate events remain supported.
+            match item {
+                RolloutItem::EventMsg(EventMsg::EnteredReviewMode(_))
+                | RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                    codex_protocol::protocol::ItemCompletedEvent {
+                        item: codex_protocol::items::TurnItem::EnteredReviewMode(_),
+                        ..
+                    },
+                )) => {
+                    // Legacy and canonical events can both encode this entry.
+                    in_review = true;
+                    saw_review_entry = true;
+                }
+                RolloutItem::EventMsg(EventMsg::ExitedReviewMode(_))
+                | RolloutItem::EventMsg(EventMsg::ItemCompleted(
+                    codex_protocol::protocol::ItemCompletedEvent {
+                        item: codex_protocol::items::TurnItem::ExitedReviewMode(_),
+                        ..
+                    },
+                )) => {
+                    review_marker_gap |= !saw_review_entry;
+                    in_review = false;
+                }
+                RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => {
+                    review_marker_gap |= in_review;
+                    in_review = false;
+                    saw_review_entry = false;
+                }
+                RolloutItem::EventMsg(EventMsg::PlanUpdate(_)) if in_review => {
+                    review_plan_events.insert(index);
+                }
+                _ => {}
+            }
             match item {
                 RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
                     started_turn = Some(event.turn_id.as_str());
                 }
-                RolloutItem::EventMsg(EventMsg::TurnComplete(event))
-                    if started_turn == Some(event.turn_id.as_str()) =>
-                {
+                RolloutItem::EventMsg(
+                    EventMsg::TurnComplete(event) | EventMsg::ImportedTurnClosed(event),
+                ) if started_turn == Some(event.turn_id.as_str()) => {
                     started_turn = None;
                 }
                 RolloutItem::EventMsg(EventMsg::TurnAborted(event))
@@ -719,6 +840,7 @@ impl Session {
                 _ => {}
             }
         }
+        review_marker_gap |= in_review;
         let has_segmented_turn_boundaries = rollout_items.iter().any(|item| {
             matches!(
                 item,
@@ -744,6 +866,9 @@ impl Session {
         for (index, item) in rollout_items.iter().enumerate().rev() {
             match item {
                 RolloutItem::EventMsg(EventMsg::PlanUpdate(update)) => {
+                    if review_plan_events.contains(&index) {
+                        continue;
+                    }
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     // The newest committed update survives compaction, but belongs
@@ -799,7 +924,9 @@ impl Session {
                         );
                     }
                 }
-                RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
+                RolloutItem::EventMsg(
+                    EventMsg::TurnComplete(event) | EventMsg::ImportedTurnClosed(event),
+                ) => {
                     if first_started_turn.is_some_and(|start| index >= start) {
                         continue;
                     }
@@ -828,10 +955,37 @@ impl Session {
                         });
                     }
                 }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                    if matches!(&event.item, codex_protocol::items::TurnItem::UserMessage(message)
+                        if crate::event_mapping::is_user_input_item_id(&message.id)) =>
+                {
+                    let codex_protocol::items::TurnItem::UserMessage(message) = &event.item else {
+                        unreachable!()
+                    };
+                    let segment = active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    segment.counts_as_user_turn = true;
+                    let input = crate::plan_store::AcceptedPlanInput::from_texts(
+                        &event.turn_id,
+                        message.content.iter().filter_map(|item| match item {
+                            codex_protocol::user_input::UserInput::Text { text, .. } => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        }),
+                    );
+                    match segment.accepted_input.as_mut() {
+                        Some(Some(latest)) => latest.retain_earlier(&input),
+                        None => segment.accepted_input = Some(Some(input)),
+                        Some(None) => {}
+                    }
+                }
                 RolloutItem::EventMsg(EventMsg::UserMessage(_)) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.counts_as_user_turn = true;
+                    if !accepted_legacy_duplicates.contains(&index) {
+                        active_segment.accepted_input.get_or_insert(None);
+                    }
                 }
                 RolloutItem::TurnContext(ctx) => {
                     let active_segment =
@@ -895,7 +1049,9 @@ impl Session {
                             active_segment,
                             FinalizedReplayState {
                                 plan: &mut plan,
+                                accepted_input: &mut accepted_input,
                                 plan_lineage: &mut plan_lineage,
+                                plan_revision: &mut plan_revision,
                                 base_replacement_history: &mut base_replacement_history,
                                 rollout_suffix: &mut rollout_suffix,
                                 discarded_history_effect_indexes:
@@ -908,6 +1064,7 @@ impl Session {
                                     &mut has_surviving_legacy_compaction_without_window_number,
                                 window: &mut window,
                                 pending_rollback_turns: &mut pending_rollback_turns,
+                                collect_inputs_only,
                             },
                         );
                     }
@@ -916,17 +1073,53 @@ impl Session {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.history_effect_indexes.push(index);
-                    active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item);
-                    if active_segment.plan_lineage.is_none()
-                        && let Some(snapshot) =
-                            crate::plan_store::plan_snapshot_from_item(response_item)
-                        && active_segment
-                            .plan
-                            .as_ref()
-                            .is_none_or(|plan| plan == &snapshot.current_plan)
+                    active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item)
+                        || legacy_inter_agent_mail_indexes.contains(&index);
+                    if let Some(decision) = thread_id.and_then(|thread_id| {
+                        super::user_decision::AcceptedUserDecision::from_snapshot(
+                            response_item,
+                            thread_id,
+                        )
+                    }) && let Some(input) = decision.accepted_input()
+                        && turn_ids_are_compatible(
+                            active_segment.turn_id.as_deref(),
+                            Some(&input.0),
+                        )
                     {
-                        active_segment.plan = Some(snapshot.current_plan);
-                        active_segment.plan_lineage = Some(snapshot.lineage);
+                        if active_segment.turn_id.is_none() {
+                            active_segment.turn_id = Some(input.0.clone());
+                        }
+                        match active_segment.accepted_input.as_mut() {
+                            Some(Some(latest)) => latest.retain_earlier(&input),
+                            None => active_segment.accepted_input = Some(Some(input)),
+                            Some(None) => {}
+                        }
+                    }
+                    if let Some(snapshot) =
+                        crate::plan_store::plan_snapshot_from_item(response_item)
+                    {
+                        if plan_lineage.is_none()
+                            && active_segment.plan_lineage_donor.is_none()
+                            && let Some(selected) = &plan
+                            && let Some(revision) = plan_revision.as_deref()
+                        {
+                            active_segment.plan_lineage_donor =
+                                snapshot.full_lineage_for(selected, Some(revision));
+                        }
+                        if active_segment.plan_lineage.is_none() {
+                            let selected = active_segment
+                                .plan
+                                .as_ref()
+                                .unwrap_or(&snapshot.current_plan);
+                            if let Some(lineage) = snapshot
+                                .full_lineage_for(selected, active_segment.plan_revision.as_deref())
+                            {
+                                active_segment.plan = Some(snapshot.current_plan);
+                                active_segment.plan_lineage = Some(lineage);
+                                active_segment.plan_revision =
+                                    (!snapshot.revision.is_empty()).then_some(snapshot.revision);
+                            }
+                        }
                     }
                     // Events and legacy direct outputs share chronological and
                     // rollback ordering; neither representation is always newer.
@@ -942,11 +1135,19 @@ impl Session {
                             crate::plan_store::plan_response_from_tool_output(output)
                     {
                         active_segment.plan = Some(response.current_plan);
+                        active_segment.plan_revision =
+                            (!response.revision.is_empty()).then_some(response.revision);
                         // Active projections must not eclipse the full
                         // durable snapshot earlier in this same turn.
                         active_segment.plan_lineage =
                             response.lineage_complete.then_some(response.lineage);
                     }
+                }
+                RolloutItem::AdditionalContextState { .. } => {
+                    active_segment
+                        .get_or_insert_with(ActiveReplaySegment::default)
+                        .history_effect_indexes
+                        .push(index);
                 }
                 RolloutItem::InterAgentCommunication(_) => {
                     let active_segment =
@@ -969,7 +1170,9 @@ impl Session {
                     active_segment,
                     FinalizedReplayState {
                         plan: &mut plan,
+                        accepted_input: &mut accepted_input,
                         plan_lineage: &mut plan_lineage,
+                        plan_revision: &mut plan_revision,
                         base_replacement_history: &mut base_replacement_history,
                         rollout_suffix: &mut rollout_suffix,
                         discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
@@ -981,20 +1184,25 @@ impl Session {
                             &mut has_surviving_legacy_compaction_without_window_number,
                         window: &mut window,
                         pending_rollback_turns: &mut pending_rollback_turns,
+                        collect_inputs_only,
                     },
                 );
             }
 
-            if base_replacement_history.is_some()
+            if !collect_inputs_only
+                && base_replacement_history.is_some()
+                && accepted_input.is_some()
                 && previous_turn_settings.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
                 && window.is_some()
-                && (plan.is_some() || !has_plan_updates)
+                && ((plan.is_some() && (plan_revision.is_none() || plan_lineage.is_some()))
+                    || !has_plan_updates)
             {
-                // At this point we have the eager resume metadata, the replacement-history base,
-                // and an explicit surviving window identity, so older rollout items cannot affect
-                // this result.
-                break;
+                // Resume metadata is now final, as at the former early exit.
+                // Older surviving segments still carry pending input authority;
+                // collect only that provenance, without changing window counts,
+                // world-state replay, settings, history or selected plan lineage.
+                collect_inputs_only = true;
             }
         }
 
@@ -1003,7 +1211,9 @@ impl Session {
                 active_segment,
                 FinalizedReplayState {
                     plan: &mut plan,
+                    accepted_input: &mut accepted_input,
                     plan_lineage: &mut plan_lineage,
+                    plan_revision: &mut plan_revision,
                     base_replacement_history: &mut base_replacement_history,
                     rollout_suffix: &mut rollout_suffix,
                     discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
@@ -1015,6 +1225,7 @@ impl Session {
                         &mut has_surviving_legacy_compaction_without_window_number,
                     window: &mut window,
                     pending_rollback_turns: &mut pending_rollback_turns,
+                    collect_inputs_only,
                 },
             );
         }
@@ -1034,16 +1245,33 @@ impl Session {
         // design should keep this same replay shape, but drive it from a resumable reverse source
         // instead of an eagerly loaded `&[RolloutItem]`.
         let rollout_suffix_start = rollout_items.len().saturating_sub(rollout_suffix.len());
+        let mut additional_context_state = None;
+        let mut repository_sources = None;
         for (offset, item) in rollout_suffix.iter().enumerate() {
             let index = rollout_suffix_start + offset;
             if discarded_history_effect_indexes.contains(&index) {
                 continue;
             }
             match item {
+                RolloutItem::AdditionalContextState {
+                    version,
+                    state,
+                    repository_sources: sources,
+                    ..
+                } => {
+                    additional_context_state = (*version == 1).then_some(state);
+                    if *version == 1
+                        && let Some(sources) = sources
+                    {
+                        repository_sources = Some(sources.clone());
+                    }
+                }
                 RolloutItem::ResponseItem(response_item) => {
                     // Durable plan state is replay metadata, not another model
                     // message or a second tool result.
-                    if crate::plan_store::plan_snapshot_from_item(response_item).is_none() {
+                    if crate::plan_store::plan_snapshot_from_item(response_item).is_none()
+                        && !super::user_decision::AcceptedUserDecision::is_snapshot(response_item)
+                    {
                         history.record_items(std::iter::once(response_item), truncation_policy);
                     }
                 }
@@ -1142,6 +1370,7 @@ impl Session {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::TurnContext(_)
+                | RolloutItem::AdditionalContextState { .. }
                 | RolloutItem::EventMsg(_) => {
                     unreachable!("only world-state replay items are collected")
                 }
@@ -1159,13 +1388,30 @@ impl Session {
         if let Some(notice) = reconstruction_notice {
             history.push(notice.clone());
         }
+        if (plan_revision.is_some() && plan_lineage.is_none()) || review_marker_gap {
+            history.push(ResponseItem::Message {
+                id: Some(codex_protocol::ResponseItemId::new("msg_plan_reconstruction_gap")),
+                role: "developer".into(),
+                content: vec![codex_protocol::models::ContentItem::InputText {
+                    text: "<plan_reconstruction_gap>Original plan scope could not be fully reconstructed: a modern projection has no matching surviving full lineage, or review ownership markers are incomplete. The restored checklist is not a complete original-requirement ledger. Reconcile affected scope with the user before relying on checklist completion.</plan_reconstruction_gap>".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            });
+        }
+        let additional_context = additional_context_state
+            .and_then(|state| crate::state::AdditionalContextStore::restore(state, &history))
+            .unwrap_or_else(|| crate::state::AdditionalContextStore::from_legacy_history(&history));
         RolloutReconstruction {
             history,
             plan,
             plan_lineage,
+            accepted_input: accepted_input.flatten(),
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
+            additional_context,
+            repository_sources,
             window_number: window.number,
             first_window_id: window.first_id,
             previous_window_id: window.previous_id,

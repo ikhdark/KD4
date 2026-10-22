@@ -18,3 +18,15 @@ Unfortunately, the Rust standard library does not provide support for UNIX domai
 https://github.com/rust-lang/rust/issues/56533
 
 As a workaround, this crate uses `codex-uds`, which provides a cross-platform async UDS API backed by https://crates.io/crates/uds_windows on Windows.
+
+## Completion policy
+
+The adapter is process-scoped and may be run only once. Native stdio workers
+are detached from the async runtime, with bounded chunk staging; cancellation
+does not wait for a blocked OS read or write. Stdin EOF half-closes socket writes
+and continues reading responses. Socket read EOF ends the session after stdout
+is physically flushed, even if stdin remains open.
+
+An input failure is retained while responses drain for at most five seconds;
+each native stdout write/flush also has a five-second stall limit. Expiry or a
+failed sink returns an explicit incomplete-delivery error, never flushed success.

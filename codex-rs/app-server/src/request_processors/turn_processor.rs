@@ -14,10 +14,9 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::AdditionalContextEntry as CoreAdditionalContextEntry;
 use codex_protocol::protocol::AdditionalContextKind as CoreAdditionalContextKind;
-use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
-use codex_protocol::protocol::SubAgentSource;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_state::BugAttemptReceipt;
 use codex_state::BugClaim;
 use codex_state::BugClassification;
 use codex_state::BugCreateParams as StateBugCreateParams;
@@ -30,8 +29,7 @@ use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 
-use crate::image_url::REMOTE_IMAGE_URL_ERROR;
-use crate::image_url::is_remote_image_url;
+use crate::image_url::image_url_error;
 
 const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
@@ -42,6 +40,28 @@ const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 128 * 1_024;
 // Context fragments cap each escaped value at approximately 4,000 tokens.
 const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 16 * 1_024;
 const ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES: usize = 96;
+
+pub(super) fn task_wall_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Observations are not independent acceptance proof or client acknowledgements.
+/// Wall time joins persisted/external evidence; elapsed time is same-process only.
+pub(super) fn observe_task_boundary(
+    thread_id: ThreadId,
+    task_id: &str,
+    turn_id: Option<&str>,
+    phase: &str,
+    at_unix_ms: u64,
+    elapsed_ms: Option<u64>,
+) {
+    tracing::info!(target: "codex_task_observation", schema_version = 1,
+        %thread_id, task_id, turn_id, phase, at_unix_ms, elapsed_ms,
+        clock = "unix_wall_ms", "task boundary observation");
+}
 
 fn validate_turn_interrupt_target(
     latest_turn: Option<(&str, &TurnStatus)>,
@@ -231,34 +251,29 @@ async fn release_turn_start_after_submission_error(
 }
 
 fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
-    if input.iter().any(|item| {
-        matches!(
-            item,
-            V2UserInput::Image { url, .. } if is_remote_image_url(url)
-        )
+    if let Some(error) = input.iter().find_map(|item| match item {
+        V2UserInput::Image { url, .. } => image_url_error(url),
+        _ => None,
     }) {
-        return Err(invalid_request(REMOTE_IMAGE_URL_ERROR));
+        return Err(invalid_request(error));
     }
     Ok(())
 }
 
 fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONRPCErrorError> {
-    if items.iter().any(|item| match item {
-        ResponseItem::Message { content, .. } => content.iter().any(|item| {
-            matches!(
-                item,
-                ContentItem::InputImage { image_url, .. } if is_remote_image_url(image_url)
-            )
+    if let Some(error) = items.iter().find_map(|item| match item {
+        ResponseItem::Message { content, .. } => content.iter().find_map(|item| match item {
+            ContentItem::InputImage { image_url, .. } => image_url_error(image_url),
+            _ => None,
         }),
         ResponseItem::FunctionCallOutput { output, .. }
         | ResponseItem::CustomToolCallOutput { output, .. } => {
-            output.content_items().is_some_and(|content| {
-                content.iter().any(|item| {
-                    matches!(
-                        item,
-                        FunctionCallOutputContentItem::InputImage { image_url, .. }
-                            if is_remote_image_url(image_url)
-                    )
+            output.content_items().and_then(|content| {
+                content.iter().find_map(|item| match item {
+                    FunctionCallOutputContentItem::InputImage { image_url, .. } => {
+                        image_url_error(image_url)
+                    }
+                    _ => None,
                 })
             })
         }
@@ -275,9 +290,9 @@ fn validate_response_item_image_urls(items: &[ResponseItem]) -> Result<(), JSONR
         | ResponseItem::CompactionTrigger { .. }
         | ResponseItem::ContextCompaction { .. }
         | ResponseItem::AdditionalTools { .. }
-        | ResponseItem::Other => false,
+        | ResponseItem::Other => None,
     }) {
-        return Err(invalid_request(REMOTE_IMAGE_URL_ERROR));
+        return Err(invalid_request(error));
     }
     Ok(())
 }
@@ -722,11 +737,11 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         thread: &CodexThread,
     ) -> Result<(), JSONRPCErrorError> {
-        if thread.multi_agent_version() == Some(MultiAgentVersion::V2)
-            && matches!(
-                thread.config_snapshot().await.session_source,
-                SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
-            )
+        if !thread
+            .config_snapshot()
+            .await
+            .session_source
+            .accepts_direct_user_input(thread.multi_agent_version())
         {
             let error = invalid_request(DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR);
             self.track_error_response(request_id, /*error_type*/ None);
@@ -833,6 +848,7 @@ impl TurnRequestProcessor {
         reserved_turn_id: Option<String>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (app_server_client_name, app_server_client_version) = app_server_client_info;
+        let received_at = std::time::Instant::now();
         let (thread_id, thread) = self.load_thread(&params.thread_id).await.inspect_err(|_| {
             self.track_error_response(&request_id, /*error_type*/ None);
         })?;
@@ -857,6 +873,27 @@ impl TurnRequestProcessor {
         validate_turn_start_target(active_turn_id.as_deref(), is_running).inspect_err(|_| {
             self.track_error_response(&request_id, /*error_type*/ None);
         })?;
+        let queued = reserved_turn_id.is_some();
+        let turn_id = reserved_turn_id.unwrap_or_else(|| thread.reserve_turn_id());
+        // Direct intake accepts responsibility before configuration/preparation
+        // or execution admission can wait. Rejections remain censored attempts.
+        // Queued work already has a durable, idempotent acceptance identity.
+        if !queued {
+            observe_task_boundary(
+                thread_id,
+                &turn_id,
+                Some(&turn_id),
+                "direct_accepted",
+                task_wall_time_ms(),
+                Some(
+                    received_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+            );
+        }
         let task_fingerprint = if params.run_independently.unwrap_or(false) {
             None
         } else {
@@ -905,7 +942,6 @@ impl TurnRequestProcessor {
             additional_context,
             thread_settings,
         };
-        let turn_id = reserved_turn_id.unwrap_or_else(|| thread.reserve_turn_id());
 
         // The RPC handler is cancelled on disconnect. Own admission through core
         // submission together so a dropped caller cannot strand a claimed turn.
@@ -959,6 +995,20 @@ impl TurnRequestProcessor {
                     };
                     let origin_reservation =
                         turn_origin_tracker.reserve(turn_id.clone(), request_id.connection_id);
+                    observe_task_boundary(
+                        thread_id,
+                        &turn_id,
+                        Some(&turn_id),
+                        "execution_admitted",
+                        task_wall_time_ms(),
+                        Some(
+                            received_at
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                        ),
+                    );
                     let request_trace_context = processor.request_trace_context(&request_id).await;
                     if let Err(err) = thread
                         .submit_user_input_with_reserved_turn_id(
@@ -980,6 +1030,20 @@ impl TurnRequestProcessor {
                         return Err(error);
                     }
                     origin_reservation.commit();
+                    observe_task_boundary(
+                        thread_id,
+                        &turn_id,
+                        Some(&turn_id),
+                        "core_submission_acknowledged",
+                        task_wall_time_ms(),
+                        Some(
+                            received_at
+                                .elapsed()
+                                .as_millis()
+                                .try_into()
+                                .unwrap_or(u64::MAX),
+                        ),
+                    );
                     Ok::<(), JSONRPCErrorError>(())
                 }
                 .instrument(tracing::Span::current()),
@@ -1015,8 +1079,14 @@ impl TurnRequestProcessor {
         match (cwd, environment_selections) {
             (None, None) => None,
             (Some(cwd), None) => {
-                let environment_selections =
-                    self.thread_manager.default_environment_selections(&cwd);
+                // A legacy host cwd updates local paths, not the selected identities.
+                let mut environment_selections =
+                    thread.config_snapshot().await.environments.environments;
+                for selection in &mut environment_selections {
+                    if selection.environment_id == LOCAL_ENVIRONMENT_ID {
+                        selection.cwd = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
+                    }
+                }
                 Some(TurnEnvironmentSelections::new(cwd, environment_selections))
             }
             (cwd, Some(environment_selections)) => {
@@ -1486,7 +1556,32 @@ impl BugClassificationFailure {
 }
 
 async fn classify_bug_claim(store: &BugStore, context: &BugClassifierContext, claim: BugClaim) {
-    match classify_bug_report(context, &claim.raw_text).await {
+    let started = std::time::Instant::now();
+    let mut receipt = BugAttemptReceipt {
+        requested_model: context.requested_model.clone(),
+        resolved_model: context.model_info.slug.clone(),
+        dispatched: Some(false),
+        ..Default::default()
+    };
+    let result = classify_bug_report(context, &claim, &mut receipt).await;
+    receipt.duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    receipt.outcome = match &result {
+        Ok(_) => "classified",
+        Err(BugClassificationFailure::Cancelled) => "cancelled",
+        Err(BugClassificationFailure::Provider) => "provider_error",
+        Err(BugClassificationFailure::MalformedOutput) => "malformed_output",
+        Err(BugClassificationFailure::Schema) => "schema_error",
+        Err(BugClassificationFailure::Grounding) => "grounding_error",
+    }
+    .into();
+    // Preserve the observed receipt before clearing the writer lease, even
+    // when semantic validation failed. Storage failure retains the lease.
+    if let Err(error) = store.record_attempt_receipt(&claim, &receipt).await {
+        tracing::warn!(bug_id = claim.id, attempt_id = %claim.attempt_id, %error,
+            "could not persist bug classifier receipt");
+        return;
+    }
+    match result {
         Ok(classification) => {
             let normalized = BugClassification {
                 summary: &classification.summary,
@@ -1518,8 +1613,12 @@ async fn classify_bug_claim(store: &BugStore, context: &BugClassifierContext, cl
 
 async fn classify_bug_report(
     context: &BugClassifierContext,
-    raw_text: &str,
+    claim: &BugClaim,
+    receipt: &mut BugAttemptReceipt,
 ) -> Result<ValidatedBugClassification, BugClassificationFailure> {
+    let raw_text = &claim.raw_text;
+    let classifier_thread_id =
+        ThreadId::from_string(&claim.attempt_id).map_err(|_| BugClassificationFailure::Provider)?;
     let agent_identity_policy = if context.config.features.enabled(Feature::UseAgentIdentity) {
         AgentIdentityAuthPolicy::ChatGptAuth
     } else {
@@ -1528,7 +1627,7 @@ async fn classify_bug_report(
     let model_client = ModelClient::new(
         Some(Arc::clone(&context.auth_manager)),
         agent_identity_policy,
-        ThreadId::new(),
+        classifier_thread_id,
         context.provider.clone(),
         context.session_source.clone(),
         context.originator.clone(),
@@ -1561,7 +1660,6 @@ async fn classify_bug_report(
     prompt.base_instructions.text = BUG_CLASSIFIER_INSTRUCTIONS.to_string();
     prompt.output_schema = Some(bug_classifier_schema());
 
-    let classifier_thread_id = ThreadId::new();
     let telemetry = SessionTelemetry::new(
         classifier_thread_id,
         context.requested_model.as_str(),
@@ -1574,14 +1672,16 @@ async fn classify_bug_report(
         "bug-classifier".to_string(),
         context.session_source.clone(),
     );
-    let responses_metadata = CodexResponsesMetadata::new(
-        String::new(),
-        ThreadId::new().to_string(),
-        ThreadId::new().to_string(),
-        String::new(),
-    );
+    let responses_metadata =
+        CodexResponsesMetadata::for_bug_classifier(&claim.attempt_id, &claim.thread_id, claim.id);
     let inference_trace = InferenceTraceContext::disabled();
     let mut session = model_client.new_session();
+    if context.shutdown.is_cancelled() {
+        return Err(BugClassificationFailure::Cancelled);
+    }
+    // Stream setup may fail after send; absence of a response is not evidence
+    // of no dispatch or no provider spend.
+    receipt.dispatched = None;
     let mut stream = tokio::select! {
         _ = context.shutdown.cancelled() => return Err(BugClassificationFailure::Cancelled),
         result = session.stream(
@@ -1596,13 +1696,14 @@ async fn classify_bug_report(
         ) => result.map_err(|_| BugClassificationFailure::Provider)?,
     };
 
-    consume_bug_classification_stream(&mut stream, &context.shutdown, raw_text).await
+    consume_bug_classification_stream(&mut stream, &context.shutdown, raw_text, receipt).await
 }
 
 async fn consume_bug_classification_stream(
     stream: &mut (impl futures::Stream<Item = Result<ResponseEvent, CodexErr>> + Unpin),
     shutdown: &CancellationToken,
     raw_text: &str,
+    receipt: &mut BugAttemptReceipt,
 ) -> Result<ValidatedBugClassification, BugClassificationFailure> {
     let mut completed = false;
     let mut output_count = 0usize;
@@ -1615,7 +1716,19 @@ async fn consume_bug_classification_stream(
         let Some(event) = event else {
             break;
         };
-        match event.map_err(|_| BugClassificationFailure::Provider)? {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                if let Some(usage) = error.terminal_usage() {
+                    receipt.token_usage = usage.clone();
+                    receipt.terminal_observed = true;
+                    receipt.dispatched = Some(true);
+                }
+                receipt.response_id = error.terminal_response_id().map(str::to_owned);
+                return Err(BugClassificationFailure::Provider);
+            }
+        };
+        match event {
             ResponseEvent::OutputItemDone(item) => {
                 if matches!(item, ResponseItem::Reasoning { .. }) {
                     continue;
@@ -1628,7 +1741,15 @@ async fn consume_bug_classification_stream(
                     output = Some(text.clone());
                 }
             }
-            ResponseEvent::Completed { .. } => {
+            ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                ..
+            } => {
+                receipt.response_id = Some(response_id);
+                receipt.token_usage = token_usage;
+                receipt.dispatched = Some(true);
+                receipt.terminal_observed = true;
                 completed = true;
                 break;
             }

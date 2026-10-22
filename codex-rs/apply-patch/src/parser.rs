@@ -90,12 +90,12 @@ use Hunk::*;
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct UpdateFileChunk {
-    /// A single line of context used to narrow down the position of the chunk
-    /// (this is usually a class, method, or function definition.)
+    /// A source line immediately preceding the chunk, or a revision-bound
+    /// `codex-range` descriptor. A textual anchor is not a containing scope.
     pub change_context: Option<String>,
 
     /// A contiguous block of lines that should be replaced with `new_lines`.
-    /// `old_lines` must occur strictly after `change_context`.
+    /// With a textual `change_context`, `old_lines` must immediately follow it.
     pub old_lines: Vec<String>,
     pub new_lines: Vec<String>,
 

@@ -172,11 +172,93 @@ pub struct JSONRPCErrorError {
     pub message: String,
 }
 
+// Stable wire spellings, independent of Rust's Debug formatting and localized
+// OS messages. Unknown future kinds remain errors with legacy classification.
+const FILE_SYSTEM_ERROR_KINDS: &[(&str, std::io::ErrorKind)] = &[
+    ("notFound", std::io::ErrorKind::NotFound),
+    ("permissionDenied", std::io::ErrorKind::PermissionDenied),
+    ("alreadyExists", std::io::ErrorKind::AlreadyExists),
+    ("notADirectory", std::io::ErrorKind::NotADirectory),
+    ("isADirectory", std::io::ErrorKind::IsADirectory),
+    ("directoryNotEmpty", std::io::ErrorKind::DirectoryNotEmpty),
+    ("readOnlyFilesystem", std::io::ErrorKind::ReadOnlyFilesystem),
+    ("invalidInput", std::io::ErrorKind::InvalidInput),
+    ("invalidData", std::io::ErrorKind::InvalidData),
+    ("unsupported", std::io::ErrorKind::Unsupported),
+    ("interrupted", std::io::ErrorKind::Interrupted),
+    ("timedOut", std::io::ErrorKind::TimedOut),
+    ("brokenPipe", std::io::ErrorKind::BrokenPipe),
+    ("wouldBlock", std::io::ErrorKind::WouldBlock),
+    ("writeZero", std::io::ErrorKind::WriteZero),
+    ("unexpectedEof", std::io::ErrorKind::UnexpectedEof),
+    ("storageFull", std::io::ErrorKind::StorageFull),
+    ("quotaExceeded", std::io::ErrorKind::QuotaExceeded),
+    ("fileTooLarge", std::io::ErrorKind::FileTooLarge),
+    ("resourceBusy", std::io::ErrorKind::ResourceBusy),
+    ("executableFileBusy", std::io::ErrorKind::ExecutableFileBusy),
+    ("deadlock", std::io::ErrorKind::Deadlock),
+    ("crossesDevices", std::io::ErrorKind::CrossesDevices),
+    ("tooManyLinks", std::io::ErrorKind::TooManyLinks),
+    ("invalidFilename", std::io::ErrorKind::InvalidFilename),
+    (
+        "argumentListTooLong",
+        std::io::ErrorKind::ArgumentListTooLong,
+    ),
+    ("outOfMemory", std::io::ErrorKind::OutOfMemory),
+    ("connectionRefused", std::io::ErrorKind::ConnectionRefused),
+    ("connectionReset", std::io::ErrorKind::ConnectionReset),
+    ("connectionAborted", std::io::ErrorKind::ConnectionAborted),
+    ("notConnected", std::io::ErrorKind::NotConnected),
+    ("addrInUse", std::io::ErrorKind::AddrInUse),
+    ("addrNotAvailable", std::io::ErrorKind::AddrNotAvailable),
+    ("networkDown", std::io::ErrorKind::NetworkDown),
+    ("networkUnreachable", std::io::ErrorKind::NetworkUnreachable),
+    ("hostUnreachable", std::io::ErrorKind::HostUnreachable),
+    ("other", std::io::ErrorKind::Other),
+];
+
+pub fn file_system_error_data(kind: std::io::ErrorKind) -> serde_json::Value {
+    let name = FILE_SYSTEM_ERROR_KINDS
+        .iter()
+        .find_map(|(name, candidate)| (*candidate == kind).then_some(*name))
+        .unwrap_or("other");
+    serde_json::json!({"filesystemError": {"version": 1, "kind": name}})
+}
+
+pub fn file_system_error_kind(data: Option<&serde_json::Value>) -> Option<std::io::ErrorKind> {
+    let payload = data?.get("filesystemError")?;
+    if payload.get("version")?.as_u64()? != 1 {
+        return None;
+    }
+    let name = payload.get("kind")?.as_str()?;
+    FILE_SYSTEM_ERROR_KINDS
+        .iter()
+        .find_map(|(candidate, kind)| (*candidate == name).then_some(*kind))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn filesystem_error_kinds_roundtrip_and_unknown_data_stays_unknown() {
+        for (_, kind) in FILE_SYSTEM_ERROR_KINDS {
+            let bytes = serde_json::to_vec(&file_system_error_data(*kind)).unwrap();
+            let data = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(file_system_error_kind(Some(&data)), Some(*kind));
+        }
+        for data in [
+            json!(null),
+            json!({"filesystemError": {"version": 2, "kind": "notFound"}}),
+            json!({"filesystemError": {"version": 1, "kind": "future"}}),
+            json!({"filesystemError": {"version": "1", "kind": "notFound"}}),
+        ] {
+            assert_eq!(file_system_error_kind(Some(&data)), None);
+        }
+        assert_eq!(file_system_error_kind(None), None);
+    }
 
     #[test]
     fn wire_messages_preserve_category_and_payload() {

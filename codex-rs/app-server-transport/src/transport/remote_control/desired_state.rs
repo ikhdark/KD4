@@ -113,76 +113,79 @@ impl RemoteControlHandle {
         &self,
         app_server_client_name: Option<&str>,
     ) -> io::Result<RemoteControlStatusChangedNotification> {
-        self.ensure_remote_control_allowed()
-            .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
-        let _transition = self
-            .desired_state_rpc_lock
-            .acquire()
-            .await
-            .unwrap_or_else(|_| unreachable!());
-        let state_db = self
-            .state_db
-            .as_deref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, RemoteControlUnavailable))?;
-        let mut auth = super::auth::load_remote_control_auth(&self.auth_manager).await?;
-        let remote_control_target = normalize_remote_control_url(&self.remote_control_url)?;
-        let app_server_client_name = self.pairing_persistence_key(app_server_client_name)?;
-        let app_server_client_name = app_server_client_name.as_deref();
-        let status = self.status();
-        let mut current_enrollment = self.current_enrollment.lock().await;
-        let (enrollment, _) = self
-            .load_or_enroll_server_with_source(
-                super::RemoteControlHttpClientSource::Pool(&self.http_clients),
-                &current_enrollment,
-                &mut auth,
-                &status.installation_id,
-                &status.server_name,
-                app_server_client_name,
-                super::RemoteControlEnrollmentSelection::ReuseOrCreate,
-            )
-            .await?;
+        self.run_with_policy(async {
+            self.ensure_remote_control_allowed()
+                .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
+            let _transition = self
+                .desired_state_rpc_lock
+                .acquire()
+                .await
+                .unwrap_or_else(|_| unreachable!());
+            let state_db = self
+                .state_db
+                .as_deref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, RemoteControlUnavailable))?;
+            let mut auth = super::auth::load_remote_control_auth(&self.auth_manager).await?;
+            let remote_control_target = normalize_remote_control_url(&self.remote_control_url)?;
+            let app_server_client_name = self.pairing_persistence_key(app_server_client_name)?;
+            let app_server_client_name = app_server_client_name.as_deref();
+            let status = self.status();
+            let mut current_enrollment = self.current_enrollment.lock().await;
+            let (enrollment, _) = self
+                .load_or_enroll_server_with_source(
+                    super::RemoteControlHttpClientSource::Pool(&self.http_clients),
+                    &current_enrollment,
+                    &mut auth,
+                    &status.installation_id,
+                    &status.server_name,
+                    app_server_client_name,
+                    super::RemoteControlEnrollmentSelection::ReuseOrCreate,
+                )
+                .await?;
 
-        let current_auth = super::auth::load_remote_control_auth(&self.auth_manager).await?;
-        if current_auth.account_id != auth.account_id {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "remote control account changed during enrollment",
-            ));
-        }
+            let current_auth = super::auth::load_remote_control_auth(&self.auth_manager).await?;
+            if current_auth.account_id != auth.account_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "remote control account changed during enrollment",
+                ));
+            }
 
-        let _persistence = acquire_persistence_lock(&self.desired_state_persistence_lock).await;
-        let updated = state_db
-            .set_remote_control_enabled(
-                &remote_control_target.websocket_url,
-                &auth.account_id,
-                app_server_client_name,
-                /*remote_control_enabled*/ true,
-            )
-            .await
-            .map_err(io::Error::other)?;
-        if updated == 0 {
-            update_persisted_remote_control_enrollment(
-                Some(state_db),
-                &remote_control_target,
-                &auth.account_id,
-                app_server_client_name,
-                Some(&enrollment),
-                Some(true),
-            )
-            .await?;
-        }
-        publish_current_enrollment(&mut current_enrollment, &enrollment);
-        self.enable_with_preference(Some(true)).map_err(|err| {
-            let kind = match err {
-                RemoteControlEnableError::Unavailable(_) => io::ErrorKind::NotFound,
-                RemoteControlEnableError::DisabledByRequirements(_) => {
-                    io::ErrorKind::PermissionDenied
-                }
-            };
-            io::Error::new(kind, err)
-        })?;
-        RemoteControlStatusPublisher::new(self.status_tx.as_ref().clone())
-            .publish_environment_id(Some(enrollment.environment_id));
-        Ok(self.status())
+            let _persistence = acquire_persistence_lock(&self.desired_state_persistence_lock).await;
+            let updated = state_db
+                .set_remote_control_enabled(
+                    &remote_control_target.websocket_url,
+                    &auth.account_id,
+                    app_server_client_name,
+                    /*remote_control_enabled*/ true,
+                )
+                .await
+                .map_err(io::Error::other)?;
+            if updated == 0 {
+                update_persisted_remote_control_enrollment(
+                    Some(state_db),
+                    &remote_control_target,
+                    &auth.account_id,
+                    app_server_client_name,
+                    Some(&enrollment),
+                    Some(true),
+                )
+                .await?;
+            }
+            publish_current_enrollment(&mut current_enrollment, &enrollment);
+            self.enable_with_preference(Some(true)).map_err(|err| {
+                let kind = match err {
+                    RemoteControlEnableError::Unavailable(_) => io::ErrorKind::NotFound,
+                    RemoteControlEnableError::DisabledByRequirements(_) => {
+                        io::ErrorKind::PermissionDenied
+                    }
+                };
+                io::Error::new(kind, err)
+            })?;
+            RemoteControlStatusPublisher::new(self.status_tx.as_ref().clone())
+                .publish_environment_id(Some(enrollment.environment_id));
+            Ok(self.status())
+        })
+        .await
     }
 }

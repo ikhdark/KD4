@@ -45,9 +45,11 @@ pub(crate) fn init(
     (otel, telemetry)
 }
 
-pub(crate) async fn run_until_shutdown<F, E>(run: F) -> Result<(), E>
+pub(crate) async fn run_until_shutdown<F, Fut, E>(run: F) -> Result<(), E>
 where
-    F: Future<Output = Result<(), E>>,
+    F: FnOnce(codex_exec_server::ExecServerShutdown) -> Fut,
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
+    E: From<std::io::Error> + Send + 'static,
 {
     let shutdown_signal = match shutdown_signal() {
         Ok(signal) => Some(signal),
@@ -56,23 +58,36 @@ where
             None
         }
     };
-    tokio::pin!(run);
+    let shutdown = codex_exec_server::ExecServerShutdown::new();
+    // Service custody survives cancellation of the signal observer. A timeout
+    // reports incomplete shutdown, never successful future-drop cleanup.
+    let mut run = tokio::spawn(run(shutdown.clone()));
 
     if let Some(shutdown_signal) = shutdown_signal {
         tokio::select! {
-            result = &mut run => result,
+            result = &mut run => result.map_err(|error| E::from(std::io::Error::other(error)))?,
             signal = wait_for_shutdown_signal(shutdown_signal) => {
                 match signal {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        shutdown.cancel();
+                        tokio::select! {
+                            result = &mut run => result.map_err(|error| E::from(std::io::Error::other(error)))?,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut, "exec-server cleanup remains owned and pending after shutdown deadline").into()),
+                            _ = tokio::signal::ctrl_c() => Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted, "exec-server forced shutdown requested; cleanup is unconfirmed").into()),
+                        }
+                    }
                     Err(error) => {
                         eprintln!("Could not listen for exec-server shutdown signal: {error}");
-                        run.await
+                        run.await.map_err(|error| E::from(std::io::Error::other(error)))?
                     }
                 }
             }
         }
     } else {
         run.await
+            .map_err(|error| E::from(std::io::Error::other(error)))?
     }
 }
 

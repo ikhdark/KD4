@@ -134,7 +134,7 @@ struct CodeModePacketAdmission {
 /// unchanged, so the model does not compose the same answer twice.
 struct RetainedDeliveryAnswer {
     text: String,
-    schema: Option<JsonValue>,
+    schema: Option<Arc<crate::session::turn_context::PreparedOutputSchema>>,
     input_activity: tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
 }
 
@@ -142,6 +142,7 @@ struct RetainedDeliveryAnswer {
 struct CodeModePacketMetrics {
     retention_tail: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
     turn_id: Option<String>,
+    delivery_retired: bool,
     output_budget: Option<usize>,
     delivery_intent: Option<CodeModeDeliveryIntent>,
     delivery_blocked: bool,
@@ -159,7 +160,7 @@ struct CodeModePacketMetrics {
 struct CodeModeDeliveryIntent {
     turn_id: String,
     input_activity: tokio::sync::watch::Receiver<crate::session::InputQueueActivity>,
-    schema: Option<JsonValue>,
+    schema: Option<Arc<crate::session::turn_context::PreparedOutputSchema>>,
     limit: usize,
 }
 
@@ -564,6 +565,9 @@ impl CodeModeService {
         })
     }
 
+    /// Runs a cell outside any model step. Production cells use
+    /// [`Self::execute_for_step`] so runtime-replacement notices stay step-scoped.
+    #[cfg(test)]
     pub(crate) async fn execute(
         &self,
         request: codex_code_mode::ExecuteRequest,
@@ -588,7 +592,18 @@ impl CodeModeService {
         if replaced_earlier_in_step {
             return Err(RUNTIME_REPLACED_EARLIER_IN_STEP.to_string());
         }
-        let result = self.execute(request).await;
+        // Worker construction does not make the runtime ready. Measure the
+        // actual shared initialization wait, including cancelled waiters.
+        let readiness = step_context
+            .turn
+            .turn_timing_state
+            .begin_local_phase(crate::turn_timing::TurnLocalPhase::ExecutorReadinessWait);
+        let session = self.session().await;
+        drop(readiness);
+        let result = match session {
+            Ok(session) => session.execute(request).await,
+            Err(error) => Err(error),
+        };
         if matches!(&result, Err(error) if error == codex_code_mode::RUNTIME_REPLACED_NOTICE) {
             *self
                 .replacement_step
@@ -663,6 +678,13 @@ impl CodeModeService {
         self.dispatch_broker.mark_cell_ready_for_dispatch(cell_id);
     }
 
+    pub(crate) fn bind_cell_environments(&self, cell_id: &CellId, step: &StepContext) {
+        self.dispatch_broker
+            .bind_cell_environments(cell_id, &step.environments);
+        self.dispatch_broker
+            .bind_cell_user_intent(cell_id, step.user_intent_epoch);
+    }
+
     pub(crate) fn record_cell_parent_call_id(&self, cell_id: &CellId, call_id: &str) {
         self.packet_admission
             .lock()
@@ -701,6 +723,41 @@ impl CodeModeService {
         }
     }
 
+    pub(super) fn bind_cell_delivery_turn(&self, cell_id: &CellId, turn: &TurnContext) {
+        // Admission and terminal sealing already share this owner. A late
+        // execute registration cannot resurrect a retired turn's obligations.
+        if !turn.tool_call_acceptance.try_accept(|| {
+            self.record_cell_turn(cell_id, &turn.sub_id);
+            true
+        }) && let Some(metrics) = self
+            .packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cells
+            .get_mut(cell_id.as_str())
+        {
+            metrics.delivery_retired = true;
+        }
+    }
+
+    pub(crate) fn retire_delivery_turn(&self, turn_id: &str) {
+        let mut admission = self
+            .packet_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.closed_recovery.remove(turn_id);
+        admission.retained_answers.remove(turn_id);
+        for metrics in admission
+            .cells
+            .values_mut()
+            .filter(|metrics| metrics.turn_id.as_deref() == Some(turn_id))
+        {
+            metrics.delivery_retired = true;
+            metrics.delivery_intent = None;
+            metrics.delivery_recovery.clear();
+        }
+    }
+
     pub(crate) fn output_budget(&self, cell_id: &str) -> Option<usize> {
         self.packet_admission
             .lock()
@@ -723,6 +780,9 @@ impl CodeModeService {
             .cells
             .get_mut(cell_id.as_str())
         {
+            if metrics.delivery_retired {
+                return;
+            }
             metrics.delivery_intent = Some(CodeModeDeliveryIntent {
                 turn_id: turn.sub_id.clone(),
                 input_activity,
@@ -814,7 +874,7 @@ impl CodeModeService {
                 if let Ok(text) = execute_handler::schema_validated_delivery(
                     response,
                     limit,
-                    intent.schema.as_ref(),
+                    intent.schema.as_deref(),
                 ) {
                     retained_answers.clear();
                     retained_answers.insert(
@@ -865,7 +925,7 @@ impl CodeModeService {
             .limit
             .min(metrics.output_budget.unwrap_or(intent.limit));
         let delivery =
-            execute_handler::schema_validated_delivery(response, limit, intent.schema.as_ref());
+            execute_handler::schema_validated_delivery(response, limit, intent.schema.as_deref());
         let Some(retained) = retained_answers.remove(&turn.sub_id).filter(|_| {
             delivery
                 .as_ref()
@@ -875,8 +935,7 @@ impl CodeModeService {
         };
         // The retry printed nothing: deliver the answer kept at the refusal,
         // unless new input or a new output schema may have outdated it.
-        if retained.schema != intent.schema
-            || retained.input_activity.has_changed().unwrap_or(true)
+        if retained.schema != intent.schema || retained.input_activity.has_changed().unwrap_or(true)
         {
             return Err(serde_json::json!({"category":"retained_answer_stale",
                 "reason":"input or the output schema changed after the refusal; print the answer"}));
@@ -1046,6 +1105,7 @@ impl CodeModeService {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(metrics) = admission.cells.remove(cell_id.as_str())
+                && !metrics.delivery_retired
                 && !metrics.delivery_recovery.is_empty()
                 && let Some(turn_id) = metrics.turn_id
             {
@@ -1146,6 +1206,25 @@ impl CodeModeService {
             .and_then(|metrics| metrics.retention_tail.clone());
         if let Some(tail) = tail {
             tail.await;
+        }
+    }
+
+    async fn observe_packet_retention(
+        &self,
+        cell_id: &CellId,
+        terminating: bool,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        let flush = self.flush_packet_retention(cell_id);
+        tokio::pin!(flush);
+        tokio::select! {
+            biased;
+            _ = &mut flush => true,
+            _ = cancellation.cancelled() => false,
+            _ = async {
+                if terminating { tokio::time::sleep(std::time::Duration::from_millis(100)).await; }
+                else { std::future::pending::<()>().await; }
+            } => false,
         }
     }
 
@@ -1260,6 +1339,7 @@ impl CodeModeService {
                 metrics.next_nested_ordinal = next_nested_ordinal;
                 metrics.output_budget = packet.output_budget;
                 metrics.turn_id = packet.turn_id.take();
+                metrics.delivery_retired = packet.delivery_retired;
                 metrics.delivery_intent = packet.delivery_intent.take();
                 metrics.delivery_blocked = packet.delivery_blocked;
                 metrics.delivery_recovery = std::mem::take(&mut packet.delivery_recovery);
@@ -1672,6 +1752,25 @@ pub(super) async fn emit_failed_code_mode_cell_item(
         exec.session
             .emit_turn_item_completed(exec.turn.as_ref(), TurnItem::DynamicToolCall(item))
             .await;
+    }
+}
+
+fn attach_pending_retention(output: &mut FunctionToolOutput, cell_id: &CellId, call_id: &str) {
+    let receipt = serde_json::json!({"canonical_retention": {
+        "status": "pending", "cell_id": cell_id.as_str(), "observation_call_id": call_id,
+        "retry_safe": false,
+        "notice": "The terminal response is captured, but accepted canonical storage has not settled. Its existing writer still owns the evidence; do not replay external effects."
+    }});
+    output.essential_inline.insert(
+        "canonical_retention".into(),
+        receipt["canonical_retention"].clone(),
+    );
+    let item = FunctionCallOutputContentItem::InputText {
+        text: receipt.to_string(),
+    };
+    output.body.push(item.clone());
+    if let Some(canonical) = &mut output.canonical_body {
+        canonical.push(item);
     }
 }
 
@@ -2471,7 +2570,11 @@ async fn call_nested_tool(
         / 5;
     let replay_response = (outcome_context.outcome == ToolOutputOutcome::Success
         && nested_read_baseline_slot.is_some())
-    .then(|| result.result.to_response_item(&nested_call_id, &result.payload));
+    .then(|| {
+        result
+            .result
+            .to_response_item(&nested_call_id, &result.payload)
+    });
     let mut result_value = result.code_mode_result_with_budget(budget);
     let recovery = exec
         .session
@@ -2665,18 +2768,25 @@ async fn call_nested_tool(
         output: retained_nested_output(&tool_name, &result_value, retained_output),
         output_truncated,
     };
-    let required_terminal = required_nested_tool_terminal_cause(outcome_context, signal.as_ref())
-        .filter(|cause| failure_is_error || matches!(cause, RequiredToolTerminalCause::Blocked))
-        .map(|cause| {
-            let label = match cause {
-                RequiredToolTerminalCause::Blocked => "blocked",
-                RequiredToolTerminalCause::Failure => "failed",
-            };
-            (
-                cause,
-                format!("required nested tool `{}` {label}", tool_name.name),
-            )
-        });
+    let post_context_failure = signal
+        .as_ref()
+        .and_then(|signal| signal.get("post_tool_context_error"))
+        .and_then(JsonValue::as_str)
+        .map(|message| (RequiredToolTerminalCause::Failure, message.to_string()));
+    let required_terminal = post_context_failure.or_else(|| {
+        required_nested_tool_terminal_cause(outcome_context, signal.as_ref())
+            .filter(|cause| failure_is_error || matches!(cause, RequiredToolTerminalCause::Blocked))
+            .map(|cause| {
+                let label = match cause {
+                    RequiredToolTerminalCause::Blocked => "blocked",
+                    RequiredToolTerminalCause::Failure => "failed",
+                };
+                (
+                    cause,
+                    format!("required nested tool `{}` {label}", tool_name.name),
+                )
+            })
+    });
     exec.session
         .services
         .code_mode_service
@@ -3214,6 +3324,7 @@ mod response_tests;
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::CodeModeService;
     use super::MAX_RETAINED_NESTED_RESULT_BYTES;
@@ -3226,6 +3337,7 @@ mod tests {
     use super::required_nested_tool_terminal_cause;
     use super::truncate_code_mode_result;
     use super::wrapped_patch_rejection;
+    use crate::session::step_context::StepContext;
     use crate::tools::context::FunctionToolOutput;
     use crate::tools::context::RequiredToolTerminalCause;
     use crate::tools::context::ToolPayload;
@@ -3730,13 +3842,13 @@ mod tests {
             None,
             None,
             &json!({"complete":false,"artifact_id":"split","canonical_sha256":"split-hash",
-                "canonical_bytes":100,
-                "results":[
-                    {"status":"selector_too_large","complete":false,
-                        "canonical_range":{"start":20,"end":90},
-                        "continuation":{"kind":"bytes","start":70,"end":90}},
-                    {"status":"ok","complete":true,"canonical_range":{"start":20,"end":70}}
-                ]}),
+            "canonical_bytes":100,
+            "results":[
+                {"status":"selector_too_large","complete":false,
+                    "canonical_range":{"start":20,"end":90},
+                    "continuation":{"kind":"bytes","start":70,"end":90}},
+                {"status":"ok","complete":true,"canonical_range":{"start":20,"end":70}}
+            ]}),
         );
         service.finish_cell_dispatch(&prior);
         let cell = CellId::new("deliver-after-selector-error".into());
@@ -3768,8 +3880,10 @@ mod tests {
             &cell,
             false,
             None,
-            Some(&json!({"semantic_evidence":{"source":"artifact","scope":"split",
-                "identity":{"sha256":"other-hash","ranges":[[70,90]]}}})),
+            Some(
+                &json!({"semantic_evidence":{"source":"artifact","scope":"split",
+                "identity":{"sha256":"other-hash","ranges":[[70,90]]}}}),
+            ),
             &json!({}),
         );
         service.record_delivery_intent(&cell, &turn, receiver.clone());
@@ -3783,8 +3897,10 @@ mod tests {
             &cell,
             false,
             None,
-            Some(&json!({"semantic_evidence":{"source":"artifact","scope":"split",
-                "identity":{"sha256":"split-hash","ranges":[[70,90]]}}})),
+            Some(
+                &json!({"semantic_evidence":{"source":"artifact","scope":"split",
+                "identity":{"sha256":"split-hash","ranges":[[70,90]]}}}),
+            ),
             &json!({}),
         );
         service.record_delivery_intent(&cell, &turn, receiver);
@@ -3824,8 +3940,10 @@ mod tests {
                 &cell,
                 false,
                 None,
-                Some(&json!({"semantic_evidence":{"source":"artifact","scope":artifact,
-                    "identity":{"sha256":"hash","ranges":[[50,100]]}}})),
+                Some(
+                    &json!({"semantic_evidence":{"source":"artifact","scope":artifact,
+                    "identity":{"sha256":"hash","ranges":[[50,100]]}}}),
+                ),
                 &json!({}),
             );
             service.finish_cell_dispatch(&cell);
@@ -4065,8 +4183,9 @@ mod tests {
 
     #[tokio::test]
     async fn prewarm_initializes_the_code_mode_session_once() {
-        let service =
-            CodeModeService::new(Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider));
+        let service = CodeModeService::new(Arc::new(
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
+        ));
         assert!(!service.is_initialized());
 
         service.prewarm().await.expect("in-process host prewarm");
@@ -4173,6 +4292,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_first_cell_records_the_real_initialization_wait() {
+        let provider = Arc::new(DelayedSessionProvider {
+            session: Arc::new(ShutdownTestSession {
+                result: Ok(()),
+                shutdown_calls: Default::default(),
+            }),
+            finish_creation: Default::default(),
+            creation_calls: Default::default(),
+        });
+        let service = CodeModeService::new(provider.clone());
+        let (_, turn) = crate::session::tests::make_session_and_context().await;
+        let timing = Arc::clone(&turn.turn_timing_state);
+        timing.mark_turn_started();
+        let step = StepContext::for_test(Arc::new(turn));
+        let mut first_cell = Box::pin(service.execute_for_step(
+            ExecuteRequest {
+                state_path: None,
+                tool_call_id: "initialization-wait".to_string(),
+                enabled_tools: Vec::new().into(),
+                source: "text('must not run')".to_string(),
+                yield_time_ms: None,
+                max_output_tokens: None,
+                default_tool_timeout_ms: None,
+            },
+            &step,
+        ));
+        assert!(futures::poll!(first_cell.as_mut()).is_pending());
+        assert_eq!(*provider.creation_calls.lock().unwrap(), 1);
+        // Keep real initialization held, then cancel the caller. No cell runs.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(first_cell);
+        assert!(
+            timing
+                .complete_snapshot()
+                .profile
+                .local
+                .executor_readiness_wait_ns
+                >= Duration::from_millis(5).as_nanos()
+        );
+        assert!(service.session.get().is_none());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn shutdown_does_not_initialize_an_unused_service() {
         let session = Arc::new(ShutdownTestSession {
             result: Ok(()),
@@ -4245,9 +4408,9 @@ mod tests {
             &'a self,
             _delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
         ) -> codex_code_mode::CodeModeSessionProviderFuture<'a> {
-            Box::pin(async move {
-                Ok(Arc::clone(&self.0) as Arc<dyn codex_code_mode::CodeModeSession>)
-            })
+            Box::pin(
+                async move { Ok(Arc::clone(&self.0) as Arc<dyn codex_code_mode::CodeModeSession>) },
+            )
         }
     }
 
@@ -4271,20 +4434,32 @@ mod tests {
 
         let step = crate::session::step_context::StepContext::for_test(Arc::clone(&turn));
         assert_eq!(
-            service.execute_for_step(request(), &step).await.err().as_deref(),
+            service
+                .execute_for_step(request(), &step)
+                .await
+                .err()
+                .as_deref(),
             Some(codex_code_mode::RUNTIME_REPLACED_NOTICE)
         );
         // Written before the model saw the notice, so it must not run on the
         // empty replacement runtime.
         assert_eq!(
-            service.execute_for_step(request(), &step).await.err().as_deref(),
+            service
+                .execute_for_step(request(), &step)
+                .await
+                .err()
+                .as_deref(),
             Some(super::RUNTIME_REPLACED_EARLIER_IN_STEP)
         );
         assert_eq!(*runtime.executions.lock().unwrap(), 1);
 
         let next_step = crate::session::step_context::StepContext::for_test(turn);
         assert_eq!(
-            service.execute_for_step(request(), &next_step).await.err().as_deref(),
+            service
+                .execute_for_step(request(), &next_step)
+                .await
+                .err()
+                .as_deref(),
             Some("reached the runtime")
         );
         assert_eq!(*runtime.executions.lock().unwrap(), 2);
@@ -5658,4 +5833,36 @@ fn parsed_root_value_does_not_establish_lexical_delivery_coverage() {
         coverage.recovered(),
         "exact delivery closes the same obligation"
     );
+}
+#[cfg(test)]
+mod delivery_retirement_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn retired_turns_drop_descriptors_and_late_closures_do_not_resurrect_them() {
+        let service = CodeModeService::new(Arc::new(
+            codex_code_mode_runtime::InProcessCodeModeSessionProvider,
+        ));
+        for index in 0..1000 {
+            let turn = format!("retired-{index}");
+            let cell = CellId::new(format!("old-{index}"));
+            service.record_cell_parent_call_id(&cell, "outer");
+            service.record_cell_turn(&cell, &turn);
+            service.record_delivery_evidence(
+                &cell,
+                true,
+                Some(("artifact".into(), "hash".into(), 12)),
+                None,
+                &serde_json::json!({"preview":"partial"}),
+            );
+            if index % 2 == 0 {
+                service.finish_cell_dispatch(&cell);
+            }
+            service.retire_delivery_turn(&turn);
+            service.finish_cell_dispatch(&cell);
+            let admission = service.packet_admission.lock().unwrap();
+            assert!(admission.closed_recovery.is_empty());
+            assert!(admission.retained_answers.is_empty());
+        }
+    }
 }

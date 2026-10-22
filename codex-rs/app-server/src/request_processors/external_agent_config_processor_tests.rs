@@ -41,6 +41,8 @@ fn migration_items_that_update_runtime_sources_trigger_refresh() {
         ExternalAgentConfigMigrationItemType::AgentsMd,
         ExternalAgentConfigMigrationItemType::Subagents,
     ] {
-        assert!(!migration_items_need_runtime_refresh(&[migration_item(item_type)]));
+        assert!(!migration_items_need_runtime_refresh(&[migration_item(
+            item_type
+        )]));
     }
 }

@@ -10,6 +10,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub(crate) mod event_processor_with_jsonl_output;
 pub(crate) mod exec_events;
+mod recovery;
 
 pub use cli::Cli;
 pub use cli::Command;
@@ -89,8 +90,6 @@ use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
@@ -118,6 +117,8 @@ pub use exec_events::ErrorItem;
 pub use exec_events::FileChangeItem;
 pub use exec_events::FileUpdateChange;
 pub use exec_events::ItemCompletedEvent;
+pub use exec_events::ItemProgress;
+pub use exec_events::ItemProgressEvent;
 pub use exec_events::ItemStartedEvent;
 pub use exec_events::ItemUpdatedEvent;
 pub use exec_events::McpToolCallItem;
@@ -126,6 +127,7 @@ pub use exec_events::McpToolCallItemResult;
 pub use exec_events::McpToolCallStatus;
 pub use exec_events::PatchApplyStatus;
 pub use exec_events::PatchChangeKind;
+pub use exec_events::PlanItem;
 pub use exec_events::ReasoningItem;
 pub use exec_events::ThreadErrorEvent;
 pub use exec_events::ThreadEvent;
@@ -137,8 +139,6 @@ pub use exec_events::TodoListItem;
 pub use exec_events::TurnCompletedEvent;
 pub use exec_events::TurnFailedEvent;
 pub use exec_events::TurnFailureDisposition;
-pub use exec_events::ItemProgress;
-pub use exec_events::ItemProgressEvent;
 pub use exec_events::TurnStartedEvent;
 pub use exec_events::Usage;
 pub use exec_events::WebSearchItem;
@@ -222,13 +222,12 @@ struct ExecRunArgs {
     config: Config,
     dangerously_bypass_approvals_and_sandbox: bool,
     exec_span: tracing::Span,
-    images: Vec<PathBuf>,
+    initial_operation: InitialOperation,
+    prompt_summary: String,
     json_mode: bool,
     last_message_file: Option<PathBuf>,
     model_provider: Option<String>,
     oss: bool,
-    output_schema_path: Option<PathBuf>,
-    prompt: Option<String>,
     skip_git_repo_check: bool,
     stderr_with_ansi: bool,
 }
@@ -253,6 +252,13 @@ fn exec_stderr_env_filter() -> EnvFilter {
 pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
     if matches!(cli.command, Some(ExecCommand::Review(_))) {
         anyhow::bail!("review requests are not available through the app-server protocol");
+    }
+    if let Some(ExecCommand::Resume(args)) = cli.command.as_ref() {
+        anyhow::ensure!(!cli.ephemeral, "--ephemeral cannot be used with resume");
+        anyhow::ensure!(
+            args.last || args.session_id.is_some(),
+            "resume requires a session ID or name, or the --last flag"
+        );
     }
     if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
@@ -286,6 +292,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         cwd,
         add_dir,
     } = shared;
+
+    // Deterministic input failures must precede configuration, authentication,
+    // provider readiness and any persistent session initialization.
+    let (initial_operation, prompt_summary) =
+        prepare_initial_operation(command.as_ref(), prompt, images, output_schema_path).await?;
 
     let (_stdout_with_ansi, stderr_with_ansi) = match color {
         cli::Color::Always => (true, true),
@@ -544,13 +555,12 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         config,
         dangerously_bypass_approvals_and_sandbox,
         exec_span: exec_span.clone(),
-        images,
+        initial_operation,
+        prompt_summary,
         json_mode,
         last_message_file,
         model_provider,
         oss,
-        output_schema_path,
-        prompt,
         skip_git_repo_check,
         stderr_with_ansi,
     })
@@ -618,13 +628,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         config,
         dangerously_bypass_approvals_and_sandbox,
         exec_span,
-        images,
+        initial_operation,
+        prompt_summary,
         json_mode,
         last_message_file,
         model_provider,
         oss,
-        output_schema_path,
-        prompt,
         skip_git_repo_check,
         stderr_with_ansi,
     } = args;
@@ -661,54 +670,6 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     let default_cwd = config.cwd.to_path_buf();
     let default_approval_policy = config.permissions.approval_policy.value();
     let default_effort = config.model_reasoning_effort.clone();
-
-    let (initial_operation, prompt_summary) = match (command.as_ref(), prompt, images) {
-        (Some(ExecCommand::Review(_)), _, _) => {
-            anyhow::bail!("review requests are not available through the app-server protocol");
-        }
-        (Some(ExecCommand::Resume(args)), root_prompt, imgs) => {
-            let prompt_arg = args.prompt.clone().or(root_prompt);
-            let prompt_text = resolve_prompt(prompt_arg);
-            let mut items: Vec<UserInput> = imgs
-                .into_iter()
-                .chain(args.images.iter().cloned())
-                .map(|path| UserInput::LocalImage { path, detail: None })
-                .collect();
-            items.push(UserInput::Text {
-                text: prompt_text.clone(),
-                // CLI input doesn't track UI element ranges, so none are available here.
-                text_elements: Vec::new(),
-            });
-            let output_schema = load_output_schema(output_schema_path.clone()).await;
-            (
-                InitialOperation::UserTurn {
-                    items,
-                    output_schema,
-                },
-                prompt_text,
-            )
-        }
-        (None, root_prompt, imgs) => {
-            let prompt_text = resolve_root_prompt(root_prompt);
-            let mut items: Vec<UserInput> = imgs
-                .into_iter()
-                .map(|path| UserInput::LocalImage { path, detail: None })
-                .collect();
-            items.push(UserInput::Text {
-                text: prompt_text.clone(),
-                // CLI input doesn't track UI element ranges, so none are available here.
-                text_elements: Vec::new(),
-            });
-            let output_schema = load_output_schema(output_schema_path).await;
-            (
-                InitialOperation::UserTurn {
-                    items,
-                    output_schema,
-                },
-                prompt_text,
-            )
-        }
-    };
 
     // When --yolo (dangerously_bypass_approvals_and_sandbox) is set, also skip the git repo check
     // since the user is explicitly running in an externally sandboxed environment.
@@ -766,38 +727,51 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
 
     // Handle resume subcommand through existing `thread/list` + `thread/resume`
     // APIs so exec no longer reaches into rollout storage directly.
-    let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
-        command.as_ref()
-    {
-        let thread_id = resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?;
-        let response: ThreadResumeResponse = send_request_with_response(
-            &client,
-            ClientRequest::ThreadResume {
-                request_id: request_ids.next(),
-                params: thread_resume_params_from_config(&config, thread_id),
-            },
-            "thread/resume",
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
-        let session_configured = session_configured_from_thread_resume_response(&response, &config)
+    let mut bootstrap_events = std::collections::VecDeque::new();
+    let (primary_thread_id, thread_ephemeral, fallback_session_configured) =
+        if let Some(ExecCommand::Resume(args)) = command.as_ref() {
+            let thread_id =
+                resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?;
+            let response: ThreadResumeResponse = send_bootstrap_request_with_response(
+                &mut client,
+                &mut bootstrap_events,
+                ClientRequest::ThreadResume {
+                    request_id: request_ids.next(),
+                    params: thread_resume_params_from_config(&config, thread_id),
+                },
+                "thread/resume",
+            )
+            .await
             .map_err(anyhow::Error::msg)?;
-        (session_configured.thread_id, session_configured)
-    } else {
-        let response: ThreadStartResponse = send_request_with_response(
-            &client,
-            ClientRequest::ThreadStart {
-                request_id: request_ids.next(),
-                params: thread_start_params_from_config(&config),
-            },
-            "thread/start",
-        )
-        .await
-        .map_err(anyhow::Error::msg)?;
-        let session_configured = session_configured_from_thread_start_response(&response, &config)
+            let session_configured =
+                session_configured_from_thread_resume_response(&response, &config)
+                    .map_err(anyhow::Error::msg)?;
+            (
+                session_configured.thread_id,
+                response.thread.ephemeral,
+                session_configured,
+            )
+        } else {
+            let response: ThreadStartResponse = send_bootstrap_request_with_response(
+                &mut client,
+                &mut bootstrap_events,
+                ClientRequest::ThreadStart {
+                    request_id: request_ids.next(),
+                    params: thread_start_params_from_config(&config),
+                },
+                "thread/start",
+            )
+            .await
             .map_err(anyhow::Error::msg)?;
-        (session_configured.thread_id, session_configured)
-    };
+            let session_configured =
+                session_configured_from_thread_start_response(&response, &config)
+                    .map_err(anyhow::Error::msg)?;
+            (
+                session_configured.thread_id,
+                response.thread.ephemeral,
+                session_configured,
+            )
+        };
 
     let primary_thread_id_for_span = primary_thread_id.to_string();
     // Use the start/resume response as the authoritative bootstrap payload.
@@ -878,34 +852,68 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
     let mut error_seen = false;
     let mut terminal_notification_seen = false;
     let mut streamed_final_message_seen = false;
+    let mut recovery_state = recovery::ExecRecoveryState::default();
     let mut delivery_error = None;
     let mut interrupt_channel_open = true;
     let primary_thread_id_for_requests = primary_thread_id.to_string();
+    let mut interrupt_requested = false;
+    type PendingInterrupt = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TurnInterruptResponse, String>> + Send>,
+    >;
+    let mut pending_interrupt: Option<PendingInterrupt> = None;
+    let mut interrupt_deadline = None;
     loop {
         let server_event = tokio::select! {
+            _ = async {
+                match interrupt_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                delivery_error = Some("turn interruption deadline expired; shutdown remains unconfirmed".to_string());
+                break;
+            }
+            result = async {
+                match pending_interrupt.as_mut() {
+                    Some(interrupt) => interrupt.await,
+                    None => std::future::pending().await,
+                }
+            }, if pending_interrupt.is_some() => {
+                pending_interrupt = None;
+                if let Err(error) = result { warn!("turn/interrupt failed: {error}"); }
+                continue;
+            }
             maybe_interrupt = interrupt_rx.recv(), if interrupt_channel_open => {
                 if maybe_interrupt.is_none() {
                     interrupt_channel_open = false;
                     continue;
                 }
-                if let Err(err) = send_request_with_response::<TurnInterruptResponse>(
-                    &client,
-                    ClientRequest::TurnInterrupt {
+                if interrupt_requested {
+                    delivery_error = Some("second interrupt requested forced shutdown; turn settlement is unconfirmed".to_string());
+                    break;
+                }
+                interrupt_requested = true;
+                interrupt_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
+                let handle = client.request_handle();
+                let request = ClientRequest::TurnInterrupt {
                         request_id: request_ids.next(),
                         params: TurnInterruptParams {
                             thread_id: primary_thread_id_for_requests.clone(),
                             turn_id: task_id.clone(),
                         },
-                    },
-                    "turn/interrupt",
-                )
-                .await
-                {
-                    warn!("turn/interrupt failed: {err}");
-                }
+                    };
+                pending_interrupt = Some(Box::pin(async move {
+                    handle.request_typed::<TurnInterruptResponse>(request).await
+                        .map_err(|error| error.to_string())
+                }));
                 continue;
             }
-            maybe_event = client.next_event() => maybe_event,
+            maybe_event = async {
+                match bootstrap_events.pop_front() {
+                    Some(event) => Some(event),
+                    None => client.next_event().await,
+                }
+            } => maybe_event,
         };
 
         let Some(server_event) = server_event else {
@@ -917,8 +925,16 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
                 handle_server_request(&client, request, &mut error_seen).await;
             }
             InProcessServerEvent::ServerNotification(mut notification) => {
+                if !should_process_notification(
+                    &notification,
+                    &primary_thread_id_for_requests,
+                    &task_id,
+                ) {
+                    continue;
+                }
+                recovery_state.backfill_complete_stream(&mut notification);
                 match prepare_server_notification(
-                    config.ephemeral,
+                    thread_ephemeral,
                     &primary_thread_id_for_requests,
                     &task_id,
                     streamed_final_message_seen,
@@ -947,10 +963,15 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
                         break;
                     }
                 }
-                if let ServerNotification::ItemCompleted(payload) = &notification
-                    && let AppServerThreadItem::AgentMessage { phase, .. } = &payload.item
-                {
-                    streamed_final_message_seen = *phase == Some(MessagePhase::FinalAnswer);
+                recovery_state.observe(&notification);
+                if let ServerNotification::ItemCompleted(payload) = &notification {
+                    streamed_final_message_seen |= matches!(
+                        &payload.item,
+                        AppServerThreadItem::AgentMessage {
+                            phase: Some(MessagePhase::FinalAnswer),
+                            ..
+                        } | AppServerThreadItem::Plan { .. }
+                    );
                 }
                 if let ServerNotification::Error(payload) = &notification {
                     if payload.thread_id == primary_thread_id_for_requests
@@ -999,6 +1020,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
                 }
             }
             InProcessServerEvent::Lagged { skipped } => {
+                recovery_state.mark_gap();
                 let message = lagged_event_warning_message(skipped);
                 warn!("{message}");
                 event_processor.process_warning(message);
@@ -1020,10 +1042,25 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<bool> {
         event_processor.process_event_stream_error(message.clone());
     }
 
-    if let Err(err) = client.shutdown().await {
-        warn!("in-process app-server shutdown failed: {err}");
+    let shutdown_error = client.shutdown().await.err();
+    // Publish accepted content before fatal diagnostics start the SDK's bounded
+    // failure drain, including when artifact publication uses slow storage.
+    let output_error = event_processor.print_final_output().err();
+    if let Some(error) = shutdown_error.as_ref() {
+        event_processor.process_invocation_error(error.to_string());
+        error_seen = true;
     }
-    event_processor.print_final_output()?;
+    if let Some(error) = output_error {
+        if let Some(shutdown_error) = shutdown_error {
+            anyhow::bail!(
+                "failed to deliver final output: {error}; session finalization: {shutdown_error}"
+            );
+        }
+        return Err(error.into());
+    }
+    if let Some(error) = event_processor.take_output_error() {
+        return Err(error.into());
+    }
     if let Some(message) = event_stream_error {
         anyhow::bail!(message);
     }
@@ -1069,6 +1106,33 @@ fn permissions_selection_from_config(config: &Config) -> Option<String> {
 
 fn permission_profile_id_from_active_profile(active: ActivePermissionProfile) -> String {
     active.id
+}
+
+/// Start/resume can require client input before returning. Service requests with
+/// exec's existing noninteractive policy; retain all notifications for the normal loop.
+async fn send_bootstrap_request_with_response<T: serde::de::DeserializeOwned>(
+    client: &mut InProcessAppServerClient,
+    events: &mut std::collections::VecDeque<InProcessServerEvent>,
+    request: ClientRequest,
+    method: &str,
+) -> Result<T, String> {
+    let handle = client.request_handle();
+    let pending = handle.request_typed::<T>(request);
+    tokio::pin!(pending);
+    loop {
+        tokio::select! {
+            result = &mut pending => return result.map_err(|error| format!("{method}: {error}")),
+            event = client.next_event() => match event {
+                Some(InProcessServerEvent::ServerRequest(request)) => {
+                    let mut error_seen = false;
+                    handle_server_request(client, request, &mut error_seen).await;
+                    if error_seen { return Err(format!("{method}: startup client request failed")); }
+                }
+                Some(event) => events.push_back(event),
+                None => return Err(format!("{method}: app-server event stream closed during initialization")),
+            },
+        }
+    }
 }
 
 async fn send_request_with_response<T>(
@@ -1337,63 +1401,41 @@ fn all_thread_source_kinds() -> Vec<ThreadSourceKind> {
     ]
 }
 
-async fn latest_thread_cwd(thread: &AppServerThread) -> PathBuf {
-    if let Some(path) = thread.path.as_deref()
-        && let Some(cwd) = parse_latest_turn_context_cwd(path).await
-    {
-        return cwd;
-    }
-    thread.cwd.to_path_buf()
+fn latest_thread_cwd(thread: &AppServerThread) -> &Path {
+    // The shared summary reduces both TurnContext and accepted settings updates.
+    thread.cwd.as_path()
 }
 
-async fn parse_latest_turn_context_cwd(path: &Path) -> Option<PathBuf> {
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncSeekExt;
-
-    let mut file = tokio::fs::File::open(path).await.ok()?;
-    let mut position = file.metadata().await.ok()?.len();
-    let mut chunk = [0_u8; 8192];
-    let mut line = Vec::new();
-    // Read only as far back as the newest valid context, without limiting tail size.
-    while position > 0 {
-        let count = position.min(chunk.len() as u64) as usize;
-        position -= count as u64;
-        file.seek(std::io::SeekFrom::Start(position)).await.ok()?;
-        file.read_exact(&mut chunk[..count]).await.ok()?;
-        for &byte in chunk[..count].iter().rev() {
-            if byte == b'\n' {
-                if let Some(cwd) = cwd_from_reversed_rollout_line(&mut line) {
-                    return Some(cwd);
-                }
-                line.clear();
-            } else {
-                line.push(byte);
-            }
-        }
+async fn resume_candidate_accepts_direct_input(thread: &AppServerThread) -> anyhow::Result<bool> {
+    if !matches!(
+        &thread.source,
+        codex_app_server_protocol::SessionSource::SubAgent(
+            codex_protocol::protocol::SubAgentSource::ThreadSpawn { .. }
+        )
+    ) {
+        return Ok(true);
     }
-    cwd_from_reversed_rollout_line(&mut line)
-}
-
-fn cwd_from_reversed_rollout_line(line: &mut [u8]) -> Option<PathBuf> {
-    line.reverse();
-    #[derive(serde::Deserialize)]
-    struct ItemType {
-        #[serde(rename = "type")]
-        item_type: String,
-    }
-    // Most trailing records are tool output or events. Scan their JSON without
-    // materializing payloads that cannot contribute a working directory.
-    // Ambiguous headers (including duplicate tags) still use the full decoder.
-    if let Ok(header) = serde_json::from_slice::<ItemType>(line)
-        && header.item_type != "turn_context"
-    {
-        return None;
-    }
-    let rollout_line = serde_json::from_slice::<RolloutLine>(line).ok()?;
-    match rollout_line.item {
-        RolloutItem::TurnContext(item) => Some(item.cwd.into_path_buf()),
-        _ => None,
-    }
+    // Only spawned candidates need hydration. Use the canonical reader and
+    // effective-version reducer, including compressed and legacy histories.
+    let path = thread.path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot determine continuation eligibility for thread {}",
+            thread.id
+        )
+    })?;
+    let history = codex_core::RolloutRecorder::get_rollout_history(path).await?;
+    let codex_protocol::protocol::InitialHistory::Resumed(resumed) = &history else {
+        anyhow::bail!("missing thread history");
+    };
+    anyhow::ensure!(
+        Uuid::parse_str(&thread.id)? == Uuid::parse_str(&resumed.conversation_id.to_string())?,
+        "thread history identity mismatch for {}",
+        thread.id
+    );
+    let Some((source, _)) = history.get_resumed_session_sources() else {
+        anyhow::bail!("missing session source for thread {}", thread.id);
+    };
+    Ok(source.accepts_direct_user_input(history.get_multi_agent_version()))
 }
 
 fn cwds_match(current_cwd: &Path, session_cwd: &Path) -> bool {
@@ -1411,6 +1453,7 @@ async fn resolve_resume_thread_id(
     if args.last {
         let mut cursor = None;
         let mut cwd_filtered_out = false;
+        let mut ineligible_filtered_out = false;
         loop {
             let response: ThreadListResponse = send_request_with_response(
                 client,
@@ -1437,12 +1480,11 @@ async fn resolve_resume_thread_id(
             .await
             .map_err(anyhow::Error::msg)?;
             for thread in response.data {
-                if args.all
-                    || cwds_match(
-                        config.cwd.as_path(),
-                        latest_thread_cwd(&thread).await.as_path(),
-                    )
-                {
+                if !resume_candidate_accepts_direct_input(&thread).await? {
+                    ineligible_filtered_out = true;
+                    continue;
+                }
+                if args.all || cwds_match(config.cwd.as_path(), latest_thread_cwd(&thread)) {
                     return Ok(thread.id);
                 }
                 cwd_filtered_out = true;
@@ -1455,13 +1497,18 @@ async fn resolve_resume_thread_id(
                         config.cwd.display()
                     );
                 }
+                if ineligible_filtered_out {
+                    anyhow::bail!(
+                        "no eligible resumable session found: spawned V2 workers do not accept direct user input"
+                    );
+                }
                 if has_resumable_thread_for_any_provider(client).await? {
                     anyhow::bail!(
                         "resumable sessions were found, but none match model provider `{}`",
                         config.model_provider_id
                     );
                 }
-                anyhow::bail!("no resumable session found");
+                anyhow::bail!("no eligible resumable session found");
             };
             cursor = Some(next_cursor);
         }
@@ -1475,18 +1522,21 @@ async fn resolve_resume_thread_id(
     }
     let mut cwd_filtered_out = false;
     if let Some(state_db) = state_db {
-        let cwd = (!args.all).then_some(config.cwd.as_path());
-        let resolved = state_db
-            .find_thread_by_exact_title(
+        // SQLite owns explicit titles. It stores a canonicalized cwd (a verbatim path on Windows),
+        // so compare cwd after normalization like the other lookups instead of in SQL.
+        let titled_threads = state_db
+            .find_threads_by_exact_title(
                 session_id,
                 &[],
                 /*model_providers*/ None,
                 /*archived_only*/ false,
-                cwd,
             )
             .await?;
-        if let Some(thread) = resolved {
-            return Ok(thread.id.to_string());
+        for thread in titled_threads {
+            if args.all || cwds_match(config.cwd.as_path(), &thread.cwd) {
+                return Ok(thread.id.to_string());
+            }
+            cwd_filtered_out = true;
         }
         if let Some((_, session_meta)) =
             find_thread_meta_by_name_str(&config.codex_home, session_id, Some(state_db.as_ref()))
@@ -1529,12 +1579,7 @@ async fn resolve_resume_thread_id(
             if thread.name.as_deref() != Some(session_id) {
                 continue;
             }
-            if args.all
-                || cwds_match(
-                    config.cwd.as_path(),
-                    latest_thread_cwd(&thread).await.as_path(),
-                )
-            {
+            if args.all || cwds_match(config.cwd.as_path(), latest_thread_cwd(&thread)) {
                 return Ok(thread.id);
             }
             cwd_filtered_out = true;
@@ -1555,31 +1600,42 @@ async fn resolve_resume_thread_id(
 async fn has_resumable_thread_for_any_provider(
     client: &InProcessAppServerClient,
 ) -> anyhow::Result<bool> {
-    let response: ThreadListResponse = send_request_with_response(
-        client,
-        ClientRequest::ThreadList {
-            request_id: RequestId::Integer(0),
-            params: ThreadListParams {
-                project_id: None,
-                cursor: None,
-                limit: Some(1),
-                sort_key: Some(ThreadSortKey::UpdatedAt),
-                sort_direction: None,
-                model_providers: Some(Vec::new()),
-                source_kinds: Some(all_thread_source_kinds()),
-                archived: Some(false),
-                parent_thread_id: None,
-                ancestor_thread_id: None,
-                cwd: None,
-                use_state_db_only: None,
-                search_term: None,
+    let mut cursor = None;
+    loop {
+        let response: ThreadListResponse = send_request_with_response(
+            client,
+            ClientRequest::ThreadList {
+                request_id: RequestId::Integer(0),
+                params: ThreadListParams {
+                    project_id: None,
+                    cursor,
+                    limit: Some(100),
+                    sort_key: Some(ThreadSortKey::UpdatedAt),
+                    sort_direction: None,
+                    model_providers: Some(Vec::new()),
+                    source_kinds: Some(all_thread_source_kinds()),
+                    archived: Some(false),
+                    parent_thread_id: None,
+                    ancestor_thread_id: None,
+                    cwd: None,
+                    use_state_db_only: None,
+                    search_term: None,
+                },
             },
-        },
-        "thread/list",
-    )
-    .await
-    .map_err(anyhow::Error::msg)?;
-    Ok(!response.data.is_empty())
+            "thread/list",
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        for thread in response.data {
+            if resume_candidate_accepts_direct_input(&thread).await? {
+                return Ok(true);
+            }
+        }
+        let Some(next_cursor) = response.next_cursor else {
+            return Ok(false);
+        };
+        cursor = Some(next_cursor);
+    }
 }
 
 fn resume_lookup_model_providers(
@@ -1589,7 +1645,7 @@ fn resume_lookup_model_providers(
     if args.last {
         Some(vec![config.model_provider_id.clone()])
     } else {
-        None
+        Some(Vec::new())
     }
 }
 
@@ -1793,30 +1849,80 @@ async fn handle_server_request(
     }
 }
 
-async fn load_output_schema(path: Option<PathBuf>) -> Option<Value> {
-    let path = path?;
+async fn load_output_schema(path: Option<PathBuf>) -> anyhow::Result<Option<Value>> {
+    use anyhow::Context;
+    use tokio::io::AsyncReadExt;
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("Failed to read output schema file {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROMPT_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("Failed to read output schema file {}", path.display()))?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_PROMPT_INPUT_BYTES,
+        "Output schema file {} exceeds the 64 MiB limit",
+        path.display()
+    );
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("Output schema file {} is not valid JSON", path.display()))
+        .map(Some)
+}
 
-    let schema_str = match tokio::fs::read_to_string(&path).await {
-        Ok(contents) => contents,
-        Err(err) => {
-            eprintln!(
-                "Failed to read output schema file {}: {err}",
-                path.display()
-            );
-            std::process::exit(1);
+async fn prepare_initial_operation(
+    command: Option<&ExecCommand>,
+    prompt: Option<String>,
+    mut images: Vec<PathBuf>,
+    output_schema_path: Option<PathBuf>,
+) -> anyhow::Result<(InitialOperation, String)> {
+    let output_schema = load_output_schema(output_schema_path).await?;
+    let prompt_text = match command {
+        Some(ExecCommand::Resume(args)) => {
+            images.extend(args.images.iter().cloned());
+            match args.prompt.clone().or(prompt) {
+                None if !images.is_empty() => {
+                    read_prompt_from_stdin(StdinPromptBehavior::OptionalAppend).unwrap_or_default()
+                }
+                prompt => resolve_prompt(prompt),
+            }
+        }
+        // Without a positional prompt, piped stdin is the prompt itself (not an
+        // appended `<stdin>` block); images make an absent prompt optional.
+        None => match prompt {
+            None if !images.is_empty() => {
+                read_prompt_from_stdin(StdinPromptBehavior::OptionalAppend).unwrap_or_default()
+            }
+            prompt => resolve_root_prompt(prompt),
+        },
+        Some(ExecCommand::Review(_)) => {
+            anyhow::bail!("review requests are not available through the app-server protocol")
         }
     };
-
-    match serde_json::from_str::<Value>(&schema_str) {
-        Ok(value) => Some(value),
-        Err(err) => {
-            eprintln!(
-                "Output schema file {} is not valid JSON: {err}",
-                path.display()
-            );
-            std::process::exit(1);
-        }
+    anyhow::ensure!(
+        !prompt_text.trim().is_empty() || !images.is_empty(),
+        "No task provided: supply a nonempty prompt, stdin, or an image"
+    );
+    let mut items: Vec<UserInput> = images
+        .into_iter()
+        .map(|path| UserInput::LocalImage { path, detail: None })
+        .collect();
+    if !prompt_text.is_empty() {
+        items.push(UserInput::Text {
+            text: prompt_text.clone(),
+            text_elements: Vec::new(),
+        });
     }
+    Ok((
+        InitialOperation::UserTurn {
+            items,
+            output_schema,
+        },
+        prompt_text,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

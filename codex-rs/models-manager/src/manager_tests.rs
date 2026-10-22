@@ -38,15 +38,24 @@ fn catalog_permutations_preserve_defaults_and_quarantine_duplicate_slugs() {
     let a = remote_model("stable-a", "A", 1);
     let b = remote_model("stable-b", "B", 1);
     let conflicting = remote_model("stable-b", "Conflicting B", 1);
-    for catalog in [vec![b.clone(), a.clone(), a.clone()], vec![a.clone(), b.clone(), a.clone()]] {
+    for catalog in [
+        vec![b.clone(), a.clone(), a.clone()],
+        vec![a.clone(), b.clone(), a.clone()],
+    ] {
         // A cache round trip must use the same normalization as a fresh catalog.
         let cached = serde_json::from_value(serde_json::to_value(&catalog).unwrap()).unwrap();
         for models in [catalog, cached] {
             for auth in [false, true] {
                 let projected = build_available_models_for_auth(models.clone(), auth);
                 assert_eq!(projected.len(), 2);
-                assert_eq!(default_model_from_available(projected.clone()).unwrap(), "stable-a");
-                assert_eq!(*AvailableModelPresets::new(&models).for_auth(auth), projected);
+                assert_eq!(
+                    default_model_from_available(projected.clone()).unwrap(),
+                    "stable-a"
+                );
+                assert_eq!(
+                    *AvailableModelPresets::new(&models).for_auth(auth),
+                    projected
+                );
             }
         }
     }
@@ -56,7 +65,10 @@ fn catalog_permutations_preserve_defaults_and_quarantine_duplicate_slugs() {
     ] {
         assert_eq!(normalize_model_catalog(models.clone()), vec![a.clone()]);
         for auth in [false, true] {
-            assert_eq!(build_available_models_for_auth(models.clone(), auth).len(), 1);
+            assert_eq!(
+                build_available_models_for_auth(models.clone(), auth).len(),
+                1
+            );
         }
         assert!(find_model_by_longest_prefix("stable-b", &models).is_none());
     }
@@ -64,6 +76,99 @@ fn catalog_permutations_preserve_defaults_and_quarantine_duplicate_slugs() {
 
 fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
     remote_model_with_visibility(slug, display, priority, "list")
+}
+
+#[tokio::test]
+async fn rejected_bundled_models_stay_quarantined_after_merge_and_cache_reload() {
+    let slug = load_bundled_models_or_panic()[0].slug.clone();
+    let a = remote_model(&slug, "A", 1);
+    let mut b = a.clone();
+    b.context_window = Some(4096);
+    for rows in [vec![a.clone(), b.clone()], vec![b, a]] {
+        let home = tempdir().unwrap();
+        let manager =
+            openai_manager_for_tests(home.path().into(), TestModelsEndpoint::new(vec![rows]));
+        manager
+            .refresh_available_models(RefreshStrategy::Online, &DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .get_remote_models()
+                .await
+                .iter()
+                .any(|model| model.slug == slug)
+        );
+        for requested in [slug.clone(), format!("namespace/{slug}-dated")] {
+            assert!(
+                manager
+                    .get_model_info(&requested, &ModelsManagerConfig::default())
+                    .await
+                    .used_fallback_model_metadata
+            );
+        }
+        let reloaded =
+            openai_manager_for_tests(home.path().into(), TestModelsEndpoint::new(vec![]));
+        assert!(reloaded.try_load_cache().await.unwrap());
+        assert!(
+            reloaded
+                .get_model_info(&slug, &ModelsManagerConfig::default())
+                .await
+                .used_fallback_model_metadata
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_numeric_catalog_retains_last_good_snapshot() {
+    let home = tempdir().unwrap();
+    let good = remote_model("valid-model", "Valid", 1);
+    let manager = openai_manager_for_tests(home.path().into(), TestModelsEndpoint::new(vec![]));
+    let identity = manager.ensure_current_cache_identity().await;
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(
+                vec![good.clone()],
+                Some("good".into()),
+                &identity
+            )
+            .await
+    );
+    for (field, value) in [
+        ("context_window", 0),
+        ("context_window", -100),
+        ("max_context_window", 0),
+        ("auto_compact_token_limit", -1),
+        ("effective_context_window_percent", 0),
+        ("effective_context_window_percent", 101),
+    ] {
+        let mut invalid = serde_json::to_value(&good).unwrap();
+        invalid[field] = json!(value);
+        let invalid: ModelInfo = serde_json::from_value(invalid).unwrap();
+        assert!(invalid.validate_capabilities().unwrap_err().contains(field));
+        assert!(
+            !manager
+                .apply_remote_models_and_etag_for_identity(
+                    vec![invalid],
+                    Some("bad".into()),
+                    &identity
+                )
+                .await
+        );
+        assert_eq!(manager.get_etag().await.as_deref(), Some("good"));
+        assert_eq!(
+            manager
+                .get_model_info("valid-model", &ModelsManagerConfig::default())
+                .await
+                .context_window,
+            good.context_window
+        );
+    }
+    for percent in [1, 100] {
+        let mut valid = good.clone();
+        valid.effective_context_window_percent = percent;
+        valid.validate_capabilities().unwrap();
+    }
 }
 
 fn remote_model_with_visibility(
@@ -377,7 +482,9 @@ async fn in_flight_refresh_does_not_publish_after_account_identity_changes() {
             let manager = Arc::clone(&manager);
             async move {
                 if notify_etag {
-                    manager.notify_etag("new-etag".into(), DEFAULT_HTTP_CLIENT_FACTORY).await;
+                    manager
+                        .notify_etag("new-etag".into(), DEFAULT_HTTP_CLIENT_FACTORY)
+                        .await;
                 } else {
                     manager
                         .list_models(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
@@ -389,15 +496,32 @@ async fn in_flight_refresh_does_not_publish_after_account_identity_changes() {
         endpoint.wait_for_fetches(1).await;
         *identity.lock().unwrap() = "second-account".into();
         endpoint.release_one();
-        timeout(Duration::from_secs(5), refresh).await.unwrap().unwrap();
+        timeout(Duration::from_secs(5), refresh)
+            .await
+            .unwrap()
+            .unwrap();
         // Inspect publication before a public read could reset stale state.
         {
             let state = manager.state.read().await;
-            assert!(!state.remote_models.iter().any(|model| model.slug == "old-account-only"));
+            assert!(
+                !state
+                    .remote_models
+                    .iter()
+                    .any(|model| model.slug == "old-account-only")
+            );
             assert_eq!(state.etag, None);
         }
-        assert!(manager.get_remote_models().await.iter().all(|model| model.slug != "old-account-only"));
-        assert!(!home.path().join(MODEL_CACHE_FILE).exists(), "old identity must not publish to disk");
+        assert!(
+            manager
+                .get_remote_models()
+                .await
+                .iter()
+                .all(|model| model.slug != "old-account-only")
+        );
+        assert!(
+            !home.path().join(MODEL_CACHE_FILE).exists(),
+            "old identity must not publish to disk"
+        );
         assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 1);
     }
 }
@@ -709,6 +833,87 @@ async fn cache_corruption_keeps_offline_fallback_and_recovers_online() {
 }
 
 #[tokio::test]
+async fn independent_file_lock_preserves_offline_fallback_and_online_refresh() {
+    for cache_state in ["absent", "valid", "stale"] {
+        let home = tempdir().unwrap();
+        let path = home.path().join(MODEL_CACHE_FILE);
+        let endpoint =
+            TestModelsEndpoint::new(vec![vec![remote_model("online-model", "Online", 1)]]);
+        let manager = openai_manager_for_tests(home.path().into(), endpoint.clone());
+        if cache_state != "absent" {
+            manager
+                .cache_manager
+                .persist_cache(
+                    &[remote_model("disk-only-model", "Disk", 1)],
+                    None,
+                    crate::client_version_to_whole(),
+                )
+                .await;
+            if cache_state == "stale" {
+                manager
+                    .cache_manager
+                    .manipulate_cache_for_test(|at| {
+                        *at = Utc::now() - chrono::Duration::days(1);
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        let holder = codex_file_system::acquire_atomic_write_lock(&path).unwrap();
+        let expected = build_available_models_for_auth(load_bundled_models_or_panic(), true);
+        let fallback = timeout(
+            Duration::from_secs(1),
+            manager.list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY),
+        )
+        .await
+        .expect("offline must not wait for another cache writer")
+        .unwrap();
+        assert_eq!(fallback, expected);
+        assert_eq!(endpoint.fetch_count(), 0);
+        let fetched = timeout(
+            Duration::from_secs(1),
+            manager.list_models(
+                RefreshStrategy::OnlineIfUncached,
+                DEFAULT_HTTP_CLIENT_FACTORY,
+            ),
+        )
+        .await
+        .expect("online must fetch while persistence is busy")
+        .unwrap();
+        assert!(fetched.iter().any(|model| model.model == "online-model"));
+        assert_eq!(endpoint.fetch_count(), 1);
+        // Fresh memory remains eligible even while the disk lock is held.
+        assert_eq!(
+            manager
+                .list_models(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY,)
+                .await
+                .unwrap(),
+            fetched
+        );
+        drop(holder);
+        manager
+            .cache_manager
+            .persist_cache(
+                &[remote_model("after-release", "Released", 1)],
+                None,
+                crate::client_version_to_whole(),
+            )
+            .await;
+        assert_eq!(
+            manager
+                .cache_manager
+                .load_fresh(&crate::client_version_to_whole())
+                .await
+                .unwrap()
+                .unwrap()
+                .models[0]
+                .slug,
+            "after-release"
+        );
+    }
+}
+
+#[tokio::test]
 async fn metadata_keeps_catalog_policy_with_personality_and_accepts_unknown_window_override() {
     use codex_protocol::config_types::Personality;
     let mut model = remote_model("gpt-5.2-codex", "Personality", 1);
@@ -994,6 +1199,33 @@ async fn older_openai_manager_fetch_cannot_overwrite_newer_process_cache() {
         .expect("older refresh task should complete")
         .expect("older refresh should succeed without replacing the newer cache");
 
+    assert!(
+        !older.memory_is_fresh().await,
+        "a rejected competing publication is not confirmed fresh"
+    );
+    older
+        .raw_model_catalog(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("reconcile from the eligible winning cache");
+    assert!(
+        older
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "newer-process-model")
+    );
+    assert!(
+        !older
+            .get_remote_models()
+            .await
+            .iter()
+            .any(|model| model.slug == "older-process-model")
+    );
+    assert_eq!(older_endpoint.fetch_count.load(Ordering::SeqCst), 1);
+
     let verifier = openai_manager_for_tests(
         codex_home.path().to_path_buf(),
         TestModelsEndpoint::new(Vec::new()),
@@ -1017,7 +1249,7 @@ async fn older_openai_manager_fetch_cannot_overwrite_newer_process_cache() {
 }
 
 #[tokio::test]
-async fn matching_etag_renews_ttl_without_fetching() {
+async fn unscoped_matching_etag_cannot_confirm_current_scope_freshness() {
     let codex_home = tempdir().expect("temp dir");
     let endpoint = ControlledModelsEndpoint::new(Vec::new());
     let manager = Arc::new(openai_manager_for_tests(
@@ -1055,18 +1287,19 @@ async fn matching_etag_renews_ttl_without_fetching() {
 
     assert_eq!(endpoint.fetch_count.load(Ordering::SeqCst), 0);
     assert!(
-        manager.memory_is_fresh().await,
-        "a matching ETag confirms the in-memory catalog"
+        !manager.memory_is_fresh().await,
+        "an inference hint without request authority cannot confirm the current catalog"
     );
     assert_eq!(manager.get_remote_models().await, cached);
-    let renewed = manager
-        .cache_manager
-        .load_fresh(&crate::client_version_to_whole())
-        .await
-        .expect("read cache")
-        .expect("matching ETag renews the cached representation");
-    assert_eq!(renewed.models, cached);
-    assert_eq!(renewed.etag.as_deref(), Some("same-etag"));
+    assert!(
+        manager
+            .cache_manager
+            .load_fresh(&crate::client_version_to_whole())
+            .await
+            .expect("read cache")
+            .is_none(),
+        "unscoped equality must not renew disk TTL"
+    );
 }
 
 #[tokio::test]
@@ -1259,6 +1492,7 @@ fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManage
 
 async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {
     let auth_dot_json = codex_login::AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::ChatgptAuthTokens),
         openai_api_key: None,
         tokens: Some(TokenData {
@@ -1972,8 +2206,6 @@ async fn refresh_available_models_replaces_obsolete_cache_before_decoding_models
         assert_eq!(saved["client_version"], crate::client_version_to_whole());
     }
 }
-
-
 
 #[tokio::test]
 async fn runtime_identity_change_does_not_reuse_disk_or_in_memory_catalog() {
@@ -2758,7 +2990,6 @@ async fn local_policy_remote_refresh_keeps_fork_prompt_and_server_capabilities()
             model.context_window = Some(400_000);
             model.max_context_window = Some(872_000);
             model.model_messages = Some(codex_protocol::openai_models::ModelMessages {
-                token_budget: None,
                 instructions_template: Some(
                     "remote verbosity policy {{ personality }}".to_string(),
                 ),
@@ -3128,4 +3359,42 @@ async fn sol_6_bundled_catalog_resolves_picker_and_runtime_metadata() {
     assert_eq!(overridden.context_window, Some(872_000));
     assert_eq!(overridden.get_model_instructions(None), "user instructions");
     assert_eq!(endpoint.fetch_count(), 0);
+}
+#[tokio::test]
+async fn invalid_numeric_remote_and_cache_never_replace_last_good_catalog() {
+    let home = tempdir().unwrap();
+    let good = remote_model("valid-retained", "Valid", 1);
+    let mut invalid = good.clone();
+    invalid.context_window = Some(0);
+    let manager = openai_manager_for_tests(
+        home.path().into(),
+        TestModelsEndpoint::new(vec![vec![invalid.clone()]]),
+    );
+    let identity = manager.cache_manager.current_identity();
+    assert!(
+        manager
+            .apply_remote_models_and_etag_for_identity(
+                vec![good.clone()],
+                Some("good".into()),
+                &identity
+            )
+            .await
+    );
+    assert!(
+        manager
+            .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+            .await
+            .is_err()
+    );
+    manager
+        .cache_manager
+        .persist_cache(
+            &[invalid],
+            Some("bad".into()),
+            crate::client_version_to_whole(),
+        )
+        .await;
+    assert!(manager.try_load_cache().await.is_err());
+    assert_eq!(manager.get_etag().await.as_deref(), Some("good"));
+    assert!(manager.get_remote_models().await.contains(&good));
 }

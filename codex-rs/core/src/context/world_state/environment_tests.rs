@@ -11,6 +11,41 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
+fn changing_only_primary_is_visible_and_noop_is_silent() -> Result<()> {
+    let previous = EnvironmentsState {
+        primary_environment_id: Some("A".into()),
+        environments: [
+            ("A".into(), available("file:///repo", "cmd")?),
+            ("B".into(), available("file:///repo", "cmd")?),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    assert!(
+        previous
+            .render()
+            .contains("<primary_environment_id>A</primary_environment_id>")
+    );
+    let snapshot = WorldStateSection::snapshot(&previous);
+    assert!(
+        WorldStateSection::render_diff(&previous, PreviousSectionState::Known(&snapshot)).is_none()
+    );
+    let current = EnvironmentsState {
+        primary_environment_id: Some("B".into()),
+        ..previous
+    };
+    let delta = WorldStateSection::render_diff(&current, PreviousSectionState::Known(&snapshot))
+        .expect("primary changed");
+    assert!(
+        delta
+            .render()
+            .contains("<primary_environment_id>B</primary_environment_id>")
+    );
+    Ok(())
+}
+
+#[test]
 fn session_visualization_roots_do_not_change_the_prompt_or_runtime_permissions() -> Result<()> {
     use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -115,6 +150,7 @@ fn visualization_projection_hides_managed_grants_but_preserves_denials() -> Resu
 #[test]
 fn renders_full_environment_state() -> Result<()> {
     let context = EnvironmentsState {
+        primary_environment_id: None,
         environments: [
             ("laptop".to_string(), available("file:///repo", "zsh")?),
             (
@@ -161,6 +197,7 @@ fn environment_os_transitions_are_explicit_and_persisted() -> Result<()> {
         let mut environment = available("file:///repo", "sh")?;
         environment.os = os.map(str::to_string);
         let state = EnvironmentsState {
+            primary_environment_id: None,
             environments: [(LOCAL_ENVIRONMENT_ID.to_string(), environment)]
                 .into_iter()
                 .collect(),
@@ -188,6 +225,7 @@ fn environment_os_transitions_are_explicit_and_persisted() -> Result<()> {
 fn changed_environments_keep_unchanged_environments_in_replacement() -> Result<()> {
     let mut previous = WorldState::default();
     previous.add_section(EnvironmentsState {
+        primary_environment_id: None,
         environments: [
             ("laptop".to_string(), available("file:///repo", "bash")?),
             ("unchanged".to_string(), available("file:///same", "sh")?),
@@ -200,6 +238,7 @@ fn changed_environments_keep_unchanged_environments_in_replacement() -> Result<(
     });
     let mut current = WorldState::default();
     current.add_section(EnvironmentsState {
+        primary_environment_id: None,
         environments: [
             ("laptop".to_string(), available("file:///repo", "zsh")?),
             ("unchanged".to_string(), available("file:///same", "sh")?),
@@ -247,6 +286,7 @@ fn changed_environments_keep_unchanged_environments_in_replacement() -> Result<(
 #[test]
 fn persisted_turn_context_values_render_a_diff() -> Result<()> {
     let environments = EnvironmentsState {
+        primary_environment_id: None,
         environments: [(
             LOCAL_ENVIRONMENT_ID.to_string(),
             available("file:///repo", "zsh")?,
@@ -257,6 +297,7 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
     };
     let mut previous = WorldState::default();
     previous.add_section(EnvironmentsState {
+        primary_environment_id: None,
         current_date: Some("2026-06-19".to_string()),
         timezone: Some("UTC".to_string()),
         network: Some(NetworkContext::new(
@@ -272,6 +313,7 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
     });
     let mut current = WorldState::default();
     current.add_section(EnvironmentsState {
+        primary_environment_id: None,
         current_date: Some("2026-06-20".to_string()),
         timezone: Some("America/Los_Angeles".to_string()),
         network: Some(NetworkContext::new(
@@ -307,6 +349,7 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
 #[test]
 fn legacy_network_snapshot_is_replaced_with_explicit_proxy_configuration() {
     let current = EnvironmentsState {
+        primary_environment_id: None,
         network: Some(NetworkContext::new(
             false,
             vec!["example.com".to_string()],
@@ -342,6 +385,7 @@ fn legacy_subagent_snapshot_is_cleared_with_none() {
     // Subagents now have their own section, so the current state never lists
     // them here. Only a snapshot persisted by an older build still can.
     let current = EnvironmentsState {
+        primary_environment_id: None,
         filesystem: Some(FileSystemContext::from_permission_profile(
             &PermissionProfile::Disabled,
             &[],
@@ -354,6 +398,7 @@ fn legacy_subagent_snapshot_is_cleared_with_none() {
         ..Default::default()
     };
     let legacy = WorldStateSection::snapshot(&EnvironmentsState {
+        primary_environment_id: None,
         subagents: Some("- agent-2: nova".to_string()),
         ..current.clone()
     });
@@ -379,6 +424,7 @@ fn legacy_subagent_snapshot_is_cleared_with_none() {
 fn persisted_snapshot_uses_model_visible_path_and_context_values() -> Result<()> {
     let mut world_state = WorldState::default();
     world_state.add_section(EnvironmentsState {
+        primary_environment_id: None,
         environments: [(
             "remote".to_string(),
             available("file:///C:/windows", "powershell")?,
@@ -413,9 +459,11 @@ fn persisted_snapshot_uses_model_visible_path_and_context_values() -> Result<()>
 #[test]
 fn single_environment_diff_reports_newly_known_shell() -> Result<()> {
     let previous = EnvironmentsState {
+        primary_environment_id: None,
         environments: [(
             LOCAL_ENVIRONMENT_ID.to_string(),
             EnvironmentState {
+                owner_id: None,
                 cwd: PathUri::parse("file:///repo")?,
                 status: EnvironmentStatus::Available,
                 shell: None,
@@ -427,6 +475,7 @@ fn single_environment_diff_reports_newly_known_shell() -> Result<()> {
         ..Default::default()
     };
     let current = EnvironmentsState {
+        primary_environment_id: None,
         environments: [(
             LOCAL_ENVIRONMENT_ID.to_string(),
             available("file:///repo", "zsh")?,
@@ -452,6 +501,7 @@ fn single_environment_diff_reports_newly_known_shell() -> Result<()> {
 #[test]
 fn removed_legacy_environment_renders_unavailable() -> Result<()> {
     let previous = EnvironmentsState {
+        primary_environment_id: None,
         environments: [(
             LOCAL_ENVIRONMENT_ID.to_string(),
             available("file:///repo", "bash")?,
@@ -483,9 +533,11 @@ fn known_unknown_and_changed_shell_are_communicated_before_snapshot_advances() -
     let make_state = |shell: Option<&str>| -> Result<WorldState> {
         let mut state = WorldState::default();
         state.add_section(EnvironmentsState {
+            primary_environment_id: None,
             environments: [(
                 LOCAL_ENVIRONMENT_ID.to_string(),
                 EnvironmentState {
+                    owner_id: None,
                     cwd: PathUri::parse("file:///repo")?,
                     status: EnvironmentStatus::Available,
                     shell: shell.map(str::to_string),
@@ -535,6 +587,7 @@ fn known_unknown_and_changed_shell_are_communicated_before_snapshot_advances() -
 fn removed_global_values_are_explicitly_cleared() {
     let mut previous = WorldState::default();
     previous.add_section(EnvironmentsState {
+        primary_environment_id: None,
         current_date: Some("2026-09-13".to_string()),
         timezone: Some("UTC".to_string()),
         network: Some(NetworkContext::new(true, vec![], vec![])),
@@ -591,6 +644,7 @@ fn unknown_environment_snapshot_is_authoritatively_replaced() {
 #[test]
 fn clearing_each_global_field_retains_other_fields_and_persists_delivery() {
     let populated = EnvironmentsState {
+        primary_environment_id: None,
         current_date: Some("2026-09-13".to_string()),
         timezone: Some("UTC".to_string()),
         network: Some(NetworkContext::new(true, vec![], vec![])),
@@ -672,6 +726,7 @@ fn clearing_each_global_field_retains_other_fields_and_persists_delivery() {
 fn environment_ids_are_escaped_in_current_and_removed_entries() -> Result<()> {
     let mut previous = WorldState::default();
     previous.add_section(EnvironmentsState {
+        primary_environment_id: None,
         environments: [("old\"&".to_string(), available("file:///old", "bash")?)]
             .into_iter()
             .collect(),
@@ -679,6 +734,7 @@ fn environment_ids_are_escaped_in_current_and_removed_entries() -> Result<()> {
     });
     let mut current = WorldState::default();
     current.add_section(EnvironmentsState {
+        primary_environment_id: None,
         environments: [("new\"&".to_string(), available("file:///new", "bash")?)]
             .into_iter()
             .collect(),
@@ -697,6 +753,7 @@ fn environment_ids_are_escaped_in_current_and_removed_entries() -> Result<()> {
 fn environment_text_keeps_quotes_and_escapes_markup() -> Result<()> {
     let mut world_state = WorldState::default();
     world_state.add_section(EnvironmentsState {
+        primary_environment_id: None,
         environments: [(
             "local".to_string(),
             available("file:///repo", "shell \"quoted\" 'value' <tag>&")?,
@@ -718,6 +775,7 @@ fn environment_text_keeps_quotes_and_escapes_markup() -> Result<()> {
 
 fn available(cwd: &str, shell: &str) -> Result<EnvironmentState> {
     Ok(EnvironmentState {
+        owner_id: None,
         cwd: PathUri::parse(cwd)?,
         status: EnvironmentStatus::Available,
         shell: Some(shell.to_string()),
@@ -728,6 +786,7 @@ fn available(cwd: &str, shell: &str) -> Result<EnvironmentState> {
 #[test]
 fn environment_os_survives_snapshot_and_reports_changes() -> Result<()> {
     let mut state = EnvironmentsState {
+        primary_environment_id: None,
         environments: [("remote".into(), available("file:///repo", "bash")?)]
             .into_iter()
             .collect(),
@@ -761,6 +820,7 @@ fn environment_os_survives_snapshot_and_reports_changes() -> Result<()> {
 
 fn starting(cwd: &str) -> Result<EnvironmentState> {
     Ok(EnvironmentState {
+        owner_id: None,
         cwd: PathUri::parse(cwd)?,
         status: EnvironmentStatus::Starting,
         shell: None,
@@ -811,4 +871,40 @@ fn assert_delivered_snapshot(
         .expect("admitted environment must record its exact rendered delivery");
     assert_eq!(receipt.as_str().unwrap().len(), 64);
     assert_eq!(actual, serde_json::to_value(expected).unwrap());
+}
+#[tokio::test]
+async fn primary_only_reorder_is_visible_and_matches_omitted_dispatch() {
+    let (_, mut turn) = crate::session::tests::make_session_and_context().await;
+    let mut secondary = turn.environments.turn_environments[0].clone();
+    secondary.environment_id = "secondary".into();
+    turn.environments.turn_environments.push(secondary);
+    let previous =
+        EnvironmentsState::from_turn_context_with_environments(&turn, &turn.environments);
+    turn.environments.turn_environments.swap(0, 1);
+    let current = EnvironmentsState::from_turn_context_with_environments(&turn, &turn.environments);
+    let previous = previous.snapshot();
+    let diff = current
+        .render_diff(PreviousSectionState::Known(&previous))
+        .expect("primary reorder needs a delta");
+    assert!(
+        diff.render()
+            .contains("<primary_environment_id>secondary</primary_environment_id>")
+    );
+    let selected = crate::tools::handlers::resolve_tool_environment(&turn.environments, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(selected.environment_id, "secondary");
+    let mut legacy = serde_json::to_value(previous).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("primary_environment_id");
+    let legacy: EnvironmentsSnapshot = serde_json::from_value(legacy).unwrap();
+    assert!(
+        current
+            .render_diff(PreviousSectionState::Known(&legacy))
+            .unwrap()
+            .render()
+            .contains("secondary")
+    );
 }

@@ -772,10 +772,14 @@ mod tests {
                 .any(|condition| matches!(condition, ConditionSpec::RemotePort(_)))
         }) {
             assert!(spec.conditions.contains(&ConditionSpec::NotLoopback));
-            ports.extend(spec.conditions.iter().filter_map(|condition| match condition {
-                ConditionSpec::RemotePort(port) => Some(*port),
-                _ => None,
-            }));
+            ports.extend(
+                spec.conditions
+                    .iter()
+                    .filter_map(|condition| match condition {
+                        ConditionSpec::RemotePort(port) => Some(*port),
+                        _ => None,
+                    }),
+            );
         }
         ports.sort_unstable();
         assert_eq!(ports, vec![53, 53, 139, 139, 445, 445, 853, 853]);

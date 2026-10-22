@@ -58,6 +58,7 @@ async fn typed_patch_commits_without_mutation_snapshots() {
                 capability_profile: CapabilityProfile::ScopedSourceWrite,
                 objective: "write a file".into(),
                 acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                    evidence_policy: None,
                     id: "written".into(),
                     text: "file is committed".into(),
                 }],

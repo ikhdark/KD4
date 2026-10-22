@@ -265,11 +265,39 @@ async fn handle_mitm_request(
     let response = match forward_request(req, &request_ctx).await {
         Ok(resp) => resp,
         Err(err) => {
-            warn!("MITM request handling failed: {err}");
-            text_response(StatusCode::BAD_GATEWAY, "mitm upstream error")
+            let phase = err.downcast_ref::<MitmFailurePhase>().copied();
+            let (status, category) = match phase {
+                Some(MitmFailurePhase::LocalConfiguration) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "local_configuration")
+                }
+                Some(MitmFailurePhase::PolicyEvaluation) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "policy_evaluation")
+                }
+                Some(MitmFailurePhase::Upstream) => (
+                    StatusCode::BAD_GATEWAY,
+                    crate::upstream::failure_phase(err.as_ref()).unwrap_or("upstream_unknown"),
+                ),
+                None => (StatusCode::BAD_REQUEST, "request_validation"),
+            };
+            warn!(phase = category, "MITM request handling failed");
+            let mut response = text_response(status, category);
+            response
+                .headers_mut()
+                .insert("x-proxy-error", HeaderValue::from_static(category));
+            response
         }
     };
     Ok(response)
+}
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+enum MitmFailurePhase {
+    #[error("local configuration failure")]
+    LocalConfiguration,
+    #[error("policy evaluation failure")]
+    PolicyEvaluation,
+    #[error("upstream failure of unknown phase")]
+    Upstream,
 }
 
 async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Result<Response> {
@@ -277,9 +305,13 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
         .policy
         .app_state
         .request_policy_snapshot()
-        .await?;
+        .await
+        .context(MitmFailurePhase::LocalConfiguration)?;
     let hook_actions =
-        match evaluate_mitm_policy_with_snapshot(&req, &request_ctx.policy, &snapshot).await? {
+        match evaluate_mitm_policy_with_snapshot(&req, &request_ctx.policy, &snapshot)
+            .await
+            .context(MitmFailurePhase::PolicyEvaluation)?
+        {
             MitmPolicyDecision::Allow { hook_actions } => hook_actions,
             MitmPolicyDecision::Block(response) => return Ok(response),
         };
@@ -288,7 +320,7 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     let target_port = request_ctx.policy.target_port;
     let mitm = snapshot
         .mitm_state()
-        .context("MITM disabled during connection")?;
+        .context(MitmFailurePhase::LocalConfiguration)?;
 
     let method = req.method().as_str().to_string();
     let path = path_and_query(req.uri());
@@ -326,7 +358,11 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     };
 
     let upstream_req = Request::from_parts(parts, body);
-    let upstream_resp = mitm.upstream.serve(upstream_req).await?;
+    let upstream_resp = mitm
+        .upstream
+        .serve(upstream_req)
+        .await
+        .context(MitmFailurePhase::Upstream)?;
     respond_with_inspection(
         upstream_resp,
         inspect,
@@ -388,7 +424,11 @@ async fn evaluate_mitm_policy_with_snapshot(
 
     // Preserve the CONNECT grant, but enforce current explicit denies and guard against rebinding.
     if let HostBlockDecision::Blocked(
-        reason @ (HostBlockReason::NotAllowedLocal | HostBlockReason::Denied),
+        reason @ (HostBlockReason::NotAllowedLocal
+        | HostBlockReason::Denied
+        | HostBlockReason::DnsFailed
+        | HostBlockReason::DnsTimeout
+        | HostBlockReason::DnsEmpty),
     ) = request_policy
         .host_blocked(&policy.target_host, policy.target_port)
         .await?

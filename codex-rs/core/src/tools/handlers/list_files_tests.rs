@@ -152,6 +152,94 @@ async fn registered_listing_tracks_directory_evidence_and_bounds_traversal() {
 }
 
 #[tokio::test]
+async fn repeated_registered_listing_observes_eval_additions_without_notifications() {
+    use crate::agent::task_capabilities::TypedToolClass;
+    use crate::session::turn_execution::SamplingRequestSettledState;
+    use crate::session::turn_execution::TurnExecutionControl;
+    use crate::tools::parallel::ToolCallRuntime;
+    use crate::tools::registry::RegisteredTool;
+    use crate::tools::registry::ToolRegistry;
+    use crate::tools::router::ToolCall;
+    use crate::tools::router::ToolRouter;
+
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::create_dir_all(root.path().join(".codex/evals")).unwrap();
+    let mut call = invocation(root.path(), json!({"path":".codex", "include_hidden":true})).await;
+    Arc::get_mut(&mut call.session)
+        .unwrap()
+        .services
+        .git_workspace = crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
+    let router = Arc::new(ToolRouter::from_parts(
+        ToolRegistry::from_unique_registered_tools([RegisteredTool::new(
+            Arc::new(ListFilesHandler) as Arc<dyn CoreToolRuntime>,
+            TypedToolClass::ReadSearch,
+        )]),
+        Vec::new(),
+    ));
+    let step = call.step_context.with_tool_router_for_test(router);
+    let mut control = TurnExecutionControl::new();
+    for index in 0..3 {
+        if index == 2 {
+            std::fs::write(root.path().join(".codex/evals/new.txt"), "new").unwrap();
+        }
+        let baseline = control.baselines(0);
+        let collector = control.collector(&baseline);
+        let response = ToolCallRuntime::new(
+            Arc::clone(&call.session),
+            Arc::clone(&step),
+            Arc::clone(&call.tracker),
+        )
+        .with_sampling_request_signals(collector.clone())
+        .handle_tool_call(
+            ToolCall {
+                tool_name: call.tool_name.clone(),
+                call_id: format!("listing-{index}"),
+                payload: call.payload.clone(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let text = serde_json::to_string(&response).unwrap();
+        assert_eq!(text.contains("new.txt"), index == 2);
+        control.settle(
+            &baseline,
+            &collector,
+            &SamplingRequestSettledState {
+                mutation_revision: 0,
+                attributed_mutation_revision: 0,
+                tool_exposure_revision: 0,
+            },
+        );
+    }
+    let timing = step
+        .turn
+        .turn_timing_state
+        .complete_snapshot()
+        .protocol_timing();
+    for index in 0..3 {
+        let id = format!("listing-{index}");
+        assert!(
+            timing
+                .tool_calls
+                .iter()
+                .find(|call| call.call_id == id)
+                .unwrap()
+                .handler_entry_at_ms
+                .is_some(),
+            "directories require a fresh walk, including unchanged repeats"
+        );
+    }
+}
+#[tokio::test]
 async fn listing_rejects_invalid_limits_missing_roots_and_cancelled_calls() {
     let root = tempfile::tempdir().unwrap();
     let call = invocation(root.path(), json!({"path": "."})).await;
@@ -271,7 +359,7 @@ async fn listing_does_not_follow_directory_symlinks() {
 }
 
 #[tokio::test]
-async fn listing_unreadable_file_link_preserves_siblings_without_claiming_complete() {
+async fn listing_omits_dangling_file_link_and_stays_complete() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("ordinary.txt"), "ordinary").unwrap();
     #[cfg(windows)]
@@ -292,21 +380,17 @@ async fn listing_unreadable_file_link_preserves_siblings_without_claiming_comple
         .await
         .unwrap()
         .code_mode_result(&payload);
-    assert_eq!(
-        output["complete"], false,
-        "unreadable entries do not prove absence"
-    );
-    assert_eq!(
-        output["truncated"], false,
-        "this is a metadata failure, not a budget cutoff"
-    );
+    // A link whose target is missing is a known link, not a metadata error
+    // (exec-server `metadata_retains_a_dangling_entry_but_follows_a_live_target`).
+    // It is neither a file nor a directory, so like a directory symlink the
+    // walk omits it and the requested scope remains complete.
+    assert_eq!(output["complete"], true);
+    assert_eq!(output["truncated"], false);
     assert_eq!(
         output["entries"],
         json!([{"path":"ordinary.txt", "kind":"file"}])
     );
-    assert_eq!(output["errors"].as_array().unwrap().len(), 1);
-    assert_eq!(output["errors"][0]["path"], "dangling");
-    assert!(!output["errors"][0]["message"].as_str().unwrap().is_empty());
+    assert_eq!(output["errors"], json!([]));
 }
 
 #[tokio::test]
@@ -449,7 +533,8 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
                 }
                 "fs/walk" => {
                     walks.push(message["params"].clone());
-                    let mut result = json!({"entries": [{"path": response_file, "kind": "file"}],
+                    // Current servers acknowledge handle-bound no-follow enumeration.
+                    let mut result = json!({"noFollowEnforced": true, "entries": [{"path": response_file, "kind": "file"}],
                            "errors": [{"path": response_cwd, "message": "permission denied for a descendant"}], "truncated": walks.len() != 1});
                     if walks.len() == 2 {
                         result["appliedFilters"] = message["params"]["options"]["filters"].clone();
@@ -544,4 +629,92 @@ async fn remote_listing_forwards_sandbox_and_preserves_partial_errors() {
         "permission denied for a descendant"
     );
     assert!(!root.path().join("remote-only.txt").exists());
+}
+#[test]
+fn listing_rendering_preserves_the_selected_environment_path_grammar() {
+    for (cwd, native, convention, expected) in [
+        (
+            r"/repo\name",
+            r"/repo\name/a\b.rs",
+            PathConvention::Posix,
+            r"a\b.rs",
+        ),
+        (
+            "/repo",
+            r"/repo\sibling/needle.rs",
+            PathConvention::Posix,
+            r"/repo\sibling/needle.rs",
+        ),
+        (
+            "/repo",
+            "/repository/needle.rs",
+            PathConvention::Posix,
+            "/repository/needle.rs",
+        ),
+        ("/repo", r"/repo/a\b.rs", PathConvention::Posix, r"a\b.rs"),
+        (
+            r"C:\repo",
+            r"C:\repo\src\main.rs",
+            PathConvention::Windows,
+            "src/main.rs",
+        ),
+        (r"C:\", r"C:\main.rs", PathConvention::Windows, "main.rs"),
+        (
+            r"\\host\share\",
+            r"\\host\share\a.rs",
+            PathConvention::Windows,
+            "a.rs",
+        ),
+    ] {
+        assert_eq!(
+            render_listing_path(cwd, native.into(), Some(convention)),
+            expected
+        );
+    }
+    assert_eq!(
+        render_listing_path("/repo", "/repo/a.rs".into(), None),
+        "/repo/a.rs"
+    );
+}
+
+#[tokio::test]
+async fn native_unrepresentable_name_never_aliases_the_replacement_character_sibling() {
+    let root = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"needle-\xff.txt".to_vec())
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        let units = "needle-"
+            .encode_utf16()
+            .chain([0xd800])
+            .chain(".txt".encode_utf16())
+            .collect::<Vec<_>>();
+        std::ffi::OsString::from_wide(&units)
+    };
+    std::fs::write(root.path().join(invalid), "UNREPRESENTABLE").unwrap();
+    std::fs::write(root.path().join("needle-�.txt"), "HEALTHY").unwrap();
+    let call = invocation(root.path(), json!({"path":".","max_depth":0})).await;
+    let payload = call.payload.clone();
+    let output = ListFilesHandler
+        .handle(call)
+        .await
+        .unwrap()
+        .code_mode_result(&payload);
+    assert_eq!(
+        output["entries"],
+        json!([{"path":"needle-�.txt","kind":"file"}])
+    );
+    assert_eq!(output["complete"], false);
+    assert_eq!(output["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(output["errors"][0]["path"], ".");
+    assert!(
+        output["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unrepresentable native entry")
+    );
 }

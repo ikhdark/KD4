@@ -25,6 +25,77 @@ def publish_source_text() -> str:
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
+    def test_activation_guard_authenticates_artifact_backed_terminal_events(self):
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            sessions = home / "sessions"
+            store = home / "rollout-payloads"
+            sessions.mkdir()
+            store.mkdir()
+            rollout = sessions / "rollout-artifact.jsonl"
+            for kind in ("task_complete", "turn_aborted"):
+                event = {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": kind,
+                        "turn_id": "turn",
+                        "message": "x" * 9000,
+                    },
+                }
+                payload = json.dumps(event).encode()
+                digest = hashlib.sha256(payload).hexdigest()
+                blob = store / (digest + ".json")
+                blob.write_bytes(payload)
+                stub = {
+                    "type": "rollout_payload_artifact",
+                    "payload": {
+                        "item_type": "event_msg",
+                        "sha256": digest,
+                        "bytes": len(payload),
+                    },
+                }
+                rollout.write_text(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "task_started",
+                                "turn_id": "turn",
+                            },
+                        }
+                    )
+                    + "\n"
+                    + json.dumps(stub)
+                    + "\n"
+                )
+                command = (
+                    f". {ps_single_quote(SCRIPT)} -ImportOnly\n"
+                    "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest\n"
+                    f"Assert-NoCodexRunningTurns -LocalCodexHome {ps_single_quote(home)}\n"
+                )
+                for corrupt in (False, True):
+                    with self.subTest(kind=kind, corrupt=corrupt):
+                        if corrupt:
+                            blob.write_bytes(b"corrupt")
+                        result = subprocess.run(
+                            [shell, "-NoProfile", "-Command", command],
+                            env=clean_env(),
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            creationflags=CREATE_NO_WINDOW,
+                        )
+                        if corrupt:
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn("Cannot verify chat state", result.stderr)
+                        else:
+                            self.assertEqual(
+                                result.returncode, 0, result.stdout + result.stderr
+                            )
+
     def test_conditional_noop_restart_does_not_scan_sessions(self):
         from scripts.common.process_owner import run_owned
 
@@ -33,8 +104,9 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
             self.skipTest("PowerShell is not available")
         source = publish_source_text()
         start = source.index("if (-not $DryRun -and ($binaryChanged")
-        block = source[start:source.index("\nif ($DryRun) {", start)]
-        command = """
+        block = source[start : source.index("\nif ($DryRun) {", start)]
+        command = (
+            """
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $DryRun = $false
@@ -49,9 +121,17 @@ $turnHostProcess = $null
 function Assert-NoCodexRunningTurns { throw 'unnecessary session scan' }
 function Test-DesktopRuntimeProof { return $true }
 function Write-ProofLine { param($Name, $Value); Write-Output "$Name : $Value" }
-""" + block + "\nif ($RestartDesktop) { throw 'unnecessary restart' }"
-        result = run_owned([shell, "-NoProfile", "-Command", command],
-                           capture_output=True, text=True, timeout=15, env=clean_env())
+"""
+            + block
+            + "\nif ($RestartDesktop) { throw 'unnecessary restart' }"
+        )
+        result = run_owned(
+            [shell, "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=clean_env(),
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("skipped: current runtime", result.stdout)
 
@@ -68,20 +148,29 @@ function Write-ProofLine { param($Name, $Value); Write-Output "$Name : $Value" }
             fixture.shell = "fixture-shell"
             with (
                 mock.patch.object(support.subprocess, "run") as run,
-                mock.patch.dict(os.environ, {
-                    "CODEX_THREAD_ID": "unrelated-live-turn",
-                    "GIT_DIR": "unrelated-repository",
-                    "GIT_WORK_TREE": "unrelated-worktree",
-                    "GIT_CONFIG_COUNT": "1",
-                }),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CODEX_THREAD_ID": "unrelated-live-turn",
+                        "GIT_DIR": "unrelated-repository",
+                        "GIT_WORK_TREE": "unrelated-worktree",
+                        "GIT_CONFIG_COUNT": "1",
+                    },
+                ),
             ):
                 fixture.run_script()
                 args = run.call_args.args[0]
                 self.assertNotIn("CODEX_THREAD_ID", run.call_args.kwargs["env"])
-                self.assertFalse(any(name.upper().startswith("GIT_")
-                                     for name in run.call_args.kwargs["env"]))
-                self.assertEqual(args[args.index("-LocalCodexHome") + 1],
-                                 str(Path(temp) / "local-home"))
+                self.assertFalse(
+                    any(
+                        name.upper().startswith("GIT_")
+                        for name in run.call_args.kwargs["env"]
+                    )
+                )
+                self.assertEqual(
+                    args[args.index("-LocalCodexHome") + 1],
+                    str(Path(temp) / "local-home"),
+                )
                 fixture.run_script("-LocalCodexHome", "explicit-home")
                 self.assertEqual(run.call_args.args[0].count("-LocalCodexHome"), 1)
                 env = dict(os.environ, USERPROFILE=str(Path(temp) / "user"))
@@ -103,11 +192,24 @@ function Write-ProofLine { param($Name, $Value); Write-Output "$Name : $Value" }
             (sessions / "condensed.jsonl").write_text(
                 '{"type":"event_msg","ptype":"task_started"}\n'
             )
+
             def event(kind: str, turn: str) -> str:
-                return json.dumps({"type": "event_msg", "payload": {
-                    "type": kind, "turn_id": turn,
-                }}) + "\n"
-            completed.write_text(event("task_started", "done") + event("task_complete", "done"))
+                return (
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": kind,
+                                "turn_id": turn,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+            completed.write_text(
+                event("task_started", "done") + event("task_complete", "done")
+            )
             running.write_text(event("task_started", "still-running"))
             command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
@@ -148,9 +250,20 @@ foreach ($invalidRecord in @(
 Write-Output 'guard checks passed'
 """
             result = subprocess.run(
-                [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-                env=clean_env(), text=True, capture_output=True, check=False,
-                timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                env=clean_env(),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
+                creationflags=CREATE_NO_WINDOW,
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -267,7 +380,7 @@ function Stop-Process {{
     if ($InputObject.Id -ne 91) {{ throw 'wrong process stopped' }}
     $script:Stopped++
 }}
-function Start-Process {{
+function Start-CodexDesktopProcess {{
     if ($script:Reads -lt 3) {{ throw 'activated before original process exited' }}
     $script:Launched = $true
 }}
@@ -689,8 +802,12 @@ finally {{
 """
         result = subprocess.run(
             [shell, "-NoProfile", "-Command", command],
-            env=clean_env(), text=True, capture_output=True, check=False,
-            timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
+            env=clean_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
@@ -827,46 +944,69 @@ catch {{
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Codex Desktop is unavailable", result.stdout)
 
-    def test_restart_activates_packaged_desktop_and_restores_process_env(self) -> None:
+    def test_restart_passes_fork_environment_to_desktop_process(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
         home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        desktop = home / "Desktop app" / "ChatGPT.exe"
+        desktop.parent.mkdir()
+        environment_output = home / "desktop-env.txt"
+        source = r"""
+using System;
+using System.IO;
+using System.Threading;
+public class DesktopEnvironmentProbe {
+    public static void Main() {
+        string output = Environment.GetEnvironmentVariable("TEST_DESKTOP_ENV_OUTPUT");
+        File.WriteAllLines(output + ".tmp", new[] {
+            Environment.CurrentDirectory,
+            Environment.GetEnvironmentVariable("CODEX_CLI_PATH"),
+            Environment.GetEnvironmentVariable("CODEX_HOME"),
+            Environment.GetEnvironmentVariable("CODEX_SQLITE_HOME"),
+            Environment.GetEnvironmentVariable("ELECTRON_RUN_AS_NODE") ?? "<unset>",
+            Environment.GetEnvironmentVariable("CODEX_INTERNAL_ORIGINATOR_OVERRIDE") ?? "<unset>"
+        });
+        File.Move(output + ".tmp", output);
+        Thread.Sleep(60000);
+    }
+}
+"""
         command = rf"""
 . {ps_single_quote(SCRIPT)} -ImportOnly
-function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
-$script:Launched = $false
-function Get-CodexDesktopProcessesForPath {{
-    param([string]$DesktopPath)
-    if ($script:Launched) {{
-        return @([pscustomobject]@{{ Id = 91; Path = $DesktopPath }})
-    }}
-    return @()
+Add-Type -TypeDefinition {ps_single_quote(source)} -OutputAssembly {ps_single_quote(desktop)} -OutputType ConsoleApplication
+function Get-CodexDesktopExecutableProof {{ return {ps_single_quote(desktop)} }}
+function Test-DesktopRuntimeProof {{
+    return (Test-Path -LiteralPath $env:TEST_DESKTOP_ENV_OUTPUT)
 }}
-function Test-DesktopRuntimeProof {{ return $true }}
-function Start-Process {{
-    param([string]$FilePath, [object[]]$ArgumentList)
-    $script:Launched = $true
-    $script:Launch = [pscustomobject]@{{
-        FilePath = $FilePath
-        Argument = [string]$ArgumentList[0]
-        CliPath = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Process')
-        CodexHome = [Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process')
-        SqliteHome = [Environment]::GetEnvironmentVariable('CODEX_SQLITE_HOME', 'Process')
-    }}
-}}
+$env:TEST_DESKTOP_ENV_OUTPUT = {ps_single_quote(environment_output)}
 [Environment]::SetEnvironmentVariable('CODEX_CLI_PATH', 'before-cli', 'Process')
 [Environment]::SetEnvironmentVariable('CODEX_HOME', 'before-home', 'Process')
 [Environment]::SetEnvironmentVariable('CODEX_SQLITE_HOME', 'before-sqlite', 'Process')
-Restart-CodexDesktop `
-    -LocalCliPath 'C:\local\codex.exe' `
-    -LocalCodexHome {ps_single_quote(home)} `
-    -LocalCodexSqliteHome 'C:\local\sqlite'
+[Environment]::SetEnvironmentVariable('ELECTRON_RUN_AS_NODE', '1', 'Process')
+[Environment]::SetEnvironmentVariable('CODEX_INTERNAL_ORIGINATOR_OVERRIDE', 'codex_vscode', 'Process')
+try {{
+    Restart-CodexDesktop `
+        -LocalCliPath 'C:\local\codex.exe' `
+        -LocalCodexHome {ps_single_quote(home)} `
+        -LocalCodexSqliteHome 'C:\local\sqlite'
+}}
+finally {{
+    foreach ($process in @(Get-CodexDesktopProcessesForPath -DesktopPath {ps_single_quote(desktop)})) {{
+        try {{
+            Stop-Process -InputObject $process
+            if (-not $process.WaitForExit(5000)) {{ throw 'fixture Desktop did not exit' }}
+        }}
+        finally {{ $process.Dispose() }}
+    }}
+}}
 [pscustomobject]@{{
-    Launch = $script:Launch
+    Launch = [IO.File]::ReadAllLines($env:TEST_DESKTOP_ENV_OUTPUT)
     RestoredCliPath = [Environment]::GetEnvironmentVariable('CODEX_CLI_PATH', 'Process')
     RestoredCodexHome = [Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process')
     RestoredSqliteHome = [Environment]::GetEnvironmentVariable('CODEX_SQLITE_HOME', 'Process')
+    RestoredElectronMode = [Environment]::GetEnvironmentVariable('ELECTRON_RUN_AS_NODE', 'Process')
+    RestoredOriginator = [Environment]::GetEnvironmentVariable('CODEX_INTERNAL_ORIGINATOR_OVERRIDE', 'Process')
 }} | ConvertTo-Json -Compress -Depth 3
 """
         result = subprocess.run(
@@ -888,20 +1028,25 @@ Restart-CodexDesktop `
 
         self.assertEqual(result.returncode, 0, result.stderr)
         output = json.loads(result.stdout.splitlines()[-1])
-        self.assertEqual(output["Launch"]["FilePath"], "explorer.exe")
         self.assertEqual(
-            output["Launch"]["Argument"],
-            r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App",
+            output["Launch"],
+            [
+                str(desktop.parent),
+                r"C:\local\codex.exe",
+                str(home),
+                r"C:\local\sqlite",
+                "<unset>",
+                "<unset>",
+            ],
         )
-        self.assertEqual(output["Launch"]["CliPath"], r"C:\local\codex.exe")
-        self.assertEqual(output["Launch"]["CodexHome"], str(home))
-        self.assertEqual(output["Launch"]["SqliteHome"], r"C:\local\sqlite")
         self.assertEqual(output["RestoredCliPath"], "before-cli")
         self.assertEqual(output["RestoredCodexHome"], "before-home")
         self.assertEqual(output["RestoredSqliteHome"], "before-sqlite")
+        self.assertEqual(output["RestoredElectronMode"], "1")
+        self.assertEqual(output["RestoredOriginator"], "codex_vscode")
         self.assertIn("desktopRestart: restarted", result.stdout)
 
-    def test_explorer_success_without_desktop_process_fails_restart(self) -> None:
+    def test_launch_without_desktop_process_fails_restart(self) -> None:
         shell = powershell()
         if shell is None:
             self.skipTest("PowerShell is not available")
@@ -910,7 +1055,7 @@ Restart-CodexDesktop `
 . {ps_single_quote(SCRIPT)} -ImportOnly
 function Get-CodexDesktopExecutableProof {{ return 'C:\Program Files\WindowsApps\OpenAI.Codex\app\Codex.exe' }}
 function Get-CodexDesktopProcessesForPath {{ return @() }}
-function Start-Process {{}}
+function Start-CodexDesktopProcess {{}}
 try {{
     Restart-CodexDesktop `
         -LocalCliPath 'C:\local\codex.exe' `
@@ -991,8 +1136,11 @@ foreach ($childId in Get-Content -LiteralPath $env:PROBE_CHILD_IDS) {{
 @{{ Version = $version; Matched = $matched; Reason = $reason; VersionElapsed = $versionElapsed; RuntimeElapsed = $runtimeElapsed }} | ConvertTo-Json -Compress
 """
         result = run_owned(
-            [shell, "-NoProfile", "-Command", command], env=clean_env(),
-            text=True, capture_output=True, timeout=20,
+            [shell, "-NoProfile", "-Command", command],
+            env=clean_env(),
+            text=True,
+            capture_output=True,
+            timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         output = json.loads(result.stdout)
@@ -1107,7 +1255,7 @@ function Test-DesktopRuntimeProof {{
     $FailureReason.Value = 'receipt CODEX_HOME does not match'
     return $false
 }}
-function Start-Process {{ $script:Launched = $true }}
+function Start-CodexDesktopProcess {{ $script:Launched = $true }}
 try {{
     Restart-CodexDesktop `
         -LocalCliPath 'C:\local\codex.exe' `
@@ -1141,9 +1289,7 @@ catch {{
     def test_noop_restart_failure_is_terminal_after_committed_publish(self) -> None:
         for fails in (False, True):
             with self.subTest(restart_fails=fails):
-                result = self.run_noop_publish_branch(
-                    restart=True, restart_fails=fails
-                )
+                result = self.run_noop_publish_branch(restart=True, restart_fails=fails)
                 self.assertEqual(result.stdout.splitlines().count("restart-called"), 1)
                 self.assertIn("publishCommitted: true", result.stdout)
                 self.assertNotIn("doctor-called", result.stdout)
@@ -1266,18 +1412,28 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
                 ["init", "--quiet"],
                 ["add", "."],
                 [
-                    "-c", "user.name=Fixture",
-                    "-c", "user.email=fixture@example.invalid",
-                    "commit", "--quiet", "-m", "fixture",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
                 ],
             ):
                 subprocess.run(
-                    ["git", "-C", str(root), *args], check=True,
-                    capture_output=True, timeout=30, env=clean_env(),
+                    ["git", "-C", str(root), *args],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                    env=clean_env(),
                 )
             head = subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"],
-                text=True, timeout=30, env=clean_env(),
+                text=True,
+                timeout=30,
+                env=clean_env(),
             ).strip()
             missing.unlink()
             directory.unlink()
@@ -1290,11 +1446,16 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
                 digest = hashlib.sha256(
                     f"codex-local-publish-inputs-v4\nhead={head}\nrecipe={'a' * 64}\n".encode()
                 )
-                for path in sorted(paths, key=lambda path: path.relative_to(root).as_posix()):
+                for path in sorted(
+                    paths, key=lambda path: path.relative_to(root).as_posix()
+                ):
                     name = path.relative_to(root).as_posix()
                     content = (
-                        literal_content if path == literal
-                        else b"untracked" if path == untracked else sort_contents.get(path)
+                        literal_content
+                        if path == literal
+                        else b"untracked"
+                        if path == untracked
+                        else sort_contents.get(path)
                     )
                     if content is None:
                         record = f"missing:{len(name.encode())}:{name}\n"
@@ -1323,9 +1484,19 @@ $deleted = Get-LocalPublishBuildInputSnapshot -RepoRoot $root
 @($first.Fingerprint, $changed.Fingerprint, $deleted.Fingerprint) | ConvertTo-Json -Compress
 """
             result = subprocess.run(
-                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-                text=True, capture_output=True, check=False,
-                timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
+                creationflags=CREATE_NO_WINDOW,
                 env=clean_env(),
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -1377,7 +1548,11 @@ $deleted = Get-LocalPublishBuildInputSnapshot -RepoRoot $root
             )
             self.assertEqual(
                 json.loads(result.stdout),
-                {"version": "codex noisy 1.0", "stderrLength": 65536, "stderrIntact": True},
+                {
+                    "version": "codex noisy 1.0",
+                    "stderrLength": 65536,
+                    "stderrIntact": True,
+                },
             )
 
 

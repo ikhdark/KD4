@@ -226,7 +226,8 @@ pub(super) async fn finish_callbacks(
                     }
                 }
                 CallbackCompletion::Cancel => {
-                    drain_tasks_bounded(notification_tasks, "notification", task_failure_handler).await;
+                    drain_tasks_bounded(notification_tasks, "notification", task_failure_handler)
+                        .await;
                 }
             }
             notification_cancellation_token.cancel();

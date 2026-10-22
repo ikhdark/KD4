@@ -14,6 +14,7 @@ doctest = false
 codex-core = { workspace = true }
 codex-http-client = { workspace = true }
 codex-model-provider-info = { workspace = true }
+codex-model-provider = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "process"] }
 tracing = { workspace = true, features = ["log"] }

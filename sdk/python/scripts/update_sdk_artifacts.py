@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import types
 import typing
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, get_args, get_origin
@@ -22,6 +23,7 @@ RUNTIME_DISTRIBUTION_NAME = "openai-codex-cli-bin"
 RUNTIME_PACKAGE_ROOT = Path("src") / "codex_cli_bin"
 CODEX_PACKAGE_METADATA = "codex-package.json"
 GENERATED_PACKAGE_INIT = '"""Auto-generated Python types derived from the app-server schemas."""\n'
+_generation_root: ContextVar[Path | None] = ContextVar("generation_root", default=None)
 
 
 def repo_root() -> Path:
@@ -29,7 +31,59 @@ def repo_root() -> Path:
 
 
 def sdk_root() -> Path:
-    return repo_root() / "sdk" / "python"
+    return _generation_root.get() or repo_root() / "sdk" / "python"
+
+
+def _repository_lock(path: Path, resource: str):
+    root = str(repo_root())
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from scripts.common.generated_output_lock import repository_lock
+
+    # A distinct resource from the Rust schema lock: schema publication may
+    # invoke this generator while retaining its own lock. Neither waits.
+    return repository_lock(path, "Python artifact generator", resource)
+
+
+def _remove_owned_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _publish_staged_paths(pairs: list[tuple[Path, Path]]) -> None:
+    """Publish one owned set, restoring all prior paths on errors/cancellation."""
+    backups: list[tuple[Path, Path, bool]] = []
+    installed: list[Path] = []
+    committed = False
+    try:
+        for staged, destination in pairs:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Backups survive a failed rollback, independently of stage cleanup.
+            backup = Path(
+                tempfile.mkdtemp(prefix=f".{destination.name}.backup-", dir=destination.parent)
+            )
+            existed = destination.exists() or destination.is_symlink()
+            backups.append((destination, backup, existed))
+            if existed:
+                os.replace(destination, backup / "old")
+            installed.append(destination)
+            os.replace(staged, destination)
+        committed = True
+    except BaseException:
+        committed = False
+        for destination, backup, existed in reversed(backups):
+            if destination in installed and ((backup / "old").exists() or not existed):
+                _remove_owned_path(destination)
+            if (backup / "old").exists():
+                os.replace(backup / "old", destination)
+        raise
+    finally:
+        for _, backup, _ in backups:
+            # Never erase the sole recoverable copy if restoration failed.
+            if committed or not (backup / "old").exists():
+                shutil.rmtree(backup)
 
 
 def app_server_schema_dir() -> Path:
@@ -240,21 +294,56 @@ def stage_python_runtime_package(
     package_archive: Path,
     platform_tag: str | None = None,
 ) -> Path:
+    _validate_staging_destination(python_runtime_root(), staging_dir)
     package_version = normalize_codex_version(codex_version)
-    _copy_package_tree(python_runtime_root(), staging_dir)
+    requested_staging_dir = staging_dir
+    staging_dir = staging_dir.absolute()
+    staging_dir.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        _repository_lock(
+            staging_dir.with_name(f".{staging_dir.name}.lock"), "Python runtime stage"
+        ),
+        tempfile.TemporaryDirectory(dir=staging_dir.parent) as td,
+    ):
+        private_stage = Path(td) / "runtime"
+        _copy_package_tree(python_runtime_root(), private_stage)
+        pyproject_path = private_stage / "pyproject.toml"
+        pyproject_text = pyproject_path.read_text()
+        pyproject_text = _rewrite_project_name(pyproject_text, RUNTIME_DISTRIBUTION_NAME)
+        pyproject_text = _rewrite_project_version(pyproject_text, package_version)
+        if platform_tag is None:
+            configured_tag = re.search(r'^platform-tag = "([^"]+)"$', pyproject_text, re.MULTILINE)
+            platform_tag = (configured_tag.group(1) if configured_tag else None) or os.environ.get(
+                "CODEX_CLI_BIN_PLATFORM_TAG"
+            )
+        if not platform_tag:
+            from packaging.tags import sys_tags
 
-    pyproject_path = staging_dir / "pyproject.toml"
-    pyproject_text = pyproject_path.read_text()
-    pyproject_text = _rewrite_project_name(pyproject_text, RUNTIME_DISTRIBUTION_NAME)
-    pyproject_text = _rewrite_project_version(pyproject_text, package_version)
-    if platform_tag is not None:
+            platform_tag = next(iter(sys_tags())).platform
+        targets = {"win_amd64": "x86_64-pc-windows-msvc", "win_arm64": "aarch64-pc-windows-msvc"}
+        if platform_tag not in targets:
+            raise RuntimeError(f"Unsupported runtime wheel platform tag: {platform_tag}")
         pyproject_text = _rewrite_runtime_platform_tag(pyproject_text, platform_tag)
-    pyproject_path.write_text(pyproject_text)
+        pyproject_path.write_text(pyproject_text)
 
-    runtime_package_root = staged_runtime_package_root(staging_dir)
-    _extract_codex_package_archive(package_archive, runtime_package_root)
-    _require_codex_package_version(runtime_package_root, package_archive, package_version)
-    return staging_dir
+        # Validate the clean native subtree before adding Python wrapper files.
+        native = Path(td) / "native"
+        _extract_codex_package_archive(package_archive, native)
+        root = str(repo_root())
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from scripts.codex_package.layout import validate_package_dir
+        from scripts.codex_package.targets import PACKAGE_VARIANTS, TARGET_SPECS
+
+        validate_package_dir(native, PACKAGE_VARIANTS["codex"], TARGET_SPECS[targets[platform_tag]])
+        _require_codex_package_version(native, package_archive, package_version)
+        runtime_package_root = staged_runtime_package_root(private_stage)
+        for source in native.iterdir():
+            if (runtime_package_root / source.name).exists():
+                raise RuntimeError(f"Native package collides with Python wrapper: {source.name}")
+            os.replace(source, runtime_package_root / source.name)
+        _publish_staged_paths([(private_stage, staging_dir)])
+    return requested_staging_dir
 
 
 def _require_codex_package_version(package_dir: Path, package_archive: Path, version: str) -> None:
@@ -298,26 +387,6 @@ def _extract_codex_package_archive(package_archive: Path, runtime_package_root: 
                 with source, destination.open("wb") as output:
                     shutil.copyfileobj(source, output)
             os.chmod(destination, member.mode & 0o777)
-
-    _validate_codex_package_layout(runtime_package_root, package_archive)
-
-
-def _validate_codex_package_layout(package_dir: Path, package_archive: Path) -> None:
-    missing_entries = []
-    if not (package_dir / CODEX_PACKAGE_METADATA).is_file():
-        missing_entries.append(CODEX_PACKAGE_METADATA)
-    for entry in ("bin", "codex-resources", "codex-path"):
-        if not (package_dir / entry).is_dir():
-            missing_entries.append(entry)
-    package_binary = package_dir / "bin" / runtime_binary_name()
-    if not package_binary.is_file():
-        missing_entries.append(str(Path("bin") / runtime_binary_name()))
-    code_mode_host = package_dir / "bin" / runtime_code_mode_host_name()
-    if not code_mode_host.is_file():
-        missing_entries.append(str(Path("bin") / runtime_code_mode_host_name()))
-    if missing_entries:
-        missing = ", ".join(missing_entries)
-        raise RuntimeError(f"Missing Codex package layout entries in {package_archive}: {missing}")
 
 
 def _flatten_string_enum_one_of(definition: dict[str, Any]) -> bool:
@@ -968,6 +1037,9 @@ def _load_generated_v2_all_module() -> types.ModuleType:
 def _kw_signature_lines(fields: list[PublicFieldSpec]) -> list[str]:
     lines: list[str] = []
     for field in fields:
+        if field.wire_name == "service_tier":
+            lines.append(f"        {field.py_name}: {field.annotation} | Unset = UNSET,")
+            continue
         default = "" if field.required else " = None"
         lines.append(f"        {field.py_name}: {field.annotation}{default},")
     return lines
@@ -998,6 +1070,11 @@ def _approval_mode_model_arg_lines(*, indent: str = "            ") -> list[str]
 def _model_arg_lines(fields: list[PublicFieldSpec], *, indent: str = "            ") -> list[str]:
     lines: list[str] = []
     for field in fields:
+        if field.wire_name == "service_tier":
+            lines.append(
+                f'{indent}**({{"service_tier": service_tier}} if service_tier is not UNSET else {{}}),'
+            )
+            continue
         arg = field.py_name
         if field.wire_name == "sandbox":
             arg = "_sandbox_mode(sandbox)"
@@ -1354,11 +1431,54 @@ def prepare_generated_package() -> None:
 
 def generate_types_from_schema_dir(schema_dir: Path) -> None:
     """Regenerate every SDK artifact derived from an existing schema directory."""
-    # v2_all is the authoritative generated surface.
-    prepare_generated_package()
-    generate_v2_all(schema_dir)
-    generate_notification_registry(schema_dir)
-    generate_public_api_flat_methods()
+    schema_dir = schema_dir.resolve()
+    destination = sdk_root()
+    lock_path = repo_root() / ".codex" / "locks" / "python-artifacts.lock"
+    with (
+        _repository_lock(lock_path, "Python generated artifacts"),
+        tempfile.TemporaryDirectory(dir=destination.parent) as td,
+    ):
+
+        def snapshot():
+            package = destination / "src/openai_codex"
+            generated = package / "generated"
+            files = {
+                str(path.relative_to(generated)): path.read_bytes()
+                for path in generated.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts
+            }
+            api = package / "api.py"
+            return generated.exists(), files, api.read_bytes() if api.is_file() else None
+
+        original = snapshot()
+        staged_sdk = Path(td)
+        staged_package = staged_sdk / "src" / "openai_codex"
+        staged_package.mkdir(parents=True)
+        api_relative = Path("src/openai_codex/api.py")
+        has_api = (destination / api_relative).is_file()
+        if has_api:
+            (staged_sdk / api_relative).write_bytes(original[2])
+        if (destination / "pyproject.toml").is_file():
+            shutil.copy2(destination / "pyproject.toml", staged_sdk / "pyproject.toml")
+        token = _generation_root.set(staged_sdk)
+        old_sys_path = sys.path[:]
+        try:
+            prepare_generated_package()
+            generate_v2_all(schema_dir)
+            generate_notification_registry(schema_dir)
+            generate_public_api_flat_methods()
+        finally:
+            sys.path[:] = old_sys_path
+            _generation_root.reset(token)
+            sys.modules.pop("_openai_codex_generated_v2_all_for_artifacts", None)
+        pairs = [(staged_package / "generated", destination / "src/openai_codex/generated")]
+        if has_api:
+            pairs.append((staged_sdk / api_relative, destination / api_relative))
+        if snapshot() != original:
+            raise RuntimeError(
+                "Python generated inputs were edited during generation; refusing to overwrite concurrent work"
+            )
+        _publish_staged_paths(pairs)
 
 
 def generate_types() -> None:

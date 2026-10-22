@@ -30,17 +30,24 @@ def test_collectors_preserve_authoritative_surface(asynchronous, canonical_messa
     from openai_codex.models import Notification
 
     surface = {
-        "adapter": "clock", "value": {"utc": "2026-10-18T00:00:00Z"},
+        "adapter": "clock",
+        "value": {"utc": "2026-10-18T00:00:00Z"},
         "canonicalMessage": canonical_message,
     }
     terminal = {"threadId": "thread", "turn": {"id": "turn", "status": "completed", "items": []}}
     (terminal["turn"] if nested else terminal)["surfacedResult"] = surface
     events = [
-        Notification("item/completed", ItemCompletedNotification.model_validate({
-            "threadId": "thread", "turnId": "turn",
-            "completedAtMs": 0,
-            "item": {"id": "message", "type": "agentMessage", "text": "not authoritative"},
-        })),
+        Notification(
+            "item/completed",
+            ItemCompletedNotification.model_validate(
+                {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "completedAtMs": 0,
+                    "item": {"id": "message", "type": "agentMessage", "text": "not authoritative"},
+                }
+            ),
+        ),
         Notification("turn/completed", TurnCompletedNotification.model_validate(terminal)),
     ]
 
@@ -48,9 +55,14 @@ def test_collectors_preserve_authoritative_surface(asynchronous, canonical_messa
         async def stream():
             for event in events:
                 yield event
+
         return await _collect_async_turn_result(stream(), turn_id="turn")
 
-    result = asyncio.run(collect()) if asynchronous else _collect_turn_result(iter(events), turn_id="turn")
+    result = (
+        asyncio.run(collect())
+        if asynchronous
+        else _collect_turn_result(iter(events), turn_id="turn")
+    )
     assert result.surfaced_result is not None
     assert result.surfaced_result.model_dump(by_alias=True) == surface
     assert result.final_response == canonical_message
@@ -118,9 +130,11 @@ def test_run_params_and_usage_cross_app_server_boundary(tmp_path) -> None:
     usage_payload = None
     if result.usage is not None:
         dumped_usage = result.usage.model_dump(by_alias=True, mode="json")
+        # `coverage` is runtime-dependent (absent on the pinned legacy runtime,
+        # reported by KD4 runtimes); this test pins the token counts only.
         usage_payload = {
-            "last": dumped_usage["last"],
-            "total": dumped_usage["total"],
+            "last": {k: v for k, v in dumped_usage["last"].items() if k != "coverage"},
+            "total": {k: v for k, v in dumped_usage["total"].items() if k != "coverage"},
         }
     assert {
         "final_response": result.final_response,
@@ -244,3 +258,63 @@ def test_thread_run_raises_when_real_app_server_reports_failed_turn(tmp_path) ->
             thread = codex.thread_start()
             with pytest.raises(RuntimeError, match="boom from mock model"):
                 thread.run("trigger failure")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_collected_result_retains_terminal_completion_assessment(asynchronous, nested):
+    from openai_codex._run import _collect_async_turn_result, _collect_turn_result
+    from openai_codex.generated.v2_all import (
+        ItemCompletedNotification,
+        TurnCompletedNotification,
+        TurnCompletionAssessment,
+        TurnTiming,
+    )
+    from openai_codex.models import Notification
+
+    # Timing measurements are irrelevant to this typed collector fixture. Do not
+    # invent measured zeros merely to attach the host's completion assessment.
+    assessment = TurnCompletionAssessment(
+        failed_checks=[], verification_gaps=["source changed after validation"], advisories=[]
+    )
+    timing = TurnTiming.model_construct(completion_assessment=assessment)
+    terminal = {"threadId": "thread", "turn": {"id": "turn", "status": "completed", "items": []}}
+    (terminal["turn"] if nested else terminal)["timing"] = timing
+    raw_answer = '{"result":"done"}'
+    events = [
+        Notification(
+            "item/completed",
+            ItemCompletedNotification.model_validate(
+                {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "completedAtMs": 0,
+                    "item": {
+                        "id": "message",
+                        "type": "agentMessage",
+                        "text": raw_answer,
+                        "phase": "final_answer",
+                    },
+                }
+            ),
+        ),
+        Notification("turn/completed", TurnCompletedNotification.model_validate(terminal)),
+    ]
+
+    async def collect():
+        async def stream():
+            for event in events:
+                yield event
+
+        return await _collect_async_turn_result(stream(), turn_id="turn")
+
+    result = (
+        asyncio.run(collect())
+        if asynchronous
+        else _collect_turn_result(iter(events), turn_id="turn")
+    )
+    assert result.timing is timing
+    assert result.timing.completion_assessment.verification_gaps == [
+        "source changed after validation"
+    ]
+    assert result.final_response == raw_answer

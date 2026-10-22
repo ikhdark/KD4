@@ -1,6 +1,32 @@
 use super::*;
 
 impl StateRuntime {
+    /// Reuse the leased backfill owner for continuing reconciliation, including
+    /// files written by supported older writers and repaired damaged rollouts.
+    pub async fn request_backfill_refresh(&self, minimum_age_seconds: i64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE backfill_state SET status = 'pending', last_watermark = NULL, updated_at = ? WHERE id = 1 AND status = 'complete' AND updated_at <= ?")
+            .bind(Utc::now().timestamp())
+            .bind(Utc::now().timestamp().saturating_sub(minimum_age_seconds))
+            .execute(self.pool.as_ref()).await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn durable_audit_refresh_fixture(&self) -> anyhow::Result<()> {
+        self.mark_backfill_complete(Some("completed-prefix"))
+            .await?;
+        self.request_backfill_refresh(0).await?;
+        let fresh = self.get_backfill_state().await?;
+        assert_eq!(fresh.status, crate::BackfillStatus::Pending);
+        assert!(fresh.last_watermark.is_none());
+        assert!(self.try_claim_backfill(60).await?);
+        self.checkpoint_backfill("running-prefix").await?;
+        self.request_backfill_refresh(0).await?;
+        let running = self.get_backfill_state().await?;
+        assert_eq!(running.status, crate::BackfillStatus::Running);
+        assert_eq!(running.last_watermark.as_deref(), Some("running-prefix"));
+        Ok(())
+    }
     pub async fn get_backfill_state(&self) -> anyhow::Result<crate::BackfillState> {
         let query =
             "SELECT status, last_watermark, last_success_at FROM backfill_state WHERE id = 1";
@@ -137,6 +163,15 @@ mod tests {
     use sqlx::Connection;
 
     #[tokio::test]
+    async fn durable_audit_13_refresh_restarts_complete_coverage_but_not_a_live_claim() {
+        let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".into())
+            .await
+            .unwrap();
+        runtime.durable_audit_refresh_fixture().await.unwrap();
+        runtime.close().await;
+    }
+
+    #[tokio::test]
     async fn backfill_state_persists_progress_and_completion() {
         let codex_home = unique_temp_dir();
         let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
@@ -205,13 +240,23 @@ mod tests {
         let reopened = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
             .await
             .expect("reopen runtime");
-        assert_eq!(reopened.get_backfill_state().await.expect("persisted state"), completed);
+        assert_eq!(
+            reopened
+                .get_backfill_state()
+                .await
+                .expect("persisted state"),
+            completed
+        );
         reopened
             .mark_backfill_complete(None)
             .await
             .expect("complete without replacing watermark");
         assert_eq!(
-            reopened.get_backfill_state().await.expect("preserved watermark").last_watermark,
+            reopened
+                .get_backfill_state()
+                .await
+                .expect("preserved watermark")
+                .last_watermark,
             completed.last_watermark
         );
         reopened.close().await;

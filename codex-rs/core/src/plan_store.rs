@@ -14,6 +14,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use tokio::sync::Mutex;
 
+#[path = "task_acceptance.rs"]
+pub(crate) mod acceptance;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlanUpdateEffect {
     Initial,
@@ -61,12 +64,97 @@ pub(crate) struct PlanLineage {
     /// The host verifies provenance, not the model's interpretation of that input.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) accepted_supersessions: BTreeMap<String, PlanInputReference>,
+    /// Acceptance criteria are independent of checklist status and survive
+    /// replacing, resolving or completing every displayed step.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) acceptance: BTreeMap<String, acceptance::AcceptanceObligation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) acceptance_reviewed_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PlanInputReference {
     pub(crate) turn_id: String,
     pub(crate) sha256: String,
+}
+
+/// Exact text parts from authentic accepted inputs in the active turn, not rendered context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcceptedPlanInput(
+    pub(crate) String,
+    pub(crate) HashSet<String>,
+    Vec<PlanInputReference>,
+    u64,
+);
+
+impl AcceptedPlanInput {
+    pub(crate) fn from_texts<'a>(turn_id: &str, texts: impl Iterator<Item = &'a str>) -> Self {
+        Self(
+            turn_id.to_owned(),
+            texts
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| hex::encode(Sha256::digest(text.as_bytes())))
+                .collect(),
+            Vec::new(),
+            1,
+        )
+    }
+
+    pub(crate) fn references(&self) -> Vec<PlanInputReference> {
+        let mut current = self.1.iter().cloned().collect::<Vec<_>>();
+        current.sort();
+        current
+            .into_iter()
+            .map(|sha256| PlanInputReference {
+                turn_id: self.0.clone(),
+                sha256,
+            })
+            .chain(self.2.iter().cloned())
+            .collect()
+    }
+
+    /// Keep provenance, not conversation text or semantic permission. Only the
+    /// prompt projection is bounded: pruning the owner would revoke unapplied
+    /// corrections after enough unrelated messages. Storage grows with accepted
+    /// user boundaries, never tool output or model generations.
+    pub(crate) fn retain_earlier(&mut self, earlier: &Self) {
+        self.3 = self.3.saturating_add(earlier.3);
+        // Non-text steering in this accepted turn does not revoke an earlier
+        // correction. Across turns an unknown boundary remains conservative.
+        if self.1.is_empty() && self.0 != earlier.0 {
+            return;
+        }
+        for reference in earlier.references() {
+            if !(reference.turn_id == self.0 && self.1.contains(&reference.sha256))
+                && !self.2.contains(&reference)
+            {
+                self.2.push(reference);
+            }
+        }
+    }
+
+    pub(crate) fn review_revision(&self) -> String {
+        let references = self.references();
+        let mut hash = Sha256::new();
+        // Include the latest boundary even when it has no text. A sampled
+        // interpretation must be reconciled again after image-only steering.
+        hash.update((self.0.len() as u64).to_le_bytes());
+        hash.update(self.0.as_bytes());
+        hash.update((self.1.len() as u64).to_le_bytes());
+        hash.update(self.3.to_le_bytes());
+        for reference in references {
+            hash.update((reference.turn_id.len() as u64).to_le_bytes());
+            hash.update(reference.turn_id.as_bytes());
+            hash.update(reference.sha256.as_bytes());
+        }
+        hex::encode(hash.finalize())
+    }
+
+    fn permits(&self, reference: &PlanInputReference, reviewed: Option<&str>) -> bool {
+        (reference.turn_id == self.0 && self.1.contains(&reference.sha256))
+            || (self.2.contains(reference)
+                && reviewed.is_some_and(|revision| revision == self.review_revision()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +234,8 @@ impl PlanLineage {
             && self.resolved_requirements.is_empty()
             && self.step_revisions.is_empty()
             && self.accepted_supersessions.is_empty()
+            && self.acceptance.is_empty()
+            && self.acceptance_reviewed_revision.is_none()
     }
 
     /// The checklist already carries these exact entries. Replay reconstructs
@@ -445,6 +535,8 @@ pub(crate) struct PlanExecutionSnapshot {
     pub(crate) revision: String,
     pub(crate) obligations: PlanObligationSummary,
     pub(crate) has_steps: bool,
+    pub(crate) acceptance: BTreeMap<String, acceptance::AcceptanceObligation>,
+    pub(crate) acceptance_reviewed_revision: Option<String>,
 }
 
 impl PlanExecutionSnapshot {
@@ -454,6 +546,8 @@ impl PlanExecutionSnapshot {
             revision: plan_revision_with_lineage(Some(plan), lineage),
             obligations: lineage.obligation_summary(plan),
             has_steps: !plan.plan.is_empty(),
+            acceptance: lineage.acceptance.clone(),
+            acceptance_reviewed_revision: lineage.acceptance_reviewed_revision.clone(),
         }
     }
 }
@@ -488,6 +582,12 @@ pub(crate) struct PlanToolArgs {
     /// Compact alternative with the same accepted-input membership checks.
     #[serde(default)]
     pub(crate) scope_change_refs: BTreeMap<String, PlanInputReference>,
+    /// Explicit interpretation of earlier input against every later accepted
+    /// input in this journal. Authenticity is host-checked; semantics are not.
+    pub(crate) scope_change_reviewed_revision: Option<String>,
+    /// Incremental independent criteria; omission never deletes existing scope.
+    pub(crate) acceptance: Option<BTreeMap<String, acceptance::AcceptanceObligation>>,
+    pub(crate) acceptance_reviewed_revision: Option<String>,
     #[serde(default)]
     pub(crate) superseded: Vec<SupersededStep>,
     /// Stable checklist step ID -> existing executable assignment ID.
@@ -540,6 +640,27 @@ pub(crate) struct PlanToolResponse {
     pub(crate) effect: String,
     #[serde(default)]
     pub(crate) no_progress: bool,
+}
+
+impl PlanToolResponse {
+    /// A projection can borrow authority only from the same canonical revision.
+    pub(crate) fn full_lineage_for(
+        &self,
+        plan: &UpdatePlanArgs,
+        revision: Option<&str>,
+    ) -> Option<PlanLineage> {
+        if !self.lineage_complete || self.current_plan != *plan {
+            return None;
+        }
+        let lineage = self.lineage.clone().reconcile_restored(Some(plan));
+        if let Some(revision) = revision
+            && (self.revision != revision
+                || plan_revision_with_lineage(Some(plan), &lineage) != revision)
+        {
+            return None;
+        }
+        Some(lineage)
+    }
 }
 
 fn complete_lineage() -> bool {
@@ -632,7 +753,9 @@ pub(crate) struct PlanStore {
     publication: Mutex<()>,
     // Every production access already holds current. These short in-memory
     // reads/writes need no second async acquisition while publication is fenced.
-    accepted_input: std::sync::Mutex<Option<(String, HashSet<String>)>>,
+    accepted_input: std::sync::Mutex<Option<AcceptedPlanInput>>,
+    /// Turn-local observations, deliberately never restored as passing proof.
+    acceptance_evidence: std::sync::Mutex<acceptance::AcceptanceEvidence>,
 }
 
 /// Holds the existing plan lock across publication so revision validation and
@@ -681,17 +804,48 @@ impl PlanStore {
         turn_id: &str,
         texts: impl Iterator<Item = &'a str>,
     ) {
-        let hashes = texts
-            .filter(|text| !text.trim().is_empty())
-            .map(|text| hex::encode(Sha256::digest(text.as_bytes())))
-            .collect();
+        let mut accepted = AcceptedPlanInput::from_texts(turn_id, texts);
         // Use the current-state lock first: accepted provenance cannot change
         // between staging a scope retirement and publishing it durably.
         let mut current = self.current.lock().await;
-        *self.accepted_input.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((turn_id.to_string(), hashes));
+        let mut inputs = self
+            .accepted_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = inputs.as_ref() {
+            accepted.retain_earlier(previous);
+        }
+        *inputs = Some(accepted);
+        self.publish_acceptance_evidence(Default::default());
+        // Authenticity is not interpretation: retaining an earlier reference
+        // does not authorize ignoring a later contradictory user instruction.
         current.derived = Default::default();
     }
+    /// Publish a matched explicit UI answer only after its source receipt is
+    /// persisted. Lock order remains publication -> current -> rollout.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Receipt persistence and accepted-input publication form one transaction against concurrent restores and input acceptance"
+    )]
+    pub(crate) async fn record_accepted_decision(
+        &self,
+        mut accepted: AcceptedPlanInput,
+        persist: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> std::io::Result<()> {
+        let mut current = self.current.lock().await;
+        persist.await?;
+        let mut inputs = self
+            .accepted_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = inputs.as_ref() {
+            accepted.retain_earlier(previous);
+        }
+        *inputs = Some(accepted);
+        current.derived = Default::default();
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn active_requirement_count(&self) -> usize {
         self.current
@@ -722,6 +876,11 @@ impl PlanStore {
                     revision: current.revision().to_string(),
                     obligations: current.lineage.obligation_summary(plan),
                     has_steps: !plan.plan.is_empty(),
+                    acceptance: current.lineage.acceptance.clone(),
+                    acceptance_reviewed_revision: current
+                        .lineage
+                        .acceptance_reviewed_revision
+                        .clone(),
                 })
             })
             .clone()
@@ -732,7 +891,10 @@ impl PlanStore {
         suspended: bool,
     ) -> crate::context::world_state::TaskState {
         let current = self.current.lock().await;
-        let accepted = self.accepted_input.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accepted = self
+            .accepted_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         current.derived.task[usize::from(suspended)]
             .get_or_init(|| {
                 crate::context::world_state::TaskState::from_plan(
@@ -742,15 +904,24 @@ impl PlanStore {
                         .map(|plan| (plan, &current.lineage, current.revision())),
                 )
                 .with_execution_suspended(suspended)
-                .with_accepted_input_refs(accepted.as_ref().filter(|_| current.plan.is_some()).map(|(turn_id, hashes)| {
-                    let mut hashes = hashes.iter().cloned().collect::<Vec<_>>();
-                    hashes.sort();
-                    hashes.into_iter().map(|sha256| PlanInputReference {
-                        turn_id: turn_id.clone(), sha256,
-                    }).collect()
-                }).unwrap_or_default())
+                .with_accepted_input_refs(
+                    accepted
+                        .as_ref()
+                        .filter(|_| current.plan.is_some())
+                        .map(AcceptedPlanInput::references)
+                        .unwrap_or_default(),
+                )
+                .with_scope_input_revision(
+                    accepted.as_ref().map(AcceptedPlanInput::review_revision),
+                )
             })
             .clone()
+            .with_acceptance_evidence(
+                &self
+                    .acceptance_evidence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
     }
 
     pub(crate) async fn snapshot_with_lineage(&self) -> Option<(UpdatePlanArgs, PlanLineage)> {
@@ -758,7 +929,20 @@ impl PlanStore {
         Some((current.plan.clone()?, current.lineage.clone()))
     }
 
+    #[cfg(test)]
     pub(crate) async fn restore_from_history(&self, items: &[ResponseItem]) -> bool {
+        self.restore_reconstructed(None, None, None, items).await
+    }
+
+    /// Replace checklist, lineage and input authority under the same owner lock.
+    /// Missing trustworthy provenance must clear an old in-process register.
+    pub(crate) async fn restore_reconstructed(
+        &self,
+        plan: Option<UpdatePlanArgs>,
+        lineage: Option<PlanLineage>,
+        accepted_input: Option<AcceptedPlanInput>,
+        items: &[ResponseItem],
+    ) -> bool {
         let update_call_ids = items
             .iter()
             .filter_map(|item| match item {
@@ -771,33 +955,41 @@ impl PlanStore {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        let restored = items.iter().rev().find_map(|item| {
-            let ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            } = item
-            else {
-                return None;
-            };
-            if !update_call_ids.contains(call_id.as_str()) {
-                return None;
-            }
-            plan_response_from_tool_output(output)
-        });
+        let restored = plan
+            .map(|plan| (plan, lineage.unwrap_or_default()))
+            .or_else(|| {
+                items.iter().rev().find_map(|item| {
+                    let ResponseItem::FunctionCallOutput {
+                        call_id, output, ..
+                    } = item
+                    else {
+                        return None;
+                    };
+                    if !update_call_ids.contains(call_id.as_str()) {
+                        return None;
+                    }
+                    plan_response_from_tool_output(output)
+                        .map(|response| (response.current_plan, response.lineage))
+                })
+            });
         let found = restored.is_some();
         let mut current = self.current.lock().await;
         *current = restored
-            .map(|response| {
-                let lineage = response
-                    .lineage
-                    .reconcile_restored(Some(&response.current_plan));
+            .map(|(plan, lineage)| {
+                let lineage = lineage.reconcile_restored(Some(&plan));
                 PlanState {
-                    plan: Some(response.current_plan),
+                    plan: Some(plan),
                     lineage,
                     durably_published: false,
                     derived: Default::default(),
                 }
             })
             .unwrap_or_default();
+        *self
+            .accepted_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = accepted_input;
+        self.publish_acceptance_evidence(Default::default());
         found
     }
 
@@ -806,6 +998,7 @@ impl PlanStore {
         self.restore_with_lineage(plan, None).await;
     }
 
+    #[cfg(test)]
     pub(crate) async fn restore_with_lineage(
         &self,
         plan: Option<UpdatePlanArgs>,
@@ -820,6 +1013,11 @@ impl PlanStore {
             durably_published: false,
             derived: Default::default(),
         };
+        *self
+            .accepted_input
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.publish_acceptance_evidence(Default::default());
     }
 
     #[cfg(test)]
@@ -850,24 +1048,35 @@ impl PlanStore {
             resolve,
             scope_change_instructions,
             mut scope_change_refs,
+            scope_change_reviewed_revision,
+            acceptance,
+            acceptance_reviewed_revision,
             superseded,
             workflow,
             resolved_workflow,
         } = args;
         let guard = self.current.lock().await;
-        let accepted_input = if scope_change_instructions.is_empty() && scope_change_refs.is_empty() {
+        let accepted_input = if scope_change_instructions.is_empty()
+            && scope_change_refs.is_empty()
+            && acceptance.is_none()
+            && acceptance_reviewed_revision.is_none()
+        {
             None
         } else {
-            self.accepted_input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+            self.accepted_input
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         };
         let revision = guard.revision().to_string();
         let unchanged_since_sampling = sampling_revision
             .as_ref()
             .is_some_and(|sampled| std::sync::Arc::ptr_eq(&sampled.0, &guard.derived));
-        let missing_revision = plan.is_some()
-            && guard.plan.is_some()
-            && expected_revision.is_none()
-            && !unchanged_since_sampling;
+        let missing_revision =
+            (plan.is_some() || acceptance.is_some() || acceptance_reviewed_revision.is_some())
+                && guard.plan.is_some()
+                && expected_revision.is_none()
+                && !unchanged_since_sampling;
         if missing_revision
             || expected_revision
                 .as_deref()
@@ -912,6 +1121,8 @@ impl PlanStore {
             && scope_change_instructions.is_empty()
             && scope_change_refs.is_empty()
             && workflow.is_none()
+            && acceptance.is_none()
+            && acceptance_reviewed_revision.is_none()
             && status_next
                 .as_ref()
                 .is_some_and(|next| guard.plan.as_ref() == Some(next))
@@ -929,6 +1140,69 @@ impl PlanStore {
         }
         let mut current = guard.clone();
         let mut lineage = current.lineage.clone();
+        if let Some(updates) = acceptance {
+            if updates.len() > 128 || updates.keys().any(|id| id.trim().is_empty()) {
+                return Err("acceptance requires nonempty IDs and at most 128 updates".into());
+            }
+            let input = accepted_input
+                .as_ref()
+                .ok_or("acceptance needs authentic user input")?;
+            if acceptance_reviewed_revision.as_deref() != Some(input.review_revision().as_str()) {
+                return Err(
+                    "acceptance must be reconciled through current scope_input_revision".into(),
+                );
+            }
+            for (id, obligation) in updates {
+                let retained_origin = lineage
+                    .acceptance
+                    .get(&id)
+                    .is_some_and(|previous| previous.origin == obligation.origin);
+                if obligation.text.trim().is_empty()
+                    || (!retained_origin && !input.references().contains(&obligation.origin))
+                {
+                    return Err(
+                        "acceptance criteria need text and an authentic accepted origin".into(),
+                    );
+                }
+                if let Some(previous) = lineage.acceptance.get(&id)
+                    && (previous.text != obligation.text
+                        || previous.origin != obligation.origin
+                        || !previous.requirement.same_contract(&obligation.requirement))
+                {
+                    return Err("acceptance criterion identity and proof kind are immutable; retire scope with accepted input instead".into());
+                }
+                if let Some(reference) = &obligation.retired_by
+                    && (!input.permits(reference, acceptance_reviewed_revision.as_deref())
+                        || obligation
+                            .retirement_reason
+                            .as_ref()
+                            .is_none_or(|reason| reason.trim().is_empty()))
+                {
+                    return Err(
+                        "retiring acceptance requires reconciled accepted input and a reason"
+                            .into(),
+                    );
+                }
+                lineage.acceptance.insert(id, obligation);
+            }
+            if lineage.acceptance.len() > 128 {
+                return Err(
+                    "at most 128 acceptance criteria are supported; split the task explicitly"
+                        .into(),
+                );
+            }
+        }
+        if let Some(reviewed) = acceptance_reviewed_revision {
+            if accepted_input
+                .as_ref()
+                .is_none_or(|input| input.review_revision() != reviewed)
+            {
+                return Err(
+                    "acceptance review is stale; reconcile current scope_input_revision".into(),
+                );
+            }
+            lineage.acceptance_reviewed_revision = Some(reviewed);
+        }
         let next = if let Some(plan) = plan {
             let mut steps = HashSet::new();
             if plan.iter().any(|item| item.step.trim().is_empty()) {
@@ -973,26 +1247,35 @@ impl PlanStore {
         };
         for (step_id, instruction) in scope_change_instructions {
             let sha256 = hex::encode(Sha256::digest(instruction.as_bytes()));
-            let Some((turn_id, _)) = accepted_input
-                .as_ref()
-                .filter(|(_, hashes)| hashes.contains(&sha256))
-            else {
+            let Some(reference) = accepted_input.as_ref().and_then(|input| {
+                input.references().into_iter().find(|reference| {
+                    reference.sha256 == sha256
+                        && input.permits(reference, scope_change_reviewed_revision.as_deref())
+                })
+            }) else {
                 return Err("scope change must cite exact, accepted user text; tool/context text and invented instructions are not authorization. No changes were made".into());
             };
-            let reference = PlanInputReference { turn_id: turn_id.clone(), sha256 };
-            if scope_change_refs.get(&step_id).is_some_and(|existing| existing != &reference) {
-                return Err("conflicting scope change text and reference; no changes were made".into());
+            if scope_change_refs
+                .get(&step_id)
+                .is_some_and(|existing| existing != &reference)
+            {
+                return Err(
+                    "conflicting scope change text and reference; no changes were made".into(),
+                );
             }
             scope_change_refs.insert(step_id, reference);
         }
         for (step_id, reference) in scope_change_refs {
             if !superseded.iter().any(|entry| entry.step_id == step_id) {
-                return Err("scope change sources must name a superseded entry; no changes were made".into());
+                return Err(
+                    "scope change sources must name a superseded entry; no changes were made"
+                        .into(),
+                );
             }
-            if !accepted_input.as_ref().is_some_and(|(turn_id, hashes)| {
-                *turn_id == reference.turn_id && hashes.contains(&reference.sha256)
+            if !accepted_input.as_ref().is_some_and(|input| {
+                input.permits(&reference, scope_change_reviewed_revision.as_deref())
             }) {
-                return Err("scope change reference is not a currently accepted user input; no changes were made".into());
+                return Err("scope change reference is not accepted, or earlier input has not been reconciled through the current scope_input_revision; no changes were made".into());
             }
             let ids = current
                 .lineage
@@ -1006,10 +1289,7 @@ impl PlanStore {
                     .values()
                     .any(|mapped| mapped.contains(&id))
                 {
-                    lineage.accepted_supersessions.insert(
-                        id,
-                        reference.clone(),
-                    );
+                    lineage.accepted_supersessions.insert(id, reference.clone());
                 }
             }
         }
@@ -1092,6 +1372,12 @@ impl PlanStore {
             }
             lineage.workflow = resolved;
         }
+        // Checklist equality does not imply graph equality: a retained pending
+        // step can acquire a resolved requirement without changing any row.
+        // Visible changes are normalized by commit; avoid aggregating twice.
+        if current.plan.as_ref() == Some(&next) && current.lineage != lineage {
+            lineage.update_statuses(&next);
+        }
         let lineage_changed = current.lineage != lineage;
         if lineage_changed {
             current.derived = Default::default();
@@ -1128,7 +1414,7 @@ impl PlanStore {
         // the caller read.
         if !revision_checked && updates.iter().any(|update| update.index.is_some()) {
             return Err(format!(
-                "index-based status updates require expected_revision once the plan changed since this sampling step began; current revision is {revision}. Use step_id to address steps without a revision. No changes were made."
+                "index-based status updates require expected_revision once the plan changed since this sampling step began; current revision is {revision}. Use step_id for stable addressing. When changing the status of a versioned step, also supply its current expected_step_revisions entry or expected_revision; an unchanged status may be idempotent. No changes were made."
             ));
         }
         let mut seen = HashSet::new();
@@ -1478,6 +1764,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit32_lineage_only_descendant_reopens_requirement_before_publication() {
+        for status in [StepStatus::Pending, StepStatus::InProgress] {
+            for resolved in [false, true] {
+                let store = PlanStore::default();
+                let a = plan_step_id("A");
+                let mut initial = serde_json::json!({"plan":[
+                    {"step":"A","status":"completed"},
+                    {"step":"B","status":status}
+                ]});
+                if resolved {
+                    initial["resolve"] = serde_json::json!([a]);
+                }
+                json_update(&store, initial.clone()).await;
+                let before = store.execution_snapshot().await;
+                let noop = json_update(&store, initial).await;
+                assert_eq!(noop.effect, PlanUpdateEffect::NoOp);
+                assert_eq!(store.execution_snapshot().await, before);
+                let args = serde_json::json!({"plan":[
+                    {"step":"A","status":"completed"},
+                    {"step":"B","status":status,"continues":[a]}
+                ]});
+                let revision = before.unwrap().revision;
+                let mut staged_args = args.clone();
+                staged_args["expected_revision"] = revision.into();
+                let staged = store
+                    .stage_tool(serde_json::from_value(staged_args).unwrap())
+                    .await
+                    .unwrap();
+                assert!(staged.needs_publication());
+                assert!(!staged.update.lineage.resolved_requirements.contains(&a));
+                let expected_status = if status == StepStatus::InProgress {
+                    StepStatus::InProgress
+                } else {
+                    StepStatus::Pending
+                };
+                assert_eq!(
+                    staged.update.lineage.requirements[&a].status,
+                    expected_status
+                );
+                let update = staged.commit_published();
+                assert_eq!(update.effect, PlanUpdateEffect::StructuralRevision);
+                let canonical = store.snapshot_with_lineage().await.unwrap();
+                let before_restore = store.execution_snapshot().await;
+                store
+                    .restore_with_lineage(Some(update.current), Some(update.lineage))
+                    .await;
+                assert_eq!(store.snapshot_with_lineage().await.unwrap(), canonical);
+                assert_eq!(store.execution_snapshot().await, before_restore);
+                let noop = store
+                    .stage_tool({
+                        let mut value = args;
+                        value["expected_revision"] = before_restore.unwrap().revision.into();
+                        serde_json::from_value(value).unwrap()
+                    })
+                    .await
+                    .unwrap();
+                // Restored state needs publication once, even though meaning is unchanged.
+                assert_eq!(noop.update.effect, PlanUpdateEffect::NoOp);
+                noop.commit_published();
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_original_resolution_survives_restore_and_reopening_invalidates_it() {
         let store = PlanStore::default();
         let original = json_update(
@@ -1664,55 +2014,186 @@ mod tests {
     async fn accepted_scope_references_match_text_and_reject_replaced_or_foreign_inputs() {
         use crate::context::ContextualUserFragment;
 
-        let text = format!("Cancel deployment, preserve review. λ\n{}", "scope detail ".repeat(1000));
+        let text = format!(
+            "Cancel deployment, preserve review. λ\n{}",
+            "scope detail ".repeat(1000)
+        );
         let reference = serde_json::json!({"turn_id":"accepted", "sha256":hex::encode(Sha256::digest(text.as_bytes()))});
         assert!(serde_json::to_vec(&reference).unwrap().len() < 256);
         assert!(text.len() > 10000);
         let mut outcomes = Vec::new();
         for use_reference in [false, true] {
             let store = PlanStore::default();
-            store.record_accepted_input("accepted", [text.as_str()].into_iter()).await;
-            assert!(!store.task_state(false).await.body().contains("accepted_input_refs"));
-            let original = json_update(&store, serde_json::json!({"plan":[{"step":"Deploy","status":"pending"}]})).await;
+            store
+                .record_accepted_input("accepted", [text.as_str()].into_iter())
+                .await;
+            assert!(
+                !store
+                    .task_state(false)
+                    .await
+                    .body()
+                    .contains("accepted_input_refs")
+            );
+            let original = json_update(
+                &store,
+                serde_json::json!({"plan":[{"step":"Deploy","status":"pending"}]}),
+            )
+            .await;
             let id = original.lineage.step_id("Deploy");
             let state = store.task_state(false).await.body().into_owned();
             assert!(state.contains("accepted_input_refs"));
             let mut args = serde_json::json!({"plan":[], "expected_revision":store.execution_snapshot().await.unwrap().revision,
                 "superseded":[{"step_id":id, "reason":"User cancelled deployment"}]});
-            args[if use_reference { "scope_change_refs" } else { "scope_change_instructions" }] =
-                if use_reference { serde_json::json!({id.clone():reference.clone()}) }
-                else { serde_json::json!({id.clone():text.clone()}) };
+            args[if use_reference {
+                "scope_change_refs"
+            } else {
+                "scope_change_instructions"
+            }] = if use_reference {
+                serde_json::json!({id.clone():reference.clone()})
+            } else {
+                serde_json::json!({id.clone():text.clone()})
+            };
             let before = store.snapshot_with_lineage().await;
             let mut foreign = args.clone();
-            foreign["scope_change_refs"] = serde_json::json!({id.clone():{"turn_id":"foreign","sha256":reference["sha256"]}});
-            assert!(store.update_tool(serde_json::from_value(foreign).unwrap()).await.is_err());
+            foreign["scope_change_refs"] =
+                serde_json::json!({id.clone():{"turn_id":"foreign","sha256":reference["sha256"]}});
+            assert!(
+                store
+                    .update_tool(serde_json::from_value(foreign).unwrap())
+                    .await
+                    .is_err()
+            );
             assert_eq!(store.snapshot_with_lineage().await, before);
-            store.record_accepted_input("replacement", ["Keep deployment."].into_iter()).await;
-            assert!(store.update_tool(serde_json::from_value(args.clone()).unwrap()).await.is_err());
+            store
+                .record_accepted_input("replacement", ["Keep deployment."].into_iter())
+                .await;
+            assert!(
+                store
+                    .update_tool(serde_json::from_value(args.clone()).unwrap())
+                    .await
+                    .is_err()
+            );
             assert_eq!(store.snapshot_with_lineage().await, before);
-            store.record_accepted_input("accepted", [text.as_str()].into_iter()).await;
-            let update = store.update_tool(serde_json::from_value(args).unwrap()).await.unwrap();
+            store
+                .record_accepted_input("accepted", [text.as_str()].into_iter())
+                .await;
+            let update = store
+                .update_tool(serde_json::from_value(args).unwrap())
+                .await
+                .unwrap();
             outcomes.push((update.current, update.lineage));
         }
         assert_eq!(outcomes[0], outcomes[1]);
     }
 
     #[tokio::test]
+    async fn accepted_scope_keeps_separate_same_turn_messages_and_textless_delivery() {
+        let store = PlanStore::default();
+        let original = json_update(
+            &store,
+            serde_json::json!({"plan":[{"step":"Deploy","status":"pending"}]}),
+        )
+        .await;
+        let id = original.lineage.step_id("Deploy");
+        let cancellation = "Cancel deployment; keep the review.";
+        store
+            .record_accepted_input("turn", [cancellation].into_iter())
+            .await;
+        store
+            .record_accepted_input("turn", ["Also update README."].into_iter())
+            .await;
+        let before_image = store
+            .accepted_input
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .review_revision();
+        store.record_accepted_input("turn", [""].into_iter()).await;
+        let inputs = store.accepted_input.lock().unwrap().clone().unwrap();
+        assert_eq!(inputs.references().len(), 2);
+        assert_ne!(inputs.review_revision(), before_image);
+        store.record_accepted_input("turn", [""].into_iter()).await;
+        let after_second_image = store.accepted_input.lock().unwrap().clone().unwrap();
+        assert_ne!(
+            after_second_image.review_revision(),
+            inputs.review_revision(),
+            "even repeated textless steering invalidates an earlier interpretation"
+        );
+        assert!(
+            store
+                .stage_tool(
+                    serde_json::from_value(serde_json::json!({"plan":[],
+            "expected_revision":store.execution_snapshot().await.unwrap().revision,
+            "superseded":[{"step_id":id,"reason":"User cancelled deployment"}],
+            "scope_change_instructions":{id.clone():cancellation},
+            "scope_change_reviewed_revision":before_image}))
+                    .unwrap()
+                )
+                .await
+                .is_err()
+        );
+        let update = json_update(
+            &store,
+            serde_json::json!({"plan":[],
+            "superseded":[{"step_id":id,"reason":"User cancelled deployment"}],
+            "scope_change_instructions":{id.clone():cancellation},
+            "scope_change_reviewed_revision":after_second_image.review_revision()}),
+        )
+        .await;
+        assert_eq!(update.lineage.accepted_supersessions[&id].turn_id, "turn");
+        store
+            .record_accepted_input("next-turn", ["Keep deployment."].into_iter())
+            .await;
+        let inputs = store.accepted_input.lock().unwrap().clone().unwrap();
+        assert_eq!(inputs.0, "next-turn");
+        assert!(
+            !inputs
+                .1
+                .contains(&hex::encode(Sha256::digest(cancellation.as_bytes())))
+        );
+    }
+
+    #[tokio::test]
     async fn accepted_input_waits_for_staged_publication_without_lock_inversion() {
         let store = PlanStore::default();
-        json_update(&store, serde_json::json!({"plan":[{"step":"Review","status":"pending"}]})).await;
-        store.record_accepted_input("old", ["old input"].into_iter()).await;
+        json_update(
+            &store,
+            serde_json::json!({"plan":[{"step":"Review","status":"pending"}]}),
+        )
+        .await;
+        store
+            .record_accepted_input("old", ["old input"].into_iter())
+            .await;
         let revision = store.execution_snapshot().await.unwrap().revision;
-        let staged = store.stage_tool(serde_json::from_value(serde_json::json!({
-            "expected_revision": revision, "set":[{"index":0,"status":"completed"}]
-        })).unwrap()).await.unwrap();
+        let staged = store
+            .stage_tool(
+                serde_json::from_value(serde_json::json!({
+                    "expected_revision": revision, "set":[{"index":0,"status":"completed"}]
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
         let accepted = store.record_accepted_input("new", ["new input"].into_iter());
         tokio::pin!(accepted);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut accepted).await.is_err());
-        assert_eq!(store.accepted_input.lock().unwrap().as_ref().unwrap().0, "old");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut accepted)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.accepted_input.lock().unwrap().as_ref().unwrap().0,
+            "old"
+        );
         drop(staged);
-        tokio::time::timeout(std::time::Duration::from_secs(1), &mut accepted).await.unwrap();
-        assert_eq!(store.accepted_input.lock().unwrap().as_ref().unwrap().0, "new");
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut accepted)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.accepted_input.lock().unwrap().as_ref().unwrap().0,
+            "new"
+        );
     }
 
     #[tokio::test]

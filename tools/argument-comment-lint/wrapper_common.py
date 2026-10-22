@@ -221,7 +221,8 @@ def ensure_source_prerequisites(env: MutableMapping[str, str]) -> None:
     require_command(
         "rustup",
         "argument-comment-lint source wrapper requires rustup.\n"
-        f"Install the {TOOLCHAIN_CHANNEL} toolchain with:\n"
+        "Install rustup and make it available on PATH, then rerun this wrapper.\n"
+        f"After rustup is available, install the {TOOLCHAIN_CHANNEL} toolchain with:\n"
         f"  rustup toolchain install {TOOLCHAIN_CHANNEL} \\\n"
         "    --component llvm-tools-preview \\\n"
         "    --component rustc-dev \\\n"

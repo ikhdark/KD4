@@ -111,6 +111,29 @@ impl McpManager {
         .await
     }
 
+    pub(crate) async fn runtime_config_for_bound_step(
+        &self,
+        config: &Config,
+        thread_init: &ExtensionDataInit,
+        thread_store: &ExtensionData,
+        originator: &str,
+        available_environment_ids: &[String],
+        roots: &[codex_exec_server::ResolvedSelectedCapabilityRoot],
+    ) -> McpRuntimeProjection {
+        self.runtime_config_with_context(
+            McpServerContributionContext::for_step(
+                config,
+                thread_init,
+                thread_store,
+                originator,
+                available_environment_ids,
+            )
+            .with_bound_roots(roots),
+            Some(originator),
+        )
+        .await
+    }
+
     async fn runtime_config_with_context(
         &self,
         context: McpServerContributionContext<'_, Config>,

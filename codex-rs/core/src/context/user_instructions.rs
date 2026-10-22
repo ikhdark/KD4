@@ -21,7 +21,15 @@ impl ContextualUserFragment for UserInstructions {
     }
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned(self.body_with_observation(None))
+        let directory = self
+            .directory
+            .as_ref()
+            .map(|directory| format!(" for {}", escape_instruction_delimiters(directory)))
+            .unwrap_or_default();
+        std::borrow::Cow::Owned(format!(
+            "{directory}\n\n<INSTRUCTIONS>\n{}\n",
+            escape_instruction_delimiters(&self.text),
+        ))
     }
 }
 
@@ -29,50 +37,21 @@ impl UserInstructions {
     pub(crate) const OPEN_MARKER: &str = "# AGENTS.md instructions";
     pub(crate) const CLOSE_MARKER: &str = "</INSTRUCTIONS>";
 
-    #[cfg(test)]
-    pub(crate) fn with_observation(
-        &self,
-        observation: &str,
-    ) -> codex_context_fragments::RenderedContextFragment {
-        let (start, end) = Self::type_markers();
-        codex_context_fragments::RenderedContextFragment::new(
-            self.role(),
-            format!(
-                "{start}{}{end}",
-                self.body_with_observation(Some(observation))
-            ),
-        )
-    }
-
-    fn body_with_observation(&self, observation: Option<&str>) -> String {
-        let directory = self
-            .directory
-            .as_ref()
-            .map(|directory| format!(" for {}", escape_instruction_delimiters(directory)))
-            .unwrap_or_default();
-        let observation = observation
-            .map(|text| {
-                format!(
-                    "<AGENTS_MD_OBSERVATION>\n{}\n</AGENTS_MD_OBSERVATION>\n\n",
-                    escape_instruction_delimiters(text)
-                )
-            })
-            .unwrap_or_default();
-        format!(
-            "{directory}\n\n{observation}<INSTRUCTIONS>\n{}\n",
-            escape_instruction_delimiters(&self.text)
-        )
+    /// Exact body size after the same delimiter encoding used by `render`.
+    pub(crate) fn escaped_text_len(text: &str) -> usize {
+        INSTRUCTION_DELIMITERS.iter().fold(text.len(), |len, tag| {
+            len.saturating_add(text.matches(tag).count().saturating_mul(6))
+        })
     }
 }
 
 fn escape_instruction_delimiters(text: &str) -> String {
-    escape_fragment_delimiters(
-        text,
-        &[
-            "<INSTRUCTIONS>",
-            UserInstructions::CLOSE_MARKER,
-            "<AGENTS_MD_OBSERVATION>",
-            "</AGENTS_MD_OBSERVATION>",
-        ],
-    )
+    escape_fragment_delimiters(text, INSTRUCTION_DELIMITERS)
 }
+
+const INSTRUCTION_DELIMITERS: &[&str] = &[
+    "<INSTRUCTIONS>",
+    UserInstructions::CLOSE_MARKER,
+    "<AGENTS_MD_OBSERVATION>",
+    "</AGENTS_MD_OBSERVATION>",
+];

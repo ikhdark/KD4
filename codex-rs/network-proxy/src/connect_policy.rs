@@ -2,6 +2,9 @@ use crate::policy::is_non_public_ip;
 use rama_core::Service;
 use rama_core::error::BoxError;
 use rama_core::extensions::ExtensionsMut;
+use rama_dns::DnsResolver;
+use rama_dns::GlobalDnsResolver;
+use rama_net::address::Domain;
 use rama_net::address::ProxyAddress;
 use rama_net::client::EstablishedClientConnection;
 use rama_net::transport::TryRefIntoTransportContext;
@@ -33,12 +36,14 @@ impl LocalTarget {
 #[derive(Clone)]
 pub(crate) struct TargetCheckedTcpConnector {
     allow_local_binding: bool,
+    dns: rama_dns::BoxDnsResolver,
 }
 
 impl TargetCheckedTcpConnector {
     pub(crate) fn from_allow_local_binding(allow_local_binding: bool) -> Self {
         Self {
             allow_local_binding,
+            dns: GlobalDnsResolver::new().boxed(),
         }
     }
 }
@@ -52,14 +57,20 @@ where
     type Error = BoxError;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
-        if input.extensions().get::<ProxyAddress>().is_some() {
-            return TcpConnector::new().serve(input).await;
-        }
-
+        // Rama detaches DNS and candidate tasks. Every detached operation observes this
+        // request-owned channel, whose sender is dropped on success, failure or cancellation.
+        // In particular a late DNS completion cannot resurrect a canceled dial.
+        let (_lifetime, cancelled) = tokio::sync::watch::channel(());
         TcpConnector::new()
+            .with_dns(RequestDns {
+                inner: self.dns.clone(),
+                cancelled: cancelled.clone(),
+            })
             .with_connector(TargetCheckedStreamConnector {
-                allow_local_binding: self.allow_local_binding,
+                allow_local_binding: self.allow_local_binding
+                    || input.extensions().get::<ProxyAddress>().is_some(),
                 local_target: input.extensions().get::<LocalTarget>().copied(),
+                cancelled,
             })
             .serve(input)
             .await
@@ -70,6 +81,43 @@ where
 struct TargetCheckedStreamConnector {
     allow_local_binding: bool,
     local_target: Option<LocalTarget>,
+    cancelled: tokio::sync::watch::Receiver<()>,
+}
+
+#[derive(Clone)]
+struct RequestDns {
+    inner: rama_dns::BoxDnsResolver,
+    cancelled: tokio::sync::watch::Receiver<()>,
+}
+
+impl RequestDns {
+    async fn run<T>(
+        &self,
+        operation: impl Future<Output = Result<T, BoxError>>,
+    ) -> Result<T, BoxError> {
+        let mut cancelled = self.cancelled.clone();
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => Err(io::Error::new(io::ErrorKind::Interrupted, "connection canceled").into()),
+            result = operation => result,
+        }
+    }
+}
+
+impl DnsResolver for RequestDns {
+    type Error = BoxError;
+
+    async fn txt_lookup(&self, domain: Domain) -> Result<Vec<Vec<u8>>, BoxError> {
+        self.run(self.inner.txt_lookup(domain)).await
+    }
+
+    async fn ipv4_lookup(&self, domain: Domain) -> Result<Vec<std::net::Ipv4Addr>, BoxError> {
+        self.run(self.inner.ipv4_lookup(domain)).await
+    }
+
+    async fn ipv6_lookup(&self, domain: Domain) -> Result<Vec<std::net::Ipv6Addr>, BoxError> {
+        self.run(self.inner.ipv6_lookup(domain)).await
+    }
 }
 
 impl TcpStreamConnector for TargetCheckedStreamConnector {
@@ -89,10 +137,12 @@ impl TcpStreamConnector for TargetCheckedStreamConnector {
             .into());
         }
 
-        tokio::net::TcpStream::connect(addr)
-            .await
-            .map(TcpStream::from)
-            .map_err(Into::into)
+        let mut cancelled = self.cancelled.clone();
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => Err(io::Error::new(io::ErrorKind::Interrupted, "connection canceled").into()),
+            result = tokio::net::TcpStream::connect(addr) => result.map(TcpStream::from).map_err(Into::into),
+        }
     }
 }
 
@@ -102,6 +152,71 @@ mod tests {
     use rama_net::address::HostWithPort;
     use std::net::Ipv4Addr;
     use tokio::net::TcpListener;
+
+    #[derive(Clone)]
+    struct BarrierDns {
+        started: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+        dropped: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl DnsResolver for BarrierDns {
+        type Error = BoxError;
+        async fn txt_lookup(&self, _: Domain) -> Result<Vec<Vec<u8>>, BoxError> {
+            Ok(vec![])
+        }
+        async fn ipv6_lookup(&self, _: Domain) -> Result<Vec<std::net::Ipv6Addr>, BoxError> {
+            Ok(vec![])
+        }
+        async fn ipv4_lookup(&self, _: Domain) -> Result<Vec<Ipv4Addr>, BoxError> {
+            struct OnDrop(std::sync::Arc<tokio::sync::Notify>);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    self.0.notify_one();
+                }
+            }
+            let _drop = OnDrop(self.dropped.clone());
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(vec![Ipv4Addr::LOCALHOST])
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_during_dns_drops_lookup_and_cannot_start_a_late_dial() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let dns = BarrierDns {
+            started: Default::default(),
+            release: Default::default(),
+            dropped: Default::default(),
+        };
+        let connector = TargetCheckedTcpConnector {
+            allow_local_binding: true,
+            dns: dns.clone().boxed(),
+        };
+        let request = rama_tcp::client::Request::new(
+            HostWithPort::try_from(format!(
+                "cancel.example:{}",
+                listener.local_addr().unwrap().port()
+            ))
+            .unwrap(),
+        );
+        let task = tokio::spawn(async move { connector.serve(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), dns.started.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), dns.dropped.notified())
+            .await
+            .unwrap();
+        dns.release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn explicit_local_target_only_authorizes_the_selected_address() {
@@ -139,7 +254,10 @@ mod tests {
             let result = Service::serve(&connector, request).await;
             if allow_local_binding {
                 let connected = result.expect("local target should be allowed");
-                let (_, peer) = listener.accept().await.expect("connection reaches listener");
+                let (_, peer) = listener
+                    .accept()
+                    .await
+                    .expect("connection reaches listener");
                 assert!(peer.ip().is_loopback());
                 drop(connected);
             } else {

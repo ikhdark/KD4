@@ -30,6 +30,72 @@ const RESULT: &str = "cG5n";
 
 const VALID_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
+#[tokio::test]
+async fn compacted_recent_image_request_never_substitutes_an_older_survivor() {
+    let image = |url: &str| ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputImage {
+            image_url: url.into(),
+            detail: None,
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let args = ImagegenArgs {
+        prompt: "edit latest".into(),
+        referenced_image_paths: None,
+        num_last_images_to_include: Some(1),
+    };
+    for checkpoint in [
+        ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "checkpoint".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText {
+                text: format!("{}\nsummary", codex_core::compact::SUMMARY_PREFIX),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ] {
+        // A survives, but newer B was evicted. Never silently edit A.
+        let mut history = vec![image("older-A"), checkpoint];
+        assert!(
+            request_for_call_args(&args, &history, None, &[])
+                .await
+                .is_err()
+        );
+        history.push(image("new-C"));
+        let ImageRequest::Edit(request) = request_for_call_args(&args, &history, None, &[])
+            .await
+            .unwrap()
+        else {
+            panic!("edit request")
+        };
+        assert_eq!(
+            request.images,
+            vec![ImageUrl {
+                image_url: "new-C".into()
+            }]
+        );
+        let args = ImagegenArgs {
+            num_last_images_to_include: Some(2),
+            prompt: args.prompt.clone(),
+            referenced_image_paths: None,
+        };
+        assert!(
+            request_for_call_args(&args, &history, None, &[])
+                .await
+                .is_err()
+        );
+    }
+}
+
 #[derive(Default)]
 struct RecordingImageEmitter(std::sync::Mutex<Vec<codex_extension_api::ExtensionTurnItem>>);
 
@@ -60,6 +126,14 @@ async fn image_completion_requires_valid_bytes_regardless_of_save_configuration(
     for save_root in [None, Some(&root), Some(&blocked)] {
         for result in ["", "%%%", RESULT, VALID_PNG] {
             let emitter = RecordingImageEmitter::default();
+            let usage = codex_extension_items::image_generation::ImageGenerationUsage {
+                model: Some("image-fixture".into()),
+                reported: true,
+                input_tokens: Some(1474),
+                output_tokens: Some(1372),
+                total_tokens: Some(2846),
+                ..Default::default()
+            };
             let output = super::complete_image_generation(
                 "call",
                 &emitter,
@@ -67,6 +141,7 @@ async fn image_completion_requires_valid_bytes_regardless_of_save_configuration(
                 result.to_string(),
                 save_root,
                 "thread",
+                Some(usage.clone()),
             )
             .await;
             let valid = result == VALID_PNG;
@@ -77,6 +152,11 @@ async fn image_completion_requires_valid_bytes_regardless_of_save_configuration(
                 panic!("image completion")
             };
             assert_eq!(item.status, if valid { "completed" } else { "failed" });
+            assert_eq!(
+                item.provider_usage,
+                Some(usage),
+                "receipt survives decode and save failures"
+            );
             assert_eq!(item.result.is_empty(), !valid);
             if let Ok(output) = output {
                 assert_eq!(
@@ -119,7 +199,7 @@ async fn referenced_image_reads_are_bounded_without_changing_valid_bytes() {
     )
     .unwrap();
     assert_eq!(
-        super::image_url(&path, &environment)
+        super::image_url(&path.display().to_string(), &environment)
             .await
             .unwrap()
             .image_url,
@@ -131,7 +211,7 @@ async fn referenced_image_reads_are_bounded_without_changing_valid_bytes() {
         .unwrap()
         .set_len(super::MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 + 1)
         .unwrap();
-    let error = super::image_url(&path, &environment)
+    let error = super::image_url(&path.display().to_string(), &environment)
         .await
         .expect_err("source exceeds read limit");
     assert!(error.to_string().contains("byte limit"));
@@ -223,9 +303,13 @@ fn requests_history_only_for_history_backed_edits() {
     for arguments in [
         "{".to_string(),
         serde_json::json!({"num_last_images_to_include": 1}).to_string(),
-        serde_json::json!({"prompt": "edit", "unknown": true, "num_last_images_to_include": 1}).to_string(),
+        serde_json::json!({"prompt": "edit", "unknown": true, "num_last_images_to_include": 1})
+            .to_string(),
     ] {
-        assert_eq!(image_history_requirement(&ToolPayload::Function { arguments }), ConversationHistoryRequirement::None);
+        assert_eq!(
+            image_history_requirement(&ToolPayload::Function { arguments }),
+            ConversationHistoryRequirement::None
+        );
     }
 }
 
@@ -237,6 +321,25 @@ fn uses_reserved_image_gen_namespace() {
     assert_eq!(spec.name, "image_gen");
     let ResponsesApiNamespaceTool::Function(function) = &spec.tools[0];
     assert_eq!(function.name, "imagegen");
+    assert!(!function.strict);
+    // Bounds and annotations added by Rust schema generation must not change
+    // the reserved contract and make unrelated agent requests fail at startup.
+    assert_eq!(
+        serde_json::to_value(&function.parameters).unwrap(),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": { "type": "string" },
+                "referenced_image_paths": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" }
+                },
+                "num_last_images_to_include": { "type": ["integer", "null"] }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        })
+    );
 }
 
 #[tokio::test]
@@ -351,11 +454,7 @@ async fn conflicting_image_selectors_return_tool_error() {
     let error = request_for_call_args(
         &ImagegenArgs {
             prompt: "change the lighting".to_string(),
-            referenced_image_paths: Some(vec![
-                "/tmp/image.png"
-                    .try_into()
-                    .expect("test path should be absolute"),
-            ]),
+            referenced_image_paths: Some(vec!["/tmp/image.png".into()]),
             num_last_images_to_include: Some(1),
         },
         &[],
@@ -378,11 +477,7 @@ async fn too_many_referenced_image_paths_return_tool_error() {
             prompt: "change the lighting".to_string(),
             referenced_image_paths: Some(
                 (0..6)
-                    .map(|index| {
-                        format!("/tmp/image-{index}.png")
-                            .try_into()
-                            .expect("test path should be absolute")
-                    })
+                    .map(|index| format!("/tmp/image-{index}.png"))
                     .collect(),
             ),
             num_last_images_to_include: None,
@@ -446,11 +541,7 @@ async fn referenced_paths_reject_an_unreadable_primary_environment() {
     let error = request_for_call_args(
         &ImagegenArgs {
             prompt: "change the lighting".to_string(),
-            referenced_image_paths: Some(vec![
-                "/tmp/image.png"
-                    .try_into()
-                    .expect("test path should be absolute"),
-            ]),
+            referenced_image_paths: Some(vec!["/tmp/image.png".into()]),
             num_last_images_to_include: None,
         },
         &[],
@@ -544,5 +635,163 @@ fn expected_edit_request(prompt: &str, images: &[&str]) -> ImageEditRequest {
 fn function_payload() -> ToolPayload {
     ToolPayload::Function {
         arguments: "{}".to_string(),
+    }
+}
+struct ReferenceImageFileSystem {
+    expected: codex_utils_path_uri::PathUri,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl codex_exec_server::ExecutorFileSystem for ReferenceImageFileSystem {
+    fn canonicalize<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, codex_utils_path_uri::PathUri> {
+        Box::pin(async { panic!("unexpected filesystem operation: canonicalize") })
+    }
+    fn read_file<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, Vec<u8>> {
+        Box::pin(async { panic!("unexpected filesystem operation: read_file") })
+    }
+    fn read_file_stream<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, codex_exec_server::FileSystemReadStream>
+    {
+        Box::pin(async { panic!("unexpected filesystem operation: read_file_stream") })
+    }
+    fn write_file<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _contents: Vec<u8>,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { panic!("unexpected filesystem operation: write_file") })
+    }
+    fn create_directory<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _options: codex_exec_server::CreateDirectoryOptions,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { panic!("unexpected filesystem operation: create_directory") })
+    }
+    fn get_metadata<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, codex_exec_server::FileMetadata> {
+        Box::pin(async { panic!("unexpected filesystem operation: get_metadata") })
+    }
+    fn read_directory<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, Vec<codex_exec_server::ReadDirectoryEntry>>
+    {
+        Box::pin(async { panic!("unexpected filesystem operation: read_directory") })
+    }
+    fn remove<'a>(
+        &'a self,
+        _path: &'a codex_utils_path_uri::PathUri,
+        _options: codex_exec_server::RemoveOptions,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { panic!("unexpected filesystem operation: remove") })
+    }
+    fn copy<'a>(
+        &'a self,
+        _source: &'a codex_utils_path_uri::PathUri,
+        _destination: &'a codex_utils_path_uri::PathUri,
+        _options: codex_exec_server::CopyOptions,
+        _sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, ()> {
+        Box::pin(async { panic!("unexpected copy") })
+    }
+
+    fn read_file_bounded<'a>(
+        &'a self,
+        path: &'a codex_utils_path_uri::PathUri,
+        limit: usize,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            use base64::Engine;
+            assert_eq!(path, &self.expected);
+            assert_eq!(limit, super::MAX_PROMPT_IMAGE_SOURCE_BYTES);
+            assert!(
+                sandbox.is_some(),
+                "selected environment sandbox must be retained"
+            );
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(super::BASE64_STANDARD.decode(VALID_PNG).unwrap()))
+        })
+    }
+}
+
+#[tokio::test]
+async fn reference_paths_use_primary_filesystem_conventions_on_every_host() {
+    use codex_utils_path_uri::PathUri;
+    for (cwd, path, expected) in [
+        (
+            "file:///C:/workspace",
+            r"C:\images\reference.png",
+            "file:///C:/images/reference.png",
+        ),
+        (
+            "file:///C:/workspace",
+            r"\\server\share\reference.png",
+            "file://server/share/reference.png",
+        ),
+        (
+            "file:///workspace",
+            "/images/reference.png",
+            "file:///images/reference.png",
+        ),
+        (
+            "file:///workspace",
+            "reference.png",
+            "file:///workspace/reference.png",
+        ),
+    ] {
+        let args: ImagegenArgs = serde_json::from_value(serde_json::json!({
+            "prompt":"edit", "referenced_image_paths":[path]
+        }))
+        .unwrap();
+        let fs = std::sync::Arc::new(ReferenceImageFileSystem {
+            expected: PathUri::parse(expected).unwrap(),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cwd = PathUri::parse(cwd).unwrap();
+        let environment = codex_extension_api::ToolEnvironment {
+            environment_id: "primary".into(),
+            cwd: cwd.clone(),
+            file_system: fs.clone(),
+            // This filesystem can be foreign to the test host. Legacy policy
+            // conversion deliberately resolves native paths on the receiving host.
+            file_system_sandbox_context:
+                codex_exec_server::FileSystemSandboxContext::from_permission_profile_with_cwd(
+                    codex_protocol::models::PermissionProfile::Disabled,
+                    cwd,
+                ),
+        };
+        let result = request_for_call_args(&args, &[], Some("primary"), &[environment])
+            .await
+            .unwrap();
+        let ImageRequest::Edit(request) = result else {
+            panic!("edit");
+        };
+        assert_eq!(request.images.len(), 1);
+        assert_eq!(
+            request.images[0].image_url,
+            format!("data:image/png;base64,{VALID_PNG}")
+        );
+        assert_eq!(fs.reads.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

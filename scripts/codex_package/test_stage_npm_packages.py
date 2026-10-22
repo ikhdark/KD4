@@ -454,6 +454,100 @@ class CodexLauncherTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
 
+class ResponsesProxyLauncherTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.node = shutil.which("node")
+        if cls.node is None:
+            raise unittest.SkipTest(
+                "Node.js is required for launcher integration tests"
+            )
+
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.root = Path(temp_dir.name).resolve()
+        self.launcher = self.root / "bin" / "proxy.js"
+        self.launcher.parent.mkdir()
+        shutil.copyfile(
+            Path(__file__).resolve().parents[2]
+            / "codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js",
+            self.launcher,
+        )
+        (self.root / "package.json").write_text('{"type":"module"}', encoding="utf-8")
+
+    def run_child_model(self, body: str) -> subprocess.CompletedProcess[str]:
+        # Exercise the actual independently staged wrapper. A mock native child
+        # makes failed forwarding deterministic without leaving a real orphan.
+        script = (
+            "import childProcess from 'node:child_process'; "
+            "import { EventEmitter } from 'node:events'; "
+            "import { syncBuiltinESMExports } from 'node:module'; "
+            "childProcess.spawn = () => { const child = new EventEmitter(); "
+            f"{body}; return child; }}; "
+            "syncBuiltinESMExports(); "
+            f"await import({json.dumps(self.launcher.as_uri())});"
+        )
+        return subprocess.run(
+            [self.node, "--input-type=module", "-e", script],
+            cwd=self.root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_numeric_and_signal_child_outcomes_are_preserved(self) -> None:
+        for code in (0, 7):
+            with self.subTest(code=code):
+                result = self.run_child_model(
+                    f"setImmediate(() => child.emit('exit', {code}, null))"
+                )
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.stderr, "")
+        for name, number in (("SIGINT", 2), ("SIGTERM", 15), ("SIGHUP", 1)):
+            with self.subTest(signal=name):
+                result = self.run_child_model(
+                    f"setImmediate(() => child.emit('exit', null, '{name}'))"
+                )
+                self.assertEqual(
+                    result.returncode, 128 + number if os.name == "nt" else -number
+                )
+                self.assertEqual(result.stderr, "")
+
+    def test_failed_forwarding_is_diagnostic_and_bounded(self) -> None:
+        for kill_body in ("return false", "throw new Error('permission denied')"):
+            with self.subTest(kill_body=kill_body):
+                result = self.run_child_model(
+                    f"child.kill = () => {{ {kill_body}; }}; "
+                    "setInterval(() => {}, 1000); "
+                    "setImmediate(() => process.emit('SIGTERM'))"
+                )
+                self.assertEqual(result.returncode, 143 if os.name == "nt" else -15)
+                self.assertIn(
+                    "Unable to forward SIGTERM to responses-api-proxy:", result.stderr
+                )
+
+    def test_spawn_error_fails_with_diagnostic(self) -> None:
+        result = self.run_child_model(
+            "setImmediate(() => child.emit('error', new Error('spawn denied')))"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "responses-api-proxy could not start: spawn denied", result.stderr
+        )
+        self.assertNotIn("\n    at ", result.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Windows console signal convention")
+    def test_ctrl_c_waits_for_child_exit(self) -> None:
+        result = self.run_child_model(
+            "child.kill = () => { throw new Error('unexpected TerminateProcess'); }; "
+            "setImmediate(() => { process.emit('SIGINT'); child.emit('exit', 7, null); })"
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+
 class StageNpmPackagesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -591,6 +685,36 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         package_json = json.loads((self.root / "package.json").read_text())
         self.assertEqual(package_json["os"], ["win32"])
+
+    def test_copy_native_binaries_validates_destination_after_source_mutation(self):
+        build = stage.load_build_module()
+        vendor = self.root / "vendor"
+        target = vendor / "x86_64-pc-windows-msvc"
+        self.write_canonical_package(target)
+        original = shutil.copy2
+        copies = []
+
+        def mutate(source, destination, *args, **kwargs):
+            if Path(source).name == "codex.exe":
+                with Path(source).open("ab") as file:
+                    file.write(b"changed during copy")
+            copies.append(Path(source))
+            return original(source, destination, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                layout.subprocess, "run", return_value=mock.Mock(stdout="codex 1.2.3")
+            ),
+            mock.patch.object(shutil, "copy2", side_effect=mutate),
+            self.assertRaisesRegex(RuntimeError, "mismatch"),
+        ):
+            build.copy_native_binaries(
+                vendor,
+                self.root / "staging",
+                [build.CODEX_PACKAGE_COMPONENT],
+                expected_version="1.2.3",
+            )
+        self.assertTrue(copies)
 
     def test_copy_native_binaries_filters_target_and_requires_executable(self) -> None:
         build = stage.load_build_module()
@@ -761,7 +885,11 @@ class StageNpmPackagesTests(unittest.TestCase):
         if not binary:
             self.skipTest("set CODEX_NPM_SMOKE_NATIVE to a built Windows x64 codex.exe")
         build = stage.load_build_module()
-        version = subprocess.check_output([binary, "--version"], text=True).strip().removeprefix("codex-cli ")
+        version = (
+            subprocess.check_output([binary, "--version"], text=True)
+            .strip()
+            .removeprefix("codex-cli ")
+        )
         main = self.root / "main"
         native = self.root / "native"
         main.mkdir()
@@ -782,7 +910,9 @@ class StageNpmPackagesTests(unittest.TestCase):
         wrong = build.run_npm_pack(native, self.root / "wrong.tgz")
         with self.assertRaisesRegex(RuntimeError, "alias or version mismatch"):
             build.smoke_test_npm_tarball(main_tar, wrong)
-        manifest["version"] = build.compute_platform_package_version(version, "win32-x64")
+        manifest["version"] = build.compute_platform_package_version(
+            version, "win32-x64"
+        )
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         payload.unlink()
         missing = build.run_npm_pack(native, self.root / "missing.tgz")
@@ -792,21 +922,40 @@ class StageNpmPackagesTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows package smoke orchestration")
     def test_staging_requires_paired_smoke_before_committing_packages(self) -> None:
         build = stage.load_build_module()
-        results = [stage.StagePackageResult(name, self.root / f"{name}.tgz", "")
-                   for name in ("codex", "codex-win32-x64")]
-        argv = ["stage", "--release-version", "1.2.3", "--package", "codex",
-                "--vendor-src", str(self.root), "--output-dir", str(self.root / "out")]
+        results = [
+            stage.StagePackageResult(name, self.root / f"{name}.tgz", "")
+            for name in ("codex", "codex-win32-x64")
+        ]
+        argv = [
+            "stage",
+            "--release-version",
+            "1.2.3",
+            "--package",
+            "codex",
+            "--vendor-src",
+            str(self.root),
+            "--output-dir",
+            str(self.root / "out"),
+        ]
         with (
             mock.patch.object(sys, "argv", argv),
             mock.patch.object(stage.platform, "machine", return_value="AMD64"),
             mock.patch.object(stage, "collect_native_component_sets", return_value=[]),
             mock.patch.object(stage, "stage_packages", return_value=results),
-            mock.patch.object(stage, "commit_staged_packages", return_value=[]) as commit,
-            mock.patch.object(build, "smoke_test_npm_tarball", side_effect=RuntimeError("smoke failed")) as smoke,
+            mock.patch.object(
+                stage, "commit_staged_packages", return_value=[]
+            ) as commit,
+            mock.patch.object(
+                build,
+                "smoke_test_npm_tarball",
+                side_effect=RuntimeError("smoke failed"),
+            ) as smoke,
         ):
             with self.assertRaisesRegex(RuntimeError, "smoke failed"):
                 stage._main()
-            smoke.assert_called_once_with(results[0].pack_output, results[1].pack_output)
+            smoke.assert_called_once_with(
+                results[0].pack_output, results[1].pack_output
+            )
             commit.assert_not_called()
             smoke.side_effect = None
             self.assertEqual(stage._main(), 0)
@@ -1087,12 +1236,23 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(
             pack_output, self.root / "dist" / "codex-npm-win32-x64-1.2.3.tgz"
         )
-        self.assertEqual(command, [
-            sys.executable, str(stage.BUILD_SCRIPT),
-            "--package", "codex-win32-x64", "--release-version", "1.2.3",
-            "--staging-dir", str(self.root / "staging"),
-            "--pack-output", str(pack_output), "--vendor-src", str(vendor_src),
-        ])
+        self.assertEqual(
+            command,
+            [
+                sys.executable,
+                str(stage.BUILD_SCRIPT),
+                "--package",
+                "codex-win32-x64",
+                "--release-version",
+                "1.2.3",
+                "--staging-dir",
+                str(self.root / "staging"),
+                "--pack-output",
+                str(pack_output),
+                "--vendor-src",
+                str(vendor_src),
+            ],
+        )
 
     def test_download_artifacts_uses_complete_markers(self) -> None:
         archives_by_id: dict[int, bytes] = {}
@@ -1480,11 +1640,17 @@ class StageNpmPackagesTests(unittest.TestCase):
                     member = tarfile.TarInfo("resources/.complete")
                     member.size = len(b"payload")
                     archive.addfile(member, io.BytesIO(b"payload"))
-                cached = archives.cached_codex_package_archive(source, "target", root / "cache")
+                cached = archives.cached_codex_package_archive(
+                    source, "target", root / "cache"
+                )
                 stage.materialize_cached_tree(cached, root / "vendor", mode)
-                self.assertEqual((root / "vendor/resources/.complete").read_bytes(), b"payload")
+                self.assertEqual(
+                    (root / "vendor/resources/.complete").read_bytes(), b"payload"
+                )
                 self.assertFalse((root / "vendor/.complete").exists())
-                artifact = stage.WorkflowArtifact("target", source.stat().st_size, 1, "a" * 64)
+                artifact = stage.WorkflowArtifact(
+                    "target", source.stat().st_size, 1, "a" * 64
+                )
                 workflow = root / "workflow"
                 (workflow / "resources").mkdir(parents=True)
                 (workflow / "resources/.complete").write_bytes(b"payload")
@@ -1493,9 +1659,11 @@ class StageNpmPackagesTests(unittest.TestCase):
                 (workflow / "resources/.complete").write_bytes(b"changed")
                 self.assertFalse(stage.artifact_is_complete(workflow, artifact))
                 (cached / "resources/.complete").write_bytes(b"changed")
-                self.assertFalse(archives.extracted_cache_is_complete(
-                    cached, cached / ".complete", archives.file_sha256(source)
-                ))
+                self.assertFalse(
+                    archives.extracted_cache_is_complete(
+                        cached, cached / ".complete", archives.file_sha256(source)
+                    )
+                )
 
     def test_cached_tree_materialization_skips_marker(self) -> None:
         cached_dir = self.root / "cached"
@@ -1534,8 +1702,12 @@ class StageNpmPackagesTests(unittest.TestCase):
 
     def test_format_bytes_returns_rendered_size(self) -> None:
         for size, expected in (
-            (0, "0.0 B"), (1023, "1023.0 B"), (1024, "1.0 KiB"),
-            (1536, "1.5 KiB"), (1024**2, "1.0 MiB"), (1024**3, "1.0 GiB"),
+            (0, "0.0 B"),
+            (1023, "1023.0 B"),
+            (1024, "1.0 KiB"),
+            (1536, "1.5 KiB"),
+            (1024**2, "1.0 MiB"),
+            (1024**3, "1.0 GiB"),
         ):
             with self.subTest(size=size):
                 self.assertEqual(stage.format_bytes(size), expected)
@@ -1552,7 +1724,9 @@ class StageNpmPackagesTests(unittest.TestCase):
             observed_output.append(output_path)
             output_path.write_text("payload", encoding="utf-8")
 
-        with mock.patch("scripts.codex_package.stage_npm_archives.run_owned", fake_check_call):
+        with mock.patch(
+            "scripts.codex_package.stage_npm_archives.run_owned", fake_check_call
+        ):
             stage.extract_zstd_archive(archive_path, dest)
 
         self.assertEqual(dest.read_text(encoding="utf-8"), "payload")
@@ -1865,15 +2039,26 @@ class StageCacheWorkflowRegressionTests(unittest.TestCase):
     def test_platform_targets_share_one_bounded_install_operation(self):
         with tempfile.TemporaryDirectory() as temp:
             args = types.SimpleNamespace(
-                vendor_src=None, output_dir=Path(temp) / "out",
+                vendor_src=None,
+                output_dir=Path(temp) / "out",
                 workflow_url="https://github.com/owner/repo/actions/runs/123",
-                workflow_name=None, github_repo="owner/repo", packages=["codex"],
-                release_version="1.2.3", cache_dir=Path(temp) / "cache",
-                max_download_workers=2, vendor_copy_mode="auto",
-                keep_staging_dirs=False, max_stage_workers=1)
+                workflow_name=None,
+                github_repo="owner/repo",
+                packages=["codex"],
+                release_version="1.2.3",
+                cache_dir=Path(temp) / "cache",
+                max_download_workers=2,
+                vendor_copy_mode="auto",
+                keep_staging_dirs=False,
+                max_stage_workers=1,
+            )
             with (
                 mock.patch.object(stage, "parse_args", return_value=args),
-                mock.patch.object(stage, "resolve_workflow_url", return_value=(args.workflow_url, "fixture")),
+                mock.patch.object(
+                    stage,
+                    "resolve_workflow_url",
+                    return_value=(args.workflow_url, "fixture"),
+                ),
                 mock.patch.object(stage, "ensure_source_matches_workflow"),
                 mock.patch.object(stage, "install_native_components") as install,
                 mock.patch.object(stage, "stage_packages", return_value=[]) as packages,

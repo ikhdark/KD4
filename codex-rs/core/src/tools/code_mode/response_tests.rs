@@ -75,10 +75,21 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                 .or_else(|| (args["cmd"] == "fixture-exit-101").then_some(101));
             let process_running = args["process_running"] == true;
             if process_exit_code.is_some() || process_running {
+                // An exited process owns its exact drained output; completeness
+                // is never inferred from the display chunk alone.
+                let process_output = (!process_running).then(|| {
+                    Arc::new(crate::unified_exec::ProcessOutputSnapshot {
+                        aggregated_output: b"COMPILER_DIAGNOSTIC".to_vec(),
+                        stdout: b"COMPILER_DIAGNOSTIC".to_vec(),
+                        stderr: Vec::new(),
+                        aggregated_output_is_exact: true,
+                        streams_are_exact: true,
+                    })
+                });
                 return Ok(crate::tools::context::boxed_tool_output(
                     crate::tools::context::ExecCommandToolOutput {
                         output_ranges: None,
-                        process_output: None,
+                        process_output,
                         error: None,
                         validation: None,
                         event_call_id: invocation.call_id,
@@ -135,7 +146,9 @@ impl ToolExecutor<ToolInvocation> for PacketTestTool {
                     Some("Remove-Item output.txt") => Some("write rejected"),
                     Some("git log -1") => Some("history unavailable"),
                     Some("Get-Content missing.txt") => Some("file missing"),
-                    Some("git status --short") => Some("status unavailable"),
+                    Some("git --no-optional-locks -c core.fsmonitor=false status --short") => {
+                        Some("status unavailable")
+                    }
                     _ => None,
                 })
             {
@@ -883,10 +896,19 @@ async fn nested_failures_preserve_only_observed_workspace_dependencies() {
             Some("missing.txt"),
             false,
         ),
-        (serde_json::json!({"cmd": "git status --short"}), None, true),
+        // Status is a certified read only with optional locks and fsmonitor off.
+        (
+            serde_json::json!({
+                "cmd": "git --no-optional-locks -c core.fsmonitor=false status --short"
+            }),
+            None,
+            true,
+        ),
     ] {
         let runtime = PacketRuntime::with_nested_runtimes_in_workspace(
-            vec![Arc::new(PacketTestTool { name: "exec_command" })],
+            vec![Arc::new(PacketTestTool {
+                name: "exec_command",
+            })],
             Some(&cwd),
         )
         .await;
@@ -907,7 +929,9 @@ async fn nested_failures_preserve_only_observed_workspace_dependencies() {
             Some("Remove-Item output.txt") => "write rejected",
             Some("git log -1") => "history unavailable",
             Some("Get-Content missing.txt") => "file missing",
-            Some("git status --short") => "status unavailable",
+            Some("git --no-optional-locks -c core.fsmonitor=false status --short") => {
+                "status unavailable"
+            }
             _ => "expects a JSON object for arguments",
         };
         assert!(visible.contains(expected_error), "{visible}");
@@ -926,10 +950,7 @@ async fn nested_failures_preserve_only_observed_workspace_dependencies() {
             ));
         }
         if observes_directory {
-            expected.insert(SourceDependencyV1::new(
-                workspace.path(),
-                true,
-            ));
+            expected.insert(SourceDependencyV1::new(workspace.path(), true));
             expected.insert(SourceDependencyV1::new(
                 &workspace.path().join(".git"),
                 true,
@@ -3073,7 +3094,12 @@ async fn completion_audit_retained_intent_requires_authoritative_terminal_comman
                 activity.send_replace(crate::session::InputQueueActivity::Steer);
             }
             "schema-changed" => {
-                turn.final_output_json_schema = Some(serde_json::json!({"type":"string"}))
+                turn.final_output_json_schema = Some(
+                    crate::session::turn_context::PreparedOutputSchema::prepare(
+                        serde_json::json!({"type":"string"}),
+                    )
+                    .unwrap(),
+                )
             }
             _ => {}
         }
@@ -3162,55 +3188,98 @@ async fn nested_read_dispatch_seeds_replay_without_duplicate_outcomes() {
         .current_dir(root.path())
         .output()
         .unwrap();
-    assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
     let runtime = PacketRuntime::with_nested_runtimes_in_workspace(
         vec![Arc::new(crate::tools::handlers::ReadFileHandler)],
         Some(root.path()),
     )
     .await;
     let args = serde_json::json!({"path": path});
-    let payload = ToolPayload::Function { arguments: args.to_string() };
+    let payload = ToolPayload::Function {
+        arguments: args.to_string(),
+    };
     let source = format!("text(await tools.read_file({args}));");
-    let captures_before = runtime.session.services.git_workspace.workspace_evidence_capture_count();
+    let captures_before = runtime
+        .session
+        .services
+        .git_workspace
+        .workspace_evidence_capture_count();
     let output = runtime.exec(&source).await;
     assert_eq!(output.outcome_for_logging(), ToolOutputOutcome::Success);
-    assert_eq!(runtime.session.services.git_workspace.workspace_evidence_capture_count(), captures_before,
-        "exporting replay evidence must not force a new whole-workspace capture");
+    assert_eq!(
+        runtime
+            .session
+            .services
+            .git_workspace
+            .workspace_evidence_capture_count(),
+        captures_before,
+        "exporting replay evidence must not force a new whole-workspace capture"
+    );
     let history = runtime.session.clone_history().await.tool_history_state();
     let history_json = serde_json::to_value(&history).unwrap();
-    let child = history_json["workspace_evidence"].as_object().unwrap().iter()
+    let child = history_json["workspace_evidence"]
+        .as_object()
+        .unwrap()
+        .iter()
         .find(|(call_id, _)| call_id.starts_with("exec-"))
-        .expect("the nested read must retain its original history evidence").1;
-    assert!(!child["source_path_observations"].as_array().unwrap().is_empty(),
-        "the replay export must not steal history's pre-read watches");
+        .expect("the nested read must retain its original history evidence")
+        .1;
+    assert!(
+        !child["source_path_observations"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the replay export must not steal history's pre-read watches"
+    );
 
     // Only the carrier was invoked by the test: the real JS broker, read
     // handler and nested result recorder must supply every replay prerequisite.
     let shared = Arc::new(SessionPathReplays::default());
     let mut control = TurnExecutionControl::new().with_session_path_replays(shared.clone());
     let baseline = control.baselines(0);
-    control.settle(&baseline, &runtime.signals, &SamplingRequestSettledState {
-        mutation_revision: 0,
-        attributed_mutation_revision: 0,
-        tool_exposure_revision: 0,
-    });
+    control.settle(
+        &baseline,
+        &runtime.signals,
+        &SamplingRequestSettledState {
+            mutation_revision: 0,
+            attributed_mutation_revision: 0,
+            tool_exposure_revision: 0,
+        },
+    );
     let next = TurnExecutionControl::new().with_session_path_replays(shared);
     let collector = next.collector(&next.baselines(0));
-    let guard = collector.register_deterministic_tool_call(
-        &codex_tools::ToolName::plain("read_file"), &payload, "later-read",
-    ).replayed_success.expect("the dispatched nested read must seed a replay candidate");
+    let guard = collector
+        .register_deterministic_tool_call(
+            &codex_tools::ToolName::plain("read_file"),
+            &payload,
+            "later-read",
+        )
+        .replayed_success
+        .expect("the dispatched nested read must seed a replay candidate");
     let cache = &runtime.session.services.git_workspace;
     // Reuse validates the actual repository identity, just like dispatch;
     // `None` describes a non-Git workspace and must not match this fixture.
-    let workspace = cache.workspace_evidence_for_turn(&runtime.step.turn, root.path()).await.identity;
+    let workspace = cache
+        .workspace_evidence_for_turn(&runtime.step.turn, root.path())
+        .await
+        .identity;
     assert!(guard.is_fresh(0, cache, workspace.as_ref()));
     let authority = crate::tools::registry::authorized_tool_invocation_sha256(
-        &runtime.step.turn, &payload, None,
+        &runtime.step.turn,
+        &payload,
+        None,
     );
     assert!(guard.matches_authorization(authority.as_deref()));
     assert!(!guard.matches_authorization(Some("changed-permissions")));
     let ResponseInputItem::FunctionCallOutput { call_id, output } =
-        guard.response_for_call("later-read").unwrap() else { panic!("read response"); };
+        guard.response_for_call("later-read").unwrap()
+    else {
+        panic!("read response");
+    };
     assert_eq!(call_id, "later-read");
     let text = output.body.to_text().unwrap();
     let replay: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -3218,13 +3287,25 @@ async fn nested_read_dispatch_seeds_replay_without_duplicate_outcomes() {
     let other = ToolPayload::Function {
         arguments: serde_json::json!({"path": root.path().join("unobserved.txt")}).to_string(),
     };
-    assert!(collector.register_deterministic_tool_call(
-        &codex_tools::ToolName::plain("read_file"), &other, "other",
-    ).replayed_success.is_none());
+    assert!(
+        collector
+            .register_deterministic_tool_call(
+                &codex_tools::ToolName::plain("read_file"),
+                &other,
+                "other",
+            )
+            .replayed_success
+            .is_none()
+    );
 
     std::fs::write(&path, "changed\n").unwrap();
-    cache.note_host_workspace_mutation_paths(root.path(), &["source.txt".into()]).await;
-    assert!(!guard.is_fresh(0, cache, workspace.as_ref()), "changed source must not replay");
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["source.txt".into()])
+        .await;
+    assert!(
+        !guard.is_fresh(0, cache, workspace.as_ref()),
+        "changed source must not replay"
+    );
     runtime.finish().await;
 }
 
@@ -3244,7 +3325,30 @@ async fn caught_nested_rejection_retains_cause_and_remedy() {
     // A caught error followed by ordinary printed output is intentionally hidden.
     assert!(text.contains("DENIED_HEAD"), "{text}");
     assert!(text.contains("REMEDY_TAIL"), "{text}");
-    assert!(text.contains("recovery_available\":false"),
-        "head/tail retention must not claim exact full recovery: {text}");
+    assert!(
+        text.contains("recovery_available\":false"),
+        "head/tail retention must not claim exact full recovery: {text}"
+    );
     runtime.finish().await;
+}
+#[tokio::test(start_paused = true)]
+async fn terminal_retention_observation_expires_without_cancelling_the_writer() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let service = &session.services.code_mode_service;
+    let cell = CellId::new("bounded-retention".into());
+    service.record_cell_parent_call_id(&cell, "outer");
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let owner = Arc::clone(&completed);
+    service.queue_packet_retention(&session, &cell, async move {
+        let _ = blocked.await;
+        owner.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let token = tokio_util::sync::CancellationToken::new();
+    assert!(!service.observe_packet_retention(&cell, true, &token).await);
+    assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
+    release.send(()).unwrap();
+    service.flush_packet_retention(&cell).await;
+    assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(service.observe_packet_retention(&cell, true, &token).await);
 }

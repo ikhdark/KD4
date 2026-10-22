@@ -24,11 +24,13 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 v8 = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true, features = ["async-await"] }
 pretty_assertions = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

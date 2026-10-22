@@ -4,6 +4,14 @@ use std::sync::Weak;
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(test)]
+#[path = "parallel_read_cohort_tests.rs"]
+mod read_cohort_tests;
+
+#[cfg(test)]
+#[path = "parallel_intent_tests.rs"]
+mod intent_tests;
+
 use futures::FutureExt;
 use futures::StreamExt;
 use tokio::sync::OwnedRwLockReadGuard;
@@ -307,6 +315,31 @@ pub(crate) struct ToolCallRuntime {
     canonical_workspace_resources: Arc<crate::git_workspace::WorkspaceRootCache>,
     sampling_request_signals: Option<SamplingRequestSignalCollector>,
     terminal_completion_only: bool,
+    code_mode_user_intent: Option<(String, u64)>,
+}
+
+tokio::task_local! {
+    static HOOK_USER_INTENT: Option<(String, u64)>;
+}
+
+fn admit_code_mode_user_intent<T>(
+    session: &Session,
+    intent: Option<&(String, u64)>,
+    admit: impl FnOnce() -> T,
+) -> Result<T, FunctionCallError> {
+    let Some((cell_id, epoch)) = intent else {
+        return Ok(admit());
+    };
+    session
+        .input_queue
+        .admit_code_mode_tool(*epoch, admit)
+        .map_err(|current_epoch| {
+            FunctionCallError::RespondToModel(serde_json::json!({
+            "type": "input_changed_decision_required", "started": false,
+            "cell_id": cell_id, "authoring_epoch": epoch, "current_epoch": current_epoch,
+            "message": "Accepted user input changed before effect admission. Preserve completed results; author a new cell after considering the changed input. Do not replay effects with unknown outcomes."
+            }).to_string())
+        })
 }
 
 /// Shared by every direct and nested runtime in a turn.
@@ -348,10 +381,41 @@ pub(crate) async fn run_workspace_hook<T: Send + 'static>(
     cancellation: CancellationToken,
     work: impl std::future::Future<Output = T> + Send + 'static,
 ) -> Result<T, FunctionCallError> {
+    run_workspace_hook_with_receipt(session, turn, tracker, cancellation, work)
+        .await
+        .map(|(value, _)| value)
+}
+
+/// Identifies only the hook owner's own conservative mutation accounting.
+/// It does not certify the command's effects or make earlier validation current.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WorkspaceHookMutationReceipt {
+    before_revision: u64,
+    after_revision: u64,
+}
+
+impl WorkspaceHookMutationReceipt {
+    pub(crate) fn covers_only_hook_effect(&self, candidate: u64, current: u64) -> bool {
+        self.before_revision == candidate
+            && self.after_revision == current
+            && self.before_revision.checked_add(1) == Some(self.after_revision)
+    }
+}
+
+pub(crate) async fn run_workspace_hook_with_receipt<T: Send + 'static>(
+    session: Arc<Session>,
+    turn: Arc<TurnContext>,
+    tracker: SharedTurnDiffTracker,
+    cancellation: CancellationToken,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<(T, Option<WorkspaceHookMutationReceipt>), FunctionCallError> {
     let inherited = HOOK_WORKSPACE_LEASE.try_with(Clone::clone).ok().flatten();
+    let user_intent = HOOK_USER_INTENT.try_with(Clone::clone).ok().flatten();
     let commit = session.retain_tool_dispatch_commit();
-    tokio::spawn(async move {
+    let terminal_tasks = session.terminal_tasks.clone();
+    terminal_tasks.spawn(async move {
         let _commit = commit;
+        close_read_cohort(&turn.workspace_execution_coordinator.global_gate_holders);
         let _lease = match inherited {
             Some(lease) => lease,
             None => tokio::select! {
@@ -362,17 +426,32 @@ pub(crate) async fn run_workspace_hook<T: Send + 'static>(
         if cancellation.is_cancelled() {
             return Err(FunctionCallError::RespondToModel("hook cancelled before execution".into()));
         }
+        // The hook may have waited for a writer since its parent was checked.
+        // Linearize its own effects against successful steering, without holding
+        // the synchronous input fence across execution or storage work.
+        admit_code_mode_user_intent(&session, user_intent.as_ref(), || ())?;
         let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
             codex_hooks::observe_command_effects(Arc::clone(&entered), work),
         )).await;
-        if entered.load(std::sync::atomic::Ordering::Acquire) {
+        let mutation_receipt = if entered.load(std::sync::atomic::Ordering::Acquire) {
             session.services.git_workspace.note_host_workspace_mutation();
-            tracker.lock().await.record_unknown_mutation();
-        }
+            let mut tracker = tracker.lock().await;
+            let before_revision = tracker.current_mutation_revision();
+            tracker.record_unknown_mutation();
+            Some(WorkspaceHookMutationReceipt {
+                before_revision,
+                after_revision: tracker.current_mutation_revision(),
+            })
+        } else {
+            None
+        };
         match result {
-            Ok(value) => Ok(value),
-            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(value) => Ok((value, mutation_receipt)),
+            Err(_) => {
+                tracing::warn!("workspace hook owner panicked");
+                Err(FunctionCallError::Fatal("workspace hook owner panicked".into()))
+            }
         }
     }).await.map_err(|error| FunctionCallError::Fatal(format!("hook owner failed: {error}")))?
 }
@@ -522,12 +601,9 @@ impl WorkspaceEvidenceGenerationBatch {
                 .ok()
                 .flatten()
         {
-            let observations = begin_source_path_observations(
-                cache,
-                &root,
-                &classification.source_dependencies,
-            )
-            .await;
+            let observations =
+                begin_source_path_observations(cache, &root, &classification.source_dependencies)
+                    .await;
             if observations.len() == classification.source_dependencies.len() {
                 // Do not put this root-only identity in the batch's full-identity
                 // cache: commands and their search-miss ledger need the digests.
@@ -596,7 +672,8 @@ impl WorkspaceEvidenceGenerationBatch {
                 })
             {
                 baseline.source_path_observations =
-                    begin_source_path_observations(cache, repo_root.unwrap_or(cwd), &dependencies).await;
+                    begin_source_path_observations(cache, repo_root.unwrap_or(cwd), &dependencies)
+                        .await;
             }
             baseline.source_dependencies = dependencies;
             return baseline;
@@ -1315,11 +1392,15 @@ fn native_file_classification(
     payload: &ToolPayload,
     environments: &crate::environment_selection::TurnEnvironmentSnapshot,
 ) -> crate::tool_history::WorkspaceCallClassification {
-    if !matches!(tool_identity, "read_file" | "list_files") {
+    if !matches!(
+        tool_identity,
+        "read_file" | "list_files" | "exec_command" | "shell" | "shell_command"
+    ) {
         return original;
     }
     let mut conservative = original;
     conservative.source_dependencies.clear();
+    conservative.source_scope_complete = false;
     let ToolPayload::Function { arguments } = payload else {
         return conservative;
     };
@@ -1433,6 +1514,7 @@ async fn workspace_resource_key_for_admission(
 #[derive(Debug)]
 struct WorkspaceAdmissionPlan {
     native_additions: Option<crate::scoped_workspace_gate::NativeAdditions>,
+    native_read_cohort: bool,
     bypass_outer_gate: bool,
     resource_key: Option<std::path::PathBuf>,
     shared_resource: bool,
@@ -1450,6 +1532,7 @@ fn workspace_admission_plan(
 ) -> WorkspaceAdmissionPlan {
     WorkspaceAdmissionPlan {
         native_additions: None,
+        native_read_cohort: false,
         bypass_outer_gate: delegates_workspace_admission,
         resource_key,
         shared_resource: classification.observes_workspace && permits_shared_observation,
@@ -1547,6 +1630,9 @@ enum WorkspaceResourceGateGuard {
 }
 
 enum WorkspaceGateGuard {
+    ReadCohort {
+        _guard: Arc<OwnedRwLockWriteGuard<()>>,
+    },
     HookExclusive {
         _guard: Arc<OwnedRwLockWriteGuard<()>>,
     },
@@ -1575,6 +1661,7 @@ impl WorkspaceGateGuard {
         holders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .holders
             .push(Arc::clone(&holder));
         Self::Attributed {
             guard: Box::new(self),
@@ -1608,7 +1695,57 @@ impl WorkspaceGateGuard {
     }
 }
 
-type WorkspaceGlobalHolders = Arc<Mutex<Vec<Arc<WorkspaceGateHolder>>>>;
+type WorkspaceGlobalHolders = Arc<Mutex<WorkspaceGlobalState>>;
+
+#[derive(Debug, Default)]
+struct WorkspaceGlobalState {
+    holders: Vec<Arc<WorkspaceGateHolder>>,
+    read_cohort: Weak<OwnedRwLockWriteGuard<()>>,
+    cohort_closed: bool,
+    cohort_arrivals: usize,
+    cohort_epoch: u64,
+}
+
+fn close_read_cohort(holders: &WorkspaceGlobalHolders) {
+    let mut state = holders
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.cohort_closed = true;
+    state.cohort_epoch = state.cohort_epoch.wrapping_add(1);
+}
+
+async fn acquire_read_cohort(
+    gate: Arc<RwLock<()>>,
+    timing: &Arc<TurnTimingState>,
+    holders: &WorkspaceGlobalHolders,
+) -> Arc<OwnedRwLockWriteGuard<()>> {
+    let epoch = {
+        let mut state = holders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A finite cohort cannot be extended indefinitely by a read stream.
+        if !state.cohort_closed
+            && state.cohort_arrivals < 16
+            && let Some(guard) = state.read_cohort.upgrade()
+        {
+            state.cohort_arrivals += 1;
+            return guard;
+        }
+        state.cohort_epoch
+    };
+    // Retain an EXCLUSIVE mutation barrier: known-root writers hold shared
+    // global admission, so downgrading it would allow forbidden overlap.
+    let guard = Arc::new(acquire_exclusive_workspace_gate(gate, timing).await);
+    let mut state = holders
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.read_cohort = Arc::downgrade(&guard);
+    // A writer may close admission between barrier grant and publication on
+    // another runtime thread. Never reopen that writer's closed cohort.
+    state.cohort_closed = state.cohort_epoch != epoch;
+    state.cohort_arrivals = 1;
+    guard
+}
 
 struct WorkspaceGlobalHolder {
     holders: WorkspaceGlobalHolders,
@@ -1620,6 +1757,7 @@ impl Drop for WorkspaceGlobalHolder {
         self.holders
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .holders
             .retain(|holder| !Arc::ptr_eq(holder, &self.holder));
     }
 }
@@ -1690,6 +1828,7 @@ async fn acquire_workspace_gate(
         workspace_execution,
         WorkspaceAdmissionPlan {
             native_additions: None,
+            native_read_cohort: false,
             bypass_outer_gate: false,
             resource_key,
             shared_resource,
@@ -1773,8 +1912,9 @@ async fn acquire_workspace_gate_for_call(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
-            holders.len(),
+            holders.holders.len(),
             holders
+                .holders
                 .iter()
                 .take(HOLDER_LIMIT)
                 .map(|holder| (**holder).clone())
@@ -1825,11 +1965,26 @@ async fn acquire_workspace_gate_with_additions(
 ) -> WorkspaceGateGuard {
     let WorkspaceAdmissionPlan {
         resource_key,
+        native_read_cohort,
         shared_resource,
         supports_parallel,
         workspace_capable,
         ..
     } = admission;
+    if native_read_cohort
+        && resource_key.is_none()
+        && shared_resource
+        && supports_parallel
+        && workspace_capable
+    {
+        return WorkspaceGateGuard::ReadCohort {
+            _guard: acquire_read_cohort(parallel_execution, turn_timing_state, global_holders)
+                .await,
+        }
+        .attributed(global_holders, false);
+    }
+    // Close before queueing, so later readers cannot bypass a pending writer.
+    close_read_cohort(global_holders);
     if workspace_tool_may_use_parallel_gate(supports_parallel, workspace_capable) {
         return WorkspaceGateGuard::Shared {
             _guard: acquire_shared_workspace_gate(parallel_execution, turn_timing_state).await,
@@ -1884,6 +2039,8 @@ async fn acquire_workspace_gate_with_additions(
     // queued on the global barrier, Tokio's writer preference lets it run
     // before another same-resource waiter extends the read phase.
     *waiting_resource = None;
+    // Resource acquisition may itself have waited while a new cohort started.
+    close_read_cohort(global_holders);
     let global = acquire_shared_workspace_gate(parallel_execution, turn_timing_state).await;
     WorkspaceGateGuard::ResourceScoped {
         _resource: resource,
@@ -1919,8 +2076,12 @@ async fn capture_workspace_evidence_baseline(
     let repo_root = cache.resolve_workspace_root(cwd).await.ok().flatten();
     // A plain directory still has observable filesystem dependencies. Git
     // identity remains None; the existing watcher is rooted at the workspace.
-    let source_path_observations =
-        begin_source_path_observations(cache, repo_root.as_deref().unwrap_or(cwd), &source_dependencies).await;
+    let source_path_observations = begin_source_path_observations(
+        cache,
+        repo_root.as_deref().unwrap_or(cwd),
+        &source_dependencies,
+    )
+    .await;
     let cached_revision = if reuse_latest {
         match repo_root.as_deref() {
             Some(repo_root) => cache.latest_workspace_evidence_identity(repo_root).await,
@@ -1958,12 +2119,14 @@ async fn begin_source_path_observations(
     let paths = source_dependencies
         .iter()
         .map(|dependency| {
-            (
-                std::path::PathBuf::from(&dependency.path),
-                dependency.recursive,
-            )
+            let uri =
+                codex_utils_path_uri::PathUri::parse(dependency.locator_uri.as_deref()?).ok()?;
+            Some((uri.to_abs_path().ok()?.to_path_buf(), dependency.recursive))
         })
-        .collect::<Vec<_>>();
+        .collect::<Option<Vec<_>>>();
+    let Some(paths) = paths else {
+        return Vec::new();
+    };
     cache
         .begin_source_path_change_observations(workspace_root, &paths)
         .await
@@ -2025,7 +2188,13 @@ impl ToolCallRuntime {
             tracker,
             sampling_request_signals: None,
             terminal_completion_only: false,
+            code_mode_user_intent: None,
         }
+    }
+
+    pub(crate) fn with_code_mode_user_intent(mut self, cell_id: &str, epoch: u64) -> Self {
+        self.code_mode_user_intent = Some((cell_id.to_string(), epoch));
+        self
     }
 
     pub(crate) fn with_terminal_completion_only(mut self, terminal_only: bool) -> Self {
@@ -2037,15 +2206,23 @@ impl ToolCallRuntime {
     fn pre_tool_use_hook_may_run(&self, call: &ToolCall) -> bool {
         let hooks = self.session.hooks();
         match self.step_context.tool_router() {
-            Some(router) => router.pre_tool_use_hook_may_run(&hooks, call)
-                || router.post_tool_use_hook_may_run(&ToolInvocation {
-                    session: Arc::clone(&self.session), step_context: Arc::clone(&self.step_context),
-                    cancellation_token: CancellationToken::new(), tracker: Arc::clone(&self.tracker),
-                    call_id: call.call_id.clone(), tool_name: call.tool_name.clone(),
-                    source: ToolCallSource::Direct, payload: call.payload.clone(),
-                }),
-            None => hooks.has_handler_for(codex_protocol::protocol::HookEventName::PreToolUse)
-                || hooks.has_handler_for(codex_protocol::protocol::HookEventName::PostToolUse),
+            Some(router) => {
+                router.pre_tool_use_hook_may_run(&hooks, call)
+                    || router.post_tool_use_hook_may_run(&ToolInvocation {
+                        session: Arc::clone(&self.session),
+                        step_context: Arc::clone(&self.step_context),
+                        cancellation_token: CancellationToken::new(),
+                        tracker: Arc::clone(&self.tracker),
+                        call_id: call.call_id.clone(),
+                        tool_name: call.tool_name.clone(),
+                        source: ToolCallSource::Direct,
+                        payload: call.payload.clone(),
+                    })
+            }
+            None => {
+                hooks.has_handler_for(codex_protocol::protocol::HookEventName::PreToolUse)
+                    || hooks.has_handler_for(codex_protocol::protocol::HookEventName::PostToolUse)
+            }
         }
     }
 
@@ -2659,6 +2836,18 @@ impl ToolCallRuntime {
         cancellation_token: CancellationToken,
         timing: Arc<ToolDispatchTiming>,
     ) -> impl std::future::Future<Output = Result<ToolCallCompletion, CodexErr>> {
+        assert!(
+            self.step_context
+                .turn
+                .turn_timing_state
+                .try_record_accepted_tool_call(
+                    &call.call_id,
+                    timing.execution_id(),
+                    TurnTimingToolCallSource::Direct,
+                    None,
+                    call.tool_name.name.as_str(),
+                )
+        );
         self.handle_model_tool_call_with_admission(call, cancellation_token, timing, None)
     }
 
@@ -2676,10 +2865,6 @@ impl ToolCallRuntime {
         self.step_context
             .workspace_evidence_generation_batch
             .register_call(&call.call_id);
-        self.step_context
-            .turn
-            .turn_timing_state
-            .record_tool_call(call.tool_name.name.as_str());
         let tool_call_timing_guard = ToolCallTimingGuard::capture_for_turn(
             Arc::clone(&timing),
             Arc::clone(&self.step_context.turn.turn_timing_state),
@@ -2793,12 +2978,14 @@ impl ToolCallRuntime {
                     Arc::clone(&self.workspace_execution),
                     WorkspaceAdmissionPlan {
                         native_additions: None,
+                        native_read_cohort: false,
                         bypass_outer_gate: false, resource_key, shared_resource: true,
                         supports_parallel: true, workspace_capable: true,
                     },
                     &self.step_context.turn.turn_timing_state,
                     None, &self.global_gate_holders, &mut None,
                 ).await;
+                let replay_admission = timing.capture_gate_admission();
                 let revision = self.tracker.lock().await.current_mutation_revision();
                 let workspace_revision = self.session.services.git_workspace.workspace_evidence_for_turn(
                     &self.step_context.turn, &workspace_call_classification.workspace_cwd,
@@ -2807,7 +2994,7 @@ impl ToolCallRuntime {
                 let mut validated = None;
                 if call.tool_name.name == "read_file"
                     && guard.matches_source_dependencies(&workspace_call_classification.source_dependencies)
-                    && let Some((hash, bytes)) = guard.cold_read_fingerprint(cache, workspace_revision.as_ref())
+                    && let Some((hash, bytes)) = guard.retained_read_fingerprint(workspace_revision.as_ref())
                     && let ToolPayload::Function { arguments } = &call.payload
                 {
                     // Register before the bounded, sandboxed read; mutations during
@@ -2822,11 +3009,16 @@ impl ToolCallRuntime {
                         validated = Some(guard.with_validated_source_paths(observations, workspace_revision.clone(), revision));
                     }
                 }
-                let guard = validated.as_ref().unwrap_or(guard);
-                if guard.is_fresh(revision, self.session.services.git_workspace.as_ref(), workspace_revision.as_ref())
+                // Never fall back to watcher silence after failed byte validation.
+                // Directory inventories have no equivalent snapshot proof here;
+                // let their owning handler perform the requested fresh walk.
+                if let Some(guard) = validated.as_ref()
+                    && guard.is_fresh(revision, self.session.services.git_workspace.as_ref(), workspace_revision.as_ref())
                     && guard.matches_source_dependencies(&workspace_call_classification.source_dependencies)
                     && let Some(response) = guard.response_for_call(&call.call_id)
                 {
+                    // A rejected replay must not mask the later fresh gate.
+                    timing.mark_captured_gate_admission(replay_admission);
                     timing.record_outcome("success");
                     timing.mark_output_collected();
                     if let Some(signal_collector) = signal_collector.as_ref() {
@@ -2840,11 +3032,7 @@ impl ToolCallRuntime {
                         }
                         signal_collector.record_replayed_response_result(registration.ordinal, &response);
                     }
-                    let provenance = if validated.is_some() {
-                        "its exact source hash was revalidated by a sandboxed cold-start read under a fresh watcher; the returned result itself is retained evidence"
-                    } else {
-                        "not a new external observation"
-                    };
+                    let provenance = "its exact source hash was revalidated by a sandboxed read under a fresh watcher; the returned result itself is retained evidence";
                     let replay_notice = codex_protocol::models::ResponseItem::Message {
                         id: None,
                         role: "developer".to_string(),
@@ -2858,7 +3046,9 @@ impl ToolCallRuntime {
                         self.step_context.turn.as_ref(), std::slice::from_ref(&replay_notice),
                     ).await?;
                     let replay_baseline = WorkspaceEvidenceBaseline {
-                        revision: workspace_revision,
+                        // Event silence permits qualified historical reuse, not
+                        // rebinding old bytes to a newly captured workspace.
+                        revision: guard.original_workspace_revision(),
                         cache_hit: false,
                         timed_out_git_dependencies: Vec::new(),
                         source_dependencies: workspace_call_classification.source_dependencies.clone(),
@@ -2981,6 +3171,11 @@ impl ToolCallRuntime {
                     };
                     let outcome_context = response.outcome_context();
                     let mut original_signal = response.sampling_request_signal();
+                    if crate::validation_task::take_admission_refusal(&self.step_context.turn, &error_call.call_id) {
+                        let signal = original_signal.get_or_insert_with(|| serde_json::json!({}));
+                        signal["validation_admission_pending"] = serde_json::json!(true);
+                        signal["outcome"] = serde_json::json!("blocked");
+                    }
                     if let Some(revision) = mutation_revision_before {
                         original_signal.get_or_insert_with(|| serde_json::json!({}))
                             ["validation_mutation_revision"] = serde_json::json!(revision);
@@ -3204,11 +3399,15 @@ impl ToolCallRuntime {
                         false
                     };
                     if let (Some(collector), Some(ordinal)) = (&signal_collector, signal_ordinal) {
-                        collector.record_failure(
-                            ordinal,
-                            &format!("model:{other}"),
-                            terminal_cause.is_some(),
-                        );
+                        if crate::validation_task::take_admission_refusal(&self.step_context.turn, &error_call.call_id) {
+                            collector.record_admission_pending(ordinal);
+                        } else {
+                            collector.record_failure(
+                                ordinal,
+                                &format!("model:{other}"),
+                                terminal_cause.is_some(),
+                            );
+                        }
                     }
                     let failure_detail = Self::search_failure_detail(&error_call, &other);
                     let response = Self::failure_response(error_call.clone(), other);
@@ -3292,10 +3491,22 @@ impl ToolCallRuntime {
                         timing.execution_id(),
                         TurnTimingToolCallSource::CodeMode,
                         parent_call_id.as_deref(),
+                        call.tool_name.name.as_str(),
                     )
             })
         } else {
-            true
+            self.step_context.turn.tool_call_acceptance.try_accept(|| {
+                self.step_context
+                    .turn
+                    .turn_timing_state
+                    .try_record_accepted_tool_call(
+                        &call.call_id,
+                        timing.execution_id(),
+                        TurnTimingToolCallSource::Direct,
+                        None,
+                        call.tool_name.name.as_str(),
+                    )
+            })
         };
         async move {
             if !accepted {
@@ -3304,10 +3515,6 @@ impl ToolCallRuntime {
                     call.call_id
                 )));
             }
-            self.step_context
-                .turn
-                .turn_timing_state
-                .record_tool_call(call.tool_name.name.as_str());
             let tool_call_timing_guard = ToolCallTimingGuard::capture_for_turn(
                 Arc::clone(&timing),
                 Arc::clone(&self.step_context.turn.turn_timing_state),
@@ -3421,6 +3628,7 @@ impl ToolCallRuntime {
                 .as_str(),
         ) || native_additions.is_some();
         let canonical_workspace_resources = Arc::clone(&self.canonical_workspace_resources);
+        let code_mode_user_intent = self.code_mode_user_intent.clone();
         let tracks_workspace = workspace_capable
             || !supports_parallel
             || router.delegates_workspace_admission(&evidence_call);
@@ -3463,7 +3671,7 @@ impl ToolCallRuntime {
         let terminal_tasks = self.session.terminal_tasks.clone();
 
         let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
-            AbortOnDropHandle::new(tokio::spawn(async move {
+            AbortOnDropHandle::new(tokio::spawn(Box::pin(async move {
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
                 let (admission, mut read_only) = match workspace_admission_hint {
                     Some(classification) => classification,
@@ -3499,20 +3707,26 @@ impl ToolCallRuntime {
                         .filter(|classification| classification.observes_workspace)
                         .map(|classification| classification.source_dependencies.clone())
                 });
-                let (dispatch_call, hook_notice) = scope_tool_dispatch_timing(
-                    Arc::clone(&timing),
-                    router.prepare_hook_input(ToolInvocation {
-                        session: Arc::clone(&session),
-                        step_context: Arc::clone(&step_context),
-                        cancellation_token: invocation_cancellation_token.clone(),
-                        tracker: Arc::clone(&tracker),
-                        call_id: dispatch_call.call_id,
-                        tool_name: dispatch_call.tool_name,
-                        source: source.clone(),
-                        payload: dispatch_call.payload,
-                    }),
-                )
-                .await?;
+                let (dispatch_call, hook_notice) = HOOK_USER_INTENT
+                    .scope(
+                        code_mode_user_intent.clone(),
+                        scope_tool_dispatch_timing(
+                            Arc::clone(&timing),
+                            router.prepare_hook_input(ToolInvocation {
+                                session: Arc::clone(&session),
+                                step_context: Arc::clone(&step_context),
+                                // Queued hooks belong to pre-admission caller lifetime.
+                                // Once entered, run_workspace_hook retains their effects.
+                                cancellation_token: admission_cancellation_token.clone(),
+                                tracker: Arc::clone(&tracker),
+                                call_id: dispatch_call.call_id,
+                                tool_name: dispatch_call.tool_name,
+                                source: source.clone(),
+                                payload: dispatch_call.payload,
+                            }),
+                        ),
+                    )
+                    .await?;
                 let hook_rewrote_input = hook_notice.is_some();
                 let evidence_call = dispatch_call.clone();
                 let admission_tool_name = router.semantic_tool_name(&dispatch_call.tool_name);
@@ -3600,14 +3814,30 @@ impl ToolCallRuntime {
                 timing.record_boundary(ToolLifecycleBoundary::ResourceResolutionEnd);
                 let passive_poll = is_passive_workspace_poll(&router, &evidence_call);
                 let post_hook_may_run = router.post_tool_use_hook_may_run(&ToolInvocation {
-                    session: Arc::clone(&session), step_context: Arc::clone(&step_context),
-                    cancellation_token: invocation_cancellation_token.clone(), tracker: Arc::clone(&tracker),
-                    call_id: dispatch_call.call_id.clone(), tool_name: dispatch_call.tool_name.clone(),
-                    source: source.clone(), payload: dispatch_call.payload.clone(),
+                    session: Arc::clone(&session),
+                    step_context: Arc::clone(&step_context),
+                    cancellation_token: invocation_cancellation_token.clone(),
+                    tracker: Arc::clone(&tracker),
+                    call_id: dispatch_call.call_id.clone(),
+                    tool_name: dispatch_call.tool_name.clone(),
+                    source: source.clone(),
+                    payload: dispatch_call.payload.clone(),
                 });
-                let hook_lease = if post_hook_may_run && !passive_poll && !router.delegates_workspace_admission(&evidence_call) {
-                    Some(Arc::new(acquire_exclusive_workspace_gate(Arc::clone(&lock), &turn.turn_timing_state).await))
-                } else { None };
+                let hook_lease = if post_hook_may_run
+                    && !passive_poll
+                    && !router.delegates_workspace_admission(&evidence_call)
+                {
+                    close_read_cohort(&global_gate_holders);
+                    Some(Arc::new(
+                        acquire_exclusive_workspace_gate(
+                            Arc::clone(&lock),
+                            &turn.turn_timing_state,
+                        )
+                        .await,
+                    ))
+                } else {
+                    None
+                };
                 let mut workspace_admission = workspace_admission_plan(
                     router.delegates_workspace_admission(&evidence_call),
                     router.permits_shared_workspace_observation(&evidence_call)
@@ -3624,6 +3854,16 @@ impl ToolCallRuntime {
                     workspace_capable,
                 );
                 workspace_admission.native_additions = additions;
+                workspace_admission.native_read_cohort = !post_hook_may_run
+                    && matches!(
+                        evidence_call.tool_name.name.as_str(),
+                        "read_file" | "list_files"
+                    )
+                    && router.permits_shared_workspace_observation(&evidence_call)
+                    && workspace_admission_classification.source_scope_complete
+                    && !workspace_admission_classification
+                        .source_dependencies
+                        .is_empty();
                 if tracks_workspace {
                     timing.record_boundary(ToolLifecycleBoundary::DiffTrackerWaitStart);
                     tracker
@@ -3636,7 +3876,9 @@ impl ToolCallRuntime {
                 }
                 timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitStart);
                 let mut gate_guard = if let Some(lease) = &hook_lease {
-                    Some(WorkspaceGateGuard::HookExclusive { _guard: Arc::clone(lease) })
+                    Some(WorkspaceGateGuard::HookExclusive {
+                        _guard: Arc::clone(lease),
+                    })
                 } else if workspace_admission.bypass_outer_gate {
                     None
                 } else {
@@ -3688,7 +3930,11 @@ impl ToolCallRuntime {
                 };
                 timing.record_boundary(ToolLifecycleBoundary::WorkspaceGateWaitEnd);
                 if admission_cancellation_token.is_cancelled()
-                    || !admission_dispatch_state.try_admit()
+                    || !admit_code_mode_user_intent(
+                        &session,
+                        code_mode_user_intent.as_ref(),
+                        || admission_dispatch_state.try_admit(),
+                    )?
                 {
                     // The cancellation owner won the admission race. Release
                     // any newly acquired guard without entering the handler;
@@ -3824,17 +4070,18 @@ impl ToolCallRuntime {
                             .map(|classification| classification.source_dependencies.clone())
                     });
 
-                let dispatch = router
-                    .dispatch_tool_call_with_terminal_outcome(
-                        Arc::clone(&session),
-                        Arc::clone(&step_context),
-                        invocation_cancellation_token,
-                        tracker,
-                        dispatch_call,
-                        source,
-                        router_dispatch_state,
-                    )
-                    .instrument(dispatch_span.clone());
+                // Keep the handler future out of every task-local/join wrapper's
+                // inline state; large handler variants otherwise exhaust a worker stack.
+                let dispatch = Box::pin(router.dispatch_tool_call_with_terminal_outcome(
+                    Arc::clone(&session),
+                    Arc::clone(&step_context),
+                    invocation_cancellation_token,
+                    tracker,
+                    dispatch_call,
+                    source,
+                    router_dispatch_state,
+                ))
+                .instrument(dispatch_span.clone());
                 let dispatch =
                     crate::tools::registry::with_prepared_hook_input(hook_notice, dispatch);
                 let dispatch = HOOK_WORKSPACE_LEASE.scope(hook_lease, dispatch);
@@ -3989,7 +4236,7 @@ impl ToolCallRuntime {
                     drop(gate_guard);
                 }
                 result
-            }));
+            })));
 
         let cancellation_owner = terminal_tasks.spawn(
             async move {
@@ -4310,8 +4557,11 @@ impl ToolCallRuntime {
             Ok(result) => result,
             Err(error) => {
                 let error = Self::tool_task_join_error(error);
-                // A joined panic cannot execute the registry's terminal branch.
-                dispatch_state.record_failed_trace(&error).await;
+                // A joined panic cannot execute the registry's terminal branch;
+                // it must still obey the same completion/cancellation election.
+                if dispatch_state.try_complete() {
+                    dispatch_state.record_failed_trace(&error).await;
+                }
                 Err(error)
             }
         }
@@ -4550,43 +4800,45 @@ impl Drop for ToolCallTimingGuard {
             runtime_tool_call_id = %self.runtime_tool_call_id,
             eager = snapshot.eager,
             outcome = snapshot.outcome.unwrap_or("unknown"),
-            execution_started = snapshot.parallel_gate_admitted,
-            item_to_first_poll_ms = snapshot.item_to_first_poll_ms.unwrap_or(0),
-            parallel_gate_wait_ms = snapshot.parallel_gate_wait_ms.unwrap_or(0),
+            timing_log_version = 2,
+            parallel_gate_admitted = snapshot.parallel_gate_admitted,
+            execution_started = snapshot.handler_duration_ms.is_some(),
+            item_to_first_poll_ms = snapshot.item_to_first_poll_ms,
+            parallel_gate_wait_ms = snapshot.parallel_gate_wait_ms,
             authorization_state_coordination_ms = snapshot
                 .authorization_state_coordination_ms
-                .unwrap_or(0),
+                ,
             first_poll_to_handler_entry_ms = snapshot
                 .first_poll_to_handler_entry_ms
-                .unwrap_or(0),
-            dispatch_duration_ms = snapshot.parallel_gate_wait_ms.unwrap_or(0),
-            handler_duration_ms = snapshot.handler_duration_ms.unwrap_or(0),
-            workspace_evidence_before_ms = snapshot.workspace_evidence_before_ms.unwrap_or(0),
+                ,
+            dispatch_duration_ms = snapshot.parallel_gate_wait_ms,
+            handler_duration_ms = snapshot.handler_duration_ms,
+            workspace_evidence_before_ms = snapshot.workspace_evidence_before_ms,
             workspace_evidence_before_cache_hit = snapshot
                 .workspace_evidence_before_cache_hit
-                .unwrap_or(false),
+                ,
             workspace_evidence_before_timed_out_git_dependencies =
                 ?snapshot.workspace_evidence_before_timed_out_git_dependencies,
-            workspace_evidence_after_ms = snapshot.workspace_evidence_after_ms.unwrap_or(0),
-            pre_tool_hook_ms = snapshot.pre_tool_hook_ms.unwrap_or(0),
-            post_tool_hook_ms = snapshot.post_tool_hook_ms.unwrap_or(0),
-            output_projection_ms = snapshot.output_projection_ms.unwrap_or(0),
-            history_persistence_ms = snapshot.history_persistence_ms.unwrap_or(0),
+            workspace_evidence_after_ms = snapshot.workspace_evidence_after_ms,
+            pre_tool_hook_ms = snapshot.pre_tool_hook_ms,
+            post_tool_hook_ms = snapshot.post_tool_hook_ms,
+            output_projection_ms = snapshot.output_projection_ms,
+            history_persistence_ms = snapshot.history_persistence_ms,
             first_poll_to_output_collected_ms = snapshot
                 .first_poll_to_output_collected_ms
-                .unwrap_or(0),
-            exec_request_to_spawn_ms = snapshot.exec_request_to_spawn_ms.unwrap_or(0),
-            exec_spawn_to_exit_ms = snapshot.exec_spawn_to_exit_ms.unwrap_or(0),
-            exec_exit_to_delivery_ms = snapshot.exec_exit_to_delivery_ms.unwrap_or(0),
-            exec_spawn_to_delivery_ms = snapshot.exec_spawn_to_delivery_ms.unwrap_or(0),
+                ,
+            exec_request_to_spawn_ms = snapshot.exec_request_to_spawn_ms,
+            exec_spawn_to_exit_ms = snapshot.exec_spawn_to_exit_ms,
+            exec_exit_to_delivery_ms = snapshot.exec_exit_to_delivery_ms,
+            exec_spawn_to_delivery_ms = snapshot.exec_spawn_to_delivery_ms,
             exec_process_alive_at_delivery = snapshot.exec_process_alive_at_delivery,
             exec_cleanup_state_observed = snapshot.exec_cleanup_state_observed,
             exec_background_process_expected = snapshot.exec_background_process_expected,
             exec_running_process_after_cleanup = snapshot.exec_running_process_after_cleanup,
             exec_running_process_stale = snapshot.exec_running_process_after_cleanup
                 && !snapshot.exec_background_process_expected,
-            post_handler_ms = snapshot.post_handler_ms.unwrap_or(0),
-            total_duration_ms = snapshot.total_duration_ms.unwrap_or(0),
+            post_handler_ms = snapshot.post_handler_ms,
+            total_duration_ms = snapshot.total_duration_ms,
             "tool call completed"
         );
     }
@@ -4655,7 +4907,9 @@ mod tests {
                     tokio::time::timeout(
                         Duration::from_secs(5),
                         locked_session.lock_history_state_for_test(),
-                    ).await.expect("history lock acquired")
+                    )
+                    .await
+                    .expect("history lock acquired")
                 });
                 let _ = held_tx.send(());
                 let released = release_rx.recv_timeout(Duration::from_secs(10));
@@ -4674,7 +4928,10 @@ mod tests {
             })
             .await;
             release_tx.send(()).expect("release history holder");
-            holder.await.expect("history holder joined").expect("history holder released");
+            holder
+                .await
+                .expect("history holder joined")
+                .expect("history holder released");
             let result = result
                 .expect("empty flush must not acquire unrelated history state")
                 .expect("empty flush succeeds");
@@ -4844,10 +5101,14 @@ mod tests {
                                 tokio::time::timeout(
                                     Duration::from_secs(5),
                                     session.lock_history_state_for_test(),
-                                ).await.expect("history lock acquired")
+                                )
+                                .await
+                                .expect("history lock acquired")
                             });
                             held_tx.send(()).expect("state hold observed");
-                            begin_rx.recv_timeout(Duration::from_secs(10)).expect("measurement begins");
+                            begin_rx
+                                .recv_timeout(Duration::from_secs(10))
+                                .expect("measurement begins");
                             let held_at = Instant::now();
                             std::thread::sleep(STATE_HOLD);
                             drop(state);
@@ -5133,6 +5394,7 @@ mod tests {
         };
         let plan = |resource_key, shared_resource| WorkspaceAdmissionPlan {
             native_additions: None,
+            native_read_cohort: false,
             bypass_outer_gate: false,
             resource_key,
             shared_resource,
@@ -5238,7 +5500,7 @@ mod tests {
         };
         assert!(result.0.contains("no nested deadline"));
         drop(held);
-        assert!(holders.lock().unwrap().is_empty());
+        assert!(holders.lock().unwrap().holders.is_empty());
 
         // Multiple resource readers, not unrelated global readers, are the
         // blockers of a resource writer. Downgrade must update attribution.
@@ -5292,7 +5554,7 @@ mod tests {
         );
         drop((first, second));
         assert!(Arc::clone(&resource).try_write_owned().is_ok());
-        assert!(holders.lock().unwrap().is_empty());
+        assert!(holders.lock().unwrap().holders.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -5312,6 +5574,7 @@ mod tests {
         let resource = workspace_resource_gate(&resources, key.clone());
         let plan = || WorkspaceAdmissionPlan {
             native_additions: None,
+            native_read_cohort: false,
             bypass_outer_gate: false,
             resource_key: Some(key.clone()),
             shared_resource: false,
@@ -5676,7 +5939,10 @@ mod tests {
             ),
             (
                 "exec_command",
-                serde_json::json!({"cmd":"git status --short --untracked-files=all"}),
+                // Status is a proven read only with optional locks and fsmonitor off.
+                serde_json::json!({
+                    "cmd": "git --no-optional-locks -c core.fsmonitor=false status --short --untracked-files=all"
+                }),
                 "evidence.txt",
             ),
         ] {
@@ -6736,12 +7002,25 @@ mod tests {
 
     #[tokio::test]
     async fn post_hook_workspace_evidence_uses_the_executed_payload() {
-        let default_cwd = std::path::Path::new("/repo");
+        use codex_utils_absolute_path::test_support::test_path_buf;
+        let default_cwd = test_path_buf("/repo");
+        let other_repo = test_path_buf("/other-repo");
+        let default_cwd = default_cwd.as_path();
+        // Command dependencies resolve only through a ready local environment.
+        let environments = crate::environment_selection::TurnEnvironmentSnapshot {
+            turn_environments: vec![crate::session::turn_context::TurnEnvironment::new(
+                "local".into(),
+                Arc::new(codex_exec_server::Environment::default_for_tests()),
+                codex_utils_path_uri::PathUri::from_host_native_path(default_cwd).unwrap(),
+                None,
+            )],
+            ..Default::default()
+        };
         let original_mutation = ToolPayload::Function {
             arguments: serde_json::json!({
                 "program": "git",
                 "args": ["add", "src/lib.rs"],
-                "workdir": "/repo"
+                "workdir": default_cwd
             })
             .to_string(),
         };
@@ -6756,7 +7035,7 @@ mod tests {
             arguments: serde_json::json!({
                 "program": "rg",
                 "args": ["needle", "src/lib.rs"],
-                "workdir": "/other-repo"
+                "workdir": other_repo
             })
             .to_string(),
         };
@@ -6765,19 +7044,16 @@ mod tests {
             "exec_command",
             Some(&rewritten_read),
             default_cwd,
-            &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+            &environments,
         )
         .await
         .expect("executed payload classification");
         assert!(executed_read.observes_workspace);
-        assert_eq!(
-            executed_read.workspace_cwd,
-            std::path::PathBuf::from("/other-repo")
-        );
+        assert_eq!(executed_read.workspace_cwd, other_repo);
         assert_eq!(
             executed_read.source_dependencies,
             std::collections::BTreeSet::from([crate::tool_history::SourceDependencyV1::new(
-                std::path::Path::new("/other-repo/src/lib.rs"),
+                &test_path_buf("/other-repo/src/lib.rs"),
                 false,
             )])
         );
@@ -6798,12 +7074,12 @@ mod tests {
                 arguments: serde_json::json!({
                     "program": "git",
                     "args": ["add", "src/lib.rs"],
-                    "workdir": "/other-repo"
+                    "workdir": other_repo
                 })
                 .to_string(),
             }),
             default_cwd,
-            &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+            &environments,
         )
         .await
         .expect("executed payload classification");
@@ -6822,7 +7098,7 @@ mod tests {
                 "exec_command",
                 None,
                 default_cwd,
-                &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+                &environments,
             )
             .await
             .expect("executed payload classification"),
@@ -7113,9 +7389,16 @@ mod tests {
             timing_event.contains("execution_started=false"),
             "tool cancelled before admission should not report execution started: {timing_event}"
         );
+        // Timing log v2 omits unknown durations instead of reporting zero. Gate
+        // wait (and its legacy dispatch alias) exists only after gate admission,
+        // and handler timing only after handler entry.
         assert!(
-            timing_event.contains("handler_duration_ms=0"),
-            "tool cancelled before admission should report zero handler duration: {timing_event}"
+            timing_event.contains("timing_log_version=2"),
+            "{timing_event}"
+        );
+        assert!(
+            timing_event.contains("parallel_gate_admitted=false"),
+            "tool cancelled before admission was never admitted: {timing_event}"
         );
         let duration_field = |name: &str| {
             timing_event.split_whitespace().find_map(|field| {
@@ -7124,21 +7407,21 @@ mod tests {
                     .and_then(|value| value.parse::<u64>().ok())
             })
         };
-        let parallel_gate_wait_ms = duration_field("parallel_gate_wait_ms")
-            .expect("timing event should include parallel_gate_wait_ms");
-        let dispatch_duration_ms = duration_field("dispatch_duration_ms")
-            .expect("compatibility timing should include dispatch_duration_ms");
-        let total_duration_ms = duration_field("total_duration_ms")
-            .expect("timing event should include total_duration_ms");
-        assert_eq!(
-            dispatch_duration_ms, parallel_gate_wait_ms,
-            "legacy dispatch timing should alias parallel-gate wait: {timing_event}"
-        );
-        assert!(
-            total_duration_ms >= parallel_gate_wait_ms
-                && total_duration_ms - parallel_gate_wait_ms <= 1,
-            "tool cancelled before admission should spend its polled lifetime at the gate: {timing_event}"
-        );
+        for name in [
+            "handler_duration_ms",
+            "first_poll_to_handler_entry_ms",
+            "parallel_gate_wait_ms",
+            "dispatch_duration_ms",
+        ] {
+            assert!(
+                !timing_event
+                    .split_whitespace()
+                    .any(|field| field.starts_with(&format!("{name}="))),
+                "tool cancelled before admission has no {name}: {timing_event}"
+            );
+        }
+        // The polled lifetime, all of it spent before admission, is still reported.
+        duration_field("total_duration_ms").expect("timing event should include total_duration_ms");
         drop(execution_gate_guard);
 
         Ok(())
@@ -7171,7 +7454,7 @@ mod tests {
             .expect("execution gate should be available before dispatch starts");
         let cancellation_token = CancellationToken::new();
 
-        let response_task = tokio::spawn(runtime.handle_tool_call_with_source(
+        let future = runtime.handle_tool_call_with_source(
             ToolCall {
                 tool_name,
                 call_id: "nested-cancelled-call".to_string(),
@@ -7187,7 +7470,17 @@ mod tests {
                 cancellation_cause: None,
             },
             cancellation_token.clone(),
-        ));
+        );
+        let admitted = turn_context.turn_timing_state.sampling_checkpoint().timing;
+        assert_eq!(admitted.counters.tool_call_count, 1);
+        assert_eq!(admitted.tool_closure.accepted_count, 1);
+        assert!(admitted.milestones.first_tool_accepted_ms.is_some());
+        assert!(admitted.milestones.first_tool_handler_entry_ms.is_none());
+        assert!(
+            admitted.tool_calls.is_empty(),
+            "nested admission must precede first poll"
+        );
+        let response_task = tokio::spawn(future);
         tokio::time::timeout(Duration::from_secs(5), async {
             while turn_context
                 .turn_timing_state
@@ -7295,6 +7588,106 @@ mod tests {
         tool_name: codex_tools::ToolName,
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "Hold the workspace writer so hook preparation queues, then cancel it before release"
+    )]
+    async fn cancelled_queued_hook_preparation_never_enters_after_writer_release() {
+        struct HookPreparation {
+            base: ImmediateHandler,
+            queued: Arc<Notify>,
+            entered: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl ToolExecutor<ToolInvocation> for HookPreparation {
+            fn tool_name(&self) -> codex_tools::ToolName {
+                self.base.tool_name()
+            }
+            fn spec(&self) -> codex_tools::ToolSpec {
+                self.base.spec()
+            }
+            fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+                self.base.handle(invocation)
+            }
+        }
+        impl CoreToolRuntime for HookPreparation {
+            fn prepare_invocation<'a>(
+                &'a self,
+                invocation: ToolInvocation,
+            ) -> futures::future::BoxFuture<'a, Result<ToolInvocation, FunctionCallError>>
+            {
+                let entered = Arc::clone(&self.entered);
+                Box::pin(async move {
+                    self.queued.notify_one();
+                    run_workspace_hook(
+                        Arc::clone(&invocation.session),
+                        Arc::clone(&invocation.step_context.turn),
+                        Arc::clone(&invocation.tracker),
+                        invocation.cancellation_token.clone(),
+                        async move {
+                            entered.store(true, std::sync::atomic::Ordering::Release);
+                        },
+                    )
+                    .await?;
+                    Ok(invocation)
+                })
+            }
+        }
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let queued = Arc::new(Notify::new());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let name = codex_tools::ToolName::plain("test_tool");
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([Arc::new(HookPreparation {
+                base: ImmediateHandler {
+                    tool_name: name.clone(),
+                },
+                queued: Arc::clone(&queued),
+                entered: Arc::clone(&entered),
+            }) as Arc<dyn CoreToolRuntime>]),
+            Vec::new(),
+        ));
+        let context = StepContext::for_test(Arc::clone(&turn)).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            Arc::clone(&session),
+            context,
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+        );
+        let writer = turn
+            .workspace_execution_coordinator
+            .parallel_execution
+            .write()
+            .await;
+        let cancellation = CancellationToken::new();
+        let response = tokio::spawn(runtime.handle_tool_call(
+            ToolCall {
+                tool_name: name,
+                call_id: "queued-hook".into(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".into(),
+                },
+            },
+            cancellation.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), queued.notified())
+            .await
+            .unwrap();
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(writer);
+        session.terminal_tasks.close();
+        tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+            .await
+            .unwrap();
+        assert!(!entered.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     impl ToolExecutor<ToolInvocation> for ImmediateHandler {
         fn tool_name(&self) -> codex_tools::ToolName {
             self.tool_name.clone()
@@ -7398,7 +7791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sampled_workspace_reads_reuse_only_original_current_dependencies() {
+    async fn sampled_workspace_reads_without_byte_proof_always_dispatch() {
         use crate::session::turn_execution::SamplingRequestSettledState;
         use crate::session::turn_execution::TurnExecutionControl;
         use codex_utils_absolute_path::AbsolutePathBuf;
@@ -7574,8 +7967,8 @@ mod tests {
             );
             assert_eq!(
                 executions.load(Ordering::SeqCst),
-                if external_edit { 2 } else { 1 },
-                "reuse requires the original dependency observations to remain current"
+                2,
+                "ReadSearch registration and watcher silence are not a byte-equivalence proof"
             );
             let history = session.clone_history().await;
             let notices = history.raw_items().iter().filter(|item| {
@@ -7588,9 +7981,8 @@ mod tests {
                     }))
             }).count();
             assert_eq!(
-                notices,
-                usize::from(!external_edit),
-                "only retained observations should carry a replay notice"
+                notices, 0,
+                "unvalidated historical observations must not carry a replay notice"
             );
         }
     }
@@ -7665,9 +8057,11 @@ mod tests {
     )]
     async fn native_read_replay_direct_and_nested_baseline() {
         use crate::session::turn_context::TurnEnvironment;
-        use crate::session::turn_execution::{SamplingRequestSettledState, TurnExecutionControl};
+        use crate::session::turn_execution::SamplingRequestSettledState;
+        use crate::session::turn_execution::TurnExecutionControl;
         use crate::tools::handlers::ReadFileHandler;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
 
         struct CountedNativeRead(Arc<AtomicUsize>);
         impl ToolExecutor<ToolInvocation> for CountedNativeRead {
@@ -7695,6 +8089,8 @@ mod tests {
                 "unchanged",
                 "unrelated",
                 "relevant",
+                "silent-write",
+                "hardlink-write",
                 "permission",
                 "selection",
             ] {
@@ -7709,7 +8105,18 @@ mod tests {
                 );
                 let path = workspace.path().join("source.txt");
                 std::fs::write(&path, "original source\n").unwrap();
-                let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+                let alias_root = tempfile::tempdir().unwrap();
+                let alias = alias_root.path().join("alias.txt");
+                if change == "hardlink-write" {
+                    std::fs::hard_link(&path, &alias).unwrap();
+                }
+                let (mut session, mut turn) =
+                    crate::session::tests::make_session_and_context().await;
+                // A deterministic undelivered-event fixture. Neither an ordinary
+                // external edit nor a write through an external inode alias may
+                // authorize stale replay while the application journal is quiet.
+                session.services.git_workspace =
+                    crate::git_workspace::GitWorkspaceCache::with_noop_watcher_for_tests();
                 Arc::make_mut(&mut turn.config).cwd =
                     codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
                         workspace.path(),
@@ -7744,6 +8151,8 @@ mod tests {
                 for index in 0..2 {
                     if index == 1 {
                         match change {
+                            "silent-write" => std::fs::write(&path, "changed source\n").unwrap(),
+                            "hardlink-write" => std::fs::write(&alias, "changed source\n").unwrap(),
                             "unrelated" | "relevant" => {
                                 let name = if change == "relevant" {
                                     "source.txt"
@@ -7835,18 +8244,37 @@ mod tests {
                         );
                         value.to_string()
                     } else {
+                        let timing = Arc::new(ToolDispatchTiming::new_with_turn_clock(
+                            Arc::clone(&turn.turn_timing_state),
+                            TokioInstant::now(),
+                            false,
+                        ));
                         let result = runtime
                             .clone()
-                            .handle_tool_call(call, CancellationToken::new())
+                            .handle_model_tool_call_with_trace(
+                                call,
+                                CancellationToken::new(),
+                                Arc::clone(&timing),
+                            )
                             .await
                             .unwrap();
-                        serde_json::to_string(&result).unwrap()
+                        let snapshot = timing.snapshot(TokioInstant::now());
+                        assert!(snapshot.parallel_gate_admitted, "{index} {change}");
+                        if index == 1 && matches!(change, "unchanged" | "unrelated" | "selection") {
+                            assert_eq!(snapshot.handler_duration_ms, None);
+                            assert_eq!(snapshot.exec_request_to_spawn_ms, None);
+                        }
+                        serde_json::to_string(&result.response).unwrap()
                     };
-                    assert!(output.contains(if index == 1 && change == "relevant" {
-                        "changed source"
-                    } else {
-                        "original source"
-                    }));
+                    assert!(output.contains(
+                        if index == 1
+                            && matches!(change, "relevant" | "silent-write" | "hardlink-write")
+                        {
+                            "changed source"
+                        } else {
+                            "original source"
+                        }
+                    ));
                     control.settle(
                         &baseline,
                         &collector,
@@ -7857,7 +8285,11 @@ mod tests {
                         },
                     );
                 }
-                let expected = if nested || matches!(change, "relevant" | "permission") {
+                let expected = if nested
+                    || matches!(
+                        change,
+                        "relevant" | "silent-write" | "hardlink-write" | "permission"
+                    ) {
                     2
                 } else {
                     1
@@ -7871,7 +8303,6 @@ mod tests {
             }
         }
     }
-
     #[tokio::test]
     async fn runtime_read_then_patch_projects_stale_only_for_overlapping_sources() {
         use crate::tools::handlers::ApplyPatchHandler;
@@ -7933,8 +8364,17 @@ mod tests {
                 step,
                 Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             );
+            // Only a search that excludes config and global/parent ignore
+            // files has a closed input scope that a disjoint edit cannot reach.
             let arguments = serde_json::json!({
-                "program": "rg", "args": ["--no-config", "before", "source.txt"],
+                "program": "rg",
+                "args": [
+                    "--no-config",
+                    "--no-ignore-global",
+                    "--no-ignore-parent",
+                    "before",
+                    "source.txt",
+                ],
                 "workdir": workspace.path(),
             })
             .to_string();
@@ -8129,7 +8569,12 @@ mod tests {
     }
 
     #[test_case::test_case("Get-Content contract.txt", true; "scoped read")]
-    #[test_case::test_case("git status --short", false; "unscoped read")]
+    // Status is a certified read only with optional locks and fsmonitor off.
+    #[test_case::test_case(
+        "git --no-optional-locks -c core.fsmonitor=false status --short",
+        false;
+        "unscoped read"
+    )]
     #[tokio::test]
     async fn nested_workspace_result_carries_dependencies_without_output_projection(
         command: &str,
@@ -8153,6 +8598,15 @@ mod tests {
         Arc::make_mut(&mut turn_context.config).cwd =
             codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())
                 .unwrap();
+        // Command dependencies resolve against the selected local environment's
+        // cwd, so root that environment in the same workspace.
+        turn_context.environments.turn_environments =
+            vec![crate::session::turn_context::TurnEnvironment::new(
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+                Arc::new(codex_exec_server::Environment::default_for_tests()),
+                codex_utils_path_uri::PathUri::from_host_native_path(workspace.path()).unwrap(),
+                None,
+            )];
         let session = Arc::new(session);
         let turn_context = Arc::new(turn_context);
         let tool_name = codex_tools::ToolName::plain("exec_command");
@@ -8317,9 +8771,13 @@ mod tests {
                 revision: Some(revision.clone()),
                 captured_current: true,
                 source_scope_complete: true,
+                // A dependency needs a host locator to be checkable at all; an
+                // unlocatable one is reported as invalidated instead.
                 source_dependencies: std::collections::BTreeSet::from([
                     crate::tool_history::SourceDependencyV1::new(
-                        std::path::Path::new("fixture/source.rs"),
+                        &codex_utils_absolute_path::test_support::test_path_buf(
+                            "/fixture/source.rs",
+                        ),
                         false,
                     ),
                 ]),
@@ -9734,9 +10192,19 @@ mod tests {
         let executed_path = workspace.path().join("executed.txt");
         std::fs::write(&original_path, "original").expect("write original source");
         std::fs::write(&executed_path, "executed").expect("write executed source");
+        // Only a search that excludes config and global/parent ignore files
+        // has a closed input scope that another file's change cannot reach.
         let payload = |path: &std::path::Path| ToolPayload::Function {
             arguments: serde_json::json!({
-                "program": "rg", "args": ["needle", path], "workdir": workspace.path()
+                "program": "rg",
+                "args": [
+                    "--no-config",
+                    "--no-ignore-global",
+                    "--no-ignore-parent",
+                    "needle",
+                    path,
+                ],
+                "workdir": workspace.path()
             })
             .to_string(),
         };
@@ -9746,12 +10214,22 @@ mod tests {
             workspace.path(),
         );
         let executed_payload = payload(&executed_path);
+        // Command dependencies resolve only through a ready local environment.
+        let environments = crate::environment_selection::TurnEnvironmentSnapshot {
+            turn_environments: vec![crate::session::turn_context::TurnEnvironment::new(
+                codex_exec_server::LOCAL_ENVIRONMENT_ID.into(),
+                Arc::new(codex_exec_server::Environment::default_for_tests()),
+                codex_utils_path_uri::PathUri::from_host_native_path(workspace.path()).unwrap(),
+                None,
+            )],
+            ..Default::default()
+        };
         let executed = executed_workspace_classification(
             &original,
             "exec_command",
             Some(&executed_payload),
             workspace.path(),
-            &crate::environment_selection::TurnEnvironmentSnapshot::default(),
+            &environments,
         )
         .await
         .expect("executed payload classification");
@@ -9832,7 +10310,12 @@ mod tests {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
         let workspace = tempfile::tempdir().expect("non-Git workspace");
         let cache = session.services.git_workspace.as_ref();
-        assert!(cache.workspace_evidence_identity(workspace.path()).await.is_none());
+        assert!(
+            cache
+                .workspace_evidence_identity(workspace.path())
+                .await
+                .is_none()
+        );
         let batch = WorkspaceEvidenceGenerationBatch::new();
         for name in ["first.txt", "second.txt"] {
             std::fs::write(workspace.path().join(name), "unchanged").unwrap();
@@ -9843,49 +10326,76 @@ mod tests {
                 arguments: serde_json::json!({"path": path}).to_string(),
             };
             let classification = crate::tool_history::classify_workspace_tool_call(
-                "read_file", &payload, workspace.path(),
+                "read_file",
+                &payload,
+                workspace.path(),
             );
-            let baseline = batch.capture_baseline_for_tool(
-                cache, None, &classification, "read_file", 0,
-            ).await;
+            let baseline = batch
+                .capture_baseline_for_tool(cache, None, &classification, "read_file", 0)
+                .await;
             assert!(baseline.revision.is_none());
             let response = ResponseInputItem::FunctionCallOutput {
                 call_id: name.into(),
-                output: FunctionCallOutputPayload::from_text(std::fs::read_to_string(&path).unwrap()),
+                output: FunctionCallOutputPayload::from_text(
+                    std::fs::read_to_string(&path).unwrap(),
+                ),
             };
             ToolCallRuntime::register_workspace_evidence_after_call(
-                &session, &turn_context,
+                &session,
+                &turn_context,
                 WorkspaceEvidenceAfterCall {
-                    response: &response, baseline: Some(baseline), mutation_advanced: false,
-                    source_dependencies_override: None, classification: &classification,
+                    response: &response,
+                    baseline: Some(baseline),
+                    mutation_advanced: false,
+                    source_dependencies_override: None,
+                    classification: &classification,
                     workspace_gate_guard: None,
-                }, None, None,
-            ).await;
-            let ToolPayload::Function { arguments } = payload else { unreachable!() };
+                },
+                None,
+                None,
+            )
+            .await;
+            let ToolPayload::Function { arguments } = payload else {
+                unreachable!()
+            };
             let canonical: Arc<[ResponseItem]> = Arc::from([
                 ResponseItem::FunctionCall {
-                    id: None, name: "read_file".into(), namespace: None, arguments,
-                    call_id: name.into(), internal_chat_message_metadata_passthrough: None,
+                    id: None,
+                    name: "read_file".into(),
+                    namespace: None,
+                    arguments,
+                    call_id: name.into(),
+                    internal_chat_message_metadata_passthrough: None,
                 },
                 ResponseItem::from(response),
             ]);
             let state = session.clone_history().await.tool_history_state();
             for _ in 0..4 {
-                assert!(crate::tool_history::tests::freshness_notices(&state, &canonical, None, cache).is_empty(),
-                    "unchanged non-Git reads must not acquire stale notices on continuation");
+                assert!(
+                    crate::tool_history::tests::freshness_notices(&state, &canonical, None, cache)
+                        .is_empty(),
+                    "unchanged non-Git reads must not acquire stale notices on continuation"
+                );
             }
             // Native external writes, not only our tool mutation tracker, must
             // still invalidate the captured read.
             std::fs::write(&path, "externally changed").unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 loop {
-                    let notices = crate::tool_history::tests::freshness_notices(&state, &canonical, None, cache);
-                    if notices.iter().any(|notice| notice["workspace_evidence_freshness"] == "changed") {
+                    let notices = crate::tool_history::tests::freshness_notices(
+                        &state, &canonical, None, cache,
+                    );
+                    if notices
+                        .iter()
+                        .any(|notice| notice["workspace_evidence_freshness"] == "changed")
+                    {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-            }).await.expect("native watcher must invalidate the external edit");
+            })
+            .await
+            .expect("native watcher must invalidate the external edit");
         }
     }
 
@@ -10906,11 +11416,14 @@ mod tests {
         }
     }
 
-    #[test_case::test_case(false; "successful execution")]
-    #[test_case::test_case(true; "failed execution")]
+    #[test_case::test_case(false, true; "successful execution")]
+    #[test_case::test_case(true, true; "failed execution")]
+    #[test_case::test_case(false, false; "stalled observer preserves success")]
+    #[test_case::test_case(true, false; "stalled observer preserves failure")]
     #[tokio::test]
     async fn cancellation_during_finish_notification_preserves_completed_execution(
         failure: bool,
+        release_observer: bool,
     ) -> anyhow::Result<()> {
         let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
         let records = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10978,9 +11491,11 @@ mod tests {
             .expect("lifecycle notification should start");
         cancellation_token.cancel();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        allow_finish.notify_waiters();
+        if release_observer {
+            allow_finish.notify_waiters();
+        }
 
-        let response = tokio::time::timeout(Duration::from_secs(1), response_task)
+        let response = tokio::time::timeout(Duration::from_secs(3), response_task)
             .await
             .expect("timed out waiting for tool response")
             .expect("tool response task should join")?;
@@ -11005,13 +11520,17 @@ mod tests {
             .drain(..)
             .collect::<Vec<_>>();
         assert_eq!(
-            vec![if failure {
-                ToolCallOutcome::Failed {
-                    handler_executed: true,
-                }
+            if !release_observer {
+                vec![]
             } else {
-                ToolCallOutcome::Completed { success: true }
-            }],
+                vec![if failure {
+                    ToolCallOutcome::Failed {
+                        handler_executed: true,
+                    }
+                } else {
+                    ToolCallOutcome::Completed { success: true }
+                }]
+            },
             actual
         );
 
@@ -12118,11 +12637,9 @@ mod tests {
         assert_dispatch_regression_trace(
             &bundle,
             call_id,
-            if force_cleanup {
-                codex_rollout_trace::ExecutionStatus::Cancelled
-            } else {
-                codex_rollout_trace::ExecutionStatus::Failed
-            },
+            // Abort owns the disposition even when cooperative cleanup later
+            // returns an error carrying already-committed effects.
+            codex_rollout_trace::ExecutionStatus::Cancelled,
             true,
         )?;
 
@@ -12252,11 +12769,12 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), terminal).await??;
         wait_for_dispatch_regression_terminal(&bundle, call_id).await?;
         // Cooperative cleanup returns the handler's failure, so retain the same
-        // registry terminal as explicit cancellation rather than overwrite it.
+        // registry terminal as explicit cancellation rather than overwrite it:
+        // abort owns the disposition (see check_dispatch_cancellation_trace).
         assert_dispatch_regression_trace(
             &bundle,
             call_id,
-            codex_rollout_trace::ExecutionStatus::Failed,
+            codex_rollout_trace::ExecutionStatus::Cancelled,
             true,
         )?;
         Ok(())
@@ -12859,4 +13377,45 @@ mod tests {
             );
         }
     }
+}
+#[cfg(test)]
+#[test]
+fn remote_exec_file_reads_do_not_inherit_primary_host_freshness() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("input.txt"), "HOST_SENTINEL").unwrap();
+    let cwd = codex_utils_path_uri::PathUri::from_host_native_path(temp.path()).unwrap();
+    let local = crate::session::turn_context::TurnEnvironment::new(
+        "local".into(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        cwd.clone(),
+        None,
+    );
+    let remote = crate::session::turn_context::TurnEnvironment::new(
+        "remote".into(),
+        Arc::new(
+            codex_exec_server::Environment::create_for_tests(Some("ws://127.0.0.1:1".into()))
+                .unwrap(),
+        ),
+        cwd,
+        None,
+    );
+    let environments = crate::environment_selection::TurnEnvironmentSnapshot {
+        turn_environments: vec![local, remote],
+        ..Default::default()
+    };
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "cmd":"Get-Content -Raw input.txt", "environment_id":"remote",
+        })
+        .to_string(),
+    };
+    let classified =
+        crate::tool_history::classify_workspace_tool_call("exec_command", &payload, temp.path());
+    let classified =
+        native_file_classification(classified, "exec_command", &payload, &environments);
+    assert!(classified.source_dependencies.is_empty());
+    assert!(
+        !classified.source_scope_complete,
+        "a host watcher cannot prove remote source freshness"
+    );
 }

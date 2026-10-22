@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EnvironmentsState {
     environments: BTreeMap<String, EnvironmentState>,
+    primary_environment_id: Option<String>,
     current_date: Option<String>,
     timezone: Option<String>,
     network: Option<NetworkContext>,
@@ -30,6 +31,10 @@ impl EnvironmentsState {
     ) -> Self {
         Self {
             environments: environment_states(environments),
+            primary_environment_id: environments
+                .to_selections()
+                .first()
+                .map(|selection| selection.environment_id.clone()),
             current_date: turn_context.current_date.clone(),
             timezone: turn_context.timezone.clone(),
             network: network_from_turn_context(turn_context),
@@ -46,6 +51,7 @@ impl EnvironmentsState {
 
     fn rendered_full(&self) -> RenderedEnvironments {
         RenderedEnvironments {
+            primary_environment_id: self.primary_environment_id.clone(),
             updates: self
                 .environments
                 .iter()
@@ -85,6 +91,7 @@ impl WorldStateSection for EnvironmentsState {
 
     fn snapshot(&self) -> Self::Snapshot {
         EnvironmentsSnapshot {
+            primary_environment_id: self.primary_environment_id.clone(),
             environments: self
                 .environments
                 .iter()
@@ -92,6 +99,7 @@ impl WorldStateSection for EnvironmentsState {
                     (
                         id.clone(),
                         EnvironmentSnapshot {
+                            owner_id: environment.owner_id.clone(),
                             cwd: environment.cwd.inferred_native_path_string(),
                             status: environment.status,
                             shell: environment.shell.clone(),
@@ -174,7 +182,11 @@ impl WorldStateSection for EnvironmentsState {
             && updates
                 .values()
                 .all(|update| matches!(update, EnvironmentUpdate::Current(..)));
-        (replace_all || !updates.is_empty() || turn_context_values_changed || subagents_changed)
+        (replace_all
+            || !updates.is_empty()
+            || turn_context_values_changed
+            || subagents_changed
+            || current.primary_environment_id != previous.primary_environment_id)
             .then(|| {
                 // Stable-context projection replaces the previous environment
                 // block. Include unchanged current fields as well as removals.
@@ -184,6 +196,7 @@ impl WorldStateSection for EnvironmentsState {
                         .or_insert_with(|| EnvironmentUpdate::Current(environment.clone(), false));
                 }
                 Box::new(RenderedEnvironments {
+                    primary_environment_id: current.primary_environment_id.clone(),
                     updates,
                     legacy_single,
                     // This block contains all current facts. Make omission semantics explicit
@@ -230,6 +243,7 @@ impl ContextualUserFragment for EnvironmentsState {
 }
 
 struct RenderedEnvironments {
+    primary_environment_id: Option<String>,
     updates: BTreeMap<String, EnvironmentUpdate>,
     legacy_single: bool,
     replace_all: bool,
@@ -263,6 +277,13 @@ impl ContextualUserFragment for RenderedEnvironments {
             let mut rendered = "\n".to_string();
             if self.replace_all {
                 rendered.push_str("  This environment context replaces all previously provided environment context. Unlisted environments are unavailable; omitted fields are unspecified; omitted subagents means none.\n");
+            }
+            if !self.legacy_single {
+                push_optional_element(
+                    &mut rendered,
+                    "primary_environment_id",
+                    self.primary_environment_id.as_deref(),
+                );
             }
             if self.legacy_single {
                 if let Some(EnvironmentUpdate::Current(environment, report_available)) =
@@ -342,6 +363,14 @@ fn push_environment_values(
     rendered.push_str("<cwd>");
     push_xml_escaped_text(rendered, &environment.cwd.inferred_native_path_string());
     rendered.push_str("</cwd>\n");
+    // Emit owner changes without replacing the compact legacy local layout.
+    if environment
+        .owner_id
+        .as_deref()
+        .is_some_and(|owner| !owner.ends_with(":local"))
+    {
+        push_optional_element(rendered, "owner_id", environment.owner_id.as_deref());
+    }
     if let Some(os) = &environment.os {
         rendered.push_str(indent);
         rendered.push_str("<os>");
@@ -381,6 +410,7 @@ fn push_optional_element(rendered: &mut String, name: &str, value: Option<&str>)
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EnvironmentState {
+    owner_id: Option<String>,
     cwd: PathUri,
     status: EnvironmentStatus,
     shell: Option<String>,
@@ -390,6 +420,8 @@ struct EnvironmentState {
 #[derive(Default, Deserialize, Serialize)]
 pub(crate) struct EnvironmentsSnapshot {
     environments: BTreeMap<String, EnvironmentSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    primary_environment_id: Option<String>,
     current_date: Option<String>,
     timezone: Option<String>,
     network: Option<String>,
@@ -399,6 +431,8 @@ pub(crate) struct EnvironmentsSnapshot {
 
 #[derive(Deserialize, Serialize)]
 struct EnvironmentSnapshot {
+    #[serde(default)]
+    owner_id: Option<String>,
     cwd: String,
     status: EnvironmentStatus,
     shell: Option<String>,
@@ -409,6 +443,7 @@ struct EnvironmentSnapshot {
 impl EnvironmentSnapshot {
     fn has_same_diff_value(&self, other: &Self) -> bool {
         self.cwd == other.cwd
+            && self.owner_id == other.owner_id
             && self.status == other.status
             && self.shell == other.shell
             && self.os == other.os
@@ -431,6 +466,7 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
             (
                 environment.environment_id.clone(),
                 EnvironmentState {
+                    owner_id: Some(environment.owner_id()),
                     cwd: environment.cwd().clone(),
                     os: environment.operating_system.clone(),
                     status: EnvironmentStatus::Available,
@@ -449,6 +485,7 @@ fn environment_states(snapshot: &TurnEnvironmentSnapshot) -> BTreeMap<String, En
         environments
             .entry(environment.selection.environment_id.clone())
             .or_insert_with(|| EnvironmentState {
+                owner_id: None,
                 cwd: environment.selection.cwd.clone(),
                 os: None,
                 status: if environment.has_failed() {

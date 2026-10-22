@@ -221,6 +221,9 @@ pub enum ThreadItem {
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
+        environment: Option<codex_protocol::items::EnvironmentProvenance>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         output_metadata: Option<codex_protocol::items::CommandExecutionOutputMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
@@ -269,6 +272,9 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     FileChange {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        environment: Option<codex_protocol::items::EnvironmentProvenance>,
         changes: Vec<FileUpdateChange>,
         status: PatchApplyStatus,
     },
@@ -343,6 +349,9 @@ pub enum ThreadItem {
     #[ts(rename_all = "camelCase")]
     ImageView {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        environment: Option<codex_protocol::items::EnvironmentProvenance>,
         path: LegacyAppPathString,
     },
     #[serde(rename_all = "camelCase")]
@@ -522,6 +531,7 @@ impl From<CoreTurnItem> for ThreadItem {
             },
             CoreTurnItem::CommandExecution(command) => ThreadItem::CommandExecution {
                 id: command.id,
+                environment: command.environment,
                 output_metadata: command.output_metadata,
                 stdout: command.stdout,
                 stderr: command.stderr,
@@ -590,9 +600,12 @@ impl From<CoreTurnItem> for ThreadItem {
                 id: search.id,
                 query: search.query,
                 action: Some(web_search_action_from_core(search.action)),
+                status: None,
+                error: None,
             }),
             CoreTurnItem::ImageView(image) => ThreadItem::ImageView {
                 id: image.id,
+                environment: image.environment,
                 path: image.path.into(),
             },
             CoreTurnItem::Sleep(sleep) => ThreadItem::Sleep {
@@ -610,6 +623,7 @@ impl From<CoreTurnItem> for ThreadItem {
                     revised_prompt: image.revised_prompt,
                     result: image.result,
                     saved_path: image.saved_path,
+                    provider_usage: image.provider_usage,
                 })
             }
             CoreTurnItem::EnteredReviewMode(review) => ThreadItem::EnteredReviewMode {
@@ -622,6 +636,7 @@ impl From<CoreTurnItem> for ThreadItem {
             },
             CoreTurnItem::FileChange(file_change) => ThreadItem::FileChange {
                 id: file_change.id,
+                environment: file_change.environment,
                 changes: convert_patch_changes(&file_change.changes),
                 status: file_change
                     .status
@@ -885,6 +900,10 @@ pub enum CollabAgentStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct CollabAgentState {
+    /// Execution scheduling cause, independent of lifecycle and task acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stop_cause: Option<codex_protocol::protocol::TurnExecutionStopCause>,
     pub status: CollabAgentStatus,
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -898,19 +917,32 @@ pub struct CollabAgentState {
 impl From<CoreAgentStatus> for CollabAgentState {
     fn from(value: CoreAgentStatus) -> Self {
         match value {
+            CoreAgentStatus::Stopped {
+                last_agent_message,
+                stop_cause,
+            } => Self {
+                stop_cause: Some(stop_cause),
+                status: CollabAgentStatus::Completed,
+                message: last_agent_message.clone(),
+                surfaced_result: None,
+                last_agent_message,
+            },
             CoreAgentStatus::PendingInit => Self {
+                stop_cause: None,
                 status: CollabAgentStatus::PendingInit,
                 message: None,
                 surfaced_result: None,
                 last_agent_message: None,
             },
             CoreAgentStatus::Running => Self {
+                stop_cause: None,
                 status: CollabAgentStatus::Running,
                 message: None,
                 surfaced_result: None,
                 last_agent_message: None,
             },
             CoreAgentStatus::Interrupted => Self {
+                stop_cause: None,
                 status: CollabAgentStatus::Interrupted,
                 message: None,
                 surfaced_result: None,
@@ -922,6 +954,7 @@ impl From<CoreAgentStatus> for CollabAgentState {
                     status: CollabAgentStatus::Completed,
                     message,
                     surfaced_result: None,
+                    stop_cause: None,
                     last_agent_message,
                 }
             }
@@ -934,22 +967,26 @@ impl From<CoreAgentStatus> for CollabAgentState {
                     status: CollabAgentStatus::Completed,
                     message,
                     surfaced_result: Some(surfaced_result),
+                    stop_cause: None,
                     last_agent_message,
                 }
             }
             CoreAgentStatus::Errored(message) => Self {
+                stop_cause: None,
                 status: CollabAgentStatus::Errored,
                 message: Some(message),
                 surfaced_result: None,
                 last_agent_message: None,
             },
             CoreAgentStatus::Shutdown => Self {
+                stop_cause: None,
                 status: CollabAgentStatus::Shutdown,
                 message: None,
                 surfaced_result: None,
                 last_agent_message: None,
             },
             CoreAgentStatus::NotFound => Self {
+                stop_cause: None,
                 status: CollabAgentStatus::NotFound,
                 message: None,
                 surfaced_result: None,

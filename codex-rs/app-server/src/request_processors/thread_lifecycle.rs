@@ -575,6 +575,9 @@ pub(super) async fn ensure_conversation_listener_for_instance(
             )));
         }
     };
+    // The private history index needs input provenance even for clients that
+    // did not request experimental raw notifications. Tool outputs stay off.
+    conversation.request_raw_user_turn_boundaries();
     if raw_events_enabled {
         // Tell the producer a consumer exists before the listener starts, so no raw event is
         // suppressed for a subscriber that asked for them.
@@ -760,6 +763,12 @@ pub(super) async fn ensure_listener_task_running(
                         Ok(event) => event,
                         Err(err) => {
                             tracing::warn!("thread.next_event() failed with: {err}");
+                            // A failed required event stream must not leave a
+                            // connected client waiting for a terminal receipt
+                            // that this listener can no longer deliver.
+                            for connection_id in thread_state_manager.subscribed_connection_ids(conversation_id).await {
+                                outgoing_for_task.fail_connection_delivery(connection_id).await;
+                            }
                             break;
                         }
                     };
@@ -841,7 +850,9 @@ async fn process_thread_listener_event(
         let state = thread_state.lock().await;
         (
             state.is_current_summary_turn(&event.id),
-            state.turn_summary_for(&event.id).is_some_and(|summary| summary.last_error.is_some()),
+            state
+                .turn_summary_for(&event.id)
+                .is_some_and(|summary| summary.last_error.is_some()),
         )
     };
     let queue_completed = is_current_turn && matches!(&event.msg, EventMsg::TurnComplete(_));
@@ -852,10 +863,11 @@ async fn process_thread_listener_event(
     {
         queue.input_recorded(conversation_id);
     }
-    let queue_paused = is_current_turn && (matches!(&event.msg, EventMsg::TurnAborted(_))
-        || matches!(&event.msg, EventMsg::TurnComplete(completed)
+    let queue_paused = is_current_turn
+        && (matches!(&event.msg, EventMsg::TurnAborted(_))
+            || matches!(&event.msg, EventMsg::TurnComplete(completed)
             if completed.error.is_some())
-        || queue_completed && summary_failed);
+            || queue_completed && summary_failed);
     if queue_paused && let Some(queue) = &context.thread_queue_processor {
         queue.pause(conversation_id).await;
     }
@@ -926,11 +938,14 @@ async fn wait_for_thread_shutdown_with_timeout(
     thread: &Arc<CodexThread>,
     shutdown_timeout: Duration,
 ) -> ThreadShutdownResult {
-    if thread.request_shutdown().await.is_err() {
-        return ThreadShutdownResult::SubmitFailed;
-    }
-    match tokio::time::timeout(shutdown_timeout, thread.wait_until_terminated()).await {
-        Ok(()) => ThreadShutdownResult::Complete,
+    match tokio::time::timeout(shutdown_timeout, async {
+        thread.shutdown_and_wait().await?;
+        thread.wait_until_drained().await
+    })
+    .await
+    {
+        Ok(Ok(())) => ThreadShutdownResult::Complete,
+        Ok(Err(_)) => ThreadShutdownResult::SubmitFailed,
         Err(_) => ThreadShutdownResult::TimedOut,
     }
 }
@@ -1085,7 +1100,11 @@ async fn unload_thread_without_subscribers_with_timeout(
             }
             ThreadShutdownResult::TimedOut => {
                 warn!("thread {thread_id} shutdown timed out; waiting for late termination");
-                thread.wait_until_terminated().await;
+                if let Err(error) = thread.wait_until_drained().await {
+                    warn!(%thread_id, %error, "late thread shutdown failed; retaining runtime");
+                    pending_thread_unloads.finish(&thread_id).await;
+                    return;
+                }
                 finish_thread_unload(
                     &thread_manager,
                     &outgoing,
@@ -1183,7 +1202,11 @@ async fn shutdown_idle_thread_for_resume_with_timeout(
                 let thread_state_manager = thread_state_manager.clone();
                 let thread_watch_manager = thread_watch_manager.clone();
                 tokio::spawn(async move {
-                    thread.wait_until_terminated().await;
+                    if let Err(error) = thread.wait_until_drained().await {
+                        warn!(%thread_id, %error, "late thread shutdown failed; retaining runtime");
+                        pending_thread_unloads.finish(&thread_id).await;
+                        return;
+                    }
                     finish_thread_unload(
                         &thread_manager,
                         &outgoing,
@@ -1282,6 +1305,12 @@ pub(super) async fn handle_pending_thread_resume_request(
     pending_thread_unloads: &Arc<PendingThreadUnloads>,
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
+    let needs_stream_prefix = !pending.redact_resume_payloads
+        && !thread_state_manager
+            .subscribed_connection_ids(conversation_id)
+            .await
+            .contains(&pending.request_id.connection_id);
+    let mut stream_prefix = Vec::new();
     let active_turn = {
         let mut state = thread_state.lock().await;
         if state.listener_generation != pending.listener_generation
@@ -1290,12 +1319,18 @@ pub(super) async fn handle_pending_thread_resume_request(
             Err(resume_listener_changed_error(conversation_id))
         } else if let Some(history_items) = pending.history_items.as_deref() {
             state.seed_resume_history_for_listener(history_items, pending.listener_generation);
+            if needs_stream_prefix {
+                stream_prefix = state.active_stream_replay();
+            }
             Ok(state.active_turn_snapshot())
         } else if !state.resume_history_is_seeded_for_current_listener() {
             Err(internal_error(format!(
                 "thread {conversation_id} resume history is not initialized for the active listener"
             )))
         } else {
+            if needs_stream_prefix {
+                stream_prefix = state.active_stream_replay();
+            }
             Ok(state.active_turn_snapshot())
         }
     };
@@ -1443,6 +1478,14 @@ pub(super) async fn handle_pending_thread_resume_request(
     if !committed {
         return;
     }
+    // Still on the listener command owner: enqueue the active prefix before
+    // consuming any future suffix. These are live starts/deltas, not completed
+    // history items. Existing subscribers already own their prefix.
+    for notification in stream_prefix {
+        outgoing
+            .send_server_notification_to_connections(&[connection_id], notification)
+            .await;
+    }
     // Match cold resume: metadata-only resume should attach the listener without
     // paying the cost of turn reconstruction for historical usage replay.
     if let Some(token_usage_snapshot) = token_usage_snapshot {
@@ -1528,12 +1571,14 @@ pub(crate) fn populate_thread_turns_from_history(
     thread: &mut Thread,
     items: &[RolloutItem],
     active_turn: Option<&Turn>,
-) {
+) -> std::result::Result<(), String> {
+    codex_rollout::ensure_rollout_source_integrity(items).map_err(|error| error.to_string())?;
     let mut turns = build_legacy_api_turns_from_rollout_items(items);
     if let Some(active_turn) = active_turn {
         merge_turn_history_with_active_turn(&mut turns, active_turn.clone());
     }
     thread.turns = turns;
+    Ok(())
 }
 
 pub(super) fn populate_thread_turns_from_history_with_token_usage(
@@ -1897,122 +1942,223 @@ mod tests {
                 ),
             };
             let connection_id = ConnectionId(1);
-            fixture.outgoing.connection_opened(
-                connection_id,
-                Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            ).await;
-            fixture.thread_state_manager.connection_initialized(
-                connection_id, ConnectionCapabilities::default(),
-            ).await;
-            let state = fixture.thread_state_manager.try_ensure_connection_subscribed(
-                fixture.thread_id, connection_id, false,
-            ).await.expect("live connection");
+            fixture
+                .outgoing
+                .connection_opened(
+                    connection_id,
+                    Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                )
+                .await;
+            fixture
+                .thread_state_manager
+                .connection_initialized(connection_id, ConnectionCapabilities::default())
+                .await;
+            let state = fixture
+                .thread_state_manager
+                .try_ensure_connection_subscribed(fixture.thread_id, connection_id, false)
+                .await
+                .expect("live connection");
             state.lock().await.seed_turn_index_from_history(&[]);
             // Core detaches A before publishing its terminal event; a stalled
             // publication can therefore arrive after B has already started.
             for (id, started_at) in [("turn-a", 1), ("turn-b", 2)] {
-                process_thread_listener_event(&context, fixture.thread_id, &fixture.thread, &state,
+                process_thread_listener_event(
+                    &context,
+                    fixture.thread_id,
+                    &fixture.thread,
+                    &state,
                     Event {
                         id: id.to_string(),
                         msg: EventMsg::TurnStarted(TurnStartedEvent {
-                            turn_id: id.to_string(), trace_id: None, started_at: Some(started_at),
-                            model_context_window: None, collaboration_mode_kind: Default::default(),
+                            turn_id: id.to_string(),
+                            trace_id: None,
+                            started_at: Some(started_at),
+                            model_context_window: None,
+                            collaboration_mode_kind: Default::default(),
                         }),
                     },
-                ).await;
+                )
+                .await;
             }
             let successor_error = codex_app_server_protocol::TurnError {
                 message: "successor-only diagnostic".to_string(),
-                codex_error_info: None, additional_details: None,
+                codex_error_info: None,
+                additional_details: None,
             };
             {
                 let mut state = state.lock().await;
                 state.turn_summary.last_error = Some(successor_error.clone());
-                state.turn_summary.command_execution_started.insert("command-b".to_string());
+                state
+                    .turn_summary
+                    .command_execution_started
+                    .insert("command-b".to_string());
             }
-            let guard = fixture.thread_watch_manager.note_user_input_requested(
-                &fixture.thread_id.to_string(),
-            ).await;
+            let guard = fixture
+                .thread_watch_manager
+                .note_user_input_requested(&fixture.thread_id.to_string())
+                .await;
             let outgoing = ThreadScopedOutgoingMessageSender::new(
-                Arc::clone(&fixture.outgoing), vec![connection_id], fixture.thread_id,
+                Arc::clone(&fixture.outgoing),
+                vec![connection_id],
+                fixture.thread_id,
             );
-            let (request_id, mut receiver) = outgoing.send_request(
-                ServerRequestPayload::ToolRequestUserInput(ToolRequestUserInputParams {
-                    thread_id: fixture.thread_id.to_string(), turn_id: "turn-b".to_string(),
-                    item_id: "question-b".to_string(), questions: Vec::new(), auto_resolution_ms: None,
-                }),
-            ).await;
+            let (request_id, mut receiver) = outgoing
+                .send_request(ServerRequestPayload::ToolRequestUserInput(
+                    ToolRequestUserInputParams {
+                        thread_id: fixture.thread_id.to_string(),
+                        turn_id: "turn-b".to_string(),
+                        item_id: "question-b".to_string(),
+                        questions: Vec::new(),
+                        auto_resolution_ms: None,
+                    },
+                ))
+                .await;
             assert!(request_id.is_some());
             while fixture.outgoing_rx.try_recv().is_ok() {}
             let msg = if abort {
                 EventMsg::TurnAborted(TurnAbortedEvent {
-                    turn_id: Some("turn-a".to_string()), reason: TurnAbortReason::Interrupted,
-                    completed_at: Some(3), duration_ms: Some(2000), timing: None,
+                    turn_id: Some("turn-a".to_string()),
+                    reason: TurnAbortReason::Interrupted,
+                    completed_at: Some(3),
+                    duration_ms: Some(2000),
+                    timing: None,
                 })
             } else {
                 EventMsg::TurnComplete(TurnCompleteEvent {
-                    turn_id: "turn-a".to_string(), last_agent_message: None,
-                    surfaced_result: None, error: None, completed_at: Some(3),
-                    duration_ms: Some(2000), time_to_first_token_ms: None, timing: None,
+                    turn_id: "turn-a".to_string(),
+                    last_agent_message: None,
+                    surfaced_result: None,
+                    error: None,
+                    completed_at: Some(3),
+                    duration_ms: Some(2000),
+                    time_to_first_token_ms: None,
+                    timing: None,
                 })
             };
-            process_thread_listener_event(&context, fixture.thread_id, &fixture.thread, &state,
-                Event { id: "turn-a".to_string(), msg },
-            ).await;
-            let pending = matches!(receiver.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
-            let status = fixture.thread_watch_manager.loaded_status_for_thread(&fixture.thread_id.to_string()).await;
+            process_thread_listener_event(
+                &context,
+                fixture.thread_id,
+                &fixture.thread,
+                &state,
+                Event {
+                    id: "turn-a".to_string(),
+                    msg,
+                },
+            )
+            .await;
+            let pending = matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            );
+            let status = fixture
+                .thread_watch_manager
+                .loaded_status_for_thread(&fixture.thread_id.to_string())
+                .await;
             let (active_id, summary) = {
                 let state = state.lock().await;
-                (state.in_progress_turn_id().map(str::to_string), state.turn_summary.clone())
+                (
+                    state.in_progress_turn_id().map(str::to_string),
+                    state.turn_summary.clone(),
+                )
             };
-            let notification = fixture.outgoing_rx.try_recv().expect("late terminal still delivered");
-            process_thread_listener_event(&context, fixture.thread_id, &fixture.thread, &state,
+            let notification = fixture
+                .outgoing_rx
+                .try_recv()
+                .expect("late terminal still delivered");
+            process_thread_listener_event(
+                &context,
+                fixture.thread_id,
+                &fixture.thread,
+                &state,
                 Event {
                     id: "turn-b".to_string(),
                     msg: EventMsg::TurnComplete(TurnCompleteEvent {
-                        turn_id: "turn-b".to_string(), last_agent_message: None,
-                        surfaced_result: None, error: None, completed_at: Some(4),
-                        duration_ms: Some(2000), time_to_first_token_ms: None, timing: None,
+                        turn_id: "turn-b".to_string(),
+                        last_agent_message: None,
+                        surfaced_result: None,
+                        error: None,
+                        completed_at: Some(4),
+                        duration_ms: Some(2000),
+                        time_to_first_token_ms: None,
+                        timing: None,
                     }),
                 },
-            ).await;
-            let successor_settled = !matches!(receiver.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty));
-            let successor_notification = fixture.outgoing_rx.try_recv().expect("B terminal delivered");
+            )
+            .await;
+            let successor_settled = !matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            );
+            let successor_notification = fixture
+                .outgoing_rx
+                .try_recv()
+                .expect("B terminal delivered");
             let successor_cleared = {
                 let state = state.lock().await;
-                state.in_progress_turn_id().is_none() && state.turn_summary.last_error.is_none()
+                state.in_progress_turn_id().is_none()
+                    && state.turn_summary.last_error.is_none()
                     && state.turn_summary.command_execution_started.is_empty()
             };
             // Clean up real resources before regression assertions, including RED runs.
             outgoing.abort_pending_server_requests().await;
             drop(guard);
-            fixture.release_shutdown.take().expect("release").send(()).expect("terminal barrier");
-            fixture.thread.shutdown_and_wait().await.expect("thread cleanup");
+            fixture
+                .release_shutdown
+                .take()
+                .expect("release")
+                .send(())
+                .expect("terminal barrier");
+            fixture
+                .thread
+                .shutdown_and_wait()
+                .await
+                .expect("thread cleanup");
 
-            assert!(pending, "A terminal must not resolve B's request; abort={abort}");
+            assert!(
+                pending,
+                "A terminal must not resolve B's request; abort={abort}"
+            );
             assert_eq!(active_id.as_deref(), Some("turn-b"));
-            assert_eq!(status, ThreadStatus::Active {
-                active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
-            });
+            assert_eq!(
+                status,
+                ThreadStatus::Active {
+                    active_flags: vec![ThreadActiveFlag::WaitingOnUserInput],
+                }
+            );
             assert_eq!(summary.started_at, Some(2));
             assert_eq!(summary.last_error, Some(successor_error.clone()));
             assert!(summary.command_execution_started.contains("command-b"));
             let message = match notification {
-                OutgoingEnvelope::Broadcast { message } | OutgoingEnvelope::ToConnection { message, .. } => message,
+                OutgoingEnvelope::Broadcast { message }
+                | OutgoingEnvelope::ToConnection { message, .. } => message,
             };
-            let OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(completed)) = message else {
+            let OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(
+                completed,
+            )) = message
+            else {
                 panic!("expected A terminal notification");
             };
             assert_eq!(completed.turn.id, "turn-a");
             assert_eq!(completed.turn.started_at, Some(1));
             assert_eq!(completed.turn.error, None);
-            assert_eq!(completed.turn.status, if abort { TurnStatus::Interrupted } else { TurnStatus::Completed });
+            assert_eq!(
+                completed.turn.status,
+                if abort {
+                    TurnStatus::Interrupted
+                } else {
+                    TurnStatus::Completed
+                }
+            );
             assert!(successor_settled);
             assert!(successor_cleared);
             let message = match successor_notification {
-                OutgoingEnvelope::Broadcast { message } | OutgoingEnvelope::ToConnection { message, .. } => message,
+                OutgoingEnvelope::Broadcast { message }
+                | OutgoingEnvelope::ToConnection { message, .. } => message,
             };
-            let OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(completed)) = message else {
+            let OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(
+                completed,
+            )) = message
+            else {
                 panic!("expected B terminal notification");
             };
             assert_eq!(completed.turn.id, "turn-b");

@@ -5,6 +5,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub(crate) enum UnifiedExecError {
+    #[error("Remote process start outcome: {error}")]
+    RemoteStart {
+        error: Box<codex_exec_server::ExecServerError>,
+    },
     #[error("Failed to create unified exec process: {message}")]
     CreateProcess { message: String },
     #[error("Unified exec process failed: {message}")]

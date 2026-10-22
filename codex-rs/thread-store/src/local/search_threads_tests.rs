@@ -131,10 +131,15 @@ fn recency_cursor_includes_thread_id_tie_breaker() {
             ..Default::default()
         },
         snippet: String::new(),
+        metadata: None,
     };
 
-    let cursor = cursor_from_thread_search_item(&item, ThreadSortKey::RecencyAt)
-        .expect("cursor should build");
+    let cursor = cursor_from_thread_search_item(
+        &item,
+        ThreadSortKey::RecencyAt,
+        crate::types::ThreadListStoragePath::StateDb,
+    )
+    .expect("cursor should build");
 
     assert_eq!(
         serde_json::to_string(&cursor).expect("cursor should serialize"),
@@ -299,7 +304,7 @@ async fn search_threads_falls_back_to_legacy_name_for_default_sqlite_title() {
 }
 
 #[tokio::test]
-async fn search_threads_rejects_unserializable_cursor_without_truncating_matches() {
+async fn search_threads_uses_physical_cursor_even_when_header_time_is_unrepresentable() {
     let home = TempDir::new().expect("temp dir");
     let first_uuid = Uuid::from_u128(601);
     let second_uuid = Uuid::from_u128(602);
@@ -329,17 +334,15 @@ async fn search_threads_rejects_unserializable_cursor_without_truncating_matches
         search_term: "Hello from user".to_string(),
     };
 
-    let error = store
+    let boundary_page = store
         .search_threads(params.clone())
         .await
-        .expect_err("an unrepresentable next page must not look like search exhaustion");
-    match error {
-        crate::ThreadStoreError::Internal { message } => assert_eq!(
-            message,
-            "failed to serialize thread search cursor: format error: The year component cannot be formatted into the requested format."
-        ),
-        other => panic!("expected the cursor serialization error, got {other}"),
-    }
+        .expect("the physical filename key remains representable");
+    assert_eq!(boundary_page.items[0].thread.thread_id, first_id);
+    assert_eq!(
+        boundary_page.next_cursor.as_deref(),
+        Some(format!("thread-list-v1:scan-and-repair:2025-01-03T12:31:00Z|{first_id}").as_str())
+    );
     assert_eq!(
         std::fs::read(&first_path).unwrap(),
         invalid_rollout.as_bytes()
@@ -357,7 +360,7 @@ async fn search_threads_rejects_unserializable_cursor_without_truncating_matches
     assert_eq!(first.items[0].snippet, "Hello from user");
     assert_eq!(
         first.next_cursor.as_deref(),
-        Some(format!("2025-01-03T12:31:00Z|{first_id}").as_str())
+        Some(format!("thread-list-v1:scan-and-repair:2025-01-03T12:31:00Z|{first_id}").as_str())
     );
     let second = store
         .search_threads(SearchThreadsParams {

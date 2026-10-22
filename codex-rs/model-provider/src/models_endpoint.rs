@@ -17,12 +17,13 @@ use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
+use codex_http_client::RouteAwareClientPool;
 use codex_login::AuthEnvTelemetry;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::collect_auth_env_telemetry;
-use codex_login::default_client::create_client_pool;
-use codex_http_client::RouteAwareClientPool;
+use codex_login::default_client::create_client_pool_with_headers;
+use codex_login::default_client::default_headers;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
@@ -52,7 +53,6 @@ pub(crate) struct OpenAiModelsEndpoint {
     auth_manager: Option<Arc<AuthManager>>,
     transport_builder: Arc<dyn ModelsTransportBuilder>,
 }
-
 
 impl OpenAiModelsEndpoint {
     pub(crate) fn new(
@@ -270,20 +270,46 @@ trait ModelsTransportBuilder: fmt::Debug + Send + Sync {
 
 #[derive(Debug, Default)]
 struct RouteAwareModelsTransportBuilder {
-    pool: Mutex<Option<(HttpClientFactory, RouteAwareClientPool)>>,
-    sandbox_transport: tokio::sync::OnceCell<ReqwestTransport>,
+    pool: Mutex<Option<(HttpClientFactory, HeaderMap, bool, RouteAwareClientPool)>>,
 }
 
 impl RouteAwareModelsTransportBuilder {
     fn pool_for(&self, factory: HttpClientFactory) -> RouteAwareClientPool {
-        let mut cached = self.pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((previous, pool)) = cached.as_ref()
+        self.pool_for_defaults(
+            factory,
+            default_headers(),
+            std::env::var("CODEX_SANDBOX").as_deref() == Ok("seatbelt"),
+        )
+    }
+
+    fn pool_for_defaults(
+        &self,
+        factory: HttpClientFactory,
+        headers: HeaderMap,
+        sandboxed: bool,
+    ) -> RouteAwareClientPool {
+        let mut cached = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((previous, previous_headers, previous_sandboxed, pool)) = cached.as_ref()
             && previous == &factory
+            && previous_headers == &headers
+            && *previous_sandboxed == sandboxed
         {
             return pool.clone();
         }
-        let pool = create_client_pool(factory.clone(), ClientRouteClass::Api);
-        *cached = Some((factory, pool.clone()));
+        let pool = create_client_pool_with_headers(
+            factory.clone(),
+            ClientRouteClass::Api,
+            headers.clone(),
+        );
+        let pool = if sandboxed {
+            pool.with_direct_routing()
+        } else {
+            pool
+        };
+        *cached = Some((factory, headers, sandboxed, pool.clone()));
         pool
     }
 }
@@ -292,18 +318,12 @@ impl ModelsTransportBuilder for RouteAwareModelsTransportBuilder {
     fn build(
         &self,
         http_client_factory: HttpClientFactory,
-        request_url: String,
+        _request_url: String,
     ) -> ModelsTransportFuture<'_> {
         Box::pin(async move {
-            if std::env::var("CODEX_SANDBOX").as_deref() == Ok("seatbelt") {
-                // Preserve the default client's sandbox-specific direct routing.
-                return self.sandbox_transport.get_or_try_init(|| async {
-                    codex_login::default_client::create_client_for_route_async(
-                        http_client_factory, request_url, ClientRouteClass::Api,
-                    ).await.map(ReqwestTransport::from_http_client)
-                }).await.cloned();
-            }
-            Ok(ReqwestTransport::from_client_pool(self.pool_for(http_client_factory)))
+            Ok(ReqwestTransport::from_client_pool(
+                self.pool_for(http_client_factory),
+            ))
         })
     }
 }
@@ -427,6 +447,55 @@ mod tests {
     use wiremock::matchers::path;
     use wiremock::matchers::query_param;
 
+    #[tokio::test]
+    async fn models_pool_tracks_exact_headers_and_preserves_warm_routes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(8)
+            .mount(&server)
+            .await;
+        let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let builder = RouteAwareModelsTransportBuilder::default();
+        for sandboxed in [false, true] {
+            for (index, residency) in [None, Some("us"), Some("us"), None].into_iter().enumerate() {
+                let mut headers = HeaderMap::new();
+                if let Some(residency) = residency {
+                    headers.insert(
+                        codex_login::default_client::RESIDENCY_HEADER_NAME,
+                        http::HeaderValue::from_static(residency),
+                    );
+                }
+                let pool = builder.pool_for_defaults(factory.clone(), headers, sandboxed);
+                assert_eq!(
+                    pool.cached_route_count(),
+                    usize::from(index == 2),
+                    "only identical defaults may reuse a previously built route"
+                );
+                pool.client_for_url(&server.uri())
+                    .await
+                    .unwrap()
+                    .get(server.uri())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(pool.cached_route_count(), 1);
+            }
+        }
+        let requests = server.received_requests().await.unwrap();
+        for group in requests.as_chunks::<4>().0 {
+            for (request, expected) in group.iter().zip([None, Some("us"), Some("us"), None]) {
+                assert_eq!(
+                    request
+                        .headers
+                        .get(codex_login::default_client::RESIDENCY_HEADER_NAME)
+                        .map(|value| value.to_str().unwrap()),
+                    expected
+                );
+            }
+        }
+    }
+
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[tokio::test]
     async fn catalog_refresh_observes_changed_proxy_and_reuses_route_clients() {
@@ -434,9 +503,12 @@ mod tests {
         let second = MockServer::start().await;
         for server in [&first, &second] {
             Mock::given(path("/models"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }),
+                )
                 .expect(2)
-                .mount(server).await;
+                .mount(server)
+                .await;
         }
         let base = format!("http://catalog-{}.invalid", first.address().port());
         let url = format!("{base}/models?client_version=route-test");
@@ -450,7 +522,10 @@ mod tests {
         };
         for server in [&first, &first, &second, &second] {
             codex_http_client::cache_system_proxy_route_for_test(&url, server.uri());
-            endpoint.list_models("route-test", factory.clone()).await.unwrap();
+            endpoint
+                .list_models("route-test", factory.clone())
+                .await
+                .unwrap();
         }
         assert_eq!(builder.pool_for(factory).cached_route_count(), 2);
     }
@@ -468,22 +543,40 @@ mod tests {
         let first = MockServer::start().await;
         let second = MockServer::start().await;
         let base = format!("http://catalog-redirect-{}.invalid", first.address().port());
-        let destination = format!("http://catalog-target-{}.invalid/next", second.address().port());
+        let destination = format!(
+            "http://catalog-target-{}.invalid/next",
+            second.address().port()
+        );
         Mock::given(path("/models"))
-            .respond_with(ResponseTemplate::new(302).insert_header("location", destination.as_str()))
-            .expect(1).mount(&first).await;
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", destination.as_str()),
+            )
+            .expect(1)
+            .mount(&first)
+            .await;
         Mock::given(path("/next"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }))
-            .expect(1).mount(&second).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(ModelsResponse { models: Vec::new() }),
+            )
+            .expect(1)
+            .mount(&second)
+            .await;
         codex_http_client::cache_system_proxy_route_for_test(
-            &format!("{base}/models?client_version=redirect-test"), first.uri(),
+            &format!("{base}/models?client_version=redirect-test"),
+            first.uri(),
         );
         codex_http_client::cache_system_proxy_route_for_test(&destination, second.uri());
         OpenAiModelsEndpoint::new(
-            "test".into(), ModelProviderInfo::create_openai_provider(Some(base)), None,
-        ).list_models(
-            "redirect-test", HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
-        ).await.unwrap();
+            "test".into(),
+            ModelProviderInfo::create_openai_provider(Some(base)),
+            None,
+        )
+        .list_models(
+            "redirect-test",
+            HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy),
+        )
+        .await
+        .unwrap();
     }
 
     impl ModelsTransportBuilder for RecordingTransportBuilder {
@@ -501,10 +594,14 @@ mod tests {
                 }
                 *observed_request
                     .lock()
-                    .expect("observed request lock should not be poisoned") =
-                    Some((http_client_factory.outbound_proxy_policy(), request_url.clone()));
+                    .expect("observed request lock should not be poisoned") = Some((
+                    http_client_factory.outbound_proxy_policy(),
+                    request_url.clone(),
+                ));
                 Ok(ReqwestTransport::from_http_client(
-                    pool.client_for_url(&request_url).await.map_err(std::io::Error::other)?,
+                    pool.client_for_url(&request_url)
+                        .await
+                        .map_err(std::io::Error::other)?,
                 ))
             })
         }

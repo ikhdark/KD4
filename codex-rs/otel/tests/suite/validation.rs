@@ -65,8 +65,6 @@ fn histogram_rejects_invalid_tag_value() -> Result<()> {
     Ok(())
 }
 
-
-
 #[test]
 fn counter_rejects_negative_increment() -> Result<()> {
     let metrics = build_in_memory_client()?;
@@ -82,7 +80,12 @@ fn counter_rejects_negative_increment() -> Result<()> {
 #[test]
 fn metric_names_enforce_sdk_prefix_and_length() -> Result<()> {
     let metrics = build_in_memory_client()?;
-    for name in ["bad name".to_string(), "1bad".to_string(), "-".to_string(), "a".repeat(256)] {
+    for name in [
+        "bad name".to_string(),
+        "1bad".to_string(),
+        "-".to_string(),
+        "a".repeat(256),
+    ] {
         assert!(matches!(
             metrics.counter(&name, 1, &[]),
             Err(MetricsError::InvalidMetricName { name: invalid }) if invalid == name
@@ -111,8 +114,6 @@ fn timer_rejects_invalid_inputs_at_construction() -> Result<()> {
     metrics.shutdown()?;
     Ok(())
 }
-
-
 
 #[tokio::test]
 async fn grpc_exporter_tls_uses_the_shared_rustls_provider() {

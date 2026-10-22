@@ -690,9 +690,8 @@ async fn thread_fork_can_exclude_turns_and_skip_restored_token_usage() -> Result
                 anyhow::bail!("excludeTurns=true should not replay token usage");
             }
             if notification.method == "thread/started" {
-                let started: ThreadStartedNotification = serde_json::from_value(
-                    notification.params.expect("thread/started params"),
-                )?;
+                let started: ThreadStartedNotification =
+                    serde_json::from_value(notification.params.expect("thread/started params"))?;
                 assert_eq!(started.thread.id, thread.id);
                 assert!(started.thread.turns.is_empty());
                 return Ok::<(), anyhow::Error>(());
@@ -709,7 +708,11 @@ async fn thread_fork_tracks_thread_initialized_analytics() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
 
     let codex_home = TempDir::new()?;
-    write_mock_responses_config_toml_with_chatgpt_base_url(codex_home.path(), &server.uri(), &server.uri())?;
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &server.uri(),
+        &server.uri(),
+    )?;
     let capture = mount_analytics_capture(&server, codex_home.path()).await?;
 
     let conversation_id = create_fake_rollout(
@@ -801,11 +804,12 @@ async fn thread_fork_rejects_unmaterialized_thread() -> Result<()> {
         mcp.read_stream_until_error_message(RequestId::Integer(fork_id)),
     )
     .await??;
+    // A known live thread without a rollout is not-materialized, not missing.
     assert!(
         fork_err
             .error
             .message
-            .contains("no rollout found for thread id"),
+            .contains("known live thread has not materialized its rollout"),
         "unexpected fork error: {}",
         fork_err.error.message
     );

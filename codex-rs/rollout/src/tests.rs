@@ -264,7 +264,11 @@ async fn find_thread_path_accepts_existing_state_db_path_without_canonical_filen
     let db_rollout_path = home.join("sessions/2025/01/03/custom-rollout-name.jsonl");
     let ts = "2025-01-03T13-00-00";
     write_session_file(home, ts, uuid, 1, Some(SessionSource::Cli)).unwrap();
-    fs::rename(home.join(format!("sessions/2025/01/03/rollout-{ts}-{uuid}.jsonl")), &db_rollout_path).unwrap();
+    fs::rename(
+        home.join(format!("sessions/2025/01/03/rollout-{ts}-{uuid}.jsonl")),
+        &db_rollout_path,
+    )
+    .unwrap();
     let runtime = insert_state_db_thread(
         home,
         thread_id,
@@ -1403,8 +1407,8 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
         };
         writeln!(file, "{}", serde_json::to_string(&response_line)?)?;
     }
-    let expected_updated = chrono::DateTime::parse_from_rfc3339("2025-06-02T09:10:11Z")?
-        .with_timezone(&chrono::Utc);
+    let expected_updated =
+        chrono::DateTime::parse_from_rfc3339("2025-06-02T09:10:11Z")?.with_timezone(&chrono::Utc);
     file.set_times(FileTimes::new().set_modified(expected_updated.into()))?;
     drop(file);
 

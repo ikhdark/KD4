@@ -1,4 +1,382 @@
 use super::*;
+use crate::tools::context::ToolPayload;
+use codex_protocol::protocol::SubAgentSource;
+
+#[tokio::test]
+async fn audit115_accepted_batch_preserves_correction_through_plan_handler() {
+    use crate::context::ContextualUserFragment;
+    use crate::tools::registry::ToolExecutor;
+    for textless in [false, true] {
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let invoke = |arguments: serde_json::Value| crate::tools::context::ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call_id: "audit115-plan".into(),
+            tool_name: codex_tools::ToolName::plain("update_plan"),
+            source: crate::tools::context::ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: arguments.to_string(),
+            },
+        };
+        crate::tools::handlers::PlanHandler
+            .handle(invoke(serde_json::json!({"plan":[
+                {"step":"Deploy","status":"pending"},{"step":"Review","status":"pending"}
+            ]})))
+            .await
+            .unwrap();
+        let correction = "Do not deploy; review only.";
+        let input = |content| TurnInput::UserInput {
+            content,
+            client_id: None,
+        };
+        run_hooks_and_record_inputs_detailed(
+            &session,
+            &turn,
+            vec![
+                input(vec![UserInput::Text {
+                    text: correction.into(),
+                    text_elements: Vec::new(),
+                }]),
+                input(if textless {
+                    vec![UserInput::Image {
+                        image_url: "data:image/png;base64,AA==".into(),
+                        detail: None,
+                    }]
+                } else {
+                    vec![UserInput::Text {
+                        text: "What have you found so far?".into(),
+                        text_elements: Vec::new(),
+                    }]
+                }),
+            ],
+        )
+        .await
+        .unwrap();
+        let state = session.services.plan_store.task_state(false).await;
+        let body = state.body();
+        let value: serde_json::Value =
+            serde_json::from_str(body.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+        assert_eq!(
+            value["accepted_input_refs"].as_array().unwrap().len(),
+            if textless { 1 } else { 2 }
+        );
+        let snapshot = session
+            .services
+            .plan_store
+            .execution_snapshot()
+            .await
+            .unwrap();
+        let deploy = crate::plan_store::plan_step_id("Deploy");
+        crate::tools::handlers::PlanHandler
+            .handle(invoke(serde_json::json!({
+                "expected_revision":snapshot.revision,
+                "plan":[{"step":"Review","status":"pending"}],
+                "superseded":[{"step_id":deploy,"reason":"User cancelled deployment"}],
+                "scope_change_instructions":{deploy:correction},
+                "scope_change_reviewed_revision":value["scope_input_revision"],
+            })))
+            .await
+            .unwrap();
+        let remaining = session
+            .services
+            .plan_store
+            .execution_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.obligations.unresolved.len(),
+            1,
+            "the status question/image cannot cancel Review"
+        );
+    }
+}
+
+#[test]
+fn audit115_ordinary_final_reconciles_plan_debt_without_extra_complete_generation() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit115-final", || async {
+        crate::test_harness::require_network!();
+        for pending in [false, true] {
+            let server = responses::start_mock_server().await;
+            let mut sequence = vec![responses::sse(vec![
+                responses::ev_assistant_message("premature", "done"),
+                responses::ev_completed("first"),
+            ])];
+            if pending {
+                sequence.push(responses::sse(vec![responses::ev_function_call("close-plan", "update_plan",
+                    &serde_json::json!({"set":[{"step_id":crate::plan_store::plan_step_id("Required wiring"),"status":"completed"}]}).to_string()), responses::ev_completed("reconcile")]));
+                sequence.push(responses::sse(vec![
+                    responses::ev_assistant_message("accepted", "wiring complete"),
+                    responses::ev_completed("last"),
+                ]));
+            }
+            let requests = responses::mount_sse_sequence(&server, sequence).await;
+            // Mailbox recording belongs to an admitted active task. Calling
+            // run_turn on the bare session fixture aborts before model dispatch.
+            let test = test_codex()
+                .with_config(|config| {
+                    config.features.disable(Feature::CodeModeHost).unwrap();
+                })
+                .build(&server)
+                .await?;
+            let session = &test.codex.as_ref().codex.session;
+            if pending {
+                session
+                    .services
+                    .plan_store
+                    .update(codex_protocol::plan_tool::UpdatePlanArgs {
+                        explanation: None,
+                        plan: vec![codex_protocol::plan_tool::PlanItemArg {
+                            step: "Required wiring".into(),
+                            status: codex_protocol::plan_tool::StepStatus::Pending,
+                        }],
+                    })
+                    .await;
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                test.submit_turn_and_capture_completion(
+                    "Finish the required wiring; do not run tests.",
+                ),
+            )
+            .await??;
+            assert!(result.error.is_none(), "{result:?}");
+            assert_eq!(requests.requests().len(), if pending { 3 } else { 1 });
+            assert_eq!(
+                result.last_agent_message.as_deref(),
+                Some(if pending { "wiring complete" } else { "done" })
+            );
+            assert!(
+                result
+                    .timing
+                    .as_ref()
+                    .and_then(|timing| timing.final_answer.as_ref())
+                    .and_then(|answer| answer.message.as_ref())
+                    .is_some()
+            );
+        }
+        Ok(())
+    })
+}
+
+#[tokio::test]
+async fn mailbox_reports_preserve_passive_cycles_but_not_instruction_or_evidence_changes() {
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_tools::ToolName;
+    use codex_tools::ToolOutputOutcomeContext;
+    for arm in [
+        "none",
+        "chatter",
+        "owner",
+        "mutation",
+        "exposure",
+        "changed-result",
+    ] {
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let mut control = TurnExecutionControl::new();
+        let mut advice = Vec::new();
+        for generation in 0..4 {
+            if generation > 0 && arm != "none" {
+                let mut mail = codex_protocol::protocol::InterAgentCommunication::new(
+                    codex_protocol::AgentPath::try_from(if arm == "owner" {
+                        "/root"
+                    } else {
+                        "/root/worker"
+                    })
+                    .unwrap(),
+                    codex_protocol::AgentPath::try_from(if arm == "owner" {
+                        "/root/worker"
+                    } else {
+                        "/root"
+                    })
+                    .unwrap(),
+                    Vec::new(),
+                    "unchanged report".to_owned(),
+                    true,
+                );
+                mail.id = Some(codex_protocol::ResponseItemId::with_suffix(
+                    "report", generation,
+                ));
+                assert!(
+                    session
+                        .input_queue
+                        .enqueue_mailbox_communication(mail.clone())
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    !session
+                        .input_queue
+                        .enqueue_mailbox_communication(mail)
+                        .await
+                        .unwrap()
+                );
+                let input = session
+                    .input_queue
+                    .take_mailbox_for_initial_input(&session.active_turn, &[])
+                    .await;
+                assert_eq!(input.len(), 1, "distinct-ID mail delivered exactly once");
+                let recorded = run_hooks_and_record_inputs_detailed(&session, &turn, input)
+                    .await
+                    .unwrap();
+                assert!(recorded.accepted_context_input);
+                assert_eq!(recorded.instructions_changed, arm == "owner");
+                assert_eq!(recorded.renews_generation_budget, arm == "owner");
+                control.accepted_context_input(recorded.instructions_changed);
+            }
+            let mutation = if arm == "mutation" { generation } else { 0 };
+            let exposure = if arm == "exposure" { generation } else { 0 };
+            let baselines = control.baselines_with_tool_exposure_revision(mutation, exposure);
+            let collector = control.collector(&baselines);
+            let registration = collector.register_deterministic_tool_call(
+                &ToolName::plain("read_tool_output"), &ToolPayload::Function {
+                    arguments: r#"{"artifact_id":"fixed","selectors":[{"kind":"lines","start":1,"end":1}]}"#.into(),
+                }, "failure",
+            );
+            let fingerprint = if arm == "changed-result" && generation > 0 {
+                "new external evidence"
+            } else {
+                "same failure"
+            };
+            collector.record_response_result(
+                registration.ordinal,
+                ToolOutputOutcomeContext::new(codex_tools::ToolOutputOutcome::Failure),
+                Some(
+                    serde_json::json!({"outcome":"failure", "failure":{"fingerprint":fingerprint}}),
+                ),
+                &ResponseInputItem::FunctionCallOutput {
+                    call_id: "failure".into(),
+                    output: FunctionCallOutputPayload::from_text(fingerprint.into()),
+                },
+                false,
+            );
+            let decision = control.evaluate_convergence(
+                &baselines,
+                &collector,
+                &SamplingRequestSettledState {
+                    mutation_revision: mutation,
+                    attributed_mutation_revision: mutation,
+                    tool_exposure_revision: exposure,
+                },
+            );
+            assert_eq!(
+                decision.continuation,
+                ContinuationDisposition::ModelRequired
+            );
+            advice.push(decision.directive.is_some());
+        }
+        match arm {
+            "none" | "chatter" => assert_eq!(advice, vec![false, true, true, true], "{arm}"),
+            "owner" | "mutation" | "exposure" => assert_eq!(advice, vec![false; 4], "{arm}"),
+            _ => assert!(!advice[1], "a changed dependency result is fresh evidence"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_hook_effects_invalidate_the_returned_assessment() {
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigLayerStack;
+    use codex_config::ConfigRequirements;
+    use codex_config::ConfigRequirementsToml;
+    for subagent in [false, true] {
+        for ending in ["", "raise SystemExit(1)", "import time; time.sleep(30)"] {
+            let (session, mut turn, _events) =
+                crate::session::tests::make_session_and_context_with_rx().await;
+            if subagent {
+                Arc::get_mut(&mut turn).unwrap().session_source =
+                    SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        parent_thread_id: codex_protocol::ThreadId::new(),
+                        depth: 1,
+                        agent_path: None,
+                        agent_nickname: None,
+                        agent_role: None,
+                    });
+            }
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("tested.py");
+            fs::write(&source, "tested source").unwrap();
+            let script = temp.path().join("hook.py");
+            fs::write(&script, format!("from pathlib import Path\np = Path({})\np.write_text(p.read_text() + ' changed')\n{ending}\n",
+                serde_json::to_string(&source.to_string_lossy()).unwrap())).unwrap();
+            let event = if subagent { "SubagentStop" } else { "Stop" };
+            let mut hooks = serde_json::Map::new();
+            hooks.insert(
+                event.into(),
+                serde_json::json!([{"hooks":[{"type":"command",
+                "command":format!("python3 \"{}\"", script.display()),
+                "commandWindows":format!("python \"{}\"", script.display()), "timeout":1}]}]),
+            );
+            let layer = serde_json::from_value(serde_json::json!({"hooks":hooks})).unwrap();
+            let stack = ConfigLayerStack::new(
+                vec![ConfigLayerEntry::new(
+                    ConfigLayerSource::User {
+                        file: turn.config.codex_home.join("config.toml"),
+                        profile: None,
+                    },
+                    layer,
+                )],
+                ConfigRequirements::default(),
+                ConfigRequirementsToml::default(),
+            )
+            .unwrap();
+            session
+                .services
+                .hooks
+                .store(Arc::new(codex_hooks::Hooks::new(
+                    codex_hooks::HooksConfig {
+                        feature_enabled: true,
+                        bypass_hook_trust: true,
+                        config_layer_stack: Some(stack),
+                        ..Default::default()
+                    },
+                )));
+            let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+            let report = run_completion_stop_hook(
+                &session,
+                &turn,
+                false,
+                Some("done".into()),
+                || std::future::ready(Default::default()),
+                &tracker,
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(
+                fs::read_to_string(source).unwrap(),
+                "tested source changed",
+                "hook runs once"
+            );
+            assert!(
+                !report.assessment.verification_gaps.is_empty(),
+                "{event}: {ending}"
+            );
+            assert!(tracker.lock().await.current_mutation_revision() > 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_terminal_hook_preserves_assessment_and_mutation_revision() {
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let report = run_completion_stop_hook(
+        &session,
+        &turn,
+        false,
+        None,
+        || std::future::ready(Default::default()),
+        &tracker,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(report.assessment.verification_gaps.is_empty());
+    assert_eq!(tracker.lock().await.current_mutation_revision(), 0);
+}
 
 #[test]
 fn uncertainty_completion_warnings_use_owner_assessment_not_final_wording() {
@@ -28,6 +406,9 @@ use crate::session::turn_execution::AuthoritativeWaitOwnerResult;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskResult;
+use crate::test_harness::hooks::trust_discovered_hooks;
+use crate::test_harness::responses;
+use crate::test_harness::test_codex::test_codex;
 use crate::tools::exposure::AgentSurfaceStage;
 use crate::tools::exposure::EnvironmentSurfaceMode;
 use crate::tools::exposure::GoalSurfaceState;
@@ -66,9 +447,6 @@ use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
-use crate::test_harness::hooks::trust_discovered_hooks;
-use crate::test_harness::responses;
-use crate::test_harness::test_codex::test_codex;
 use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
 use rmcp::model::JsonObject;
@@ -216,7 +594,7 @@ fn turn_submission_type_distinguishes_queued_continuations() {
 
 #[tokio::test]
 async fn stopped_session_start_restores_input_and_requests_a_fresh_turn() {
-    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
     let input = vec![TurnInput::UserInput {
         content: vec![UserInput::Text {
             text: "retry after session-start stop".to_string(),
@@ -225,7 +603,7 @@ async fn stopped_session_start_restores_input_and_requests_a_fresh_turn() {
         client_id: None,
     }];
 
-    let result = finish_stopped_session_start(&session, input.clone()).await;
+    let result = finish_stopped_session_start(&session, &turn, input.clone()).await;
 
     assert!(result.defer_pending_input);
     assert_eq!(
@@ -235,6 +613,48 @@ async fn stopped_session_start_restores_input_and_requests_a_fresh_turn() {
             .await,
         input
     );
+    let owned_turn = Arc::new(turn);
+    let worker = tokio::spawn(std::future::pending::<()>());
+    let active = crate::state::ActiveTurn {
+        // Input ownership is tied to a running task's turn identity, not only
+        // to the terminal coordinator. Match installed-startup scaffolding.
+        task: Some(crate::state::RunningTask {
+            done: Arc::new(tokio::sync::Notify::new()),
+            worker_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            kind: crate::state::TaskKind::Regular,
+            task: Arc::new(crate::tasks::RegularTask::new()),
+            cancellation_token: CancellationToken::new(),
+            auxiliary_cancellation_token: CancellationToken::new(),
+            auxiliary_tasks: tokio::task::JoinSet::new(),
+            worker_abort_handle: worker.abort_handle(),
+            task_span: tracing::Span::none(),
+            turn_context: Arc::clone(&owned_turn),
+            _agent_execution_guard: None,
+        }),
+        terminal: Some(crate::state::TurnTerminalCoordinator::new(
+            owned_turn.sub_id.clone(),
+        )),
+        ..Default::default()
+    };
+    let state = active.turn_state.clone();
+    state.lock().await.input_in_flight = input.iter().cloned().collect();
+    *session.active_turn.lock().await = Some(active);
+    let owned_result = finish_stopped_session_start(&session, &owned_turn, input.clone()).await;
+    assert!(owned_result.defer_pending_input);
+    session
+        .input_queue
+        .recover_pending_input_for_turn_state(&state)
+        .await;
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        input,
+        "an owned startup stop must recover once, not restore a second copy"
+    );
+    worker.abort();
+    let _ = worker.await;
 }
 
 #[tokio::test]
@@ -564,6 +984,203 @@ async fn consecutive_turn_contexts_share_the_unchanged_picker_snapshot() {
         &first_turn.available_models,
         &second_turn.available_models
     ));
+}
+
+#[tokio::test]
+async fn pending_hook_recorder_is_cancelled_before_terminal_and_successor() {
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigLayerStack;
+    use codex_config::ConfigRequirements;
+    use codex_config::ConfigRequirementsToml;
+    let directory = tempfile::tempdir().unwrap();
+    let script = directory.path().join("gated_prompt.py");
+    let entered = directory.path().join("entered");
+    let release = directory.path().join("release");
+    std::fs::write(&script, "import pathlib,sys,time\npathlib.Path(sys.argv[1]).write_text('entered')\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.01)\n").unwrap();
+    let command = |python: &str| {
+        format!(
+            "{python} \"{}\" \"{}\" \"{}\"",
+            script.display(),
+            entered.display(),
+            release.display()
+        )
+    };
+    let (session, turn, events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let layer = serde_json::from_value(serde_json::json!({"hooks": {"UserPromptSubmit": [{"hooks": [{
+        "type": "command", "command": command("python3"), "commandWindows": command("python"), "timeout": 120
+    }]}]}})).unwrap();
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: turn.config.codex_home.join("config.toml"),
+                profile: None,
+            },
+            layer,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .unwrap();
+    session
+        .services
+        .hooks
+        .store(Arc::new(codex_hooks::Hooks::new(
+            codex_hooks::HooksConfig {
+                feature_enabled: true,
+                bypass_hook_trust: true,
+                config_layer_stack: Some(stack),
+                ..Default::default()
+            },
+        )));
+    session
+        .spawn_task(
+            turn.clone(),
+            Vec::new(),
+            SignalCompletingTask {
+                finish: CancellationToken::new(),
+            },
+        )
+        .await;
+    session
+        .steer_input(
+            vec![UserInput::Text {
+                text: "older-A".into(),
+                text_elements: Vec::new(),
+            }],
+            Default::default(),
+            Some(&turn.sub_id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut recorder = Box::pin(drain_and_record_pending_inputs(&session, &turn, false, &[]));
+    assert!(futures::poll!(recorder.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !entered.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("real prompt hook entered before any commit");
+    assert_eq!(
+        session
+            .durable_history_commits_in_flight
+            .load(Ordering::Acquire),
+        0
+    );
+    drop(recorder);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        session.abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted),
+    )
+    .await
+    .expect("interruption must not wait for the hook timeout");
+    let mut terminal = false;
+    while let Ok(event) = events.try_recv() {
+        terminal |= matches!(event.msg, EventMsg::TurnAborted(_));
+    }
+    assert!(terminal);
+    let next = session
+        .new_default_turn_with_sub_id("successor".into())
+        .await;
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &next,
+            &[UserInput::Text {
+                text: "newer-B".into(),
+                text_elements: Vec::new(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    std::fs::write(release, "release").unwrap();
+    session.terminal_tasks.close();
+    tokio::time::timeout(Duration::from_secs(5), session.terminal_tasks.wait())
+        .await
+        .unwrap();
+    let history = serde_json::to_string(session.clone_history().await.raw_items()).unwrap();
+    assert!(
+        !history.contains("older-A"),
+        "discarded old hook input must never append after terminal"
+    );
+    assert_eq!(history.matches("newer-B").count(), 1);
+}
+
+#[tokio::test]
+async fn aborted_undelivered_context_is_present_once_on_the_next_explicit_input() {
+    for kind in [
+        AdditionalContextKind::Untrusted,
+        AdditionalContextKind::Application,
+    ] {
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        session
+            .spawn_task(
+                turn.clone(),
+                Vec::new(),
+                SignalCompletingTask {
+                    finish: CancellationToken::new(),
+                },
+            )
+            .await;
+        let context = indexmap::IndexMap::from([(
+            "browser_info".to_string(),
+            AdditionalContextEntry {
+                kind,
+                value: "This tab is the production dashboard.".to_string(),
+            },
+        )]);
+        session
+            .steer_input(
+                vec![UserInput::Text {
+                    text: "older-A".into(),
+                    text_elements: Vec::new(),
+                }],
+                context.clone(),
+                Some(&turn.sub_id),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+            .await;
+        let next = session
+            .new_default_turn_with_sub_id("context-successor".into())
+            .await;
+        session
+            .record_additional_context_snapshot(&next, context.clone())
+            .await
+            .unwrap();
+        session
+            .record_user_prompt_and_emit_turn_item(
+                &next,
+                &[UserInput::Text {
+                    text: "newer-B".into(),
+                    text_elements: Vec::new(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        session
+            .record_additional_context_snapshot(&next, context)
+            .await
+            .unwrap();
+        let history = serde_json::to_string(session.clone_history().await.raw_items()).unwrap();
+        assert_eq!(
+            history
+                .matches("This tab is the production dashboard.")
+                .count(),
+            1
+        );
+        assert!(history.find("production dashboard.").unwrap() < history.find("newer-B").unwrap());
+        assert!(!history.contains("older-A"));
+    }
 }
 
 #[tokio::test]
@@ -1231,11 +1848,13 @@ async fn projected_prompt_defers_dynamic_history_measurement_across_retries() {
 async fn pending_turn_router_reuses_session_cache_until_planning_changes() -> Result<()> {
     let (session, turn_context, _events) =
         crate::session::tests::make_session_and_context_with_rx().await;
-    let planning_generation = session.services.planning_generation();
     let first_step = session
         .capture_step_context(Arc::clone(&turn_context))
         .await
         .unwrap();
+    // The first capture may publish the MCP runtime's selected scope.
+    // Cache the generation belonging to that captured planning view.
+    let planning_generation = session.services.planning_generation();
     let first = built_tools_for_pending_turn(
         session.as_ref(),
         &first_step,
@@ -1299,6 +1918,80 @@ async fn prepared_router_config_match_accepts_the_shared_turn_snapshot() {
     assert!(same_config_snapshot(&shared, &distinct));
     Arc::make_mut(&mut distinct).service_tier = Some("changed-test-tier".to_string());
     assert!(!same_config_snapshot(&shared, &distinct));
+}
+
+#[tokio::test]
+async fn prepared_router_rebuilds_for_same_slug_metadata_and_catalog_changes() {
+    for startup in [false, true] {
+        for changed in ["enable-search", "disable-search", "catalog"] {
+            let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+            let session = Arc::new(session);
+            turn.model_info.supports_search_tool = changed == "disable-search";
+            let mut turn = Arc::new(turn);
+            let step = session
+                .capture_step_context(Arc::clone(&turn))
+                .await
+                .unwrap();
+            // The first capture may publish the MCP runtime's selected scope.
+            // Cache the generation belonging to that captured planning view.
+            let generation = session.services.planning_generation();
+            let cancellation = CancellationToken::new();
+            let old = built_tools(&session, &step, &[], &cancellation)
+                .await
+                .unwrap();
+            assert!(old.matches_planning_context(turn.as_ref()));
+            if startup {
+                session
+                    .startup_prepared_router
+                    .publish(crate::session_startup_prewarm::PreparedStartupRouter {
+                        planning_generation: generation,
+                        config: Arc::clone(&turn.config),
+                        dynamic_tools: turn.dynamic_tools.clone(),
+                        router: Arc::clone(&old),
+                    })
+                    .await;
+            } else {
+                session
+                    .prepared_tool_router
+                    .publish(generation, turn.as_ref(), Arc::clone(&old));
+            }
+            drop(step);
+            let current = Arc::get_mut(&mut turn).expect("only the immutable plan was cached");
+            if changed == "catalog" {
+                Arc::make_mut(&mut current.available_models).push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "new-catalog-model", "model": "new-catalog-model",
+                        "display_name": "New catalog model", "description": "Refreshed catalog",
+                        "default_reasoning_effort": "medium", "supported_reasoning_efforts": [],
+                        "is_default": false, "upgrade": null, "show_in_picker": true,
+                        "availability_nux": null, "supported_in_api": true
+                    }))
+                    .unwrap(),
+                );
+            } else {
+                current.model_info.supports_search_tool = changed == "enable-search";
+            }
+            assert!(!old.matches_planning_context(turn.as_ref()), "{changed}");
+            let step = session
+                .capture_step_context(Arc::clone(&turn))
+                .await
+                .unwrap();
+            let rebuilt =
+                built_tools_for_pending_turn(&session, &step, &[], generation, &cancellation)
+                    .await
+                    .unwrap();
+            assert!(!Arc::ptr_eq(&old, &rebuilt), "{changed}, startup={startup}");
+            assert!(rebuilt.matches_planning_context(turn.as_ref()));
+            let warm =
+                built_tools_for_pending_turn(&session, &step, &[], generation, &cancellation)
+                    .await
+                    .unwrap();
+            assert!(
+                Arc::ptr_eq(&rebuilt, &warm),
+                "unchanged inputs must reuse the plan"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1645,7 +2338,7 @@ fn kd4_latency_continuation_prefetch_rejects_stale_or_steered_state() {
 
 #[tokio::test]
 async fn local_compaction_reuses_pending_capture_and_rejects_stale_revision() {
-    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
     Arc::make_mut(&mut turn.config).compact_prompt = Some("local summary".into());
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let revision = tracker.lock().await.current_mutation_revision();
@@ -1659,7 +2352,6 @@ async fn local_compaction_reuses_pending_capture_and_rejects_stale_revision() {
         }
         let mut identity = None;
         reuse_workspace_prefetch_for_local_compaction(
-            &session,
             &turn,
             &tracker,
             &mut pending,
@@ -1676,7 +2368,7 @@ async fn local_compaction_reuses_pending_capture_and_rejects_stale_revision() {
 
 #[tokio::test]
 async fn local_compaction_pending_capture_is_cancellable() {
-    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
     Arc::make_mut(&mut turn.config).compact_prompt = Some("local summary".into());
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let revision = tracker.lock().await.current_mutation_revision();
@@ -1689,7 +2381,6 @@ async fn local_compaction_pending_capture_is_cancellable() {
     cancellation.cancel();
     assert!(matches!(
         reuse_workspace_prefetch_for_local_compaction(
-            &session,
             &turn,
             &tracker,
             &mut pending,
@@ -3235,13 +3926,10 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
         assert!(history.raw_items().starts_with(&before));
         assert_eq!(history.raw_items().len(), before.len() + 1);
     }
-    // A root task that asks for no exhaustive coverage gets no full-read policy.
-    record_sampling_notices(
-        &session, &turn, false, /*forced_terminal*/ None,
-        /*exhaustive_scope_requested*/ false,
-    )
-    .await
-    .unwrap();
+    // Root tasks get no phrase-triggered full-read policy.
+    record_sampling_notices(&session, &turn, false, /*forced_terminal*/ None)
+        .await
+        .unwrap();
     assert!(
         !serde_json::to_string(session.clone_history().await.raw_items())
             .unwrap()
@@ -3252,19 +3940,17 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
         &turn,
         true,
         Some(ForcedTerminalReason::GenerationBudget),
-        /*exhaustive_scope_requested*/ true,
     )
     .await
     .unwrap();
     let notices = session.clone_history().await.raw_items().to_vec();
-    for exhaustive_scope_requested in [true, false] {
+    for _ in 0..2 {
         // A recorded notice is neither duplicated nor retracted by later steps.
         record_sampling_notices(
             &session,
             &turn,
             true,
             Some(ForcedTerminalReason::GenerationBudget),
-            exhaustive_scope_requested,
         )
         .await
         .unwrap();
@@ -3274,21 +3960,29 @@ async fn sampling_context_notices_are_persisted_once_and_append_only() {
         );
     }
     let rendered = serde_json::to_string(&notices).unwrap();
-    assert_eq!(
-        rendered.matches("<exhaustive_scope_feasibility>").count(),
-        1
-    );
-    assert!(rendered.contains("do not narrow the scope without the user's approval"));
-    assert!(rendered.contains("Continue reading through compactions"));
-    assert!(rendered.contains("not reasons to stop while required work remains obtainable"));
+    assert!(!rendered.contains("<exhaustive_scope_feasibility>"));
     assert_eq!(rendered.matches("<mcp_catalog_notice>").count(), 1);
     assert_eq!(rendered.matches("<forced_terminal_notice>").count(), 1);
     assert!(rendered.contains("Later user input may resume work"));
 }
 
-#[test]
-fn exhaustive_scope_requests_are_recognized_and_ordinary_tasks_are_not() {
+#[tokio::test]
+async fn root_scope_phrases_preserve_requests_without_injecting_notices() {
+    let long_narrow_request = format!(
+        "Fix one README typo. {} No full audit is authorized.",
+        "Do not change the scope. ".repeat(40)
+    );
     for request in [
+        "Fix the typo only; do not conduct a full review.",
+        "Do not read every file. Inspect src/parser.rs only.",
+        "The log says \"full audit failed\"; explain this one error.",
+        "Rename the UI label \"Complete Review\" to \"Review Complete\" in labels.json.",
+        "Find the definition of full_review; do not run an exhaustive review.",
+        "The previous request to review the entire repository is cancelled. Fix only the typo in README.md.",
+        long_narrow_request.as_str(),
+        "Explain how a full audit differs from a sampled audit; do not inspect repository files.",
+        // Positive controls: the host must retain the complete requested scope
+        // without asking to narrow it or inserting a feasibility inventory.
         "Read every file in src/ and list the unsafe blocks.",
         "Do an exhaustive review of the parser.",
         "Audit the entire codebase for panics.",
@@ -3298,45 +3992,247 @@ fn exhaustive_scope_requests_are_recognized_and_ordinary_tasks_are_not() {
         "A full-read audit of each source file, please.",
         "Go through everything under scripts/.",
     ] {
-        assert!(request_asks_for_exhaustive_scope(request), "{request}");
-    }
-    // Sentences from three real implementation requests that received the
-    // notice and spent a step inventorying files, plus everyday requests.
-    for request in [
-        "Deeply audit and optimize KDA's total wall-clock time for complete repository scans using 3 representative workloads, then implement exactly 3 verified findings.",
-        "Preserve full scan behavior, deterministic results, and exact source/configuration provenance.",
-        "Deeply audit and optimize KDA's CPU consumption during full repository scans.",
-        "Repeated whole-graph solving and redundant fixpoint iterations.",
-        "Preserve every valid semantic conclusion, diagnostic, witness, and required analysis surface.",
-        "Never reduce RAM by silently discarding semantic facts, suppressing findings, weakening proofs, or sacrificing analysis coverage.",
-        "Fix all",
-        "Run all tests and fix the failures.",
-        "Find up to 25 material things that need to be fixed.",
-    ] {
-        assert!(!request_asks_for_exhaustive_scope(request), "{request}");
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let input = vec![TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: request.to_owned(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        }];
+        record_inspected_inputs(&session, &turn, &input)
+            .await
+            .unwrap();
+        record_sampling_notices(&session, &turn, false, None)
+            .await
+            .unwrap();
+        let history = session.clone_history().await;
+        assert_eq!(history.raw_items().len(), 1, "{request}");
+        let prepared = prepare_sampling_prompt_with_workspace_identity(
+            history,
+            &turn,
+            None,
+            session.services.git_workspace.as_ref(),
+        );
+        assert_eq!(prepared.items().len(), 1, "{request}");
+        let ResponseItem::Message { role, content, .. } = &prepared.items()[0] else {
+            panic!("accepted request must remain a message");
+        };
+        assert_eq!(role, "user");
+        assert_eq!(
+            content,
+            &vec![ContentItem::InputText {
+                text: request.to_owned()
+            }]
+        );
     }
 }
 
 #[tokio::test]
-async fn exhaustive_scope_notice_prices_full_reads_and_bounds_spawned_agents() {
+async fn accepted_user_messages_remain_citeable_across_input_packing() {
+    use crate::context::ContextualUserFragment;
+    use sha2::Digest;
+
+    let texts = [
+        "Do not implement; audit only.",
+        "Include exact source line references.",
+    ];
+    for initial_input in [true, false] {
+        for separate_messages in [true, false] {
+            for use_reference in [true, false] {
+                let (session, turn, _events) =
+                    crate::session::tests::make_session_and_context_with_rx().await;
+                let store = &session.services.plan_store;
+                store
+                    .update_tool(
+                        serde_json::from_value(serde_json::json!({
+                            "plan": [{"step": "Implement the repair", "status": "pending"}]
+                        }))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let parts = texts.map(|text| UserInput::Text {
+                    text: text.to_owned(),
+                    text_elements: Vec::new(),
+                });
+                let input = if separate_messages {
+                    parts
+                        .into_iter()
+                        .map(|part| TurnInput::UserInput {
+                            content: vec![part],
+                            client_id: None,
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![TurnInput::UserInput {
+                        content: parts.to_vec(),
+                        client_id: None,
+                    }]
+                };
+                if initial_input {
+                    record_inspected_inputs(&session, &turn, &input)
+                        .await
+                        .unwrap();
+                } else {
+                    let outcome = run_hooks_and_record_inputs_detailed(&session, &turn, input)
+                        .await
+                        .unwrap();
+                    assert!(outcome.accepted_context_input);
+                    assert!(!outcome.should_stop);
+                }
+                let state = store.task_state(false).await;
+                let body = state.body();
+                let state: serde_json::Value =
+                    serde_json::from_str(body.lines().find(|line| line.starts_with('{')).unwrap())
+                        .unwrap();
+                let refs = texts.map(|text| {
+                    serde_json::json!({
+                        "turn_id": turn.sub_id,
+                        "sha256": hex::encode(sha2::Sha256::digest(text.as_bytes())),
+                    })
+                });
+                let accepted = state["accepted_input_refs"].as_array().unwrap();
+                assert_eq!(accepted.len(), 2);
+                for reference in &refs {
+                    assert!(accepted.contains(reference));
+                }
+                let step_id = state["step_ids"][0].as_str().unwrap();
+                let before = store.snapshot_with_lineage().await;
+                let mut args = serde_json::json!({
+                    "expected_revision": state["revision"], "plan": [],
+                    "superseded": [{"step_id": step_id, "reason": "User requested audit only"}],
+                    "scope_change_reviewed_revision": state["scope_input_revision"],
+                });
+                args[if use_reference {
+                    "scope_change_refs"
+                } else {
+                    "scope_change_instructions"
+                }] = if use_reference {
+                    serde_json::json!({step_id: refs[0]})
+                } else {
+                    serde_json::json!({step_id: texts[0]})
+                };
+                let mut forged = args.clone();
+                forged["scope_change_refs"] = serde_json::json!({step_id: {
+                    "turn_id": "foreign", "sha256": refs[0]["sha256"],
+                }});
+                assert!(
+                    store
+                        .update_tool(serde_json::from_value(forged).unwrap())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(store.snapshot_with_lineage().await, before);
+                store
+                    .update_tool(serde_json::from_value(args).unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    store
+                        .snapshot_with_lineage()
+                        .await
+                        .unwrap()
+                        .0
+                        .plan
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_broad_sibling_cannot_supply_scope_or_root_notice() {
+    use crate::context::ContextualUserFragment;
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigLayerStack;
+    use codex_config::ConfigRequirements;
+    use codex_config::ConfigRequirementsToml;
+
+    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let script = "import json, sys; blocked = 'comprehensive' in json.load(sys.stdin)['prompt']; sys.stderr.write('broad input rejected' if blocked else ''); sys.exit(2 if blocked else 0)";
+    let layer = serde_json::from_value(serde_json::json!({"hooks": {
+        "UserPromptSubmit": [{"hooks": [{
+            "type": "command",
+            "command": format!("python3 -c \"{script}\""),
+            "commandWindows": format!("python -c \"{script}\""),
+        }]}]
+    }}))
+    .unwrap();
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: turn.config.codex_home.join("config.toml"),
+                profile: None,
+            },
+            layer,
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .unwrap();
+    session
+        .services
+        .hooks
+        .store(Arc::new(codex_hooks::Hooks::new(
+            codex_hooks::HooksConfig {
+                feature_enabled: true,
+                bypass_hook_trust: true,
+                config_layer_stack: Some(stack),
+                ..Default::default()
+            },
+        )));
+    let store = &session.services.plan_store;
+    store
+        .update_tool(
+            serde_json::from_value(serde_json::json!({
+                "plan": [{"step": "Fix typo", "status": "pending"}]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let input =
+        ["Perform a comprehensive audit.", "Fix this one typo."].map(|text| TurnInput::UserInput {
+            content: vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }],
+            client_id: None,
+        });
+    let outcome = run_hooks_and_record_inputs_detailed(&session, &turn, input.to_vec())
+        .await
+        .unwrap();
+    assert!(!outcome.should_stop);
+    assert!(outcome.accepted_context_input);
+    record_sampling_notices(&session, &turn, false, None)
+        .await
+        .unwrap();
+    let prepared = prepare_sampling_prompt_with_workspace_identity(
+        session.clone_history().await,
+        &turn,
+        None,
+        session.services.git_workspace.as_ref(),
+    );
+    let rendered = serde_json::to_string(prepared.items()).unwrap();
+    assert!(rendered.contains("Fix this one typo."));
+    assert!(!rendered.contains("Perform a comprehensive audit."));
+    assert!(!rendered.contains("<exhaustive_scope_feasibility>"));
+    let state = store.task_state(false).await;
+    let body = state.body();
+    let state: serde_json::Value =
+        serde_json::from_str(body.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
+    assert_eq!(state["accepted_input_refs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn spawned_agent_notice_preserves_budget_without_a_scope_classifier() {
     use codex_protocol::protocol::SubAgentSource;
 
-    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
-    let limit = turn
-        .model_info
-        .auto_compact_token_limit()
-        .or_else(|| turn.model_context_window())
-        .expect("the test model has a context limit");
-    // Three quarters of the compaction limit is read content, at 4 bytes a token.
-    let megabytes = (limit * 3 / 4 * 4) as f64 / 1_000_000.0;
-    let root = exhaustive_scope_feasibility_notice(&turn);
-    assert!(root.starts_with("Before committing to an exhaustive review or full-read request"));
-    assert!(root.contains(&format!(
-        "each ~{megabytes:.1} MB read fills a context window"
-    )));
-    assert!(root.contains("set autoResolutionMs so an unanswered question proceeds"));
-    assert!(root.contains("Continue reading through compactions"));
-
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
     turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
         parent_thread_id: codex_protocol::ThreadId::new(),
         depth: 1,
@@ -3344,19 +4240,59 @@ async fn exhaustive_scope_notice_prices_full_reads_and_bounds_spawned_agents() {
         agent_nickname: None,
         agent_role: None,
     });
-    let child = exhaustive_scope_feasibility_notice(&turn);
+    let limit = turn
+        .model_info
+        .auto_compact_token_limit()
+        .or_else(|| turn.model_context_window())
+        .expect("the test model has a context limit");
+    // Illustrate three quarters of the compaction limit at 4 bytes a token.
+    let megabytes = (limit * 3 / 4 * 4) as f64 / 1_000_000.0;
+    let child = spawned_agent_context_budget_notice(&turn);
+    assert!(child.starts_with("Before committing to an exhaustive review or full-read request"));
+    assert!(child.contains(&format!("~{megabytes:.1} MB uses three quarters")));
+    assert!(child.contains("Rough inline capacity illustration, not a timing estimate"));
+    assert!(child.contains("retiring exactly recoverable consumed output"));
+    assert!(child.contains("model summarization that can lose detail"));
+    // The removed token-budget window reset is no longer a relief route.
+    assert!(!child.contains("fresh-window"));
+    assert!(child.contains("duration is unknown without measurements for the active route"));
+    assert!(!child.contains("forces a compaction"));
+    assert!(!child.contains("minutes each"));
+
     assert!(child.contains(&format!(
-        "each ~{megabytes:.1} MB read fills a context window"
+        "Your context budget is {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} counted context-pressure events per turn"
     )));
-    assert!(child.contains(&format!(
-        "Your context budget is {MAX_SUBAGENT_CONTEXT_PRESSURE_EVENTS} compactions per turn"
-    )));
+    assert!(child.contains("duration is unknown without measurements for the active route"));
     assert!(child.contains("unread files or byte ranges"));
     assert!(
         !child.contains("autoResolutionMs"),
         "a spawned agent does not ask the user"
     );
     assert!(!child.contains("Continue reading through compactions"));
+    for _ in 0..2 {
+        record_sampling_notices(&session, &turn, false, None)
+            .await
+            .unwrap();
+    }
+    let rendered = serde_json::to_string(session.clone_history().await.raw_items()).unwrap();
+    assert_eq!(
+        rendered.matches("<exhaustive_scope_feasibility>").count(),
+        1
+    );
+    assert!(rendered.contains(&child));
+}
+
+#[tokio::test]
+async fn spawned_agent_notice_does_not_invent_unknown_capacity() {
+    let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
+    turn.model_info.context_window = None;
+    turn.model_info.max_context_window = None;
+    turn.model_info.auto_compact_token_limit = None;
+    let notice = spawned_agent_context_budget_notice(&turn);
+    assert!(notice.contains("model context limit is unknown"));
+    assert!(!notice.contains("MB uses three quarters"));
+    assert!(notice.contains("duration is unknown without measurements for the active route"));
+    assert!(notice.contains("Report unfinished coverage in the final answer"));
 }
 
 #[test]
@@ -3472,6 +4408,16 @@ async fn spawned_agent_limit_retirements_leave_the_compaction_budget_impl() -> R
     // Enough consumed results for both limit retirements, while the projected
     // first prompt stays under the limit so nothing retires before the turn.
     seed_retirable_consumed_outputs(&session, 50).await;
+    // Pending-input recording belongs to an admitted task for this turn.
+    session
+        .spawn_task(
+            Arc::clone(&turn),
+            Vec::new(),
+            SignalCompletingTask {
+                finish: CancellationToken::new(),
+            },
+        )
+        .await;
 
     let mut budget = LogicalGenerationBudget::default();
     tokio::time::timeout(
@@ -3528,6 +4474,9 @@ async fn spawned_agent_limit_retirements_leave_the_compaction_budget_impl() -> R
         !sent[2].body_contains_text("reached its context budget"),
         "retirement at the limit must not force the final synthesis"
     );
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
     Ok(())
 }
 
@@ -3617,6 +4566,16 @@ fn usage_limit_waits_for_an_account_switch_and_retries_the_same_request() -> Res
                     turn.config.http_client_factory(),
                 );
             }
+            // Pending-input recording belongs to an admitted task for this turn.
+            session
+                .spawn_task(
+                    Arc::clone(&turn),
+                    Vec::new(),
+                    SignalCompletingTask {
+                        finish: CancellationToken::new(),
+                    },
+                )
+                .await;
             let mut budget = LogicalGenerationBudget::default();
             // Joined futures move on the stack; keep the turn future on the heap.
             let run = Box::pin(run_turn(
@@ -3692,6 +4651,9 @@ fn usage_limit_waits_for_an_account_switch_and_retries_the_same_request() -> Res
                 sent[1].body_json()["input"],
                 "the switch retries the same request"
             );
+            session
+                .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                .await;
             Ok(())
         },
     )
@@ -3981,6 +4943,7 @@ async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
         environment_mode: current.environment_mode,
         environment_starting: current.environment_starting,
         windows_shell_guidance: current.windows_shell_guidance,
+        native_environment_contract: current.native_environment_contract,
         ..ToolExposureIdentity::default()
     };
     let matching_router = ToolRouter::from_parts_with_warnings_and_identity(
@@ -3988,7 +4951,8 @@ async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
         Vec::new(),
         Vec::new(),
         matching_identity.clone(),
-    );
+    )
+    .with_planning_context(turn.as_ref());
     assert!(
         finalized_router_matches_current_exposure(
             &session,
@@ -4033,7 +4997,8 @@ async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
             Vec::new(),
             Vec::new(),
             stale_identity,
-        );
+        )
+        .with_planning_context(turn.as_ref());
         assert!(
             !finalized_router_matches_current_exposure(&session, step_context.as_ref(), &stale)
                 .await
@@ -4048,7 +5013,8 @@ async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
             request_user_input_eligible: !matching_identity.request_user_input_eligible,
             ..matching_identity.clone()
         },
-    );
+    )
+    .with_planning_context(turn.as_ref());
     assert!(
         !finalized_router_matches_current_exposure(&session, step_context.as_ref(), &stale_router,)
             .await
@@ -4062,7 +5028,8 @@ async fn finalized_router_reuse_rejects_changed_dynamic_exposure() {
             collaboration_mode: ModeKind::Plan,
             ..matching_identity
         },
-    );
+    )
+    .with_planning_context(turn.as_ref());
     assert!(
         !finalized_router_matches_current_exposure(
             &session,
@@ -4430,18 +5397,19 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
     .await;
     assert_eq!(delta.item_id, started_id);
     assert_eq!(delta.delta, "streamed");
-    let completed_id = crate::test_harness::wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::ItemCompleted(event) => match &event.item {
-            TurnItem::AgentMessage(item) => Some(item.id.clone()),
+    let completed_id =
+        crate::test_harness::wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::ItemCompleted(event) => match &event.item {
+                TurnItem::AgentMessage(item) => Some(item.id.clone()),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    })
-    .await;
+        })
+        .await;
 
     match provider_id {
         "" => assert!(started_id.starts_with("msg_")),
-        "msg_sctx_provider" => assert_eq!(started_id, "msg_msg_sctx_provider"),
+        "msg_sctx_provider" => assert_eq!(started_id, "msg_provider_msg_sctx_provider"),
         id => assert_eq!(started_id, id),
     }
     assert_eq!(started_id, completed_id);
@@ -4457,164 +5425,12 @@ async fn assert_streamed_item_id(provider_id: &str) -> Result<()> {
 
 fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo {
     let mut provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
+    // OpenAI identity is the trusted registration kind, not the display name.
+    provider.kind = codex_model_provider_info::ProviderKind::Custom;
     provider.name = "OpenAI (phase 68 test)".to_string();
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider.supports_websockets = false;
     provider
-}
-
-#[test]
-fn new_context_tool_installs_fresh_window_before_next_generation() -> Result<()> {
-    run_turn_multi_thread_test_with_stack(
-        "new_context_tool_installs_fresh_window_before_next_generation",
-        || async {
-            let server = responses::start_mock_server().await;
-            let requests = responses::mount_sse_sequence(
-                &server,
-                vec![
-                    responses::sse(vec![
-                        responses::ev_function_call("fresh-window", "new_context", "{}"),
-                        responses::ev_completed("reset"),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_assistant_message("answer", "Fresh window installed."),
-                        responses::ev_completed("done"),
-                    ]),
-                ],
-            )
-            .await;
-            let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
-            extensions.tool_contributor(Arc::new(crate::session::tests::TokenBudgetRecoveryTools));
-            let test = test_codex()
-                .with_extensions(Arc::new(extensions.build()))
-                .with_config(|config| {
-                    config.features.enable(Feature::TokenBudget).unwrap();
-                    config.features.disable(Feature::CodeModeHost).unwrap();
-                    config.model_auto_compact_token_limit = Some(i64::MAX);
-                })
-                .build(&server)
-                .await?;
-            fs::write(test.workspace_path("world-state.txt"), "persistent world")?;
-            let completion = test
-                .submit_turn_and_capture_completion("old-conversation-sentinel")
-                .await?;
-            assert!(completion.error.is_none(), "{completion:?}");
-            assert_eq!(
-                completion.last_agent_message.as_deref(),
-                Some("Fresh window installed.")
-            );
-            let sent = requests.requests();
-            assert_eq!(
-                sent.len(),
-                2,
-                "request flag is consumed once, without a compaction generation"
-            );
-            assert!(sent[0].body_contains_text("old-conversation-sentinel"));
-            assert!(
-                sent[1].body_contains_text("old-conversation-sentinel"),
-                "a fresh context window must preserve the unresolved original request"
-            );
-            let context = |index: usize| {
-                [
-                    sent[index].message_input_texts("user"),
-                    sent[index].message_input_texts("developer"),
-                ]
-                .concat()
-                .join("\n")
-            };
-            let before = context(0);
-            let after = context(1);
-            let window = |text: &str| {
-                text.lines()
-                    .find_map(|line| line.strip_prefix("Current context window id: "))
-                    .unwrap()
-                    .to_owned()
-            };
-            assert_ne!(window(&before), window(&after));
-            assert!(after.contains(&format!("Previous context window id: {}", window(&before))));
-            assert!(after.contains("environment_context"));
-            assert!(after.contains(&test.cwd_path().to_string_lossy().to_string()));
-            assert_eq!(
-                fs::read_to_string(test.workspace_path("world-state.txt"))?,
-                "persistent world"
-            );
-            Ok(())
-        },
-    )
-}
-
-#[test]
-fn token_budget_compaction_keeps_history_without_recovery_tools() -> Result<()> {
-    run_turn_multi_thread_test_with_stack(
-        "token_budget_compaction_keeps_history_without_recovery_tools",
-        || async {
-            let server = responses::start_mock_server().await;
-            let requests = responses::mount_sse_sequence(
-                &server,
-                vec![
-                    responses::sse(vec![
-                        responses::ev_function_call("continue-work", "unknown_test_tool", "{}"),
-                        responses::ev_completed_with_tokens("before-compaction", 500_000),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_assistant_message(
-                            "summary",
-                            &complete_compaction_summary(
-                                "budget window compacted; continue budget-request-sentinel",
-                            ),
-                        ),
-                        responses::ev_completed_with_tokens("compaction", 20),
-                    ]),
-                    responses::sse(vec![
-                        responses::ev_assistant_message("answer", "History kept."),
-                        responses::ev_completed("done"),
-                    ]),
-                ],
-            )
-            .await;
-            let provider = non_openai_model_provider(&server);
-            let test = test_codex()
-                .with_config(move |config| {
-                    config.model_provider = provider;
-                    config.features.enable(Feature::TokenBudget).unwrap();
-                    config.features.disable(Feature::CodeModeHost).unwrap();
-                    config.compact_prompt = Some(codex_prompts::SUMMARIZATION_PROMPT.to_string());
-                    config.model_context_window = Some(1_000_000);
-                    config.model_auto_compact_token_limit = Some(90_000);
-                })
-                .build(&server)
-                .await?;
-            let completion = test
-                .submit_turn_and_capture_completion("budget-request-sentinel")
-                .await?;
-            assert!(completion.error.is_none(), "{completion:?}");
-            assert_eq!(
-                completion.last_agent_message.as_deref(),
-                Some("History kept.")
-            );
-            let sent = requests.requests();
-            assert_eq!(
-                sent.len(),
-                3,
-                "compaction must generate a replacement history"
-            );
-            assert!(
-                sent[1].body_contains_text("budget-request-sentinel"),
-                "the summarizer must receive the current request"
-            );
-            // Once input has been consumed by a model step, normal local
-            // compaction carries it forward through the generated summary.
-            assert!(
-                sent[2].body_contains_text("budget-request-sentinel"),
-                "the current request must survive compaction without recovery tools"
-            );
-            assert!(
-                sent[2].body_contains_text("budget window compacted"),
-                "the replacement summary must reach the next model request"
-            );
-            Ok(())
-        },
-    )
 }
 
 #[test]
@@ -4641,6 +5457,16 @@ fn first_turn_dispatch_aborts_never_completing_prewarm() -> Result<()> {
                     move |config| {
                         config.model_provider = provider;
                         config.features.disable(Feature::CodeModeHost).unwrap();
+                    },
+                )
+                .await;
+            // Pending-input recording belongs to an admitted task for this turn.
+            session
+                .spawn_task(
+                    Arc::clone(&turn),
+                    Vec::new(),
+                    SignalCompletingTask {
+                        finish: CancellationToken::new(),
                     },
                 )
                 .await;
@@ -4684,6 +5510,100 @@ fn first_turn_dispatch_aborts_never_completing_prewarm() -> Result<()> {
             })
             .await?;
             assert!(session.take_session_startup_prewarm().await.is_none());
+            session
+                .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                .await;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn refused_missing_answer_repair_reports_only_the_budget_cause() -> Result<()> {
+    run_turn_multi_thread_test_with_stack(
+        "refused_missing_answer_repair_reports_only_the_budget_cause",
+        || async {
+            let server = responses::start_mock_server().await;
+            let requests = responses::mount_sse_sequence(
+                &server,
+                vec![responses::sse(vec![
+                    responses::ev_response_created("empty"),
+                    responses::ev_completed("empty"),
+                ])],
+            )
+            .await;
+            let home = tempfile::tempdir()?;
+            let provider = non_openai_model_provider(&server);
+            let (session, turn, events) =
+                crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                    CodexAuth::from_api_key("test key"),
+                    Vec::new(),
+                    home.path(),
+                    move |config| {
+                        config.model_provider = provider;
+                        config.features.disable(Feature::CodeModeHost).unwrap();
+                    },
+                )
+                .await;
+            // Pending-input recording belongs to an admitted task for this turn.
+            session
+                .spawn_task(
+                    Arc::clone(&turn),
+                    Vec::new(),
+                    SignalCompletingTask {
+                        finish: CancellationToken::new(),
+                    },
+                )
+                .await;
+            // The sampled generation is the last regular one and the forced final
+            // summary is already spent, so the missing-answer repair is refused.
+            let mut budget = LogicalGenerationBudget {
+                regular_generations: MAX_REGULAR_LOGICAL_GENERATIONS - 1,
+                terminal_generation_used: true,
+                monitoring_credits: 0,
+            };
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                run_turn(
+                    Arc::clone(&session),
+                    Arc::clone(&turn),
+                    Arc::new(ExtensionData::new(turn.sub_id.clone())),
+                    Vec::new(),
+                    None,
+                    &mut budget,
+                    CancellationToken::new(),
+                ),
+            )
+            .await??;
+            assert_eq!(
+                requests.requests().len(),
+                1,
+                "a refused repair sends nothing"
+            );
+            let budget_message = format!(
+                "This turn exhausted its explicit safety budget of {MAX_REGULAR_LOGICAL_GENERATIONS} generations and one final summary. Work is suspended before all requested work completed. Send another message to resume."
+            );
+            let mut errors = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let EventMsg::Error(error) = event.msg
+                    && error.affects_turn_status()
+                {
+                    errors.push(error.message);
+                }
+            }
+            assert_eq!(errors, vec![budget_message.clone()]);
+            assert_eq!(
+                turn.terminal_error
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|error| error.message.clone()),
+                Some(budget_message),
+                "the budget refusal remains the terminal cause"
+            );
+            session
+                .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                .await;
             Ok(())
         },
     )
@@ -4713,6 +5633,16 @@ fn first_turn_dispatch_reports_disabled_startup_prewarm() -> Result<()> {
                     move |config| {
                         config.model_provider = provider;
                         config.features.disable(Feature::CodeModeHost).unwrap();
+                    },
+                )
+                .await;
+            // Pending-input recording belongs to an admitted task for this turn.
+            session
+                .spawn_task(
+                    Arc::clone(&turn),
+                    Vec::new(),
+                    SignalCompletingTask {
+                        finish: CancellationToken::new(),
                     },
                 )
                 .await;
@@ -4756,6 +5686,9 @@ fn first_turn_dispatch_reports_disabled_startup_prewarm() -> Result<()> {
             assert_eq!(snapshot.phases.transport_preconnect_ns, 0);
             assert_eq!(snapshot.phases.prewarm_request_ns, 0);
             assert!(session.take_session_startup_prewarm().await.is_none());
+            session
+                .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                .await;
             Ok(())
         },
     )
@@ -4964,8 +5897,11 @@ fn ordinary_exec_validation_repair_and_inflight_source_freshness() -> Result<()>
                     !paths.is_empty(),
                     "recorded dependency observations must survive"
                 );
+                // Notices never claim checked-current bytes: an unchanged
+                // dependency is `unknown`, and only an observed change is
+                // `changed`. The fresh run must leave no changed dependency.
                 assert!(
-                    paths.iter().all(|path| path["freshness"] == "current"),
+                    paths.iter().all(|path| path["freshness"] == "unknown"),
                     "{notice}"
                 );
             }
@@ -5596,33 +6532,35 @@ async fn seed_retirable_consumed_outputs(session: &Session, count: u32) {
                 call_id: call_id.clone(),
             },
         ));
-        assert!(history.apply_tool_history_mutation(
-            &crate::tool_history::ToolHistoryMutation::RegisterCandidate {
-                candidate: crate::tool_history::ToolHistoryCandidate {
-                    call_id: call_id.clone(),
-                    tool_identity: "functions.exec".to_string(),
-                    semantic_class: "tool_output".to_string(),
-                    successful: true,
-                    source_dependencies: std::collections::BTreeSet::new(),
-                    source_dependencies_current: true,
-                    artifact_id: format!("artifact-{call_id}"),
-                    artifact_bytes: 96_000,
-                    artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
-                    original_output_sha256: crate::tool_history::sha256(
-                        evidence(index).as_bytes(),
-                    ),
-                    original_tokens: 24_000,
-                    preserved_non_text_tokens: Some(0),
-                    bounded_model_output: evidence(index),
-                    complete: true,
-                    projection_eligible: true,
-                    proof_identity: None,
-                    supersession_identity: None,
-                    consumed_by_generation: None,
-                    derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+        assert!(
+            history.apply_tool_history_mutation(
+                &crate::tool_history::ToolHistoryMutation::RegisterCandidate {
+                    candidate: crate::tool_history::ToolHistoryCandidate {
+                        call_id: call_id.clone(),
+                        tool_identity: "functions.exec".to_string(),
+                        semantic_class: "tool_output".to_string(),
+                        successful: true,
+                        source_dependencies: std::collections::BTreeSet::new(),
+                        source_dependencies_current: true,
+                        artifact_id: format!("artifact-{call_id}"),
+                        artifact_bytes: 96_000,
+                        artifact_sha256: crate::tool_history::sha256(b"canonical artifact"),
+                        original_output_sha256: crate::tool_history::sha256(
+                            evidence(index).as_bytes(),
+                        ),
+                        original_tokens: 24_000,
+                        preserved_non_text_tokens: Some(0),
+                        bounded_model_output: evidence(index),
+                        complete: true,
+                        projection_eligible: true,
+                        proof_identity: None,
+                        supersession_identity: None,
+                        consumed_by_generation: None,
+                        derived: crate::tool_history::ToolHistoryCandidateDerived::default(),
+                    },
                 },
-            },
-        ));
+            )
+        );
         history.record_items(
             [
                 &ResponseItem::FunctionCall {
@@ -5636,9 +6574,9 @@ async fn seed_retirable_consumed_outputs(session: &Session, count: u32) {
                 &ResponseItem::FunctionCallOutput {
                     id: None,
                     call_id: call_id.clone(),
-                    output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                        evidence(index),
-                    ),
+                    output: codex_protocol::models::FunctionCallOutputPayload::from_text(evidence(
+                        index,
+                    )),
                     internal_chat_message_metadata_passthrough: None,
                 },
             ],
@@ -5921,7 +6859,7 @@ fn completion_advisory_names_changed_existing_tests() {
         changed_tests_advisory(&["tests/test_cli.py".to_string(), "a_test.go".to_string()])
             .as_deref(),
         Some(
-            "This turn modified or deleted existing test files; review any changed expectations: tests/test_cli.py, a_test.go."
+            "This turn modified or deleted existing test files; review any changed expectations or execution policy: tests/test_cli.py, a_test.go."
         )
     );
 }
@@ -5929,6 +6867,88 @@ fn completion_advisory_names_changed_existing_tests() {
 /// Recorded sessions: one rewrote a fixture inside an inline `#[cfg(test)]`
 /// module of `callable_collector.rs` without an advisory, while another only
 /// appended a regression test to `profile_matrix_tests.rs` and was flagged.
+#[test]
+fn completion_advisory_detects_oracle_activation_and_occurrence_changes() {
+    let python = "import unittest\nEXPECTED = 1\nclass TestContract(unittest.TestCase):\n    EXPECTED = 1\n    def test_contract(self):\n        self.assertEqual(2, EXPECTED)\n";
+    let rust = "#[cfg(test)]\nmod tests { #[test] fn contract() { assert!(true); } }\n";
+    let duplicate = "#[cfg(unix)]\nmod tests { #[test] fn contract() {} }\n#[cfg(windows)]\nmod tests { #[test] fn contract() {} }\n";
+    for (path, before, after) in [
+        (
+            "tests/test_contract.py",
+            python,
+            python.replacen("EXPECTED = 1", "EXPECTED = 2", 1),
+        ),
+        (
+            "tests/test_contract.py",
+            python,
+            python.replace("    EXPECTED = 1", "    EXPECTED = 2"),
+        ),
+        (
+            "tests/test_contract.py",
+            python,
+            python.replace(
+                "class TestContract",
+                "@unittest.skip('temporary')\nclass TestContract",
+            ),
+        ),
+        ("src/lib.rs", rust, rust.replace("cfg(test)", "cfg(any())")),
+        (
+            "src/lib.rs",
+            duplicate,
+            "#[cfg(unix)]\nmod tests { #[test] fn contract() {} }\n".to_string(),
+        ),
+        // Same header and leaf text still describe two distinct occurrences.
+        (
+            "src/lib.rs",
+            "#[cfg(test)] mod tests { #[test] fn a() {} }\n#[cfg(test)] mod tests { #[test] fn a() {} }",
+            "#[cfg(test)] mod tests { #[test] fn a() {} }".to_string(),
+        ),
+    ] {
+        let result =
+            changed_existing_tests(vec![(path.to_string(), before.to_string(), Some(after))]);
+        assert_eq!(result.changed, [path], "{before}");
+        assert!(result.incomplete.is_empty());
+    }
+    let two = "def test_first():\n    assert True\n\ndef test_second():\n    assert True\n";
+    let moved = "def test_second():\n    assert True\n\ndef test_first():\n    assert True\n";
+    let result = changed_existing_tests(vec![(
+        "test_move.py".to_string(),
+        two.to_string(),
+        Some(moved.to_string()),
+    )]);
+    assert!(
+        result.changed.is_empty(),
+        "moving tests within the same policy is not a rewrite"
+    );
+    assert!(result.incomplete.is_empty());
+}
+
+#[test]
+fn completion_advisory_keeps_incomplete_analysis_separate_from_test_edits() {
+    let result = changed_existing_tests(vec![(
+        "src/broken.rs".to_string(),
+        "fn broken(".to_string(),
+        Some("fn broken(".to_string()),
+    )]);
+    assert!(result.changed.is_empty());
+    assert_eq!(result.incomplete, ["src/broken.rs"]);
+    let advisory = incomplete_test_evidence_advisory(&result.incomplete).unwrap();
+    assert!(advisory.contains("could not be fully assessed"));
+    assert!(advisory.contains("uncertain before/after attribution"));
+    assert_eq!(incomplete_test_evidence_advisory(&[]), None);
+    assert_eq!(
+        crate::tools::handlers::existing_tests_changed(
+            "test_deadline.py",
+            "def test_a(): pass",
+            Some("def test_a(): pass"),
+            true,
+            std::time::Instant::now(),
+        ),
+        None,
+        "deadline exhaustion cannot certify additions-only behavior",
+    );
+}
+
 #[test]
 fn completion_advisory_reports_edited_existing_tests_not_added_ones() {
     let inline = "pub fn run() -> u8 {\n    1\n}\n\n#[cfg(test)]\nmod tests {\n    fn fixture() -> u8 {\n        super::run()\n    }\n\n    #[test]\n    fn runs() {\n        assert_eq!(fixture(), 1);\n    }\n}\n";
@@ -5940,6 +6960,7 @@ fn completion_advisory_reports_edited_existing_tests_not_added_ones() {
             before.to_string(),
             after.map(str::to_string),
         )])
+        .changed
     };
     let edited_fixture = inline.replace("super::run()\n", "super::run() + 0\n");
     assert_eq!(
@@ -5960,10 +6981,21 @@ fn completion_advisory_reports_edited_existing_tests_not_added_ones() {
     assert!(changed("src/callable_collector.rs", inline, Some(&added_inline)).is_empty());
 
     let appended = format!("{test_file}\n#[test]\nfn second() {{\n    assert!(true);\n}}\n");
-    assert!(changed("src/cli/profile_matrix_tests.rs", test_file, Some(&appended)).is_empty());
+    assert!(
+        changed(
+            "src/cli/profile_matrix_tests.rs",
+            test_file,
+            Some(&appended)
+        )
+        .is_empty()
+    );
     let weakened = test_file.replace("    assert!(true);\n", "");
     assert_eq!(
-        changed("src/cli/profile_matrix_tests.rs", test_file, Some(&weakened)),
+        changed(
+            "src/cli/profile_matrix_tests.rs",
+            test_file,
+            Some(&weakened)
+        ),
         ["src/cli/profile_matrix_tests.rs"]
     );
     assert_eq!(
@@ -7882,11 +8914,13 @@ async fn realized_context_commits_only_the_bound_physical_attempt() {
         session
             .bind_context_baseline_candidate("request-1", "attempt-1")
             .await
+            .0
     );
     assert!(
         session
             .bind_context_baseline_candidate("request-1", "attempt-2")
             .await
+            .0
     );
     assert!(
         !session
@@ -7912,6 +8946,13 @@ async fn realized_context_commits_only_the_bound_physical_attempt() {
     assert_eq!(provenance.accepted_attempt.sampling_request_id, "request-1");
     assert_eq!(provenance.accepted_attempt.physical_attempt_id, "attempt-2");
     assert!(!provenance.fragment_digests.is_empty());
+    assert_eq!(
+        session
+            .bind_context_baseline_candidate("request-2", "attempt-3")
+            .await,
+        (false, false),
+        "unchanged accepted context is not an unresolved boundary"
+    );
     assert!(
         !session
             .commit_context_baseline_candidate("request-1", "attempt-2")
@@ -8753,6 +9794,8 @@ async fn plan_mode_uses_contributed_turn_item_for_last_agent_message() {
         &mut state,
         /*previously_active_item*/ None,
         &mut last_agent_message,
+        &mut None,
+        &mut None,
     )
     .await
     .unwrap();
@@ -9080,6 +10123,7 @@ fn terminal_surface_preserves_owner_canonical_message_exactly() {
     let schema = serde_json::json!({
         "type": "object", "properties": {"answer": {"type": "integer"}}, "required": ["answer"]
     });
+    let schema = crate::session::turn_context::PreparedOutputSchema::prepare(schema).unwrap();
     assert!(authoritative_wait_terminal_surface(&decision, Some(&schema), 10_000).is_none());
     if let Some(AuthoritativeWaitResolution::Terminal(result)) = &mut decision.authoritative_wait {
         result.surfaceable_message = Some(r#"{"answer":42}"#.to_string());
@@ -9440,6 +10484,7 @@ async fn legacy_followup_renews_at_turn_entry_but_cancelled_turn_does_not() {
                 capability_profile: CapabilityProfile::ScopedSourceWrite,
                 objective: "complete the follow-up".to_string(),
                 acceptance_criteria: vec![AcceptanceCriterion {
+                    evidence_policy: None,
                     id: "completed".to_string(),
                     text: "follow-up completed".to_string(),
                 }],
@@ -10318,7 +11363,13 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
                 additional_context: Default::default(),
-                thread_settings: Default::default(),
+                // This test exercises final-state validation and a mutating finalizer.
+                // Permit the local test command explicitly on hosts without a sandbox
+                // backend; sandbox refusal has its own focused coverage.
+                thread_settings: ThreadSettingsOverrides {
+                    permission_profile: Some(PermissionProfile::Disabled),
+                    ..Default::default()
+                },
             })
             .await?;
         let mut boundary_reported = false;
@@ -10372,6 +11423,281 @@ fn source_changing_finalizer_validates_final_state_without_replay() -> Result<()
         );
         Ok(())
     })
+}
+
+#[test]
+fn audit115_observed_preexisting_failure_is_reported_without_repair() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit115_observed_preexisting_failure", || {
+        audit115_failing_validation_turn(/*changes_sources*/ false)
+    })
+}
+
+#[test]
+fn audit115_failure_after_source_change_keeps_bounded_repair() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("audit115_failure_after_source_change", || {
+        audit115_failing_validation_turn(/*changes_sources*/ true)
+    })
+}
+
+/// One turn runs a check that already fails before the turn starts. Observing
+/// and reporting it is the result; after this turn's own source change the
+/// same failure is owned work with one bounded repair (audit 115).
+async fn audit115_failing_validation_turn(changes_sources: bool) -> Result<()> {
+    crate::test_harness::require_network!();
+    let server = responses::start_mock_server().await;
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let command = serde_json::json!({
+        "program": python, "args": ["-B", "-m", "unittest", "test_fixture"],
+        "yield_time_ms": 300000,
+    })
+    .to_string();
+    let report = "The fixture check fails with a pre-existing failure.";
+    let mut sequence = Vec::new();
+    if changes_sources {
+        sequence.push(responses::sse(vec![
+            responses::ev_apply_patch_custom_tool_call(
+                "edit",
+                "*** Begin Patch\n*** Add File: notes.txt\n+changed by this turn\n*** End Patch",
+            ),
+            responses::ev_completed("edited"),
+        ]));
+    }
+    sequence.push(responses::sse(vec![
+        responses::ev_function_call("validate", "exec_command", &command),
+        responses::ev_completed("validated"),
+    ]));
+    // An owned failure gets one bounded repair; the unchanged report ends it.
+    let reports = if changes_sources { 2 } else { 1 };
+    for attempt in 0..reports {
+        sequence.push(responses::sse(vec![
+            responses::ev_assistant_message(&format!("report-{attempt}"), report),
+            responses::ev_completed(&format!("reported-{attempt}")),
+        ]));
+    }
+    let requests = responses::mount_sse_sequence(&server, sequence).await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::Kd4Runtime).unwrap();
+            config.features.enable(Feature::UnifiedExec).unwrap();
+            config.features.disable(Feature::CodeModeHost).unwrap();
+        })
+        .build(&server)
+        .await?;
+    fs::write(
+        test.workspace_path("test_fixture.py"),
+        "import unittest\nclass Check(unittest.TestCase):\n def test_source(self):\n  self.fail('pre-existing failure')\n",
+    )?;
+    // A repository baseline proves the uncertain check changed no source.
+    let initialized = tokio::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(test.workspace_path("."))
+        .status()
+        .await?;
+    assert!(initialized.success());
+    let completion = tokio::time::timeout(
+        Duration::from_secs(60),
+        test.submit_turn_and_capture_completion("Run the fixture check and report its result."),
+    )
+    .await??;
+    let sent = requests.requests();
+    let output = sent
+        .iter()
+        .find_map(|request| request.function_call_output_text("validate"))
+        .context("the model receives the validation result")?;
+    assert!(output.contains("FAILED"), "{output}");
+    assert_eq!(completion.last_agent_message.as_deref(), Some(report));
+    let repairs = sent
+        .iter()
+        .map(|request| {
+            request
+                .message_input_texts("developer")
+                .into_iter()
+                .filter(|text| text.contains("Known current work prevents final acceptance"))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if changes_sources {
+        assert_eq!(sent.len(), 4, "{completion:?}");
+        assert!(
+            repairs[..3].iter().all(std::vec::Vec::is_empty),
+            "{repairs:?}"
+        );
+        assert!(
+            repairs[3].len() == 1 && repairs[3][0].contains("Resolve current failed validation"),
+            "{repairs:?}"
+        );
+        let error = completion
+            .error
+            .as_ref()
+            .context("an owned failure is not accepted as task success")?;
+        assert!(
+            error
+                .message
+                .contains("Known current work remains unresolved"),
+            "{completion:?}"
+        );
+    } else {
+        assert!(completion.error.is_none(), "{completion:?}");
+        assert_eq!(sent.len(), 2, "no repair request: {repairs:?}");
+        let assessment = completion
+            .timing
+            .as_ref()
+            .and_then(|timing| timing.completion_assessment.as_ref())
+            .context("completion assessment")?;
+        assert!(
+            !assessment.failed_checks.is_empty(),
+            "the observed failure stays reported: {assessment:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn non_git_validation_rerun_after_fix_ends_without_repair() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("non_git_validation_rerun_after_fix", || {
+        non_git_validation_rerun_turn(/*rerun_writes_tree*/ false)
+    })
+}
+
+#[test]
+fn non_git_validation_rerun_that_writes_the_tree_keeps_bounded_repair() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("non_git_validation_rerun_writes_tree", || {
+        non_git_validation_rerun_turn(/*rerun_writes_tree*/ true)
+    })
+}
+
+/// Outside any Git repository, a failing check, this turn's fix and a passing
+/// rerun that left the bounded workspace tree unchanged end without a repair.
+/// A rerun that writes into the tree does not prove the final sources, so the
+/// earlier failure stays owned work with one bounded repair.
+async fn non_git_validation_rerun_turn(rerun_writes_tree: bool) -> Result<()> {
+    crate::test_harness::require_network!();
+    let server = responses::start_mock_server().await;
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let command = serde_json::json!({
+        "program": python, "args": ["-B", "-m", "unittest", "test_fixture"],
+        "yield_time_ms": 300000,
+    })
+    .to_string();
+    let report = "The fixture check passes after the fix.";
+    let mut sequence = vec![
+        responses::sse(vec![
+            responses::ev_function_call("validate", "exec_command", &command),
+            responses::ev_completed("validated"),
+        ]),
+        responses::sse(vec![
+            responses::ev_apply_patch_custom_tool_call(
+                "fix",
+                "*** Begin Patch\n*** Update File: lib.py\n@@\n-VALUE = 1\n+VALUE = 2\n*** End Patch",
+            ),
+            responses::ev_completed("fixed"),
+        ]),
+        responses::sse(vec![
+            responses::ev_function_call("revalidate", "exec_command", &command),
+            responses::ev_completed("revalidated"),
+        ]),
+    ];
+    // A stale pass leaves the failure as owned work: one bounded repair, and
+    // the unchanged report ends it.
+    let reports = if rerun_writes_tree { 2 } else { 1 };
+    for attempt in 0..reports {
+        sequence.push(responses::sse(vec![
+            responses::ev_assistant_message(&format!("report-{attempt}"), report),
+            responses::ev_completed(&format!("reported-{attempt}")),
+        ]));
+    }
+    let requests = responses::mount_sse_sequence(&server, sequence).await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.features.enable(Feature::Kd4Runtime).unwrap();
+            config.features.enable(Feature::UnifiedExec).unwrap();
+            config.features.disable(Feature::CodeModeHost).unwrap();
+        })
+        .build(&server)
+        .await?;
+    // Unlike the audit 115 fixtures there is no `git init`, so neither check
+    // has a Git-visible tree to compare.
+    let outside_git = test
+        .cwd_path()
+        .ancestors()
+        .all(|directory| !directory.join(".git").exists());
+    assert!(
+        outside_git,
+        "the fixture workspace must be outside any Git repository"
+    );
+    fs::write(test.workspace_path("lib.py"), "VALUE = 1\n")?;
+    // Only the guard's passing run writes a workspace file.
+    let write = if rerun_writes_tree {
+        "  if lib.VALUE == 2: pathlib.Path('generated.py').write_text('GENERATED = True')\n"
+    } else {
+        ""
+    };
+    fs::write(
+        test.workspace_path("test_fixture.py"),
+        format!(
+            "import pathlib,unittest\nimport lib\nclass Check(unittest.TestCase):\n def test_value(self):\n{write}  self.assertEqual(lib.VALUE, 2)\n"
+        ),
+    )?;
+    let completion = tokio::time::timeout(
+        Duration::from_secs(60),
+        test.submit_turn_and_capture_completion("Run the check, fix it and rerun it."),
+    )
+    .await??;
+    let sent = requests.requests();
+    let failed = sent
+        .iter()
+        .find_map(|request| request.function_call_output_text("validate"))
+        .context("the model receives the failing result")?;
+    assert!(failed.contains("FAILED"), "{failed}");
+    let passed = sent
+        .iter()
+        .find_map(|request| request.function_call_output_text("revalidate"))
+        .context("the model receives the rerun result")?;
+    assert!(
+        passed.contains("OK") && !passed.contains("FAILED"),
+        "{passed}"
+    );
+    assert_eq!(completion.last_agent_message.as_deref(), Some(report));
+    let repairs = sent
+        .iter()
+        .map(|request| {
+            request
+                .message_input_texts("developer")
+                .into_iter()
+                .filter(|text| text.contains("Known current work prevents final acceptance"))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if rerun_writes_tree {
+        assert!(test.workspace_path("generated.py").exists());
+        assert_eq!(sent.len(), 5, "{completion:?}");
+        assert!(repairs[..4].iter().all(Vec::is_empty), "{repairs:?}");
+        assert!(
+            repairs[4].len() == 1 && repairs[4][0].contains("Resolve current failed validation"),
+            "{repairs:?}"
+        );
+        let error = completion
+            .error
+            .as_ref()
+            .context("a stale pass does not clear the owned failure")?;
+        assert!(
+            error
+                .message
+                .contains("Known current work remains unresolved"),
+            "{completion:?}"
+        );
+    } else {
+        assert!(completion.error.is_none(), "{completion:?}");
+        assert_eq!(sent.len(), 4, "no repair request: {repairs:?}");
+        let failed_checks = completion
+            .timing
+            .as_ref()
+            .and_then(|timing| timing.completion_assessment.as_ref())
+            .map(|assessment| assessment.failed_checks.clone())
+            .unwrap_or_default();
+        assert!(failed_checks.is_empty(), "{failed_checks:?}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -10561,3 +11887,397 @@ mod completion_latency;
 
 #[path = "request_latency_tests.rs"]
 mod request_latency;
+#[tokio::test]
+async fn ctxaudit_pressure_retirement_counts_its_checkpoint() -> Result<()> {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    turn.model_info.auto_compact_token_limit = Some(100_000);
+    Arc::make_mut(&mut turn.config).model_auto_compact_token_limit_scope =
+        codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+    seed_retirable_consumed_outputs(&session, 8).await;
+    let (_, saved) = session
+        .clone_history()
+        .await
+        .pressure_retirement_selection(CONTEXT_PRESSURE_KEPT_GENERATIONS, u64::MAX);
+    assert!(saved > 0);
+    let pressure = 100_000 + i64::try_from(saved)? - 1;
+    assert!(
+        !retire_consumed_tool_outputs_for_context_pressure(
+            &session,
+            &turn,
+            CONTEXT_PRESSURE_KEPT_GENERATIONS,
+            Some(ProjectedPromptPressure {
+                total_tokens: pressure,
+                auto_compact_scope_tokens: pressure
+            })
+        )
+        .await
+    );
+    assert!(
+        !crate::tool_history::ToolHistoryState::has_phase_checkpoint(
+            session.clone_history().await.raw_items()
+        )
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn audit_instruction_authority_unchanged_context_does_not_inflate_prompt_pressure() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let values = indexmap::IndexMap::from([(
+        "policy".into(),
+        codex_protocol::protocol::AdditionalContextEntry {
+            kind: codex_protocol::protocol::AdditionalContextKind::Application,
+            value: "Never edit protected.txt.".repeat(200),
+        },
+    )]);
+    session
+        .record_additional_context_snapshot(&turn, values.clone())
+        .await
+        .unwrap();
+    let before = session.state.lock().await.additional_context.clone();
+    assert_eq!(
+        estimate_pending_additional_context_tokens(
+            &session,
+            &[TurnInput::AdditionalContext(values)]
+        )
+        .await,
+        0
+    );
+    assert!(
+        estimate_pending_additional_context_tokens(
+            &session,
+            &[TurnInput::AdditionalContext(indexmap::IndexMap::new())]
+        )
+        .await
+            > 0
+    );
+    assert_eq!(session.state.lock().await.additional_context, before);
+}
+#[tokio::test]
+async fn kd4_ip_009_scaffold_accounts_for_projected_desktop_payload() {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    turn.session_source = SessionSource::VSCode;
+    let original = "<app-context>\n# Codex desktop context\n### Images/Visuals/Files\nKeep this guidance.\n### Automations\nDEFERRED_BODY_SHOULD_NOT_BE_SENT\n</app-context>";
+    turn.developer_instructions = Some(original.to_string());
+    let turn = Arc::new(turn);
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let items = session
+        .build_initial_context_with_world_state_and_mcp(
+            &turn,
+            &crate::context::world_state::WorldState::default(),
+            false,
+        )
+        .await
+        .items;
+    let mut history = ContextManager::new();
+    history.record_items(items.iter(), turn.model_info.truncation_policy.into());
+    let prepared = history.prepare_for_sampling_prompt(
+        &turn.model_info.input_modalities,
+        StableContextTarget::Sampling,
+    );
+    let router = ToolRouter::from_parts(
+        ToolRegistry::from_tools(std::iter::empty::<
+            Arc<dyn crate::tools::registry::CoreToolRuntime>,
+        >()),
+        Vec::new(),
+    );
+    let prompt = build_projected_prompt(
+        &session,
+        &prepared,
+        &router,
+        &step,
+        session.get_base_instructions().await,
+    );
+    let encoded = serde_json::to_string(&prompt.input).unwrap();
+    assert!(!encoded.contains("DEFERRED_BODY_SHOULD_NOT_BE_SENT"));
+    assert!(encoded.contains("context:desktop"));
+    let measured = crate::context::PromptContextBreakdown::from_response_items(
+        &prompt.input,
+        &prompt.prompt_provenance,
+    )
+    .unwrap();
+    assert!(
+        measured.bytes(PromptContextCategory::AppDesktop) > 0,
+        "the emitted payload, not the deferred source, belongs to Desktop"
+    );
+    assert_eq!(serde_json::to_string(&prompt.input).unwrap(), encoded);
+}
+#[tokio::test]
+async fn router_reuse_tracks_same_count_native_environment_contracts() {
+    use crate::session::turn_context::TurnEnvironment;
+    use crate::tools::router::ToolRouterParams;
+    use codex_utils_path_uri::PathUri;
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config.features.enable(Feature::SpawnCsv).unwrap();
+    turn.config = Arc::new(config);
+    let turn = Arc::new(turn);
+    let base = StepContext::for_test(turn.clone());
+    let local = base.environments.primary().unwrap().clone();
+    let remote_environment = Arc::new(
+        codex_exec_server::Environment::create_for_tests(Some("ws://127.0.0.1:1/catalog".into()))
+            .unwrap(),
+    );
+    let remote = TurnEnvironment::new(
+        "remote".into(),
+        remote_environment.clone(),
+        local.cwd().clone(),
+        local.shell.clone(),
+    );
+    let make_router = |step: &StepContext, identity: ToolExposureIdentity| {
+        ToolRouter::from_context(
+            step,
+            ToolRouterParams {
+                mcp_tools: None,
+                deferred_mcp_tools: None,
+                tool_suggest_candidates: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+                exposure_identity: identity,
+            },
+            &Default::default(),
+        )
+    };
+    let identity = |current: DynamicToolExposureIdentity| ToolExposureIdentity {
+        agent_surface_stage: current.agent_surface_stage,
+        extension_tool_surface_revision: current.extension_tool_surface_revision,
+        mcp_tool_catalog_revision: current.mcp_tool_catalog_revision,
+        mcp_resources_available: current.mcp_resources_available,
+        request_user_input_eligible: current.request_user_input_eligible,
+        collaboration_mode: current.collaboration_mode,
+        environment_mode: current.environment_mode,
+        environment_starting: current.environment_starting,
+        windows_shell_guidance: current.windows_shell_guidance,
+        native_environment_contract: current.native_environment_contract,
+        ..Default::default()
+    };
+    let local_router = make_router(
+        &base,
+        identity(current_dynamic_tool_exposure_identity(&session, &base).await),
+    );
+    assert!(local_router.has_registered_tool(&codex_tools::ToolName::plain("spawn_agents_on_csv")));
+    assert!(finalized_router_matches_current_exposure(&session, &base, &local_router).await);
+    let mut changed = (*base).clone();
+    changed.environments.turn_environments = vec![remote.clone()];
+    assert!(!finalized_router_matches_current_exposure(&session, &changed, &local_router).await);
+    let remote_router = make_router(
+        &changed,
+        identity(current_dynamic_tool_exposure_identity(&session, &changed).await),
+    );
+    assert!(
+        !remote_router.has_registered_tool(&codex_tools::ToolName::plain("spawn_agents_on_csv"))
+    );
+    assert!(!finalized_router_matches_current_exposure(&session, &base, &remote_router).await);
+
+    let foreign_cwd = if cfg!(windows) {
+        "file:///workspace"
+    } else {
+        "file:///C:/workspace"
+    };
+    let foreign = TurnEnvironment::new(
+        "foreign".into(),
+        remote_environment,
+        PathUri::parse(foreign_cwd).unwrap(),
+        local.shell.clone(),
+    );
+    changed.environments.turn_environments = vec![local, foreign];
+    let ordered = make_router(
+        &changed,
+        identity(current_dynamic_tool_exposure_identity(&session, &changed).await),
+    );
+    changed.environments.turn_environments.reverse();
+    assert!(!finalized_router_matches_current_exposure(&session, &changed, &ordered).await);
+}
+#[test]
+fn accepted_final_identity_is_scoped_to_the_accepted_completion_attempt() -> Result<()> {
+    run_turn_multi_thread_test_with_stack("accepted_final_identity", || async {
+        crate::test_harness::require_network!();
+        for (phases, expected) in [
+            (
+                vec![
+                    (Some("final_answer"), "answer"),
+                    (Some("commentary"), "progress"),
+                ],
+                Some("answer"),
+            ),
+            (
+                vec![
+                    (Some("commentary"), "progress"),
+                    (Some("final_answer"), "answer"),
+                ],
+                Some("answer"),
+            ),
+            (
+                vec![(None, "{\"answer\":\"α\"}\n")],
+                Some("{\"answer\":\"α\"}\n"),
+            ),
+        ] {
+            let server = responses::start_mock_server().await;
+            let mut events = phases
+                .into_iter()
+                .enumerate()
+                .map(|(index, (phase, text))| {
+                    let mut event =
+                        responses::ev_assistant_message(&format!("message-{index}"), text);
+                    if let Some(phase) = phase {
+                        event["item"]["phase"] = serde_json::json!(phase);
+                    }
+                    event
+                })
+                .collect::<Vec<_>>();
+            events.push(responses::ev_completed("accepted-response"));
+            let requests = responses::mount_sse_once(&server, responses::sse(events)).await;
+            let test = test_codex().build(&server).await?;
+            let completion = test
+                .submit_turn_and_capture_completion("Finish the answer")
+                .await?;
+            let answer = completion
+                .timing
+                .as_ref()
+                .unwrap()
+                .final_answer
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                answer.message.as_ref().map(|message| message.text.as_str()),
+                expected
+            );
+            if let Some(message) = &answer.message {
+                assert!(
+                    message
+                        .completion_attempt_id
+                        .starts_with(&format!("{}:", completion.turn_id))
+                );
+                assert!(message.item_id.starts_with("message-"));
+            }
+            assert_eq!(requests.requests().len(), 1);
+        }
+        let server = responses::start_mock_server().await;
+        responses::mount_sse_sequence(
+            &server,
+            vec![
+                responses::sse(vec![
+                    responses::ev_assistant_message("rejected", "rejected final"),
+                    responses::ev_completed("rejected-response"),
+                ]),
+                responses::sse(vec![
+                    responses::ev_assistant_message("accepted", "accepted correction"),
+                    responses::ev_completed("accepted-response"),
+                ]),
+            ],
+        )
+        .await;
+        let test = test_codex()
+            .with_pre_build_hook(|home| {
+                write_one_shot_stop_hook(home).unwrap();
+            })
+            .with_config(trust_discovered_hooks)
+            .build(&server)
+            .await?;
+        let completion = test
+            .submit_turn_and_capture_completion("Finish the answer")
+            .await?;
+        let accepted = completion
+            .timing
+            .as_ref()
+            .unwrap()
+            .final_answer
+            .as_ref()
+            .unwrap()
+            .message
+            .as_ref()
+            .unwrap();
+        assert_eq!(accepted.text, "accepted correction");
+
+        // Exercise the real configured hook owner after its one-shot repair.
+        // Its receipt must never cover an independently attributed mutation,
+        // nor remove known validation failures or unknown-effect warnings.
+        let session = &test.codex.as_ref().codex.session;
+        let turn = session.new_default_turn().await;
+        for changed_before_hook in [false, true] {
+            let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+            let changed_path = test.workspace_path("independent-change.txt");
+            if changed_before_hook {
+                fs::write(&changed_path, "independent writer before hook")?;
+                tracker
+                    .lock()
+                    .await
+                    .record_exec_command_end_with_mutation_at(
+                        &[],
+                        0,
+                        false,
+                        "local",
+                        None,
+                        crate::turn_diff_tracker::CommandMutation::KnownMutation {
+                            paths: Some(std::collections::BTreeSet::from([changed_path.clone()])),
+                        },
+                    );
+            }
+            let report = run_completion_stop_hook(
+                session,
+                &turn,
+                true,
+                Some(accepted.text.clone()),
+                || {
+                    std::future::ready(codex_protocol::protocol::TurnCompletionAssessment {
+                        failed_checks: vec!["required check still failed".into()],
+                        ..Default::default()
+                    })
+                },
+                &tracker,
+                &CancellationToken::new(),
+            )
+            .await;
+            let receipt = report
+                .mutation_receipt
+                .expect("approved command owns a mutation receipt");
+            assert_eq!(
+                receipt
+                    .covers_only_hook_effect(0, tracker.lock().await.current_mutation_revision()),
+                !changed_before_hook,
+                "an earlier independent mutation is not the hook's own effect",
+            );
+            assert_eq!(
+                report.assessment.failed_checks,
+                vec!["required check still failed"]
+            );
+            assert!(!report.assessment.verification_gaps.is_empty());
+            fs::write(&changed_path, "independent writer after hook")?;
+            tracker
+                .lock()
+                .await
+                .record_exec_command_end_with_mutation_at(
+                    &[],
+                    0,
+                    false,
+                    "local",
+                    None,
+                    crate::turn_diff_tracker::CommandMutation::KnownMutation {
+                        paths: Some(std::collections::BTreeSet::from([changed_path])),
+                    },
+                );
+            assert!(
+                !receipt
+                    .covers_only_hook_effect(0, tracker.lock().await.current_mutation_revision(),),
+                "a later independent mutation must invalidate the receipt"
+            );
+        }
+        let mut execution = TurnExecutionControl::new();
+        let mut output = TurnOutputState::default();
+        output.observe(
+            None,
+            Some(accepted.clone()),
+            execution.baselines(0).relevant_state_fingerprint(),
+            true,
+            true,
+        );
+        execution.accepted_context_input(true);
+        output.reconcile_revision(&execution.baselines(0).relevant_state_fingerprint());
+        assert!(
+            !output.has_answer(),
+            "a hook receipt cannot restore a pre-correction answer"
+        );
+        Ok(())
+    })
+}

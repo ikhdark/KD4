@@ -32,6 +32,7 @@ codex-utils-path-uri = { workspace = true }
 core_test_support_base = { workspace = true }
 ctor = { workspace = true }
 futures = { workspace = true }
+fs2 = { workspace = true }
 regex-lite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

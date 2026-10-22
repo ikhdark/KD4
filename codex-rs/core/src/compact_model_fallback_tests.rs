@@ -98,7 +98,7 @@ fn local_compaction_does_not_bypass_provider_or_storage_failures() {
     ] {
         assert!(!should_retry_with_local_compaction(&error));
     }
-    assert!(should_retry_with_local_compaction(&CodexErr::InvalidRequest(
-        "unsupported compaction format".into(),
-    )));
+    assert!(should_retry_with_local_compaction(
+        &CodexErr::InvalidRequest("unsupported compaction format".into(),)
+    ));
 }

@@ -9,5 +9,10 @@ import type { ReasoningSummary } from "../ReasoningSummary";
 import type { ActivePermissionProfile } from "./ActivePermissionProfile";
 import type { AskForApproval } from "./AskForApproval";
 import type { SandboxPolicy } from "./SandboxPolicy";
+import type { ThreadSelectedEnvironment } from "./ThreadSelectedEnvironment";
 
-export type ThreadSettings = {cwd: AbsolutePathBuf, approvalPolicy: AskForApproval, sandboxPolicy: SandboxPolicy, activePermissionProfile: ActivePermissionProfile | null, model: string, modelProvider: string, serviceTier: string | null, effort: ReasoningEffort | null, summary: ReasoningSummary | null, collaborationMode: CollaborationMode, personality: Personality | null};
+export type ThreadSettings = {cwd: AbsolutePathBuf, /**
+ * Ordered applied selection; first is primary, empty disables environment access.
+ * Absent only when restoring legacy settings without selection information.
+ */
+environments?: Array<ThreadSelectedEnvironment>, approvalPolicy: AskForApproval, sandboxPolicy: SandboxPolicy, activePermissionProfile: ActivePermissionProfile | null, model: string, modelProvider: string, serviceTier: string | null, effort: ReasoningEffort | null, summary: ReasoningSummary | null, collaborationMode: CollaborationMode, personality: Personality | null};

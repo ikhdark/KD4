@@ -27,22 +27,78 @@ use super::should_print_final_message_to_tty;
 use super::write_final_message;
 use crate::event_processor::EventProcessor;
 
+#[tokio::test]
+async fn required_terminal_recovers_material_caveats_once_without_changing_answer_file() {
+    use codex_protocol::protocol::TurnCompletionAssessment;
+    use codex_protocol::protocol::TurnTiming;
+    for optional_warning_delivered in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().into())
+            .fallback_cwd(Some(cwd.path().into()))
+            .build()
+            .await
+            .unwrap();
+        let answer_path = home.path().join("answer.txt");
+        let mut processor = EventProcessorWithHumanOutput::create_with_ansi(
+            false,
+            &config,
+            Some(answer_path.clone()),
+        );
+        let assessment = TurnCompletionAssessment {
+            verification_gaps: vec!["Required consumer build is pending.".into()],
+            advisories: vec!["Optional style suggestion.".into()],
+            ..Default::default()
+        };
+        let expected = "Required consumer build is pending. This turn is not a verified completion of that scope.";
+        if optional_warning_delivered {
+            processor.process_warning(expected.into());
+        }
+        let ServerNotification::TurnCompleted(mut terminal) = crate::tests::recovery_completion()
+        else {
+            unreachable!()
+        };
+        terminal.timing = Some(TurnTiming {
+            completion_assessment: Some(assessment),
+            ..Default::default()
+        });
+        terminal.surfaced_result = Some(codex_protocol::protocol::SurfacedToolResult {
+            adapter: "owner".into(),
+            value: serde_json::json!({"changed":true}),
+            canonical_message: Some("{\"changed\":true}".into()),
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                processor.process_server_notification(ServerNotification::TurnCompleted(
+                    terminal.clone()
+                )),
+                crate::event_processor::CodexStatus::InitiateShutdown
+            );
+        }
+        assert_eq!(
+            processor
+                .displayed_warnings
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![expected]
+        );
+        processor.print_final_output().unwrap();
+        assert_eq!(std::fs::read(answer_path).unwrap(), b"{\"changed\":true}");
+    }
+}
+
 #[test]
-fn blended_token_total_is_nonnegative_and_saturates_at_the_display_limit() {
-    for (input, cached, output, expected) in [
-        (10, 3, 5, 12),
-        (2, 5, 3, 3),
-        (-1, -2, -3, 0),
-        (i64::MIN, i64::MAX, 7, 7),
-        (i64::MAX, 0, 1, i64::MAX),
-        (i64::MAX, i64::MAX, i64::MAX, i64::MAX),
-    ] {
+fn human_usage_preserves_inclusive_input_and_independent_provider_total() {
+    for cached in [0, 500, 1500] {
         let total = codex_app_server_protocol::TokenUsageBreakdown {
-            total_tokens: 0,
-            input_tokens: input,
+            total_tokens: 1900,
+            input_tokens: 1500,
             cached_input_tokens: cached,
-            output_tokens: output,
+            output_tokens: 250,
             reasoning_output_tokens: 0,
+            coverage: None,
         };
         let usage = codex_app_server_protocol::ThreadTokenUsage {
             estimated_context_tokens: None,
@@ -50,7 +106,10 @@ fn blended_token_total_is_nonnegative_and_saturates_at_the_display_limit() {
             total,
             model_context_window: None,
         };
-        assert_eq!(super::blended_total(&usage), expected, "{input}/{cached}/{output}");
+        let text = super::format_token_usage(&usage);
+        assert!(text.contains("total=1,900 input=1,500"));
+        assert!(text.contains("cached=unknown uncached=unknown"));
+        assert!(text.contains("metering unknown"));
     }
 }
 
@@ -89,11 +148,21 @@ fn final_message_destinations_respect_terminal_and_rendered_state() {
         (true, false, true, false),
         (true, true, false, true),
     ] {
-        assert_eq!(should_print_final_message_to_stdout(Some("hello"), stdout_tty, stderr_tty), expected_stdout);
-        assert!(!should_print_final_message_to_stdout(None, stdout_tty, stderr_tty));
+        assert_eq!(
+            should_print_final_message_to_stdout(Some("hello"), stdout_tty, stderr_tty),
+            expected_stdout
+        );
+        assert!(!should_print_final_message_to_stdout(
+            None, stdout_tty, stderr_tty
+        ));
         for rendered in [false, true] {
-            assert_eq!(should_print_final_message_to_tty(Some("hello"), rendered, stdout_tty, stderr_tty), expected_tty && !rendered);
-            assert!(!should_print_final_message_to_tty(None, rendered, stdout_tty, stderr_tty));
+            assert_eq!(
+                should_print_final_message_to_tty(Some("hello"), rendered, stdout_tty, stderr_tty),
+                expected_tty && !rendered
+            );
+            assert!(!should_print_final_message_to_tty(
+                None, rendered, stdout_tty, stderr_tty
+            ));
         }
     }
 }
@@ -217,7 +286,8 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
         ))
         .expect("set permission profile");
 
-    let session_configured_event = SessionConfiguredEvent {
+    config.model_reasoning_effort = None;
+    let mut session_configured_event = SessionConfiguredEvent {
         session_id: SessionId::new(),
         thread_id: ThreadId::new(),
         forked_from_id: None,
@@ -231,13 +301,21 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
         permission_profile: config.permissions.effective_permission_profile(),
         active_permission_profile: None,
         cwd,
-        reasoning_effort: None,
+        reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
         initial_messages: None,
         network_proxy: None,
         rollout_path: None,
     };
 
     let summary_entries = config_summary_entries(&config, &session_configured_event);
+    assert!(summary_entries.contains(&("reasoning effort", "high".to_string())));
+    // An explicit override is reflected by the authoritative response too.
+    session_configured_event.reasoning_effort =
+        Some(codex_protocol::openai_models::ReasoningEffort::Low);
+    assert!(
+        config_summary_entries(&config, &session_configured_event)
+            .contains(&("reasoning effort", "low".to_string()))
+    );
     let sandbox_summary = summary_entries
         .iter()
         .find_map(|(key, value)| (*key == "sandbox").then_some(value))
@@ -249,8 +327,6 @@ async fn config_summary_entries_include_runtime_workspace_roots() {
     );
 }
 
-
-
 #[test]
 fn turn_completed_overwrites_stale_final_message_from_turn_items() {
     for (previous, rendered, expected_rendered) in [
@@ -258,55 +334,58 @@ fn turn_completed_overwrites_stale_final_message_from_turn_items() {
         (Some("stale answer"), true, false),
         (Some("final answer"), true, true),
     ] {
-    let mut processor = EventProcessorWithHumanOutput {
-        bold: Style::new(),
-        cyan: Style::new(),
-        dimmed: Style::new(),
-        green: Style::new(),
-        italic: Style::new(),
-        magenta: Style::new(),
-        red: Style::new(),
-        yellow: Style::new(),
-        show_agent_reasoning: true,
-        show_raw_agent_reasoning: false,
-        last_message_path: None,
-        final_message: previous.map(str::to_owned),
-        final_message_rendered: rendered,
-        emit_final_message_on_shutdown: false,
-        last_total_token_usage: None,
-    };
+        let mut processor = EventProcessorWithHumanOutput {
+            bold: Style::new(),
+            cyan: Style::new(),
+            dimmed: Style::new(),
+            green: Style::new(),
+            italic: Style::new(),
+            magenta: Style::new(),
+            red: Style::new(),
+            yellow: Style::new(),
+            show_agent_reasoning: true,
+            show_raw_agent_reasoning: false,
+            last_message_path: None,
+            final_message: previous.map(str::to_owned),
+            final_message_rendered: rendered,
+            emit_final_message_on_shutdown: false,
+            last_total_token_usage: None,
+            displayed_warnings: Default::default(),
+            streamed_final_message: Default::default(),
+            last_non_retry_error: None,
+        };
 
-    let status = processor.process_server_notification(ServerNotification::TurnCompleted(
-        codex_app_server_protocol::TurnCompletedNotification {
-            surfaced_result: None,
-            thread_id: "thread-1".to_string(),
-            timing: None,
-            turn: Turn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: vec![ThreadItem::AgentMessage {
-                    id: "msg-1".to_string(),
-                    text: "final answer".to_string(),
-                    phase: None,
-                }],
-                status: TurnStatus::Completed,
-                error: None,
-                started_at: None,
-                completed_at: Some(0),
-                duration_ms: None,
-                timing: None,
+        let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+            codex_app_server_protocol::TurnCompletedNotification {
                 surfaced_result: None,
+                thread_id: "thread-1".to_string(),
+                timing: None,
+                turn: Turn {
+                    id: "turn-1".to_string(),
+                    items_view: codex_app_server_protocol::TurnItemsView::Full,
+                    items: vec![ThreadItem::AgentMessage {
+                        id: "msg-1".to_string(),
+                        text: "final answer".to_string(),
+                        phase: None,
+                    }],
+                    status: TurnStatus::Completed,
+                    error: None,
+                    started_at: None,
+                    completed_at: Some(0),
+                    duration_ms: None,
+                    timing: None,
+                    surfaced_result: None,
+                },
             },
-        },
-    ));
+        ));
 
-    assert_eq!(
-        status,
-        crate::event_processor::CodexStatus::InitiateShutdown
-    );
-    assert_eq!(processor.final_message.as_deref(), Some("final answer"));
-    assert_eq!(processor.final_message_rendered, expected_rendered);
-    assert!(processor.emit_final_message_on_shutdown);
+        assert_eq!(
+            status,
+            crate::event_processor::CodexStatus::InitiateShutdown
+        );
+        assert_eq!(processor.final_message.as_deref(), Some("final answer"));
+        assert_eq!(processor.final_message_rendered, expected_rendered);
+        assert!(processor.emit_final_message_on_shutdown);
     }
 }
 
@@ -328,6 +407,9 @@ fn turn_completed_preserves_streamed_final_message_when_turn_items_are_empty() {
         final_message_rendered: false,
         emit_final_message_on_shutdown: false,
         last_total_token_usage: None,
+        displayed_warnings: Default::default(),
+        streamed_final_message: Default::default(),
+        last_non_retry_error: None,
     };
 
     let status = processor.process_server_notification(ServerNotification::TurnCompleted(
@@ -361,55 +443,56 @@ fn turn_completed_preserves_streamed_final_message_when_turn_items_are_empty() {
 #[test]
 fn turn_failed_clears_stale_final_message() {
     for turn_status in [TurnStatus::Failed, TurnStatus::Interrupted] {
-    let mut processor = EventProcessorWithHumanOutput {
-        bold: Style::new(),
-        cyan: Style::new(),
-        dimmed: Style::new(),
-        green: Style::new(),
-        italic: Style::new(),
-        magenta: Style::new(),
-        red: Style::new(),
-        yellow: Style::new(),
-        show_agent_reasoning: true,
-        show_raw_agent_reasoning: false,
-        last_message_path: None,
-        final_message: Some("partial answer".to_string()),
-        final_message_rendered: true,
-        emit_final_message_on_shutdown: true,
-        last_total_token_usage: None,
-    };
+        let mut processor = EventProcessorWithHumanOutput {
+            bold: Style::new(),
+            cyan: Style::new(),
+            dimmed: Style::new(),
+            green: Style::new(),
+            italic: Style::new(),
+            magenta: Style::new(),
+            red: Style::new(),
+            yellow: Style::new(),
+            show_agent_reasoning: true,
+            show_raw_agent_reasoning: false,
+            last_message_path: None,
+            final_message: Some("partial answer".to_string()),
+            final_message_rendered: true,
+            emit_final_message_on_shutdown: true,
+            last_total_token_usage: None,
+            displayed_warnings: Default::default(),
+            streamed_final_message: Default::default(),
+            last_non_retry_error: None,
+        };
 
-    let status = processor.process_server_notification(ServerNotification::TurnCompleted(
-        codex_app_server_protocol::TurnCompletedNotification {
-            surfaced_result: None,
-            thread_id: "thread-1".to_string(),
-            timing: None,
-            turn: Turn {
-                id: "turn-1".to_string(),
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
-                status: turn_status,
-                error: None,
-                started_at: None,
-                completed_at: Some(0),
-                duration_ms: None,
-                timing: None,
+        let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+            codex_app_server_protocol::TurnCompletedNotification {
                 surfaced_result: None,
+                thread_id: "thread-1".to_string(),
+                timing: None,
+                turn: Turn {
+                    id: "turn-1".to_string(),
+                    items_view: codex_app_server_protocol::TurnItemsView::Full,
+                    items: Vec::new(),
+                    status: turn_status,
+                    error: None,
+                    started_at: None,
+                    completed_at: Some(0),
+                    duration_ms: None,
+                    timing: None,
+                    surfaced_result: None,
+                },
             },
-        },
-    ));
+        ));
 
-    assert_eq!(
-        status,
-        crate::event_processor::CodexStatus::InitiateShutdown
-    );
-    assert_eq!(processor.final_message, None);
-    assert!(!processor.final_message_rendered);
-    assert!(!processor.emit_final_message_on_shutdown);
+        assert_eq!(
+            status,
+            crate::event_processor::CodexStatus::InitiateShutdown
+        );
+        assert_eq!(processor.final_message, None);
+        assert!(!processor.final_message_rendered);
+        assert!(!processor.emit_final_message_on_shutdown);
     }
 }
-
-
 
 #[test]
 fn canonical_message_retains_rendered_state_only_when_unchanged() {
@@ -430,6 +513,9 @@ fn canonical_message_retains_rendered_state_only_when_unchanged() {
             final_message_rendered: false,
             emit_final_message_on_shutdown: false,
             last_total_token_usage: None,
+            displayed_warnings: Default::default(),
+            streamed_final_message: Default::default(),
+            last_non_retry_error: None,
         };
         processor.process_server_notification(ServerNotification::ItemCompleted(
             codex_app_server_protocol::ItemCompletedNotification {
@@ -460,6 +546,63 @@ fn canonical_message_retains_rendered_state_only_when_unchanged() {
         processor.process_event_stream_error("lost stream".into());
         assert_eq!(processor.final_message, None);
         assert!(!processor.final_message_rendered);
+        assert!(!processor.emit_final_message_on_shutdown);
+    }
+}
+#[tokio::test]
+async fn human_stream_cache_keeps_final_phase_and_failed_none_has_a_notice() {
+    use codex_protocol::models::MessagePhase;
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let config = ConfigBuilder::default()
+        .codex_home(home.path().into())
+        .fallback_cwd(Some(cwd.path().into()))
+        .build()
+        .await
+        .unwrap();
+    let mut processor = EventProcessorWithHumanOutput::create_with_ansi(false, &config, None);
+    for (id, text, phase) in [
+        ("final", "accepted answer", MessagePhase::FinalAnswer),
+        ("progress", "I will check next", MessagePhase::Commentary),
+    ] {
+        processor.process_server_notification(ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                completed_at_ms: 0,
+                item: ThreadItem::AgentMessage {
+                    id: id.into(),
+                    text: text.into(),
+                    phase: Some(phase),
+                },
+            },
+        ));
+    }
+    assert_eq!(processor.final_message.as_deref(), Some("accepted answer"));
+    let ServerNotification::TurnCompleted(mut terminal) = crate::tests::recovery_completion()
+    else {
+        unreachable!()
+    };
+    terminal.turn.items.clear();
+    terminal.turn.timing = None;
+    terminal.timing = None;
+    terminal.surfaced_result = None;
+    terminal.turn.surfaced_result = None;
+    processor.process_server_notification(ServerNotification::TurnCompleted(terminal.clone()));
+    assert_eq!(processor.final_message.as_deref(), Some("accepted answer"));
+    terminal.turn.status = TurnStatus::Failed;
+    terminal.turn.error = None;
+    for _ in 0..2 {
+        processor.process_server_notification(ServerNotification::TurnCompleted(terminal.clone()));
+        assert!(
+            processor
+                .last_non_retry_error
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("Turn failed.")
+        );
+        assert!(processor.final_message.is_none());
         assert!(!processor.emit_final_message_on_shutdown);
     }
 }

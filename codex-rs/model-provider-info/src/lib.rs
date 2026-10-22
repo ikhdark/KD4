@@ -88,10 +88,27 @@ impl<'de> Deserialize<'de> for WireApi {
     }
 }
 
+pub mod local;
+
+/// Trusted registration identity, never accepted from provider configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProviderKind {
+    #[default]
+    Custom,
+    OpenAi,
+    AmazonBedrock,
+    AmazonBedrockRuntime,
+    Ollama,
+    LmStudio,
+}
+
 /// Serializable representation of a provider definition.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ModelProviderInfo {
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub kind: ProviderKind,
     /// Friendly display name.
     #[serde(default)]
     pub name: String,
@@ -143,6 +160,10 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the Responses API WebSocket transport.
     #[serde(default)]
     pub supports_websockets: bool,
+    /// Whether this provider accepts the hosted Responses `web_search` tool.
+    /// Custom providers must opt in; Responses transport alone does not imply support.
+    #[serde(default)]
+    pub supports_hosted_web_search: bool,
     /// Internal compatibility field; custom-provider web search is not configured in this fork.
     #[doc(hidden)]
     #[serde(skip)]
@@ -345,6 +366,7 @@ impl ModelProviderInfo {
 
     pub fn create_openai_provider(base_url: Option<String>) -> ModelProviderInfo {
         ModelProviderInfo {
+            kind: ProviderKind::OpenAi,
             name: OPENAI_PROVIDER_NAME.into(),
             base_url,
             env_key: None,
@@ -378,6 +400,7 @@ impl ModelProviderInfo {
             requires_openai_auth: true,
             supports_websockets: true,
             supports_standalone_web_search: false,
+            supports_hosted_web_search: true,
         }
     }
 
@@ -385,6 +408,7 @@ impl ModelProviderInfo {
         aws: Option<ModelProviderAwsAuthInfo>,
     ) -> ModelProviderInfo {
         ModelProviderInfo {
+            kind: ProviderKind::AmazonBedrock,
             name: AMAZON_BEDROCK_PROVIDER_NAME.into(),
             base_url: Some(AMAZON_BEDROCK_DEFAULT_BASE_URL.into()),
             env_key: None,
@@ -409,6 +433,7 @@ impl ModelProviderInfo {
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            supports_hosted_web_search: false,
         }
     }
 
@@ -416,13 +441,14 @@ impl ModelProviderInfo {
         aws: Option<ModelProviderAwsAuthInfo>,
     ) -> ModelProviderInfo {
         let mut provider = Self::create_amazon_bedrock_provider(aws);
+        provider.kind = ProviderKind::AmazonBedrockRuntime;
         provider.name = AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME.into();
         provider.http_headers = None;
         provider
     }
 
     pub fn is_openai(&self) -> bool {
-        self.name == OPENAI_PROVIDER_NAME
+        self.kind == ProviderKind::OpenAi
     }
 
     pub fn uses_openai_actor_authorization(&self) -> bool {
@@ -436,12 +462,11 @@ impl ModelProviderInfo {
     }
 
     pub fn is_amazon_bedrock(&self) -> bool {
-        self.name == AMAZON_BEDROCK_PROVIDER_NAME
-            || self.name == AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME
+        matches!(self.kind, ProviderKind::AmazonBedrock | ProviderKind::AmazonBedrockRuntime)
     }
 
     pub fn is_amazon_bedrock_runtime(&self) -> bool {
-        self.name == AMAZON_BEDROCK_RUNTIME_PROVIDER_NAME
+        self.kind == ProviderKind::AmazonBedrockRuntime
     }
 
     pub fn supports_remote_compaction(&self) -> bool {
@@ -490,7 +515,14 @@ pub fn built_in_model_providers(
         ),
     ]
     .into_iter()
-    .map(|(k, v)| (k.to_string(), v))
+    .map(|(k, mut v)| {
+        v.kind = match k {
+            OLLAMA_OSS_PROVIDER_ID => ProviderKind::Ollama,
+            LMSTUDIO_OSS_PROVIDER_ID => ProviderKind::LmStudio,
+            _ => v.kind,
+        };
+        (k.to_string(), v)
+    })
     .collect()
 }
 
@@ -556,6 +588,7 @@ pub fn create_oss_provider(default_provider_port: u16, wire_api: WireApi) -> Mod
 
 pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> ModelProviderInfo {
     ModelProviderInfo {
+        kind: ProviderKind::Custom,
         name: "gpt-oss".into(),
         base_url: Some(base_url.into()),
         env_key: None,
@@ -574,6 +607,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     }
 }
 

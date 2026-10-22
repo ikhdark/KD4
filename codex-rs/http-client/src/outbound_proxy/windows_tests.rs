@@ -191,7 +191,11 @@ fn automatic_proxy_info_applies_bypass_only_to_matching_hosts() {
             host: host.to_string(),
             port: 443,
         };
-        assert_eq!(proxy_info_decision(&proxy_info, &origin), expected, "{host}");
+        assert_eq!(
+            proxy_info_decision(&proxy_info, &origin),
+            expected,
+            "{host}"
+        );
     }
 }
 

@@ -188,7 +188,9 @@ async fn thread_read_can_include_turns() -> Result<()> {
 
     assert_eq!(thread.turns.len(), 1);
     let turn = &thread.turns[0];
-    assert_eq!(turn.status, TurnStatus::Completed);
+    // A user-only rollout turn never received an answer; a cold read reports
+    // that unfinished turn as interrupted.
+    assert_eq!(turn.status, TurnStatus::Interrupted);
     assert_eq!(turn.items_view, TurnItemsView::Full);
     assert_eq!(turn.items.len(), 1, "expected user message item");
     match &turn.items[0] {

@@ -44,14 +44,18 @@ def _codex_home_payload_roots() -> list[Path]:
     return [Path(home) / "rollout-payloads" for home in homes if home]
 
 
-def load_rollout_payload(path: Path, sha256: str, expected_bytes: int | None = None) -> bytes:
+def load_rollout_payload(
+    path: Path, sha256: str, expected_bytes: int | None = None
+) -> bytes:
     """Load immutable undo/timing data, rejecting missing or substituted blobs."""
     if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
         raise ValueError("invalid rollout payload hash")
     # A rollout copied out of its sessions tree leaves its blobs behind. They
     # are content-addressed and checksum-verified below, so the Codex home's
     # store may stand in for a missing colocated blob, but never a corrupt one.
-    roots = list(dict.fromkeys([rollout_payload_root(path), *_codex_home_payload_roots()]))
+    roots = list(
+        dict.fromkeys([rollout_payload_root(path), *_codex_home_payload_roots()])
+    )
     for root in roots:
         artifact = root / f"{sha256}.json"
         try:
@@ -91,8 +95,11 @@ def _hydrate_verified_payload(record: dict[str, Any], data: bytes) -> dict[str, 
     """Decode bytes already authenticated by load_rollout_payload in this operation."""
     reference = record["payload"]
     item = json.loads(data)
-    if (not isinstance(item, dict) or item.get("type") == _PAYLOAD_KIND
-            or item.get("type") != reference.get("item_type")):
+    if (
+        not isinstance(item, dict)
+        or item.get("type") == _PAYLOAD_KIND
+        or item.get("type") != reference.get("item_type")
+    ):
         raise ValueError("rollout payload type mismatch")
     item["timestamp"] = record.get("timestamp")
     item["format_version"] = record.get("format_version")
@@ -113,9 +120,14 @@ def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
             if not isinstance(record, dict) or record.get("type") != _PAYLOAD_KIND:
                 continue
             reference = record["payload"]
-            if not isinstance(reference, dict) or type(reference.get("bytes")) is not int:
+            if (
+                not isinstance(reference, dict)
+                or type(reference.get("bytes")) is not int
+            ):
                 raise ValueError("invalid rollout payload reference")
-            data = load_rollout_payload(snapshot.path, reference.get("sha256"), reference["bytes"])
+            data = load_rollout_payload(
+                snapshot.path, reference.get("sha256"), reference["bytes"]
+            )
             _hydrate_verified_payload(record, data)
             digest = reference["sha256"]
             if digest in seen:
@@ -130,7 +142,9 @@ def copy_rollout_payloads(snapshot: RolloutSnapshot, output: Path) -> None:
             # Publish atomically without replacing any existing immutable blob.
             temporary_path = None
             try:
-                with tempfile.NamedTemporaryFile(dir=directory, delete=False) as temporary:
+                with tempfile.NamedTemporaryFile(
+                    dir=directory, delete=False
+                ) as temporary:
                     temporary_path = Path(temporary.name)
                     temporary.write(data)
                     temporary.flush()
@@ -286,11 +300,17 @@ def _open_shared_binary(path: Path, *, reject_links: bool = False) -> BinaryIO:
 
     try:
         if reject_links:
+
             class FileAttributeTagInfo(ctypes.Structure):
                 _fields_ = [("attributes", wintypes.DWORD), ("tag", wintypes.DWORD)]
 
             get_info = kernel32.GetFileInformationByHandleEx
-            get_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+            get_info.argtypes = (
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            )
             get_info.restype = wintypes.BOOL
             info = FileAttributeTagInfo()
             if not get_info(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
@@ -387,9 +407,12 @@ def read_rollout_snapshot(path: Path) -> RolloutSnapshot:
     )
 
 
-def iter_rollout_records(path: Path, *, recover: bool = False,
-                         on_gap: Callable[[dict[str, Any]], None] | None = None
-                         ) -> Iterator[tuple[dict[str, Any], int]]:
+def iter_rollout_records(
+    path: Path,
+    *,
+    recover: bool = False,
+    on_gap: Callable[[dict[str, Any]], None] | None = None,
+) -> Iterator[tuple[dict[str, Any], int]]:
     """Yield records and their JSONL byte lengths from one fixed snapshot.
 
     A live writer can leave an unterminated, unparseable final record. Keep the
@@ -414,19 +437,37 @@ def iter_rollout_records(path: Path, *, recover: bool = False,
             try:
                 record = json.loads(line.decode("utf-8"))
                 if not isinstance(record, dict):
-                    raise ValueError(f"rollout record {snapshot.path}:{number} is not an object")
+                    raise ValueError(
+                        f"rollout record {snapshot.path}:{number} is not an object"
+                    )
                 category = "payload_unavailable"
                 hydrated = hydrate_rollout_record(record, snapshot.path)
             except (ValueError, OSError) as error:
                 if recover:
-                    reference = record.get("payload") if isinstance(record, dict) else None
-                    on_gap({"path": str(snapshot.path), "snapshot": snapshot.sha256,
-                            "line": number, "byteStart": start, "byteEnd": offset,
-                            "coordinateSpace": "decoded_jsonl", "category": category,
-                            "payload": reference if category == "payload_unavailable" else None,
-                            "error": str(error)})
+                    reference = (
+                        record.get("payload") if isinstance(record, dict) else None
+                    )
+                    on_gap(
+                        {
+                            "path": str(snapshot.path),
+                            "snapshot": snapshot.sha256,
+                            "line": number,
+                            "byteStart": start,
+                            "byteEnd": offset,
+                            "coordinateSpace": "decoded_jsonl",
+                            "category": category,
+                            "payload": reference
+                            if category == "payload_unavailable"
+                            else None,
+                            "error": str(error),
+                        }
+                    )
                     continue
-                if isinstance(error, (json.JSONDecodeError, UnicodeDecodeError)) and category == "invalid_record" and not line.endswith(b"\n"):
+                if (
+                    isinstance(error, (json.JSONDecodeError, UnicodeDecodeError))
+                    and category == "invalid_record"
+                    and not line.endswith(b"\n")
+                ):
                     print(
                         f"warning: {snapshot.path}:{number}: ignoring unparseable "
                         "unterminated final record; report covers the complete prefix only",
@@ -441,12 +482,17 @@ def iter_rollout_records(path: Path, *, recover: bool = False,
             yield hydrated, len(line)
 
 
-def read_rollout_records(path: Path, *, recover: bool = False,
-                         on_gap: Callable[[dict[str, Any]], None] | None = None
-                         ) -> list[tuple[dict[str, Any], int]]:
+def read_rollout_records(
+    path: Path,
+    *,
+    recover: bool = False,
+    on_gap: Callable[[dict[str, Any]], None] | None = None,
+) -> list[tuple[dict[str, Any], int]]:
     """Return all verified records, closing the snapshot before returning."""
     return list(iter_rollout_records(path, recover=recover, on_gap=on_gap))
 
 
 if __name__ == "__main__":
-    raise SystemExit("Snapshot CLI moved to KDR; shared validation-ledger readers remain.")
+    raise SystemExit(
+        "Snapshot CLI moved to KDR; shared validation-ledger readers remain."
+    )

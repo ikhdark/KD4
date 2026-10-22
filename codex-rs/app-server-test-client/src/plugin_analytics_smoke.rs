@@ -530,9 +530,8 @@ mod deadline_tests {
 
     #[test]
     fn smoke_deadline_bounds_nested_turn_rpc_and_forbids_expired_retry() {
-        let temp = tempfile::tempdir().expect("peer log root");
-        let log = temp.path().join("requests.jsonl");
-        let mut client = crate::tests::smoke_deadline_client(&log, "Start-Sleep -Seconds 5");
+        let temp = tempfile::tempdir().expect("capture root");
+        let (mut client, recorder) = crate::tests::stalled_smoke_deadline_client();
         let expected = ExpectedPlugin {
             plugin_id: "fixture-plugin".to_string(),
             remote_plugin_id: "fixture-remote".to_string(),
@@ -550,22 +549,8 @@ mod deadline_tests {
             start.elapsed() < Duration::from_secs(2),
             "must not wait for the five-second peer stall"
         );
-        let requests = std::fs::read_to_string(&log).expect("actual nested request");
-        let requests = requests
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).expect("RPC JSON"))
-            .collect::<Vec<_>>();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["method"], "thread/start");
         wait_for_plugin_usage(&mut client, &capture, &expected, deadline)
             .expect_err("expired budget rejects before retrying any RPC");
-        assert_eq!(
-            std::fs::read_to_string(&log)
-                .expect("unchanged request log")
-                .lines()
-                .count(),
-            1
-        );
         let super::super::ClientTransport::Stdio { child, .. } = &client.transport else {
             panic!("owned stdio transport")
         };
@@ -578,6 +563,13 @@ mod deadline_tests {
                 .is_some(),
             "deadline must terminate and reap the stalled child, not detach work"
         );
+        let requests = recorder.finish(client);
+        assert_eq!(
+            requests.len(),
+            1,
+            "expiry admits no retry of the nested RPC"
+        );
+        assert_eq!(requests[0]["method"], "thread/start");
     }
 
     #[test]

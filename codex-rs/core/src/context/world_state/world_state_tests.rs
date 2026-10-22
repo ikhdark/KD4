@@ -387,3 +387,119 @@ fn snapshot_merge_patch_changes_and_removes_nested_values() {
     assert_eq!(previous, current);
     assert_eq!(current.merge_patch_from(&current), None);
 }
+
+struct PressureSection(String);
+
+impl WorldStateSection for PressureSection {
+    const ID: &'static str = "pressure";
+    type Snapshot = String;
+
+    fn snapshot(&self) -> String {
+        self.0.clone()
+    }
+    fn required() -> bool {
+        true
+    }
+    fn render_diff(
+        &self,
+        previous: PreviousSectionState<'_, String>,
+    ) -> Option<Box<dyn ContextualUserFragment>> {
+        if matches!(previous, PreviousSectionState::Known(old) if old == &self.0) {
+            None
+        } else {
+            Some(Box::new(TestFragment(self.0.clone())))
+        }
+    }
+}
+
+#[test]
+fn optional_replacement_invalidates_under_pressure_without_forging_delivery() {
+    let world = |body: String, pressure: &str| {
+        let mut world = WorldState::default();
+        world.add_section(PressureSection(pressure.into()));
+        let current = body.clone();
+        world.add_extension_section(
+            WorldStateSectionContribution::new("catalog", json!({"body": body}), move |previous| {
+                if matches!(previous, PreviousWorldStateSection::Known(old)
+                    if old.get("body").and_then(Value::as_str) == Some(body.as_str()))
+                {
+                    return None;
+                }
+                Some(RenderedWorldStateFragment::new(
+                    "developer",
+                    ("<catalog>", "</catalog>"),
+                    body.clone(),
+                ))
+            })
+            .with_retained_fragment_matcher(move |role, text| {
+                role == "developer"
+                    && (text.contains(&current) || text.contains("catalog deferred"))
+            })
+            .with_budget_fallback(
+                json!({"deferred": true}),
+                RenderedWorldStateFragment::new(
+                    "developer",
+                    ("<catalog>", "</catalog>"),
+                    "catalog deferred",
+                ),
+            ),
+        );
+        world
+    };
+    let (initial, accepted) = world("old".into(), "small").render_full_with_snapshot();
+    let history = crate::context_manager::updates::merge_contextual_fragments(initial);
+    let required = "R".repeat(41_000);
+    let desired = world("new".into(), &required);
+    let (changed, fallback) = desired.render_history_diff_with_snapshot(Some(&accepted), &history);
+    let texts = changed
+        .iter()
+        .map(|fragment| fragment.render())
+        .collect::<Vec<_>>();
+    assert!(texts.contains(&required));
+    assert!(texts.contains(&"<catalog>catalog deferred</catalog>".to_string()));
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("<catalog>new</catalog>"))
+    );
+    assert_eq!(
+        fallback.section("catalog"),
+        Some(&json!({"deferred": true}))
+    );
+    let (retried, complete) = desired.render_diff_with_snapshot(&fallback);
+    assert_eq!(
+        retried
+            .iter()
+            .map(|fragment| fragment.render())
+            .collect::<Vec<_>>(),
+        vec!["<catalog>new</catalog>"]
+    );
+    assert_eq!(complete.section("catalog"), Some(&json!({"body": "new"})));
+    assert!(desired.render_diff(&complete).is_empty());
+
+    // First-time optional inventory is not promoted to required context.
+    let (initial, _) = world("new".into(), &required).render_full_with_snapshot();
+    assert_eq!(initial.len(), 1);
+    // A replacement too large even without pressure must not repeat the invalidation.
+    let oversized = world("N".repeat(50_000), &required);
+    let (_, pending) = oversized.render_diff_with_snapshot(&accepted);
+    assert!(oversized.render_diff(&pending).is_empty());
+    assert_eq!(pending.section("catalog"), Some(&json!({"deferred": true})));
+}
+
+#[test]
+fn subagent_removal_survives_required_instruction_pressure() {
+    let mut initial = WorldState::default();
+    initial.add_section(SubagentsState::new("worker running".into()));
+    let (_, previous) = initial.render_full_with_snapshot();
+    let mut current = WorldState::default();
+    current.add_section(PressureSection("R".repeat(41_000)));
+    current.add_section(SubagentsState::new(String::new()));
+    let (fragments, accepted) = current.render_diff_with_snapshot(&previous);
+    assert!(
+        fragments
+            .iter()
+            .any(|fragment| fragment.render().contains("\nnone\n"))
+    );
+    assert_eq!(accepted.section("subagents").unwrap()["text"], "");
+}

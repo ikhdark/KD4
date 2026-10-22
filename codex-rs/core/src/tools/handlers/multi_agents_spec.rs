@@ -99,10 +99,15 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
             strict: false,
             defer_loading: None,
             parameters: JsonSchema {
-                one_of: Some(["message", "items"].into_iter().map(|field| JsonSchema {
-                    required: Some(vec![field.to_string()]),
-                    ..JsonSchema::object(BTreeMap::new(), None, None)
-                }).collect()),
+                one_of: Some(
+                    ["message", "items"]
+                        .into_iter()
+                        .map(|field| JsonSchema {
+                            required: Some(vec![field.to_string()]),
+                            ..JsonSchema::object(BTreeMap::new(), None, None)
+                        })
+                        .collect(),
+                ),
                 ..JsonSchema::object(properties, /*required*/ None, Some(false.into()))
             },
             output_schema: Some(spawn_agent_output_schema_v1().into()),
@@ -149,14 +154,36 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
         ),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["task_name".to_string()]),
-            Some(false.into()),
+        parameters: JsonSchema {
+            one_of: Some(
+                ["message", "assignment"]
+                    .into_iter()
+                    .map(|field| JsonSchema {
+                        required: Some(vec![field.to_string()]),
+                        ..JsonSchema::object(BTreeMap::new(), None, None)
+                    })
+                    .collect(),
+            ),
+            // Keep role admission separate from the exclusive input choice: otherwise
+            // message + assignment without agent_type could match the message branch.
+            any_of: Some(
+                ["message", "agent_type"]
+                    .into_iter()
+                    .map(|field| JsonSchema {
+                        required: Some(vec![field.to_string()]),
+                        ..JsonSchema::object(BTreeMap::new(), None, None)
+                    })
+                    .collect(),
+            ),
+            ..JsonSchema::object(
+                properties,
+                Some(vec!["task_name".to_string()]),
+                Some(false.into()),
+            )
+        },
+        output_schema: Some(
+            spawn_agent_output_schema_v2(options.hide_agent_type_model_reasoning).into(),
         ),
-        output_schema: Some(spawn_agent_output_schema_v2(
-            options.hide_agent_type_model_reasoning,
-        ).into()),
     })
 }
 
@@ -208,10 +235,13 @@ pub fn create_send_message_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "targets".to_string(),
-            JsonSchema::array(
-                JsonSchema::string(None),
-                Some("Explicit recipients for the same message. Supply either target or a non-empty targets list; each recipient returns queued or failed.".to_string()),
-            ),
+            JsonSchema {
+                min_items: Some(1),
+                ..JsonSchema::array(
+                    JsonSchema::string(None),
+                    Some("Explicit recipients for the same message. Supply either target or a non-empty targets list; each recipient returns queued or failed.".to_string()),
+                )
+            },
         ),
         (
             "target".to_string(),
@@ -240,11 +270,20 @@ pub fn create_send_message_tool() -> ToolSpec {
             .to_string(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["message".to_string()]),
-            Some(false.into()),
-        ),
+        parameters: JsonSchema {
+            one_of: Some(vec![
+                JsonSchema {
+                    // Agreeing aliases remain valid together. Equality is checked at runtime.
+                    any_of: Some(["target", "task_name"].into_iter().map(|field| JsonSchema {
+                        required: Some(vec![field.to_string()]),
+                        ..JsonSchema::object(BTreeMap::new(), None, None)
+                    }).collect()),
+                    ..JsonSchema::default()
+                },
+                JsonSchema::object(BTreeMap::new(), Some(vec!["targets".to_string()]), None),
+            ]),
+            ..JsonSchema::object(properties, Some(vec!["message".to_string()]), Some(false.into()))
+        },
         output_schema: None,
     })
 }
@@ -704,7 +743,10 @@ fn create_collab_input_items_schema() -> JsonSchema {
     .into_iter()
     .map(|(kind, required)| {
         let mut properties = properties.clone();
-        properties.insert("type".to_string(), JsonSchema::string_enum(vec![json!(kind)], None));
+        properties.insert(
+            "type".to_string(),
+            JsonSchema::string_enum(vec![json!(kind)], None),
+        );
         JsonSchema::object(
             properties,
             Some(required.into_iter().map(str::to_string).collect()),
@@ -819,9 +861,21 @@ fn task_name_alias_schema() -> JsonSchema {
     ))
 }
 
+pub(crate) fn criterion_evidence_policy_schema() -> JsonSchema {
+    JsonSchema::object(BTreeMap::from([
+        ("kind".into(), JsonSchema::string_enum(vec![json!("report_only"), json!("source_inspection"), json!("validation_execution")], Some("Declared assurance, not inferred coverage. Omission of the entire policy leaves a legacy claim unverified.".into()))),
+        ("required_evidence".into(), JsonSchema::string(Some("Exact immutable required_evidence entry applicable to this criterion; required except for report_only. Shared observations are allowed only when the declared contract covers each criterion.".into()))),
+        ("freshness".into(), JsonSchema::string_enum(vec![json!("current"), json!("historical")], Some("Defaults to current. Current source acquisition is rehashed; current execution stays unverified without a complete trusted input binding. Historical means only the recorded observation, never final-source correctness.".into()))),
+    ]), Some(vec!["kind".into()]), Some(false.into()))
+}
+
 fn typed_assignment_schema() -> JsonSchema {
     let criterion = JsonSchema::object(
         BTreeMap::from([
+            (
+                "evidence_policy".to_string(),
+                criterion_evidence_policy_schema(),
+            ),
             (
                 "id".to_string(),
                 JsonSchema::string(Some("Stable acceptance-criterion id.".to_string())),
@@ -1007,7 +1061,7 @@ fn typed_assignment_schema() -> JsonSchema {
             ),
             (
                 "required_evidence".to_string(),
-                string_array("Evidence the host must have recorded before a `completed` receipt is accepted. Each entry must be `inspect:<normalized repository-relative file>`: the agent satisfies it by reading that whole file with native read_file, and no other form is ever recorded, so any other entry blocks completion. It proves inspection, not tests, semantic correctness, or current workspace freshness."),
+                string_array("Exact host observations required for completion: inspect:<normalized repository-relative file> for full native source acquisition, or exact resolved command argv (JSON array or shell-quoted argv) for native validation execution. Listing, busy, zero-test, failed and cancelled runs are not successful execution evidence. Criterion evidence_policy separately governs applicability and freshness."),
             ),
             (
                 "prohibited_changes".to_string(),
@@ -1152,6 +1206,7 @@ fn spawn_agent_tool_description_v2(
         {agent_role_guidance}
         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
+Registered leaf names take precedence over compact UUIDs; use a hyphenated UUID to select a concrete thread unambiguously.
 The spawned agent receives a durable task binding.
 {default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
@@ -1163,6 +1218,7 @@ Launch authorized independent assignments in the same batch rather than awaiting
 Sequence only real dependencies or shared-resource conflicts. Do not add a model round merely to acknowledge a completed agent; integrate its result with the next substantive step or final response.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 Use `assignment` for explicitly scoped typed coordination or `message` for a compatibility task admitted with a repository-wide diagnostic claim; exactly one is required. Both forms are durably admitted, record overlap without rejecting it, and return an `assignment_id`. Typed assignments require an explicit built-in `agent_type`: `architect`, `explorer`, `worker`, `reviewer`, `verifier`, or `integrator`.
+The `reviewer` profile requires a typed assignment with a review relation; it cannot be used with the compatibility `message` form.
 
     {full_history_override_guidance}
 Omitted `fork_turns` and `fork_turns="none"` create a lineage-preserving TaskCapsule fork: the capsule is the sole structured bootstrap and no parent conversation or conversation-derived capability selection is inherited. Integers from 1 through 5 retain bounded history. `fork_turns="all"` is disabled by default and is only available with the configuration escape hatch."#

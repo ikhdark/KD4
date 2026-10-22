@@ -7,8 +7,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use codex_app_server_protocol::ClientRequestSerializationScope;
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
@@ -69,6 +69,8 @@ pub(crate) enum RequestSerializationQueueKey {
 pub(crate) enum RequestSerializationAccess {
     Exclusive,
     SharedRead,
+    /// Reserved admission, but FIFO execution behind process registration.
+    OrderedControl,
     /// Out-of-band control traffic for a key, such as `turn/interrupt`.
     ///
     /// Control requests run ahead of queued work on the same key because they observe or
@@ -78,6 +80,46 @@ pub(crate) enum RequestSerializationAccess {
 }
 
 impl RequestSerializationQueueKey {
+    /// Production preparation is fallible and bounds the OS work even after a
+    /// caller times out. The permit lives in the blocking closure, not its waiter.
+    pub(crate) async fn try_from_scope(
+        connection_id: ConnectionId,
+        scope: ClientRequestSerializationScope,
+    ) -> std::io::Result<(Self, RequestSerializationAccess)> {
+        if let ClientRequestSerializationScope::ThreadPath { path } = scope {
+            static RESOLVERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+                std::sync::OnceLock::new();
+            let permit = RESOLVERS
+                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "thread path preparation capacity exhausted",
+                    )
+                })?;
+            let resolution = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                std::fs::canonicalize(path)
+            });
+            let path = tokio::time::timeout(std::time::Duration::from_secs(1), resolution)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "thread path preparation timed out; request not dispatched",
+                    )
+                })?
+                .map_err(std::io::Error::other)??;
+            return Ok((
+                Self::ThreadPath { path },
+                RequestSerializationAccess::Exclusive,
+            ));
+        }
+        Ok(Self::from_scope(connection_id, scope).await)
+    }
+
     pub(crate) async fn from_scope(
         connection_id: ConnectionId,
         scope: ClientRequestSerializationScope,
@@ -90,13 +132,17 @@ impl RequestSerializationQueueKey {
                 (Self::Global(name), RequestSerializationAccess::SharedRead)
             }
             ClientRequestSerializationScope::Thread { thread_id } => (
-                Self::Thread { thread_id },
+                Self::Thread {
+                    thread_id: canonical_thread_key(thread_id),
+                },
                 RequestSerializationAccess::Exclusive,
             ),
             // Enqueue wraps this thread key in a separate control lane, allowing
             // cancellation while an ordered request is still running.
             ClientRequestSerializationScope::ThreadControl { thread_id } => (
-                Self::Thread { thread_id },
+                Self::Thread {
+                    thread_id: canonical_thread_key(thread_id),
+                },
                 RequestSerializationAccess::Control,
             ),
             ClientRequestSerializationScope::ThreadPath { path } => (
@@ -139,6 +185,12 @@ impl RequestSerializationQueueKey {
             ),
         }
     }
+}
+
+fn canonical_thread_key(thread_id: String) -> String {
+    codex_protocol::ThreadId::from_string(&thread_id)
+        .map(|id| id.to_string())
+        .unwrap_or(thread_id)
 }
 
 async fn normalize_thread_path(path: PathBuf) -> PathBuf {
@@ -256,16 +308,25 @@ struct KeyQueues {
 
 impl KeyQueues {
     fn ordered_len(&self) -> usize {
-        self.ordered.len()
+        self.ordered
+            .iter()
+            .filter(|request| request.access != RequestSerializationAccess::OrderedControl)
+            .count()
     }
 
     fn control_len(&self) -> usize {
         self.control.len()
+            + self
+                .ordered
+                .iter()
+                .filter(|request| request.access == RequestSerializationAccess::OrderedControl)
+                .count()
     }
 
     fn ordered_bytes(&self) -> usize {
         self.ordered
             .iter()
+            .filter(|request| request.access != RequestSerializationAccess::OrderedControl)
             .map(QueuedSerializedRequest::estimated_bytes)
             .fold(0usize, usize::saturating_add)
     }
@@ -368,10 +429,13 @@ impl RequestSerializationQueues {
         request: QueuedInitializedRequest,
     ) -> RequestAdmission {
         let request = QueuedSerializedRequest { access, request };
-        let is_control = access == RequestSerializationAccess::Control;
+        let is_control = matches!(
+            access,
+            RequestSerializationAccess::Control | RequestSerializationAccess::OrderedControl
+        );
         // A separate drain is required: queue priority alone cannot interrupt a
         // handler that is already running and waiting for cancellation.
-        let key = if is_control {
+        let key = if access == RequestSerializationAccess::Control {
             RequestSerializationQueueKey::Control(Box::new(key))
         } else {
             key
@@ -380,6 +444,11 @@ impl RequestSerializationQueues {
             let mut state = self.inner.lock().await;
             let existing = state.queues.get(&key);
             if is_control {
+                // Match the independent outer control envelope. Never charge
+                // ordinary bytes here: they may be full during an interrupt.
+                if request.estimated_bytes() > 64 * 1024 {
+                    return RequestAdmission::Rejected(RequestAdmissionError::TotalBytes);
+                }
                 if state.total_control >= MAX_TOTAL_QUEUED_REQUESTS {
                     return RequestAdmission::Rejected(RequestAdmissionError::ControlLane);
                 }
@@ -457,18 +526,19 @@ impl RequestSerializationQueues {
             queues
                 .control
                 .retain(|request| !request.request.belongs_to_gate(gate));
-            cancelled_control += previous_control_len - queues.control_len();
 
             let previous_len = queues.ordered_len();
             let previous_bytes = queues.ordered_bytes();
             queues
                 .ordered
                 .retain(|request| !request.request.belongs_to_gate(gate));
+            cancelled_control += previous_control_len - queues.control_len();
             cancelled += previous_len - queues.ordered_len();
             let retained_bytes = queues.ordered_bytes();
             cancelled_bytes =
                 cancelled_bytes.saturating_add(previous_bytes.saturating_sub(retained_bytes));
-            if previous_control_len != queues.control_len() || previous_len != queues.ordered_len() {
+            if previous_control_len != queues.control_len() || previous_len != queues.ordered_len()
+            {
                 // Removing a queued writer can admit readers while an earlier
                 // read is still running. Wake the existing drain rather than
                 // waiting for that unrelated read or another enqueue to finish.
@@ -493,27 +563,43 @@ impl RequestSerializationQueues {
                     total_queued_bytes,
                     ..
                 } = &mut *state;
-                let Some(queue) = queues.get_mut(&key) else { return };
+                let Some(queue) = queues.get_mut(&key) else {
+                    return;
+                };
                 loop {
                     let next = queue.control.front().or_else(|| queue.ordered.front());
                     let Some(next) = next else { break };
                     // Refill free reader slots, but never cross a queued writer.
-                    if !running.is_empty() && (exclusive
-                        || next.access != RequestSerializationAccess::SharedRead
-                        || running.len() >= self.limits.max_concurrent_shared_reads)
+                    if !running.is_empty()
+                        && (exclusive
+                            || next.access != RequestSerializationAccess::SharedRead
+                            || running.len() >= self.limits.max_concurrent_shared_reads)
                     {
                         break;
                     }
                     let control = next.access == RequestSerializationAccess::Control;
-                    let Some(request) = (if control { queue.control.pop_front() } else { queue.ordered.pop_front() }) else {
+                    let Some(request) = (if control {
+                        queue.control.pop_front()
+                    } else {
+                        queue.ordered.pop_front()
+                    }) else {
                         break;
                     };
                     exclusive = request.access != RequestSerializationAccess::SharedRead;
-                    if !control {
+                    let reserved = matches!(
+                        request.access,
+                        RequestSerializationAccess::Control
+                            | RequestSerializationAccess::OrderedControl
+                    );
+                    if !reserved {
                         *total_queued -= 1;
-                        *total_queued_bytes = total_queued_bytes.saturating_sub(request.estimated_bytes());
+                        *total_queued_bytes =
+                            total_queued_bytes.saturating_sub(request.estimated_bytes());
                     }
-                    running.push(request.request.run());
+                    running.push(async move {
+                        request.request.run().await;
+                        reserved
+                    });
                 }
                 if running.is_empty() {
                     queues.remove(&key);
@@ -523,9 +609,9 @@ impl RequestSerializationQueues {
             };
             tokio::select! {
                 biased;
-                _ = running.next() => {
+                completed = running.next() => {
                     if running.is_empty() { exclusive = false; }
-                    if matches!(key, RequestSerializationQueueKey::Control(_)) {
+                    if completed == Some(true) {
                         self.inner.lock().await.total_control -= 1;
                     }
                 }
@@ -558,6 +644,75 @@ mod tests {
 
     fn gate() -> Arc<ConnectionRpcGate> {
         Arc::new(ConnectionRpcGate::new())
+    }
+
+    #[tokio::test]
+    async fn ordered_controls_have_reserved_admission_without_overtaking_registration() {
+        let queues = RequestSerializationQueues::with_limits_and_bytes(1, 1, 1, 1, 1);
+        let key = RequestSerializationQueueKey::Process {
+            connection_id: ConnectionId(1),
+            process_handle: "p".into(),
+        };
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new_with_estimated_bytes(gate(), 1, async move {
+                        started_tx.send(()).unwrap();
+                        let _ = release_rx.await;
+                    })
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        started_rx.await.unwrap();
+        assert_eq!(
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::Exclusive,
+                    QueuedInitializedRequest::new_with_estimated_bytes(gate(), 1, async {})
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        let (control_tx, mut control_rx) = oneshot::channel();
+        assert_eq!(
+            queues
+                .enqueue(
+                    key,
+                    RequestSerializationAccess::OrderedControl,
+                    QueuedInitializedRequest::new_with_estimated_bytes(gate(), 1, async move {
+                        control_tx.send(()).unwrap();
+                    })
+                )
+                .await,
+            RequestAdmission::Accepted
+        );
+        assert!(
+            matches!(
+                control_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "cleanup must not overtake process registration"
+        );
+        release_tx.send(()).unwrap();
+        timeout(queue_drain_timeout(), control_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // Drain completion returns the reserved accounting even after handler return.
+        timeout(queue_drain_timeout(), async {
+            while queues.inner.lock().await.total_control != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(queues.inner.lock().await.total_queued, 0);
     }
 
     fn queue_drain_timeout() -> Duration {
@@ -1429,23 +1584,64 @@ mod tests {
         let (release, blocked) = oneshot::channel();
         let (started, mut events) = mpsc::unbounded_channel();
         let slow_started = started.clone();
-        queues.enqueue(key.clone(), RequestSerializationAccess::SharedRead, QueuedInitializedRequest::new(gate(), async move {
-            slow_started.send(0).unwrap(); let _ = blocked.await;
-        })).await;
+        queues
+            .enqueue(
+                key.clone(),
+                RequestSerializationAccess::SharedRead,
+                QueuedInitializedRequest::new(gate(), async move {
+                    slow_started.send(0).unwrap();
+                    let _ = blocked.await;
+                }),
+            )
+            .await;
         assert_eq!(events.recv().await, Some(0));
         for index in 1..5 {
             let started = started.clone();
-            queues.enqueue(key.clone(), RequestSerializationAccess::SharedRead, QueuedInitializedRequest::new(gate(), async move { started.send(index).unwrap(); })).await;
+            queues
+                .enqueue(
+                    key.clone(),
+                    RequestSerializationAccess::SharedRead,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        started.send(index).unwrap();
+                    }),
+                )
+                .await;
         }
-        for index in 1..5 { assert_eq!(timeout(queue_drain_timeout(), events.recv()).await.unwrap(), Some(index)); }
-        for (index, access) in [(5, RequestSerializationAccess::Exclusive), (6, RequestSerializationAccess::SharedRead)] {
+        for index in 1..5 {
+            assert_eq!(
+                timeout(queue_drain_timeout(), events.recv()).await.unwrap(),
+                Some(index)
+            );
+        }
+        for (index, access) in [
+            (5, RequestSerializationAccess::Exclusive),
+            (6, RequestSerializationAccess::SharedRead),
+        ] {
             let started = started.clone();
-            queues.enqueue(key.clone(), access, QueuedInitializedRequest::new(gate(), async move { started.send(index).unwrap(); })).await;
+            queues
+                .enqueue(
+                    key.clone(),
+                    access,
+                    QueuedInitializedRequest::new(gate(), async move {
+                        started.send(index).unwrap();
+                    }),
+                )
+                .await;
         }
-        assert!(timeout(shutdown_wait_timeout(), events.recv()).await.is_err());
+        assert!(
+            timeout(shutdown_wait_timeout(), events.recv())
+                .await
+                .is_err()
+        );
         release.send(()).unwrap();
-        assert_eq!(timeout(queue_drain_timeout(), events.recv()).await.unwrap(), Some(5));
-        assert_eq!(timeout(queue_drain_timeout(), events.recv()).await.unwrap(), Some(6));
+        assert_eq!(
+            timeout(queue_drain_timeout(), events.recv()).await.unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            timeout(queue_drain_timeout(), events.recv()).await.unwrap(),
+            Some(6)
+        );
     }
 
     #[tokio::test]
@@ -1683,5 +1879,46 @@ mod tests {
             .await
             .expect("later read should start after the write")
             .expect("sender should be open");
+    }
+}
+#[cfg(test)]
+mod canonical_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_uuid_spellings_share_mutation_and_control_keys() {
+        let id = "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string();
+        let (canonical, _) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(1),
+            ClientRequestSerializationScope::Thread {
+                thread_id: id.clone(),
+            },
+        )
+        .await;
+        let (alias, _) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(2),
+            ClientRequestSerializationScope::Thread {
+                thread_id: id.to_uppercase(),
+            },
+        )
+        .await;
+        let (control, access) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(3),
+            ClientRequestSerializationScope::ThreadControl {
+                thread_id: id.to_uppercase(),
+            },
+        )
+        .await;
+        assert_eq!(canonical, alias);
+        assert_eq!(canonical, control);
+        assert_eq!(access, RequestSerializationAccess::Control);
+        let (other, _) = RequestSerializationQueueKey::from_scope(
+            ConnectionId(1),
+            ClientRequestSerializationScope::Thread {
+                thread_id: codex_protocol::ThreadId::new().to_string(),
+            },
+        )
+        .await;
+        assert_ne!(canonical, other);
     }
 }

@@ -1,8 +1,11 @@
 use super::ContextualUserFragment;
-use codex_protocol::models::{ContentItem, ResponseItem};
-use codex_protocol::protocol::{
-    EventMsg, RolloutItem, TurnTiming, TurnTimingModelRequest, TurnTimingProviderTokenUsage,
-};
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::TurnTiming;
+use codex_protocol::protocol::TurnTimingModelRequest;
+use codex_protocol::protocol::TurnTimingProviderTokenUsage;
 
 /// Recover only recorded evidence. Missing timestamps and incomplete requests
 /// remain unknown; this must never masquerade as a complete terminal profile.
@@ -64,7 +67,8 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
                     }
                 } else {
                     timing.model_requests.push(TurnTimingModelRequest {
-                        generation_index: timing.model_requests.len() as u32,
+                        // A sampling identity is not a logical generation.
+                        // Legacy boundaries do not carry that relationship.
                         sampling_request_id: Some(value.sampling_request_id.clone()),
                         physical_attempt_ids: vec![value.physical_attempt_id.clone()],
                         ..TurnTimingModelRequest::default()
@@ -83,6 +87,10 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
                         request.reasoning_output_tokens =
                             usage.reasoning_output_tokens.max(0) as u64;
                         request.token_usage = Some(TurnTimingProviderTokenUsage {
+                            coverage: usage.coverage,
+                            output_excluding_reported_reasoning_tokens: usage
+                                .known_visible_output()
+                                .and_then(|tokens| u64::try_from(tokens).ok()),
                             input_tokens: usage.input_tokens.max(0) as u64,
                             cached_input_tokens: usage.cached_input_tokens.max(0) as u64,
                             visible_output_tokens: request
@@ -98,12 +106,16 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
             _ => {}
         }
     }
-    timing.counters.logical_generation_count = timing.model_requests.len() as u32;
-    timing.counters.model_request_count = timing
+    // Only checkpoint scalars establish logical-generation cardinality. Row
+    // indices default to zero in old records, and boundaries can be retries.
+    // Keep the known prefix count; do not manufacture one from either identity.
+    let observed_attempts = timing
         .model_requests
         .iter()
-        .map(|request| request.physical_attempt_ids.len() as u32)
-        .sum();
+        .filter(|request| request.dispatch_ms.is_some())
+        .count() as u32;
+    timing.counters.model_request_count =
+        timing.counters.model_request_count.max(observed_attempts);
     timing.profile_valid = false;
     timing.classification_complete = false;
     timing.completed_at_unix_ms = None;
@@ -118,6 +130,7 @@ pub(crate) fn lost_turn_recovery(items: &[RolloutItem]) -> (String, TurnTiming) 
     notice.push_str(
         "\n\nIn flight at the last retained timing checkpoint (not a crash-time inventory):",
     );
+    notice.push_str(" Logical-generation totals come only from retained checkpoints; without one they remain unknown (the zero counter is not proof of no generations). Reconstructed request counters are observed lower bounds, not complete lifetime counts.");
     let mut in_flight = 0;
     for call in &timing.tool_calls {
         let handler_running =
@@ -160,6 +173,14 @@ fn append_retained_work(notice: &mut String, checkpoint: Option<&str>, plan: Opt
 /// remain, and an entry recorded again because it changed (for example, a
 /// request that has since completed) replaces its earlier version.
 fn merge_checkpoint_entries(timing: &mut TurnTiming, previous: TurnTiming) {
+    timing.counters.logical_generation_count = timing
+        .counters
+        .logical_generation_count
+        .max(previous.counters.logical_generation_count);
+    timing.counters.model_request_count = timing
+        .counters
+        .model_request_count
+        .max(previous.counters.model_request_count);
     timing.model_requests = merge_by_identity(
         previous.model_requests,
         std::mem::take(&mut timing.model_requests),
@@ -187,6 +208,21 @@ fn merge_checkpoint_entries(timing: &mut TurnTiming, previous: TurnTiming) {
             )
         },
     );
+    // Intervals are turn-relative and ordered by start. An update repeats the
+    // earlier checkpoint's last interval, which may have grown since; replace
+    // every retained interval from that start on. A full timeline written by an
+    // older checkpoint begins with the turn's first interval, so it replaces all.
+    if let Some(timeline) = timing.activity_timeline.as_mut()
+        && let Some(earlier) = previous.activity_timeline
+    {
+        let mut intervals = earlier.intervals;
+        if let Some(first) = timeline.intervals.first() {
+            intervals
+                .truncate(intervals.partition_point(|interval| interval.start_ns < first.start_ns));
+        }
+        intervals.append(&mut timeline.intervals);
+        timeline.intervals = intervals;
+    }
 }
 
 fn merge_by_identity<T, K: PartialEq>(
@@ -273,5 +309,70 @@ impl ContextualUserFragment for TurnAborted {
 
     fn body(&self) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Owned(format!("\n{}\n", self.guidance))
+    }
+}
+
+#[cfg(test)]
+mod audit110_tests {
+    use super::*;
+    use codex_protocol::protocol::SamplingBoundaryItem;
+    use codex_protocol::protocol::SamplingTimingCheckpoint;
+
+    #[test]
+    fn legacy_boundaries_do_not_invent_logical_generations() {
+        let boundaries = (0..2)
+            .map(|index| {
+                RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+                    sampling_request_id: format!("sampling-{index}"),
+                    physical_attempt_id: format!("attempt-{index}"),
+                    timing_checkpoint: None,
+                    workspace_freshness_notices: Vec::new(),
+                    turn_id: None,
+                    unresolved_context: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let (notice, recovered) = lost_turn_recovery(&boundaries);
+        assert_eq!(recovered.model_requests.len(), 2);
+        assert_eq!(recovered.counters.logical_generation_count, 0);
+        assert!(notice.contains("without one they remain unknown"));
+        assert!(!recovered.profile_valid);
+        assert!(!recovered.classification_complete);
+    }
+
+    #[test]
+    fn retry_rows_do_not_replace_cumulative_checkpoint_counters() {
+        let mut timing = TurnTiming::default();
+        timing.counters.logical_generation_count = 1;
+        timing.counters.model_request_count = 80;
+        timing.model_requests = (0..2)
+            .map(|index| TurnTimingModelRequest {
+                generation_index: 0,
+                sampling_request_id: Some(format!("sampling-{index}")),
+                physical_attempt_ids: vec![format!("attempt-{index}")],
+                dispatch_ms: Some(index),
+                ..Default::default()
+            })
+            .collect();
+        let boundary = RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+            sampling_request_id: "sampling-1".into(),
+            physical_attempt_id: "attempt-1".into(),
+            timing_checkpoint: Some(SamplingTimingCheckpoint {
+                timing,
+                observed_at_unix_ms: 100,
+                tail_unknown: true,
+                incremental: false,
+                runtime_identity: Default::default(),
+                harness_build: None,
+            }),
+            workspace_freshness_notices: Vec::new(),
+            turn_id: None,
+            unresolved_context: false,
+        });
+        let (_, recovered) = lost_turn_recovery(&[boundary]);
+        assert_eq!(recovered.counters.logical_generation_count, 1);
+        assert_eq!(recovered.counters.model_request_count, 80);
+        assert!(!recovered.profile_valid);
+        assert!(recovered.completed_at_unix_ms.is_none());
     }
 }

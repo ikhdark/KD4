@@ -160,12 +160,15 @@ pub(crate) async fn apply_bespoke_event_handling(
     } = event;
     match msg {
         EventMsg::TurnPhaseChanged(payload) => {
-            let is_current = thread_state.lock().await.active_turn_snapshot()
+            let is_current = thread_state
+                .lock()
+                .await
+                .active_turn_snapshot()
                 .is_some_and(|turn| turn.id == payload.turn_id);
             if is_current {
-                thread_watch_manager.note_harness_phases(
-                    &conversation_id.to_string(), payload.phases,
-                ).await;
+                thread_watch_manager
+                    .note_harness_phases(&conversation_id.to_string(), payload.phases)
+                    .await;
             }
         }
         EventMsg::TurnStarted(payload) => {
@@ -203,15 +206,16 @@ pub(crate) async fn apply_bespoke_event_handling(
         EventMsg::TurnComplete(turn_complete_event) => {
             let (is_current, turn_failed) = {
                 let state = thread_state.lock().await;
-                (state.is_current_summary_turn(&event_turn_id),
+                (
+                    state.is_current_summary_turn(&event_turn_id),
                     turn_complete_event.error.is_some()
-                        || state.turn_summary_for(&event_turn_id).is_some_and(|summary| summary.last_error.is_some()))
+                        || state
+                            .turn_summary_for(&event_turn_id)
+                            .is_some_and(|summary| summary.last_error.is_some()),
+                )
             };
             if is_current {
                 outgoing.abort_pending_server_requests().await;
-                thread_watch_manager
-                    .note_turn_completed(&conversation_id.to_string(), turn_failed)
-                    .await;
             }
             respond_to_pending_interrupts(&thread_state, &outgoing, &event_turn_id).await;
             handle_turn_complete(
@@ -222,6 +226,14 @@ pub(crate) async fn apply_bespoke_event_handling(
                 &thread_state,
             )
             .await;
+            // Zero running turns now implies terminal dispatch has registered
+            // its physical-write receipts. Host shutdown settles those before
+            // closing established transports.
+            if is_current {
+                thread_watch_manager
+                    .note_turn_completed(&conversation_id.to_string(), turn_failed)
+                    .await;
+            }
         }
         EventMsg::McpStartupUpdate(update) => {
             let (status, error, failure_reason) = match update.status {
@@ -743,7 +755,11 @@ pub(crate) async fn apply_bespoke_event_handling(
             if !ev.affects_turn_status() {
                 return;
             }
-            if thread_state.lock().await.is_current_summary_turn(&event_turn_id) {
+            if thread_state
+                .lock()
+                .await
+                .is_current_summary_turn(&event_turn_id)
+            {
                 thread_watch_manager
                     .note_system_error(&conversation_id.to_string())
                     .await;
@@ -791,13 +807,18 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .lock()
                     .await
                     .turn_summary_for_mut(&event.turn_id)
-                    .is_none_or(|summary| summary.command_execution_started.insert(item.id.clone())),
+                    .is_none_or(|summary| {
+                        summary.command_execution_started.insert(item.id.clone())
+                    }),
                 _ => true,
             };
             let dynamic_tool_call_params = match &event.item {
                 CoreTurnItem::DynamicToolCall(item)
                     if item.namespace.as_deref() == Some("codex.internal")
-                        && item.tool == "code_mode_cell" => None,
+                        && item.tool == "code_mode_cell" =>
+                {
+                    None
+                }
                 CoreTurnItem::DynamicToolCall(item) => Some(DynamicToolCallParams {
                     thread_id: conversation_id.to_string(),
                     turn_id: event.turn_id.clone(),
@@ -823,7 +844,8 @@ pub(crate) async fn apply_bespoke_event_handling(
                     .send_request(ServerRequestPayload::DynamicToolCall(params))
                     .await;
                 tokio::spawn(async move {
-                    crate::dynamic_tools::on_call_response(turn_id, call_id, rx, conversation).await;
+                    crate::dynamic_tools::on_call_response(turn_id, call_id, rx, conversation)
+                        .await;
                 });
             }
         }
@@ -895,7 +917,11 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         // If this is a TurnAborted, reply to any pending interrupt requests.
         EventMsg::TurnAborted(turn_aborted_event) => {
-            if thread_state.lock().await.is_current_summary_turn(&event_turn_id) {
+            if thread_state
+                .lock()
+                .await
+                .is_current_summary_turn(&event_turn_id)
+            {
                 outgoing.abort_pending_server_requests().await;
                 thread_watch_manager
                     .note_turn_aborted(&conversation_id.to_string(), &turn_aborted_event.reason)
@@ -1023,6 +1049,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
 
         EventMsg::AgentMessage(_)
+        | EventMsg::ImportedTurnClosed(_)
         | EventMsg::UserMessage(_)
         | EventMsg::AgentReasoning(_)
         | EventMsg::AgentReasoningRawContent(_)
@@ -1130,11 +1157,7 @@ async fn apply_canonical_item_completed_side_effects(
 ) {
     match item {
         CoreTurnItem::CommandExecution(item) => {
-            if let Some(summary) = thread_state
-                .lock()
-                .await
-                .turn_summary_for_mut(turn_id)
-            {
+            if let Some(summary) = thread_state.lock().await.turn_summary_for_mut(turn_id) {
                 summary.command_execution_started.remove(&item.id);
             }
         }
@@ -1193,6 +1216,7 @@ async fn start_command_execution_item(
             turn_id,
             started_at_ms: now_unix_timestamp_ms(),
             item: ThreadItem::CommandExecution {
+                environment: None,
                 output_metadata: None,
                 stdout: None,
                 stderr: None,
@@ -1243,6 +1267,7 @@ async fn complete_command_execution_item(
     }
 
     let item = ThreadItem::CommandExecution {
+        environment: None,
         output_metadata: None,
         stdout: None,
         stderr: None,
@@ -1342,9 +1367,11 @@ async fn handle_turn_interrupted(
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
     let turn_summary = find_and_remove_turn_summary(&event_turn_id, thread_state).await;
-    let internal_error = matches!(turn_aborted_event.reason,
+    let internal_error = matches!(
+        turn_aborted_event.reason,
         codex_protocol::protocol::TurnAbortReason::InternalError
-        | codex_protocol::protocol::TurnAbortReason::ProcessLost);
+            | codex_protocol::protocol::TurnAbortReason::ProcessLost
+    );
     let status = if internal_error {
         TurnStatus::Failed
     } else {
@@ -1405,7 +1432,8 @@ fn thread_rollback_response_from_stored_thread(
             "thread {thread_id} did not include persisted history after rollback"
         ));
     };
-    populate_thread_turns_from_history(&mut thread, &history.items, /*active_turn*/ None);
+    populate_thread_turns_from_history(&mut thread, &history.items, /*active_turn*/ None)
+        .map_err(|error| format!("rollback completed, but its history view is unavailable; do not repeat the rollback: {error}"))?;
     thread.status = loaded_status;
     Ok(ThreadRollbackResponse { thread })
 }
@@ -1457,11 +1485,7 @@ async fn handle_token_count_event(
     }
 }
 
-async fn handle_error(
-    turn_id: &str,
-    error: TurnError,
-    thread_state: &Arc<Mutex<ThreadState>>,
-) {
+async fn handle_error(turn_id: &str, error: TurnError, thread_state: &Arc<Mutex<ThreadState>>) {
     let mut state = thread_state.lock().await;
     if let Some(summary) = state.turn_summary_for_mut(turn_id) {
         summary.last_error = Some(error);
@@ -1524,7 +1548,9 @@ async fn on_request_user_input_response(
 
 fn interrupted_request_user_input_response() -> CoreRequestUserInputResponse {
     CoreRequestUserInputResponse {
-        disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::TransportError),
+        disposition: Some(
+            codex_protocol::request_user_input::RequestUserInputDisposition::TransportError,
+        ),
         answers: HashMap::new(),
         interrupted: true,
     }
@@ -1569,6 +1595,60 @@ fn request_user_input_response_from_client_result(
             Some(interrupted_request_user_input_response())
         }
     }
+}
+
+/// Service initialization forms through the same typed client request/response
+/// mapping before a thread/listener exists. Dropping the operation retires its
+/// outgoing callback; no provisional thread is exposed to turn/start.
+pub(crate) async fn with_startup_mcp_elicitation<F: std::future::Future>(
+    outgoing: Arc<crate::outgoing_message::OutgoingMessageSender>,
+    connection_id: crate::outgoing_message::ConnectionId,
+    future: F,
+) -> F::Output {
+    codex_mcp::StartupElicitationHandler::new(move |thread_id, request| {
+        let outgoing = Arc::clone(&outgoing);
+        async move {
+            let cancel = || codex_rmcp_client::ElicitationResponse {
+                action: codex_rmcp_client::ElicitationAction::Cancel,
+                content: None,
+                meta: None,
+            };
+            let Ok(request_body) = request.request.try_into() else {
+                return cancel();
+            };
+            let result = outgoing
+                .send_request_to_connections_and_wait(
+                    Some(&[connection_id]),
+                    ServerRequestPayload::McpServerElicitationRequest(
+                        McpServerElicitationRequestParams {
+                            thread_id: thread_id.to_string(),
+                            turn_id: None,
+                            server_name: request.server_name,
+                            request: request_body,
+                        },
+                    ),
+                    Some(thread_id),
+                )
+                .await;
+            let response = mcp_server_elicitation_response_from_client_result(result);
+            let action = match response.action {
+                McpServerElicitationAction::Accept => codex_rmcp_client::ElicitationAction::Accept,
+                McpServerElicitationAction::Decline => {
+                    codex_rmcp_client::ElicitationAction::Decline
+                }
+                McpServerElicitationAction::Cancel => codex_rmcp_client::ElicitationAction::Cancel,
+            };
+            let content = matches!(action, codex_rmcp_client::ElicitationAction::Accept)
+                .then(|| response.content.unwrap_or_else(|| serde_json::json!({})));
+            codex_rmcp_client::ElicitationResponse {
+                action,
+                content,
+                meta: response.meta,
+            }
+        }
+    })
+    .scope(future)
+    .await
 }
 
 async fn on_mcp_server_elicitation_response(
@@ -2058,7 +2138,9 @@ mod tests {
         assert_eq!(
             response,
             Some(CoreRequestUserInputResponse {
-                disposition: Some(codex_protocol::request_user_input::RequestUserInputDisposition::TransportError),
+                disposition: Some(
+                    codex_protocol::request_user_input::RequestUserInputDisposition::TransportError
+                ),
                 answers: HashMap::new(),
                 interrupted: true,
             })
@@ -2067,13 +2149,24 @@ mod tests {
 
     #[test]
     fn request_user_input_disposition_is_preserved_across_transport() {
-        for disposition in ["answered", "timed_out", "skipped", "interrupted", "transport_error"] {
+        for disposition in [
+            "answered",
+            "timed_out",
+            "skipped",
+            "interrupted",
+            "transport_error",
+        ] {
             let response = request_user_input_response_from_client_result(Ok(Ok(json!({
                 "answers": {}, "interrupted": false, "disposition": disposition,
-            })))).unwrap();
-            assert_eq!(serde_json::to_value(response).unwrap()["disposition"], disposition);
+            }))))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(response).unwrap()["disposition"],
+                disposition
+            );
         }
-        let legacy = request_user_input_response_from_client_result(Ok(Ok(json!({"answers": {}})))).unwrap();
+        let legacy =
+            request_user_input_response_from_client_result(Ok(Ok(json!({"answers": {}})))).unwrap();
         assert_eq!(legacy.disposition, None);
     }
 
@@ -2090,9 +2183,9 @@ mod tests {
             receiver.await,
             Ok(Ok(json!({ "answers": "not-an-answer-map" }))),
         ] {
-            assert_interrupted_user_input_response(
-                request_user_input_response_from_client_result(response),
-            );
+            assert_interrupted_user_input_response(request_user_input_response_from_client_result(
+                response,
+            ));
         }
         assert_eq!(
             request_user_input_response_from_client_result(Ok(Err(JSONRPCErrorError {
@@ -2125,6 +2218,7 @@ mod tests {
         let stored_thread = StoredThread {
             project_id: None,
             thread_id,
+            session_id: None,
             extra_config: None,
             rollout_path: None,
             forked_from_id: None,
@@ -2248,6 +2342,7 @@ mod tests {
                 assert_eq!(
                     payload.item,
                     ThreadItem::CommandExecution {
+                        environment: None,
                         output_metadata: None,
                         stdout: None,
                         stderr: None,
@@ -3453,6 +3548,7 @@ mod tests {
                 output_tokens: 50,
                 reasoning_output_tokens: 9,
                 total_tokens: 200,
+                coverage: None,
             },
             last_token_usage: TokenUsage {
                 input_tokens: 10,
@@ -3460,6 +3556,7 @@ mod tests {
                 output_tokens: 7,
                 reasoning_output_tokens: 1,
                 total_tokens: 23,
+                coverage: None,
             },
             model_context_window: Some(4096),
         };
@@ -3707,7 +3804,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_completion_consumes_errors_without_leaking_across_threads_or_turns() -> Result<()> {
+    async fn turn_completion_consumes_errors_without_leaking_across_threads_or_turns() -> Result<()>
+    {
         // Conversation A will have two turns; Conversation B will have one turn.
         let conversation_a = ThreadId::new();
         let conversation_b = ThreadId::new();

@@ -69,9 +69,17 @@ fn read_from_unix_stdin(buffer: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-fn read_auth_header_with<F>(mut read_fn: F) -> Result<&'static str>
+fn read_auth_header_with<F>(read_fn: F) -> Result<&'static str>
 where
     F: FnMut(&mut [u8]) -> std::io::Result<usize>,
+{
+    read_auth_header_with_lock(read_fn, mlock_str)
+}
+
+fn read_auth_header_with_lock<F, L>(mut read_fn: F, lock_fn: L) -> Result<&'static str>
+where
+    F: FnMut(&mut [u8]) -> std::io::Result<usize>,
+    L: FnOnce(&str) -> Result<()>,
 {
     // TAKE CARE WHEN MODIFYING THIS CODE!!!
     //
@@ -152,56 +160,65 @@ where
         }
     };
 
-    let header_value = String::from(header_str);
+    let mut header_value = String::from(header_str);
     buf.zeroize();
 
-    let leaked: &'static mut str = header_value.leak();
-    mlock_str(leaked);
+    // Keep ownership until locking succeeds, so denied protection does not
+    // leak an unlocked key or permit the listener to start.
+    if let Err(err) = lock_fn(&header_value) {
+        header_value.zeroize();
+        return Err(err).context("locking Authorization header memory");
+    }
 
-    Ok(leaked)
+    // String::leak does not reallocate the protected bytes.
+    Ok(header_value.leak())
 }
 
 #[cfg(unix)]
-fn mlock_str(value: &str) {
+fn mlock_str(value: &str) -> Result<()> {
     use libc::_SC_PAGESIZE;
     use libc::c_void;
     use libc::mlock;
     use libc::sysconf;
 
     if value.is_empty() {
-        return;
+        return Ok(());
     }
 
     let page_size = unsafe { sysconf(_SC_PAGESIZE) };
     if page_size <= 0 {
-        return;
+        let error = std::io::Error::last_os_error();
+        return Err(anyhow!(
+            "sysconf(_SC_PAGESIZE) returned {page_size}: {error}"
+        ));
     }
     let page_size = page_size as usize;
-    if page_size == 0 {
-        return;
+    if !page_size.is_power_of_two() {
+        return Err(anyhow!(
+            "sysconf(_SC_PAGESIZE) returned a non-power-of-two size"
+        ));
     }
 
     let addr = value.as_ptr() as usize;
     let len = value.len();
     let start = addr & !(page_size - 1);
-    let addr_end = match addr.checked_add(len) {
-        Some(v) => match v.checked_add(page_size - 1) {
-            Some(total) => total,
-            None => return,
-        },
-        None => return,
-    };
+    let addr_end = addr
+        .checked_add(len)
+        .and_then(|end| end.checked_add(page_size - 1))
+        .ok_or_else(|| anyhow!("Authorization header memory range overflow"))?;
     let end = addr_end & !(page_size - 1);
-    let size = end.saturating_sub(start);
-    if size == 0 {
-        return;
-    }
+    let size = end - start;
 
-    let _ = unsafe { mlock(start as *const c_void, size) };
+    if unsafe { mlock(start as *const c_void, size) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("mlock");
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn mlock_str(_value: &str) {}
+fn mlock_str(_value: &str) -> Result<()> {
+    Ok(())
+}
 
 /// The key should match /^[A-Za-z0-9\-_]+$/. Ensure there is no funny business
 /// with NUL characters and whatnot.
@@ -223,6 +240,32 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::io;
+
+    #[test]
+    fn lock_failure_is_fatal_and_does_not_disclose_the_key() {
+        let key = b"sk-synthetic-lock-failure\n";
+        let mut sent = false;
+        let err = read_auth_header_with_lock(
+            |buf| {
+                if sent {
+                    return Ok(0);
+                }
+                buf[..key.len()].copy_from_slice(key);
+                sent = true;
+                Ok(key.len())
+            },
+            |_| Err(io::Error::from(io::ErrorKind::PermissionDenied)).context("mlock"),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("locking Authorization header memory"));
+        assert!(message.contains("mlock"));
+        assert!(!message.contains("sk-synthetic-lock-failure"));
+        assert_eq!(
+            err.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn reads_key_with_short_reads() {

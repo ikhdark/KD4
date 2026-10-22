@@ -68,13 +68,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_git_for_stdout_exact(dir, args, env).map(|value| value.trim().to_string())
+}
+
+/// Source bytes and NUL-delimited path inventories must not be whitespace-trimmed.
+pub(crate) fn run_git_for_stdout_exact<I, S>(
+    dir: &Path,
+    args: I,
+    env: Option<&[(OsString, OsString)]>,
+) -> Result<String, GitToolingError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let run = run_git_for_stdout_from(crate::git_executable(), dir, args, env)?;
-    String::from_utf8(run.output.stdout)
-        .map(|value| value.trim().to_string())
-        .map_err(|source| GitToolingError::GitOutputUtf8 {
-            command: run.command,
-            source,
-        })
+    String::from_utf8(run.output.stdout).map_err(|source| GitToolingError::GitOutputUtf8 {
+        command: run.command,
+        source,
+    })
 }
 
 fn run_git_for_stdout_from<I, S>(

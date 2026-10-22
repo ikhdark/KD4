@@ -67,21 +67,24 @@ unsafe fn set_default_dacl(h_token: HANDLE, logon_sid: *mut c_void) -> Result<()
     // OWNER RIGHTS suppresses the owner's implicit WRITE_DAC. Sandbox launches
     // can share an account owner without sharing their creating logon.
     let owner_rights = LocalSid::from_string("S-1-3-4")?;
-    let entries: Vec<EXPLICIT_ACCESS_W> = [(logon_sid, GENERIC_ALL), (owner_rights.as_ptr(), 0x0002_0000)]
-        .iter()
-        .map(|(sid, permissions)| EXPLICIT_ACCESS_W {
-            grfAccessPermissions: *permissions,
-            grfAccessMode: GRANT_ACCESS,
-            grfInheritance: 0,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation: 0,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN,
-                ptstrName: *sid as *mut u16,
-            },
-        })
-        .collect();
+    let entries: Vec<EXPLICIT_ACCESS_W> = [
+        (logon_sid, GENERIC_ALL),
+        (owner_rights.as_ptr(), 0x0002_0000),
+    ]
+    .iter()
+    .map(|(sid, permissions)| EXPLICIT_ACCESS_W {
+        grfAccessPermissions: *permissions,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: *sid as *mut u16,
+        },
+    })
+    .collect();
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
     let res = SetEntriesInAclW(
         entries.len() as u32,
@@ -583,11 +586,18 @@ pub(crate) fn probe_legacy_delete_child_restriction() -> Result<bool> {
 #[cfg(test)]
 mod default_dacl_tests {
     use super::*;
-    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, EqualSid, GetAce, TOKEN_DEFAULT_DACL};
+    use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
+    use windows_sys::Win32::Security::EqualSid;
+    use windows_sys::Win32::Security::GetAce;
+    use windows_sys::Win32::Security::TOKEN_DEFAULT_DACL;
 
     struct Token(HANDLE);
     impl Drop for Token {
-        fn drop(&mut self) { unsafe { CloseHandle(self.0); } }
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
     }
 
     #[test]
@@ -597,15 +607,32 @@ mod default_dacl_tests {
             let home = tempfile::tempdir().unwrap();
             let caps = crate::cap::load_or_create_cap_sids(home.path()).unwrap();
             let capability = LocalSid::from_string(&caps.workspace).unwrap();
-            let restricted = Token(create_token_with_caps_from(base.0, &[capability.as_ptr()], &[]).unwrap());
+            let restricted =
+                Token(create_token_with_caps_from(base.0, &[capability.as_ptr()], &[]).unwrap());
             let mut logon = get_logon_sid_bytes(base.0).unwrap();
             let owner = LocalSid::from_string("S-1-3-4").unwrap();
             let everyone = LocalSid::from_string("S-1-1-0").unwrap();
             let mut needed = 0;
-            GetTokenInformation(restricted.0, TokenDefaultDacl, std::ptr::null_mut(), 0, &mut needed);
+            GetTokenInformation(
+                restricted.0,
+                TokenDefaultDacl,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
             let mut buffer = vec![0u8; needed as usize];
-            assert_ne!(GetTokenInformation(restricted.0, TokenDefaultDacl, buffer.as_mut_ptr().cast(), needed, &mut needed), 0);
-            let dacl = std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl;
+            assert_ne!(
+                GetTokenInformation(
+                    restricted.0,
+                    TokenDefaultDacl,
+                    buffer.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed
+                ),
+                0
+            );
+            let dacl =
+                std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl;
             assert!(!dacl.is_null());
             assert_eq!((*dacl).AceCount, 2);
             let mut found_logon = false;
@@ -623,7 +650,9 @@ mod default_dacl_tests {
                 } else if EqualSid(sid, owner.as_ptr()) != 0 {
                     found_owner = true;
                     assert_eq!(ace.Mask, 0x0002_0000); // READ_CONTROL, not WRITE_DAC
-                } else { panic!("unexpected trustee in token default DACL"); }
+                } else {
+                    panic!("unexpected trustee in token default DACL");
+                }
             }
             assert!(found_logon && found_owner);
         }

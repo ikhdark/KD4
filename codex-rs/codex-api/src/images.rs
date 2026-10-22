@@ -62,9 +62,76 @@ pub struct ImageResponse {
     pub quality: Option<ImageQuality>,
     #[serde(default)]
     pub size: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_image_usage")]
+    pub usage: Option<codex_protocol::items::ImageGenerationUsage>,
+}
+
+fn deserialize_image_usage<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<codex_protocol::items::ImageGenerationUsage>, D::Error> {
+    use codex_protocol::items::ImageGenerationUsage;
+    use codex_protocol::items::ImageTokenDetails;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if !value.is_object() {
+        return Ok(None);
+    }
+    let count = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+    let details = |key: &str| {
+        value
+            .get(key)
+            .filter(|v| v.is_object())
+            .map(|v| ImageTokenDetails {
+                image_tokens: v.get("image_tokens").and_then(serde_json::Value::as_u64),
+                text_tokens: v.get("text_tokens").and_then(serde_json::Value::as_u64),
+            })
+    };
+    Ok(Some(ImageGenerationUsage {
+        model: None,
+        reported: true,
+        input_tokens: count("input_tokens"),
+        output_tokens: count("output_tokens"),
+        total_tokens: count("total_tokens"),
+        input_tokens_details: details("input_tokens_details"),
+        output_tokens_details: details("output_tokens_details"),
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ImageData {
     pub b64_json: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_usage_preserves_valid_fields_without_inventing_missing_components() {
+        for details in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"image_tokens": "invalid", "text_tokens": 0}),
+        ] {
+            let response: ImageResponse = serde_json::from_value(serde_json::json!({
+                "created": 1, "data": [{"b64_json": "unchanged"}],
+                "usage": {"input_tokens":1474,"output_tokens":1372,"total_tokens":2846,
+                    "input_tokens_details": details}
+            }))
+            .unwrap();
+            let usage = response.usage.unwrap();
+            assert_eq!(usage.input_tokens, Some(1474));
+            assert_eq!(usage.output_tokens, Some(1372));
+            assert_eq!(usage.total_tokens, Some(2846));
+            assert_eq!(usage.output_tokens_details, None);
+            assert_eq!(response.data[0].b64_json, "unchanged");
+        }
+        let response: ImageResponse = serde_json::from_value(serde_json::json!({
+            "created": 1, "data": [], "usage":{"input_tokens": -1,"output_tokens":0}
+        }))
+        .unwrap();
+        let usage = response.usage.unwrap();
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, Some(0));
+        assert_eq!(usage.total_tokens, None);
+    }
 }

@@ -53,7 +53,6 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
-use codex_rollout_trace::InferenceTraceContext;
 use codex_tools::CanonicalToolResult;
 use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::approx_token_count;
@@ -168,6 +167,26 @@ fn incremental_summarization_prompt(compact_prompt: Option<&str>) -> Option<&'st
     compact_prompt
         .is_none()
         .then_some(INCREMENTAL_SUMMARIZATION_PROMPT)
+}
+
+fn select_compaction_input(
+    input: &mut [UserInput],
+    previous: Option<&str>,
+    compact_prompt: Option<&str>,
+    rebase_sections: &[usize],
+) {
+    if let Some(previous) = previous
+        && let Some(prompt) = incremental_summarization_prompt(compact_prompt)
+        && let [UserInput::Text { text, .. }] = input
+        && text == SUMMARIZATION_PROMPT
+    {
+        // Select one default contract without changing caller-authored input.
+        *text = format!(
+            "{prompt}{}{}",
+            compaction_rebase_prompt(rebase_sections),
+            compaction_update_budget_prompt(previous, rebase_sections)
+        );
+    }
 }
 
 fn compaction_rebase_sections(previous: &str) -> Vec<usize> {
@@ -480,6 +499,9 @@ async fn run_compact_task_inner(
         return Err(error);
     }
     let mut analytics_details = CompactionAnalyticsDetails::default();
+    let mut compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    sess.emit_turn_item_started(&turn_context, &compaction_item)
+        .await;
     // Keep the large compaction state machine off every enclosing turn and
     // thread-spawn future's stack, including forked child startup.
     let result = Box::pin(run_compact_task_inner_impl(
@@ -491,10 +513,21 @@ async fn run_compact_task_inner(
         initial_context_injection,
         compaction_metadata,
         &mut analytics_details,
+        &mut compaction_item,
         emit_error_event,
         cancellation_token,
     ))
     .await;
+    // The inner operation can fail before or after sampling/persistence. Close
+    // the item at its owner boundary, including interruption and every `?` exit.
+    sess.emit_turn_item_completed(&turn_context, compaction_item)
+        .await;
+    if result.is_ok() {
+        let warning = EventMsg::Warning(WarningEvent {
+            message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
+        });
+        sess.send_event(&turn_context, warning).await;
+    }
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
     if let Ok(summary) = &result
@@ -521,12 +554,10 @@ async fn run_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    compaction_item: &mut TurnItem,
     emit_error_event: bool,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<String> {
-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
-    sess.emit_turn_item_started(&turn_context, &compaction_item)
-        .await;
     // Read before history is replaced so the completed item can report the
     // before/after pair rather than only the post-compaction size.
     let tokens_before = sess.get_total_token_usage().await;
@@ -539,6 +570,7 @@ async fn run_compact_task_inner_impl(
         omitted_user_text,
         omitted_text,
     ) = build_bounded_input_history(&task_items, false);
+    let omission_receipt_ids = new_omission_receipt_ids(&retained_history, history.raw_items());
     analytics_details.retained_image_count = Some(retained_image_count);
     let summary_items = compaction_summary_items(history.raw_items());
     // A structurally valid summary cannot certify conservation of arbitrary
@@ -602,23 +634,12 @@ async fn run_compact_task_inner_impl(
                     Vec::new()
                 };
                 history.replace(summary_items);
-                if previous_summary.is_some()
-                    && let Some(prompt) = incremental_summarization_prompt(
-                        turn_context.config.compact_prompt.as_deref(),
-                    )
-                {
-                    input.push(UserInput::Text {
-                        text: format!(
-                            "{prompt}{}{}",
-                            compaction_rebase_prompt(&rebase_sections),
-                            compaction_update_budget_prompt(
-                                previous_summary.as_deref().unwrap_or_default(),
-                                &rebase_sections
-                            )
-                        ),
-                        text_elements: Vec::new(),
-                    });
-                }
+                select_compaction_input(
+                    &mut input,
+                    previous_summary.as_deref(),
+                    turn_context.config.compact_prompt.as_deref(),
+                    &rebase_sections,
+                );
                 let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
                 history.record_items(
                     &[initial_input_for_turn.into()],
@@ -637,7 +658,17 @@ async fn run_compact_task_inner_impl(
                     &sess.services.git_workspace,
                 );
                 // Filter only trusted source messages, before sampling projection drops IDs.
-                let turn_input = filter_compaction_startup_envelopes(turn_input.iter().cloned());
+                // Selected System skills are retained exactly in the checkpoint,
+                // not activated as instructions to the local summarizer.
+                let turn_input = filter_compaction_startup_envelopes(
+                    turn_input
+                        .iter()
+                        .filter(|item| {
+                            !matches!(item, ResponseItem::Message { role, .. } if role == "system")
+                                || !crate::stable_context::is_trusted_selected_skill_item(item)
+                        })
+                        .cloned(),
+                );
                 let turn_input =
                     project_stable_context(turn_input.into(), StableContextTarget::Sampling).items;
                 let base_instructions = BaseInstructions {
@@ -685,7 +716,7 @@ async fn run_compact_task_inner_impl(
 
                     match attempt_result {
                         Ok(output) => {
-                            sess.update_token_usage_info(
+                            sess.record_compaction_token_usage(
                                 turn_context.as_ref(),
                                 output.token_usage.as_ref(),
                             )
@@ -740,7 +771,12 @@ async fn run_compact_task_inner_impl(
                                     let mut corrected_input = prompt.input.to_vec();
                                     corrected_input.push(correction);
                                     prompt.input = corrected_input.into();
-                                    turn_context.turn_timing_state.record_model_retry();
+                                    // A completed answer followed by a corrected prompt is a
+                                    // new semantic generation, not transport recovery. Keep
+                                    // retry_state intact: its budget spans this whole operation.
+                                    turn_context
+                                        .turn_timing_state
+                                        .begin_compaction_repair_generation();
                                 }
                                 Err(error) => break Err(error),
                             }
@@ -807,7 +843,7 @@ async fn run_compact_task_inner_impl(
     let mut summary_item =
         compaction_summary_item_with_artifact_pins(summary_for_history, artifact_pin_payload);
     if let Some(text) = &text_recovery_sidecar {
-        bind_omission_receipts_to_recovery(&mut retained_history, text);
+        bind_omission_receipts_to_recovery(&mut retained_history, text, &omission_receipt_ids);
     }
     if let Some(text) = text_recovery_sidecar
         && let ResponseItem::Message { content, .. } = &mut summary_item
@@ -874,25 +910,15 @@ async fn run_compact_task_inner_impl(
     // Report what the replacement actually dropped. These values are already
     // computed above for analytics; carrying them on the completed item is what
     // lets a client say more than "context compacted".
-    let compaction_item = match compaction_item {
-        TurnItem::ContextCompaction(item) => TurnItem::ContextCompaction(ContextCompactionItem {
-            tokens_before: analytics_details
-                .active_context_tokens_before
-                .or(Some(tokens_before)),
-            tokens_after: Some(sess.get_total_token_usage().await),
-            omitted_image_count: Some(omitted_image_count),
-            retained_image_count: Some(retained_image_count),
-            omitted_text: Some(omitted_text),
-            ..item
-        }),
-        other => other,
-    };
-    sess.emit_turn_item_completed(&turn_context, compaction_item)
-        .await;
-    let warning = EventMsg::Warning(WarningEvent {
-        message: "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.".to_string(),
-    });
-    sess.send_event(&turn_context, warning).await;
+    if let TurnItem::ContextCompaction(item) = compaction_item {
+        item.tokens_before = analytics_details
+            .active_context_tokens_before
+            .or(Some(tokens_before));
+        item.tokens_after = Some(sess.get_total_token_usage().await);
+        item.omitted_image_count = Some(omitted_image_count);
+        item.retained_image_count = Some(retained_image_count);
+        item.omitted_text = Some(omitted_text);
+    }
     Ok(summary_text)
 }
 
@@ -1190,19 +1216,19 @@ fn bounded_checkpoint_excerpt(text: &str, max_tokens: usize) -> String {
 }
 
 fn truncate_compaction_summary(summary: &str, max_tokens: usize) -> String {
+    if approx_token_count(summary) <= max_tokens {
+        return summary.to_string();
+    }
+    // Origin is harness-owned, not introductory prose competing with sections.
+    // Keep the current ID-plus-prefix recognition contract on every later pass.
+    if let Some(body) = summary.strip_prefix(SUMMARY_PREFIX) {
+        let body = truncate_compaction_summary(
+            body.trim_start(),
+            max_tokens.saturating_sub(approx_token_count(SUMMARY_PREFIX) + 1),
+        );
+        return format!("{SUMMARY_PREFIX}\n{body}");
+    }
     if !has_compaction_section(summary) {
-        if approx_token_count(summary) <= max_tokens {
-            return summary.to_string();
-        }
-        if let Some(body) = summary.strip_prefix(SUMMARY_PREFIX) {
-            return format!(
-                "{SUMMARY_PREFIX}\n{}",
-                bounded_checkpoint_excerpt(
-                    body.trim_start(),
-                    max_tokens.saturating_sub(approx_token_count(SUMMARY_PREFIX) + 1),
-                )
-            );
-        }
         return bounded_checkpoint_excerpt(summary, max_tokens);
     }
 
@@ -1388,8 +1414,19 @@ fn retain_newest_section_updates(updates: &[(String, usize)], max_tokens: usize)
     // Paragraphs keep multiline obligations and their qualifications together.
     // Never sample characters from a negation or fabricate a complete sentence.
     for (update, _) in updates.iter().rev() {
-        for unit in update
-            .rsplit("\n\n")
+        // A labelled/quoted evidence update is indivisible. Paragraph sampling
+        // can otherwise retain its directive after discarding the opening fence
+        // or source label (and turn a closing fence into a new opening fence).
+        let structured = checkpoint_lines_with_structure(update).any(|(line, _, outer)| {
+            !outer || line.trim_start().starts_with('>') || line.trim_start().starts_with("Source:")
+        });
+        let units = if structured {
+            vec![update.as_str()]
+        } else {
+            update.rsplit("\n\n").collect()
+        };
+        for unit in units
+            .into_iter()
             .map(str::trim)
             .filter(|unit| !unit.is_empty())
         {
@@ -1410,6 +1447,7 @@ fn retain_latest_goal(updates: &[(String, usize)], max_tokens: usize) -> String 
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
+    _timing_guard: crate::turn_timing::TurnTimingGuard,
     thread_id: String,
     turn_id: String,
     trigger: CompactionTrigger,
@@ -1438,8 +1476,12 @@ impl CompactionAnalyticsAttempt {
         implementation: CompactionImplementation,
         phase: CompactionPhase,
     ) -> Self {
+        let timing_guard = turn_context
+            .turn_timing_state
+            .begin_local_phase(crate::turn_timing::TurnLocalPhase::Compaction);
         let active_context_tokens_before = sess.get_total_token_usage().await;
         Self {
+            _timing_guard: timing_guard,
             thread_id: sess.thread_id.to_string(),
             turn_id: turn_context.sub_id.clone(),
             trigger,
@@ -1577,7 +1619,22 @@ fn collect_user_messages_with_indices(
                 if retained.is_empty() && !content.is_empty() {
                     return None;
                 }
-                let content = crate::event_mapping::parse_user_message_content(&retained).content;
+                // Compaction is not a UI projection: path/number wrappers are
+                // part of the image's model-visible source identity.
+                let content = retained
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentItem::InputText { text } => Some(UserInput::Text {
+                            text: text.clone(),
+                            text_elements: Vec::new(),
+                        }),
+                        ContentItem::InputImage { image_url, detail } => Some(UserInput::Image {
+                            image_url: image_url.clone(),
+                            detail: *detail,
+                        }),
+                        ContentItem::OutputText { .. } => None,
+                    })
+                    .collect();
                 Some((
                     index,
                     CompactedUserMessage {
@@ -1618,7 +1675,28 @@ fn is_compaction_text_bookkeeping_item(item: &ResponseItem) -> bool {
 
 /// Bind this compaction's omission receipts to the artifact that holds their
 /// exact text. Receipts carried from earlier compactions already name their own.
-pub(crate) fn bind_omission_receipts_to_recovery(history: &mut [ResponseItem], sidecar: &str) {
+pub(crate) fn new_omission_receipt_ids(
+    retained: &[ResponseItem],
+    source: &[ResponseItem],
+) -> std::collections::HashSet<codex_protocol::ResponseItemId> {
+    let previous = source
+        .iter()
+        .filter_map(ResponseItem::id)
+        .collect::<std::collections::HashSet<_>>();
+    retained
+        .iter()
+        .filter_map(|item| {
+            let id = item.id()?;
+            (is_trusted_stable_context_item(item) && !previous.contains(id)).then(|| id.clone())
+        })
+        .collect()
+}
+
+pub(crate) fn bind_omission_receipts_to_recovery(
+    history: &mut [ResponseItem],
+    sidecar: &str,
+    created_receipt_ids: &std::collections::HashSet<codex_protocol::ResponseItemId>,
+) {
     let Some(artifact_id) = serde_json::from_str::<serde_json::Value>(sidecar)
         .ok()
         .and_then(|value| value["artifact_id"].as_str().map(str::to_owned))
@@ -1627,7 +1705,9 @@ pub(crate) fn bind_omission_receipts_to_recovery(history: &mut [ResponseItem], s
     };
     let bound = format!("\"artifact_id\":{}", serde_json::Value::String(artifact_id));
     for item in history.iter_mut() {
-        if !is_trusted_stable_context_item(item) {
+        if !is_trusted_stable_context_item(item)
+            || !item.id().is_some_and(|id| created_receipt_ids.contains(id))
+        {
             continue;
         }
         let ResponseItem::Message { content, .. } = item else {
@@ -1863,8 +1943,15 @@ pub(crate) fn task_compaction_items(items: &[ResponseItem]) -> Vec<ResponseItem>
             .enumerate()
             .filter(|(index, item)| {
                 *index >= unresolved_start
+                    // Native messages keep their role and provenance and still
+                    // pass through the bounded agent allocator and exact omission
+                    // accounting. Consumed does not mean an instruction expired.
+                    // Admit all native directions conservatively: this selector
+                    // has no authenticated session ancestry context.
+                    || matches!(item, ResponseItem::AgentMessage { .. })
                     || crate::session::is_unified_exec_resume_invalidation(item)
                     || codex_rollout::is_rollout_reconstruction_notice(item)
+                    || crate::stable_context::is_unsettled_tool_recovery_notice(item)
                     || Some(*index) == latest_assistant
                     || Some(*index) == latest_summary
                     || is_selected_skill_item(item)
@@ -1991,9 +2078,12 @@ fn build_bounded_input_history(
         .collect::<std::collections::BTreeMap<_, _>>();
     // Old selectors remain exact in the mandatory recovery archive. Budget their
     // model-visible envelope together with new receipts, never outside the cap.
-    let mut omission_receipts = unresolved.iter().enumerate()
+    let mut omission_receipts = unresolved
+        .iter()
+        .enumerate()
         .filter(|(_, item)| is_compaction_text_bookkeeping_item(item))
-        .map(|(index, item)| (index, item.clone())).collect::<Vec<_>>();
+        .map(|(index, item)| (index, item.clone()))
+        .collect::<Vec<_>>();
     let inherited_receipt_count = omission_receipts.len();
     // Preserve the runtime boundary in source order. Moving it after post-resume
     // command receipts could incorrectly invalidate a newly returned handle.
@@ -2004,6 +2094,7 @@ fn build_bounded_input_history(
             .filter(|(_, item)| {
                 crate::session::is_unified_exec_resume_invalidation(item)
                     || codex_rollout::is_rollout_reconstruction_notice(item)
+                    || crate::stable_context::is_unsettled_tool_recovery_notice(item)
                     || is_selected_skill_item(item)
             })
             .map(|(index, item)| (index, item.clone())),
@@ -2693,7 +2784,19 @@ fn append_bounded_user_messages(
         let mut remaining = budgets[index];
         let mut short_remaining = costs[index].1;
         let mut content = Vec::new();
-        for item in &message.content {
+        for (part_index, item) in message.content.iter().enumerate() {
+            if compacted_image_notice_index(&message.content, part_index).is_some() {
+                continue;
+            }
+            // Keep recognized wrappers atomic with their image. Literal,
+            // unbound image-like user text still follows normal text policy.
+            if (part_index + 1 < message.content.len()
+                && compacted_image_binding(&message.content, part_index + 1).is_some())
+                || (part_index > 0
+                    && compacted_image_binding(&message.content, part_index - 1).is_some())
+            {
+                continue;
+            }
             match item {
                 UserInput::Text { text, .. } if remaining > 0 && !text.is_empty() => {
                     let tokens = approx_token_count(text);
@@ -2724,12 +2827,57 @@ fn append_bounded_user_messages(
                     }
                 }
                 UserInput::Image { image_url, detail } => {
-                    let next_bytes = retained_image_bytes.saturating_add(image_url.len());
-                    if retained_image_count < max_images && next_bytes <= max_image_bytes {
+                    let binding = compacted_image_binding(&message.content, part_index);
+                    let notice_index = part_index + if binding.is_some() { 2 } else { 1 };
+                    let notice = message
+                        .content
+                        .get(notice_index)
+                        .and_then(|item| match item {
+                            UserInput::Text { text, .. }
+                                if crate::image_preparation::is_image_preparation_notice(text) =>
+                            {
+                                Some(text)
+                            }
+                            _ => None,
+                        });
+                    let binding_tokens = binding
+                        .map_or(0, |(open, close)| {
+                            approx_token_count(open).saturating_add(approx_token_count(close))
+                        })
+                        .saturating_add(notice.map_or(0, |text| approx_token_count(text)));
+                    let binding_bytes = binding
+                        .map_or(0, |(open, close)| open.len().saturating_add(close.len()))
+                        .saturating_add(notice.map_or(0, String::len));
+                    let next_bytes = retained_image_bytes
+                        .saturating_add(image_url.len())
+                        .saturating_add(binding_bytes);
+                    if retained_image_count < max_images
+                        && next_bytes <= max_image_bytes
+                        && binding_tokens <= remaining
+                    {
+                        if let Some((open, _)) = binding {
+                            content.push(UserInput::Text {
+                                text: open.to_string(),
+                                text_elements: Vec::new(),
+                            });
+                        }
                         content.push(UserInput::Image {
                             image_url: image_url.clone(),
                             detail: *detail,
                         });
+                        if let Some((_, close)) = binding {
+                            content.push(UserInput::Text {
+                                text: close.to_string(),
+                                text_elements: Vec::new(),
+                            });
+                        }
+                        if let Some(text) = notice {
+                            content.push(UserInput::Text {
+                                text: text.clone(),
+                                text_elements: Vec::new(),
+                            });
+                        }
+                        remaining -= binding_tokens;
                         retained_image_count = retained_image_count.saturating_add(1);
                         retained_image_bytes = next_bytes;
                     } else {
@@ -2793,6 +2941,37 @@ fn append_bounded_user_messages(
     )
 }
 
+fn compacted_image_binding(content: &[UserInput], index: usize) -> Option<(&str, &str)> {
+    use codex_protocol::models::is_image_close_tag_text;
+    use codex_protocol::models::is_image_open_tag_text;
+    use codex_protocol::models::is_local_image_open_tag_text;
+    if !matches!(content.get(index), Some(UserInput::Image { .. })) {
+        return None;
+    }
+    let UserInput::Text { text: open, .. } = content.get(index.checked_sub(1)?)? else {
+        return None;
+    };
+    let UserInput::Text { text: close, .. } = content.get(index + 1)? else {
+        return None;
+    };
+    ((is_local_image_open_tag_text(open) || is_image_open_tag_text(open))
+        && is_image_close_tag_text(close))
+    .then_some((open.as_str(), close.as_str()))
+}
+
+fn compacted_image_notice_index(content: &[UserInput], index: usize) -> Option<usize> {
+    let UserInput::Text { text, .. } = content.get(index)? else {
+        return None;
+    };
+    if !crate::image_preparation::is_image_preparation_notice(text) {
+        return None;
+    }
+    if index > 0 && matches!(content[index - 1], UserInput::Image { .. }) {
+        return Some(index - 1);
+    }
+    (index > 1 && compacted_image_binding(content, index - 2).is_some()).then(|| index - 2)
+}
+
 #[derive(Default)]
 struct LocalCompactionAccumulator {
     items: Vec<ResponseItem>,
@@ -2824,8 +3003,20 @@ async fn drain_to_completed(
     prompt: &Prompt,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<LocalCompactionOutput> {
+    client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
+    client_session.set_startup_timing(Arc::clone(&sess.startup_timing));
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
-    let inference_trace_context = InferenceTraceContext::disabled();
+    // Local compaction is one classified inference attempt, not a second
+    // compaction trace receipt. Transport retries retain their own identities.
+    let inference_trace_context = sess
+        .services
+        .rollout_thread_trace
+        .inference_trace_context(
+            turn_context.sub_id.as_str(),
+            turn_context.model_info.slug.as_str(),
+            turn_context.provider.info().name.as_str(),
+        )
+        .with_request_metadata(|| serde_json::json!({"request_kind": "local_compaction"}));
     let stream_result = tokio::select! {
         _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
         result = async {
@@ -2838,8 +3029,6 @@ async fn drain_to_completed(
             turn_context.reasoning_summary,
             service_tier,
             responses_metadata,
-            // Rollout tracing currently models remote compaction only; local compaction streams
-            // are left untraced until the reducer has a first-class local compaction lifecycle.
             &inference_trace_context,
             ).await
         } => result,
@@ -2865,10 +3054,12 @@ async fn drain_to_completed(
             Ok(event) => event,
             Err(error) => {
                 if let Some(token_usage) = error.terminal_usage() {
-                    turn_context.turn_timing_state
+                    turn_context
+                        .turn_timing_state
                         .record_generation_token_usage(token_usage.as_ref());
                     if let Some(usage) = token_usage.as_ref() {
-                        sess.update_token_usage_info(turn_context, Some(usage)).await?;
+                        sess.record_compaction_token_usage(turn_context, Some(usage))
+                            .await?;
                     }
                 }
                 return Err(error.into_response_error());
@@ -2891,9 +3082,6 @@ async fn drain_to_completed(
             ResponseEvent::OutputItemDone(item) => {
                 accumulator.record_output(item);
             }
-            ResponseEvent::ServerReasoningIncluded(included) => {
-                sess.set_server_reasoning_included(included).await;
-            }
             ResponseEvent::RateLimits(snapshot) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
@@ -2908,3 +3096,7 @@ async fn drain_to_completed(
 #[cfg(test)]
 #[path = "compact_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "compact_generation_tests.rs"]
+mod generation_tests;

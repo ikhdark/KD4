@@ -106,6 +106,16 @@ async fn remove_agents_md_world_state_section(rollout_path: &Path) -> Result<()>
     Ok(())
 }
 
+/// Multi-request fixtures need final answers: an empty response triggers the
+/// single missing-answer repair request, which would consume the next response.
+fn answered_sse(id: &str) -> String {
+    responses::sse(vec![
+        responses::ev_response_created(id),
+        responses::ev_assistant_message(&format!("{id}-answer"), "done"),
+        responses::ev_completed(id),
+    ])
+}
+
 fn instruction_fragments(request: &responses::ResponsesRequest) -> Vec<String> {
     request
         .message_input_texts("user")
@@ -596,16 +606,7 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     let server = responses::start_mock_server().await;
     let response_mock = responses::mount_sse_sequence(
         &server,
-        vec![
-            responses::sse(vec![
-                responses::ev_response_created("response-1"),
-                responses::ev_completed("response-1"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("response-2"),
-                responses::ev_completed("response-2"),
-            ]),
-        ],
+        vec![answered_sse("response-1"), answered_sse("response-2")],
     )
     .await;
     let home = Arc::new(TempDir::new()?);
@@ -750,18 +751,9 @@ async fn cold_resume_invalidates_deleted_legacy_agents_md_once() -> Result<()> {
     let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
-            responses::sse(vec![
-                responses::ev_response_created("initial-response"),
-                responses::ev_completed("initial-response"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("resumed-response"),
-                responses::ev_completed("resumed-response"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("second-resumed-response"),
-                responses::ev_completed("second-resumed-response"),
-            ]),
+            answered_sse("initial-response"),
+            answered_sse("resumed-response"),
+            answered_sse("second-resumed-response"),
         ],
     )
     .await;
@@ -845,18 +837,9 @@ async fn fork_injects_changed_agents_md_once() -> Result<()> {
     let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
-            responses::sse(vec![
-                responses::ev_response_created("parent-response"),
-                responses::ev_completed("parent-response"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("fork-response"),
-                responses::ev_completed("fork-response"),
-            ]),
-            responses::sse(vec![
-                responses::ev_response_created("second-fork-response"),
-                responses::ev_completed("second-fork-response"),
-            ]),
+            answered_sse("parent-response"),
+            answered_sse("fork-response"),
+            answered_sse("second-fork-response"),
         ],
     )
     .await;
@@ -1094,12 +1077,16 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
             let child_model = child_thread.config_snapshot().await.model;
             let mut child_terminal_events = Vec::new();
             for _ in 0..64 {
-                let Some(Ok(event)) = futures::FutureExt::now_or_never(child_thread.next_event()) else {
+                let Some(Ok(event)) = futures::FutureExt::now_or_never(child_thread.next_event())
+                else {
                     break;
                 };
                 match event.msg {
-                    EventMsg::Error(error) => child_terminal_events.push(format!("error: {error:?}")),
-                    EventMsg::TurnComplete(completed) => child_terminal_events.push(format!("completed: error={:?}", completed.error)),
+                    EventMsg::Error(error) => {
+                        child_terminal_events.push(format!("error: {error:?}"))
+                    }
+                    EventMsg::TurnComplete(completed) => child_terminal_events
+                        .push(format!("completed: error={:?}", completed.error)),
                     _ => {}
                 }
             }

@@ -13,9 +13,15 @@ async fn concurrent_recovery_does_not_quarantine_the_replacement() -> anyhow::Re
         super::super::StateRuntime::recover_for_fresh_start(path.clone(), "openai".into()),
     );
     let all = first?.into_iter().chain(second?).collect::<Vec<_>>();
-    let database_backups = all.iter().filter(|backup| backup.original_path == path).collect::<Vec<_>>();
+    let database_backups = all
+        .iter()
+        .filter(|backup| backup.original_path == path)
+        .collect::<Vec<_>>();
     assert_eq!(database_backups.len(), 1);
-    assert_eq!(std::fs::read(&database_backups[0].backup_path)?, b"damaged original");
+    assert_eq!(
+        std::fs::read(&database_backups[0].backup_path)?,
+        b"damaged original"
+    );
     let runtime = super::super::StateRuntime::init(home, "openai".into()).await?;
     runtime.close().await;
     Ok(())

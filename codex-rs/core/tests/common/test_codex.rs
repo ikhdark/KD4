@@ -395,8 +395,7 @@ impl TestCodexBuilder {
             && matches!(
                 config.permissions.windows_sandbox_mode,
                 Some(codex_config::types::WindowsSandboxModeToml::Elevated)
-            )
-        {
+            ) {
             // The elevated wrapper resolves command-runner beside its executable.
             // Cargo test binaries live in deps/, unlike the configured helper
             // bundle. Keep test-binary reexecution for every other fixture.
@@ -408,8 +407,7 @@ impl TestCodexBuilder {
         } else {
             std::env::current_exe()?
         };
-        let local_runtime_paths =
-            codex_exec_server::ExecServerRuntimePaths::new(local_helper)?;
+        let local_runtime_paths = codex_exec_server::ExecServerRuntimePaths::new(local_helper)?;
         let environment_manager = Arc::new(
             codex_exec_server::EnvironmentManager::create_for_tests(
                 self.exec_server_url.clone(),
@@ -1177,27 +1175,33 @@ mod tests {
 
     #[test]
     fn custom_tool_call_output_text_returns_output_text() {
-        let mut bodies = vec![json!({
-            "input": [{
-                "type": "function_call_output",
-                "call_id": "call-1",
-                "output": "wrong type"
-            }, {
-                "type": "custom_tool_call_output",
-                "call_id": "other-call",
-                "output": "wrong call"
-            }]
-        }), json!({
-            "input": [{
-                "type": "custom_tool_call_output",
-                "call_id": "call-1",
-                "output": "hello"
-            }]
-        })];
+        let mut bodies = vec![
+            json!({
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "wrong type"
+                }, {
+                    "type": "custom_tool_call_output",
+                    "call_id": "other-call",
+                    "output": "wrong call"
+                }]
+            }),
+            json!({
+                "input": [{
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1",
+                    "output": "hello"
+                }]
+            }),
+        ];
 
         assert_eq!(custom_tool_call_output_text(&bodies, "call-1"), "hello");
         bodies[1]["input"][0]["output"] = json!([{"type": "input_text", "text": "typed hello"}]);
-        assert_eq!(custom_tool_call_output_text(&bodies, "call-1"), "typed hello");
+        assert_eq!(
+            custom_tool_call_output_text(&bodies, "call-1"),
+            "typed hello"
+        );
     }
 
     #[test]

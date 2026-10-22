@@ -51,6 +51,18 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
         clear_instruction_messages(&mut model);
     } else if !config.personality_enabled {
         clear_instruction_messages(&mut model);
+    } else if let Some(template) = model
+        .model_messages
+        .as_ref()
+        .and_then(|messages| messages.instructions_template.as_ref())
+    {
+        // Personality is emitted separately; retain the template's neutral policy
+        // in the shared base projection used by startup and turn construction.
+        let neutral = template.replace(PERSONALITY_PLACEHOLDER, "");
+        // Mirrored templates must not perturb established prompt/cache bytes.
+        if neutral.trim() != model.base_instructions.trim() {
+            model.base_instructions = neutral;
+        }
     }
 
     model
@@ -60,7 +72,7 @@ pub(crate) fn clear_instruction_messages(model: &mut ModelInfo) {
     if let Some(model_messages) = &mut model.model_messages {
         model_messages.instructions_template = None;
         model_messages.instructions_variables = None;
-        if model_messages.approvals.is_none() && model_messages.token_budget.is_none() {
+        if model_messages.approvals.is_none() {
             model.model_messages = None;
         }
     }
@@ -125,8 +137,9 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
-        supports_experimental_context: false,
-        context_window: Some(272_000),
+        // Prompt/tool defaults are useful without inventing a model capacity.
+        // Explicit configuration is applied by `with_config_overrides`.
+        context_window: None,
         max_context_window: None,
         auto_compact_token_limit: None,
         comp_hash: None,
@@ -147,7 +160,6 @@ fn local_personality_messages_for_slug(
 ) -> Option<ModelMessages> {
     match slug {
         "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
-            token_budget: None,
             instructions_template: Some(format!(
                 "{PERSONALITY_PLACEHOLDER}\n\n{base_instructions}"
             )),
@@ -172,10 +184,6 @@ pub(crate) fn apply_local_personality_messages(model: &mut ModelInfo, requested_
         .model_messages
         .as_ref()
         .and_then(|messages| messages.approvals.clone());
-    local_messages.token_budget = model
-        .model_messages
-        .as_ref()
-        .and_then(|messages| messages.token_budget.clone());
     model.model_messages = Some(local_messages);
 }
 

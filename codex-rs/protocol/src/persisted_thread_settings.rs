@@ -186,6 +186,7 @@ impl PersistedThreadSettingsReducer {
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::AdditionalContextState { .. }
             | RolloutItem::EventMsg(_) => {}
         }
     }

@@ -590,22 +590,38 @@ mod tests {
             ),
             (
                 "powershell_remove_item_path_recurse_force_is_dangerous",
-                vec_str(&["powershell", "-Command", "Remove-Item -Path 'test' -Recurse -Force"]),
+                vec_str(&[
+                    "powershell",
+                    "-Command",
+                    "Remove-Item -Path 'test' -Recurse -Force",
+                ]),
                 true,
             ),
             (
                 "powershell_remove_item_force_with_semicolon_is_dangerous",
-                vec_str(&["powershell", "-Command", "Remove-Item test -Force; Write-Host done"]),
+                vec_str(&[
+                    "powershell",
+                    "-Command",
+                    "Remove-Item test -Force; Write-Host done",
+                ]),
                 true,
             ),
             (
                 "powershell_remove_item_force_inside_block_is_dangerous",
-                vec_str(&["powershell", "-Command", "if ($true) { Remove-Item test -Force}"]),
+                vec_str(&[
+                    "powershell",
+                    "-Command",
+                    "if ($true) { Remove-Item test -Force}",
+                ]),
                 true,
             ),
             (
                 "powershell_remove_item_force_inside_brackets_is_dangerous",
-                vec_str(&["powershell", "-Command", "[void]( Remove-Item test -Force)]"]),
+                vec_str(&[
+                    "powershell",
+                    "-Command",
+                    "[void]( Remove-Item test -Force)]",
+                ]),
                 true,
             ),
             (
@@ -625,7 +641,11 @@ mod tests {
             ),
             (
                 "powershell_chained_no_space_is_dangerous",
-                vec_str(&["powershell", "-Command", "Write-Host hi;Remove-Item -Force C:\\tmp"]),
+                vec_str(&[
+                    "powershell",
+                    "-Command",
+                    "Write-Host hi;Remove-Item -Force C:\\tmp",
+                ]),
                 true,
             ),
             (

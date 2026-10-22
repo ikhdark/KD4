@@ -191,9 +191,21 @@ pub(crate) fn merge_contextual_fragments(
     fragments: Vec<Box<dyn ContextualUserFragment>>,
 ) -> Vec<ResponseItem> {
     let mut messages: Vec<(&str, Vec<String>)> = Vec::with_capacity(fragments.len());
+    let mut items = Vec::new();
     for fragment in fragments {
         let role = fragment.role();
-        let text = fragment.render();
+        let item = fragment.into_boxed_response_item();
+        let ResponseItem::Message { content, .. } = item else {
+            continue;
+        };
+        let text = content
+            .into_iter()
+            .filter_map(|part| match part {
+                ContentItem::InputText { text } => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
         match messages.last_mut() {
             Some((previous_role, text_sections)) if *previous_role == role => {
                 text_sections.push(text);
@@ -201,10 +213,12 @@ pub(crate) fn merge_contextual_fragments(
             _ => messages.push((role, vec![text])),
         }
     }
-    messages
-        .into_iter()
-        .filter_map(|(role, text_sections)| build_text_message(role, text_sections))
-        .collect()
+    items.extend(
+        messages
+            .into_iter()
+            .filter_map(|(role, text_sections)| build_text_message(role, text_sections)),
+    );
+    items
 }
 
 fn build_text_message(role: &str, text_sections: Vec<String>) -> Option<ResponseItem> {

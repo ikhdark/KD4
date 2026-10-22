@@ -74,7 +74,8 @@ where
         return Ok(());
     }
 
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<peer::OutgoingFrame>(OUTGOING_FRAME_CAPACITY);
+    let (outgoing_tx, mut outgoing_rx) =
+        mpsc::channel::<peer::OutgoingFrame>(OUTGOING_FRAME_CAPACITY);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
     let state = Arc::new(HostState {
         catalogs: Mutex::new(HashMap::new()),
@@ -231,7 +232,8 @@ where
     let receipt_capability = codex_code_mode_protocol::host::Capability::new(
         codex_code_mode_protocol::host::RECEIPT_RECOVERY_CAPABILITY,
     )?;
-    let supported_capabilities = CapabilitySet::try_new([catalog_capability, state_capability, receipt_capability])?;
+    let supported_capabilities =
+        CapabilitySet::try_new([catalog_capability, state_capability, receipt_capability])?;
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
@@ -248,10 +250,15 @@ where
         return Ok(false);
     }
 
-    let host_capabilities = CapabilitySet::try_new(supported_capabilities.iter()
-        .filter(|capability| client_hello.required_capabilities().contains(capability)
-            || client_hello.optional_capabilities().contains(capability))
-        .cloned())?;
+    let host_capabilities = CapabilitySet::try_new(
+        supported_capabilities
+            .iter()
+            .filter(|capability| {
+                client_hello.required_capabilities().contains(capability)
+                    || client_hello.optional_capabilities().contains(capability)
+            })
+            .cloned(),
+    )?;
     writer
         .write(&HostToClient::HostHello(HostHello::new(
             ProtocolVersion::V1,
@@ -288,7 +295,10 @@ impl HostState {
             .unwrap_or_else(PoisonError::into_inner)
             .start(request_id, RequestKind::from(&request))?;
         let mut resolved_tools = None;
-        if let HostRequest::Execute { session_id, request } = &mut request
+        if let HostRequest::Execute {
+            session_id,
+            request,
+        } = &mut request
             && let Some(catalog) = request.catalog.take()
         {
             // Resolve before spawning: even concurrent cells see catalog
@@ -297,20 +307,32 @@ impl HostState {
                 let mut catalogs = self.catalogs.lock().unwrap_or_else(PoisonError::into_inner);
                 self.session(session_id)?;
                 if catalog.register {
-                    if catalogs.get(session_id).is_some_and(|(revision, _)| catalog.revision <= *revision) {
+                    if catalogs
+                        .get(session_id)
+                        .is_some_and(|(revision, _)| catalog.revision <= *revision)
+                    {
                         return Err("stale tool catalog registration; no cell started".to_string());
                     }
-                    let tools: Arc<[codex_code_mode_protocol::ToolDefinition]> = std::mem::take(&mut request.enabled_tools)
-                        .into_iter().map(Into::into).collect();
+                    let tools: Arc<[codex_code_mode_protocol::ToolDefinition]> =
+                        std::mem::take(&mut request.enabled_tools)
+                            .into_iter()
+                            .map(Into::into)
+                            .collect();
                     resolved_tools = Some(Arc::clone(&tools));
                     catalogs.insert(session_id.clone(), (catalog.revision, tools));
                 } else {
                     if !request.enabled_tools.is_empty() {
-                        return Err("catalog references cannot carry tool definitions; no cell started".to_string());
+                        return Err(
+                            "catalog references cannot carry tool definitions; no cell started"
+                                .to_string(),
+                        );
                     }
-                    let (_, tools) = catalogs.get(session_id)
+                    let (_, tools) = catalogs
+                        .get(session_id)
                         .filter(|(revision, _)| *revision == catalog.revision)
-                        .ok_or_else(|| "unknown or revoked tool catalog revision; no cell started".to_string())?;
+                        .ok_or_else(|| {
+                            "unknown or revoked tool catalog revision; no cell started".to_string()
+                        })?;
                     resolved_tools = Some(Arc::clone(tools));
                 }
                 Ok(())
@@ -357,7 +379,8 @@ impl HostState {
         request: HostRequest,
         cancellation: CancellationToken,
     ) {
-        self.handle_request_with_catalog(request_id, request, cancellation, None).await;
+        self.handle_request_with_catalog(request_id, request, cancellation, None)
+            .await;
     }
 
     async fn handle_request_with_catalog(
@@ -389,7 +412,8 @@ impl HostState {
                     self.respond(request_id, Err("code-mode request cancelled".to_string()));
                     return;
                 }
-                let mut request: codex_code_mode_protocol::ExecuteRequest = match request.try_into() {
+                let mut request: codex_code_mode_protocol::ExecuteRequest = match request.try_into()
+                {
                     Ok(request) => request,
                     Err(err) => {
                         self.respond(
@@ -399,7 +423,9 @@ impl HostState {
                         return;
                     }
                 };
-                if let Some(tools) = resolved_tools { request.enabled_tools = tools; }
+                if let Some(tools) = resolved_tools {
+                    request.enabled_tools = tools;
+                }
                 let session = match self.session(&session_id) {
                     Ok(session) => session,
                     Err(err) => {
@@ -486,15 +512,27 @@ impl HostState {
                     .sessions
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
+                    .get(&session_id)
+                    .cloned();
+                self.catalogs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .remove(&session_id);
-                self.catalogs.lock().unwrap_or_else(PoisonError::into_inner).remove(&session_id);
                 let result = match session {
                     Some(session) => match session.shutdown().await {
                         Ok(()) => {
                             self.peer.wait_for_session_cells(&session_id).await;
+                            self.sessions
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .remove(&session_id);
                             Ok(HostResponse::SessionClosed { session_id })
                         }
-                        Err(err) => Err(err),
+                        Err(err) => {
+                            tracing::warn!(%err, %session_id, "session close observation expired; retaining storage custody");
+                            Err(codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING
+                                .to_string())
+                        }
                     },
                     None => Err(format!("unknown code-mode session {session_id}")),
                 };

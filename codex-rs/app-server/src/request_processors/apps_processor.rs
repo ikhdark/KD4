@@ -727,8 +727,13 @@ mod tests {
 
         let mut forced_request = None;
         send_app_list_updated_notification(
-            &outgoing, &shared, &mut forced_request, Vec::new(), false,
-        ).await;
+            &outgoing,
+            &shared,
+            &mut forced_request,
+            Vec::new(),
+            false,
+        )
+        .await;
         assert!(matches!(
             receiver.try_recv().expect("force refresh bypasses cross-request deduplication"),
             crate::outgoing_message::OutgoingEnvelope::Broadcast {
@@ -738,12 +743,20 @@ mod tests {
             } if data.is_empty()
         ));
         send_app_list_updated_notification(
-            &outgoing, &shared, &mut forced_request, Vec::new(), false,
-        ).await;
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ), "force refresh still deduplicates within its own request");
+            &outgoing,
+            &shared,
+            &mut forced_request,
+            Vec::new(),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "force refresh still deduplicates within its own request"
+        );
     }
 
     // The loaders are borrowed here; the request loop that owns them is not driven.
@@ -763,9 +776,13 @@ mod tests {
             started + APP_LIST_LOAD_TIMEOUT,
         )
         .await;
-        assert_eq!(result.err(), Some(internal_error(format!(
-            "timed out waiting for app lists after {} seconds", APP_LIST_LOAD_TIMEOUT.as_secs()
-        ))));
+        assert_eq!(
+            result.err(),
+            Some(internal_error(format!(
+                "timed out waiting for app lists after {} seconds",
+                APP_LIST_LOAD_TIMEOUT.as_secs()
+            )))
+        );
         assert_eq!(started.elapsed(), APP_LIST_LOAD_TIMEOUT);
     }
 }

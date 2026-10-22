@@ -8,24 +8,99 @@ use std::path::PathBuf;
 
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
 use codex_rollout::SESSIONS_SUBDIR;
-use codex_rollout::find_archived_thread_path_by_id_str;
-use codex_rollout::find_thread_path_by_id_str;
 use codex_rollout::remove_thread_name_entries;
 
 use super::LocalThreadStore;
 use super::helpers::matching_rollout_file_name;
-use super::helpers::rollout_lookup_error;
 use super::helpers::scoped_rollout_path;
 use crate::DeleteThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
-const RECOVERABLE_DELETE_PREFIX: &str = "thread-delete-v2-";
+use codex_rollout::RECOVERABLE_DELETE_PREFIX;
 const MAX_RECOVERY_BATCHES: usize = 128;
 const MAX_RECOVERY_ENTRIES: usize = 4096;
 
+fn auxiliary_paths(id: codex_protocol::ThreadId) -> [PathBuf; 4] {
+    [
+        PathBuf::from("tool-history").join(format!("{id}.json")),
+        PathBuf::from("tool-history").join(format!("{id}.journal.jsonl")),
+        PathBuf::from("command-execution-cache").join(format!("{id}.json")),
+        PathBuf::from("code-mode-state").join(format!("{id}.json")),
+    ]
+}
+
+fn auxiliary_owners(
+    home: &Path,
+    id: codex_protocol::ThreadId,
+) -> std::io::Result<Vec<std::fs::File>> {
+    // All acquisitions are nonblocking. Stable lock files are never staged or
+    // unlinked: sessions, detached cache commits and snapshot runtimes share them.
+    let mut owners = Vec::new();
+    for relative in [
+        PathBuf::from("tool-output-residency").join(format!("{id}.lock")),
+        PathBuf::from("tool-history").join(format!(".{id}.owner.lock")),
+        PathBuf::from("code-mode-state").join(format!("{id}.lock")),
+    ] {
+        let path = home.join(relative);
+        std::fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("owner has no parent"))?,
+        )?;
+        let owner = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        owner.try_lock().map_err(std::io::Error::from)?;
+        owners.push(owner);
+    }
+    Ok(owners)
+}
+
+fn mark_storage_retired(home: &Path, id: codex_protocol::ThreadId) -> std::io::Result<()> {
+    let directory = home.join("tool-history");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{id}.retired"));
+    match std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            std::io::Write::write_all(&mut file, b"KD4_THREAD_STORAGE_RETIRED_V1\n")?;
+            file.sync_all()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn retire_auxiliary_storage(home: &Path, id: codex_protocol::ThreadId) -> std::io::Result<()> {
+    let _owners = auxiliary_owners(home, id)?;
+    let home = std::fs::canonicalize(home)?;
+    for relative in auxiliary_paths(id) {
+        let path = home.join(relative);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() || std::fs::canonicalize(&path)? != path {
+            return Err(std::io::Error::other("indirect auxiliary storage retained"));
+        }
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+const AUXILIARY_RETIREMENT_PENDING: &str = ".auxiliary-retirement.pending";
+
 fn delete_recovery_error(error: impl std::fmt::Display) -> ThreadStoreError {
-    ThreadStoreError::Internal { message: format!("staged thread deletion: {error}") }
+    ThreadStoreError::Internal {
+        message: format!("staged thread deletion: {error}"),
+    }
 }
 
 /// Recover the existing staging layout, not a second journal. A live staging
@@ -34,7 +109,11 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
     // Recovery can be requested while a live staged-delete guard owns this lock.
     // Defer rather than waiting on that same caller; the initialization cell must retry.
     let Some(moves) = codex_rollout::try_lock_rollout_moves(&store.config.codex_home)
-        .await.map_err(delete_recovery_error)? else { return Ok(false); };
+        .await
+        .map_err(delete_recovery_error)?
+    else {
+        return Ok(false);
+    };
     let moves = std::sync::Arc::new(moves);
     let home = store.config.codex_home.clone();
     let batches = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
@@ -46,10 +125,20 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
         let mut batches = Vec::new();
         for entry in entries {
             let entry = entry?;
-            if !entry.file_name().to_string_lossy().starts_with(RECOVERABLE_DELETE_PREFIX)
-                || !entry.file_type()?.is_dir() { continue; }
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(RECOVERABLE_DELETE_PREFIX)
+                || !entry.file_type()?.is_dir()
+            {
+                continue;
+            }
             let directory = entry.path();
-            let owner = match std::fs::File::options().read(true).write(true).open(directory.join(".owner")) {
+            let owner = match std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(directory.join(".owner"))
+            {
                 Ok(owner) => owner,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => return Err(err),
@@ -57,7 +146,9 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
             match owner.try_lock() {
                 Ok(()) => {
                     if batches.len() == MAX_RECOVERY_BATCHES {
-                        return Err(std::io::Error::other("staged deletion recovery batch limit exceeded; files retained"));
+                        return Err(std::io::Error::other(
+                            "staged deletion recovery batch limit exceeded; files retained",
+                        ));
                     }
                     batches.push((directory, owner));
                 }
@@ -66,11 +157,16 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
             }
         }
         Ok(batches)
-    }).await.map_err(delete_recovery_error)?.map_err(delete_recovery_error)?;
+    })
+    .await
+    .map_err(delete_recovery_error)?
+    .map_err(delete_recovery_error)?;
     for (directory, owner) in batches {
         // Capture DB decisions before filesystem mutation. Cancellation here
         // simply releases the batch for the next initialization attempt.
-        let mut entries = tokio::fs::read_dir(&directory).await.map_err(delete_recovery_error)?;
+        let mut entries = tokio::fs::read_dir(&directory)
+            .await
+            .map_err(delete_recovery_error)?;
         while let Some(entry) = entries.next_entry().await.map_err(delete_recovery_error)? {
             let kind = entry.file_type().await.map_err(delete_recovery_error)?;
             let name = entry.file_name();
@@ -80,7 +176,9 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                 (name == "indexed" || name == "unindexed" || name == "committed") && kind.is_dir()
             };
             if !known {
-                return Err(delete_recovery_error("unknown staged deletion layout; files retained"));
+                return Err(delete_recovery_error(
+                    "unknown staged deletion layout; files retained",
+                ));
             }
         }
         let mut decisions = Vec::new();
@@ -94,20 +192,37 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
             let mut entries = entries;
             while let Some(entry) = entries.next_entry().await.map_err(delete_recovery_error)? {
                 if decisions.len() == MAX_RECOVERY_ENTRIES {
-                    return Err(delete_recovery_error("staged deletion recovery entry limit exceeded; files retained"));
+                    return Err(delete_recovery_error(
+                        "staged deletion recovery entry limit exceeded; files retained",
+                    ));
                 }
-                if !entry.file_type().await.map_err(delete_recovery_error)?.is_dir() {
+                if !entry
+                    .file_type()
+                    .await
+                    .map_err(delete_recovery_error)?
+                    .is_dir()
+                {
                     return Err(delete_recovery_error("invalid staged thread directory"));
                 }
-                let id = codex_protocol::ThreadId::from_string(&entry.file_name().to_string_lossy())
-                    .map_err(delete_recovery_error)?;
+                let id =
+                    codex_protocol::ThreadId::from_string(&entry.file_name().to_string_lossy())
+                        .map_err(delete_recovery_error)?;
                 let restore = match kind {
                     "indexed" => {
                         let db = store.state_db.as_ref().ok_or_else(|| delete_recovery_error(
                             "indexed deletion recovery requires its state database; staged files retained"))?;
-                        db.get_thread(id).await.map_err(delete_recovery_error)?.is_some()
+                        db.get_thread(id)
+                            .await
+                            .map_err(delete_recovery_error)?
+                            .is_some()
                     }
-                    "unindexed" => true,
+                    "unindexed" => !store
+                        .config
+                        .codex_home
+                        .join("tool-history")
+                        .join(format!("{id}.retired"))
+                        .try_exists()
+                        .map_err(delete_recovery_error)?,
                     _ => false,
                 };
                 decisions.push((entry.path(), id, restore));
@@ -118,7 +233,9 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
         ids.sort_by_key(ToString::to_string);
         ids.dedup();
         let mut leases = Vec::new();
-        for id in ids { leases.push(store.acquire_writer_lease(id, false).await?); }
+        for id in ids {
+            leases.push(store.acquire_writer_lease(id, false).await?);
+        }
         let moves = std::sync::Arc::clone(&moves);
         tokio::task::spawn_blocking(move || -> ThreadStoreResult<()> {
             let _leases = leases;
@@ -127,6 +244,7 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
             let home = std::fs::canonicalize(home).map_err(delete_recovery_error)?;
             let mut visited = 0usize;
             for (root, id, restore) in decisions {
+                if !restore { mark_storage_retired(&home, id).map_err(delete_recovery_error)?; }
                 let mut directories = vec![root.clone()];
                 let mut empty_directories = Vec::new();
                 while let Some(parent) = directories.pop() {
@@ -142,6 +260,11 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                         if !kind.is_file() { return Err(delete_recovery_error("non-regular staged rollout")); }
                         let path = entry.path();
                         let relative = path.strip_prefix(&root).map_err(delete_recovery_error)?;
+                        if relative == Path::new(AUXILIARY_RETIREMENT_PENDING) {
+                            if !restore { retire_auxiliary_storage(&home, id).map_err(delete_recovery_error)?; }
+                            std::fs::remove_file(&path).map_err(delete_recovery_error)?;
+                            continue;
+                        }
                         let first = relative.components().next().ok_or_else(|| delete_recovery_error("empty staged identity"))?;
                         if first.as_os_str() != SESSIONS_SUBDIR && first.as_os_str() != ARCHIVED_SESSIONS_SUBDIR {
                             return Err(delete_recovery_error("staged rollout is outside session storage"));
@@ -154,7 +277,9 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                             entry.insert(lock);
                         }
                         if restore {
-                            if original.try_exists().map_err(delete_recovery_error)? {
+                            if original.try_exists().map_err(delete_recovery_error)?
+                                && !codex_rollout::rollout_files_same_identity(&path, &original).map_err(delete_recovery_error)?
+                            {
                                 return Err(delete_recovery_error(format!("restore conflict at {}; both files retained", original.display())));
                             }
                             let parent = original.parent().ok_or_else(|| {
@@ -164,8 +289,7 @@ pub(super) async fn recover_staged_deletes(store: &LocalThreadStore) -> ThreadSt
                             if !std::fs::canonicalize(parent).map_err(delete_recovery_error)?.starts_with(&home) {
                                 return Err(delete_recovery_error("restore parent escapes codex home"));
                             }
-                            std::fs::hard_link(&path, original).map_err(delete_recovery_error)?;
-                            std::fs::remove_file(path).map_err(delete_recovery_error)?;
+                            restore_staged_rollout(&path, &original).map_err(delete_recovery_error)?;
                         } else {
                             std::fs::remove_file(path).map_err(delete_recovery_error)?;
                         }
@@ -234,6 +358,7 @@ struct StagedRolloutFiles {
     _writer_leases: Vec<std::sync::Arc<std::fs::File>>,
     recorder_pauses: Vec<codex_rollout::RolloutMaintenanceGuard>,
     _rollout_locks: Vec<std::fs::File>,
+    retirement_pending: bool,
     _moves: Option<std::fs::File>,
 }
 
@@ -254,6 +379,44 @@ impl StagedThreadDelete<'_> {
             }
         }
         self.files.committed = true;
+        // Keep the queue if cancellation drops this observer. The worker owns
+        // each nonblocking auxiliary lease through slow storage and unlink;
+        // it never blocks a Tokio worker waiting for filesystem completion.
+        self.files.retirement_pending = true;
+        let home = self.store.config.codex_home.clone();
+        let ids = self.thread_ids.clone();
+        let staging = self
+            .files
+            .staging_dir
+            .as_ref()
+            .map(|directory| directory.path().to_path_buf());
+        match tokio::task::spawn_blocking(move || {
+            let mut incomplete = false;
+            for id in ids {
+                let result = mark_storage_retired(&home, id)
+                    .and_then(|()| retire_auxiliary_storage(&home, id)).and_then(|()| {
+                    if let Some(directory) = &staging {
+                        for kind in ["indexed", "unindexed", "committed"] {
+                            let pending = directory.join(kind).join(id.to_string()).join(AUXILIARY_RETIREMENT_PENDING);
+                            match std::fs::remove_file(pending) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    incomplete = true;
+                    tracing::warn!(%error, thread_id = %id, "committed auxiliary retirement deferred until writers close");
+                }
+            }
+            incomplete
+        }).await {
+            Ok(incomplete) => self.files.retirement_pending = incomplete,
+            Err(error) => tracing::warn!(%error, "auxiliary retirement worker incomplete; recovery queue retained"),
+        }
         for thread_id in &self.thread_ids {
             if let Err(err) =
                 remove_thread_name_entries(self.store.config.codex_home.as_path(), *thread_id).await
@@ -293,12 +456,7 @@ impl StagedRolloutFiles {
             if matches!(staged.staged_path.try_exists(), Ok(false)) {
                 continue;
             }
-            let restore = if staged.original_path.try_exists().unwrap_or(true) {
-                Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "restore destination already exists"))
-            } else {
-                std::fs::hard_link(&staged.staged_path, &staged.original_path)
-                    .and_then(|()| std::fs::remove_file(&staged.staged_path))
-            };
+            let restore = restore_staged_rollout(&staged.staged_path, &staged.original_path);
             if let Err(err) = restore {
                 retain_staging = true;
                 tracing::error!(
@@ -319,9 +477,38 @@ impl StagedRolloutFiles {
     }
 }
 
+fn restore_staged_rollout(stage: &Path, original: &Path) -> std::io::Result<()> {
+    // Validate even the absent-destination branch. Hard-linking a substituted
+    // symlink must not install it as a restored ordinary rollout.
+    if !codex_rollout::rollout_files_same_identity(stage, stage)? {
+        return Err(std::io::Error::other(
+            "staged rollout identity changed; evidence retained",
+        ));
+    }
+    match std::fs::hard_link(stage, original) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    if !codex_rollout::rollout_files_same_identity(stage, original)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "rollout restore conflict; both files retained",
+        ));
+    }
+    std::fs::remove_file(stage)
+}
+
 impl Drop for StagedRolloutFiles {
     fn drop(&mut self) {
         let restored = self.committed || self.restore();
+        if self.committed
+            && self.retirement_pending
+            && let Some(directory) = self.staging_dir.take()
+        {
+            let retained = directory.keep();
+            tracing::warn!(path = %retained.display(), "committed thread storage retirement queued for recovery");
+        }
         // Release the open Windows handle before TempDir removes the lock file.
         self.owner_lock.take();
         // A resumed recorder must never race restoration or reacquire its own
@@ -372,7 +559,12 @@ pub(super) async fn delete_thread(
     }
     // Cancellation during staging still restores files. Once SQLite deletion
     // starts, an owned task must finish the same commit path as rollback.
-    let StagedThreadDelete { store, thread_ids, found_thread_ids, files } = staged;
+    let StagedThreadDelete {
+        store,
+        thread_ids,
+        found_thread_ids,
+        files,
+    } = staged;
     let store = store.clone();
     tokio::spawn(async move {
         let staged = StagedThreadDelete {
@@ -395,9 +587,12 @@ async fn commit_thread_delete(
 ) -> ThreadStoreResult<()> {
     // Recovery already ran before staging acquired rollout-moves.lock.
     if let Some(state_db) = staged.store.state_db.as_ref() {
-        state_db.delete_thread(thread_id).await.map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to delete state for thread {thread_id}: {err}"),
-        })?;
+        state_db
+            .delete_thread(thread_id)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to delete state for thread {thread_id}: {err}"),
+            })?;
     }
     staged.commit().await;
     Ok(())
@@ -422,7 +617,10 @@ pub(super) async fn stage_thread_deletes<'a>(
         // Never hold the registry mutex or moves lock while waiting for a writer.
         // Sorted IDs also serialize overlapping multi-thread deletions consistently.
         if let Ok(recorder) = store.live_recorder(id).await {
-            let pause = recorder.pause_for_maintenance().await.map_err(delete_recovery_error)?;
+            let pause = recorder
+                .pause_for_maintenance()
+                .await
+                .map_err(delete_recovery_error)?;
             if let Some(lease) = recorder.writer_lease() {
                 writer_leases.push(lease);
             } else {
@@ -433,17 +631,28 @@ pub(super) async fn stage_thread_deletes<'a>(
             writer_leases.push(store.acquire_writer_lease(id, false).await?);
         }
     }
-    let moves = codex_rollout::lock_rollout_moves(&store.config.codex_home).await.map_err(delete_recovery_error)?;
+    let moves = codex_rollout::lock_rollout_moves(&store.config.codex_home)
+        .await
+        .map_err(delete_recovery_error)?;
     let mut found_thread_ids = Vec::new();
     let mut candidates = Vec::new();
+    let mut auxiliary_threads = Vec::new();
     for thread_id in thread_ids {
         let paths = rollout_paths(store, *thread_id).await?;
         if !paths.is_empty() {
             found_thread_ids.push(*thread_id);
         }
         let indexed = if let Some(db) = store.state_db.as_ref() {
-            db.get_thread(*thread_id).await.map_err(delete_recovery_error)?.is_some()
-        } else { false };
+            db.get_thread(*thread_id)
+                .await
+                .map_err(delete_recovery_error)?
+                .is_some()
+        } else {
+            false
+        };
+        if !paths.is_empty() || indexed {
+            auxiliary_threads.push((*thread_id, indexed));
+        }
         candidates.extend(paths.into_iter().map(|path| (*thread_id, indexed, path)));
     }
     let codex_home = store.config.codex_home.clone();
@@ -461,16 +670,24 @@ pub(super) async fn stage_thread_deletes<'a>(
                 _writer_leases: writer_leases,
                 recorder_pauses,
                 _rollout_locks: Vec::new(),
+                retirement_pending: false,
                 _moves: Some(moves),
             };
-            let mut paths: Vec<_> = candidates.iter().map(|(_, _, path)| codex_rollout::plain_rollout_path(path)).collect();
+            let mut paths: Vec<_> = candidates
+                .iter()
+                .map(|(_, _, path)| codex_rollout::plain_rollout_path(path))
+                .collect();
             paths.sort();
             paths.dedup();
             for path in paths {
-                files._rollout_locks.push(codex_rollout::try_lock_rollout_for_maintenance(&path).map_err(delete_recovery_error)?);
+                files._rollout_locks.push(
+                    codex_rollout::try_lock_rollout_for_maintenance(&path)
+                        .map_err(delete_recovery_error)?,
+                );
             }
             let mut original_paths = Vec::new();
-            let canonical_home = std::fs::canonicalize(&codex_home).map_err(delete_recovery_error)?;
+            let canonical_home =
+                std::fs::canonicalize(&codex_home).map_err(delete_recovery_error)?;
             for (thread_id, indexed, rollout_path) in candidates {
                 let plain_path = codex_rollout::plain_rollout_path(&rollout_path);
                 for path in [plain_path.clone(), plain_path.with_extension("jsonl.zst")] {
@@ -483,12 +700,15 @@ pub(super) async fn stage_thread_deletes<'a>(
                     continue;
                 }
                     let checked_path = checked_rollout_path(&codex_home, &path, thread_id)?;
-                    if !original_paths.iter().any(|(_, _, path)| path == &checked_path) {
+                    if !original_paths
+                        .iter()
+                        .any(|(_, _, path)| path == &checked_path)
+                    {
                         original_paths.push((thread_id, indexed, checked_path));
                     }
                 }
             }
-            let staging_dir = if original_paths.is_empty() {
+            let staging_dir = if original_paths.is_empty() && auxiliary_threads.is_empty() {
                 None
             } else {
                 Some(
@@ -502,16 +722,45 @@ pub(super) async fn stage_thread_deletes<'a>(
                         })?,
                 )
             };
-            let owner_lock = staging_dir.as_ref().map(|directory| {
-                let lock = std::fs::File::options().create(true).truncate(false).read(true).write(true)
-                    .open(directory.path().join(".owner"))?;
-                lock.lock()?;
-                Ok::<_, std::io::Error>(lock)
-            }).transpose().map_err(delete_recovery_error)?;
+            let owner_lock = staging_dir
+                .as_ref()
+                .map(|directory| {
+                    let lock = std::fs::File::options()
+                        .create(true)
+                        .truncate(false)
+                        .read(true)
+                        .write(true)
+                        .open(directory.path().join(".owner"))?;
+                    lock.lock()?;
+                    Ok::<_, std::io::Error>(lock)
+                })
+                .transpose()
+                .map_err(delete_recovery_error)?;
             files.staging_dir = staging_dir;
             files.owner_lock = owner_lock;
+            if let Some(directory) = &files.staging_dir {
+                for (id, indexed) in auxiliary_threads {
+                    let pending = directory
+                        .path()
+                        .join(if indexed { "indexed" } else { "unindexed" })
+                        .join(id.to_string())
+                        .join(AUXILIARY_RETIREMENT_PENDING);
+                    std::fs::create_dir_all(
+                        pending
+                            .parent()
+                            .ok_or_else(|| delete_recovery_error("retirement has no parent"))?,
+                    )
+                    .map_err(delete_recovery_error)?;
+                    std::fs::File::create(pending)
+                        .and_then(|file| file.sync_all())
+                        .map_err(delete_recovery_error)?;
+                    files.retirement_pending = true;
+                }
+            }
             for (thread_id, indexed, original_path) in original_paths {
-                let relative = original_path.strip_prefix(&canonical_home).map_err(delete_recovery_error)?;
+                let relative = original_path
+                    .strip_prefix(&canonical_home)
+                    .map_err(delete_recovery_error)?;
                 let staged_path = files
                     .staging_dir
                     .as_ref()
@@ -525,8 +774,7 @@ pub(super) async fn stage_thread_deletes<'a>(
                 let staged_parent = staged_path.parent().ok_or_else(|| {
                     delete_recovery_error("staged rollout has no parent; deletion not staged")
                 })?;
-                std::fs::create_dir_all(staged_parent)
-                    .map_err(delete_recovery_error)?;
+                std::fs::create_dir_all(staged_parent).map_err(delete_recovery_error)?;
                 std::fs::rename(&original_path, &staged_path).map_err(|err| {
                     ThreadStoreError::Internal {
                         message: format!(
@@ -589,42 +837,9 @@ async fn rollout_paths(
     store: &LocalThreadStore,
     thread_id: codex_protocol::ThreadId,
 ) -> ThreadStoreResult<Vec<PathBuf>> {
-    let thread_id_str = thread_id.to_string();
-    // Callers recover before acquiring any move lock; do not recursively recover here.
-    let state_db_ctx = store.state_db.clone();
-    let mut rollout_paths = Vec::new();
-
-    match find_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        thread_id_str.as_str(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(path)) => rollout_paths.push(path),
-        Ok(None) => {}
-        Err(err) => {
-            return Err(rollout_lookup_error(
-                thread_id, /*archived*/ false, err,
-            ));
-        }
-    }
-
-    match find_archived_thread_path_by_id_str(
-        store.config.codex_home.as_path(),
-        thread_id_str.as_str(),
-        state_db_ctx.as_deref(),
-    )
-    .await
-    {
-        Ok(Some(path)) if !rollout_paths.contains(&path) => rollout_paths.push(path),
-        Ok(Some(_)) | Ok(None) => {}
-        Err(err) => {
-            return Err(rollout_lookup_error(thread_id, /*archived*/ true, err));
-        }
-    }
-
-    Ok(rollout_paths)
+    codex_rollout::find_thread_rollout_paths(&store.config.codex_home, thread_id)
+        .await
+        .map_err(delete_recovery_error)
 }
 
 fn preflight_rollout_file(
@@ -703,19 +918,65 @@ fn checked_rollout_path(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_audit_17_restore_accepts_only_its_own_hard_link() {
+        let home = tempfile::tempdir().unwrap();
+        let stage = home.path().join("stage");
+        let original = home.path().join("original");
+        std::fs::write(&stage, b"same bytes").unwrap();
+        std::fs::write(&original, b"same bytes").unwrap();
+        assert!(super::restore_staged_rollout(&stage, &original).is_err());
+        assert!(stage.exists());
+        std::fs::remove_file(&original).unwrap();
+        std::fs::hard_link(&stage, &original).unwrap();
+        super::restore_staged_rollout(&stage, &original).unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"same bytes");
+        assert!(!stage.exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&original, &stage).unwrap();
+            let absent_destination = home.path().join("absent-destination");
+            assert!(super::restore_staged_rollout(&stage, &absent_destination).is_err());
+            assert!(
+                !absent_destination.exists(),
+                "must not install a staged symlink"
+            );
+            assert!(
+                std::fs::symlink_metadata(&stage)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read(&original).unwrap(), b"same bytes");
+        }
+    }
     #[tokio::test]
     async fn deletion_cannot_stage_a_representation_owned_by_compression() {
         let home = tempfile::tempdir().unwrap();
-        let store = super::LocalThreadStore::new(super::super::test_support::test_config(home.path()), None);
+        let store = super::LocalThreadStore::new(
+            super::super::test_support::test_config(home.path()),
+            None,
+        );
         let uuid = uuid::Uuid::new_v4();
         let id = codex_protocol::ThreadId::from_string(&uuid.to_string()).unwrap();
-        let path = super::super::test_support::write_session_file(home.path(), "2025-01-03T12-00-00", uuid).unwrap();
+        let path = super::super::test_support::write_session_file(
+            home.path(),
+            "2025-01-03T12-00-00",
+            uuid,
+        )
+        .unwrap();
         let original = std::fs::read(&path).unwrap();
         let compressor = codex_rollout::try_lock_rollout_for_maintenance(&path).unwrap();
-        assert!(super::delete_thread(&store, crate::DeleteThreadParams { thread_id: id }).await.is_err());
+        assert!(
+            super::delete_thread(&store, crate::DeleteThreadParams { thread_id: id })
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), original);
         drop(compressor);
-        super::delete_thread(&store, crate::DeleteThreadParams { thread_id: id }).await.unwrap();
+        super::delete_thread(&store, crate::DeleteThreadParams { thread_id: id })
+            .await
+            .unwrap();
         assert!(!path.exists());
         assert!(!path.with_extension("jsonl.zst").exists());
     }
@@ -732,25 +993,104 @@ mod tests {
     use crate::local::test_support::write_session_file;
 
     #[tokio::test]
+    async fn audit63_committed_auxiliary_retirement_waits_for_live_owners_and_retries() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::new_v4();
+        let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let rollout = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).unwrap();
+        for relative in auxiliary_paths(id) {
+            let path = home.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"private thread state").unwrap();
+        }
+        let corrupt = home
+            .path()
+            .join("tool-history")
+            .join(format!("{id}.json.corrupt-evidence"));
+        std::fs::write(&corrupt, b"unresolved recovery evidence").unwrap();
+        let leases = auxiliary_owners(home.path(), id).unwrap();
+        delete_thread(&store, crate::DeleteThreadParams { thread_id: id })
+            .await
+            .unwrap();
+        assert!(!rollout.exists());
+        for relative in auxiliary_paths(id) {
+            assert!(home.path().join(relative).exists());
+        }
+        assert!(
+            home.path()
+                .join("tool-history")
+                .join(format!("{id}.retired"))
+                .exists()
+        );
+        assert!(recover_staged_deletes(&store).await.is_err());
+        drop(leases);
+        assert!(recover_staged_deletes(&store).await.unwrap());
+        for relative in auxiliary_paths(id) {
+            assert!(!home.path().join(relative).exists());
+        }
+        assert_eq!(
+            std::fs::read(corrupt).unwrap(),
+            b"unresolved recovery evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit63_rollback_does_not_retire_auxiliary_state() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let uuid = Uuid::new_v4();
+        let id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let rollout = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).unwrap();
+        let cache = home.path().join(auxiliary_paths(id)[2].clone());
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, b"resumable state").unwrap();
+        drop(stage_thread_deletes(&store, &[id]).await.unwrap());
+        assert!(rollout.exists());
+        assert_eq!(std::fs::read(cache).unwrap(), b"resumable state");
+        assert!(
+            !home
+                .path()
+                .join("tool-history")
+                .join(format!("{id}.retired"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn staged_delete_restart_uses_database_commit_state() {
         for committed in [false, true] {
             let home = TempDir::new().unwrap();
             let config = test_config(home.path());
-            let runtime = codex_state::StateRuntime::init(home.path().to_path_buf(), config.default_model_provider_id.clone()).await.unwrap();
+            let runtime = codex_state::StateRuntime::init(
+                home.path().to_path_buf(),
+                config.default_model_provider_id.clone(),
+            )
+            .await
+            .unwrap();
             let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
             let uuid = Uuid::from_u128(9996);
             let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
             let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).unwrap();
             let original = std::fs::read(&path).unwrap();
-            store.update_thread_metadata(crate::UpdateThreadMetadataParams {
-                thread_id, include_archived: false,
-                patch: crate::ThreadMetadataPatch { title: Some("indexed".into()), ..Default::default() },
-            }).await.unwrap();
+            store
+                .update_thread_metadata(crate::UpdateThreadMetadataParams {
+                    thread_id,
+                    include_archived: false,
+                    patch: crate::ThreadMetadataPatch {
+                        title: Some("indexed".into()),
+                        ..Default::default()
+                    },
+                })
+                .await
+                .unwrap();
             let mut staged = store.stage_thread_deletes(&[thread_id]).await.unwrap();
             // A separate store must not recover a live staging owner.
             assert!(!recover_staged_deletes(&store).await.unwrap());
             assert!(!path.exists());
-            if committed { runtime.delete_thread(thread_id).await.unwrap(); }
+            if committed {
+                runtime.delete_thread(thread_id).await.unwrap();
+            }
             // Simulate process death: preserve files, release only OS ownership,
             // and do not run the in-memory restoration guard.
             let staging_path = staged.files.staging_dir.take().unwrap().keep();
@@ -761,7 +1101,9 @@ mod tests {
             let reopened = LocalThreadStore::new(config, Some(runtime));
             reopened.state_db().await;
             assert_eq!(path.exists(), !committed);
-            if !committed { assert_eq!(std::fs::read(&path).unwrap(), original); }
+            if !committed {
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
             assert!(!staging_path.exists());
         }
     }
@@ -889,7 +1231,10 @@ mod tests {
         let concurrent = b"concurrent replacement";
         std::fs::write(&path, concurrent).expect("conflicting replacement");
         drop(staged);
-        assert_eq!(std::fs::read(&path).expect("replacement retained"), concurrent);
+        assert_eq!(
+            std::fs::read(&path).expect("replacement retained"),
+            concurrent
+        );
         assert_eq!(
             std::fs::read(retained_path).expect("retained rollout"),
             original
@@ -1012,9 +1357,17 @@ mod tests {
             codex_rollout::RolloutRecorderParams::resume(path.clone()),
             None,
             lease,
-        ).await.unwrap();
-        store.insert_live_recorder(thread_id, recorder,
-            codex_protocol::protocol::ThreadHistoryMode::Legacy).await.unwrap();
+        )
+        .await
+        .unwrap();
+        store
+            .insert_live_recorder(
+                thread_id,
+                recorder,
+                codex_protocol::protocol::ThreadHistoryMode::Legacy,
+            )
+            .await
+            .unwrap();
         let (release, released) = std::sync::mpsc::channel();
         let pause = std::sync::Arc::new(TestStagePause {
             reached: tokio::sync::Notify::new(),
@@ -1064,14 +1417,28 @@ mod tests {
             ),
         );
         super::super::live_writer::append_persisted_items_ordered(
-            &store, thread_id, std::slice::from_ref(&item),
-        ).await.unwrap();
-        super::super::live_writer::flush_thread(&store, thread_id, false).await.unwrap();
-        let (items, _, errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path).await.unwrap();
+            &store,
+            thread_id,
+            std::slice::from_ref(&item),
+        )
+        .await
+        .unwrap();
+        super::super::live_writer::flush_thread(&store, thread_id, false)
+            .await
+            .unwrap();
+        let (items, _, errors) = codex_rollout::RolloutRecorder::load_rollout_items(&path)
+            .await
+            .unwrap();
         assert_eq!(errors, 0);
         let expected = serde_json::to_value(&item).unwrap();
-        assert!(items.iter().any(|item| serde_json::to_value(item).unwrap() == expected));
-        super::super::live_writer::shutdown_thread(&store, thread_id).await.unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| serde_json::to_value(item).unwrap() == expected)
+        );
+        super::super::live_writer::shutdown_thread(&store, thread_id)
+            .await
+            .unwrap();
     }
 
     async fn rollback_fixture() -> (
@@ -1114,13 +1481,31 @@ mod tests {
     async fn delete_thread_removes_its_sqlite_metadata() {
         // ThreadStore::delete_thread promises rollout data AND associated metadata.
         let (home, store, state, thread_id, path) = rollback_fixture().await;
-        store.delete_thread(DeleteThreadParams { thread_id }).await.expect("delete indexed thread");
+        store
+            .delete_thread(DeleteThreadParams { thread_id })
+            .await
+            .expect("delete indexed thread");
         assert!(!path.exists());
-        assert!(state.get_thread(thread_id).await.unwrap().is_none(), "deleted thread must not remain in SQLite listings");
-        assert!(codex_rollout::find_thread_name_by_id(home.path(), &thread_id).await.unwrap().is_none());
-        assert!(matches!(store.read_thread(crate::ReadThreadParams {
-            thread_id, include_archived: true, include_history: false,
-        }).await, Err(ThreadStoreError::ThreadNotFound { .. })));
+        assert!(
+            state.get_thread(thread_id).await.unwrap().is_none(),
+            "deleted thread must not remain in SQLite listings"
+        );
+        assert!(
+            codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store
+                .read_thread(crate::ReadThreadParams {
+                    thread_id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await,
+            Err(ThreadStoreError::ThreadNotFound { .. })
+        ));
         state.close().await;
     }
 
@@ -1256,7 +1641,9 @@ mod tests {
         let deleting = store.clone();
         let operation = tokio::spawn(async move {
             if direct_delete {
-                deleting.delete_thread(DeleteThreadParams { thread_id }).await
+                deleting
+                    .delete_thread(DeleteThreadParams { thread_id })
+                    .await
             } else {
                 deleting.rollback_created_thread(thread_id).await
             }

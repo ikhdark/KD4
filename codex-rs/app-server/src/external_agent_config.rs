@@ -193,7 +193,8 @@ pub(crate) struct ExternalAgentConfigService {
     #[cfg(test)]
     config_lock_attempted: Option<std::sync::mpsc::Sender<()>>,
     #[cfg(test)]
-    config_lock_admitted: Option<std::sync::Arc<std::sync::Mutex<Option<ConfigLockAdmissionTestControl>>>>,
+    config_lock_admitted:
+        Option<std::sync::Arc<std::sync::Mutex<Option<ConfigLockAdmissionTestControl>>>>,
 }
 
 impl ExternalAgentConfigService {
@@ -322,7 +323,11 @@ impl ExternalAgentConfigService {
     ) -> ExternalAgentConfigImportOutcome {
         let mut outcome = ExternalAgentConfigImportOutcome::default();
         for migration_item in migration_items {
-            if self.import_cancellation.as_ref().is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            if self
+                .import_cancellation
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
                 break;
             }
             let item_type = migration_item.item_type;
@@ -1226,7 +1231,10 @@ impl ExternalAgentConfigService {
         import_sources
     }
 
-    fn acquire_config_write_lock(&self, path: &Path) -> io::Result<codex_file_system::AtomicWriteLock> {
+    fn acquire_config_write_lock(
+        &self,
+        path: &Path,
+    ) -> io::Result<codex_file_system::AtomicWriteLock> {
         #[cfg(test)]
         if let Some(attempted) = &self.config_lock_attempted {
             let _ = attempted.send(());
@@ -1236,7 +1244,10 @@ impl ExternalAgentConfigService {
         };
         let lock = loop {
             if cancellation.is_cancelled() {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "config import cancelled before lock admission"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "config import cancelled before lock admission",
+                ));
             }
             if let Some(lock) = codex_file_system::try_acquire_atomic_write_lock(path)? {
                 // Admission is the cancellation boundary: the complete
@@ -1250,7 +1261,10 @@ impl ExternalAgentConfigService {
             && let Some(control) = control.lock().unwrap().take()
         {
             let _ = control.reached.send(());
-            control.release.recv_timeout(std::time::Duration::from_secs(5)).expect("release admitted transaction");
+            control
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("release admitted transaction");
         }
         Ok(lock)
     }

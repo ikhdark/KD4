@@ -70,10 +70,7 @@ mod tests {
             .to_string_lossy()
             .replace('\\', "/");
         // Git reports worktree roots with forward slashes; pin that form literally.
-        assert!(
-            value.ends_with("/repo") && !value.contains('\\'),
-            "{value}"
-        );
+        assert!(value.ends_with("/repo") && !value.contains('\\'), "{value}");
         value
     }
 
@@ -121,18 +118,33 @@ mod tests {
                     expected.extend([
                         ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
                         ("GIT_CONFIG_KEY_0".to_string(), "existing.key".to_string()),
-                        ("GIT_CONFIG_VALUE_0".to_string(), "existing value".to_string()),
+                        (
+                            "GIT_CONFIG_VALUE_0".to_string(),
+                            "existing value".to_string(),
+                        ),
                     ]);
                 }
                 let mut env_map = expected.clone();
                 inject_git_safe_directory(&mut env_map, &nested);
 
                 expected.extend([
-                    ("GIT_CONFIG_COUNT".to_string(), (existing_count + 1).to_string()),
-                    (format!("GIT_CONFIG_KEY_{existing_count}"), "safe.directory".to_string()),
-                    (format!("GIT_CONFIG_VALUE_{existing_count}"), safe_directory_value(&repo)),
+                    (
+                        "GIT_CONFIG_COUNT".to_string(),
+                        (existing_count + 1).to_string(),
+                    ),
+                    (
+                        format!("GIT_CONFIG_KEY_{existing_count}"),
+                        "safe.directory".to_string(),
+                    ),
+                    (
+                        format!("GIT_CONFIG_VALUE_{existing_count}"),
+                        safe_directory_value(&repo),
+                    ),
                 ]);
-                assert_eq!(env_map, expected, "gitfile={git_is_file}, count={existing_count}");
+                assert_eq!(
+                    env_map, expected,
+                    "gitfile={git_is_file}, count={existing_count}"
+                );
             }
         }
     }

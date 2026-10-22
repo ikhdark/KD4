@@ -90,23 +90,14 @@ async fn desktop_missing_tool_notice_uses_current_instructions_on_a_reused_route
     clippy::print_stderr,
     reason = "the schema-size regression test reports measurements for each tool mode"
 )]
-async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Result<()> {
+async fn final_router_manifest_registers_visible_tools_within_schema_budget() -> anyhow::Result<()>
+{
     use codex_features::Feature;
     use codex_protocol::openai_models::ToolMode;
-    for (token_budget, mode) in [
-        (false, ToolMode::Direct),
-        (true, ToolMode::Direct),
-        (true, ToolMode::CodeMode),
-        (true, ToolMode::CodeModeOnly),
-    ] {
-        let (session, mut turn) = make_session_and_context().await;
+    for mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+        let (_session, mut turn) = make_session_and_context().await;
         let config = Arc::make_mut(&mut turn.config);
         config.features.enable(Feature::Kd4Runtime)?;
-        if token_budget {
-            config.features.enable(Feature::TokenBudget)?;
-        } else {
-            config.features.disable(Feature::TokenBudget)?;
-        }
         turn.model_info.tool_mode = Some(mode);
         let turn = Arc::new(turn);
         let step = StepContext::for_test(Arc::clone(&turn));
@@ -116,7 +107,7 @@ async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Res
                 tool_suggest_candidates: None,
                 deferred_mcp_tools: None,
                 mcp_tools: None,
-                extension_tool_executors: crate::session::tests::token_budget_recovery_tool_stubs(),
+                extension_tool_executors: Vec::new(),
                 dynamic_tools: &[],
                 exposure_identity: Default::default(),
             },
@@ -138,71 +129,15 @@ async fn final_router_manifest_and_dispatch_cover_context_tools() -> anyhow::Res
                 "missing handler: {name:?}"
             );
         }
-        assert_eq!(
-            router.has_registered_tool(&ToolName::plain("get_context_remaining")),
-            token_budget
-        );
-        assert_eq!(
-            router.has_registered_tool(&ToolName::plain("new_context")),
-            token_budget
-        );
-        for name in ["get_context_remaining", "new_context"] {
-            assert_eq!(
-                names.contains(&ToolName::plain(name)),
-                token_budget && mode != ToolMode::CodeModeOnly,
-                "unexpected exposure for {name} in {mode:?}"
-            );
-        }
         let bytes = serde_json::to_vec(&specs)?.len();
-        eprintln!("tool schema bytes: token_budget={token_budget}, mode={mode:?}, bytes={bytes}");
+        eprintln!("tool schema bytes: mode={mode:?}, bytes={bytes}");
         assert!(
             bytes < 160 * 1024,
             "material schema growth beyond the 128 KiB warning baseline: {bytes}"
         );
-        if mode != ToolMode::Direct {
-            continue;
+        if mode == ToolMode::Direct {
+            assert!(!router.has_registered_tool(&ToolName::plain("context_checkpoint")));
         }
-        let session = Arc::new(session);
-        assert!(!router.has_registered_tool(&ToolName::plain("context_checkpoint")));
-        let mut calls = Vec::new();
-        if token_budget {
-            calls.push(("get_context_remaining", json!({})));
-        }
-        let before = session.clone_history().await.raw_items().len();
-        for (name, args) in calls {
-            let result = router
-                .dispatch_tool_call_with_terminal_outcome(
-                    Arc::clone(&session),
-                    Arc::clone(&step),
-                    CancellationToken::new(),
-                    Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-                    ToolCall {
-                        tool_name: ToolName::plain(name),
-                        call_id: format!("smoke-{name}"),
-                        payload: ToolPayload::Function {
-                            arguments: args.to_string(),
-                        },
-                    },
-                    ToolCallSource::Direct,
-                    admitted_tool_dispatch_state(),
-                )
-                .await?
-                .into_response();
-            let ResponseInputItem::FunctionCallOutput { output, .. } = result else {
-                panic!("expected function result");
-            };
-            let FunctionCallOutputBody::Text(text) = output.body else {
-                panic!("expected JSON text");
-            };
-            let value: serde_json::Value = serde_json::from_str(&text)?;
-            assert_eq!(value.as_object().unwrap().len(), 1);
-            assert!(value["tokens_left"].is_i64() || value["tokens_left"].is_null());
-        }
-        assert_eq!(
-            session.clone_history().await.raw_items().len(),
-            before,
-            "context inspection must not persist notes"
-        );
     }
     Ok(())
 }
@@ -257,9 +192,12 @@ async fn retired_transactions_are_unregistered_and_do_not_intercept_edits() -> a
                     .to_string(),
         },
     };
+    // The fixture session owns its codex home; keep it alive through the
+    // final read of the legacy metadata stored there.
+    let session = Arc::new(session);
     router
         .dispatch_tool_call_with_terminal_outcome(
-            Arc::new(session),
+            Arc::clone(&session),
             step_context,
             CancellationToken::new(),
             Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
@@ -742,6 +680,7 @@ async fn enable_typed_router_task_with_state_home(
                 capability_profile: codex_agent_task_store::CapabilityProfile::ScopedSourceWrite,
                 objective: "exercise router apply_patch mutation evidence".to_string(),
                 acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                    evidence_policy: None,
                     id: "router-mutation-evidence".to_string(),
                     text: "router-dispatched apply_patch finalizes mutation evidence".to_string(),
                 }],
@@ -1427,6 +1366,33 @@ impl codex_exec_server::ExecutorFileSystem for PatchReplyBarrierFileSystem {
                 }
             }
             Ok(())
+        })
+    }
+
+    // apply_patch commits every write, including rollback, through a
+    // conditional mutation; hold the first file's reply at that boundary.
+    fn mutate_file_if_matches<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&'a codex_exec_server::FileSystemSandboxContext>,
+    ) -> codex_exec_server::ExecutorFileSystemFuture<'a, codex_exec_server::FileMutationOutcome>
+    {
+        Box::pin(async move {
+            self.writes.lock().expect("write log").push(path.clone());
+            let outcome = codex_exec_server::LOCAL_FS
+                .mutate_file_if_matches(path, expected, replacement, sandbox)
+                .await?;
+            if path == &self.first {
+                let committed = self.committed.lock().expect("commit signal").take();
+                if let Some(committed) = committed {
+                    let _reply_lifetime = PatchReplyLifetime(Arc::clone(&self.reply_dropped));
+                    let _ = committed.send(());
+                    self.release.notified().await;
+                }
+            }
+            Ok(outcome)
         })
     }
 
@@ -2226,6 +2192,7 @@ async fn task_authority_fixture(
                     capability_profile: CapabilityProfile::ReadSearchDiff,
                     objective: "review the persisted tracked-file mutation".to_string(),
                     acceptance_criteria: vec![AcceptanceCriterion {
+                        evidence_policy: None,
                         id: "review".to_string(),
                         text: "review exact target evidence".to_string(),
                     }],
@@ -2726,6 +2693,7 @@ async fn amended_attempt_cannot_be_used_by_an_older_turn() -> anyhow::Result<()>
                 capability_profile: CapabilityProfile::ScopedSourceWrite,
                 objective: "inspect the authored source".into(),
                 acceptance_criteria: vec![AcceptanceCriterion {
+                    evidence_policy: None,
                     id: "inspect".into(),
                     text: "inspect tracked.txt in this attempt".into(),
                 }],

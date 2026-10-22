@@ -14,6 +14,7 @@ pub struct WorldStateContributionInput<'a> {
     pub environments: &'a [TurnEnvironmentSelection],
     /// Selected roots whose stable environments are ready in this sampling step.
     pub ready_selected_capability_roots: &'a [SelectedCapabilityRoot],
+    pub bound_selected_capability_roots: &'a [codex_exec_server::ResolvedSelectedCapabilityRoot],
     pub session_store: &'a ExtensionData,
     pub thread_store: &'a ExtensionData,
     pub turn_store: &'a ExtensionData,
@@ -85,6 +86,7 @@ pub struct WorldStateSectionContribution {
     render_diff: Arc<RenderDiff>,
     matches_legacy_fragment: Arc<LegacyFragmentMatcher>,
     matches_retained_fragment: Option<Arc<LegacyFragmentMatcher>>,
+    budget_fallback: Option<(Value, RenderedWorldStateFragment)>,
 }
 
 impl WorldStateSectionContribution {
@@ -109,6 +111,7 @@ impl WorldStateSectionContribution {
             render_diff: Arc::new(render_diff),
             matches_legacy_fragment: Arc::new(|_, _| false),
             matches_retained_fragment: None,
+            budget_fallback: None,
         }
     }
 
@@ -131,6 +134,24 @@ impl WorldStateSectionContribution {
     ) -> Self {
         self.matches_retained_fragment = Some(Arc::new(matcher));
         self
+    }
+
+    /// A compact authoritative invalidation when an update cannot fit the optional budget.
+    ///
+    /// The host uses this only for an already observed section, with a separate 1 KiB control
+    /// limit. `snapshot` must describe exactly the fallback, not an undelivered replacement.
+    /// Keep a deferred replacement distinct so an unchanged next step can retry it.
+    pub fn with_budget_fallback(
+        mut self,
+        snapshot: Value,
+        fragment: RenderedWorldStateFragment,
+    ) -> Self {
+        self.budget_fallback = Some((snapshot, fragment));
+        self
+    }
+
+    pub fn budget_fallback(&self) -> Option<&(Value, RenderedWorldStateFragment)> {
+        self.budget_fallback.as_ref()
     }
 
     pub fn id(&self) -> &'static str {

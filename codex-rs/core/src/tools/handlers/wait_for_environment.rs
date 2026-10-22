@@ -78,6 +78,7 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
             let ToolInvocation {
                 payload,
                 step_context,
+                cancellation_token,
                 ..
             } = invocation;
             let arguments = match payload {
@@ -97,32 +98,17 @@ impl ToolExecutor<ToolInvocation> for WaitForEnvironmentHandler {
                     .iter()
                     .map(|environment| environment.selection.environment_id.as_str()),
             )?;
-            let already_ready = step_context
-                .environments
-                .turn_environments
-                .iter()
-                .any(|environment| environment.environment_id == environment_id);
-            if !already_ready {
-                let Some(environment) = step_context
-                    .environments
-                    .starting
-                    .iter()
-                    .find(|environment| environment.selection.environment_id == environment_id)
-                    .cloned()
-                else {
-                    return Err(FunctionCallError::RespondToModel(format!(
-                        "environment `{environment_id}` is neither ready nor starting"
-                    )));
-                };
-
-                if let Err(error) = environment.wait_until_ready().await {
-                    return Ok(boxed_tool_output(FunctionToolOutput::from_text(
-                        format!(
-                            "Environment `{environment_id}` failed to start and is unavailable: {error}"
-                        ),
-                        Some(false),
-                    )));
-                }
+            if let Err(error) = super::wait_for_tool_environment(
+                &step_context.environments,
+                Some(&environment_id),
+                &cancellation_token,
+            )
+            .await
+            {
+                return Ok(boxed_tool_output(FunctionToolOutput::from_text(
+                    format!("Environment `{environment_id}` is unavailable: {error}"),
+                    Some(false),
+                )));
             }
 
             Ok(boxed_tool_output(JsonToolOutput::new(json!({

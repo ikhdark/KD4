@@ -18,30 +18,47 @@ def test_fake(mocked):
     entrypoint = base + '@patch("test_case.run")\n' + candidate
     return {
         "patched_entrypoint": {"product.py": product, "test_case.py": entrypoint},
-        "patched_module_entrypoint": {"product.py": product, "test_case.py": base + '''import product as api
+        "patched_module_entrypoint": {
+            "product.py": product,
+            "test_case.py": base
+            + """import product as api
 @patch("product.run")
 def test_candidate(mocked):
     api.run()
     mocked.assert_called_once()
-'''},
-        "patched_intermediate": {"product.py": product + "def wrapper(): return run()\n",
-            "test_case.py": base + '''from product import wrapper
+""",
+        },
+        "patched_intermediate": {
+            "product.py": product + "def wrapper(): return run()\n",
+            "test_case.py": base
+            + """from product import wrapper
 @patch("product.run")
 def test_candidate(mocked):
     wrapper()
     mocked.assert_called_once()
-'''},
-        "opaque_patch": {"product.py": product, "test_case.py": base
-            + 'TARGET = "test_case.run"\n@patch(TARGET)\n' + candidate},
+""",
+        },
+        "opaque_patch": {
+            "product.py": product,
+            "test_case.py": base
+            + 'TARGET = "test_case.run"\n@patch(TARGET)\n'
+            + candidate,
+        },
         # Patching the exporting module does not replace an already imported
         # function binding. This call really does enter the original body.
-        "unaffected_import_binding": {"product.py": product, "test_case.py": base + '''@patch("product.run")
+        "unaffected_import_binding": {
+            "product.py": product,
+            "test_case.py": base
+            + """@patch("product.run")
 def test_candidate(mocked):
     run()
     mocked.assert_not_called()
-'''},
-        "patched_entrypoint_with_real": {"product.py": product,
-            "test_case.py": entrypoint + "def test_real(): run()\n"},
+""",
+        },
+        "patched_entrypoint_with_real": {
+            "product.py": product,
+            "test_case.py": entrypoint + "def test_real(): run()\n",
+        },
     }
 
 
@@ -102,7 +119,9 @@ def test_fake(mocked):
 def test_unpatched(): run()
 """,
         },
-        "unknown_dispatch": {"test_case.py": "def test_dynamic(subject): subject.run()\n"},
+        "unknown_dispatch": {
+            "test_case.py": "def test_dynamic(subject): subject.run()\n"
+        },
         "invalid_syntax": {"broken.py": "def broken("},
         **patched_boundary_cases(),
     }
@@ -116,8 +135,13 @@ def checks(name, report):
     }
     reasons = {row["reason"] for row in report["diagnostics"]}
     if name in patched_boundary_cases():
-        needs_warning = name not in {"unaffected_import_binding", "patched_entrypoint_with_real"}
-        result["patched_path_not_real_coverage"] = ("external_boundary_only_mocked" in reasons) == needs_warning
+        needs_warning = name not in {
+            "unaffected_import_binding",
+            "patched_entrypoint_with_real",
+        }
+        result["patched_path_not_real_coverage"] = (
+            "external_boundary_only_mocked" in reasons
+        ) == needs_warning
         if name != "unaffected_import_binding":
             result["replacement_path_unknown"] = any(
                 row["reason"] == "boundary_reachability_unknown"
@@ -125,25 +149,44 @@ def checks(name, report):
                 for row in report["unknown"]
             )
     elif name == "package_import":
-        result["relative_package_identity"] = report["tests"]["pkg.test_package"]["reached"] == ["pkg.product.run"]
+        result["relative_package_identity"] = report["tests"]["pkg.test_package"][
+            "reached"
+        ] == ["pkg.product.run"]
     elif name == "shadowed_calls":
         for test in ("parameter", "local", "module", "comprehension", "direct"):
             expected = ["product.run"] if test == "direct" else []
-            result[test + "_identity"] = report["tests"]["test_case.test_" + test]["reached"] == expected
+            result[test + "_identity"] = (
+                report["tests"]["test_case.test_" + test]["reached"] == expected
+            )
         result["unknowns_retained"] = len(report["unknown"]) >= 4
     elif name == "match_contract":
-        result["no_false_parameter_independence"] = "compared_value_independent_of_parameter" not in reasons
+        result["no_false_parameter_independence"] = (
+            "compared_value_independent_of_parameter" not in reasons
+        )
     elif name.endswith("boundary"):
-        result["mocked_boundary_status"] = ("external_boundary_only_mocked" in reasons) == (name == "decorated_boundary")
+        result["mocked_boundary_status"] = (
+            "external_boundary_only_mocked" in reasons
+        ) == (name == "decorated_boundary")
         if name == "decorated_boundary":
-            result["wrapper_uncertainty"] = any(row["reason"] == "boundary_reachability_unknown" for row in report["unknown"])
+            result["wrapper_uncertainty"] = any(
+                row["reason"] == "boundary_reachability_unknown"
+                for row in report["unknown"]
+            )
     elif name == "unknown_dispatch":
-        result["dynamic_not_resolved"] = report["tests"]["test_case.test_dynamic"]["reached"] == []
-        result["unknown_retained"] = any(row.get("target") == "subject.run" for row in report["unknown"])
+        result["dynamic_not_resolved"] = (
+            report["tests"]["test_case.test_dynamic"]["reached"] == []
+        )
+        result["unknown_retained"] = any(
+            row.get("target") == "subject.run" for row in report["unknown"]
+        )
     elif name == "invalid_syntax":
-        result["parse_failure_retained"] = any(row["reason"] == "parse_error" for row in report["unknown"])
+        result["parse_failure_retained"] = any(
+            row["reason"] == "parse_error" for row in report["unknown"]
+        )
     return result
 
 
 if __name__ == "__main__":
-    raise SystemExit("Semantic benchmark retired; fixtures remain for KD4 oracle tests.")
+    raise SystemExit(
+        "Semantic benchmark retired; fixtures remain for KD4 oracle tests."
+    )

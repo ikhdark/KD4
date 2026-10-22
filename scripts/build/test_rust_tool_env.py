@@ -15,6 +15,7 @@ class RustToolEnvTest(unittest.TestCase):
         self,
     ) -> None:
         env = {"CODEX_SCCACHE_CACHE_SIZE": "100G"}
+
         def which(name):
             return f"/tools/{name}"
 

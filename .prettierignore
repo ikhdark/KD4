@@ -10,7 +10,6 @@ prompt.md
 .worktrees/**
 /codex-rs/aws-auth/**
 /codex-rs/backend-client/**
-/codex-rs/cloud-tasks-mock-client/**
 /codex-rs/codex-backend-openapi-models/**
 /codex-rs/codex-experimental-api-macros/**
 /codex-rs/codex-home/**

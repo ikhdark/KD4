@@ -182,6 +182,12 @@ pub unsafe fn create_process_as_user(
         return Err(std::io::Error::from_raw_os_error(err)).context(msg);
     }
 
+    codex_utils_pty::process_observation::observe_process_start(
+        "windows_sandbox",
+        codex_utils_pty::process_observation::ProcessRole::RequestedRoot,
+        Some(pi.dwProcessId),
+        None,
+    );
     Ok(CreatedProcess {
         process_info: pi,
         startup_info: si.StartupInfo,

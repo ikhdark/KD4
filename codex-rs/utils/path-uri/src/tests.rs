@@ -7,6 +7,39 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
 #[test]
+fn windows_namespace_constructors_agree_without_erasing_unsafe_prefixes() {
+    let cwd = PathUri::parse("file:///C:/audit").unwrap();
+    for (extended, ordinary) in [
+        (r"\\?\C:\audit\café.txt", "file:///C:/audit/caf%C3%A9.txt"),
+        (
+            r"\\?\UNC\server\share\café.txt",
+            "file://server/share/caf%C3%A9.txt",
+        ),
+    ] {
+        let native = AbsolutePathBuf::from_absolute_path_checked(extended).unwrap();
+        let joined = cwd.join(extended).unwrap();
+        assert_eq!(joined, PathUri::parse(ordinary).unwrap());
+        assert_eq!(joined, PathUri::from_abs_path(&native));
+        assert_eq!(joined.to_abs_path().unwrap(), native);
+    }
+    for extended in [
+        r"\\?\C:\audit\name.",
+        r"\\?\C:\audit\name ",
+        r"\\?\UNC\server\share\name.",
+        r"\\?\UNC\server\share\name ",
+        r"\\?\UNC\server\share\..\name",
+        r"\\?\UNC\server\share\CON",
+    ] {
+        let native = AbsolutePathBuf::from_absolute_path_checked(extended).unwrap();
+        let uri = PathUri::from_abs_path(&native);
+        assert!(uri.to_string().contains("/%00/bad/path/"));
+        assert_eq!(cwd.join(extended).unwrap(), uri);
+        assert_eq!(uri.to_abs_path().unwrap(), native);
+        assert_ne!(uri, cwd.join("name").unwrap());
+    }
+}
+
+#[test]
 fn file_uri_round_trips_an_absolute_path() {
     let path = AbsolutePathBuf::current_dir()
         .expect("current directory")
@@ -51,8 +84,16 @@ fn non_native_uri_io_conversion_is_invalid_input() {
 #[test]
 fn file_uri_preserves_encoded_paths_and_decodes_only_the_basename() {
     for (input, encoded, basename) in [
-        ("file:///C:/Users/Alice%20Smith/src/main.rs", "/C:/Users/Alice%20Smith/src/main.rs", "main.rs"),
-        ("file:///home/alice/src/main.rs", "/home/alice/src/main.rs", "main.rs"),
+        (
+            "file:///C:/Users/Alice%20Smith/src/main.rs",
+            "/C:/Users/Alice%20Smith/src/main.rs",
+            "main.rs",
+        ),
+        (
+            "file:///home/alice/src/main.rs",
+            "/home/alice/src/main.rs",
+            "main.rs",
+        ),
         ("file:///tmp/100%25/file", "/tmp/100%25/file", "file"),
         ("file:///tmp/a%3Fb%23c%25d", "/tmp/a%3Fb%23c%25d", "a?b#c%d"),
         ("file:///tmp/a%252Fb", "/tmp/a%252Fb", "a%2Fb"),
@@ -71,7 +112,10 @@ fn infers_path_conventions_from_uri_shape() {
         ("file:///home/alice/src", Some(PathConvention::Posix)),
         ("file:///C:/Users/Alice/src", Some(PathConvention::Windows)),
         // Drive-shaped POSIX spellings deliberately use Windows inference.
-        ("file:///C:/actually/a/posix/path", Some(PathConvention::Windows)),
+        (
+            "file:///C:/actually/a/posix/path",
+            Some(PathConvention::Windows),
+        ),
         ("file:///d:", Some(PathConvention::Windows)),
         ("file://server/share/src", Some(PathConvention::Windows)),
         // Opaque fallback for POSIX bytes `/tmp/null-\0-\xff-byte`.
@@ -162,7 +206,10 @@ fn escaped_windows_drive_opens_the_same_native_file() {
     let local_path = uri.encoded_path();
     let drive = local_path.as_bytes()[1];
     assert!(drive.is_ascii_alphabetic());
-    for escaped_drive in [format!("{}%3A", char::from(drive)), format!("%{drive:02X}%3A")] {
+    for escaped_drive in [
+        format!("{}%3A", char::from(drive)),
+        format!("%{drive:02X}%3A"),
+    ] {
         let spelling = format!("file:///{escaped_drive}{}", &local_path[3..]);
         let escaped = PathUri::parse(&spelling).unwrap();
         let converted = escaped.to_abs_path().unwrap();
@@ -445,9 +492,12 @@ fn known_path_uris_reject_queries_and_fragments() {
 
 #[test]
 fn path_uris_reject_encoded_null_bytes() {
-    assert_eq!(PathUri::parse("file:///tmp/%00"), Err(PathUriParseError::InvalidFileUriPath {
-        path: "file:///tmp/%00".to_string(),
-    }));
+    assert_eq!(
+        PathUri::parse("file:///tmp/%00"),
+        Err(PathUriParseError::InvalidFileUriPath {
+            path: "file:///tmp/%00".to_string(),
+        })
+    );
 }
 
 #[test]
@@ -559,7 +609,11 @@ fn lexical_drive_roots_convert_to_the_native_drive_root() {
 #[test]
 fn join_normalizes_relative_uri_segments() {
     for (base, relative, expected) in [
-        ("file:///C:/workspace/src", r"..\tests\test.rs", "file:///C:/workspace/tests/test.rs"),
+        (
+            "file:///C:/workspace/src",
+            r"..\tests\test.rs",
+            "file:///C:/workspace/tests/test.rs",
+        ),
         (
             "file:///workspace/src",
             "../tests/test.rs",
@@ -610,7 +664,11 @@ fn join_keeps_canonicalized_posix_double_slash_paths_hierarchical() {
 fn join_normalizes_absolute_parent_segments() {
     for (base, path, expected) in [
         ("file:///workspace", "/src", "file:///src"),
-        ("file:///C:/workspace/src", r"D:\tmp\test.rs", "file:///D:/tmp/test.rs"),
+        (
+            "file:///C:/workspace/src",
+            r"D:\tmp\test.rs",
+            "file:///D:/tmp/test.rs",
+        ),
         ("file:///workspace", "/tmp/a/../b", "file:///tmp/b"),
         ("file:///C:/workspace", r"D:\tmp\a\..\b", "file:///D:/tmp/b"),
         (
@@ -918,7 +976,7 @@ fn legacy_posix_drive_shaped_paths_keep_posix_display() {
 
 #[test]
 fn absolute_join_can_replace_an_opaque_windows_base() {
-    let base = LegacyAppPathString::from_path(Path::new(r"\\?\C:\base"))
+    let base = LegacyAppPathString::from_path(Path::new(r"\\?\C:\base."))
         .to_path_uri(PathConvention::Windows)
         .unwrap();
     assert!(base.join("relative").is_err());
@@ -926,4 +984,135 @@ fn absolute_join_can_replace_an_opaque_windows_base() {
         base.join(r"D:\replacement").unwrap().to_string(),
         "file:///D:/replacement"
     );
+}
+
+#[test]
+fn safe_extended_aliases_share_native_constructor_identity() {
+    for raw in [r"\\?\C:\repo\file.rs", r"\\?\UNC\server\share\file.rs"] {
+        let native = AbsolutePathBuf::from_absolute_path_checked(raw).unwrap();
+        let uri = LegacyAppPathString::from_path(Path::new(raw))
+            .to_path_uri(PathConvention::Windows)
+            .unwrap();
+        assert_eq!(uri, PathUri::from_abs_path(&native));
+        assert_eq!(uri.to_abs_path().unwrap(), native);
+        assert!(uri.join("child").is_ok());
+        // A previously serialized safe alias remains decodable, but does not
+        // weaken the authenticity check for an arbitrary opaque drive path.
+        let bytes = raw
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let legacy = PathUri::from_opaque_path_bytes(&bytes);
+        assert_eq!(legacy.to_abs_path().unwrap(), native);
+    }
+}
+
+#[test]
+fn localhost_unc_hierarchy_preserves_share_and_exact_components() {
+    for raw in [
+        r"\\localhost\share\repo",
+        "//localhost/share/repo",
+        r"/\localhost/share\repo",
+    ] {
+        let native = AbsolutePathBuf::from_absolute_path_checked(raw).unwrap();
+        let uri = LegacyAppPathString::from_path(Path::new(raw))
+            .to_path_uri(PathConvention::Windows)
+            .unwrap();
+        assert_eq!(uri.infer_path_convention(), Some(PathConvention::Windows));
+        assert_eq!(uri, PathUri::from_abs_path(&native));
+        assert_eq!(
+            uri.inferred_native_path_string(),
+            native.as_path().to_string_lossy()
+        );
+        assert!(LegacyAppPathString::from_path_uri(&uri, PathConvention::Posix).is_err());
+        let restored: PathUri =
+            serde_json::from_str(&serde_json::to_string(&uri).unwrap()).unwrap();
+        assert_eq!(
+            restored.to_abs_path().unwrap(),
+            AbsolutePathBuf::from_absolute_path_checked(raw).unwrap()
+        );
+        let child = restored.join(r"src\100%雪.rs").unwrap();
+        assert_eq!(child.basename().as_deref(), Some("100%雪.rs"));
+        assert_eq!(
+            child.inferred_native_path_string(),
+            r"\\localhost\share\repo\src\100%雪.rs"
+        );
+        assert!(child.starts_with(&restored));
+        let share = restored.parent().unwrap();
+        assert_eq!(
+            share.inferred_native_path_string().trim_end_matches('\\'),
+            r"\\localhost\share"
+        );
+        assert_eq!(share.parent(), None);
+        assert_eq!(restored.ancestors().count(), 2);
+        assert_eq!(
+            restored.join(r"\other").unwrap(),
+            share.join("other").unwrap()
+        );
+        assert_eq!(
+            restored.join("../../../child").unwrap(),
+            share.join("child").unwrap()
+        );
+        assert!(!child.starts_with(&share.join("repository").unwrap()));
+        assert!(child.to_abs_path().is_ok());
+    }
+}
+
+#[test]
+fn tagged_windows_fallback_does_not_reinterpret_legacy_posix_bytes() {
+    let posix =
+        PathUri::from_opaque_path_bytes(b"/\0/\0l\0o\0c\0a\0l\0h\0o\0s\0t\0/\0s\0h\0a\0r\0e\0");
+    assert_eq!(posix.infer_path_convention(), Some(PathConvention::Posix));
+    assert!(posix.to_abs_path().is_err());
+    for bytes in [
+        vec![47, 0, 47],
+        vec![47, 0, 47, 0, 0, 0],
+        vec![67, 0, 58, 0, 114, 0],
+    ] {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let uri = PathUri::parse(&format!("{WINDOWS_BAD_PATH_URI_PREFIX}{encoded}")).unwrap();
+        assert_eq!(uri.infer_path_convention(), None);
+        assert!(uri.to_abs_path().is_err());
+        assert!(uri.parent().is_none());
+    }
+}
+
+#[test]
+fn opaque_unc_parent_becomes_an_addressable_ordinary_uri_when_representable() {
+    use std::os::windows::ffi::OsStringExt;
+    let mut wide = r"\\server\share\".encode_utf16().collect::<Vec<_>>();
+    wide.push(0xd800);
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+    let child = PathUri::from_host_native_path(path).unwrap();
+    let parent = child.parent().unwrap();
+    assert!(!parent.as_str().starts_with(BAD_PATH_URI_PREFIX));
+    assert_eq!(parent.to_url().host_str(), Some("server"));
+    assert_eq!(
+        parent.to_abs_path().unwrap().as_path(),
+        Path::new(r"\\server\share")
+    );
+}
+
+#[test]
+fn namespace_sensitive_native_roundtrip_keeps_distinct_io_targets() {
+    let temp = tempfile::tempdir().unwrap();
+    let ordinary = temp.path().join("name");
+    let dotted = PathBuf::from(format!(r"\\?\{}\name.", temp.path().display()));
+    std::fs::write(&ordinary, b"ordinary").unwrap();
+    std::fs::write(&dotted, b"verbatim").unwrap();
+    let ordinary_uri = PathUri::from_host_native_path(&ordinary).unwrap();
+    let dotted_uri = PathUri::from_host_native_path(&dotted).unwrap();
+    assert_ne!(ordinary_uri, dotted_uri);
+    let restored: PathUri =
+        serde_json::from_str(&serde_json::to_string(&dotted_uri).unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read(restored.to_abs_path().unwrap()).unwrap(),
+        b"verbatim"
+    );
+    std::fs::write(restored.to_abs_path().unwrap(), b"updated").unwrap();
+    assert_eq!(
+        std::fs::read(ordinary_uri.to_abs_path().unwrap()).unwrap(),
+        b"ordinary"
+    );
+    std::fs::remove_file(dotted).unwrap();
 }

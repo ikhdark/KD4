@@ -33,6 +33,9 @@ use tokio::io::BufReader;
 use tokio::io::BufWriter;
 
 pub(crate) const CHANNEL_CAPACITY: usize = 128;
+// Small, finite control-read headroom while application delivery is blocked.
+// A receiver that stalls beyond this backlog fails via the same liveness bound.
+pub(crate) const WEBSOCKET_CONTROL_BACKLOG: usize = 8;
 /// Largest serialized JSON-RPC message any exec-server transport accepts.
 ///
 /// Stdio and WebSocket enforce it per message and Noise enforces it before
@@ -54,6 +57,16 @@ const STDIO_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(70);
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(not(test))]
 pub(crate) const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+// Whole-message policy, not a process/RPC timeout. Unlike 60 KiB Noise
+// records, legacy peers may place a Pong behind one 64 MiB frame. Allow
+// that frame 64 KiB/s plus 60 seconds of slack in either direction. A
+// continuously slower link must use a smaller message/streamed file read.
+#[cfg(not(test))]
+pub(crate) const WEBSOCKET_MESSAGE_TIMEOUT: Duration =
+    Duration::from_secs(60 + (MAX_JSONRPC_MESSAGE_LEN / (64 * 1024)) as u64);
+#[cfg(test)]
+pub(crate) const WEBSOCKET_MESSAGE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Reader limits for WebSockets that carry one JSON-RPC message per frame.
 ///
@@ -495,7 +508,7 @@ impl JsonRpcConnection {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        Self::from_websocket_stream(stream, connection_label, /*ping_interval*/ None)
+        Self::from_websocket_stream(stream, connection_label, Some(WEBSOCKET_KEEPALIVE_INTERVAL))
     }
 
     pub(crate) fn from_axum_websocket(stream: AxumWebSocket, connection_label: String) -> Self {
@@ -518,25 +531,35 @@ impl JsonRpcConnection {
 
         let websocket_task = tokio::spawn(async move {
             let (mut writer, mut reader) = websocket.split();
+            let liveness =
+                crate::websocket_pong_watchdog::WebSocketLiveness::new(WEBSOCKET_MESSAGE_TIMEOUT);
+            // Frames read ahead of a busy consumer live outside `read`: a close,
+            // read error, or liveness verdict must not drop already received messages.
+            let mut pending: std::collections::VecDeque<JsonRpcConnectionEvent> =
+                std::collections::VecDeque::new();
             let read = async {
-                while let Some(message) = reader.next().await {
+                loop {
+                    let message = tokio::select! {
+                        permit = incoming_tx.reserve(), if !pending.is_empty() => {
+                            let Ok(permit) = permit else { return None; };
+                            if let Some(event) = pending.pop_front() { permit.send(event); }
+                            continue;
+                        }
+                        message = reader.next(), if pending.len() < WEBSOCKET_CONTROL_BACKLOG => message,
+                    };
+                    let message = message?;
                     match message {
                         Ok(message) => match message.parse_jsonrpc_frame() {
                             Ok(JsonRpcWebSocketFrame::Message(message)) => {
-                                if incoming_tx
-                                    .send(JsonRpcConnectionEvent::Message(message))
-                                    .await
-                                    .is_err()
-                                {
-                                    return None;
-                                }
+                                pending.push_back(JsonRpcConnectionEvent::Message(message));
                             }
+                            Ok(JsonRpcWebSocketFrame::Pong) => liveness.received_pong(),
                             Ok(JsonRpcWebSocketFrame::Close) => return None,
                             Ok(JsonRpcWebSocketFrame::Ignore) => {}
                             Err(err) => {
-                                send_malformed_message(&incoming_tx, Some(format!(
-                                    "failed to parse websocket JSON-RPC message from {connection_label}: {err}"
-                                ))).await;
+                                pending.push_back(JsonRpcConnectionEvent::MalformedMessage {
+                                    reason: format!("failed to parse websocket JSON-RPC message from {connection_label}: {err}"),
+                                });
                             }
                         },
                         Err(err) => {
@@ -546,7 +569,6 @@ impl JsonRpcConnection {
                         }
                     }
                 }
-                None
             };
             let write = async {
                 let mut ping_interval = ping_interval.map(|ping_interval| {
@@ -561,9 +583,9 @@ impl JsonRpcConnection {
                     tokio::select! {
                         message = outgoing_rx.recv() => {
                             let message = message?;
-                            if let Err(reason) = send_websocket_jsonrpc_message(
+                            if let Err(reason) = timeout(WEBSOCKET_MESSAGE_TIMEOUT, send_websocket_jsonrpc_message(
                                 &mut writer, &connection_label, &message,
-                            ).await {
+                            )).await.unwrap_or_else(|_| Err("websocket message write deadline expired".into())) {
                                 return Some(reason);
                             }
                         }
@@ -573,11 +595,15 @@ impl JsonRpcConnection {
                                 None => std::future::pending().await,
                             }
                         } => {
-                            if let Err(err) = writer.send(M::ping()).await {
-                                return Some(format!(
-                                    "failed to write websocket ping to {connection_label}: {err}"
-                                ));
+                            let generation = liveness.pong_generation();
+                            match timeout(WEBSOCKET_MESSAGE_TIMEOUT, writer.send(M::ping())).await {
+                                Ok(Ok(())) => {},
+                                Ok(Err(error)) => return Some(format!("failed to write websocket ping: {error}")),
+                                Err(_) => return Some("websocket ping write deadline expired".into()),
                             }
+                            // Flush errors also fail closed; never restart a partial send.
+                            // A Pong can have arrived while the flush was pending.
+                            liveness.ping_flushed(generation);
                         }
                     }
                 }
@@ -585,9 +611,19 @@ impl JsonRpcConnection {
             // Keep both futures alive until disconnect: inbound progress must not
             // cancel a pending send, and a full inbound queue must not stop writes.
             let reason = tokio::select! {
+                biased;
                 reason = read => reason,
                 reason = write => reason,
+                _ = liveness.expired() => Some("websocket Pong deadline expired".into()),
             };
+            // Publish the disconnect before waiting on a possibly stalled consumer,
+            // then deliver received frames in order ahead of the terminal event.
+            let _ = disconnected_tx.send(true);
+            for event in pending.drain(..) {
+                if incoming_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
             send_disconnected(&incoming_tx, &disconnected_tx, reason).await;
         });
 
@@ -618,6 +654,7 @@ impl JsonRpcConnection {
 
 enum JsonRpcWebSocketFrame {
     Message(JSONRPCMessage),
+    Pong,
     Close,
     Ignore,
 }
@@ -638,9 +675,8 @@ impl JsonRpcWebSocketMessage for Message {
                 serde_json::from_slice(bytes.as_ref()).map(JsonRpcWebSocketFrame::Message)
             }
             Message::Close(_) => Ok(JsonRpcWebSocketFrame::Close),
-            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
-                Ok(JsonRpcWebSocketFrame::Ignore)
-            }
+            Message::Pong(_) => Ok(JsonRpcWebSocketFrame::Pong),
+            Message::Ping(_) | Message::Frame(_) => Ok(JsonRpcWebSocketFrame::Ignore),
         }
     }
 
@@ -663,9 +699,8 @@ impl JsonRpcWebSocketMessage for AxumWebSocketMessage {
                 serde_json::from_slice(bytes.as_ref()).map(JsonRpcWebSocketFrame::Message)
             }
             AxumWebSocketMessage::Close(_) => Ok(JsonRpcWebSocketFrame::Close),
-            AxumWebSocketMessage::Ping(_) | AxumWebSocketMessage::Pong(_) => {
-                Ok(JsonRpcWebSocketFrame::Ignore)
-            }
+            AxumWebSocketMessage::Pong(_) => Ok(JsonRpcWebSocketFrame::Pong),
+            AxumWebSocketMessage::Ping(_) => Ok(JsonRpcWebSocketFrame::Ignore),
         }
     }
 
@@ -907,7 +942,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_connection_ignores_pong_accepts_text_and_binary_then_reports_close() -> anyhow::Result<()> {
+    async fn websocket_connection_ignores_pong_accepts_text_and_binary_then_reports_close()
+    -> anyhow::Result<()> {
         let (client_websocket, mut server_websocket) = websocket_pair().await?;
         let mut connection = JsonRpcConnection::from_websocket(client_websocket, "test".into());
 
@@ -1068,6 +1104,34 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn websocket_close_after_read_ahead_delivers_every_received_message() -> anyhow::Result<()>
+    {
+        // The reader races delivery against the next frame. Repeat so a close
+        // read while messages are still staged cannot pass by chance.
+        let message = test_jsonrpc_message();
+        for _ in 0..32 {
+            let (websocket, control, _outbound_rx) = ControlledWebSocket::new(true);
+            let mut connection =
+                JsonRpcConnection::from_websocket_stream(websocket, "test".into(), None);
+            for _ in 0..4 {
+                control.send_inbound(Message::Text(serde_json::to_string(&message)?.into()))?;
+            }
+            control.send_inbound(Message::Close(None))?;
+            for _ in 0..4 {
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+                    Some(JsonRpcConnectionEvent::Message(actual)) if actual == message
+                ));
+            }
+            assert!(matches!(
+                timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+                Some(JsonRpcConnectionEvent::Disconnected { reason: None })
+            ));
+        }
+        Ok(())
+    }
+
     async fn websocket_pair() -> anyhow::Result<(
         WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
         WebSocketStream<tokio::net::TcpStream>,
@@ -1099,6 +1163,48 @@ mod tests {
         write_blocked: Arc<AtomicBool>,
         write_blocked_waker: Arc<AtomicWaker>,
         write_waker: Arc<AtomicWaker>,
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn websocket_silent_peer_and_blocked_sink_fail_boundedly() {
+        for ready in [true, false] {
+            let (socket, _control, _outbound) = ControlledWebSocket::new(ready);
+            let mut connection = JsonRpcConnection::from_websocket_stream(
+                socket,
+                "silent".into(),
+                Some(Duration::from_millis(25)),
+            );
+            connection
+                .outgoing_tx
+                .send(test_jsonrpc_message())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), async {
+                while !*connection.disconnected_rx.borrow_and_update() {
+                    connection.disconnected_rx.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("silent peer or blocked flush must release pending owners");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn websocket_healthy_pongs_keep_a_quiet_connection_alive() {
+        let (socket, control, mut outbound) = ControlledWebSocket::new(true);
+        let connection = JsonRpcConnection::from_websocket_stream(
+            socket,
+            "healthy".into(),
+            Some(Duration::from_millis(25)),
+        );
+        for _ in 0..12 {
+            assert!(matches!(outbound.next().await, Some(Message::Ping(_))));
+            control
+                .send_inbound(Message::Pong(Vec::new().into()))
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert!(!*connection.disconnected_rx.borrow());
+        }
     }
 
     struct ControlledWebSocketHandle {

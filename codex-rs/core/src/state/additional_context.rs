@@ -12,14 +12,52 @@ const ADDITIONAL_CONTEXT_MAX_ITEMS: usize = 256;
 const ADDITIONAL_CONTEXT_RESET_SOURCE: &str = "__codex_additional_context_reset__";
 const ADDITIONAL_CONTEXT_RESET: &str = "Additional context snapshot replaced. All previously supplied additional context values are obsolete (previous_value_obsolete=\"true\"). Only additional-context entries following this reset in the current update remain available. Do not infer omitted values from earlier messages.";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AdditionalContextStore {
     values: IndexMap<String, AdditionalContextEntry>,
     delivered: IndexMap<String, AdditionalContextEntry>,
     delivery_invalidated: bool,
+    #[serde(default)]
+    legacy: Vec<ResponseItem>,
 }
 
 impl AdditionalContextStore {
+    pub(crate) fn is_current(&self, values: &IndexMap<String, AdditionalContextEntry>) -> bool {
+        self.values == *values && !self.delivery_invalidated && self.legacy.is_empty()
+    }
+
+    pub(crate) fn from_legacy_history(history: &[ResponseItem]) -> Self {
+        Self {
+            legacy: history
+                .iter()
+                .filter(|item| {
+                    matches!(item,
+                ResponseItem::Message { role, content, .. } if role == "developer"
+                    && content.iter().any(|part| matches!(part,
+                        codex_protocol::models::ContentItem::InputText { text }
+                            if AdditionalContextDeveloperFragment::matches_text(text))))
+                })
+                .cloned()
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn restore(value: &serde_json::Value, history: &[ResponseItem]) -> Option<Self> {
+        let mut state: Self = serde_json::from_value(value.clone()).ok()?;
+        Self::validate_application_context(&state.values).ok()?;
+        if state
+            .delivered
+            .iter()
+            .any(|(key, entry)| state.values.get(key) != Some(entry))
+        {
+            return None;
+        }
+        state.legacy.retain(|item| history.contains(item));
+        state.reconcile_history(history);
+        Some(state)
+    }
+
     /// Account for the complete source before excerpt truncation. Otherwise a
     /// huge source appears to fit and its omitted middle becomes unrecoverable.
     /// The application envelope supplies a conservative, untruncated size only;
@@ -82,22 +120,30 @@ impl AdditionalContextStore {
             .filter(|(_, entry)| entry.kind == AdditionalContextKind::Application)
             .map(|(key, entry)| (key.clone(), entry.clone()))
             .collect();
-        Self::default()
-            .merge(values)
-            .into_iter()
-            .filter(|input| {
-                let ResponseInputItem::Message { role, content, .. } = input else {
-                    return false;
-                };
-                !history.iter().any(|item| {
-                    matches!(item,
-                        ResponseItem::Message { role: retained_role, content: retained_content, .. }
-                            if retained_role == role && retained_content == content
-                    )
+        let mut retained = self
+            .legacy
+            .iter()
+            .filter(|item| !history.contains(item))
+            .cloned()
+            .collect::<Vec<_>>();
+        retained.extend(
+            Self::default()
+                .merge(values)
+                .into_iter()
+                .filter(|input| {
+                    let ResponseInputItem::Message { role, content, .. } = input else {
+                        return false;
+                    };
+                    !history.iter().any(|item| {
+                        matches!(item,
+                            ResponseItem::Message { role: retained_role, content: retained_content, .. }
+                                if retained_role == role && retained_content == content
+                        )
+                    })
                 })
-            })
-            .map(ResponseItem::from)
-            .collect()
+                .map(ResponseItem::from),
+        );
+        retained
     }
 
     /// Reconcile acknowledgements, not the authoritative supplied snapshot. An
@@ -122,7 +168,7 @@ impl AdditionalContextStore {
         &mut self,
         values: IndexMap<String, AdditionalContextEntry>,
     ) -> Vec<ResponseInputItem> {
-        if self.values == values && !self.delivery_invalidated {
+        if self.is_current(&values) {
             return Vec::new();
         }
         let mut fragments = Vec::new();
@@ -130,6 +176,17 @@ impl AdditionalContextStore {
         let mut retained_bytes = 2;
         let mut overflowed = false;
         let mut delivered = self.delivered.clone();
+        if !self.legacy.is_empty() {
+            let reset = render_entry(
+                ADDITIONAL_CONTEXT_RESET_SOURCE,
+                &AdditionalContextEntry {
+                    value: ADDITIONAL_CONTEXT_RESET.to_string(),
+                    kind: AdditionalContextKind::Application,
+                },
+            );
+            push_bounded_item(&mut fragments, &mut retained_bytes, reset);
+            self.legacy.clear();
+        }
         for (key, old) in &self.delivered {
             if values.get(key).is_some_and(|new| new.kind == old.kind) {
                 continue;
@@ -287,6 +344,39 @@ fn push_bounded_item(
 mod tests {
     use super::*;
     use codex_protocol::models::ContentItem;
+
+    #[test]
+    fn audit_instruction_authority_legacy_context_is_opaque_until_reset() {
+        let mut original = ResponseItem::from(render_entry(
+            "policy",
+            &AdditionalContextEntry {
+                kind: AdditionalContextKind::Application,
+                value: "Never edit protected.txt.".into(),
+            },
+        ));
+        if let ResponseItem::Message { content, .. } = &mut original {
+            content.push(ContentItem::InputText {
+                text: "unrelated same-message instructions".into(),
+            });
+        }
+        let mut store =
+            AdditionalContextStore::from_legacy_history(std::slice::from_ref(&original));
+        assert_eq!(
+            store.application_context_for_replacement(&[]),
+            vec![original.clone()]
+        );
+        assert!(
+            store
+                .application_context_for_replacement(&[original])
+                .is_empty()
+        );
+        let reset = store.merge(IndexMap::new());
+        assert_eq!(reset.len(), 1);
+        assert!(
+            matches!(&reset[0], ResponseInputItem::Message { role, .. } if role == "developer")
+        );
+        assert!(store.merge(IndexMap::new()).is_empty());
+    }
 
     #[test]
     fn application_policy_is_whole_and_oversized_updates_are_rejected() {

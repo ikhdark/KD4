@@ -196,29 +196,65 @@ pub async fn collect_git_info_assume_git_repo(cwd: &Path) -> GitInfo {
 /// Collect fetch remotes in a multi-root-friendly format: {"origin": "https://..."},
 /// without checking whether `cwd` is in a git repo.
 pub async fn get_git_remote_urls_assume_git_repo(cwd: &Path) -> Option<BTreeMap<String, String>> {
-    let output = run_git_command_with_timeout(&["remote", "-v"], cwd).await?;
-    if !output.status.success() {
-        return None;
-    }
+    get_git_remote_urls_result(cwd).await.ok().flatten()
+}
 
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    parse_git_remote_urls(stdout.as_str())
+/// Distinguishes a successful empty remote list from an unavailable observation.
+pub async fn get_git_remote_urls_result(
+    cwd: &Path,
+) -> std::io::Result<Option<BTreeMap<String, String>>> {
+    let output = run_git_command_with_timeout(&["remote", "-v"], cwd)
+        .await
+        .ok_or_else(|| std::io::Error::other("Git remote query failed or timed out"))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("Git remote query failed"));
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(std::io::Error::other)?;
+    let remotes = parse_git_remote_urls(stdout.as_str());
+    if remotes.is_none() && !stdout.trim().is_empty() {
+        return Err(std::io::Error::other("invalid Git remote list"));
+    }
+    Ok(remotes)
 }
 
 /// Return the current HEAD commit hash without checking whether `cwd` is in a git repo.
 pub async fn get_head_commit_hash(cwd: &Path) -> Option<GitSha> {
-    let output = run_git_command_with_timeout(&["rev-parse", "HEAD"], cwd).await?;
-    if !output.status.success() {
-        return None;
-    }
+    get_head_commit_hash_result(cwd).await.ok().flatten()
+}
 
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let hash = stdout.trim();
-    if hash.is_empty() {
-        None
-    } else {
-        Some(GitSha::new(hash))
+/// Distinguishes an unborn HEAD from command, decoding, and timeout failures.
+pub async fn get_head_commit_hash_result(cwd: &Path) -> std::io::Result<Option<GitSha>> {
+    let output = run_git_command_with_timeout(&["rev-parse", "--verify", "--quiet", "HEAD"], cwd)
+        .await
+        .ok_or_else(|| std::io::Error::other("Git HEAD query failed or timed out"))?;
+    if !output.status.success() {
+        if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+            // A quiet lookup alone cannot prove absence. Confirm that HEAD
+            // names a branch whose ref really does not exist.
+            if let Some(symbolic) =
+                run_git_command_with_timeout(&["symbolic-ref", "--quiet", "HEAD"], cwd).await
+                && symbolic.status.success()
+                && let Ok(reference) = std::str::from_utf8(&symbolic.stdout)
+                && reference.trim().starts_with("refs/heads/")
+                && let Some(missing) = run_git_command_with_timeout(
+                    &["show-ref", "--verify", "--quiet", reference.trim()],
+                    cwd,
+                )
+                .await
+                && missing.status.code() == Some(1)
+                && missing.stderr.is_empty()
+            {
+                return Ok(None);
+            }
+        }
+        return Err(std::io::Error::other("Git HEAD query failed"));
     }
+    let stdout = String::from_utf8(output.stdout).map_err(std::io::Error::other)?;
+    let hash = stdout.trim();
+    if !matches!(hash.len(), 40 | 64) || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(std::io::Error::other("invalid Git HEAD hash"));
+    }
+    Ok(Some(GitSha::new(hash)))
 }
 
 pub fn canonicalize_git_remote_url(url: &str) -> Option<String> {
@@ -2029,5 +2065,56 @@ mod tests {
                 "active Git command must not receive a safe.directory retry: {active_args:?}"
             );
         }
+    }
+}
+#[cfg(test)]
+mod metadata_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn metadata_observations_preserve_absence_failure_and_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path();
+        assert!(get_head_commit_hash_result(cwd).await.is_err());
+        assert!(get_git_remote_urls_result(cwd).await.is_err());
+        assert!(
+            run_git_command_with_timeout(&["init", "-q"], cwd)
+                .await
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(get_head_commit_hash_result(cwd).await.unwrap(), None);
+        assert_eq!(get_git_remote_urls_result(cwd).await.unwrap(), None);
+        let config = cwd.join(".git/config");
+        let valid_config = std::fs::read(&config).unwrap();
+        std::fs::write(&config, "[broken").unwrap();
+        assert!(get_head_commit_hash_result(cwd).await.is_err());
+        assert!(get_git_remote_urls_result(cwd).await.is_err());
+        std::fs::write(&config, valid_config).unwrap();
+        assert!(
+            run_git_command_with_timeout(
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    "initial"
+                ],
+                cwd
+            )
+            .await
+            .unwrap()
+            .status
+            .success()
+        );
+        assert!(get_head_commit_hash_result(cwd).await.unwrap().is_some());
+        assert_eq!(get_git_remote_urls_result(cwd).await.unwrap(), None);
     }
 }

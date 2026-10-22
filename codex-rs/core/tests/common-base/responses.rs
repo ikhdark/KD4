@@ -1637,7 +1637,11 @@ pub async fn mount_sse_sequence_with_request(
         let index = next.fetch_add(1, Ordering::SeqCst);
         let body = bodies.get(index).expect("unexpected model request").clone();
         sse_response(adapt(&ResponsesRequest(request.clone()).body_json(), body))
-    }).up_to_n_times(count).expect(count).mount(server).await;
+    })
+    .up_to_n_times(count)
+    .expect(count)
+    .mount(server)
+    .await;
     response_mock
 }
 

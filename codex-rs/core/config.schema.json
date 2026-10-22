@@ -283,7 +283,7 @@
           "type": "string"
         },
         {
-          "description": "Use keyring when available; otherwise, fall back to a file in CODEX_HOME.",
+          "description": "Prefer keyring storage. Read CODEX_HOME/auth.json only when the keyring has no credentials; keyring read errors do not select fallback credentials.",
           "enum": [
             "auto"
           ],
@@ -346,16 +346,6 @@
             "type": "string"
           },
           "type": "array"
-        }
-      },
-      "type": "object"
-    },
-    "ContextManagementConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "experimental_mode": {
-          "description": "Enables experimental context management.",
-          "type": "boolean"
         }
       },
       "type": "object"
@@ -469,16 +459,6 @@
         }
       ]
     },
-    "FeatureToml_for_ContextManagementConfigToml": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "$ref": "#/definitions/ContextManagementConfigToml"
-        }
-      ]
-    },
     "FeatureToml_for_CurrentTimeReminderConfigToml": {
       "anyOf": [
         {
@@ -506,16 +486,6 @@
         },
         {
           "$ref": "#/definitions/NetworkProxyConfigToml"
-        }
-      ]
-    },
-    "FeatureToml_for_TokenBudgetConfigToml": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "$ref": "#/definitions/TokenBudgetConfigToml"
         }
       ]
     },
@@ -643,7 +613,7 @@
             }
           ],
           "default": "save-all",
-          "description": "If true, history entries will not be written to disk."
+          "description": "Controls history persistence: `save-all` writes entries to disk; `none` disables history writes."
         }
       },
       "type": "object"
@@ -1161,6 +1131,11 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "supports_hosted_web_search": {
+          "default": false,
+          "description": "Whether this provider accepts the hosted Responses `web_search` tool. Custom providers must opt in; Responses transport alone does not imply support.",
+          "type": "boolean"
         },
         "supports_websockets": {
           "default": false,
@@ -2126,7 +2101,7 @@
       "description": "Policy for building the `env` when spawning a process via shell-like tools.",
       "properties": {
         "exclude": {
-          "description": "List of regular expressions.",
+          "description": "Case-insensitive wildcard patterns for environment variable names, using `*` and `?`.",
           "items": {
             "type": "string"
           },
@@ -2139,7 +2114,7 @@
           "type": "boolean"
         },
         "include_only": {
-          "description": "List of regular expressions.",
+          "description": "Case-insensitive wildcard patterns for environment variable names, using `*` and `?`.",
           "items": {
             "type": "string"
           },
@@ -2217,47 +2192,6 @@
           "type": "object"
         }
       ]
-    },
-    "TokenBudgetConfigToml": {
-      "additionalProperties": false,
-      "properties": {
-        "auto_compact_fallback_buffer_tokens": {
-          "description": "Additional tokens available after the compaction threshold for fallback note-taking.",
-          "format": "int64",
-          "minimum": 1.0,
-          "type": "integer"
-        },
-        "auto_compact_fallback_prompt": {
-          "description": "Developer message sampled before an automatic context-window rollover.",
-          "maxLength": 2000,
-          "type": "string"
-        },
-        "enabled": {
-          "type": "boolean"
-        },
-        "guidance_message": {
-          "description": "Guidance appended to the context-window metadata in a developer message.",
-          "maxLength": 2000,
-          "type": "string"
-        },
-        "reminder_message_template": {
-          "description": "Reminder template. `{n_remaining}` is replaced with the tokens remaining before auto-compaction.",
-          "maxLength": 2000,
-          "minLength": 1,
-          "type": "string"
-        },
-        "reminder_threshold_tokens": {
-          "description": "Number of tokens remaining before auto-compaction when the wrap-up reminder is emitted.",
-          "format": "int64",
-          "minimum": 1.0,
-          "type": "integer"
-        },
-        "use_history_notes_extension": {
-          "description": "Whether to expose the built-in history and notes extension.",
-          "type": "boolean"
-        }
-      },
-      "type": "object"
     },
     "ToolSuggestConfig": {
       "additionalProperties": false,
@@ -4098,9 +4032,6 @@
         "concurrent_reasoning_summaries": {
           "type": "boolean"
         },
-        "context_management": {
-          "$ref": "#/definitions/FeatureToml_for_ContextManagementConfigToml"
-        },
         "current_time_reminder": {
           "$ref": "#/definitions/FeatureToml_for_CurrentTimeReminderConfigToml"
         },
@@ -4211,9 +4142,6 @@
         },
         "terminal_visualization_instructions": {
           "type": "boolean"
-        },
-        "token_budget": {
-          "$ref": "#/definitions/FeatureToml_for_TokenBudgetConfigToml"
         },
         "tool_call_mcp_elicitation": {
           "type": "boolean"

@@ -151,7 +151,10 @@ pub(crate) enum Error {
     CellIdSpaceExhausted,
     DuplicateCell(CellId),
     MissingCell(CellId),
-    ExpiredResult { cell_id: CellId, completed: bool },
+    ExpiredResult {
+        cell_id: CellId,
+        completed: bool,
+    },
     BusyObserver(CellId),
     AlreadyTerminating(CellId),
     ClosedCell(CellId),
@@ -163,37 +166,50 @@ impl fmt::Display for Error {
         match self {
             Self::ShuttingDown => formatter.write_str("code mode session is shutting down"),
             Self::ActiveCellLimit(active) => {
-                let active = active.iter().map(|cell_id| serde_json::json!({
-                    "cell_id": cell_id.as_str(),
-                    "state": "registered",
-                    "readiness": "unknown",
-                    "permitted_actions": ["wait", "terminate"],
-                })).collect::<Vec<_>>();
-                write!(formatter, "{}", serde_json::json!({
-                    "kind": "code_mode_admission_failure",
-                    "version": 1,
-                    "reason": "active_cell_limit",
-                    "message": "code mode has reached its active cell limit; wait for a known dependency or explicitly terminate an unwanted cell before starting another exec",
-                    "started": false,
-                    "active_cells": active,
-                    "preparing_cells_may_be_unlisted": true,
-                    "retry_after": "a cell releases its permit",
-                }))
+                let active = active
+                    .iter()
+                    .map(|cell_id| {
+                        serde_json::json!({
+                            "cell_id": cell_id.as_str(),
+                            "state": "registered",
+                            "readiness": "unknown",
+                            "permitted_actions": ["wait", "terminate"],
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                write!(
+                    formatter,
+                    "{}",
+                    serde_json::json!({
+                        "kind": "code_mode_admission_failure",
+                        "version": 1,
+                        "reason": "active_cell_limit",
+                        "message": "code mode has reached its active cell limit; wait for a known dependency or explicitly terminate an unwanted cell before starting another exec",
+                        "started": false,
+                        "active_cells": active,
+                        "preparing_cells_may_be_unlisted": true,
+                        "retry_after": "a cell releases its permit",
+                    })
+                )
             }
             Self::CellIdSpaceExhausted => {
                 formatter.write_str("code mode session exhausted its cell ID space")
             }
             Self::DuplicateCell(cell_id) => write!(formatter, "exec cell {cell_id} already exists"),
             Self::MissingCell(cell_id) => write!(formatter, "exec cell {cell_id} not found"),
-            Self::ExpiredResult { cell_id, completed } => write!(formatter, "{}", serde_json::json!({
-                "kind": "exec_result_unavailable",
-                "cell_id": cell_id.as_str(),
-                "status": "expired_result",
-                "terminal_state": if *completed { "completed" } else { "interrupted" },
-                "recovery": null,
-                "automatic_replay_allowed": false,
-                "message": "The terminal result was evicted. No retained result locator is known; inspect previously retained tool receipts and do not replay effects blindly.",
-            })),
+            Self::ExpiredResult { cell_id, completed } => write!(
+                formatter,
+                "{}",
+                serde_json::json!({
+                    "kind": "exec_result_unavailable",
+                    "cell_id": cell_id.as_str(),
+                    "status": "expired_result",
+                    "terminal_state": if *completed { "completed" } else { "interrupted" },
+                    "recovery": null,
+                    "automatic_replay_allowed": false,
+                    "message": "The terminal result was evicted. No retained result locator is known; inspect previously retained tool receipts and do not replay effects blindly.",
+                })
+            ),
             Self::BusyObserver(cell_id) => {
                 write!(
                     formatter,

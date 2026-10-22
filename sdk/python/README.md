@@ -28,6 +28,12 @@ with Codex() as codex:
 `thread.run(...)` returns a `TurnResult` containing the final response,
 collected items, and token usage.
 
+Failed or incomplete buffered runs raise `TurnRunError` (a `RuntimeError`).
+It retains `items`, `usage`, `turn_id`, the observed `terminal` and `result`
+when available, and the original stream exception as `__cause__`.
+Earlier tools may already have completed: inspect these receipts before retrying.
+Async cancellation still propagates `CancelledError`.
+
 ## Authentication
 
 Existing Codex authentication is reused automatically. To start ChatGPT
@@ -71,6 +77,19 @@ with Codex() as codex:
 | `max_buffer_bytes` | 64 MiB of serialized notification payloads |
 | `max_notification_routes` | 256 tracked login, turn, and goal IDs |
 | `max_in_flight_requests` | 32 operations / async workers |
+
+The high-level `Codex` and `AsyncCodex` facades opt out of redundant
+`thread/started` and `thread/status/changed` mirrors. Turn streams and creation
+responses remain authoritative. Consume other global/account/warning events with
+`next_notification()` (sync accepts `timeout_s`); an undrained important-event
+stream still fails explicitly at the configured buffer limit. Low-level clients
+retain their default subscriptions and pull ownership.
+
+Server-request callbacks run in a separate four-worker, nonqueueing lane. A held
+callback does not block stdout decoding; saturation and callback exceptions return
+per-request errors. Callbacks cannot be forcibly stopped: uncooperative callbacks
+keep their slots, including across process restart, and late replies cannot cross
+transport generations.
 
 Timeouts must be finite and positive; capacity limits must be positive integers.
 Increase them explicitly for workloads that need larger results or longer turns.

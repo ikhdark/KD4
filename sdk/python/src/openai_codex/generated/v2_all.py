@@ -26,6 +26,12 @@ class AbsolutePathBuf(RootModel[str]):
     ]
 
 
+class AcceptedFinalMessageOrigin(Enum):
+    assistant_final = "assistant_final"
+    legacy_unphased = "legacy_unphased"
+    plan = "plan"
+
+
 class ApiKeyAccount(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -589,25 +595,6 @@ class CommandExecResizeResponse(BaseModel):
     )
 
 
-class CommandExecResponse(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    exit_code: Annotated[int, Field(alias="exitCode", description="Process exit code.")]
-    stderr: Annotated[
-        str,
-        Field(
-            description="Buffered stderr capture.\n\nEmpty when stderr was streamed via `command/exec/outputDelta`."
-        ),
-    ]
-    stdout: Annotated[
-        str,
-        Field(
-            description="Buffered stdout capture.\n\nEmpty when stdout was streamed via `command/exec/outputDelta`."
-        ),
-    ]
-
-
 class CommandExecTerminateParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -635,7 +622,8 @@ class CommandExecWriteParams(BaseModel):
     close_stdin: Annotated[
         bool | None,
         Field(
-            alias="closeStdin", description="Close stdin after writing `deltaBase64`, if present."
+            alias="closeStdin",
+            description="Close input after queued bytes. Unix PTYs send canonical VEOF (including flushing a partial line); raw/disabled-VEOF terminals return an error. Terminal EOF is not a permanent pipe half-close.",
         ),
     ] = None
     delta_base64: Annotated[
@@ -1072,6 +1060,20 @@ class DynamicToolSpec(RootModel[FunctionDynamicToolSpec | NamespaceDynamicToolSp
         populate_by_name=True,
     )
     root: FunctionDynamicToolSpec | NamespaceDynamicToolSpec
+
+
+class EnvironmentProvenance(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    environment_id: Annotated[str, Field(alias="environmentId")]
+    owner_id: Annotated[
+        str,
+        Field(
+            alias="ownerId",
+            description="Opaque registration/logical-session identity captured before dispatch.",
+        ),
+    ]
 
 
 class ExecOutputStream(Enum):
@@ -1590,14 +1592,6 @@ class FuzzyFileSearchResult(BaseModel):
     score: Annotated[int, Field(ge=0)]
 
 
-class FuzzyFileSearchSessionCompletedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    query: str
-    session_id: Annotated[str, Field(alias="sessionId")]
-
-
 class FuzzyFileSearchSessionUpdatedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -1625,7 +1619,7 @@ class FuzzyFileSearchSessionUpdatedNotification(BaseModel):
         bool | None,
         Field(
             alias="walkComplete",
-            description="True only after scanning finishes without omitting paths. A completed notification with this still false indicates an incomplete traversal.",
+            description="True only after scanning and current-query matching finish without omissions. False during matching, or when limits, cancellation or errors interrupt search.",
         ),
     ] = False
 
@@ -1774,6 +1768,14 @@ class ImageDetail(Enum):
     low = "low"
     high = "high"
     original = "original"
+
+
+class ImageTokenDetails(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    image_tokens: Annotated[int | None, Field(alias="imageTokens", ge=0)] = None
+    text_tokens: Annotated[int | None, Field(alias="textTokens", ge=0)] = None
 
 
 class InitializeCapabilities(BaseModel):
@@ -2936,44 +2938,13 @@ class PluginsMigration(BaseModel):
     plugin_names: Annotated[list[str], Field(alias="pluginNames")]
 
 
-class ProcessExitedNotification(BaseModel):
+class ProcessOutputCaptureState(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    exit_code: Annotated[int, Field(alias="exitCode", description="Process exit code.")]
-    process_handle: Annotated[
-        str,
-        Field(
-            alias="processHandle",
-            description="Client-supplied, connection-scoped `processHandle` from `process/spawn`.",
-        ),
-    ]
-    stderr: Annotated[
-        str,
-        Field(
-            description="Buffered stderr capture.\n\nEmpty when stderr was streamed via `process/outputDelta`."
-        ),
-    ]
-    stderr_cap_reached: Annotated[
-        bool,
-        Field(
-            alias="stderrCapReached",
-            description="Whether stderr reached `outputBytesCap`.\n\nIn streaming mode, stderr is empty and cap state is also reported on the final stderr `process/outputDelta` notification.",
-        ),
-    ]
-    stdout: Annotated[
-        str,
-        Field(
-            description="Buffered stdout capture.\n\nEmpty when stdout was streamed via `process/outputDelta`."
-        ),
-    ]
-    stdout_cap_reached: Annotated[
-        bool,
-        Field(
-            alias="stdoutCapReached",
-            description="Whether stdout reached `outputBytesCap`.\n\nIn streaming mode, stdout is empty and cap state is also reported on the final stdout `process/outputDelta` notification.",
-        ),
-    ]
+    cap_reached: Annotated[bool, Field(alias="capReached")]
+    drain_timed_out: Annotated[bool, Field(alias="drainTimedOut")]
+    reached_eof: Annotated[bool, Field(alias="reachedEof")]
 
 
 class ProcessOutputStream(Enum):
@@ -3572,14 +3543,6 @@ class ItemPlanDeltaServerNotification(BaseModel):
     params: PlanDeltaNotification
 
 
-class ProcessExitedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[Literal["process/exited"], Field(title="Process/exitedNotificationMethod")]
-    params: ProcessExitedNotification
-
-
 class ItemMcpToolCallProgressServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -3713,17 +3676,6 @@ class FuzzyFileSearchSessionUpdatedServerNotification(BaseModel):
         Field(title="FuzzyFileSearch/sessionUpdatedNotificationMethod"),
     ]
     params: FuzzyFileSearchSessionUpdatedNotification
-
-
-class FuzzyFileSearchSessionCompletedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["fuzzyFileSearch/sessionCompleted"],
-        Field(title="FuzzyFileSearch/sessionCompletedNotificationMethod"),
-    ]
-    params: FuzzyFileSearchSessionCompletedNotification
 
 
 class AccountLoginCompletedServerNotification(BaseModel):
@@ -4211,6 +4163,7 @@ class CommandExecutionThreadItem(BaseModel):
             alias="durationMs", description="The duration of the command execution in milliseconds."
         ),
     ] = None
+    environment: EnvironmentProvenance | None = None
     execution_id: Annotated[
         str | None,
         Field(
@@ -4325,6 +4278,7 @@ class ImageViewThreadItem(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    environment: EnvironmentProvenance | None = None
     id: str
     path: LegacyAppPathString
     type: Annotated[Literal["imageView"], Field(title="ImageViewThreadItemType")]
@@ -4337,18 +4291,6 @@ class SleepThreadItem(BaseModel):
     duration_ms: Annotated[int, Field(alias="durationMs", ge=0)]
     id: str
     type: Annotated[Literal["sleep"], Field(title="SleepThreadItemType")]
-
-
-class ImageGenerationThreadItem(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: str
-    result: str
-    revised_prompt: Annotated[str | None, Field(alias="revisedPrompt")] = None
-    saved_path: Annotated[AbsolutePathBuf | None, Field(alias="savedPath")] = None
-    status: str
-    type: Annotated[Literal["imageGeneration"], Field(title="ImageGenerationThreadItemType")]
 
 
 class EnteredReviewModeThreadItem(BaseModel):
@@ -4496,10 +4438,19 @@ class ThreadProjectUpdatedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadQueueAcceptedSubmission(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    queued_submission_id: Annotated[str, Field(alias="queuedSubmissionId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
 class ThreadQueueChangedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    revision: Annotated[int | None, Field(ge=0)] = None
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
@@ -4527,6 +4478,14 @@ class ThreadQueueListParams(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadQueuePendingStart(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    queued_submission_id: Annotated[str, Field(alias="queuedSubmissionId")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
 class ThreadQueueReorderParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4546,6 +4505,22 @@ class ThreadQueueReorderResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+
+
+class ThreadQueueSnapshot(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    accepted_submissions: Annotated[
+        list[ThreadQueueAcceptedSubmission],
+        Field(
+            alias="acceptedSubmissions",
+            description="Bounded recent receipts. An absent ID is unknown/expired, never proof of rejection or permission to resubmit potentially accepted input.",
+        ),
+    ]
+    paused: bool
+    pending_start: Annotated[ThreadQueuePendingStart | None, Field(alias="pendingStart")] = None
+    revision: Annotated[int, Field(ge=0)]
 
 
 class ThreadQueueStartParams(BaseModel):
@@ -4767,15 +4742,32 @@ class ThreadUnsubscribeStatus(Enum):
     unsubscribed = "unsubscribed"
 
 
-class TokenUsageBreakdown(BaseModel):
+class TokenUsageCoverage(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
-    cached_input_tokens: Annotated[int, Field(alias="cachedInputTokens")]
-    input_tokens: Annotated[int, Field(alias="inputTokens")]
-    output_tokens: Annotated[int, Field(alias="outputTokens")]
-    reasoning_output_tokens: Annotated[int, Field(alias="reasoningOutputTokens")]
-    total_tokens: Annotated[int, Field(alias="totalTokens")]
+    cache_write_input_tokens: Annotated[
+        int | None,
+        Field(
+            description="Sum of the explicitly reported cache-write input class, not an estimate. Interpret with cache_write_receipts; an absent class is never known zero."
+        ),
+    ] = 0
+    cache_write_receipts: Annotated[int | None, Field(ge=0)] = 0
+    cached_input_tokens: Annotated[int, Field(ge=0)]
+    input_tokens: Annotated[int, Field(ge=0)]
+    invalid_receipts: Annotated[int, Field(ge=0)]
+    output_tokens: Annotated[int, Field(ge=0)]
+    reasoning_output_tokens: Annotated[int, Field(ge=0)]
+    receipts: Annotated[int, Field(ge=0)]
+    reported_receipts: Annotated[
+        int | None,
+        Field(
+            description="Whole usage objects received. None preserves legacy coverage uncertainty.",
+            ge=0,
+        ),
+    ] = None
+    saturated: bool
+    total_tokens: Annotated[int, Field(ge=0)]
 
 
 class Tool(BaseModel):
@@ -4853,6 +4845,23 @@ class TurnEnvironmentParams(BaseModel):
     environment_id: Annotated[str, Field(alias="environmentId")]
 
 
+class TurnExecutionStopCause(RootModel[Literal["subagent_context_budget"]]):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    root: Literal["subagent_context_budget"]
+
+
+class TurnFinalRenderAck(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    canonical_sha256: Annotated[str, Field(alias="canonicalSha256")]
+    client_id: Annotated[str, Field(alias="clientId")]
+    clock_domain: Annotated[str, Field(alias="clockDomain")]
+    rendered_at_ms: Annotated[int, Field(alias="renderedAtMs", ge=0)]
+
+
 class TurnInterruptParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -4889,6 +4898,19 @@ class TurnPlanStepStatus(Enum):
     completed = "completed"
 
 
+class TurnRequiredEvidenceFrontier(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    available_host_ms: Annotated[int, Field(alias="availableHostMs", ge=0)]
+    provenance: str
+    result_ids: Annotated[
+        list[str],
+        Field(alias="resultIds", description="Oracle-owned references; not final-answer prose."),
+    ]
+    source_snapshot: Annotated[str, Field(alias="sourceSnapshot")]
+
+
 class TurnStatus(Enum):
     completed = "completed"
     interrupted = "interrupted"
@@ -4901,6 +4923,32 @@ class TurnSteerResponse(BaseModel):
         populate_by_name=True,
     )
     turn_id: Annotated[str, Field(alias="turnId")]
+
+
+class TurnTimingActivityInterval(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    compaction: bool
+    end_ns: Annotated[int, Field(alias="endNs", ge=0)]
+    interactive_wait: Annotated[bool, Field(alias="interactiveWait")]
+    model_active: Annotated[bool, Field(alias="modelActive")]
+    phase: Annotated[
+        str,
+        Field(
+            description="One of the ten canonical exclusive bucket names (without the Ns suffix)."
+        ),
+    ]
+    planning: bool
+    process_in_flight: Annotated[
+        bool,
+        Field(
+            alias="processInFlight",
+            description="Observed process flight, NOT guarded tool runtime or CPU execution.",
+        ),
+    ]
+    start_ns: Annotated[int, Field(alias="startNs", ge=0)]
+    tool_active: Annotated[bool, Field(alias="toolActive")]
 
 
 class TurnTimingAttemptKind(Enum):
@@ -4948,6 +4996,7 @@ class TurnTimingDiagnosticTokenAggregate(BaseModel):
         populate_by_name=True,
     )
     cached_input_tokens: Annotated[int, Field(alias="cachedInputTokens", ge=0)]
+    coverage: TokenUsageCoverage | None = None
     expected_usage_count: Annotated[
         int | None,
         Field(
@@ -4966,9 +5015,24 @@ class TurnTimingDiagnosticTokenAggregate(BaseModel):
             ge=0,
         ),
     ] = None
+    output_excluding_reported_reasoning_tokens: Annotated[
+        int | None,
+        Field(
+            alias="outputExcludingReportedReasoningTokens",
+            description="Same provider remainder as the per-request canonical field. Retained window only when TurnTiming.model_request_history_truncated is true.",
+            ge=0,
+        ),
+    ] = None
     reasoning_tokens: Annotated[int, Field(alias="reasoningTokens", ge=0)]
     total_tokens: Annotated[int, Field(alias="totalTokens", ge=0)]
-    visible_output_tokens: Annotated[int, Field(alias="visibleOutputTokens", ge=0)]
+    visible_output_tokens: Annotated[
+        int,
+        Field(
+            alias="visibleOutputTokens",
+            description="Deprecated compatibility remainder; never add it to the canonical field.",
+            ge=0,
+        ),
+    ]
 
 
 class TurnTimingExclusive(BaseModel):
@@ -5020,6 +5084,7 @@ class TurnTimingGenerationPurposeAggregate(BaseModel):
         populate_by_name=True,
     )
     cached_input_tokens: Annotated[int | None, Field(alias="cachedInputTokens", ge=0)] = 0
+    coverage: TokenUsageCoverage | None = None
     decision_latency_ns: Annotated[
         int | None,
         Field(
@@ -5048,6 +5113,14 @@ class TurnTimingGenerationPurposeAggregate(BaseModel):
             ge=0,
         ),
     ] = None
+    output_excluding_reported_reasoning_tokens: Annotated[
+        int | None,
+        Field(
+            alias="outputExcludingReportedReasoningTokens",
+            description="Provider remainder, not visible/final text. Completeness also requires TurnTiming.model_request_history_truncated == Some(false).",
+            ge=0,
+        ),
+    ] = None
     output_tokens: Annotated[int, Field(alias="outputTokens", ge=0)]
     purpose: TurnTimingGenerationPurpose
     reasoning_output_tokens: Annotated[int, Field(alias="reasoningOutputTokens", ge=0)]
@@ -5061,7 +5134,14 @@ class TurnTimingGenerationPurposeAggregate(BaseModel):
     ] = 0
     tool_calls: Annotated[int, Field(alias="toolCalls", ge=0)]
     total_tokens: Annotated[int | None, Field(alias="totalTokens", ge=0)] = 0
-    visible_output_tokens: Annotated[int | None, Field(alias="visibleOutputTokens", ge=0)] = 0
+    visible_output_tokens: Annotated[
+        int | None,
+        Field(
+            alias="visibleOutputTokens",
+            description="Deprecated compatibility remainder; never add it to the canonical field.",
+            ge=0,
+        ),
+    ] = 0
 
 
 class TurnTimingGenerationPurposeCounts(BaseModel):
@@ -5279,10 +5359,26 @@ class TurnTimingProviderTokenUsage(BaseModel):
         populate_by_name=True,
     )
     cached_input_tokens: Annotated[int, Field(alias="cachedInputTokens", ge=0)]
+    coverage: TokenUsageCoverage | None = None
     input_tokens: Annotated[int, Field(alias="inputTokens", ge=0)]
+    output_excluding_reported_reasoning_tokens: Annotated[
+        int | None,
+        Field(
+            alias="outputExcludingReportedReasoningTokens",
+            description="Provider output minus explicitly reported reasoning, not visible text.",
+            ge=0,
+        ),
+    ] = None
     reasoning_tokens: Annotated[int, Field(alias="reasoningTokens", ge=0)]
     total_tokens: Annotated[int, Field(alias="totalTokens", ge=0)]
-    visible_output_tokens: Annotated[int, Field(alias="visibleOutputTokens", ge=0)]
+    visible_output_tokens: Annotated[
+        int,
+        Field(
+            alias="visibleOutputTokens",
+            description="Deprecated compatibility remainder. Not a final-answer text count; consult coverage and the canonical optional field before interpreting it.",
+            ge=0,
+        ),
+    ]
 
 
 class TurnTimingRequestDiagnosticsStatus(Enum):
@@ -5315,6 +5411,44 @@ class TurnTimingTerminalization(BaseModel):
     validation_aggregate_ns: Annotated[int | None, Field(alias="validationAggregateNs", ge=0)] = 0
     validation_launch_count: Annotated[int | None, Field(alias="validationLaunchCount", ge=0)] = 0
     validation_process_ns: Annotated[int, Field(alias="validationProcessNs", ge=0)]
+
+
+class TurnTimingTimeline(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    clock_domain_id: Annotated[
+        str | None,
+        Field(
+            alias="clockDomainId",
+            description="Absent for clocks without proven alignment (including legacy records).",
+        ),
+    ] = None
+    coverage_complete: Annotated[bool, Field(alias="coverageComplete")]
+    dropped_intervals: Annotated[int, Field(alias="droppedIntervals", ge=0)]
+    duration_ns: Annotated[int, Field(alias="durationNs", ge=0)]
+    intervals: list[TurnTimingActivityInterval]
+    open_process_count: Annotated[
+        int,
+        Field(
+            alias="openProcessCount",
+            description="Processes still observed in flight at the frozen window end are censored.",
+            ge=0,
+        ),
+    ]
+    started_at_ns: Annotated[
+        int,
+        Field(
+            alias="startedAtNs",
+            description="Turn start in the named process domain; intervals below are turn-relative.",
+            ge=0,
+        ),
+    ]
+    tail_unknown: Annotated[
+        bool,
+        Field(alias="tailUnknown", description="Checkpoints do not assert a terminal endpoint."),
+    ]
+    version: Annotated[int, Field(ge=0)]
 
 
 class TurnTimingTokenCategoryBasis(RootModel[Literal["full_logical_prompt"]]):
@@ -5635,6 +5769,16 @@ class WorkspaceRouting(BaseModel):
 class WriteStatus(Enum):
     ok = "ok"
     ok_overridden = "okOverridden"
+
+
+class AcceptedFinalMessage(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    completion_attempt_id: Annotated[str, Field(alias="completionAttemptId")]
+    item_id: Annotated[str, Field(alias="itemId")]
+    origin: AcceptedFinalMessageOrigin
+    text: str
 
 
 class ChatgptAccount(BaseModel):
@@ -6577,6 +6721,13 @@ class CollabAgentState(BaseModel):
     last_agent_message: Annotated[str | None, Field(alias="lastAgentMessage")] = None
     message: str | None = None
     status: CollabAgentStatus
+    stop_cause: Annotated[
+        TurnExecutionStopCause | None,
+        Field(
+            alias="stopCause",
+            description="Execution scheduling cause, independent of lifecycle and task acceptance.",
+        ),
+    ] = None
     surfaced_result: Annotated[SurfacedToolResult | None, Field(alias="surfacedResult")] = None
 
 
@@ -6721,6 +6872,47 @@ class CommandExecResizeParams(BaseModel):
         ),
     ]
     size: Annotated[PtyTerminalSize, Field(description="New PTY size in character cells.")]
+
+
+class CommandExecResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    exit_code: Annotated[int, Field(alias="exitCode", description="Process exit code.")]
+    stderr: Annotated[
+        str,
+        Field(
+            description="Buffered stderr capture.\n\nEmpty when stderr was streamed via `command/exec/outputDelta`."
+        ),
+    ]
+    stderr_base64: Annotated[
+        str | None,
+        Field(
+            alias="stderrBase64",
+            description="Exact undelivered stderr suffix; same contract as `stdoutBase64`.",
+        ),
+    ] = None
+    stderr_capture: Annotated[ProcessOutputCaptureState | None, Field(alias="stderrCapture")] = None
+    stdout: Annotated[
+        str,
+        Field(
+            description="Buffered stdout capture.\n\nEmpty when stdout was streamed via `command/exec/outputDelta`."
+        ),
+    ]
+    stdout_base64: Annotated[
+        str | None,
+        Field(
+            alias="stdoutBase64",
+            description="Exact undelivered stdout suffix, appended after streamed raw deltas. When present use these bytes, not the lossy legacy `stdout` projection.",
+        ),
+    ] = None
+    stdout_capture: Annotated[
+        ProcessOutputCaptureState | None,
+        Field(
+            alias="stdoutCapture",
+            description="Absent only for peers/backends that cannot report capture facts.",
+        ),
+    ] = None
 
 
 class CommandExecutionOutputDeltaNotification(BaseModel):
@@ -6984,6 +7176,51 @@ class FunctionCallOutputContentItem(
     ]
 
 
+class FuzzyFileSearchResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    files: list[FuzzyFileSearchResult]
+    scanned_file_count: Annotated[
+        int | None,
+        Field(
+            alias="scannedFileCount",
+            description="Number of indexed files and directories, including entries that did not match.",
+            ge=0,
+        ),
+    ] = 0
+    total_match_count: Annotated[
+        int | None,
+        Field(
+            alias="totalMatchCount",
+            description="Matches found among scanned entries, before the result limit is applied.",
+            ge=0,
+        ),
+    ] = 0
+    walk_complete: Annotated[
+        bool | None,
+        Field(
+            alias="walkComplete",
+            description="False if scanning was skipped or paths were omitted due to limits, cancellation, or errors.",
+        ),
+    ] = False
+
+
+class FuzzyFileSearchSessionCompletedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cancelled: bool | None = None
+    query: str
+    results: Annotated[
+        FuzzyFileSearchResponse | None,
+        Field(
+            description="Terminal results are delivered even if best-effort progress updates were lost. Absent only in legacy server payloads; absence does not prove completeness."
+        ),
+    ] = None
+    session_id: Annotated[str, Field(alias="sessionId")]
+
+
 class GatewayOAuthReadResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7091,6 +7328,28 @@ class HooksListResponse(BaseModel):
         populate_by_name=True,
     )
     data: list[HooksListEntry]
+
+
+class ImageGenerationUsage(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    input_tokens: Annotated[int | None, Field(alias="inputTokens", ge=0)] = None
+    input_tokens_details: Annotated[ImageTokenDetails | None, Field(alias="inputTokensDetails")] = (
+        None
+    )
+    model: str | None = None
+    output_tokens: Annotated[int | None, Field(alias="outputTokens", ge=0)] = None
+    output_tokens_details: Annotated[
+        ImageTokenDetails | None, Field(alias="outputTokensDetails")
+    ] = None
+    reported: Annotated[
+        bool,
+        Field(
+            description="False means a response was observed but supplied no usable usage object."
+        ),
+    ]
+    total_tokens: Annotated[int | None, Field(alias="totalTokens", ge=0)] = None
 
 
 class ListMcpServerStatusParams(BaseModel):
@@ -7438,6 +7697,62 @@ class PluginShareUpdateTargetsResponse(BaseModel):
     principals: list[PluginSharePrincipal]
 
 
+class ProcessExitedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    exit_code: Annotated[int, Field(alias="exitCode", description="Process exit code.")]
+    process_handle: Annotated[
+        str,
+        Field(
+            alias="processHandle",
+            description="Client-supplied, connection-scoped `processHandle` from `process/spawn`.",
+        ),
+    ]
+    stderr: Annotated[
+        str,
+        Field(
+            description="Buffered stderr capture.\n\nEmpty when stderr was streamed via `process/outputDelta`."
+        ),
+    ]
+    stderr_base64: Annotated[str | None, Field(alias="stderrBase64")] = None
+    stderr_cap_reached: Annotated[
+        bool,
+        Field(
+            alias="stderrCapReached",
+            description="Whether stderr reached `outputBytesCap`.\n\nIn streaming mode, stderr is empty and cap state is also reported on the final stderr `process/outputDelta` notification.",
+        ),
+    ]
+    stderr_capture: Annotated[ProcessOutputCaptureState | None, Field(alias="stderrCapture")] = None
+    stdout: Annotated[
+        str,
+        Field(
+            description="Buffered stdout capture.\n\nEmpty when stdout was streamed via `process/outputDelta`."
+        ),
+    ]
+    stdout_base64: Annotated[
+        str | None,
+        Field(
+            alias="stdoutBase64",
+            description="Exact undelivered stdout suffix, appended after streamed raw deltas. When present use these bytes, not the lossy legacy text projection.",
+        ),
+    ] = None
+    stdout_cap_reached: Annotated[
+        bool,
+        Field(
+            alias="stdoutCapReached",
+            description="Whether stdout reached `outputBytesCap`.\n\nIn streaming mode, stdout is empty and cap state is also reported on the final stdout `process/outputDelta` notification.",
+        ),
+    ]
+    stdout_capture: Annotated[
+        ProcessOutputCaptureState | None,
+        Field(
+            alias="stdoutCapture",
+            description="Root exit does not establish output EOF; post-exit drain is bounded independently of the execution timeout and byte cap.",
+        ),
+    ] = None
+
+
 class ProcessOutputDeltaNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7719,6 +8034,14 @@ class ProcessOutputDeltaServerNotification(BaseModel):
     params: ProcessOutputDeltaNotification
 
 
+class ProcessExitedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[Literal["process/exited"], Field(title="Process/exitedNotificationMethod")]
+    params: ProcessExitedNotification
+
+
 class ItemCommandExecutionOutputDeltaServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7794,6 +8117,17 @@ class ConfigWarningServerNotification(BaseModel):
     )
     method: Annotated[Literal["configWarning"], Field(title="ConfigWarningNotificationMethod")]
     params: ConfigWarningNotification
+
+
+class FuzzyFileSearchSessionCompletedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["fuzzyFileSearch/sessionCompleted"],
+        Field(title="FuzzyFileSearch/sessionCompletedNotificationMethod"),
+    ]
+    params: FuzzyFileSearchSessionCompletedNotification
 
 
 class WindowsWorldWritableWarningServerNotification(BaseModel):
@@ -7986,6 +8320,7 @@ class FileChangeThreadItem(BaseModel):
         populate_by_name=True,
     )
     changes: list[FileUpdateChange]
+    environment: EnvironmentProvenance | None = None
     id: str
     status: PatchApplyStatus
     type: Annotated[Literal["fileChange"], Field(title="FileChangeThreadItemType")]
@@ -8044,9 +8379,35 @@ class WebSearchThreadItem(BaseModel):
         populate_by_name=True,
     )
     action: WebSearchAction | None = None
+    error: str | None = None
     id: str
     query: str
+    status: Annotated[
+        str | None,
+        Field(
+            description="Absent on historical/hosted items whose terminal outcome was not recorded."
+        ),
+    ] = None
     type: Annotated[Literal["webSearch"], Field(title="WebSearchThreadItemType")]
+
+
+class ImageGenerationThreadItem(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: str
+    provider_usage: Annotated[
+        ImageGenerationUsage | None,
+        Field(
+            alias="providerUsage",
+            description="Separate image-model receipt; never add these tokens to text inference.",
+        ),
+    ] = None
+    result: str
+    revised_prompt: Annotated[str | None, Field(alias="revisedPrompt")] = None
+    saved_path: Annotated[AbsolutePathBuf | None, Field(alias="savedPath")] = None
+    status: str
+    type: Annotated[Literal["imageGeneration"], Field(title="ImageGenerationThreadItemType")]
 
 
 class ThreadItem(
@@ -8182,6 +8543,10 @@ class ThreadQueueListResponse(BaseModel):
     )
     data: list[QueuedSubmission]
     next_cursor: Annotated[str | None, Field(alias="nextCursor")] = None
+    snapshot: Annotated[
+        ThreadQueueSnapshot | None,
+        Field(description="Absent on older peers, not proof that no submission was accepted."),
+    ] = None
 
 
 class ThreadQueueUpdateParams(BaseModel):
@@ -8232,6 +8597,12 @@ class ThreadSettings(BaseModel):
     collaboration_mode: Annotated[CollaborationMode, Field(alias="collaborationMode")]
     cwd: AbsolutePathBuf
     effort: ReasoningEffort | None = None
+    environments: Annotated[
+        list[ThreadSelectedEnvironment] | None,
+        Field(
+            description="Ordered applied selection; first is primary, empty disables environment access. Absent only when restoring legacy settings without selection information."
+        ),
+    ] = None
     model: str
     model_provider: Annotated[str, Field(alias="modelProvider")]
     personality: Personality | None = None
@@ -8276,36 +8647,23 @@ class ThreadStartParams(BaseModel):
     ] = None
 
 
-class ThreadTokenUsage(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    estimated_context_tokens: Annotated[
-        int | None,
-        Field(
-            alias="estimatedContextTokens",
-            description="Local active-context estimate, not observed provider consumption.",
-        ),
-    ] = None
-    last: TokenUsageBreakdown
-    model_context_window: Annotated[int | None, Field(alias="modelContextWindow")] = None
-    total: TokenUsageBreakdown
-
-
-class ThreadTokenUsageUpdatedNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    thread_id: Annotated[str, Field(alias="threadId")]
-    token_usage: Annotated[ThreadTokenUsage, Field(alias="tokenUsage")]
-    turn_id: Annotated[str, Field(alias="turnId")]
-
-
 class ThreadUnsubscribeResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
     status: ThreadUnsubscribeStatus
+
+
+class TokenUsageBreakdown(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cached_input_tokens: Annotated[int, Field(alias="cachedInputTokens")]
+    coverage: TokenUsageCoverage | None = None
+    input_tokens: Annotated[int, Field(alias="inputTokens")]
+    output_tokens: Annotated[int, Field(alias="outputTokens")]
+    reasoning_output_tokens: Annotated[int, Field(alias="reasoningOutputTokens")]
+    total_tokens: Annotated[int, Field(alias="totalTokens")]
 
 
 class ToolLifecycleTimerWait(BaseModel):
@@ -8352,6 +8710,42 @@ class TurnError(BaseModel):
     message: str
 
 
+class TurnFinalTail(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    canonical_sha256: Annotated[str | None, Field(alias="canonicalSha256")] = None
+    first_content_host_ms: Annotated[int | None, Field(alias="firstContentHostMs", ge=0)] = None
+    full_content_host_ms: Annotated[int | None, Field(alias="fullContentHostMs", ge=0)] = None
+    item_id: Annotated[str | None, Field(alias="itemId")] = None
+    measurement_version: Annotated[int, Field(alias="measurementVersion", ge=0)]
+    native_render_ack: Annotated[
+        TurnFinalRenderAck | None,
+        Field(
+            alias="nativeRenderAck",
+            description="Requires a capable native client. Server writer receipts are NOT render acknowledgments and cannot populate this field.",
+        ),
+    ] = None
+    reconciled_host_ms: Annotated[
+        int | None,
+        Field(
+            alias="reconciledHostMs",
+            description="Host observation of the admitted final candidate, not proof that every user obligation or external evidence source was reconciled.",
+            ge=0,
+        ),
+    ] = None
+    required_evidence: Annotated[
+        TurnRequiredEvidenceFrontier | None,
+        Field(
+            alias="requiredEvidence",
+            description="Unknown unless an authoritative task oracle supplies required evidence; never substitute the most recent tool, status call, or plan completion.",
+        ),
+    ] = None
+    text_codepoints: Annotated[int | None, Field(alias="textCodepoints", ge=0)] = None
+    text_utf8_bytes: Annotated[int | None, Field(alias="textUtf8Bytes", ge=0)] = None
+    whitespace_words: Annotated[int | None, Field(alias="whitespaceWords", ge=0)] = None
+
+
 class TurnPlanStep(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -8384,7 +8778,9 @@ class TurnStartParams(BaseModel):
     client_user_message_id: Annotated[str | None, Field(alias="clientUserMessageId")] = None
     cwd: Annotated[
         str | None,
-        Field(description="Override the working directory for this turn and subsequent turns."),
+        Field(
+            description="Override the legacy host working directory for this and subsequent turns. When `environments` is omitted, only a selected local environment is retargeted; remote cwd values and an explicitly empty selection are preserved."
+        ),
     ] = None
     effort: Annotated[
         ReasoningEffort | None,
@@ -8510,13 +8906,21 @@ class TurnTimingCounters(BaseModel):
         int | None,
         Field(
             alias="logicalGenerationCount",
-            description="Logical workflow generations. `model_request_count` remains the authoritative physical provider-attempt aggregate.",
+            description="Logical workflow generations. `model_request_count` remains the authoritative physical transport-attempt aggregate in timing schema 34+: each identity is counted once at transport entry, including internal auth retries. This does not prove provider receipt. Older schemas may count only the first dispatch/readiness in a sampling row.",
             ge=0,
         ),
     ] = 0
     mcp_elicitation_wait_count: Annotated[int, Field(alias="mcpElicitationWaitCount", ge=0)]
     model_fallback_count: Annotated[int, Field(alias="modelFallbackCount", ge=0)]
     model_request_count: Annotated[int, Field(alias="modelRequestCount", ge=0)]
+    model_request_detail_eviction_count: Annotated[
+        int | None,
+        Field(
+            alias="modelRequestDetailEvictionCount",
+            description="Bounded detail loss; diagnostics derived from request rows cover only retained detail when either eviction counter is nonzero.",
+            ge=0,
+        ),
+    ] = 0
     model_retry_count: Annotated[int, Field(alias="modelRetryCount", ge=0)]
     no_progress_directive_count: Annotated[
         int | None, Field(alias="noProgressDirectiveCount", ge=0)
@@ -8530,6 +8934,9 @@ class TurnTimingCounters(BaseModel):
         ),
     ] = 0
     permission_wait_count: Annotated[int, Field(alias="permissionWaitCount", ge=0)]
+    physical_attempt_detail_eviction_count: Annotated[
+        int | None, Field(alias="physicalAttemptDetailEvictionCount", ge=0)
+    ] = 0
     plan_revision_generation_count: Annotated[
         int | None, Field(alias="planRevisionGenerationCount", ge=0)
     ] = 0
@@ -8986,6 +9393,13 @@ class TurnTimingToolClosure(BaseModel):
         int | None, Field(alias="duplicatePersistenceCount", ge=0)
     ] = 0
     duplicate_timing_count: Annotated[int | None, Field(alias="duplicateTimingCount", ge=0)] = 0
+    measurement_available: Annotated[
+        bool | None,
+        Field(
+            alias="measurementAvailable",
+            description="False when a legacy record omitted the entire closure ledger. Its zero counts and incomplete verdict are unavailable evidence, not observations.",
+        ),
+    ] = True
     orphan_calls: Annotated[list[TurnTimingToolCallIdentity] | None, Field(alias="orphanCalls")] = (
         None
     )
@@ -9687,17 +10101,6 @@ class ThreadSettingsUpdatedServerNotification(BaseModel):
     params: ThreadSettingsUpdatedNotification
 
 
-class ThreadTokenUsageUpdatedServerNotification(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    method: Annotated[
-        Literal["thread/tokenUsage/updated"],
-        Field(title="Thread/tokenUsage/updatedNotificationMethod"),
-    ]
-    params: ThreadTokenUsageUpdatedNotification
-
-
 class HookCompletedServerNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -9810,6 +10213,44 @@ class SessionSource(RootModel[SessionSourceValue | CustomSessionSource | SubAgen
         populate_by_name=True,
     )
     root: SessionSourceValue | CustomSessionSource | SubAgentSessionSource
+
+
+class ThreadTokenUsage(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    estimated_context_tokens: Annotated[
+        int | None,
+        Field(
+            alias="estimatedContextTokens",
+            description="Local active-context estimate, not observed provider consumption.",
+        ),
+    ] = None
+    last: TokenUsageBreakdown
+    model_context_window: Annotated[int | None, Field(alias="modelContextWindow")] = None
+    total: TokenUsageBreakdown
+
+
+class ThreadTokenUsageUpdatedNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    thread_id: Annotated[str, Field(alias="threadId")]
+    token_usage: Annotated[ThreadTokenUsage, Field(alias="tokenUsage")]
+    turn_id: Annotated[str, Field(alias="turnId")]
+
+
+class TurnFinalAnswer(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    message: AcceptedFinalMessage | None = None
+    tail: Annotated[
+        TurnFinalTail | None,
+        Field(
+            description="Absent in older records. Final-specific observations, not task acceptance."
+        ),
+    ] = None
 
 
 class TurnTimingModelRequest(BaseModel):
@@ -9991,7 +10432,7 @@ class TurnTimingModelRequest(BaseModel):
         int | None,
         Field(
             alias="toolCallCount",
-            description="Tool calls whose deferred executor future was polled for this generation. Kept under its historical field name for rollout compatibility.",
+            description="Unique tool calls accepted for this generation, including unpolled calls. Timing schemas <=32 counted calls at executor polling instead.",
             ge=0,
         ),
     ] = 0
@@ -10152,10 +10593,28 @@ class RawResponseItemCompletedNotification(BaseModel):
     turn_id: Annotated[str, Field(alias="turnId")]
 
 
+class ThreadTokenUsageUpdatedServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    method: Annotated[
+        Literal["thread/tokenUsage/updated"],
+        Field(title="Thread/tokenUsage/updatedNotificationMethod"),
+    ]
+    params: ThreadTokenUsageUpdatedNotification
+
+
 class TurnTiming(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
     )
+    activity_timeline: Annotated[
+        TurnTimingTimeline | None,
+        Field(
+            alias="activityTimeline",
+            description="Bounded occurrence intervals in a named process clock domain. Missing evidence must not be reconstructed from scalar totals or wall epochs.",
+        ),
+    ] = None
     checkout_snapshot_sha256: Annotated[
         str | None,
         Field(
@@ -10191,6 +10650,13 @@ class TurnTiming(BaseModel):
         ),
     ] = None
     exclusive: TurnTimingExclusive
+    final_answer: Annotated[
+        TurnFinalAnswer | None,
+        Field(
+            alias="finalAnswer",
+            description="Accepted answer identity frozen after completion hooks and pending-input admission. Some with no message explicitly means no accepted answer; absence is legacy unknown. This is not the last visible/partial message.",
+        ),
+    ] = None
     inclusive_duration_ms: Annotated[int, Field(alias="inclusiveDurationMs", ge=0)]
     inclusive_duration_ns: Annotated[int, Field(alias="inclusiveDurationNs", ge=0)]
     local: TurnTimingLocal
@@ -10204,6 +10670,13 @@ class TurnTiming(BaseModel):
         ),
     ]
     milestones: TurnTimingMilestones
+    model_request_history_truncated: Annotated[
+        bool | None,
+        Field(
+            alias="modelRequestHistoryTruncated",
+            description="True qualifies all history-derived purpose, failure, wait-signature and nonprogress aggregates as retained-tail lower bounds. None is legacy unknown.",
+        ),
+    ] = None
     model_requests: Annotated[
         list[TurnTimingModelRequest] | None,
         Field(
@@ -10215,7 +10688,7 @@ class TurnTiming(BaseModel):
         TurnTimingDiagnosticLatencyAggregate | None,
         Field(
             alias="observationalNonprogressLatency",
-            description="Latency observed on the same unchanged-state, unchanged-next-action generations as `observational_nonprogress_tokens`. Model-stream wait remains a model-side wall-clock measurement; `decision_latency_ns` narrows that to dispatch-to-first-actionable-output where observable.",
+            description="Latency observed on the same no-recorded-progress, unchanged-state generations as `observational_nonprogress_tokens`. Model-stream wait remains a model-side wall-clock measurement; `decision_latency_ns` narrows that to dispatch-to-first-actionable-output where observable.",
         ),
     ] = {
         "decisionLatencyNs": 0,
@@ -10230,7 +10703,7 @@ class TurnTiming(BaseModel):
         TurnTimingDiagnosticTokenAggregate | None,
         Field(
             alias="observationalNonprogressTokens",
-            description="Provider usage observed on generations where neither relevant structured state nor the next-correct-action changed. This is a diagnostic and is never treated as measured avoidable savings.",
+            description="Provider usage observed on generations with no recorded progress kinds and unchanged relevant state. A changed next action alone is not progress under this predicate; useful inference or diagnosis may still occur. Final-answer publication is excluded. This observational diagnostic is neither measured avoidable savings nor authority to stop a turn.",
         ),
     ] = {
         "cachedInputTokens": 0,
@@ -10246,6 +10719,20 @@ class TurnTiming(BaseModel):
     profile_valid: Annotated[bool, Field(alias="profileValid")]
     schema_version: Annotated[int, Field(alias="schemaVersion", ge=0)]
     started_at_unix_ms: Annotated[int | None, Field(alias="startedAtUnixMs")] = None
+    stop_cause: Annotated[
+        TurnExecutionStopCause | None,
+        Field(
+            alias="stopCause",
+            description="Scheduling cause, not an acceptance verdict. Absent on older records.",
+        ),
+    ] = None
+    terminal_publication_duration_excluded: Annotated[
+        bool | None,
+        Field(
+            alias="terminalPublicationDurationExcluded",
+            description="Frozen-core duration excludes subsequent detail export and event enqueue; it is not a client-delivery or terminal-publication latency measurement.",
+        ),
+    ] = None
     terminalization: Annotated[
         TurnTimingTerminalization | None,
         Field(
@@ -10277,11 +10764,12 @@ class TurnTiming(BaseModel):
         ),
     ] = {
         "acceptedCount": 0,
-        "complete": True,
+        "complete": False,
         "duplicateAcceptanceCount": 0,
         "duplicateCallIdCount": 0,
         "duplicatePersistenceCount": 0,
         "duplicateTimingCount": 0,
+        "measurementAvailable": False,
         "orphanPersistenceCount": 0,
         "orphanTimingCount": 0,
         "overflowCount": 0,

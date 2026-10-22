@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import io
+import contextlib
 import os
 import sys
 import tarfile
@@ -61,13 +62,16 @@ class ResolveZstdCommandTest(unittest.TestCase):
             process = mock.Mock()
             process.stdin = io.BytesIO()
             process.wait.return_value = 0
+            process.poll.return_value = 0
 
             with (
                 mock.patch.object(
                     archive, "resolve_zstd_command", return_value=["zstd"]
                 ),
                 mock.patch.object(
-                    archive.subprocess, "Popen", return_value=process
+                    archive,
+                    "owned_process",
+                    side_effect=lambda *args, **kwargs: contextlib.nullcontext(process),
                 ) as popen,
                 mock.patch.object(
                     archive, "write_tar_stream", wraps=archive.write_tar_stream
@@ -119,6 +123,37 @@ class ResolveZstdCommandTest(unittest.TestCase):
 
 
 class WriteArchiveSafetyTest(unittest.TestCase):
+    def test_zstd_deadline_interrupts_blocked_input_and_preserves_output(self):
+        from scripts.common.process_owner import operation
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            package.mkdir()
+            (package / "codex-package.json").write_bytes(b"x" * 2_000_000)
+            output = root / "package.tar.zst"
+            output.write_bytes(b"previous")
+            with (
+                mock.patch.object(
+                    archive,
+                    "resolve_zstd_command",
+                    return_value=[
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        "import time; time.sleep(30)",
+                    ],
+                ),
+                operation(0.1),
+            ):
+                with self.assertRaises(TimeoutError):
+                    archive.write_archive(package, output, force=True)
+            self.assertEqual(output.read_bytes(), b"previous")
+            self.assertEqual(
+                sorted(p.name for p in root.iterdir()), ["package", "package.tar.zst"]
+            )
+
     def test_rejects_archive_output_that_resolves_inside_package_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

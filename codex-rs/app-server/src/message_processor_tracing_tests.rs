@@ -1,8 +1,8 @@
 use super::ConnectionSessionState;
-#[path = "message_processor_thread_queue_tests.rs"]
-mod thread_queue_tests;
 #[path = "message_processor_dispatch_latency_tests.rs"]
 mod dispatch_latency_tests;
+#[path = "message_processor_thread_queue_tests.rs"]
+mod thread_queue_tests;
 use super::MessageProcessor;
 use super::MessageProcessorArgs;
 use super::notification_log_metadata;
@@ -94,134 +94,6 @@ fn logging_contract_notification_metadata_is_bounded_and_omits_params() {
     assert!(metadata.params_present);
     assert!(metadata.method.len() <= 128);
     assert!(!format!("{metadata:?}").contains("notification secret"));
-}
-
-#[test]
-#[serial(app_server_tracing)]
-fn external_import_records_committed_change_after_disconnect_with_full_queue() -> Result<()> {
-    run_current_thread_test_with_stack(
-        "external_import_records_committed_change_after_disconnect_with_full_queue",
-        async {
-            use crate::outgoing_message::ConnectionRequestId;
-            use codex_app_server_protocol::AppListUpdatedNotification;
-            use codex_app_server_protocol::ExternalAgentConfigMigrationItemType;
-            use codex_app_server_protocol::ServerNotification;
-            use std::time::Duration;
-
-            let server = create_mock_responses_server_repeating_assistant("Done").await;
-            let mut harness = TracingHarness::new_with_features(
-                server,
-                Arc::new(codex_config::NoopThreadConfigLoader),
-                false,
-                true,
-            )
-            .await?;
-            let repo = TempDir::new()?;
-            std::fs::create_dir(repo.path().join(".git"))?;
-            std::fs::create_dir(repo.path().join(".claude"))?;
-            let source = repo.path().join(".claude").join("settings.json");
-            let target = repo.path().join(".codex").join("config.toml");
-            std::fs::write(&source, r#"{"env":{"IMPORT_COMPLETION_TEST":"saved"}}"#)?;
-
-            while harness.processor.outgoing.try_send_server_notification(
-                ServerNotification::AppListUpdated(AppListUpdatedNotification { data: Vec::new() }),
-            ) {}
-            let request_id = ConnectionRequestId {
-                connection_id: TEST_CONNECTION_ID,
-                request_id: RequestId::Integer(430_001),
-            };
-            harness
-                .processor
-                .process_request(
-                    TEST_CONNECTION_ID,
-                    request_from_client_request(ClientRequest::ExternalAgentConfigImport {
-                        request_id: request_id.request_id.clone(),
-                        params: serde_json::from_value(json!({
-                            "migrationItems": [{
-                                "itemType": "CONFIG",
-                                "description": "Import project environment",
-                                "cwd": repo.path(),
-                            }],
-                        }))?,
-                    }),
-                    &AppServerTransport::Stdio,
-                    Arc::clone(&harness.session),
-                )
-                .await;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if !harness
-                        .processor
-                        .outgoing
-                        .lock_request_contexts_for_test()
-                        .await
-                        .contains_key(&request_id)
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("import must reach its blocked response after the write");
-            let config: toml::Value = toml::from_str(&std::fs::read_to_string(&target)?)?;
-            assert_eq!(
-                config["shell_environment_policy"]["set"]["IMPORT_COMPLETION_TEST"].as_str(),
-                Some("saved")
-            );
-            assert!(
-                harness
-                    .processor
-                    .external_agent_config_processor
-                    .read_import_histories()
-                    .await
-                    .expect("read persisted import history")
-                    .data
-                    .is_empty(),
-                "completion must still be pending at the blocked response"
-            );
-
-            // Use the dispatcher's actual cancellation boundary and leave the
-            // outgoing queue full: neither disconnect nor delivery can own completion.
-            harness.session.rpc_gate.shutdown().await;
-            let history = tokio::time::timeout(Duration::from_secs(20), async {
-                loop {
-                    let history = harness
-                        .processor
-                        .external_agent_config_processor
-                        .read_import_histories()
-                        .await
-                        .expect("read persisted import history");
-                    if !history.data.is_empty() {
-                        break history.data;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("committed import must finalize despite a disconnected, blocked recipient");
-            assert_eq!(history.len(), 1);
-            assert!(history[0].failures.is_empty());
-            assert_eq!(history[0].successes.len(), 1);
-            let success = &history[0].successes[0];
-            assert_eq!(
-                success.item_type,
-                ExternalAgentConfigMigrationItemType::Config
-            );
-            assert_eq!(success.source.as_deref(), source.to_str());
-            assert_eq!(success.target.as_deref(), target.to_str());
-            let background_tasks = harness.processor.thread_processor.background_tasks.clone();
-            background_tasks.close();
-            tokio::time::timeout(Duration::from_secs(7), background_tasks.wait())
-                .await
-                .expect(
-                    "completion delivery must release the tracked task while the queue is full",
-                );
-            harness.outgoing_rx.close();
-            harness.shutdown().await;
-            Ok(())
-        },
-    )
 }
 
 struct SerializationProbe<'a>(&'a AtomicUsize);
@@ -324,16 +196,43 @@ async fn graceful_drain_rejects_new_turns_but_routes_interrupts() -> Result<()> 
     let thread = harness.start_thread(2, None).await.thread.id;
     harness.processor.begin_drain();
     for (id, method, params, rejected) in [
-        (3, "turn/start", serde_json::json!({"threadId":thread, "input":[]}), true),
-        (4, "thread/compact/start", serde_json::json!({"threadId":thread}), true),
-        (5, "turn/interrupt", serde_json::json!({"threadId":thread, "turnId":"not-running"}), false),
-        (6, "thread/shellCommand", serde_json::json!({"threadId":thread, "command":"echo blocked"}), true),
+        (
+            3,
+            "turn/start",
+            serde_json::json!({"threadId":thread, "input":[]}),
+            true,
+        ),
+        (
+            4,
+            "thread/compact/start",
+            serde_json::json!({"threadId":thread}),
+            true,
+        ),
+        (
+            5,
+            "turn/interrupt",
+            serde_json::json!({"threadId":thread, "turnId":"not-running"}),
+            false,
+        ),
+        (
+            6,
+            "thread/shellCommand",
+            serde_json::json!({"threadId":thread, "command":"echo blocked"}),
+            true,
+        ),
     ] {
         let request: JSONRPCRequest = serde_json::from_value(serde_json::json!({
             "id": id, "method": method, "params": params,
         }))?;
-        harness.processor.process_request(TEST_CONNECTION_ID, request, &AppServerTransport::Stdio,
-            harness.session.clone()).await;
+        harness
+            .processor
+            .process_request(
+                TEST_CONNECTION_ID,
+                request,
+                &AppServerTransport::Stdio,
+                harness.session.clone(),
+            )
+            .await;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let envelope = harness.outgoing_rx.recv().await.unwrap();
@@ -341,28 +240,36 @@ async fn graceful_drain_rejects_new_turns_but_routes_interrupts() -> Result<()> 
                     connection_id,
                     message,
                     ..
-                } = envelope else {
+                } = envelope
+                else {
                     continue;
                 };
                 if connection_id != TEST_CONNECTION_ID {
                     continue;
                 }
                 match message {
-                    crate::outgoing_message::OutgoingMessage::Error(error) if error.id == RequestId::Integer(id) => {
+                    crate::outgoing_message::OutgoingMessage::Error(error)
+                        if error.id == RequestId::Integer(id) =>
+                    {
                         let draining = error.error.data.as_ref().and_then(|data| data.get("kind"))
                             == Some(&serde_json::json!("server_draining"));
                         assert_eq!(draining, rejected, "{error:?}");
-                        if rejected { assert_eq!(error.error.data.unwrap()["retryable"], true); }
+                        if rejected {
+                            assert_eq!(error.error.data.unwrap()["retryable"], true);
+                        }
                         break;
                     }
-                    crate::outgoing_message::OutgoingMessage::Response(response) if response.id == RequestId::Integer(id) => {
+                    crate::outgoing_message::OutgoingMessage::Response(response)
+                        if response.id == RequestId::Integer(id) =>
+                    {
                         assert!(!rejected);
                         break;
                     }
                     _ => {}
                 }
             }
-        }).await?;
+        })
+        .await?;
     }
     harness.shutdown().await;
     Ok(())
@@ -581,7 +488,11 @@ fn config_batch_write_refreshes_live_thread_only_when_requested() -> Result<()> 
                 // through config(), which supplies the next turn's configuration.
                 assert_eq!(thread.enabled(Feature::AuthElicitation), original);
                 assert_eq!(
-                    thread.config().await.features.enabled(Feature::AuthElicitation),
+                    thread
+                        .config()
+                        .await
+                        .features
+                        .enabled(Feature::AuthElicitation),
                     expected_live,
                 );
                 let features: ExperimentalFeatureListResponse = harness
@@ -594,8 +505,12 @@ fn config_batch_write_refreshes_live_thread_only_when_requested() -> Result<()> 
                     )
                     .await;
                 assert_eq!(
-                    features.data.iter().find(|feature| feature.name == "auth_elicitation")
-                        .expect("auth_elicitation feature").enabled,
+                    features
+                        .data
+                        .iter()
+                        .find(|feature| feature.name == "auth_elicitation")
+                        .expect("auth_elicitation feature")
+                        .enabled,
                     enabled,
                     "feature listing projects persisted configuration even without runtime reload",
                 );
@@ -730,9 +645,10 @@ fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
-    // Match the larger stack used by the other async integration harnesses.
-    // The fully instrumented thread/start path exceeds 4 MiB on Windows.
-    const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+    // Match the production Tokio worker stack (`TOKIO_WORKER_STACK_SIZE_BYTES`
+    // in codex-arg0). The fully instrumented debug thread/start path exceeds
+    // 8 MiB on Windows.
+    const TEST_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
     let handle = std::thread::Builder::new()
         .name(name.to_string())
@@ -2042,7 +1958,9 @@ fn rollback_request_cancellation_releases_reservation_before_retry() -> Result<(
                         } => {
                             assert_eq!(connection_id, TEST_CONNECTION_ID);
                             if let Some(receipt) = write_complete_tx {
-                                receipt.send(std::time::Instant::now()).expect("transport receipt receiver");
+                                receipt
+                                    .send(std::time::Instant::now())
+                                    .expect("transport receipt receiver");
                             }
                             message
                         }
@@ -2585,7 +2503,10 @@ fn archive_cleanup_survives_origin_disconnect_while_quiescing_writer() -> Result
             .await
             .expect("surviving connection must be notified of the committed archive");
             assert_eq!(archived.thread_id, thread_id.to_string());
-            assert!(!rollout_path.exists(), "store commit must move the active rollout");
+            assert!(
+                !rollout_path.exists(),
+                "store commit must move the active rollout"
+            );
             assert!(
                 store
                     .read_thread(ReadThreadParams {
@@ -4405,7 +4326,11 @@ mod command_exec_control_rpc_tests {
             .display()
             .to_string()
             .replace('\'', "''");
-        let pid_file = dir.join("child-pid").display().to_string().replace('\'', "''");
+        let pid_file = dir
+            .join("child-pid")
+            .display()
+            .to_string()
+            .replace('\'', "''");
         let script = format!(
             "[IO.File]::WriteAllText('{pid_file}', [string]$PID); \
              [Console]::Out.WriteLine('stdin-ready'); [Console]::Out.Flush(); \
@@ -4759,7 +4684,8 @@ mod command_exec_control_rpc_tests {
                 let dir = TempDir::new()?;
                 start_gated_reader(&mut harness, dir.path(), "metadata-blocked-command", 60_000)
                     .await;
-                let child_pid: u32 = std::fs::read_to_string(dir.path().join("child-pid"))?.parse()?;
+                let child_pid: u32 =
+                    std::fs::read_to_string(dir.path().join("child-pid"))?.parse()?;
                 let mut watcher = tokio::process::Command::new("powershell.exe")
                     .args(["-NoLogo", "-NoProfile", "-Command", &format!(
                         "$ErrorActionPreference = 'Stop'; $child = Get-Process -Id {child_pid}; \
@@ -4771,21 +4697,37 @@ mod command_exec_control_rpc_tests {
                     .spawn()?;
                 let mut output = tokio::io::BufReader::new(watcher.stdout.take().unwrap());
                 let mut ready = String::new();
-                tokio::time::timeout(Duration::from_secs(15), output.read_line(&mut ready)).await??;
-                assert_eq!(ready.trim(), "watching", "watcher owns the live child handle");
+                tokio::time::timeout(Duration::from_secs(15), output.read_line(&mut ready))
+                    .await??;
+                assert_eq!(
+                    ready.trim(),
+                    "watching",
+                    "watcher owns the live child handle"
+                );
 
                 let outgoing = Arc::clone(&harness.processor.outgoing);
                 let contexts = outgoing.lock_request_contexts_for_test().await;
                 let processor = Arc::clone(&harness.processor);
                 let session = Arc::clone(&harness.session);
                 let close = tokio::spawn(async move {
-                    processor.connection_closed(TEST_CONNECTION_ID, &session).await;
+                    processor
+                        .connection_closed(TEST_CONNECTION_ID, &session)
+                        .await;
                 });
-                tokio::time::timeout(Duration::from_secs(5),
-                    harness.session.rpc_gate.cancellation_token().cancelled()).await?;
-                assert!(!close.is_finished(), "cleanup is blocked on response metadata");
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    harness.session.rpc_gate.cancellation_token().cancelled(),
+                )
+                .await?;
+                assert!(
+                    !close.is_finished(),
+                    "cleanup is blocked on response metadata"
+                );
                 let early_exit = tokio::time::timeout(Duration::from_secs(5), watcher.wait()).await;
-                assert!(!close.is_finished(), "metadata remains locked through observation");
+                assert!(
+                    !close.is_finished(),
+                    "metadata remains locked through observation"
+                );
                 // Always release cleanup before asserting the regression outcome, so
                 // a RED run still kills the real child rather than leaking it.
                 drop(contexts);
@@ -4793,13 +4735,20 @@ mod command_exec_control_rpc_tests {
                 let exited_before_cleanup = early_exit.is_ok();
                 let status = match early_exit {
                     Ok(status) => status?,
-                    Err(_) => tokio::time::timeout(Duration::from_secs(15), watcher.wait()).await??,
+                    Err(_) => {
+                        tokio::time::timeout(Duration::from_secs(15), watcher.wait()).await??
+                    }
                 };
-                assert!(status.success(), "OS watcher observes actual child termination");
+                assert!(
+                    status.success(),
+                    "OS watcher observes actual child termination"
+                );
                 assert!(!dir.path().join("received.bin").exists());
                 harness.shutdown().await;
-                assert!(exited_before_cleanup,
-                    "connection cancellation must kill command/exec before blocked metadata cleanup");
+                assert!(
+                    exited_before_cleanup,
+                    "connection cancellation must kill command/exec before blocked metadata cleanup"
+                );
                 Ok(())
             },
         )
@@ -5598,159 +5547,6 @@ fn acknowledged_goal_set_finishes_runtime_update_after_rpc_gate_cancellation() -
             })
             .await
             .expect("normal goal runtime must reach the model provider");
-            harness.shutdown().await;
-            Ok(())
-        },
-    )
-}
-
-#[test]
-#[serial(app_server_tracing)]
-fn committed_import_finishes_after_rpc_cancellation_during_response_delivery() -> Result<()> {
-    run_current_thread_test_with_stack(
-        "committed_import_finishes_after_rpc_cancellation_during_response_delivery",
-        async {
-            use crate::outgoing_message::OutgoingEnvelope;
-            use crate::outgoing_message::OutgoingMessage;
-            use codex_app_server_protocol::ClientResponsePayload;
-            use codex_app_server_protocol::ExternalAgentConfigImportResponse;
-            use codex_app_server_protocol::ServerNotification;
-            use codex_app_server_protocol::SkillsListParams;
-            use codex_app_server_protocol::SkillsListResponse;
-            use std::time::Duration;
-
-            let mut harness = TracingHarness::new_with_features(
-                MockServer::start().await,
-                Arc::new(codex_config::NoopThreadConfigLoader),
-                false,
-                true,
-            )
-            .await?;
-            let project = TempDir::new()?;
-            std::fs::create_dir(project.path().join(".git"))?;
-            let source = project.path().join(".claude/skills/import-proof");
-            std::fs::create_dir_all(&source)?;
-            let skill = "---\nname: import-proof\ndescription: Imported skill proof\n---\nUse this imported skill.\n";
-            std::fs::write(source.join("SKILL.md"), skill)?;
-            let target = project.path().join(".agents/skills/import-proof/SKILL.md");
-            let skills_params = SkillsListParams {
-                cwds: vec![project.path().to_path_buf()],
-                force_reload: false,
-            };
-            let before: SkillsListResponse = harness
-                .request(
-                    ClientRequest::SkillsList {
-                        request_id: RequestId::Integer(429_000),
-                        params: skills_params.clone(),
-                    },
-                    None,
-                )
-                .await;
-            assert_eq!(before.data.len(), 1);
-            assert!(before.data[0].errors.is_empty());
-            assert!(
-                before.data[0]
-                    .skills
-                    .iter()
-                    .all(|skill| skill.name != "import-proof")
-            );
-
-            while harness.processor.outgoing.try_send_server_notification(
-                ServerNotification::AppListUpdated(
-                    codex_app_server_protocol::AppListUpdatedNotification { data: Vec::new() },
-                ),
-            ) {}
-            assert_eq!(harness.outgoing_rx.capacity(), 0);
-            harness
-                .processor
-                .process_request(
-                    TEST_CONNECTION_ID,
-                    request_from_client_request(ClientRequest::ExternalAgentConfigImport {
-                        request_id: RequestId::Integer(429_001),
-                        params: serde_json::from_value(json!({
-                            "migrationItems": [{
-                                "itemType": "SKILLS",
-                                "description": "Import skill",
-                                "cwd": project.path(),
-                            }],
-                        }))?,
-                    }),
-                    &AppServerTransport::Stdio,
-                    Arc::clone(&harness.session),
-                )
-                .await;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !target.exists() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("import must commit while response delivery is blocked");
-            assert_eq!(std::fs::read_to_string(&target)?, skill);
-            assert_eq!(harness.outgoing_rx.capacity(), 0);
-            // This is the dispatcher's actual disconnect cancellation boundary.
-            harness.session.rpc_gate.shutdown().await;
-
-            let response: ExternalAgentConfigImportResponse = tokio::time::timeout(
-                Duration::from_secs(5),
-                read_response(&mut harness.outgoing_rx, 429_001),
-            )
-            .await
-            .expect("the import owner must survive cancellation at response delivery");
-            let completed = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    if let OutgoingEnvelope::Broadcast {
-                        message:
-                            OutgoingMessage::AppServerNotification(
-                                ServerNotification::ExternalAgentConfigImportCompleted(completed),
-                            ),
-                    } = harness
-                        .outgoing_rx
-                        .recv()
-                        .await
-                        .expect("outgoing channel must remain open until import completes")
-                    {
-                        break completed;
-                    }
-                }
-            })
-            .await
-            .expect("committed import must publish completion after cancellation");
-            assert_eq!(completed.import_id, response.import_id);
-            assert_eq!(completed.item_type_results.len(), 1);
-            assert_eq!(completed.item_type_results[0].successes.len(), 1);
-            assert!(completed.item_type_results[0].failures.is_empty());
-            let histories = harness
-                .processor
-                .external_agent_config_processor
-                .read_import_histories()
-                .await
-                .expect("read durable import history");
-            let history = histories
-                .data
-                .iter()
-                .find(|entry| entry.import_id == response.import_id)
-                .expect("completion must be recoverable after disconnect");
-            assert_eq!(history.successes, completed.item_type_results[0].successes);
-            assert!(history.failures.is_empty());
-
-            let Some(ClientResponsePayload::SkillsList(after)) = harness
-                .processor
-                .catalog_processor
-                .skills_list(skills_params)
-                .await
-                .expect("read refreshed skills")
-            else {
-                anyhow::bail!("expected skills list response");
-            };
-            assert_eq!(after.data.len(), 1);
-            assert!(after.data[0].errors.is_empty());
-            assert!(
-                after.data[0]
-                    .skills
-                    .iter()
-                    .any(|skill| skill.name == "import-proof")
-            );
             harness.shutdown().await;
             Ok(())
         },

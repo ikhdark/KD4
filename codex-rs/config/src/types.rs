@@ -84,7 +84,8 @@ pub enum AuthCredentialsStoreMode {
     File,
     /// Persist credentials in the keyring. Fail if unavailable.
     Keyring,
-    /// Use keyring when available; otherwise, fall back to a file in CODEX_HOME.
+    /// Prefer keyring storage. Read CODEX_HOME/auth.json only when the keyring
+    /// has no credentials; keyring read errors do not select fallback credentials.
     Auto,
     /// Store credentials in memory only for the current process.
     Ephemeral,
@@ -168,7 +169,7 @@ impl UriBasedFileOpener {
 #[serde(default)]
 #[schemars(deny_unknown_fields)]
 pub struct History {
-    /// If true, history entries will not be written to disk.
+    /// Controls history persistence: `save-all` writes entries to disk; `none` disables history writes.
     pub persistence: HistoryPersistence,
 
     /// If set, the maximum size of the history file in bytes. The oldest entries
@@ -791,12 +792,12 @@ pub struct ShellEnvironmentPolicyToml {
 
     pub ignore_default_excludes: Option<bool>,
 
-    /// List of regular expressions.
+    /// Case-insensitive wildcard patterns for environment variable names, using `*` and `?`.
     pub exclude: Option<Vec<String>>,
 
     pub r#set: Option<HashMap<String, String>>,
 
-    /// List of regular expressions.
+    /// Case-insensitive wildcard patterns for environment variable names, using `*` and `?`.
     pub include_only: Option<Vec<String>>,
 
     pub experimental_use_profile: Option<bool>,

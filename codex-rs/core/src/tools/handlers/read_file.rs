@@ -142,6 +142,7 @@ impl CoreToolRuntime for ReadStatusHandler {}
 struct PendingSourceInspection {
     store: std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>,
     start: codex_agent_task_store::SourceInspectionStart,
+    proof_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -409,7 +410,13 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             required.retain(|key| {
                 !matches!(
                     key.as_str(),
-                    Some("artifact_id" | "canonical_sha256" | "delivered_selection_complete" | "retained_bytes" | "retained_artifact_complete")
+                    Some(
+                        "artifact_id"
+                            | "canonical_sha256"
+                            | "delivered_selection_complete"
+                            | "retained_bytes"
+                            | "retained_artifact_complete"
+                    )
                 )
             });
             required.push(json!("source_sha256"));
@@ -675,15 +682,21 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
                     .services
                     .code_mode_service
                     .output_budget(cell_id),
-                _ => None,
+                _ => {
+                    let policy: codex_protocol::protocol::TruncationPolicy =
+                        turn.model_info.truncation_policy.into();
+                    Some(policy.token_budget())
+                }
             }
             .unwrap_or(RECOVERY_AGGREGATE_TOKEN_CEILING);
             // Tiny/zero projections must not disable data processing inside JS.
             // Reserve space for file metadata, page handles, and the exec wrapper.
-            let token_ceiling = output_budget
-                .max(2_000)
-                .saturating_sub(1_000)
-                .min(RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000));
+            let token_ceiling = if script_consumer {
+                output_budget.max(2_000).saturating_sub(1_000)
+            } else {
+                output_budget.saturating_sub(256)
+            }
+            .min(RECOVERY_AGGREGATE_TOKEN_CEILING.saturating_sub(1_000));
             let structure_path = args.path.clone();
             let (
                 canonical,
@@ -835,6 +848,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             });
             let inspection_binding_error = if !file_complete
                 && let (Some(inspection), Some(artifact_id)) = (&inspection, &artifact_id)
+                && inspection.proof_error.is_none()
             {
                 let binding = invocation
                     .session
@@ -879,7 +893,11 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             output["total_lines"] = json!(total_lines);
             output["source_sha256"] = json!(canonical.sha256);
             output["file_complete"] = json!(file_complete);
-            if let Some(error) = inspection_binding_error {
+            if let Some(error) = inspection_binding_error.or_else(|| {
+                inspection
+                    .as_ref()
+                    .and_then(|inspection| inspection.proof_error.clone())
+            }) {
                 output["inspection_proof_error"] = json!(error);
             }
             if !selector_errors.is_empty() {
@@ -888,7 +906,10 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             if !selector_bindings.is_empty() {
                 output["selector_bindings"] = json!(selector_bindings);
             }
-            if file_complete && let Some(inspection) = inspection {
+            if file_complete
+                && let Some(inspection) = inspection
+                && inspection.proof_error.is_none()
+            {
                 match inspection
                     .store
                     .record_source_inspection(
@@ -940,6 +961,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileHandler {
             if let Some(projected) = projected {
                 output = output.with_model_value(projected);
             }
+            crate::tools::context::ensure_exact_model_delivery(&output, &invocation)?;
             Ok(boxed_tool_output(output))
         })
     }
@@ -1158,7 +1180,7 @@ async fn read_environment_file(
     let fs = environment.environment.get_filesystem();
     let coordinator = invocation.session.services.agent_control.task_coordinator();
     crate::tools::parallel::wait_for_workspace_baseline().await;
-    let inspection = if !environment.environment.is_remote()
+    let mut inspection = if !environment.environment.is_remote()
         && let Some(binding) = coordinator.binding_for_turn(turn)
         && let Some(store) = coordinator.store()
     {
@@ -1170,16 +1192,32 @@ async fn read_environment_file(
                     "unable to prepare source inspection evidence: {error}"
                 ))
             })?
-            .map(|start| PendingSourceInspection { store, start })
+            .map(|start| PendingSourceInspection {
+                store,
+                start,
+                proof_error: None,
+            })
     } else {
         None
     };
     // Execution backends validate the opened regular file and enforce the
     // byte limit during the stable read. Avoid a separate RPC/helper launch
     // on success; retain metadata only to explain failures as before.
-    let result = fs
-        .read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox))
-        .await;
+    let result = if let Some(inspection) = &mut inspection {
+        fs.read_file_bounded_with_source(&path, MAX_FILE_BYTES, Some(&sandbox))
+            .await.map(|read| read.map(|(bytes, source)| {
+                if source.as_deref().zip(inspection.start.canonical_path())
+                    .is_none_or(|(actual, expected)| actual != expected) {
+                    inspection.proof_error = Some(
+                        "opened source target does not match the prepared inspection; read bytes are retained without criterion proof".to_string(),
+                    );
+                }
+                bytes
+            }))
+    } else {
+        fs.read_file_bounded(&path, MAX_FILE_BYTES, Some(&sandbox))
+            .await
+    };
     let contents = match result {
         Ok(Some(contents)) => contents,
         failure => {
@@ -1441,7 +1479,9 @@ mod tests {
 
     #[test]
     fn read_schemas_reject_undecodable_offsets() {
-        let ToolSpec::Function(read) = ReadFileHandler.spec() else { panic!("read_file tool"); };
+        let ToolSpec::Function(read) = ReadFileHandler.spec() else {
+            panic!("read_file tool");
+        };
         let schema = serde_json::to_value(read.parameters).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for field in ["offset", "limit"] {
@@ -1456,15 +1496,23 @@ mod tests {
             assert!(validator.is_valid(&args));
             assert!(serde_json::from_value::<ReadFileArgs>(args).is_ok());
         }
-        let ToolSpec::Function(status) = ReadStatusHandler.spec() else { panic!("read_status tool"); };
+        let ToolSpec::Function(status) = ReadStatusHandler.spec() else {
+            panic!("read_status tool");
+        };
         let schema = serde_json::to_value(status.parameters).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for field in ["snapshot_offset", "range_offset", "artifact_offset"] {
             let query = json!({field:-1});
-            assert!(serde_json::from_value::<crate::tool_history::ReadStatusQuery>(query.clone()).is_err());
+            assert!(
+                serde_json::from_value::<crate::tool_history::ReadStatusQuery>(query.clone())
+                    .is_err()
+            );
             assert!(!validator.is_valid(&json!({"paths":["file.rs"],"query":query})));
             let query = json!({field:0});
-            assert!(serde_json::from_value::<crate::tool_history::ReadStatusQuery>(query.clone()).is_ok());
+            assert!(
+                serde_json::from_value::<crate::tool_history::ReadStatusQuery>(query.clone())
+                    .is_ok()
+            );
             assert!(validator.is_valid(&json!({"paths":["file.rs"],"query":query})));
         }
     }
@@ -2071,9 +2119,13 @@ mod tests {
     #[tokio::test]
     async fn json_pointer_value_does_not_claim_exact_lexical_file_coverage() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("duplicate-keys.json");
-        let source = r#"{"policy":"deny", "policy":"allow", "escaped":"\u0061"}"#;
+        let path = dir.path().join("lexical-spellings.json");
+        // Escapes and whitespace parse away, so a decoded value is not lexical.
+        let source = r#"{"policy":"allow", "escaped":"\u0061"}"#;
         std::fs::write(&path, source).unwrap();
+        // A duplicated decoded member name has no unique value to present.
+        let duplicates = dir.path().join("duplicate-keys.json");
+        std::fs::write(&duplicates, r#"{"policy":"deny", "policy":"allow"}"#).unwrap();
         for script in [false, true] {
             for include_bytes in [false, true] {
                 let mut selectors = json!([{"kind":"json_pointer", "pointer":""}]);
@@ -2100,7 +2152,7 @@ mod tests {
                 assert_eq!(result["complete"], true);
                 assert_eq!(
                     result["file_complete"], include_bytes,
-                    "parsed values discard duplicate members and lexical spellings"
+                    "parsed values discard lexical spellings"
                 );
                 let selections = result["results"].as_array().unwrap();
                 assert!(selections.iter().any(
@@ -2113,6 +2165,66 @@ mod tests {
                     include_bytes
                 );
             }
+            let mut call = invocation(
+                &duplicates,
+                json!([{"kind":"json_pointer", "pointer":""}]),
+                false,
+            )
+            .await;
+            if script {
+                call.source = ToolCallSource::CodeMode {
+                    cell_id: "json-duplicates".into(),
+                    parent_call_id: None,
+                    runtime_tool_call_id: "json-duplicates-read".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                };
+            }
+            let result = ReadFileHandler
+                .handle(call.clone())
+                .await
+                .unwrap()
+                .code_mode_result(&call.payload);
+            assert_eq!(result["complete"], false, "{result}");
+            assert_eq!(result["results"][0]["status"], "invalid", "{result}");
+            assert!(result["results"][0]["value"].is_null(), "{result}");
+        }
+    }
+
+    #[tokio::test]
+    async fn json_payload_hydration_keys_are_not_lexical_acquisition_in_either_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collision.json");
+        let source = r#"{"picked":{"hydrated_ranges":[{"text":"x","canonical_range":{"start":0,"end":142}}]},"not_selected":"source bytes deliberately not requested"}"#;
+        assert_eq!(source.len(), 142);
+        std::fs::write(&path, source).unwrap();
+        for script in [false, true] {
+            let mut call = invocation(
+                &path,
+                json!([{"kind":"json_pointer","pointer":"/picked"}]),
+                false,
+            )
+            .await;
+            if script {
+                call.source = ToolCallSource::CodeMode {
+                    cell_id: "collision".into(),
+                    parent_call_id: None,
+                    runtime_tool_call_id: "collision-read".into(),
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                };
+            }
+            let result = ReadFileHandler
+                .handle(call.clone())
+                .await
+                .unwrap()
+                .code_mode_result(&call.payload);
+            assert_eq!(result["complete"], true);
+            assert_eq!(result["file_complete"], false);
+            assert_eq!(
+                result["results"][0]["value"],
+                serde_json::from_str::<serde_json::Value>(source).unwrap()["picked"]
+            );
         }
     }
 
@@ -3378,9 +3490,9 @@ mod tests {
 
     #[tokio::test]
     async fn identical_files_keep_distinct_provenance_through_edit_and_restart() {
-        use crate::tool_history::{
-            SourceDependencyV1, ToolHistoryLoadOutcome, WorkspaceEvidenceObservation,
-        };
+        use crate::tool_history::SourceDependencyV1;
+        use crate::tool_history::ToolHistoryLoadOutcome;
+        use crate::tool_history::WorkspaceEvidenceObservation;
         use std::collections::BTreeSet;
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.txt");
@@ -3633,6 +3745,8 @@ mod tests {
         .await;
         let codex_home = call.step_context.turn.config.codex_home.clone();
         let thread_id = call.session.thread_id.to_string();
+        // The fixture session owns its temporary home and the snapshot in it.
+        let _session = Arc::clone(&call.session);
         let payload = call.payload.clone();
         let result = ReadFileHandler
             .handle(call)
@@ -4109,11 +4223,17 @@ mod tests {
 
     #[tokio::test]
     async fn read_failure_survives_secondary_filesystem_diagnostics() {
-        use codex_exec_server::{
-            CopyOptions, CreateDirectoryOptions, ExecutorFileSystem, ExecutorFileSystemFuture,
-            FileMetadata, FileSystemReadStream, FileSystemSandboxContext, ReadDirectoryEntry,
-            RemoveOptions, WalkOptions, WalkOutcome,
-        };
+        use codex_exec_server::CopyOptions;
+        use codex_exec_server::CreateDirectoryOptions;
+        use codex_exec_server::ExecutorFileSystem;
+        use codex_exec_server::ExecutorFileSystemFuture;
+        use codex_exec_server::FileMetadata;
+        use codex_exec_server::FileSystemReadStream;
+        use codex_exec_server::FileSystemSandboxContext;
+        use codex_exec_server::ReadDirectoryEntry;
+        use codex_exec_server::RemoveOptions;
+        use codex_exec_server::WalkOptions;
+        use codex_exec_server::WalkOutcome;
         use codex_utils_path_uri::PathUri;
         use std::io;
 
@@ -4462,7 +4582,15 @@ mod tests {
                     .find(|result| result["selector"]["kind"] == "json_pointer")
                     .unwrap();
                 assert_eq!(json["status"], "invalid");
-                assert!(json["message"].as_str().unwrap().contains("valid JSON"));
+                // Pointer validation reports both malformed and over-deep input
+                // before selection, and directs recovery to the retained bytes.
+                assert!(
+                    json["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Malformed or depth-limited JSON"),
+                    "{json}"
+                );
                 let search = results
                     .iter()
                     .find(|result| result["selector"]["kind"] == "search")

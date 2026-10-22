@@ -327,11 +327,19 @@ mod tests {
         };
 
         for (auth_mode, expected_servers, expected_apps) in [
-            (Some(AuthMode::Chatgpt), vec!["alpha", "zeta"], vec!["connector-app"]),
+            (
+                Some(AuthMode::Chatgpt),
+                vec!["alpha", "zeta"],
+                vec!["connector-app"],
+            ),
             (Some(AuthMode::ApiKey), vec!["alpha", "app", "zeta"], vec![]),
             (None, vec!["alpha", "app", "zeta"], vec!["connector-app"]),
             // Projection must not mutate the cached fragment across auth changes.
-            (Some(AuthMode::Chatgpt), vec!["alpha", "zeta"], vec!["connector-app"]),
+            (
+                Some(AuthMode::Chatgpt),
+                vec!["alpha", "zeta"],
+                vec!["connector-app"],
+            ),
         ] {
             let projected = fragment.project(&SkillConfigRules::default(), auth_mode);
 

@@ -47,7 +47,6 @@ use tokio::time::timeout;
 
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-
 #[tokio::test]
 async fn mcp_server_status_list_uses_thread_project_local_config() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
@@ -494,7 +493,13 @@ url = "{underscore_server_url}/mcp"
         ])
     );
     for status in &response.data {
-        assert_eq!(status.server_info.as_ref().and_then(|info| info.title.as_deref()), Some("Lookup Server"));
+        assert_eq!(
+            status
+                .server_info
+                .as_ref()
+                .and_then(|info| info.title.as_deref()),
+            Some("Lookup Server")
+        );
         for (key, tool) in &status.tools {
             assert_eq!(key, &tool.name);
         }

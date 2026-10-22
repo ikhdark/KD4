@@ -207,7 +207,10 @@ mod tests {
         assert_eq!(cloned.cause(), cancellation.cause());
         cloned.cancel_with(CancellationCause::NestedDeadline);
         assert!(cancellation.is_cancelled());
-        assert_eq!(cancellation.cause(), Some(CancellationCause::RuntimeShutdown));
+        assert_eq!(
+            cancellation.cause(),
+            Some(CancellationCause::RuntimeShutdown)
+        );
     }
 
     #[test]
@@ -216,32 +219,44 @@ mod tests {
 
         for (cause, expected, wire) in [
             (
-                CancellationCause::TurnAborted { reason: TurnAbortReason::Interrupted },
+                CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::Interrupted,
+                },
                 "aborted by user",
                 json!({"type": "turn_aborted", "reason": "interrupted"}),
             ),
             (
-                CancellationCause::TurnAborted { reason: TurnAbortReason::Replaced },
+                CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::Replaced,
+                },
                 "cancelled: turn replaced",
                 json!({"type": "turn_aborted", "reason": "replaced"}),
             ),
             (
-                CancellationCause::TurnAborted { reason: TurnAbortReason::ReviewEnded },
+                CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::ReviewEnded,
+                },
                 "cancelled: turn review ended",
                 json!({"type": "turn_aborted", "reason": "review_ended"}),
             ),
             (
-                CancellationCause::TurnAborted { reason: TurnAbortReason::BudgetLimited },
+                CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::BudgetLimited,
+                },
                 "cancelled: turn budget limited",
                 json!({"type": "turn_aborted", "reason": "budget_limited"}),
             ),
             (
-                CancellationCause::TurnAborted { reason: TurnAbortReason::InternalError },
+                CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::InternalError,
+                },
                 "cancelled: turn internal error",
                 json!({"type": "turn_aborted", "reason": "internal_error"}),
             ),
             (
-                CancellationCause::TurnAborted { reason: TurnAbortReason::ProcessLost },
+                CancellationCause::TurnAborted {
+                    reason: TurnAbortReason::ProcessLost,
+                },
                 "cancelled: turn process lost",
                 json!({"type": "turn_aborted", "reason": "process_lost"}),
             ),
@@ -287,5 +302,4 @@ mod tests {
         );
         assert!(quiet_call.is_cancelled(), "the scope cancels its children");
     }
-
 }

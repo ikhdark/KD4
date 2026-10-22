@@ -35,6 +35,10 @@ pub(crate) struct AgentRoleLocks {
     pub(crate) model: bool,
     pub(crate) reasoning_effort: bool,
     pub(crate) permissions: bool,
+    pub(crate) allow_login_shell: bool,
+    pub(crate) shell_environment_policy: bool,
+    pub(crate) windows_sandbox: bool,
+    pub(crate) windows_private_desktop: bool,
 }
 
 /// Applies a named role layer to `config` while preserving caller-owned runtime settings.
@@ -71,7 +75,8 @@ async fn apply_role_to_config_inner(
     let Some(config_file) = role.config_file.as_ref() else {
         return Ok(AgentRoleLocks::default());
     };
-    let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
+    let role_layer_toml =
+        load_role_layer_toml(config, role, config_file, is_built_in, role_name).await?;
     if role_layer_toml
         .as_table()
         .is_some_and(toml::map::Map::is_empty)
@@ -89,6 +94,16 @@ async fn apply_role_to_config_inner(
         ]
         .iter()
         .any(|key| role_layer_toml.get(*key).is_some()),
+        allow_login_shell: role_layer_toml.get("allow_login_shell").is_some(),
+        shell_environment_policy: role_layer_toml.get("shell_environment_policy").is_some(),
+        windows_sandbox: role_layer_toml
+            .get("windows")
+            .and_then(|windows| windows.get("sandbox"))
+            .is_some(),
+        windows_private_desktop: role_layer_toml
+            .get("windows")
+            .and_then(|windows| windows.get("sandbox_private_desktop"))
+            .is_some(),
     };
     let preserve_current_provider = role_layer_toml.get("model_provider").is_none();
     let preserve_current_service_tier = role_layer_toml.get("service_tier").is_none();
@@ -105,6 +120,7 @@ async fn apply_role_to_config_inner(
 
 async fn load_role_layer_toml(
     config: &Config,
+    role: &AgentRoleConfig,
     config_file: &Path,
     is_built_in: bool,
     role_name: &str,
@@ -116,7 +132,16 @@ async fn load_role_layer_toml(
         let role_config_toml: TomlValue = toml::from_str(&role_config_contents)?;
         (role_config_toml, config.codex_home.as_path())
     } else {
-        let role_config_contents = tokio::fs::read_to_string(config_file).await?;
+        let role_config_contents = if role.config_snapshot.get().is_some() {
+            role.config_file_contents()
+                .map(str::to_owned)
+                .map_err(anyhow::Error::msg)?
+        } else {
+            let role = role.clone();
+            tokio::task::spawn_blocking(move || role.config_file_contents().map(str::to_owned))
+                .await?
+                .map_err(anyhow::Error::msg)?
+        };
         let role_config_base = config_file
             .parent()
             .ok_or(anyhow!("No corresponding config content"))?;
@@ -189,6 +214,9 @@ mod reload {
                 config.model_provider_id.clone(),
                 config.model_provider.clone(),
             );
+        }
+        if role_layer_toml.get("agents").is_none() {
+            next_config.agent_roles = config.agent_roles.clone();
         }
         Ok(next_config)
     }
@@ -304,7 +332,7 @@ pub(crate) mod spawn_tool_spec {
                     if is_built_in {
                         built_in::config_file_contents(config_file).map(str::to_owned)
                     } else {
-                        std::fs::read_to_string(config_file).ok()
+                        declaration.config_file_contents().ok().map(str::to_owned)
                     }
                 })
                 .and_then(|contents| toml::from_str::<TomlValue>(&contents).ok())
@@ -392,6 +420,7 @@ mod built_in {
                         description: Some("Default agent.".to_string()),
                         config_file: None,
                         nickname_candidates: None,
+                        config_snapshot: Default::default(),
                     }
                 ),
                 (
@@ -403,6 +432,7 @@ mod built_in {
                         ),
                         config_file: Some("architect.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
+                        config_snapshot: Default::default(),
                     },
                 ),
                 (
@@ -411,6 +441,7 @@ mod built_in {
                         description: Some("Use for a well-scoped codebase question when delegation saves work. Reuse an existing explorer for related questions. Run independent questions in parallel. Reuse returned paths and evidence; recheck only when a relevant change, contradiction, or missing detail requires it. Do not duplicate the investigation.".to_string()),
                         config_file: Some("explorer.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
+                        config_snapshot: Default::default(),
                     }
                 ),
                 (
@@ -419,6 +450,7 @@ mod built_in {
                         description: Some("Use for implementation, fixes, and other execution work. In the worker assignment, specify explicit file/module ownership and tell the worker to preserve others' edits and adapt to concurrent changes rather than reverting them.".to_string()),
                         config_file: None,
                         nickname_candidates: None,
+                        config_snapshot: Default::default(),
                     }
                 ),
                 (
@@ -430,6 +462,7 @@ mod built_in {
                         ),
                         config_file: Some("reviewer.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
+                        config_snapshot: Default::default(),
                     },
                 ),
                 (
@@ -441,6 +474,7 @@ mod built_in {
                         ),
                         config_file: Some("verifier.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
+                        config_snapshot: Default::default(),
                     },
                 ),
                 (
@@ -452,6 +486,7 @@ mod built_in {
                         ),
                         config_file: None,
                         nickname_candidates: None,
+                        config_snapshot: Default::default(),
                     },
                 ),
             ])

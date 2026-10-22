@@ -22,6 +22,17 @@ GENERATED_TARGETS = [
 ]
 
 
+def test_generated_wrappers_distinguish_omitted_service_tier() -> None:
+    generator = runpy.run_path(str(ROOT / "scripts/update_sdk_artifacts.py"))
+    field = generator["PublicFieldSpec"]("service_tier", "service_tier", "str | None", False)
+    assert generator["_kw_signature_lines"]([field]) == [
+        "        service_tier: str | None | Unset = UNSET,"
+    ]
+    assert generator["_model_arg_lines"]([field]) == [
+        '            **({"service_tier": service_tier} if service_tier is not UNSET else {}),'
+    ]
+
+
 def _snapshot_target(root: Path, rel_path: Path) -> dict[str, bytes] | bytes | None:
     """Capture one generated artifact so regeneration drift is easy to compare."""
     target = root / rel_path
@@ -51,6 +62,9 @@ def test_generation_replaces_stale_artifacts_with_current_fork_contracts(tmp_pat
         ROOT / "scripts", staged_sdk / "scripts", ignore=shutil.ignore_patterns("__pycache__")
     )
     shutil.copy2(ROOT / "pyproject.toml", staged_sdk / "pyproject.toml")
+    shared_lock = tmp_path / "scripts/common/generated_output_lock.py"
+    shared_lock.parent.mkdir(parents=True)
+    shutil.copy2(ROOT.parents[1] / "scripts/common/generated_output_lock.py", shared_lock)
     schema_path = Path("codex-rs/app-server-protocol/schema/json")
     shutil.copytree(ROOT.parents[1] / schema_path, tmp_path / schema_path)
 
@@ -73,6 +87,112 @@ def test_generation_replaces_stale_artifacts_with_current_fork_contracts(tmp_pat
 
     assert "UserWarning" not in completed.stderr, completed.stderr
     assert before == _snapshot_targets(staged_sdk), "Generated files drifted after regeneration"
+
+
+def _generation_fixture(tmp_path, monkeypatch):
+    script = runpy.run_path(str(ROOT / "scripts/update_sdk_artifacts.py"))
+    owner = script["generate_types_from_schema_dir"].__globals__
+    monkeypatch.setitem(owner, "repo_root", lambda: tmp_path)
+    shared_lock = tmp_path / "scripts/common/generated_output_lock.py"
+    shared_lock.parent.mkdir(parents=True)
+    shutil.copy2(ROOT.parents[1] / "scripts/common/generated_output_lock.py", shared_lock)
+    sdk = tmp_path / "sdk/python"
+    generated = sdk / "src/openai_codex/generated"
+    generated.mkdir(parents=True)
+    for name in ("__init__.py", "v2_all.py", "notification_registry.py", "obsolete.py"):
+        (generated / name).write_bytes(f"old {name}".encode())
+    (sdk / "src/openai_codex/api.py").write_bytes(b"old API")
+    return script, owner, sdk
+
+
+@pytest.mark.parametrize("schema_text", [None, "not JSON"])
+def test_schema_read_failure_preserves_complete_generated_set(tmp_path, monkeypatch, schema_text):
+    script, _, sdk = _generation_fixture(tmp_path, monkeypatch)
+    schema = tmp_path / "schema"
+    schema.mkdir()
+    if schema_text is not None:
+        script["schema_bundle_path"](schema).write_text(schema_text)
+    before = _snapshot_targets(sdk)
+    with pytest.raises((FileNotFoundError, json.JSONDecodeError)):
+        script["generate_types_from_schema_dir"](schema)
+    assert _snapshot_targets(sdk) == before
+
+
+@pytest.mark.parametrize(
+    "phase", ["models", "registry", "formatter", "invariant", "cancel", "publish"]
+)
+def test_generation_failure_rolls_back_all_owned_outputs(tmp_path, monkeypatch, phase):
+    script, owner, sdk = _generation_fixture(tmp_path, monkeypatch)
+    before = _snapshot_targets(sdk)
+
+    def generate_models(_schema):
+        (owner["sdk_root"]() / "src/openai_codex/generated/v2_all.py").write_bytes(b"new models")
+        if phase == "models":
+            raise FileNotFoundError("missing generator")
+        if phase == "invariant":
+            raise RuntimeError("model invariant")
+
+    def generate_registry(_schema):
+        (owner["sdk_root"]() / "src/openai_codex/generated/notification_registry.py").write_bytes(
+            b"new registry"
+        )
+        if phase == "registry":
+            raise RuntimeError("invalid registry")
+
+    def generate_api():
+        (owner["sdk_root"]() / "src/openai_codex/api.py").write_bytes(b"new API")
+        if phase == "formatter":
+            raise subprocess.CalledProcessError(1, "ruff format")
+        if phase == "cancel":
+            raise KeyboardInterrupt()
+
+    monkeypatch.setitem(owner, "generate_v2_all", generate_models)
+    monkeypatch.setitem(owner, "generate_notification_registry", generate_registry)
+    monkeypatch.setitem(owner, "generate_public_api_flat_methods", generate_api)
+    replace = owner["os"].replace
+
+    def fail_late(source, destination):
+        if (
+            phase == "publish"
+            and Path(source).name == "api.py"
+            and Path(destination) == sdk / "src/openai_codex/api.py"
+        ):
+            raise OSError("publication interrupted")
+        return replace(source, destination)
+
+    monkeypatch.setattr(owner["os"], "replace", fail_late)
+    with pytest.raises(
+        (FileNotFoundError, RuntimeError, subprocess.CalledProcessError, KeyboardInterrupt, OSError)
+    ):
+        script["generate_types_from_schema_dir"](tmp_path / "schema")
+    assert _snapshot_targets(sdk) == before
+    assert owner["sdk_root"]() == sdk
+
+
+def test_generation_preserves_api_edits_made_while_tools_run(tmp_path, monkeypatch):
+    script, owner, sdk = _generation_fixture(tmp_path, monkeypatch)
+    generated_before = _snapshot_target(sdk, GENERATED_TARGETS[0])
+    monkeypatch.setitem(owner, "generate_v2_all", lambda _schema: None)
+    monkeypatch.setitem(owner, "generate_notification_registry", lambda _schema: None)
+
+    def concurrent_edit():
+        (sdk / "src/openai_codex/api.py").write_bytes(b"concurrent user edit")
+
+    monkeypatch.setitem(owner, "generate_public_api_flat_methods", concurrent_edit)
+    with pytest.raises(RuntimeError, match="edited during generation"):
+        script["generate_types_from_schema_dir"](tmp_path / "schema")
+    assert _snapshot_target(sdk, GENERATED_TARGETS[0]) == generated_before
+    assert (sdk / "src/openai_codex/api.py").read_bytes() == b"concurrent user edit"
+
+
+def test_generation_rejects_concurrent_writer_without_mutation(tmp_path, monkeypatch):
+    script, _, sdk = _generation_fixture(tmp_path, monkeypatch)
+    before = _snapshot_targets(sdk)
+    lock = tmp_path / ".codex/locks/python-artifacts.lock"
+    with script["_repository_lock"](lock, "Python generated artifacts"):
+        with pytest.raises(RuntimeError, match="already locked"):
+            script["generate_types_from_schema_dir"](tmp_path / "schema")
+    assert _snapshot_targets(sdk) == before
 
 
 def test_nullable_map_normalization_preserves_literals_and_complex_constraints(tmp_path):
@@ -132,8 +252,11 @@ def test_command_exec_environment_preserves_typed_map_contract() -> None:
 
 def test_context_estimate_round_trips_without_overwriting_provider_totals() -> None:
     observed = {
-        "inputTokens": 100, "cachedInputTokens": 40, "outputTokens": 20,
-        "reasoningOutputTokens": 5, "totalTokens": 120,
+        "inputTokens": 100,
+        "cachedInputTokens": 40,
+        "outputTokens": 20,
+        "reasoningOutputTokens": 5,
+        "totalTokens": 120,
     }
     wire = {"total": observed, "last": observed, "estimatedContextTokens": 500}
     usage = generated_v2.ThreadTokenUsage.model_validate(wire)

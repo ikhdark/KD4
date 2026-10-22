@@ -1,4 +1,5 @@
 """Real owner-lock, crash, and conservative ledger-maintenance regressions."""
+
 from __future__ import annotations
 
 import contextlib
@@ -48,7 +49,8 @@ time.sleep(60)
         process = subprocess.Popen(
             [sys.executable, "-B", "-c", program, str(self.root)],
             cwd=Path(__file__).resolve().parents[2],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:
@@ -58,7 +60,7 @@ time.sleep(60)
                     self.fail(repr(process.communicate(timeout=1)))
                 if time.monotonic() >= deadline:
                     self.fail("owner did not publish its ready barrier")
-                time.sleep(.01)
+                time.sleep(0.01)
             path = Path((self.root / "ready").read_text(encoding="utf-8"))
             original = path.read_bytes()
             report = metrics.maintain_ledgers(self.logs, apply=True)
@@ -79,8 +81,12 @@ time.sleep(60)
             self.assertIsNone(row["finished_at"])
             self.assertIsNone(row["lifecycle_seconds"])
             self.assertEqual(row["proof"]["status"], "unknown")
-            self.assertEqual(row["reconciliation"]["process_exit_and_cleanup"], "unknown")
-            self.assertEqual(metrics.maintain_ledgers(self.logs, apply=True)["abandoned"], [])
+            self.assertEqual(
+                row["reconciliation"]["process_exit_and_cleanup"], "unknown"
+            )
+            self.assertEqual(
+                metrics.maintain_ledgers(self.logs, apply=True)["abandoned"], []
+            )
         finally:
             if process.poll() is None:
                 process.kill()
@@ -100,7 +106,10 @@ time.sleep(60)
         # The explicit cutoff authorizes expiry; keep=1 independently protects
         # the newest record even when that cutoff would otherwise include it.
         report = metrics.maintain_ledgers(
-            self.logs, apply=True, prune_before="2100-01-01T00:00:00+00:00", keep=1,
+            self.logs,
+            apply=True,
+            prune_before="2100-01-01T00:00:00+00:00",
+            keep=1,
         )
         self.assertEqual(report["pruned"], [str(old.path)])
         self.assertEqual(report["active"], 1)
@@ -113,7 +122,9 @@ time.sleep(60)
     def test_checkpoint_failure_releases_owner_and_preserves_inline_outcome(self):
         value = self.ledger("running")
         owner = value._owner
-        with mock.patch.object(metrics, "write_json_atomic", side_effect=OSError("slow disk failed")):
+        with mock.patch.object(
+            metrics, "write_json_atomic", side_effect=OSError("slow disk failed")
+        ):
             with contextlib.redirect_stderr(io.StringIO()) as stderr:
                 value.finish("cancelled")
         self.assertTrue(owner.closed)
@@ -130,7 +141,10 @@ time.sleep(60)
         self.assertFalse(json.loads(stdout.getvalue())["apply"])
         self.assertEqual(value.path.read_bytes(), before)
         for extra in (["--keep", "0"], ["--prune-before", "2026-01-01"]):
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
                 metrics.main(["--maintain", str(self.logs), *extra])
 
     def test_discarded_observation_releases_its_handle_without_claiming_success(self):

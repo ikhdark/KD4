@@ -122,8 +122,7 @@ impl WebSearchTool {
                     .await
                     .map_err(|_| setup_error("provider configuration"))?;
                 let endpoint = provider.url_for_path("alpha/search");
-                self
-                    .http_clients
+                self.http_clients
                     .client_for_url(&endpoint)
                     .await
                     .map_err(|_| setup_error("HTTP client configuration"))?;
@@ -155,6 +154,8 @@ impl WebSearchTool {
                     id: call.call_id.clone(),
                     query: String::new(),
                     action: None,
+                    status: Some("inProgress".to_string()),
+                    error: None,
                 },
                 EventMsg::WebSearchBegin(WebSearchBeginEvent {
                     call_id: call.call_id.clone(),
@@ -165,17 +166,31 @@ impl WebSearchTool {
             .cancellation_token
             .run_until_cancelled(client.search(&request, HeaderMap::new()))
             .await;
-        let terminal_item = completed_turn_item(&call.call_id, command_action);
         match search_result {
             None => {
+                let terminal_item = completed_turn_item(
+                    &call.call_id,
+                    command_action,
+                    "cancelled",
+                    Some(WEB_SEARCH_CANCELLED_MESSAGE.to_string()),
+                );
                 call.turn_item_emitter.emit_completed(terminal_item).await;
                 Err(cancelled_error())
             }
             Some(Err(err)) => {
+                let error = search_error(err);
+                let terminal_item = completed_turn_item(
+                    &call.call_id,
+                    command_action,
+                    "failed",
+                    Some(error.to_string()),
+                );
                 call.turn_item_emitter.emit_completed(terminal_item).await;
-                Err(search_error(err))
+                Err(error)
             }
             Some(Ok(response)) => {
+                let terminal_item =
+                    completed_turn_item(&call.call_id, command_action, "completed", None);
                 call.turn_item_emitter.emit_completed(terminal_item).await;
                 Ok(Box::new(SearchOutput::new(response.output)))
             }
@@ -294,7 +309,12 @@ fn validate_commands(commands: &SearchCommands) -> Result<(), FunctionCallError>
     Ok(())
 }
 
-fn completed_turn_item(call_id: &str, action: WebSearchAction) -> ExtensionTurnItem {
+fn completed_turn_item(
+    call_id: &str,
+    action: WebSearchAction,
+    status: &str,
+    error: Option<String>,
+) -> ExtensionTurnItem {
     let legacy_action = match &action {
         WebSearchAction::Search { query, queries } => CoreWebSearchAction::Search {
             query: query.clone(),
@@ -313,6 +333,8 @@ fn completed_turn_item(call_id: &str, action: WebSearchAction) -> ExtensionTurnI
             id: call_id.to_string(),
             query: query.clone(),
             action: Some(action),
+            status: Some(status.to_string()),
+            error,
         },
         EventMsg::WebSearchEnd(WebSearchEndEvent {
             call_id: call_id.to_string(),
@@ -379,9 +401,37 @@ fn literal_url(ref_id: &str) -> Option<String> {
 }
 
 fn extension_turn_item(item: WebSearchItem, legacy_event: EventMsg) -> ExtensionTurnItem {
+    // The legacy end event has no failure representation. Publishing it for a
+    // failed request would overwrite the honest canonical item during replay.
+    let legacy_events = if matches!(item.status.as_deref(), Some("failed" | "cancelled")) {
+        Vec::new()
+    } else {
+        vec![legacy_event]
+    };
     ExtensionTurnItem {
         item: ExtensionItem::WebSearch(item),
-        legacy_events: vec![legacy_event],
+        legacy_events,
+    }
+}
+
+#[test]
+fn terminal_search_items_preserve_failure_and_do_not_emit_success_compatibility_events() {
+    for status in ["completed", "failed", "cancelled"] {
+        let item = completed_turn_item(
+            "search",
+            WebSearchAction::Other,
+            status,
+            (status != "completed").then(|| "no evidence retrieved".to_string()),
+        );
+        let ExtensionItem::WebSearch(search) = item.item else {
+            panic!("web search")
+        };
+        assert_eq!(search.status.as_deref(), Some(status));
+        assert_eq!(search.error.is_some(), status != "completed");
+        assert_eq!(item.legacy_events.len(), usize::from(status == "completed"));
+        let restored: WebSearchItem =
+            serde_json::from_str(&serde_json::to_string(&search).unwrap()).unwrap();
+        assert_eq!(restored, search);
     }
 }
 

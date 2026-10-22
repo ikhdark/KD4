@@ -46,7 +46,8 @@ struct GoalRuntimeInner {
     thread_manager: Weak<ThreadManager>,
     accounting_state: Arc<GoalAccountingState>,
     enabled: AtomicBool,
-    suppressed_goal: Mutex<Option<String>>,
+    terminal_transition: Mutex<Option<codex_state::GoalTerminalTransition>>,
+    pending_terminal_intent: Mutex<Option<crate::tool::PendingGoalTerminalIntent>>,
     live_turn: Mutex<Option<String>>,
     live_usage: Mutex<(
         codex_protocol::config_types::ModeKind,
@@ -111,7 +112,8 @@ impl GoalRuntimeHandle {
                 thread_manager,
                 accounting_state,
                 enabled: AtomicBool::new(config.enabled),
-                suppressed_goal: Mutex::new(None),
+                terminal_transition: Mutex::new(None),
+                pending_terminal_intent: Mutex::new(None),
                 live_turn: Mutex::new(None),
                 live_usage: Mutex::new((
                     codex_protocol::config_types::ModeKind::Default,
@@ -130,6 +132,15 @@ impl GoalRuntimeHandle {
         mode: codex_protocol::config_types::ModeKind,
         usage: &codex_protocol::protocol::TokenUsage,
     ) {
+        // A replaced/aborted turn cannot carry a staged goal close into its
+        // successor or keep its host capability alive indefinitely.
+        let stale = self
+            .inner
+            .pending_terminal_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(stale);
         *self
             .inner
             .live_usage
@@ -181,6 +192,7 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) fn finish_live_turn(&self, turn_id: &str) {
+        self.take_terminal_intent(turn_id);
         let mut live = self
             .inner
             .live_turn
@@ -202,12 +214,185 @@ impl GoalRuntimeHandle {
                 == Some(turn_id)
     }
 
-    pub(crate) fn suppress_goal(&self, goal_id: &str) {
+    pub(crate) fn stage_terminal_intent(
+        &self,
+        intent: crate::tool::PendingGoalTerminalIntent,
+    ) -> Result<(), String> {
+        let mut pending = self
+            .inner
+            .pending_terminal_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.is_some() {
+            return Err("a goal terminal intent is already awaiting settlement".into());
+        }
+        *pending = Some(intent);
+        Ok(())
+    }
+
+    pub(crate) fn take_terminal_intent(
+        &self,
+        turn_id: &str,
+    ) -> Option<crate::tool::PendingGoalTerminalIntent> {
+        let mut pending = self
+            .inner
+            .pending_terminal_intent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending
+            .as_ref()
+            .is_some_and(|intent| intent.turn_id() == turn_id)
+        {
+            pending.take()
+        } else {
+            None
+        }
+    }
+
+    pub fn terminal_transition(&self) -> Option<codex_state::GoalTerminalTransition> {
+        self.inner
+            .terminal_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_terminal_transition(
+        &self,
+        transition: Option<codex_state::GoalTerminalTransition>,
+    ) {
         *self
             .inner
-            .suppressed_goal
+            .terminal_transition
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(goal_id.to_string());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = transition;
+    }
+
+    /// Caller holds goal_state_permit. Publish fail-stop intent before any
+    /// fallible accounting/status write; cancellation leaves a pending stop.
+    pub(crate) async fn begin_terminal_transition(
+        &self,
+        goal: &codex_state::ThreadGoal,
+        status: codex_state::ThreadGoalStatus,
+        turn_id: &str,
+        transition_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
+        let mut transition = codex_state::GoalTerminalTransition {
+            goal_id: goal.goal_id.clone(),
+            objective: goal.objective.clone(),
+            turn_id: turn_id.to_owned(),
+            transition_id: transition_id.to_owned(),
+            intended_status: status,
+            reason: reason.to_owned(),
+            outcome: codex_state::GoalTerminalTransitionOutcome::Pending,
+            persistence_confirmed: false,
+            error: None,
+        };
+        self.set_terminal_transition(Some(transition.clone()));
+        transition.persistence_confirmed = true;
+        match self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .set_terminal_transition(self.thread_id(), &transition)
+            .await
+        {
+            Ok(true) => {
+                self.set_terminal_transition(Some(transition));
+                Ok(())
+            }
+            result => {
+                transition.persistence_confirmed = false;
+                transition.outcome = codex_state::GoalTerminalTransitionOutcome::FailedUnconfirmed;
+                let error = match result {
+                    Err(err) => format!("stop intent persistence unconfirmed: {err}"),
+                    _ => "goal changed before stop intent could be persisted".to_owned(),
+                };
+                transition.error = Some(error.clone());
+                self.set_terminal_transition(Some(transition));
+                Err(error)
+            }
+        }
+    }
+
+    /// Shared status boundary for model tools and lifecycle stops. A bounded
+    /// readback can confirm an ambiguous success, never authorize continuation.
+    pub(crate) async fn persist_terminal_status(
+        &self,
+        intended: &codex_state::ThreadGoal,
+        status: codex_state::ThreadGoalStatus,
+    ) -> Result<codex_state::ThreadGoal, String> {
+        let result = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .update_thread_goal(
+                self.thread_id(),
+                codex_state::GoalUpdate {
+                    objective: None,
+                    status: Some(status),
+                    token_budget: None,
+                    expected_goal_id: Some(intended.goal_id.clone()),
+                },
+            )
+            .await
+            .map_err(|err| err.to_string());
+        let result = match result {
+            Ok(Some(goal))
+                if goal.goal_id == intended.goal_id
+                    && goal.objective == intended.objective
+                    && goal.status != codex_state::ThreadGoalStatus::Active =>
+            {
+                Ok(goal)
+            }
+            other => {
+                let error = match other {
+                    Err(err) => err,
+                    _ => "goal disappeared or was replaced during stop".to_owned(),
+                };
+                match self
+                    .inner
+                    .state_dbs
+                    .thread_goals()
+                    .get_thread_goal(self.thread_id())
+                    .await
+                {
+                    Ok(Some(goal))
+                        if goal.goal_id == intended.goal_id
+                            && goal.objective == intended.objective
+                            && goal.status == status =>
+                    {
+                        Ok(goal)
+                    }
+                    _ => Err(error),
+                }
+            }
+        };
+        if let Some(mut transition) = self.terminal_transition() {
+            transition.outcome = if result.is_ok() {
+                codex_state::GoalTerminalTransitionOutcome::ConfirmedTerminal
+            } else {
+                codex_state::GoalTerminalTransitionOutcome::FailedUnconfirmed
+            };
+            transition.error = result.as_ref().err().cloned();
+            transition.persistence_confirmed = true;
+            match self
+                .inner
+                .state_dbs
+                .thread_goals()
+                .set_terminal_transition(self.thread_id(), &transition)
+                .await
+            {
+                Ok(true) => {}
+                _ => transition.persistence_confirmed = false,
+            }
+            self.set_terminal_transition(Some(transition));
+        }
+        result.map_err(|error| format!(
+            "failed to persist terminal goal status: {error}; automatic continuation remains stopped; inspect get_goal and explicitly retry the stop or request Active reactivation. Transition: {:?}",
+            self.terminal_transition(),
+        ))
     }
 
     pub(crate) async fn retry_goal_steering(&self) {
@@ -350,11 +535,11 @@ impl GoalRuntimeHandle {
         }
         match goal.status {
             codex_state::ThreadGoalStatus::Active => {
-                *self
-                    .inner
-                    .suppressed_goal
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                // Explicit reactivation clears the guard in GoalService after
+                // durable intent is cleared. A budget-only edit is not resume.
+                if previous_goal.is_none() || objective_changed {
+                    self.set_terminal_transition(None);
+                }
                 if self.inner.accounting_state.current_turn_id().is_some() {
                     let _ = self
                         .inner
@@ -407,6 +592,7 @@ impl GoalRuntimeHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.inner.analytics.cleared(&goal);
+        self.set_terminal_transition(None);
         self.inner.accounting_state.clear_active_goal();
         Ok(())
     }
@@ -437,16 +623,14 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
 
-        if let Some(goal) = self
+        let intended_goal = self
             .inner
             .state_dbs
             .thread_goals()
             .get_thread_goal(self.thread_id())
             .await
             .map_err(|err| err.to_string())?
-        {
-            self.suppress_goal(&goal.goal_id);
-        }
+            .ok_or_else(|| "active goal disappeared before stop".to_owned())?;
         let (event_name, status) = match reason {
             ActiveGoalStopReason::TurnError => {
                 ("turn-error", codex_state::ThreadGoalStatus::Blocked)
@@ -455,6 +639,14 @@ impl GoalRuntimeHandle {
                 ("usage-limit", codex_state::ThreadGoalStatus::UsageLimited)
             }
         };
+        self.begin_terminal_transition(
+            &intended_goal,
+            status,
+            turn_id,
+            &format!("{turn_id}:{event_name}"),
+            event_name,
+        )
+        .await?;
         let accounting_result = self
             .account_active_goal_progress(
                 turn_id,
@@ -487,24 +679,7 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
         let previous_status = Some(active_goal.status);
-        let Some(goal) = self
-            .inner
-            .state_dbs
-            .thread_goals()
-            .update_thread_goal(
-                self.thread_id(),
-                codex_state::GoalUpdate {
-                    objective: None,
-                    status: Some(status),
-                    token_budget: None,
-                    expected_goal_id: Some(active_goal.goal_id),
-                },
-            )
-            .await
-            .map_err(|err| err.to_string())?
-        else {
-            return Ok(());
-        };
+        let goal = self.persist_terminal_status(&active_goal, status).await?;
         self.inner
             .metrics
             .record_terminal_if_status_changed(previous_status, &goal);
@@ -535,8 +710,24 @@ impl GoalRuntimeHandle {
             .get_thread_goal(self.thread_id())
             .await
             .map_err(|err| err.to_string())?;
+        let transition = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .get_terminal_transition(self.thread_id())
+            .await
+            .map_err(|err| err.to_string())?
+            .filter(|transition| {
+                goal.as_ref().is_some_and(|goal| {
+                    goal.goal_id == transition.goal_id && goal.objective == transition.objective
+                })
+            });
+        self.set_terminal_transition(transition);
         match goal {
-            Some(goal) if goal.status == codex_state::ThreadGoalStatus::Active => {
+            Some(goal)
+                if goal.status == codex_state::ThreadGoalStatus::Active
+                    && self.terminal_transition().is_none() =>
+            {
                 self.inner
                     .accounting_state
                     .mark_idle_goal_active(goal.goal_id);
@@ -580,13 +771,25 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
+        // Also consult durable intent if resume restoration was interrupted or
+        // unavailable. A failed read defers continuation rather than assuming
+        // that an Active row is permission to restart.
+        if self.terminal_transition().is_none() {
+            let transition = self
+                .inner
+                .state_dbs
+                .thread_goals()
+                .get_terminal_transition(self.thread_id())
+                .await
+                .map_err(|err| err.to_string())?;
+            self.set_terminal_transition(transition);
+        }
         if self
-            .inner
-            .suppressed_goal
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_deref()
-            == Some(goal.goal_id.as_str())
+            .terminal_transition()
+            .as_ref()
+            .is_some_and(|transition| {
+                transition.goal_id == goal.goal_id && transition.objective == goal.objective
+            })
         {
             return Ok(());
         }

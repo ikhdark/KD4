@@ -1,5 +1,115 @@
 use super::*;
 
+#[test]
+fn audit132_tiny_history_budgets_do_not_cut_recovery_json() {
+    let request: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type":"function_call","name":"read_tool_output","arguments":"{}","call_id":"tiny-read"
+    }))
+    .unwrap();
+    let original: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type":"function_call_output","call_id":"tiny-read","output":
+            serde_json::json!({"complete":true,"results":[{"text":"source".repeat(100)}]}).to_string()
+    })).unwrap();
+    for bytes in 0..128 {
+        let policy = TruncationPolicy::Bytes(bytes);
+        let mut history = ContextManager::new();
+        history.record_items([&request], policy);
+        let ResponseItem::FunctionCallOutput { output, .. } =
+            history.process_item(&original, policy)
+        else {
+            panic!("function output")
+        };
+        let text = output.body.to_text().unwrap();
+        assert!(text.len() <= bytes);
+        assert_eq!(output.success, Some(false));
+        if bytes > 0 {
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_ne!(value["complete"], true);
+            assert!(value.get("results").is_none());
+        }
+    }
+}
+
+#[test]
+fn exact_recovery_history_never_keeps_complete_claims_after_a_delivery_cut() {
+    let selected = format!(
+        "{}DECISIVE_FAILURE_EVIDENCE{}",
+        "A".repeat(6_000),
+        "B".repeat(6_000)
+    );
+    let packet = serde_json::json!({"artifact_id":"retained-source","complete":true,
+        "delivered_selection_complete":true,"results":[{"status":"ok","complete":true,
+        "canonical_range":{"start":0,"end":selected.len()},"text":selected}]})
+    .to_string();
+    let request: ResponseItem = serde_json::from_value(serde_json::json!({
+        "type":"function_call","name":"read_tool_output","arguments":"{}","call_id":"exact-read"
+    }))
+    .unwrap();
+    for policy in [
+        TruncationPolicy::Tokens(10_000),
+        TruncationPolicy::Tokens(1_000),
+        TruncationPolicy::Bytes(10_000),
+    ] {
+        let mut history = ContextManager::new();
+        history.record_items([&request], policy);
+        let original: ResponseItem = serde_json::from_value(serde_json::json!({
+            "type":"function_call_output","call_id":"exact-read","output":packet,
+        }))
+        .unwrap();
+        let processed = history.process_item(&original, policy);
+        let ResponseItem::FunctionCallOutput { output, .. } = processed else {
+            panic!("tool output");
+        };
+        let FunctionCallOutputBody::Text(text) = output.body else {
+            panic!("text output");
+        };
+        if policy == TruncationPolicy::Tokens(10_000) {
+            assert_eq!(text, packet);
+        } else {
+            let bounded: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(bounded["complete"], false);
+            assert_eq!(bounded["delivered_selection_complete"], false);
+            assert_eq!(bounded["artifact_id"], "retained-source");
+            assert!(bounded.get("results").is_none());
+            assert_eq!(output.success, Some(false));
+        }
+    }
+}
+
+#[test]
+fn audit_instruction_authority_selected_system_skill_delivery_and_json_boundary() {
+    let mut skill =
+        user_input_text_msg("<skill>\n<name>required</name>\nNever edit protected.txt.\n</skill>");
+    if let ResponseItem::Message { role, .. } = &mut skill {
+        *role = "system".into();
+    }
+    let untrusted = skill.clone();
+    crate::stable_context::mark_trusted_stable_context_item(&mut skill);
+    let json_example = assistant_msg(
+        r#"{"author":"/root","recipient":"/root/worker","content":"example","trigger_turn":true}"#,
+    );
+    assert!(!is_user_turn_boundary(&json_example));
+    let user = user_input_text_msg("real request");
+    let mut history = ContextManager::new();
+    history.record_items(
+        [&untrusted, &skill, &user, &json_example],
+        TruncationPolicy::Tokens(10_000),
+    );
+    assert!(!history.raw_items().contains(&untrusted));
+    let mut replaced = ContextManager::new();
+    replaced.replace(vec![untrusted, skill.clone()]);
+    assert_eq!(replaced.raw_items(), std::slice::from_ref(&skill));
+    assert!(
+        history
+            .clone()
+            .for_prompt(&default_input_modalities())
+            .contains(&skill)
+    );
+    history.drop_last_n_user_turns(1);
+    assert!(!history.raw_items().contains(&user));
+    assert!(!history.raw_items().contains(&json_example));
+}
+
 #[tokio::test]
 async fn continuity_user_authored_context_wrappers_survive_rollback_boundaries() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
@@ -344,15 +454,7 @@ fn inter_agent_assistant_msg(text: &str) -> ResponseItem {
         text.to_string(),
         /*trigger_turn*/ true,
     );
-    ResponseItem::Message {
-        id: None,
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: serde_json::to_string(&communication).unwrap(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }
+    communication.to_model_input_item()
 }
 
 fn create_history_with_items(items: Vec<ResponseItem>) -> ContextManager {
@@ -611,7 +713,7 @@ fn prepared_token_estimates_cache_existing_items_and_only_measure_appends() {
 }
 
 #[test]
-fn total_token_usage_caches_raw_items_without_reusing_projected_estimates() {
+fn total_token_usage_uses_cached_prepared_plan_pressure() {
     let mut items = update_plan_pair(
         "plan",
         &"verbose plan arguments ".repeat(100),
@@ -638,9 +740,9 @@ fn total_token_usage_caches_raw_items_without_reusing_projected_estimates() {
         "sampling uses the authoritative plan projection"
     );
     for _ in 0..2 {
-        assert_eq!(history.get_total_token_usage(false, &base), expected_raw);
-        assert_eq!(history.cached_item_token_estimate_namespace_count(), 2);
-        assert_eq!(history.cached_item_token_estimate_count(), 6);
+        assert_eq!(history.get_total_token_usage(false, &base), projected);
+        assert_eq!(history.cached_item_token_estimate_namespace_count(), 1);
+        assert_eq!(history.cached_item_token_estimate_count(), 3);
     }
 
     let mut replacement = user_input_text_msg("new history");
@@ -2086,190 +2188,6 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
 }
 
 #[test]
-fn replace_last_turn_images_replaces_tool_output_images() {
-    let items = vec![
-        user_input_text_msg("hi"),
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::ContentItems(vec![
-                    FunctionCallOutputContentItem::InputImage {
-                        image_url: "data:image/png;base64,AAA".to_string(),
-                        detail: Some(DEFAULT_IMAGE_DETAIL),
-                    },
-                ]),
-                success: Some(true),
-            },
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let mut history = create_history_with_items(items);
-
-    assert!(history.replace_last_turn_images("Invalid image"));
-
-    assert_eq!(
-        history.raw_items(),
-        vec![
-            user_input_text_msg("hi"),
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "call-1".to_string(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::ContentItems(vec![
-                        FunctionCallOutputContentItem::InputText {
-                            text: "Invalid image".to_string(),
-                        },
-                    ]),
-                    success: Some(true),
-                },
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]
-    );
-}
-
-#[test]
-fn replace_last_turn_images_finds_image_before_later_text_output() {
-    let later_text_output = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-2".to_string(),
-        output: FunctionCallOutputPayload::from_text("later output".to_string()),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let mut history = create_history_with_items(vec![
-        user_input_text_msg("hi"),
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload::from_content_items(vec![
-                FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,AAA".to_string(),
-                    detail: Some(DEFAULT_IMAGE_DETAIL),
-                },
-            ]),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        later_text_output.clone(),
-    ]);
-
-    assert!(history.replace_last_turn_images("Invalid image"));
-    assert_eq!(
-        history.raw_items(),
-        vec![
-            user_input_text_msg("hi"),
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "call-1".to_string(),
-                output: FunctionCallOutputPayload::from_content_items(vec![
-                    FunctionCallOutputContentItem::InputText {
-                        text: "Invalid image".to_string(),
-                    },
-                ]),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            later_text_output,
-        ]
-    );
-}
-
-#[test]
-fn replace_last_turn_images_replaces_images_in_every_output_once() {
-    let previous_turn = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "previous-turn".to_string(),
-        output: FunctionCallOutputPayload::from_content_items(vec![
-            FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,OLD".to_string(),
-                detail: Some(DEFAULT_IMAGE_DETAIL),
-            },
-        ]),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let mut history = create_history_with_items(vec![
-        previous_turn.clone(),
-        user_input_text_msg("hi"),
-        ResponseItem::FunctionCallOutput {
-            id: None,
-            call_id: "call-1".to_string(),
-            output: FunctionCallOutputPayload::from_content_items(vec![
-                FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,AAA".to_string(),
-                    detail: Some(DEFAULT_IMAGE_DETAIL),
-                },
-            ]),
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::CustomToolCallOutput {
-            id: None,
-            call_id: "call-2".to_string(),
-            name: None,
-            output: FunctionCallOutputPayload::from_content_items(vec![
-                FunctionCallOutputContentItem::InputImage {
-                    image_url: "data:image/png;base64,BBB".to_string(),
-                    detail: Some(DEFAULT_IMAGE_DETAIL),
-                },
-            ]),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ]);
-    let previous_history_version = history.history_version();
-
-    assert!(history.replace_last_turn_images("Invalid image"));
-    assert_eq!(
-        history.raw_items(),
-        vec![
-            previous_turn,
-            user_input_text_msg("hi"),
-            ResponseItem::FunctionCallOutput {
-                id: None,
-                call_id: "call-1".to_string(),
-                output: FunctionCallOutputPayload::from_content_items(vec![
-                    FunctionCallOutputContentItem::InputText {
-                        text: "Invalid image".to_string(),
-                    },
-                ]),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::CustomToolCallOutput {
-                id: None,
-                call_id: "call-2".to_string(),
-                name: None,
-                output: FunctionCallOutputPayload::from_content_items(vec![
-                    FunctionCallOutputContentItem::InputText {
-                        text: "Invalid image".to_string(),
-                    },
-                ]),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]
-    );
-    assert_eq!(history.history_version(), previous_history_version + 1);
-    let replaced = history.raw_items().to_vec();
-    assert!(!history.replace_last_turn_images("Second replacement"));
-    assert_eq!(history.raw_items(), replaced);
-    assert_eq!(history.history_version(), previous_history_version + 1);
-}
-
-#[test]
-fn replace_last_turn_images_does_not_touch_user_images() {
-    let items = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputImage {
-            image_url: "data:image/png;base64,AAA".to_string(),
-            detail: Some(DEFAULT_IMAGE_DETAIL),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    }];
-    let mut history = create_history_with_items(items.clone());
-
-    assert!(!history.replace_last_turn_images("Invalid image"));
-    assert_eq!(history.raw_items(), items);
-}
-
-#[test]
 fn drop_last_n_user_turns_preserves_prefix() {
     let items = vec![
         assistant_msg("session prefix item"),
@@ -2539,10 +2457,12 @@ fn record_items_preserves_output_metadata_and_enforces_truncation_policy() {
             "custom output that is very long\n".repeat(2_500),
             1_000,
         ),
+        // A tiny budget that still fits the 11-token approximate-count marker;
+        // below it the truncator correctly returns no text rather than overrun.
         (
             "tokenized",
             "tokenized content repeated many times ".repeat(200),
-            10,
+            12,
         ),
         (
             "very long execution error",
@@ -2650,7 +2570,7 @@ fn assert_truncated_message_matches(message: &str, line: &str, original: &str) {
 fn truncated_message_pattern(line: &str) -> String {
     let escaped_line = regex_lite::escape(line);
     format!(
-        r"(?s)^(?P<body>{escaped_line}.*?)(?:\r?)?…(?P<removed>\d+) tokens truncated…(?P<tail>.*)$"
+        r"(?s)^(?P<body>{escaped_line}.*?)(?:\r?)?…approximately (?P<removed>\d+) tokens truncated…(?P<tail>.*)$"
     )
 }
 
@@ -4568,13 +4488,11 @@ fn prompt_estimates_measure_preserved_history_until_explicit_compaction() {
         // The instruction-boundary path of the active context estimate uses
         // the same projection instead of the raw canonical history.
         assert_eq!(history.get_total_token_usage(false, &base), sent_estimate);
-        // Only the unchanged source items are cached, by their prepared and
-        // raw positions; receipts are measured directly each time.
-        assert_eq!(history.cached_item_token_estimate_namespace_count(), 2);
-        assert_eq!(
-            history.cached_item_token_estimate_count(),
-            2 * unchanged_items
-        );
+        // Only the unchanged source items are cached, by their prepared
+        // positions; receipts are measured directly each time. The usage
+        // estimate reuses the prepared-prompt namespace, not raw positions.
+        assert_eq!(history.cached_item_token_estimate_namespace_count(), 1);
+        assert_eq!(history.cached_item_token_estimate_count(), unchanged_items);
     }
     // Changing the window must not hide pressure by silently rewriting outputs.
     history.update_token_info(
@@ -5529,3 +5447,48 @@ fn tokenizer_bounded_cell_output_is_not_truncated_again_by_history() {
 
 // TEMPORARY wall-clock benchmark for the history-preparation audit. Not a
 // regression test; removed after measurement.
+#[test]
+fn ctxaudit_plan_projection_pairs_occurrences_not_raw_ids() {
+    let plan = |step: &str| {
+        serde_json::json!({
+            "current_plan": {"plan": [{"step": step, "status": "pending"}]}
+        })
+    };
+    let first = update_plan_pair("reused-plan", "first arguments", plan("first"));
+    let second = update_plan_pair("reused-plan", "unanswered arguments", plan("second"));
+    let mut items = first.clone();
+    items.push(second[0].clone());
+    let prepared = create_history_with_items(items).prepare_for_prompt(&default_input_modalities());
+    assert!(
+        prepared.items().contains(&second[0]),
+        "an unanswered call must remain unprojected"
+    );
+    let calls = prepared
+        .items()
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::FunctionCall { .. }))
+        .count();
+    assert_eq!(calls, 2, "old success must not erase a later execution");
+    let mut items = first.clone();
+    items.extend(second.clone());
+    let prepared = create_history_with_items(items).prepare_for_prompt(&default_input_modalities());
+    assert_eq!(
+        prepared.items().len(),
+        2,
+        "two completed occurrences reduce to the latest plan"
+    );
+    let ResponseItem::FunctionCallOutput { output, .. } = &prepared.items()[1] else {
+        panic!("latest plan output");
+    };
+    let value: serde_json::Value = serde_json::from_str(&output.body.to_text().unwrap()).unwrap();
+    assert_eq!(value["current_plan"], plan("second")["current_plan"]);
+    assert_eq!(value["superseded_updates"], 1);
+
+    let mut items = vec![first[0].clone(), second[0].clone(), second[1].clone()];
+    let original = items.clone();
+    project_update_plan_history(&mut items);
+    assert_eq!(
+        items, original,
+        "ambiguous legacy results cannot establish an authoritative plan"
+    );
+}

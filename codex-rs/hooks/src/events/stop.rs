@@ -526,7 +526,9 @@ mod tests {
                     parsed.completed.run.entries,
                     vec![HookOutputEntry {
                         kind: HookOutputEntryKind::Error,
-                        text: format!("{label} hook returned decision:block without a non-empty reason"),
+                        text: format!(
+                            "{label} hook returned decision:block without a non-empty reason"
+                        ),
                     }]
                 );
             }
@@ -602,8 +604,6 @@ mod tests {
             }]
         );
     }
-
-
 
     #[test]
     fn invalid_stdout_fails_instead_of_silently_nooping() {

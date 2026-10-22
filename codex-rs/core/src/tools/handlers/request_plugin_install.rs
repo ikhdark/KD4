@@ -242,6 +242,11 @@ impl RequestPluginInstallHandler {
             )
             .await;
         let response = elicitation.response;
+        if !elicitation.sent && response.is_none() {
+            return Err(FunctionCallError::RespondToModel(
+                "Installation request was not sent because its originating turn is no longer active. No user decision was received.".to_string(),
+            ));
+        }
         if let Some(response) = response.as_ref() {
             handle_disabled_install_persistence(
                 &session,

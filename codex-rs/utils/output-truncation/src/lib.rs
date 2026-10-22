@@ -195,15 +195,29 @@ fn omitted_line_marker_at_lines(
     let (first, last, partial) = omitted_line_span(content, start, end);
     let first = first + offset;
     let last = last + offset;
-    format!("\n[omitted lines {first}-{last} of {total}{}]\n",
-        if partial { "; boundary lines partially retained" } else { "" })
+    format!(
+        "\n[omitted lines {first}-{last} of {total}{}]\n",
+        if partial {
+            "; boundary lines partially retained"
+        } else {
+            ""
+        }
+    )
 }
 
 /// 1-based inclusive lines touched by the omitted byte range, and whether a
 /// boundary line is partially retained.
 fn omitted_line_span(content: &str, start: usize, end: usize) -> (usize, usize, bool) {
-    let first = content[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let last = first + content[start..end].bytes().filter(|byte| *byte == b'\n').count()
+    let first = content[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let last = first
+        + content[start..end]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
         - usize::from(content[..end].ends_with('\n'));
     let partial = (start > 0 && content.as_bytes()[start - 1] != b'\n')
         || (end < content.len() && end > 0 && content.as_bytes()[end - 1] != b'\n');
@@ -408,7 +422,10 @@ fn json_outline(value: &serde_json::Value, depth: usize, out: &mut String) {
             if chars <= JSON_OUTLINE_STRING_CHARS {
                 let _ = write!(out, "{value}");
             } else {
-                let prefix = text.chars().take(JSON_OUTLINE_STRING_CHARS).collect::<String>();
+                let prefix = text
+                    .chars()
+                    .take(JSON_OUTLINE_STRING_CHARS)
+                    .collect::<String>();
                 let _ = write!(out, "{}…({chars} chars)", Value::String(prefix));
             }
         }
@@ -432,7 +449,8 @@ fn truncate_over_budget_text_with_markers(
         if !approx_token_count_exceeds(&outlined, max_tokens) {
             return (outlined, Vec::new());
         }
-        let (text, _) = truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
+        let (text, _) =
+            truncate_over_budget_lines_with_markers(&outlined, max_tokens, line_markers);
         return (text, Vec::new());
     }
     truncate_over_budget_lines_with_markers(content, max_tokens, line_markers)
@@ -448,7 +466,10 @@ fn truncate_over_budget_lines_with_markers(
     let marker_tokens = approx_token_count(BEFORE_MIDDLE) + approx_token_count(AFTER_MIDDLE);
     // Leave room for useful UTF-8 content in each retained region.
     if max_tokens <= marker_tokens + 4 {
-        return (truncate_middle_to_token_ceiling(content, max_tokens), Vec::new());
+        return (
+            truncate_middle_to_token_ceiling(content, max_tokens),
+            Vec::new(),
+        );
     }
 
     let mut retained_bytes =
@@ -464,28 +485,34 @@ fn truncate_over_budget_lines_with_markers(
         let middle_start = (content.len() - middle) / 2;
         candidate.clear();
         let head_text = retained_text(content, 0, content.floor_char_boundary(head));
-        let middle_text = retained_text(content,
+        let middle_text = retained_text(
+            content,
             content.ceil_char_boundary(middle_start),
-            content.floor_char_boundary(middle_start + middle));
-        let tail_text = retained_text(content,
-            content.ceil_char_boundary(content.len() - tail), content.len());
+            content.floor_char_boundary(middle_start + middle),
+        );
+        let tail_text = retained_text(
+            content,
+            content.ceil_char_boundary(content.len() - tail),
+            content.len(),
+        );
         let middle_offset = middle_text.as_ptr() as usize - content.as_ptr() as usize;
         let tail_offset = tail_text.as_ptr() as usize - content.as_ptr() as usize;
         let gaps = [
             (head_text.len(), middle_offset),
             (middle_offset + middle_text.len(), tail_offset),
         ];
-        let before = total_lines.map(|total| {
-            omitted_line_marker_at_lines(content, gaps[0].0, gaps[0].1, 0, total)
-        });
-        let after = total_lines.map(|total| {
-            omitted_line_marker_at_lines(content, gaps[1].0, gaps[1].1, 0, total)
-        });
+        let before = total_lines
+            .map(|total| omitted_line_marker_at_lines(content, gaps[0].0, gaps[0].1, 0, total));
+        let after = total_lines
+            .map(|total| omitted_line_marker_at_lines(content, gaps[1].0, gaps[1].1, 0, total));
         let _ = write!(
             candidate,
             "{}{}{}{}{}",
-            head_text, before.as_deref().unwrap_or(BEFORE_MIDDLE),
-            middle_text, after.as_deref().unwrap_or(AFTER_MIDDLE), tail_text
+            head_text,
+            before.as_deref().unwrap_or(BEFORE_MIDDLE),
+            middle_text,
+            after.as_deref().unwrap_or(AFTER_MIDDLE),
+            tail_text
         );
         let actual_tokens = approx_token_count(&candidate);
         if actual_tokens <= max_tokens {
@@ -509,7 +536,10 @@ fn truncate_over_budget_lines_with_markers(
             // changes across UTF-8 boundaries or retained regions.
             .min(retained_bytes.saturating_sub(retained_bytes.div_ceil(8)));
         if retained_bytes < 3 {
-            return (truncate_middle_to_token_ceiling(content, max_tokens), Vec::new());
+            return (
+                truncate_middle_to_token_ceiling(content, max_tokens),
+                Vec::new(),
+            );
         }
     }
 }
@@ -648,7 +678,7 @@ fn formatted_truncate_text_to_token_ceiling(
         return (output, Vec::new());
     }
     let warning = format!(
-        "Warning: truncated output (original token count: {original_tokens})\nTotal output lines: {}\n\n",
+        "Warning: truncated output (estimated original tokens: {original_tokens})\nTotal output lines: {}\n\n",
         content.lines().count(),
     );
     let warning_tokens = approx_token_count(&warning);
@@ -889,7 +919,9 @@ fn strip_prefix_ascii_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
 
 pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
     if let TruncationPolicy::Tokens(max_tokens) = policy {
-        return formatted_truncate_text_to_token_ceiling(content, max_tokens, false).0.text;
+        return formatted_truncate_text_to_token_ceiling(content, max_tokens, false)
+            .0
+            .text;
     }
     if content.len() <= policy.byte_budget() {
         return content.to_string();
@@ -899,7 +931,7 @@ pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> Strin
     let total_lines = content.lines().count();
     let result = truncate_text(content, policy);
     format!(
-        "Warning: truncated output (original token count: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
+        "Warning: truncated output (estimated original tokens: {original_token_count})\nTotal output lines: {total_lines}\n\n{result}"
     )
 }
 

@@ -14,11 +14,53 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
+// serde_json's default decoder rejects the 128th container. Count the complete
+// serialized frame (including envelopes and RawValue), not just tool arguments.
+#[derive(Default)]
+struct JsonDepth {
+    depth: usize,
+    in_string: bool,
+    escaped: bool,
+}
+
+impl JsonDepth {
+    fn admit(&mut self, bytes: &[u8]) -> io::Result<()> {
+        for &byte in bytes {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => self.in_string = true,
+                    b'[' | b'{' => {
+                        self.depth += 1;
+                        if self.depth >= 128 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "code-mode IPC frame exceeds the JSON nesting limit",
+                            ));
+                        }
+                    }
+                    b']' | b'}' => self.depth = self.depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct LimitedPayload {
     bytes: Vec<u8>,
     /// Leading bytes, such as the length prefix, outside the payload limit.
     reserved: usize,
     limit: usize,
+    depth: JsonDepth,
 }
 
 impl io::Write for LimitedPayload {
@@ -29,6 +71,7 @@ impl io::Write for LimitedPayload {
                 format!("code-mode IPC frame exceeds {} bytes", self.limit),
             ));
         }
+        self.depth.admit(bytes)?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -49,18 +92,24 @@ impl EncodedFrame {
     /// Measure without allocating an encoded buffer so callers can admit bytes
     /// before serialization. Encoding still independently enforces the limit.
     pub fn encoded_len<T: Serialize>(message: &T) -> io::Result<usize> {
-        struct Counter(usize);
+        struct Counter(usize, JsonDepth);
         impl io::Write for Counter {
             fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
                 self.0 = self.0.saturating_add(bytes.len());
                 if self.0 > MAX_FRAME_BYTES {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "IPC frame exceeds byte limit"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "IPC frame exceeds byte limit",
+                    ));
                 }
+                self.1.admit(bytes)?;
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
         }
-        let mut count = Counter(0);
+        let mut count = Counter(0, JsonDepth::default());
         serde_json::to_writer(&mut count, message).map_err(io::Error::other)?;
         Ok(count.0 + LENGTH_PREFIX_BYTES)
     }
@@ -76,6 +125,7 @@ impl EncodedFrame {
             bytes,
             reserved: LENGTH_PREFIX_BYTES,
             limit: MAX_FRAME_BYTES,
+            depth: JsonDepth::default(),
         };
         serde_json::to_writer(&mut frame, message).map_err(|err| {
             io::Error::new(
@@ -201,6 +251,37 @@ mod tests {
     use super::MAX_FRAME_BYTES;
 
     #[test]
+    fn complete_frame_nesting_admission_includes_envelopes_and_raw_json() {
+        #[derive(serde::Serialize)]
+        struct Envelope<'a> {
+            input: &'a serde_json::value::RawValue,
+        }
+        for depth in [126, 127] {
+            let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+            let raw = serde_json::value::RawValue::from_string(raw).unwrap();
+            let frame = Envelope { input: &raw };
+            let measured = EncodedFrame::encoded_len(&frame);
+            let encoded = EncodedFrame::encode(&frame);
+            if depth == 126 {
+                let encoded = encoded.unwrap();
+                assert_eq!(measured.unwrap(), encoded.bytes.len());
+                serde_json::from_slice::<serde_json::Value>(encoded.payload()).unwrap();
+            } else {
+                assert!(measured.is_err());
+                assert!(encoded.is_err());
+            }
+        }
+        // Strings and escapes may be split across arbitrary writer chunks.
+        let json = serde_json::to_vec(&serde_json::json!({"input": "\\\"[{λ😀}]"})).unwrap();
+        let mut depth = super::JsonDepth::default();
+        for byte in json {
+            depth.admit(&[byte]).unwrap();
+        }
+        assert_eq!(depth.depth, 0);
+        assert!(!depth.in_string);
+    }
+
+    #[test]
     fn encoded_frame_accepts_exact_serialized_limit_and_rejects_one_extra_byte() {
         // Quotes add two bytes, and the final newline adds two escaped bytes.
         let mut message = "x".repeat(MAX_FRAME_BYTES - 4);
@@ -238,6 +319,7 @@ mod tests {
             bytes: Vec::new(),
             reserved: 0,
             limit: 4,
+            depth: super::JsonDepth::default(),
         };
         payload.write_all(b"ab").expect("first chunk");
         let err = payload.write_all(b"cde").expect_err("oversized chunk");
@@ -260,6 +342,7 @@ mod tests {
             bytes: Vec::new(),
             reserved: 0,
             limit: 4,
+            depth: super::JsonDepth::default(),
         };
         serde_json::to_writer(&mut exact, "\n").expect("exact serialized limit");
         assert_eq!(exact.bytes, br#""\n""#);
@@ -268,6 +351,7 @@ mod tests {
             bytes: Vec::new(),
             reserved: 0,
             limit: 3,
+            depth: super::JsonDepth::default(),
         };
         assert!(serde_json::to_writer(&mut short, "\n").is_err());
         assert_eq!(short.bytes, b"\"\\n");

@@ -501,9 +501,13 @@ async fn completed_tool_call_dispatch_overlaps_required_persistence() {
     assert!(!started.load(Ordering::SeqCst));
     assert_eq!(
         turn_context.turn_timing_state.model_tool_call_counts(),
-        Some((1, 0)),
-        "model emission must be counted before the deferred executor future is polled"
+        Some((1, 1)),
+        "unique acceptance must be counted before the deferred executor future is polled"
     );
+    let admitted = turn_context.turn_timing_state.sampling_checkpoint().timing;
+    assert!(admitted.milestones.first_tool_accepted_ms.is_some());
+    assert!(admitted.milestones.first_tool_handler_entry_ms.is_none());
+    assert!(admitted.tool_calls.is_empty());
     assert!(session.clone_history().await.raw_items().is_empty());
     let tool_future = output
         .tool_future
@@ -529,7 +533,7 @@ async fn completed_tool_call_dispatch_overlaps_required_persistence() {
     assert_eq!(
         turn_context.turn_timing_state.model_tool_call_counts(),
         Some((1, 1)),
-        "executor polling must be counted separately from model emission"
+        "polling must not count an accepted call twice"
     );
 }
 
@@ -913,5 +917,46 @@ async fn audit_reports_17_19_terminal_generation_rejects_tools_before_acceptance
             .tool_closure_snapshot()
             .accepted_count,
         0
+    );
+}
+#[tokio::test]
+async fn ctxaudit_reused_provider_call_ids_get_independent_durable_occurrences() {
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let call = || ResponseItem::FunctionCall {
+        id: Some(ResponseItemId::new("fc")),
+        name: "read_file".into(),
+        namespace: None,
+        arguments: "{}".into(),
+        call_id: "reused".into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let first = OrderedResponseItemRecorder::default();
+    let mut a = call();
+    first.normalize_call_id(&session, &mut a).await;
+    assert_eq!(crate::tool_occurrence::identity(&a).unwrap().2, "reused");
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "reused".into(),
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text("A completed".into()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    session
+        .record_conversation_items(&turn, &[a.clone(), output.clone()])
+        .await
+        .unwrap();
+    let second = OrderedResponseItemRecorder::default();
+    let mut b = call();
+    second.normalize_call_id(&session, &mut b).await;
+    let b_id = crate::tool_occurrence::identity(&b).unwrap().2.to_string();
+    assert_ne!(b_id, "reused");
+    let mut replay = b.clone();
+    crate::tool_occurrence::set_call_id(&mut replay, "reused".into());
+    second.normalize_call_id(&session, &mut replay).await;
+    assert_eq!(replay, b, "same-generation replay keeps the same identity");
+    let missing = crate::context_manager::missing_call_outputs(&[a, output, b]);
+    assert_eq!(missing.len(), 1);
+    assert_eq!(
+        crate::tool_occurrence::identity(&missing[0]).unwrap().2,
+        b_id
     );
 }

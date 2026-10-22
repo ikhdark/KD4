@@ -97,7 +97,11 @@ async fn public_connector_uses_factory_stream_sink_and_requested_nodelay() {
                 .expect("websocket request should build");
             let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
             let connector = WebSocketConnector::new(&factory).expect("connector should build");
-            let connector = if nodelay { connector.with_tcp_nodelay() } else { connector };
+            let connector = if nodelay {
+                connector.with_tcp_nodelay()
+            } else {
+                connector
+            };
 
             let (mut websocket, _) = connector
                 .connect(request, WebSocketConfig::default())
@@ -105,9 +109,15 @@ async fn public_connector_uses_factory_stream_sink_and_requested_nodelay() {
                 .expect("websocket handshake should succeed");
             assert_eq!(websocket_tcp_nodelay(&websocket), nodelay);
             let expected = Message::Text(message.into());
-            websocket.send(expected.clone()).await.expect("websocket should send");
+            websocket
+                .send(expected.clone())
+                .await
+                .expect("websocket should send");
             assert_eq!(
-                websocket.next().await.expect("websocket should receive a message")
+                websocket
+                    .next()
+                    .await
+                    .expect("websocket should receive a message")
                     .expect("websocket message should be valid"),
                 expected,
             );
@@ -404,7 +414,11 @@ async fn happy_eyeballs_does_not_wait_for_stalled_preferred_family() {
     let connected = tokio::time::timeout(
         Duration::from_secs(1),
         connect_happy_eyeballs(vec![stalled, reachable], |address| {
-            let drop_sender = if address == stalled { drop_sender.take() } else { None };
+            let drop_sender = if address == stalled {
+                drop_sender.take()
+            } else {
+                None
+            };
             async move {
                 let _drop_sender = drop_sender;
                 if address == stalled {
@@ -437,7 +451,9 @@ async fn happy_eyeballs_cancellation_drops_all_started_attempts() {
     let result = tokio::time::timeout(
         HAPPY_EYEBALLS_DELAY + Duration::from_millis(1),
         connect_happy_eyeballs(addresses.to_vec(), |_| {
-            let sender = senders.pop().expect("only the supplied addresses may start");
+            let sender = senders
+                .pop()
+                .expect("only the supplied addresses may start");
             async move {
                 let _sender = sender;
                 std::future::pending::<std::io::Result<SocketAddr>>().await

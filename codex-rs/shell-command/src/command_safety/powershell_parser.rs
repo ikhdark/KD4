@@ -5,6 +5,10 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
+#[cfg(windows)]
+use std::fs::File as ChildStdin;
+#[cfg(windows)]
+use std::fs::File as ChildStdout;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::ErrorKind;
@@ -12,13 +16,15 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(not(windows))]
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-#[cfg(windows)]
-use std::fs::File as ChildStdin;
-#[cfg(windows)]
-use std::fs::File as ChildStdout;
-#[cfg(windows)]
-use windows_process::Child;
+use std::process::Child;
+#[cfg(not(windows))]
+use std::process::ChildStdin;
+#[cfg(not(windows))]
+use std::process::ChildStdout;
+#[cfg(not(windows))]
+use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::LazyLock;
@@ -29,6 +35,8 @@ use std::sync::TryLockError;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
+#[cfg(windows)]
+use windows_process::Child;
 
 const POWERSHELL_PARSER_SCRIPT: &str = include_str!("powershell_parser.ps1");
 #[cfg(windows)]
@@ -202,7 +210,8 @@ pub fn powershell_command_has_syntax_error(command: &[String]) -> bool {
 /// means no positive syntax-error report, not proof that execution is safe.
 pub fn powershell_command_syntax_error(command: &[String]) -> Option<String> {
     let (executable, args) = command.split_first()?;
-    let PowershellInvocation::InlineCommand { script, .. } = parse_powershell_invocation(args) else {
+    let PowershellInvocation::InlineCommand { script, .. } = parse_powershell_invocation(args)
+    else {
         return None;
     };
     match parse_with_powershell_ast(executable, script) {
@@ -230,11 +239,10 @@ fn parse_with_powershell_ast_request(
             .clone()
     };
     let access = match acquire_cached_parser(&parser, SPARE_PARSERS.as_slice()) {
-        CachedParserAccess::Saturated => wait_for_cached_parser(
-            &parser,
-            SPARE_PARSERS.as_slice(),
-            deadline,
-        ).unwrap_or(CachedParserAccess::Saturated),
+        CachedParserAccess::Saturated => {
+            wait_for_cached_parser(&parser, SPARE_PARSERS.as_slice(), deadline)
+                .unwrap_or(CachedParserAccess::Saturated)
+        }
         access => access,
     };
     let outcome = match access {
@@ -265,7 +273,9 @@ fn acquire_cached_parser<'a>(
 ) -> CachedParserAccess<'a> {
     match parser.try_lock() {
         Ok(parser) => return CachedParserAccess::Shared(parser),
-        Err(TryLockError::Poisoned(poisoned)) => return CachedParserAccess::Shared(poisoned.into_inner()),
+        Err(TryLockError::Poisoned(poisoned)) => {
+            return CachedParserAccess::Shared(poisoned.into_inner());
+        }
         Err(TryLockError::WouldBlock) => {}
     }
     for spare in spare_parsers {
@@ -286,7 +296,9 @@ pub(crate) fn try_parse_powershell_ast_commands(
 ) -> Option<Vec<Vec<String>>> {
     match parse_with_powershell_ast(executable, script) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis.commands),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError(_) => None,
+        PowershellParseOutcome::Unsupported
+        | PowershellParseOutcome::Failed
+        | PowershellParseOutcome::SyntaxError(_) => None,
     }
 }
 
@@ -302,6 +314,8 @@ pub(crate) struct PowershellParseAnalysis {
     pub commands: Vec<Vec<String>>,
     pub standalone_command: bool,
     pub direct_argv: Option<PowershellDirectArgvCandidate>,
+    /// Resource inspection only; not a direct-execution or runner-receipt proof.
+    pub inspection_argv: Option<Vec<String>>,
     pub resolved_application: Option<String>,
 }
 
@@ -311,7 +325,9 @@ pub(crate) fn try_parse_powershell_ast_analysis(
 ) -> Option<PowershellParseAnalysis> {
     match parse_with_powershell_ast(executable, script) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError(_) => None,
+        PowershellParseOutcome::Unsupported
+        | PowershellParseOutcome::Failed
+        | PowershellParseOutcome::SyntaxError(_) => None,
     }
 }
 
@@ -322,7 +338,9 @@ pub(crate) fn try_parse_powershell_ast_analysis_with_resolution(
 ) -> Option<PowershellParseAnalysis> {
     match parse_with_powershell_ast_request(executable, script, Some(resolution)) {
         PowershellParseOutcome::Analysis(analysis) => Some(analysis),
-        PowershellParseOutcome::Unsupported | PowershellParseOutcome::Failed | PowershellParseOutcome::SyntaxError(_) => None,
+        PowershellParseOutcome::Unsupported
+        | PowershellParseOutcome::Failed
+        | PowershellParseOutcome::SyntaxError(_) => None,
     }
 }
 
@@ -367,6 +385,7 @@ fn parse_with_cached_process(
         let Some(process) = parser_process.as_mut() else {
             return PowershellParseOutcome::Failed;
         };
+        process.observation.reference();
         let parse_result = process.parse_request_before(script, resolution, deadline);
         match parse_result {
             Ok(outcome) => return outcome,
@@ -416,6 +435,7 @@ fn encoded_parser_bootstrap() -> &'static str {
 }
 
 struct PowershellParserProcess {
+    observation: codex_utils_pty::process_observation::ObservedProcess,
     child: Option<Child>,
     requests: mpsc::Sender<ParserIoRequest>,
     // Syntax is deterministic within this host. Keep just the latest bounded result so
@@ -463,6 +483,15 @@ impl PowershellParserProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
+        #[cfg(windows)]
+        let observation = child.observation.clone();
+        #[cfg(not(windows))]
+        let observation = codex_utils_pty::process_observation::observe_process_start(
+            "powershell_parser",
+            codex_utils_pty::process_observation::ProcessRole::AuxiliaryRoot,
+            Some(child.id()),
+            None,
+        );
         let mut child = Some(child);
         let stdin_result = child
             .as_mut()
@@ -504,6 +533,7 @@ impl PowershellParserProcess {
             }
         };
         Ok(Self {
+            observation,
             child,
             requests,
             syntax_cache: VecDeque::new(),
@@ -541,23 +571,19 @@ impl PowershellParserProcess {
                 "PowerShell parser deadline expired",
             ));
         }
-        if let Some(index) = self
-                .syntax_cache
-                .iter()
-                .position(|(cached, outcome, _)| {
-                    cached == script
-                        && (resolution.is_none()
-                            || matches!(
-                                outcome,
-                                PowershellParseOutcome::Unsupported
-                                    | PowershellParseOutcome::SyntaxError(_)
-                                    | PowershellParseOutcome::Analysis(PowershellParseAnalysis {
-                                        direct_argv: None,
-                                        ..
-                                    })
-                            ))
-                })
-            && let Some(entry) = self.syntax_cache.remove(index)
+        if let Some(index) = self.syntax_cache.iter().position(|(cached, outcome, _)| {
+            cached == script
+                && (resolution.is_none()
+                    || matches!(
+                        outcome,
+                        PowershellParseOutcome::Unsupported
+                            | PowershellParseOutcome::SyntaxError(_)
+                            | PowershellParseOutcome::Analysis(PowershellParseAnalysis {
+                                direct_argv: None,
+                                ..
+                            })
+                    ))
+        }) && let Some(entry) = self.syntax_cache.remove(index)
         {
             let outcome = entry.1.clone();
             self.syntax_cache.push_back(entry);
@@ -869,6 +895,8 @@ struct PowershellParserResponse {
     #[serde(default)]
     standalone_command: bool,
     direct_argv: Option<Vec<String>>,
+    #[serde(default)]
+    inspection_argv: Option<Vec<String>>,
     native_argument_mode: Option<String>,
     powershell_version: Option<String>,
     resolved_application: Option<String>,
@@ -887,6 +915,20 @@ impl PowershellParserResponse {
                             .all(|cmd| !cmd.is_empty() && !cmd[0].is_empty())
                 })
                 .map(|commands| {
+                    let inspection_argv = self.inspection_argv.filter(|argv| {
+                        self.standalone_command
+                            && commands.len() == 1
+                            && !argv.is_empty()
+                            && !argv[0].is_empty()
+                            && matches!(
+                                self.native_argument_mode.as_deref(),
+                                Some("Standard" | "Windows")
+                            )
+                            && self
+                                .powershell_version
+                                .as_deref()
+                                .is_some_and(|version| version.split('.').next() == Some("7"))
+                    });
                     let direct_argv = self
                         .direct_argv
                         .filter(|argv| !argv.is_empty() && !argv[0].is_empty())
@@ -906,12 +948,15 @@ impl PowershellParserResponse {
                         standalone_command: self.standalone_command && commands.len() == 1,
                         commands,
                         direct_argv,
+                        inspection_argv,
                         resolved_application: self.resolved_application,
                     })
                 })
                 .unwrap_or(PowershellParseOutcome::Unsupported),
             "unsupported" => PowershellParseOutcome::Unsupported,
-            "parse_errors" => PowershellParseOutcome::SyntaxError(self.syntax_error.unwrap_or_default()),
+            "parse_errors" => {
+                PowershellParseOutcome::SyntaxError(self.syntax_error.unwrap_or_default())
+            }
             _ => PowershellParseOutcome::Failed,
         }
     }
@@ -947,6 +992,7 @@ mod tests {
             commands: Some(vec![vec!["python".to_string()]]),
             standalone_command: true,
             direct_argv: Some(vec!["python".to_string()]),
+            inspection_argv: Some(vec!["python".to_string()]),
             native_argument_mode: Some(mode.to_string()),
             powershell_version: Some(version.to_string()),
             resolved_application: None,
@@ -1025,7 +1071,13 @@ mod tests {
             (
                 "Get-ChildItem rolloutdetect,tests -Recurse -File | Select-Object FullName,Length",
                 vec![
-                    vec!["Get-ChildItem", "rolloutdetect", "tests", "-Recurse", "-File"],
+                    vec![
+                        "Get-ChildItem",
+                        "rolloutdetect",
+                        "tests",
+                        "-Recurse",
+                        "-File",
+                    ],
                     vec!["Select-Object", "FullName", "Length"],
                 ],
             ),
@@ -1082,7 +1134,11 @@ mod tests {
         ));
         temporary.pop();
         assert!(matches!(
-            wait_for_cached_parser(&parser, &temporary_slot, Instant::now() + Duration::from_secs(1)),
+            wait_for_cached_parser(
+                &parser,
+                &temporary_slot,
+                Instant::now() + Duration::from_secs(1)
+            ),
             Some(CachedParserAccess::Spare(_))
         ));
         drop(held);
@@ -1105,6 +1161,7 @@ mod tests {
                 panic!("expected parser analysis");
             };
             assert_eq!(analysis.direct_argv, None);
+            assert_eq!(analysis.inspection_argv, None);
         }
 
         // "Windows" is the default mode of PowerShell 7 on this platform.
@@ -1235,7 +1292,9 @@ mod tests {
             .expect("start parser");
         for _ in 0..2 {
             assert_eq!(
-                parser.parse("while ($true) { Write-Output hidden }").unwrap(),
+                parser
+                    .parse("while ($true) { Write-Output hidden }")
+                    .unwrap(),
                 PowershellParseOutcome::Unsupported,
             );
         }
@@ -1243,11 +1302,15 @@ mod tests {
         let mut first_diagnostic = None;
         for _ in 0..2 {
             let PowershellParseOutcome::SyntaxError(diagnostic) =
-                parser.parse("Get-Content '").unwrap() else {
-                    panic!("expected positive syntax error");
-                };
+                parser.parse("Get-Content '").unwrap()
+            else {
+                panic!("expected positive syntax error");
+            };
             assert!(diagnostic.contains("line 1, column"), "{diagnostic}");
-            assert!(diagnostic.contains("TerminatorExpectedAtEndOfString"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("TerminatorExpectedAtEndOfString"),
+                "{diagnostic}"
+            );
             if let Some(first) = &first_diagnostic {
                 assert_eq!(&diagnostic, first, "cached diagnostics must be unchanged");
             }
@@ -1266,19 +1329,29 @@ mod tests {
     #[test]
     fn parser_syntax_diagnostics_are_bounded_and_legacy_errors_still_reject() {
         let legacy = deserialize_response(r#"{"id":1,"status":"parse_errors"}"#).unwrap();
-        assert_eq!(legacy.into_outcome(), PowershellParseOutcome::SyntaxError(String::new()));
+        assert_eq!(
+            legacy.into_outcome(),
+            PowershellParseOutcome::SyntaxError(String::new())
+        );
         let powershell = try_find_powershell_executable_blocking().expect("Windows PowerShell");
-        let mut parser = PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap()).unwrap();
+        let mut parser =
+            PowershellParserProcess::spawn(powershell.as_path().to_str().unwrap()).unwrap();
         let source = "foreach ($d in ) {}\n".repeat(20);
         let PowershellParseOutcome::SyntaxError(diagnostic) = parser.parse(&source).unwrap() else {
             panic!("invalid foreach expression must be rejected");
         };
         assert!(diagnostic.contains("line 1, column"), "{diagnostic}");
-        assert!(diagnostic.contains("further parser errors omitted"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("further parser errors omitted"),
+            "{diagnostic}"
+        );
         assert!(diagnostic.len() < 2000, "bounded recovery packet");
         assert_eq!(diagnostic.lines().count(), 4);
         // A rejected parse must not contaminate the next request or execute it.
-        assert!(matches!(parser.parse("Get-Content 'source.txt'").unwrap(), PowershellParseOutcome::Analysis(_)));
+        assert!(matches!(
+            parser.parse("Get-Content 'source.txt'").unwrap(),
+            PowershellParseOutcome::Analysis(_)
+        ));
     }
 
     #[test]
@@ -1363,7 +1436,8 @@ mod tests {
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
         let primary = parser.lock().unwrap_or_else(PoisonError::into_inner);
-        let temporary = SPARE_PARSERS.iter()
+        let temporary = SPARE_PARSERS
+            .iter()
             .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner))
             .collect::<Vec<_>>();
         let executable = executable.to_string();
@@ -1401,7 +1475,8 @@ mod tests {
         let parser = Arc::new(Mutex::new(None));
         let _held = parser.lock().unwrap();
         assert!(
-            wait_for_cached_parser(&parser, &[], Instant::now() + Duration::from_millis(20)).is_none()
+            wait_for_cached_parser(&parser, &[], Instant::now() + Duration::from_millis(20))
+                .is_none()
         );
         let mut process = None;
         assert_eq!(
@@ -1465,7 +1540,10 @@ mod tests {
                 "{script}"
             );
         }
-        assert_eq!(parser.next_request_id, 5, "each distinct form reached the host");
+        assert_eq!(
+            parser.next_request_id, 5,
+            "each distinct form reached the host"
+        );
         let PowershellParseOutcome::Analysis(analysis) =
             parser.parse("Write-Output after-rejection").unwrap()
         else {
@@ -1473,7 +1551,10 @@ mod tests {
         };
         assert_eq!(
             analysis.commands,
-            vec![vec!["Write-Output".to_string(), "after-rejection".to_string()]]
+            vec![vec![
+                "Write-Output".to_string(),
+                "after-rejection".to_string()
+            ]]
         );
     }
 

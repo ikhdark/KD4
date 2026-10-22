@@ -31,6 +31,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -120,7 +121,6 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::time::Duration;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio_tungstenite::tungstenite::Error;
@@ -174,7 +174,7 @@ use codex_response_debug_context::telemetry_api_error_message;
 use codex_response_debug_context::telemetry_transport_error_message;
 
 pub const OPENAI_BETA_HEADER: &str = "OpenAI-Beta";
-pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+pub use codex_api::X_CODEX_INSTALLATION_ID_HEADER;
 pub const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 pub const X_CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
 pub const X_CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
@@ -466,7 +466,9 @@ impl ModelRequestMeasurements {
                 Vec::new()
             };
         TurnTimingRequestTokenCategories {
-            prompt_section_sha256: self.prompt_context_categories.iter()
+            prompt_section_sha256: self
+                .prompt_context_categories
+                .iter()
                 .map(|section| (section.category.to_string(), section.sha256.clone()))
                 .collect(),
             accounting_basis: TurnTimingTokenCategoryBasis::FullLogicalPrompt,
@@ -575,6 +577,12 @@ impl ModelRequestMeasurements {
                 b"tool_schema_array_envelope",
             );
         }
+        if let Some(text) = &request.text {
+            context.record_serialized(
+                PromptContextCategory::OtherInjected,
+                &serde_json::to_vec(text)?,
+            );
+        }
         Self::from_context(
             logical_request_bytes,
             context,
@@ -666,6 +674,12 @@ impl ModelRequestMeasurements {
                 PromptContextCategory::ToolSchemas,
                 tools.len(),
                 b"tool_schema_array_envelope",
+            );
+        }
+        if let Some(text) = &request.text {
+            context.record_serialized(
+                PromptContextCategory::OtherInjected,
+                &serde_json::to_vec(text)?,
             );
         }
         Self::from_context(
@@ -1226,6 +1240,7 @@ impl SelectedInputRepresentation {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn measure_responses_request_after_dispatch(
     request: ResponsesApiRequest,
     prompt: Prompt,
@@ -1234,12 +1249,16 @@ fn measure_responses_request_after_dispatch(
     logical_request_bytes: Option<u64>,
     encoded_request: Option<Bytes>,
     payload_timing: Option<(Arc<TurnTimingState>, ResponseAttemptIdentity)>,
+    diagnostic_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> tokio::task::JoinHandle<PostDispatchRequestMeasurements> {
     let input_reprojected = selected_representation.is_reprojected();
     tokio::spawn(async move {
         let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
         let blocking_cancellation = cancellation.clone();
+        let span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
+            let _permit = diagnostic_permit;
+            let _span = span.enter();
             // Reuse the dispatched bytes and this worker. Canonical JSON
             // parsing/hashing must not hold up either HTTP or WS transmission.
             // Publish before token categories so calibration never sees those
@@ -1334,7 +1353,7 @@ fn measure_responses_request_after_dispatch(
         };
         result.measurements.selected_representation = Some(selected_representation);
         result
-    })
+    }.in_current_span())
 }
 
 #[derive(Debug, Default)]
@@ -1343,7 +1362,7 @@ struct ModelAttemptOffsets {
     queue_us: u64,
     connection_setup_started_us: Option<u64>,
     connection_setup_us: u64,
-    dispatch_ready_us: u64,
+    dispatch_ready_us: Option<u64>,
     stream_established_us: Option<u64>,
     first_provider_event_us: Option<u64>,
     first_model_output_us: Option<u64>,
@@ -1355,12 +1374,16 @@ struct ModelAttemptOffsets {
 #[derive(Debug, Clone)]
 struct ModelAttemptClock {
     started: Instant,
+    origin: codex_rollout_trace::TraceOccurrence,
+    provider_event_at_transport: bool,
     offsets: Arc<StdMutex<ModelAttemptOffsets>>,
 }
 
 impl ModelAttemptClock {
     fn new() -> Self {
         Self {
+            origin: codex_rollout_trace::TraceOccurrence::now(),
+            provider_event_at_transport: false,
             started: Instant::now(),
             offsets: Arc::new(StdMutex::new(ModelAttemptOffsets::default())),
         }
@@ -1377,7 +1400,7 @@ impl ModelAttemptClock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         finish_queue_span(&mut offsets, now_us);
-        offsets.dispatch_ready_us = now_us;
+        offsets.dispatch_ready_us.get_or_insert(now_us);
     }
 
     fn mark_queue_started(&self) {
@@ -1429,11 +1452,20 @@ impl ModelAttemptClock {
     }
 
     fn mark_completed(&self) {
-        self.offsets
+        let now_us = self.elapsed_us();
+        let mut offsets = self
+            .offsets
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .completed_us
-            .get_or_insert_with(|| self.elapsed_us());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if offsets.completed_us.is_none() {
+            finish_queue_span(&mut offsets, now_us);
+            if let Some(started) = offsets.connection_setup_started_us.take() {
+                offsets.connection_setup_us = offsets
+                    .connection_setup_us
+                    .saturating_add(now_us.saturating_sub(started));
+            }
+            offsets.completed_us = Some(now_us);
+        }
     }
 
     fn mark_first_provider_event(&self) {
@@ -1470,6 +1502,8 @@ impl ModelAttemptClock {
 }
 
 struct ModelAttemptGuard {
+    turn_timing: Option<Arc<TurnTimingState>>,
+    details_only: bool,
     session_telemetry: SessionTelemetry,
     turn_id: Option<String>,
     generation: Option<ModelAttemptGenerationMetadata>,
@@ -1486,9 +1520,17 @@ struct ModelAttemptGuard {
     emitted: bool,
     terminal_usage: Option<TokenUsage>,
     response_id: Option<String>,
+    provider_completed: bool,
+    _diagnostic_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl ModelAttemptGuard {
+    fn with_diagnostic_permit(mut self, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> Self {
+        self._diagnostic_permit = Some(permit);
+        self.details_only = true;
+        self
+    }
+
     // These fields are the complete dimensions of one attempt telemetry event;
     // grouping them would only obscure their call-site correspondence.
     #[allow(clippy::too_many_arguments)]
@@ -1506,6 +1548,9 @@ impl ModelAttemptGuard {
         generation: Option<ModelAttemptGenerationMetadata>,
     ) -> Self {
         Self {
+            _diagnostic_permit: None,
+            turn_timing: None,
+            details_only: false,
             session_telemetry,
             turn_id,
             generation,
@@ -1522,6 +1567,7 @@ impl ModelAttemptGuard {
             emitted: false,
             terminal_usage: None,
             response_id: None,
+            provider_completed: false,
         }
     }
 
@@ -1547,8 +1593,23 @@ impl ModelAttemptGuard {
     }
 
     fn observe_terminal_usage(&mut self, response_id: Option<&str>, usage: Option<&TokenUsage>) {
+        if self.emitted {
+            return;
+        }
         self.response_id = response_id.map(str::to_owned);
         self.terminal_usage = usage.cloned();
+        if let Some(timing) = self.turn_timing.as_ref() {
+            if let Some(usage) = usage {
+                timing.record_model_attempt_token_usage(
+                    &self.sampling_request_id,
+                    &self.attempt_id,
+                    usage,
+                );
+            }
+            if let Some(response_id) = response_id {
+                timing.record_model_response_id(&self.attempt_id, response_id);
+            }
+        }
     }
 
     fn finish(
@@ -1562,6 +1623,7 @@ impl ModelAttemptGuard {
             return;
         }
         self.emitted = true;
+        self.clock.mark_completed();
         let uncached_input_tokens = input_tokens
             .zip(cached_input_tokens)
             .and_then(|(input, cached)| input.checked_sub(cached))
@@ -1597,7 +1659,7 @@ impl ModelAttemptGuard {
         // for it. These measurements are counts and domain-separated hashes, so
         // the record stays content-free.
         tracing::info!(
-            event.name = "codex.model_cache",
+            event.name = if self.details_only { "codex.model_cache_details" } else { "codex.model_cache" },
             turn_id = self.turn_id.as_deref(),
             sampling_request_id = %self.sampling_request_id,
             physical_attempt_id = %self.attempt_id,
@@ -1623,9 +1685,11 @@ impl ModelAttemptGuard {
             cached_input_tokens,
             uncached_input_tokens,
             response_id = self.response_id.as_deref(),
-            output_tokens = self.terminal_usage.as_ref().map(|usage| usage.output_tokens),
-            reasoning_output_tokens = self.terminal_usage.as_ref().map(|usage| usage.reasoning_output_tokens),
-            total_tokens = self.terminal_usage.as_ref().map(|usage| usage.total_tokens),
+            provider_completed = self.provider_completed,
+            cache_write_input_tokens = self.terminal_usage.as_ref().and_then(TokenUsage::known_cache_write_input),
+            output_tokens = self.terminal_usage.as_ref().and_then(TokenUsage::known_output),
+            reasoning_output_tokens = self.terminal_usage.as_ref().and_then(TokenUsage::known_reasoning_output),
+            total_tokens = self.terminal_usage.as_ref().and_then(TokenUsage::known_total),
             "model cache diagnostics"
         );
         if !self.session_telemetry.model_attempt_logging_enabled() {
@@ -1658,6 +1722,10 @@ impl ModelAttemptGuard {
         debug_assert!(attempt_offsets_are_nondecreasing(&offsets, completed_us));
         self.session_telemetry
             .model_attempt_completed(&ModelAttemptTelemetry {
+                details_only: self.details_only,
+                diagnostics_available: !self.measurements.prompt_context_categories.is_empty(),
+                clock_id: self.clock.origin.clock_id.clone(),
+                attempt_started_us: self.clock.origin.offset_us,
                 turn_id: self.turn_id.clone(),
                 generation_index: self
                     .generation
@@ -1694,9 +1762,18 @@ impl ModelAttemptGuard {
                 cached_input_tokens,
                 uncached_input_tokens,
                 response_id: self.response_id.clone(),
-                output_tokens: self.terminal_usage.as_ref().map(|usage| usage.output_tokens),
-                reasoning_output_tokens: self.terminal_usage.as_ref().map(|usage| usage.reasoning_output_tokens),
-                total_tokens: self.terminal_usage.as_ref().map(|usage| usage.total_tokens),
+                output_tokens: self
+                    .terminal_usage
+                    .as_ref()
+                    .and_then(TokenUsage::known_output),
+                reasoning_output_tokens: self
+                    .terminal_usage
+                    .as_ref()
+                    .and_then(TokenUsage::known_reasoning_output),
+                total_tokens: self
+                    .terminal_usage
+                    .as_ref()
+                    .and_then(TokenUsage::known_total),
                 tool_token_count: self.measurements.tool_token_count,
                 wire_request_bytes: self.measurements.wire_request_bytes,
                 logical_request_bytes: self.measurements.logical_request_bytes,
@@ -1818,16 +1895,22 @@ fn compact_prompt_context_categories(
 }
 
 fn model_attempt_phase_durations(offsets: &ModelAttemptOffsets) -> (u64, u64, Option<u64>) {
-    let queue_us = offsets.queue_us.min(offsets.dispatch_ready_us);
-    let request_construction_us = offsets
+    let local_end = offsets
         .dispatch_ready_us
+        .or(offsets.completed_us)
+        .unwrap_or_default();
+    let queue_us = offsets.queue_us.min(local_end);
+    let request_construction_us = local_end
         .saturating_sub(queue_us)
         .saturating_sub(offsets.connection_setup_us);
-    let transport_us = offsets.stream_established_us.map(|established_us| {
-        offsets
-            .connection_setup_us
-            .saturating_add(established_us.saturating_sub(offsets.dispatch_ready_us))
-    });
+    let transport_us = offsets
+        .stream_established_us
+        .zip(offsets.dispatch_ready_us)
+        .map(|(established_us, dispatched_us)| {
+            offsets
+                .connection_setup_us
+                .saturating_add(established_us.saturating_sub(dispatched_us))
+        });
     (request_construction_us, queue_us, transport_us)
 }
 
@@ -1843,8 +1926,9 @@ enum ModelAttemptState {
 }
 
 struct PendingModelAttempt {
+    essential: Box<ModelAttemptGuard>,
     turn_timing: Option<Arc<TurnTimingState>>,
-    _diagnostic_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _diagnostic_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
     identity: ResponseAttemptIdentity,
     clock: ModelAttemptClock,
     task: AbortOnDropHandle<ModelAttemptGuard>,
@@ -1854,38 +1938,41 @@ struct PendingModelAttempt {
 impl Drop for PendingModelAttempt {
     fn drop(&mut self) {
         self.measurement_cancellation.cancel();
+        if !self.task.is_finished()
+            && let Some(timing) = &self.turn_timing
+        {
+            timing.record_model_request_diagnostics_unavailable(
+                &self.identity.sampling_request_id,
+                &self.identity.physical_attempt_id,
+            );
+        }
     }
 }
 
 impl ModelAttemptState {
+    fn try_diagnostic_permit() -> Option<Arc<tokio::sync::OwnedSemaphorePermit>> {
+        static DIAGNOSTICS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(32)));
+        Arc::clone(&DIAGNOSTICS)
+            .try_acquire_owned()
+            .ok()
+            .map(Arc::new)
+    }
+
     fn pending(
-        identity: ResponseAttemptIdentity,
-        clock: ModelAttemptClock,
+        mut essential: ModelAttemptGuard,
         task: tokio::task::JoinHandle<ModelAttemptGuard>,
         measurement_cancellation: CancellationToken,
         turn_timing: Option<Arc<TurnTimingState>>,
+        permit: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> Self {
-        // Bound optional work retained after provider completion. Saturation
-        // cancels detail collection; usage and provider history remain authoritative.
-        static DIAGNOSTICS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(32)));
-        let permit = Arc::clone(&DIAGNOSTICS).try_acquire_owned().ok();
-        if permit.is_none() {
-            warn!(sampling_request_id = %identity.sampling_request_id, "model request diagnostics omitted: capacity exhausted");
-            measurement_cancellation.cancel();
-            task.abort();
-            if let Some(timing) = turn_timing.as_ref() {
-                timing.record_model_request_diagnostics_unavailable(
-                    &identity.sampling_request_id,
-                    &identity.physical_attempt_id,
-                );
-            }
-        }
+        essential.turn_timing = turn_timing.clone();
         Self::Pending(PendingModelAttempt {
+            identity: essential.response_identity(),
+            clock: essential.clock(),
+            essential: Box::new(essential),
             turn_timing,
             _diagnostic_permit: permit,
-            identity,
-            clock,
             task: AbortOnDropHandle::new(task),
             measurement_cancellation,
         })
@@ -1909,7 +1996,11 @@ impl ModelAttemptState {
         match self {
             Self::Ready(attempt) => Some(*attempt),
             Self::Pending(mut pending) => match (&mut pending.task).await {
-                Ok(attempt) => Some(attempt),
+                Ok(mut attempt) => {
+                    attempt._diagnostic_permit = Some(Arc::clone(&pending._diagnostic_permit));
+                    attempt.details_only = true;
+                    Some(attempt)
+                }
                 Err(err) => {
                     warn!(error = %err, "model attempt diagnostics task failed after dispatch");
                     if let Some(timing) = pending.turn_timing.as_ref() {
@@ -1922,6 +2013,28 @@ impl ModelAttemptState {
                 }
             },
         }
+    }
+
+    fn finish_essential(
+        &mut self,
+        outcome: ModelAttemptOutcome,
+        response_id: Option<&str>,
+        usage: Option<&TokenUsage>,
+        items: &[ResponseItem],
+        provider_completed: bool,
+    ) {
+        let guard = match self {
+            Self::Ready(guard) => guard.as_mut(),
+            Self::Pending(pending) => pending.essential.as_mut(),
+        };
+        guard.provider_completed = provider_completed;
+        guard.observe_terminal_usage(response_id, usage);
+        guard.finish(
+            outcome,
+            usage.and_then(TokenUsage::known_input),
+            usage.and_then(TokenUsage::known_cached_input),
+            items,
+        );
     }
 }
 
@@ -1947,24 +2060,56 @@ fn finish_failed_model_attempt_with_usage(
     response_id: Option<String>,
     usage: Option<TokenUsage>,
 ) {
-    if let Some(attempt) = attempt.take() {
+    finish_model_attempt_with_usage(
+        attempt,
+        items,
+        response_id,
+        usage,
+        ModelAttemptOutcome::Failed,
+    );
+}
+
+fn finish_model_attempt_with_usage(
+    attempt: &mut Option<ModelAttemptState>,
+    items: Vec<ResponseItem>,
+    response_id: Option<String>,
+    usage: Option<TokenUsage>,
+    outcome: ModelAttemptOutcome,
+) {
+    if let Some(mut attempt) = attempt.take() {
         attempt.clock().mark_completed();
+        attempt.finish_essential(
+            outcome,
+            response_id.as_deref(),
+            usage.as_ref(),
+            &items,
+            outcome == ModelAttemptOutcome::Cancelled,
+        );
         // Diagnostics own their lifetime, but never delay transport recovery.
-        tokio::spawn(async move {
-            if let Some(mut attempt) = attempt.resolve().await {
-                attempt.observe_terminal_usage(response_id.as_deref(), usage.as_ref());
-                attempt.finish(ModelAttemptOutcome::Failed,
-                    usage.as_ref().map(|usage| usage.input_tokens),
-                    usage.as_ref().map(|usage| usage.cached_input_tokens), &items);
+        tokio::spawn(
+            async move {
+                if let Some(mut attempt) = attempt.resolve().await {
+                    // A cancelled delivery can still follow an observed provider
+                    // completion. Keep those independent of diagnostic readiness.
+                    attempt.provider_completed = outcome == ModelAttemptOutcome::Cancelled;
+                    attempt.observe_terminal_usage(response_id.as_deref(), usage.as_ref());
+                    attempt.finish(
+                        outcome,
+                        usage.as_ref().and_then(TokenUsage::known_input),
+                        usage.as_ref().and_then(TokenUsage::known_cached_input),
+                        &items,
+                    );
+                }
             }
-        });
+            .in_current_span(),
+        );
     }
 }
 
 fn attempt_offsets_are_nondecreasing(offsets: &ModelAttemptOffsets, completed_us: u64) -> bool {
     let mut previous = 0;
     for offset in [
-        Some(offsets.dispatch_ready_us),
+        offsets.dispatch_ready_us,
         offsets.stream_established_us,
         offsets.first_provider_event_us,
         offsets.first_model_output_us,
@@ -1979,9 +2124,12 @@ fn attempt_offsets_are_nondecreasing(offsets: &ModelAttemptOffsets, completed_us
         }
         previous = offset;
     }
-    offsets
-        .first_actionable_output_us
-        .is_none_or(|offset| offset >= offsets.dispatch_ready_us && offset <= completed_us)
+    offsets.first_actionable_output_us.is_none_or(|offset| {
+        offsets
+            .dispatch_ready_us
+            .is_none_or(|dispatch| offset >= dispatch)
+            && offset <= completed_us
+    })
 }
 
 pub(crate) fn request_effort_for_model(
@@ -1989,12 +2137,7 @@ pub(crate) fn request_effort_for_model(
     effort: Option<ReasoningEffortConfig>,
 ) -> Option<ReasoningEffortConfig> {
     effort
-        .or_else(|| {
-            model_info
-                .supports_reasoning_summaries
-                .then(|| model_info.default_reasoning_level.clone())
-                .flatten()
-        })
+        .or_else(|| model_info.default_reasoning_level.clone())
         .and_then(|effort| {
             if !matches!(
                 effort,
@@ -2029,6 +2172,44 @@ pub(crate) fn request_effort_for_model(
         })
 }
 
+/// Validate a child agent's already normalized wire effort. Main-turn requests
+/// intentionally preserve explicit ordinary and custom values independently of
+/// picker metadata. Unknown fallback descriptors have no authoritative list.
+pub(crate) fn validate_request_effort_for_model(
+    model: &ModelInfo,
+    effort: Option<&ReasoningEffortConfig>,
+) -> std::result::Result<(), String> {
+    if model.used_fallback_model_metadata {
+        return Ok(());
+    }
+    let Some(effort) = effort else {
+        return Ok(());
+    };
+    validate_reasoning_effort(&model.slug, &model.supported_reasoning_levels, effort)
+}
+
+pub(crate) fn validate_reasoning_effort(
+    model: &str,
+    supported: &[codex_protocol::openai_models::ReasoningEffortPreset],
+    effort: &ReasoningEffortConfig,
+) -> std::result::Result<(), String> {
+    if supported.iter().any(|level| {
+        &level.effort == effort
+            || (*effort == ReasoningEffortConfig::Max
+                && level.effort == ReasoningEffortConfig::Ultra)
+    }) {
+        return Ok(());
+    }
+    let choices = supported
+        .iter()
+        .map(|level| level.effort.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Reasoning effort `{effort}` is not supported for model `{model}`. Supported reasoning efforts: {choices}. Update model_reasoning_effort or the turn reasoning setting."
+    ))
+}
+
 fn session_telemetry_for_request(
     session_telemetry: &SessionTelemetry,
     request: &ResponsesApiRequest,
@@ -2056,9 +2237,12 @@ impl SharedModelHttpClients {
             .pools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(index) = pools.iter().position(|(cached_factory, cached_headers, _)| {
-            cached_factory == factory && cached_headers == &headers
-        }) {
+        if let Some(index) = pools
+            .iter()
+            .position(|(cached_factory, cached_headers, _)| {
+                cached_factory == factory && cached_headers == &headers
+            })
+        {
             #[expect(
                 clippy::expect_used,
                 reason = "the index was selected from this deque while holding the same exclusive lock"
@@ -2107,6 +2291,7 @@ struct ModelClientState {
     http_clients: RouteAwareClientPool,
     cached_websocket_transport: StdMutex<WebsocketTransportCache>,
     request_schema_cache: StdMutex<RequestSchemaSerializationCache>,
+    startup_timing: Option<Arc<crate::startup_timing::StartupTimingState>>,
 }
 
 #[derive(Debug, Default)]
@@ -2311,6 +2496,7 @@ pub struct ModelClientSession {
     last_stream_transport: Option<ModelAttemptTransport>,
     effective_input: Option<Arc<[ResponseItem]>>,
     turn_timing: Option<Arc<TurnTimingState>>,
+    startup_timing: Option<Arc<crate::startup_timing::StartupTimingState>>,
     logical_sampling_request_count: u32,
     prompt_context_baseline: Arc<StdMutex<Option<PromptContextBaseline>>>,
     latest_measurement_attempt: Arc<StdMutex<Option<String>>>,
@@ -2372,7 +2558,9 @@ impl CanonicalPrefixHash {
         Self::from_iter(items.iter())
     }
 
-    fn from_iter<'a>(items: impl IntoIterator<Item = &'a ResponseItem>) -> serde_json::Result<Self> {
+    fn from_iter<'a>(
+        items: impl IntoIterator<Item = &'a ResponseItem>,
+    ) -> serde_json::Result<Self> {
         let mut prefix = Self::empty();
         prefix.extend_iter(items)?;
         Ok(prefix)
@@ -2382,7 +2570,10 @@ impl CanonicalPrefixHash {
         self.extend_iter(items.iter())
     }
 
-    fn extend_iter<'a>(&mut self, items: impl IntoIterator<Item = &'a ResponseItem>) -> serde_json::Result<()> {
+    fn extend_iter<'a>(
+        &mut self,
+        items: impl IntoIterator<Item = &'a ResponseItem>,
+    ) -> serde_json::Result<()> {
         // Reuse scratch storage within this pass, not across requests. Large
         // histories otherwise allocate and grow a fresh JSON buffer per item.
         let mut serialized = Vec::new();
@@ -2497,7 +2688,7 @@ impl StreamThroughputCollapse {
 #[derive(Debug, Default)]
 struct WebsocketStreamThroughput {
     workload: Option<serde_json::Value>,
-    recent_tokens_per_second: VecDeque<f64>,
+    recent_tokens_per_second: VecDeque<(i64, f64)>,
     collapsed_streak: u8,
     latest_collapse: Option<StreamThroughputCollapse>,
     responses_since_rotation: Option<u8>,
@@ -2514,13 +2705,27 @@ impl WebsocketStreamThroughput {
         }
     }
 
-    fn record(&mut self, output_tokens: i64, elapsed: Duration, input_tokens: i64) {
+    fn record(
+        &mut self,
+        output_tokens: i64,
+        elapsed: Duration,
+        input_tokens: i64,
+        sustained_delivery_interval: bool,
+    ) {
+        if !sustained_delivery_interval {
+            // Total usage over request-to-completion includes queue/prefill and
+            // hidden reasoning. It is advisory, never a socket-rotation signal.
+            // No transport currently supplies a compatible token/delivery interval.
+            self.collapsed_streak = 0;
+            self.latest_collapse = None;
+            return;
+        }
         if output_tokens < STREAM_THROUGHPUT_MIN_OUTPUT_TOKENS || elapsed.is_zero() {
             return;
         }
         let tokens_per_second = output_tokens as f64 / elapsed.as_secs_f64();
         self.latest_collapse = self
-            .baseline_tokens_per_second()
+            .baseline_tokens_per_second(output_tokens)
             .filter(|baseline| tokens_per_second < baseline * STREAM_THROUGHPUT_COLLAPSE_RATIO)
             .map(|baseline_tokens_per_second| StreamThroughputCollapse {
                 observed_tokens_per_second: tokens_per_second,
@@ -2535,21 +2740,28 @@ impl WebsocketStreamThroughput {
         if self.recent_tokens_per_second.len() == STREAM_THROUGHPUT_WINDOW {
             self.recent_tokens_per_second.pop_front();
         }
-        self.recent_tokens_per_second.push_back(tokens_per_second);
+        self.recent_tokens_per_second
+            .push_back((output_tokens, tokens_per_second));
         if let Some(responses) = self.responses_since_rotation.as_mut() {
             *responses = responses.saturating_add(1);
         }
     }
 
-    fn baseline_tokens_per_second(&self) -> Option<f64> {
-        if self.recent_tokens_per_second.len() < STREAM_THROUGHPUT_MIN_BASELINE_SAMPLES {
-            return None;
-        }
+    fn baseline_tokens_per_second(&self, output_tokens: i64) -> Option<f64> {
+        // Only compare similar lengths after the caller establishes compatible
+        // token/interval provenance. Request-average rates never enter this history.
         let mut sorted = self
             .recent_tokens_per_second
             .iter()
-            .copied()
+            .filter(|(tokens, _)| {
+                *tokens <= output_tokens.saturating_mul(2)
+                    && output_tokens <= tokens.saturating_mul(2)
+            })
+            .map(|(_, rate)| *rate)
             .collect::<Vec<_>>();
+        if sorted.len() < STREAM_THROUGHPUT_MIN_BASELINE_SAMPLES {
+            return None;
+        }
         sorted.sort_by(f64::total_cmp);
         Some(sorted[sorted.len() / 2])
     }
@@ -2672,7 +2884,11 @@ fn websocket_setup_fingerprint(
 ) -> Option<WebsocketSetupFingerprint> {
     let websocket_url = provider.websocket_url_for_path("responses").ok()?;
     let mut headers = provider.headers.clone();
-    api_auth.add_auth_headers(&mut headers);
+    api_auth.try_add_auth_headers(&mut headers).ok()?;
+    let connection_identity = api_auth.connection_identity();
+    if connection_identity.is_some() {
+        headers.remove(http::header::AUTHORIZATION);
+    }
     let mut canonical_headers = headers
         .iter()
         .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes()))
@@ -2681,6 +2897,10 @@ fn websocket_setup_fingerprint(
 
     let mut hasher = Sha256::new();
     hasher.update(WEBSOCKET_SETUP_FINGERPRINT_DOMAIN);
+    if let Some(identity) = connection_identity {
+        hasher.update((identity.len() as u64).to_be_bytes());
+        hasher.update(identity);
+    }
     hasher.update((provider.name.len() as u64).to_be_bytes());
     hasher.update(provider.name.as_bytes());
     hasher.update((websocket_url.as_str().len() as u64).to_be_bytes());
@@ -2746,8 +2966,13 @@ impl WebsocketSession {
         {
             return false;
         }
-        if CanonicalPrefixHash::from_iter(request.input.iter().take(baseline.request_prefix.item_count))
-            .ok()
+        if CanonicalPrefixHash::from_iter(
+            request
+                .input
+                .iter()
+                .take(baseline.request_prefix.item_count),
+        )
+        .ok()
             != Some(baseline.request_prefix)
         {
             return false;
@@ -2862,6 +3087,7 @@ impl ModelClient {
                 http_clients,
                 cached_websocket_transport: StdMutex::new(WebsocketTransportCache::default()),
                 request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
+                startup_timing: None,
             }),
             agent_identity_policy,
             http_client_factory,
@@ -2894,6 +3120,22 @@ impl ModelClient {
         metadata.session_id.clone()
     }
 
+    /// Attach before cloning, so regular and compaction sessions share the
+    /// same once-only startup cut without retaining the owning Session.
+    pub(crate) fn with_startup_timing(
+        mut self,
+        timing: Arc<crate::startup_timing::StartupTimingState>,
+    ) -> Self {
+        #[expect(
+            clippy::expect_used,
+            reason = "construction-only builder, before cloning"
+        )]
+        let state =
+            Arc::get_mut(&mut self.state).expect("startup observer attached before cloning");
+        state.startup_timing = Some(timing);
+        self
+    }
+
     /// Creates a fresh turn-scoped streaming session.
     ///
     /// This constructor does not perform network I/O itself; the session opens a websocket lazily
@@ -2913,6 +3155,7 @@ impl ModelClient {
             last_stream_transport: None,
             effective_input: None,
             turn_timing: None,
+            startup_timing: self.state.startup_timing.clone(),
             logical_sampling_request_count: 0,
             prompt_context_baseline: Arc::new(StdMutex::new(None)),
             turn_state: Arc::new(OnceLock::new()),
@@ -2934,6 +3177,7 @@ impl ModelClient {
             last_stream_transport: None,
             effective_input: None,
             turn_timing: None,
+            startup_timing: None,
             logical_sampling_request_count: 0,
             prompt_context_baseline: Arc::new(StdMutex::new(None)),
             turn_state: Arc::new(OnceLock::new()),
@@ -2988,7 +3232,8 @@ impl ModelClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = tokio::time::Instant::now();
-        let activated = self.state.provider.info().supports_websockets && cache.fallback.enabled(now);
+        let activated =
+            self.state.provider.info().supports_websockets && cache.fallback.enabled(now);
         cache.fallback.record_failure(recoverable, now);
         // Invalidate cached and in-flight publishers atomically with the fallback decision.
         cache.epoch = cache.epoch.wrapping_add(1);
@@ -3047,14 +3292,16 @@ impl ModelClient {
         request_effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
     ) -> Option<Reasoning> {
-        if model_info.supports_reasoning_summaries {
+        if request_effort.is_some() || model_info.supports_reasoning_summaries {
             Some(Reasoning {
                 // Sampling and compaction callers resolve their raw
                 // configured effort exactly once. In particular, do not feed an
                 // already-normalized request effort (such as ultra -> max) back
                 // through model capability normalization here.
                 effort: request_effort,
-                summary: if summary == ReasoningSummaryConfig::None {
+                summary: if !model_info.supports_reasoning_summaries
+                    || summary == ReasoningSummaryConfig::None
+                {
                     None
                 } else {
                     Some(summary)
@@ -3207,6 +3454,10 @@ impl ModelClient {
         } else {
             prompt.get_formatted_input_for_request(model_info.use_responses_lite)
         };
+        input = crate::image_preparation::for_model_image_detail(
+            input,
+            model_info.supports_image_detail_original,
+        );
         let is_openai = self.state.provider.info().is_openai();
         if !is_openai
             && input
@@ -3302,17 +3553,20 @@ impl ModelClient {
             return;
         }
         input.update_segments(|input| {
-        if !input.iter().any(|item| item.id().is_some_and(|id| strip_all_ids || !id.is_prefixed())) {
-            return;
-        }
-        for item in Arc::make_mut(input).iter_mut() {
-            if item
-                .id()
-                .is_some_and(|id| strip_all_ids || !id.is_prefixed())
-            {
-                item.set_id(/*new_id*/ None);
+            if !input.iter().any(|item| {
+                item.id()
+                    .is_some_and(|id| strip_all_ids || !id.is_prefixed())
+            }) {
+                return;
             }
-        }
+            for item in Arc::make_mut(input).iter_mut() {
+                if item
+                    .id()
+                    .is_some_and(|id| strip_all_ids || !id.is_prefixed())
+                {
+                    item.set_id(/*new_id*/ None);
+                }
+            }
         });
     }
 
@@ -3380,7 +3634,9 @@ impl ModelClient {
         if self.http_client_factory.outbound_proxy_policy()
             == codex_http_client::OutboundProxyPolicy::RespectSystemProxy
         {
-            Ok(ReqwestTransport::from_client_pool(self.state.http_clients.clone()))
+            Ok(ReqwestTransport::from_client_pool(
+                self.state.http_clients.clone(),
+            ))
         } else {
             Ok(ReqwestTransport::from_http_client(client))
         }
@@ -3536,6 +3792,13 @@ impl ModelClientSession {
 
     pub(crate) fn set_turn_timing(&mut self, turn_timing: Arc<TurnTimingState>) {
         self.turn_timing = Some(turn_timing);
+    }
+
+    pub(crate) fn set_startup_timing(
+        &mut self,
+        timing: Arc<crate::startup_timing::StartupTimingState>,
+    ) {
+        self.startup_timing = Some(timing);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3885,15 +4148,22 @@ impl ModelClientSession {
                 return None;
             }
             let mut prefix = request_prefix;
-            let verified =
-                prefix
-                    .extend_iter(request.input.iter().skip(expected_prefix.item_count))
-                    .ok()
-                    .map(|()| VerifiedRequestHistory {
-                        prefix,
-                        properties: current_properties_fingerprint,
-                    });
-            return Some((request.input.iter().skip(expected_prefix.item_count).cloned().collect(), verified));
+            let verified = prefix
+                .extend_iter(request.input.iter().skip(expected_prefix.item_count))
+                .ok()
+                .map(|()| VerifiedRequestHistory {
+                    prefix,
+                    properties: current_properties_fingerprint,
+                });
+            return Some((
+                request
+                    .input
+                    .iter()
+                    .skip(expected_prefix.item_count)
+                    .cloned()
+                    .collect(),
+                verified,
+            ));
         }
 
         Self::get_incremental_items_full_compare(
@@ -4033,10 +4303,9 @@ impl ModelClientSession {
             ) {
                 trace!("completed-tool substitution metadata did not match request input");
             }
-            if self.substitutions_overlap_provider_history(
-                tool_history_substitutions,
-                &last_response,
-            ) {
+            if self
+                .substitutions_overlap_provider_history(tool_history_substitutions, &last_response)
+            {
                 self.tool_history_fail_open_pending = true;
                 let build_fallback_request =
                     build_tool_history_fail_open_request.take().ok_or_else(|| {
@@ -4093,7 +4362,9 @@ impl ModelClientSession {
             Some(&last_response),
             /*allow_empty_delta*/ true,
         ) else {
-            self.invalidate_provider_history_inheritance("request no longer matches inherited history");
+            self.invalidate_provider_history_inheritance(
+                "request no longer matches inherited history",
+            );
             return Ok((
                 ResponsesWsRequest::ResponseCreate(payload),
                 false,
@@ -4149,7 +4420,14 @@ impl ModelClientSession {
                     && state.include_attestation
                     && !provider.supports_startup_requests()
             })
-            .map(|provider| (provider, AttestationContext { thread_id: state.thread_id }));
+            .map(|provider| {
+                (
+                    provider,
+                    AttestationContext {
+                        thread_id: state.thread_id,
+                    },
+                )
+            });
         if let Some(connection) = self.websocket_session.connection.as_ref() {
             if !websocket_connection_expiring(self.websocket_session.connected_at, Instant::now())
                 && !connection.is_closed().await
@@ -4396,344 +4674,376 @@ impl ModelClientSession {
     ///
     /// Handles reasoning summaries, verbosity, and the `text` controls used for output schemas.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(
-        name = "model_client.stream_responses_api",
-        level = "info",
-        skip_all,
-        fields(
-            model = %model_info.slug,
-            wire_api = %self.client.state.provider.info().wire_api,
-            transport = "responses_http",
-            http.method = "POST",
-            api.path = "responses",
-            turn.has_metadata_header = responses_metadata.has_turn_metadata()
-        )
-    )]
-    async fn stream_responses_api(
-        &mut self,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
-        sampling_request_id: &str,
+    fn stream_responses_api<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
+        sampling_request_id: &'a str,
         request_kind: ModelAttemptRequestKind,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
-        inference_trace: &InferenceTraceContext,
+        responses_metadata: &'a CodexResponsesMetadata,
+        inference_trace: &'a InferenceTraceContext,
         attempt_prepared: Option<AttemptPreparedCallback>,
-    ) -> Result<ResponseStream> {
-        let auth_manager = self.client.state.provider.auth_manager();
-        let mut auth_recovery = auth_manager
-            .as_ref()
-            .map(AuthManager::unauthorized_recovery);
-        let mut pending_retry = PendingUnauthorizedRetry::default();
-        let mut retry_index = 0_u32;
-        loop {
-            // Include client-side composition, normalization, serialization, and transport setup
-            // in dispatch_ready_us for this physical attempt.
-            let attempt_clock = ModelAttemptClock::new();
-            let transport_readiness_guard = self
-                .turn_timing
-                .as_ref()
-                .map(|timing| timing.begin_local_phase(TurnLocalPhase::TransportReadiness));
-            let client_setup = self.client.current_client_setup().await?;
-            let transport = self
-                .client
-                .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)
-                .await?;
-            let request_auth_context = AuthRequestTelemetryContext::new(
-                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
-                client_setup.api_auth.as_ref(),
-                client_setup.agent_identity_telemetry.clone(),
-                pending_retry,
+    ) -> impl std::future::Future<Output = Result<ResponseStream>> + 'a {
+        Box::pin(async move {
+            let span = tracing::info_span!(
+                "model_client.stream_responses_api",
+                model = %model_info.slug,
+                wire_api = %self.client.state.provider.info().wire_api,
+                transport = "responses_http",
+                http.method = "POST",
+                api.path = "responses",
+                turn.has_metadata_header = responses_metadata.has_turn_metadata()
             );
-            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
-                session_telemetry,
-                request_auth_context,
-                RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
-                self.client.state.auth_env_telemetry.clone(),
-            );
-            let compression = self.responses_request_compression(client_setup.auth.as_ref());
-            let mut options = self
-                .build_responses_options(
-                    responses_metadata,
-                    compression,
-                    model_info.use_responses_lite,
-                )
-                .await;
+            // Instrument pointer-sized storage, not the transport state machine.
+            // Keep span creation on first poll and cancellation on the caller task.
+            Box::pin(async move {
+                let auth_manager = self.client.state.provider.auth_manager();
+                let mut auth_recovery = auth_manager
+                    .as_ref()
+                    .map(AuthManager::unauthorized_recovery);
+                let mut pending_retry = PendingUnauthorizedRetry::default();
+                let mut retry_index = 0_u32;
+                loop {
+                    // Include client-side composition, normalization, serialization, and transport setup
+                    // in dispatch_ready_us for this physical attempt.
+                    let attempt_clock = ModelAttemptClock::new();
+                    let transport_readiness_guard = self
+                        .turn_timing
+                        .as_ref()
+                        .map(|timing| timing.begin_local_phase(TurnLocalPhase::TransportReadiness));
+                    let client_setup = self.client.current_client_setup().await?;
+                    let transport = self
+                        .client
+                        .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)
+                        .await?;
+                    let request_auth_context = AuthRequestTelemetryContext::new(
+                        client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                        client_setup.api_auth.as_ref(),
+                        client_setup.agent_identity_telemetry.clone(),
+                        pending_retry,
+                    );
+                    let compression = self.responses_request_compression(client_setup.auth.as_ref());
+                    let mut options = self
+                        .build_responses_options(
+                            responses_metadata,
+                            compression,
+                            model_info.use_responses_lite,
+                        )
+                        .await;
 
-            let request_transformation_guard = self
-                .turn_timing
-                .as_ref()
-                .map(|timing| timing.begin_local_phase(TurnLocalPhase::RequestTransformation));
-            let mut request = self.client.build_responses_request(
-                &client_setup.api_provider,
-                prompt,
-                model_info,
-                effort.clone(),
-                summary,
-                service_tier.clone(),
-                responses_metadata,
-            )?;
-            self.client
-                .prepare_response_items_for_request(&mut request.input);
-            drop(request_transformation_guard);
-            let request_session_telemetry =
-                session_telemetry_for_request(session_telemetry, &request);
-            let attempt_identity = new_attempt_identity(sampling_request_id);
-            if let Some(timing) = self.turn_timing.as_ref() {
-                timing.record_model_attempt_identity(
-                    &attempt_identity.sampling_request_id,
-                    &attempt_identity.physical_attempt_id,
-                );
-            }
-            let inference_trace_attempt =
-                AsyncInferenceTraceAttempt::from(inference_trace.start_attempt());
-            inference_trace_attempt.add_request_headers(&mut options.extra_headers);
-            attempt_clock.mark_queue_started();
-            let sampling_admission = match attempt_prepared.as_ref() {
-                Some(attempt_prepared) => attempt_prepared(attempt_identity.clone()).await,
-                None => Ok(None),
-            };
-            attempt_clock.mark_queue_finished();
-            let _sampling_admission = sampling_admission?;
-            inference_trace_attempt
-                .record_audited_request(
-                    &request,
-                    &attempt_identity,
-                    None::<(&ResponsesApiRequest, &str)>,
-                )
-                .await;
-            let mut api_provider = client_setup.api_provider;
-            if let Some(timeout) = prompt.stream_progress_timeout {
-                api_provider.stream_idle_timeout = timeout;
-            }
-            let client = ApiResponsesClient::new(transport, api_provider, client_setup.api_auth)
-                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
-            let turn_timing = self.turn_timing.clone();
-            let serialization_timing_guard = self
-                .turn_timing
-                .as_ref()
-                .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
-            let dispatched_request = Arc::new(OnceLock::new());
-            let dispatched_request_for_callback = Arc::clone(&dispatched_request);
-            let stream_result = client
-                .stream_request_with_dispatch_ready(&request, options, {
-                    let attempt_clock = attempt_clock.clone();
-                    let dispatched_identity = attempt_identity.clone();
-                    move |request_bytes| {
-                        if let Some(timing) = turn_timing.as_ref() {
-                            timing.record_model_request_payload(
-                                &dispatched_identity.sampling_request_id,
-                                &dispatched_identity.physical_attempt_id,
-                                &request_bytes,
+                    let request_transformation_guard = self
+                        .turn_timing
+                        .as_ref()
+                        .map(|timing| timing.begin_local_phase(TurnLocalPhase::RequestTransformation));
+                    let mut request = self.client.build_responses_request(
+                        &client_setup.api_provider,
+                        prompt,
+                        model_info,
+                        effort.clone(),
+                        summary,
+                        service_tier.clone(),
+                        responses_metadata,
+                    )?;
+                    self.client
+                        .prepare_response_items_for_request(&mut request.input);
+                    drop(request_transformation_guard);
+                    let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request);
+                    let attempt_identity = new_attempt_identity(sampling_request_id);
+                    let mut essential_attempt = ModelAttemptGuard::new(
+                        request_session_telemetry.clone(), attempt_identity.clone(), retry_index,
+                        if retry_index == 0 { ModelAttemptRetryReason::None } else { ModelAttemptRetryReason::Unauthorized },
+                        request_kind, ModelAttemptTransport::ResponsesHttp, None,
+                        ModelRequestMeasurements::default(), attempt_clock.clone(),
+                        responses_metadata.turn_id.clone(), self.turn_timing.as_ref()
+                            .and_then(|timing| timing.current_model_attempt_metadata()),
+                    );
+                    essential_attempt.turn_timing = self.turn_timing.clone();
+                    let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+                        &request_session_telemetry,
+                        request_auth_context,
+                        RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+                        self.client.state.auth_env_telemetry.clone(),
+                        ModelRequestTelemetryContext {
+                            timing: self.turn_timing.clone(),
+                            startup: self.startup_timing.clone(),
+                            identity: attempt_identity.clone(),
+                            clock: attempt_clock.clone(),
+                            turn_id: responses_metadata.turn_id.clone(),
+                            retry_index,
+                            dispatched: AtomicBool::new(false),
+                            highest_started_transport_attempt: StdMutex::new(None),
+                            readiness: StdMutex::new(transport_readiness_guard),
+                        },
+                    );
+                    if let Some(timing) = self.turn_timing.as_ref() {
+                        timing.record_model_attempt_identity(
+                            &attempt_identity.sampling_request_id,
+                            &attempt_identity.physical_attempt_id,
+                        );
+                    }
+                    let inference_trace_attempt =
+                        AsyncInferenceTraceAttempt::unstarted(inference_trace.start_attempt());
+                    inference_trace_attempt.add_request_headers(&mut options.extra_headers);
+                    attempt_clock.mark_queue_started();
+                    let sampling_admission = match attempt_prepared.as_ref() {
+                        Some(attempt_prepared) => attempt_prepared(attempt_identity.clone()).await,
+                        None => Ok(None),
+                    };
+                    attempt_clock.mark_queue_finished();
+                    let _sampling_admission = sampling_admission?;
+                    inference_trace_attempt
+                        .record_audited_request(
+                            &request,
+                            &attempt_identity,
+                            None::<(&ResponsesApiRequest, &str)>,
+                        )
+                        .await;
+                    let mut api_provider = client_setup.api_provider;
+                    if let Some(timeout) = prompt.stream_progress_timeout {
+                        api_provider.stream_idle_timeout = timeout;
+                    }
+                    let client = ApiResponsesClient::new(transport, api_provider, client_setup.api_auth)
+                        .with_ollama_summary_compat(self.client.state.provider.info().kind == codex_model_provider_info::ProviderKind::Ollama)
+                        .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+                    let turn_timing = self.turn_timing.clone();
+                    let serialization_timing_guard = self
+                        .turn_timing
+                        .as_ref()
+                        .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
+                    let dispatched_request = Arc::new(OnceLock::new());
+                    let dispatched_request_for_callback = Arc::clone(&dispatched_request);
+                    let stream_result = client
+                        .stream_request_with_dispatch_ready(&request, options, {
+                            let dispatched_identity = attempt_identity.clone();
+                            move |request_bytes| {
+                                if let Some(timing) = turn_timing.as_ref() {
+                                    timing.record_model_request_payload(
+                                        &dispatched_identity.sampling_request_id,
+                                        &dispatched_identity.physical_attempt_id,
+                                        &request_bytes,
+                                    );
+                                }
+                                let _ = dispatched_request_for_callback.set(request_bytes);
+                                drop(serialization_timing_guard);
+                            }
+                        })
+                        .await;
+                    if stream_result.is_ok() {
+                        attempt_clock.mark_stream_established();
+                    } else {
+                        attempt_clock.mark_completed();
+                        if let Some(timing) = self.turn_timing.as_ref() {
+                            timing.mark_model_request_attempt_ended();
+                        }
+                    }
+                    self.effective_input = Some(Arc::clone(&request.input));
+                    let prompt_cache_key = request.prompt_cache_key.clone();
+                    let dispatched_request = dispatched_request.get().cloned();
+                    let logical_request_bytes = dispatched_request
+                        .as_ref()
+                        .map(|request| u64::try_from(request.len()).unwrap_or(u64::MAX));
+                    let mut attempt = if let Some(permit) = ModelAttemptState::try_diagnostic_permit() {
+                        let measurement_cancellation = CancellationToken::new();
+                        let measurement_task =
+                            AbortOnDropHandle::new(measure_responses_request_after_dispatch(
+                                request,
+                                prompt.clone(),
+                                // The HTTP path always dispatches the logical projection.
+                                SelectedInputRepresentation::default(),
+                                measurement_cancellation.clone(),
+                                logical_request_bytes,
+                                dispatched_request,
+                                self.turn_timing
+                                    .clone()
+                                    .map(|timing| (timing, attempt_identity.clone())),
+                                Arc::clone(&permit),
+                            ));
+                        let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
+                        let prompt_digests = prompt.digests;
+                        let prompt_context_baseline = Arc::clone(&self.prompt_context_baseline);
+                        let turn_timing = self.turn_timing.clone();
+                        let generation = turn_timing
+                            .as_ref()
+                            .and_then(|timing| timing.current_model_attempt_metadata());
+                        *self
+                            .latest_measurement_attempt
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(attempt_identity.physical_attempt_id.clone());
+                        let latest_measurement_attempt = Arc::clone(&self.latest_measurement_attempt);
+                        let predecessor = self.measurement_predecessor.take();
+                        let initial_baseline = self
+                            .prompt_context_baseline
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        let (baseline_sender, baseline_receiver) = oneshot::channel();
+                        self.measurement_predecessor = Some(baseline_receiver);
+                        let attempt_task_identity = attempt_identity.clone();
+                        let attempt_task_clock = attempt_clock.clone();
+                        let attempt_task_telemetry = request_session_telemetry.clone();
+                        let turn_id = responses_metadata.turn_id.clone();
+                        let diagnostic_permit = Arc::clone(&permit);
+                        let attempt_task = tokio::spawn(async move {
+                        let mut measurement_task = measurement_task;
+                        let PostDispatchRequestMeasurements {
+                            mut measurements,
+                            stable_context_manifest,
+                        } = match (&mut measurement_task).await {
+                            Ok(measurements) => measurements,
+                            Err(err) => {
+                                warn!(error = %err, "model request diagnostics join failed after dispatch");
+                                PostDispatchRequestMeasurements {
+                                    measurements: ModelRequestMeasurements::default(),
+                                    stable_context_manifest: fallback_stable_context_manifest,
+                                }
+                            }
+                        };
+                        measurements.record_stable_context(
+                            &stable_context_manifest,
+                            /*baseline_generation*/ None,
+                            ModelAttemptProviderBaseline::StatelessFull,
+                            /*previous_response_id_present*/ false,
+                        );
+                        // Compare with the dispatched predecessor even when it finishes late.
+                        let baseline = measurements
+                            .compare_after_predecessor(
+                                predecessor,
+                                initial_baseline,
+                                prompt_cache_key.as_deref(),
+                                prompt_digests,
+                            )
+                            .await;
+                        let latest_attempt = latest_measurement_attempt
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if latest_attempt.as_deref()
+                            == Some(attempt_task_identity.physical_attempt_id.as_str())
+                        {
+                            *prompt_context_baseline
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = baseline.clone();
+                        }
+                        drop(latest_attempt);
+                        let _ = baseline_sender.send(baseline);
+                        if let Some(timing) = turn_timing
+                            .as_ref()
+                            .filter(|_| !measurements.prompt_context_categories.is_empty())
+                        {
+                            timing.record_model_request_token_categories(
+                                &attempt_task_identity.sampling_request_id,
+                                &attempt_task_identity.physical_attempt_id,
+                                measurements.request_token_categories(),
+                            );
+                            timing.record_model_request_cache_identity(
+                                &attempt_task_identity.sampling_request_id,
+                                &attempt_task_identity.physical_attempt_id,
+                                measurements.fixed_prefix_reuse_eligible,
+                                prompt_cache_key.as_deref(),
                             );
                         }
-                        let _ = dispatched_request_for_callback.set(request_bytes);
-                        attempt_clock.mark_dispatch_ready();
-                        drop(serialization_timing_guard);
-                        drop(transport_readiness_guard);
-                        if let Some(timing) = turn_timing {
-                            timing.mark_model_request_dispatched();
+                        if measurements.prompt_context_categories.is_empty()
+                            && let Some(timing) = turn_timing.as_ref()
+                        {
+                            timing.record_model_request_diagnostics_unavailable(
+                                &attempt_task_identity.sampling_request_id,
+                                &attempt_task_identity.physical_attempt_id,
+                            );
                         }
-                    }
-                })
-                .await;
-            if stream_result.is_ok() {
-                attempt_clock.mark_stream_established();
-            } else {
-                attempt_clock.mark_completed();
-            }
-            self.effective_input = Some(Arc::clone(&request.input));
-            let prompt_cache_key = request.prompt_cache_key.clone();
-            let dispatched_request = dispatched_request.get().cloned();
-            let logical_request_bytes = dispatched_request
-                .as_ref()
-                .map(|request| u64::try_from(request.len()).unwrap_or(u64::MAX));
-            let measurement_cancellation = CancellationToken::new();
-            let measurement_task =
-                AbortOnDropHandle::new(measure_responses_request_after_dispatch(
-                    request,
-                    prompt.clone(),
-                    // The HTTP path always dispatches the logical projection.
-                    SelectedInputRepresentation::default(),
-                    measurement_cancellation.clone(),
-                    logical_request_bytes,
-                    dispatched_request,
-                    self.turn_timing.clone().map(|timing| (timing, attempt_identity.clone())),
-                ));
-            let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
-            let prompt_digests = prompt.digests;
-            let prompt_context_baseline = Arc::clone(&self.prompt_context_baseline);
-            let turn_timing = self.turn_timing.clone();
-            let generation = turn_timing
-                .as_ref()
-                .and_then(|timing| timing.current_model_attempt_metadata());
-            *self
-                .latest_measurement_attempt
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(attempt_identity.physical_attempt_id.clone());
-            let latest_measurement_attempt = Arc::clone(&self.latest_measurement_attempt);
-            let predecessor = self.measurement_predecessor.take();
-            let initial_baseline = self
-                .prompt_context_baseline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let (baseline_sender, baseline_receiver) = oneshot::channel();
-            self.measurement_predecessor = Some(baseline_receiver);
-            let attempt_task_identity = attempt_identity.clone();
-            let attempt_task_clock = attempt_clock.clone();
-            let attempt_task_telemetry = request_session_telemetry.clone();
-            let turn_id = responses_metadata.turn_id.clone();
-            let attempt_task = tokio::spawn(async move {
-                let mut measurement_task = measurement_task;
-                let PostDispatchRequestMeasurements {
-                    mut measurements,
-                    stable_context_manifest,
-                } = match (&mut measurement_task).await {
-                    Ok(measurements) => measurements,
-                    Err(err) => {
-                        warn!(error = %err, "model request diagnostics join failed after dispatch");
-                        PostDispatchRequestMeasurements {
-                            measurements: ModelRequestMeasurements::default(),
-                            stable_context_manifest: fallback_stable_context_manifest,
-                        }
-                    }
-                };
-                measurements.record_stable_context(
-                    &stable_context_manifest,
-                    /*baseline_generation*/ None,
-                    ModelAttemptProviderBaseline::StatelessFull,
-                    /*previous_response_id_present*/ false,
-                );
-                // Compare with the dispatched predecessor even when it finishes late.
-                let baseline = measurements
-                    .compare_after_predecessor(
-                        predecessor,
-                        initial_baseline,
-                        prompt_cache_key.as_deref(),
-                        prompt_digests,
-                    )
-                    .await;
-                let latest_attempt = latest_measurement_attempt
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if latest_attempt.as_deref()
-                    == Some(attempt_task_identity.physical_attempt_id.as_str())
-                {
-                    *prompt_context_baseline
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = baseline.clone();
-                }
-                drop(latest_attempt);
-                let _ = baseline_sender.send(baseline);
-                if let Some(timing) = turn_timing
-                    .as_ref()
-                    .filter(|_| !measurements.prompt_context_categories.is_empty())
-                {
-                    timing.record_model_request_token_categories(
-                        &attempt_task_identity.sampling_request_id,
-                        &attempt_task_identity.physical_attempt_id,
-                        measurements.request_token_categories(),
-                    );
-                    timing.record_model_request_cache_identity(
-                        &attempt_task_identity.sampling_request_id,
-                        &attempt_task_identity.physical_attempt_id,
-                        measurements.fixed_prefix_reuse_eligible,
-                        prompt_cache_key.as_deref(),
-                    );
-                }
-                if measurements.prompt_context_categories.is_empty()
-                    && let Some(timing) = turn_timing.as_ref()
-                {
-                    timing.record_model_request_diagnostics_unavailable(
-                        &attempt_task_identity.sampling_request_id,
-                        &attempt_task_identity.physical_attempt_id,
-                    );
-                }
-                ModelAttemptGuard::new(
-                    attempt_task_telemetry,
-                    attempt_task_identity,
-                    retry_index,
-                    if retry_index == 0 {
-                        ModelAttemptRetryReason::None
+                        ModelAttemptGuard::new(
+                            attempt_task_telemetry,
+                            attempt_task_identity,
+                            retry_index,
+                            if retry_index == 0 {
+                                ModelAttemptRetryReason::None
+                            } else {
+                                ModelAttemptRetryReason::Unauthorized
+                            },
+                            request_kind,
+                            ModelAttemptTransport::ResponsesHttp,
+                            None,
+                            measurements,
+                            attempt_task_clock,
+                            turn_id,
+                            generation,
+                        ).with_diagnostic_permit(diagnostic_permit)
+                    }.in_current_span());
+                        Some(ModelAttemptState::pending(
+                            essential_attempt,
+                            attempt_task,
+                            measurement_cancellation,
+                            self.turn_timing.clone(),
+                            permit,
+                        ))
                     } else {
-                        ModelAttemptRetryReason::Unauthorized
-                    },
-                    request_kind,
-                    ModelAttemptTransport::ResponsesHttp,
-                    None,
-                    measurements,
-                    attempt_task_clock,
-                    turn_id,
-                    generation,
-                )
-            });
-            let mut attempt = Some(ModelAttemptState::pending(
-                attempt_identity,
-                attempt_clock,
-                attempt_task,
-                measurement_cancellation,
-                self.turn_timing.clone(),
-            ));
+                        if let Some(timing) = self.turn_timing.as_ref() {
+                            timing.record_model_request_diagnostics_unavailable(
+                                &attempt_identity.sampling_request_id,
+                                &attempt_identity.physical_attempt_id,
+                            );
+                        }
+                        Some(ModelAttemptState::Ready(Box::new(essential_attempt)))
+                    };
 
-            match stream_result {
-                Ok(stream) => {
-                    let (stream, _) = map_response_stream(
-                        stream,
-                        request_session_telemetry,
-                        inference_trace_attempt,
-                        Arc::clone(&self.client.state.provider),
-                        attempt,
-                        /*stream_throughput*/ None,
-                        /*websocket_success*/ None,
-                    );
-                    return Ok(stream);
+                    match stream_result {
+                        Ok(stream) => {
+                            let (stream, _) = map_response_stream(
+                                stream,
+                                request_session_telemetry,
+                                inference_trace_attempt,
+                                Arc::clone(&self.client.state.provider),
+                                attempt,
+                                /*stream_throughput*/ None,
+                                /*websocket_success*/ None,
+                            );
+                            return Ok(stream);
+                        }
+                        Err(ApiError::Transport(unauthorized_transport))
+                            if is_recoverable_authentication_failure(&unauthorized_transport) =>
+                        {
+                            let response_debug_context =
+                                extract_response_debug_context(&unauthorized_transport);
+                            inference_trace_attempt
+                                .record_failed(
+                                    &unauthorized_transport,
+                                    response_debug_context.request_id.as_deref(),
+                                    /*output_items*/ &[],
+                                )
+                                .await;
+                            finish_failed_model_attempt(&mut attempt, Vec::new());
+                            pending_retry = PendingUnauthorizedRetry::from_recovery(
+                                handle_unauthorized(
+                                    unauthorized_transport,
+                                    &mut auth_recovery,
+                                    session_telemetry,
+                                    &self.client.state.provider,
+                                )
+                                .await?,
+                            );
+                            retry_index = retry_index.saturating_add(1);
+                            continue;
+                        }
+                        Err(err) => {
+                            let response_debug_context = extract_response_debug_context_from_api_error(&err);
+                            let err = self.client.state.provider.map_api_error(err);
+                            inference_trace_attempt
+                                .record_failed(
+                                    &err,
+                                    response_debug_context.request_id.as_deref(),
+                                    /*output_items*/ &[],
+                                )
+                                .await;
+                            finish_failed_model_attempt(&mut attempt, Vec::new());
+                            return Err(err);
+                        }
+                    }
                 }
-                Err(ApiError::Transport(unauthorized_transport))
-                    if is_recoverable_authentication_failure(&unauthorized_transport) =>
-                {
-                    let response_debug_context =
-                        extract_response_debug_context(&unauthorized_transport);
-                    inference_trace_attempt
-                        .record_failed(
-                            &unauthorized_transport,
-                            response_debug_context.request_id.as_deref(),
-                            /*output_items*/ &[],
-                        )
-                        .await;
-                    finish_failed_model_attempt(&mut attempt, Vec::new());
-                    pending_retry = PendingUnauthorizedRetry::from_recovery(
-                        handle_unauthorized(
-                            unauthorized_transport,
-                            &mut auth_recovery,
-                            session_telemetry,
-                            &self.client.state.provider,
-                        )
-                        .await?,
-                    );
-                    retry_index = retry_index.saturating_add(1);
-                    continue;
-                }
-                Err(err) => {
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
-                    let err = self.client.state.provider.map_api_error(err);
-                    inference_trace_attempt
-                        .record_failed(
-                            &err,
-                            response_debug_context.request_id.as_deref(),
-                            /*output_items*/ &[],
-                        )
-                        .await;
-                    finish_failed_model_attempt(&mut attempt, Vec::new());
-                    return Err(err);
-                }
-            }
-        }
+            }).instrument(span).await
+        })
     }
 
     /// Streams a turn via the Responses API over WebSocket transport.
@@ -4782,7 +5092,10 @@ impl ModelClientSession {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .epoch;
             // `generate=false` warmup is transport setup rather than a sampling attempt.
-            let attempt_clock = (!warmup).then(ModelAttemptClock::new);
+            let attempt_clock = (!warmup).then(|| ModelAttemptClock {
+                provider_event_at_transport: true,
+                ..ModelAttemptClock::new()
+            });
             let prepared_attempt = if warmup {
                 None
             } else {
@@ -4841,10 +5154,13 @@ impl ModelClientSession {
             // Judge the upcoming request only against comparable work, before
             // a stale collapse can discard this request's healthy connection.
             let setup = websocket_setup_fingerprint(
-                &client_setup.api_provider, client_setup.api_auth.as_ref(),
+                &client_setup.api_provider,
+                client_setup.api_auth.as_ref(),
             );
-            self.websocket_session.stream_throughput
-                .lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            self.websocket_session
+                .stream_throughput
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .select_workload(serde_json::json!({
                     "setup": setup.map(|fingerprint| fingerprint.0),
                     "model": &request.model,
@@ -4905,7 +5221,7 @@ impl ModelClientSession {
                     api_provider: client_setup.api_provider.clone(),
                     api_auth: client_setup.api_auth,
                     responses_metadata,
-                    auth_context: request_auth_context,
+                    auth_context: request_auth_context.clone(),
                     request_route_telemetry: RequestRouteTelemetry::for_endpoint(
                         RESPONSES_ENDPOINT,
                     ),
@@ -5046,7 +5362,7 @@ impl ModelClientSession {
             } else {
                 ModelAttemptProviderBaseline::FreshFullReplay
             };
-            let inference_trace_attempt = AsyncInferenceTraceAttempt::from(if warmup {
+            let inference_trace_attempt = AsyncInferenceTraceAttempt::unstarted(if warmup {
                 // Prewarm sends `generate=false`; it is connection setup, not a
                 // model inference attempt that should appear in rollout traces.
                 InferenceTraceAttempt::disabled()
@@ -5077,6 +5393,28 @@ impl ModelClientSession {
             let attempt_identity = attempt_clock
                 .as_ref()
                 .map(|_| new_attempt_identity(sampling_request_id));
+            let connection_reused = self.websocket_session.connection_reused();
+            let mut essential_attempt =
+                attempt_identity
+                    .as_ref()
+                    .zip(attempt_clock.as_ref())
+                    .map(|(identity, clock)| {
+                        ModelAttemptGuard::new(
+                            request_session_telemetry.clone(),
+                            identity.clone(),
+                            0,
+                            ModelAttemptRetryReason::None,
+                            request_kind,
+                            ModelAttemptTransport::ResponsesWebsocket,
+                            Some(connection_reused),
+                            ModelRequestMeasurements::default(),
+                            clock.clone(),
+                            responses_metadata.turn_id.clone(),
+                            self.turn_timing
+                                .as_ref()
+                                .and_then(|timing| timing.current_model_attempt_metadata()),
+                        )
+                    });
             if let (Some(timing), Some(identity)) =
                 (self.turn_timing.as_ref(), attempt_identity.as_ref())
             {
@@ -5126,15 +5464,37 @@ impl ModelClientSession {
                 .turn_timing
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
-            let connection_reused = self.websocket_session.connection_reused();
             let queue_clock = attempt_clock.clone();
-            let dispatch_clock = attempt_clock.clone();
             let established_clock = attempt_clock.clone();
             let dispatched_request = Arc::new(OnceLock::new());
             let dispatched_request_for_callback = Arc::clone(&dispatched_request);
             let dispatched_identity = attempt_identity.clone();
+            let transport_identity = attempt_identity.clone();
+            let transport_clock = attempt_clock.clone();
+            let transport_timing = self.turn_timing.as_ref().map(Arc::downgrade);
+            let logical_transport_id = websocket_connection
+                .logical_transport_id()
+                .map(str::to_owned);
+            let response_telemetry =
+                attempt_identity
+                    .as_ref()
+                    .zip(attempt_clock.as_ref())
+                    .map(|(identity, clock)| {
+                        let mut telemetry = ApiTelemetry::new(
+                            request_session_telemetry.clone(),
+                            request_auth_context,
+                            RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+                            self.client.state.auth_env_telemetry.clone(),
+                        );
+                        telemetry.logical_request_id = logical_transport_id
+                            .clone()
+                            .unwrap_or_else(new_sampling_request_id);
+                        telemetry.websocket_response = Some((identity.clone(), clock.clone()));
+                        Arc::new(telemetry) as Arc<dyn WebsocketTelemetry>
+                    });
+            let startup_timing = self.startup_timing.clone();
             let stream_result = websocket_connection
-                .stream_request_with_response_idle_timeout(
+                .stream_request_with_observers(
                     &ws_request,
                     connection_reused,
                     Some(Arc::clone(&self.turn_state)),
@@ -5156,20 +5516,46 @@ impl ModelClientSession {
                             );
                         }
                         let _ = dispatched_request_for_callback.set(request_bytes);
-                        if let Some(clock) = dispatch_clock {
-                            clock.mark_dispatch_ready();
-                        }
                         drop(serialization_timing_guard);
                         drop(transport_readiness_guard);
-                        if !warmup && let Some(timing) = turn_timing {
-                            timing.mark_model_request_dispatched();
-                        }
                     },
                     move || {
                         if let Some(clock) = established_clock {
                             clock.mark_stream_established();
                         }
                     },
+                    (!warmup).then(|| {
+                        Arc::new(move || {
+                            if let Some(clock) = &transport_clock {
+                                clock.mark_dispatch_ready();
+                            }
+                            if let Some(timing) =
+                                transport_timing.as_ref().and_then(std::sync::Weak::upgrade)
+                                && let Some(identity) = &transport_identity
+                            {
+                                timing.mark_model_attempt_dispatched(
+                                    &identity.sampling_request_id,
+                                    &identity.physical_attempt_id,
+                                    false,
+                                );
+                            }
+                            if let Some(identity) = &transport_identity {
+                                tracing::info!(
+                                    event.name = "codex.model_transport_identity",
+                                    transport = "websocket",
+                                    logical_request_id = logical_transport_id.as_deref(),
+                                    sampling_request_id = %identity.sampling_request_id,
+                                    physical_attempt_id = %identity.physical_attempt_id,
+                                    connection_reused,
+                                    "model transport identity at send attempt"
+                                );
+                            }
+                            if let Some(timing) = &startup_timing {
+                                timing.freeze_at_first_transport_attempt();
+                            }
+                        }) as Arc<dyn Fn() + Send + Sync>
+                    }),
+                    response_telemetry,
                 )
                 .await;
             if stream_result.is_err()
@@ -5183,45 +5569,56 @@ impl ModelClientSession {
                 attempt_identity,
             ) {
                 (Some(logical_request), Some(attempt_clock), Some(attempt_identity)) => {
-                    let prompt_cache_key = logical_request.prompt_cache_key.clone();
-                    let dispatched_request = dispatched_request.get().cloned();
-                    let measurement_cancellation = CancellationToken::new();
-                    let measurement_task =
-                        AbortOnDropHandle::new(measure_responses_request_after_dispatch(
-                            logical_request,
-                            prompt.clone(),
-                            selected_representation,
-                            measurement_cancellation.clone(),
-                            /*logical_request_bytes*/ None,
-                            dispatched_request,
-                            self.turn_timing.clone().map(|timing| (timing, attempt_identity.clone())),
-                        ));
-                    let fallback_stable_context_manifest = prompt.stable_context_manifest.clone();
-                    let prompt_digests = prompt.digests;
-                    let prompt_context_baseline = Arc::clone(&self.prompt_context_baseline);
-                    let turn_timing = self.turn_timing.clone();
-                    let generation = turn_timing
-                        .as_ref()
-                        .and_then(|timing| timing.current_model_attempt_metadata());
-                    *self
-                        .latest_measurement_attempt
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(attempt_identity.physical_attempt_id.clone());
-                    let latest_measurement_attempt = Arc::clone(&self.latest_measurement_attempt);
-                    let predecessor = self.measurement_predecessor.take();
-                    let initial_baseline = self
-                        .prompt_context_baseline
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    let (baseline_sender, baseline_receiver) = oneshot::channel();
-                    self.measurement_predecessor = Some(baseline_receiver);
-                    let attempt_task_identity = attempt_identity.clone();
-                    let attempt_task_clock = attempt_clock.clone();
-                    let attempt_task_telemetry = request_session_telemetry.clone();
-                    let turn_id = responses_metadata.turn_id.clone();
-                    let attempt_task = tokio::spawn(async move {
+                    // Identity and clock imply the essential owner exists. Take it only
+                    // with a permit; otherwise the ready-attempt branch below keeps it.
+                    if let Some(permit) = ModelAttemptState::try_diagnostic_permit()
+                        && let Some(essential) = essential_attempt.take()
+                    {
+                        let prompt_cache_key = logical_request.prompt_cache_key.clone();
+                        let dispatched_request = dispatched_request.get().cloned();
+                        let measurement_cancellation = CancellationToken::new();
+                        let measurement_task =
+                            AbortOnDropHandle::new(measure_responses_request_after_dispatch(
+                                logical_request,
+                                prompt.clone(),
+                                selected_representation,
+                                measurement_cancellation.clone(),
+                                /*logical_request_bytes*/ None,
+                                dispatched_request,
+                                self.turn_timing
+                                    .clone()
+                                    .map(|timing| (timing, attempt_identity.clone())),
+                                Arc::clone(&permit),
+                            ));
+                        let fallback_stable_context_manifest =
+                            prompt.stable_context_manifest.clone();
+                        let prompt_digests = prompt.digests;
+                        let prompt_context_baseline = Arc::clone(&self.prompt_context_baseline);
+                        let turn_timing = self.turn_timing.clone();
+                        let generation = turn_timing
+                            .as_ref()
+                            .and_then(|timing| timing.current_model_attempt_metadata());
+                        *self
+                            .latest_measurement_attempt
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(attempt_identity.physical_attempt_id.clone());
+                        let latest_measurement_attempt =
+                            Arc::clone(&self.latest_measurement_attempt);
+                        let predecessor = self.measurement_predecessor.take();
+                        let initial_baseline = self
+                            .prompt_context_baseline
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        let (baseline_sender, baseline_receiver) = oneshot::channel();
+                        self.measurement_predecessor = Some(baseline_receiver);
+                        let attempt_task_identity = attempt_identity;
+                        let attempt_task_clock = attempt_clock;
+                        let attempt_task_telemetry = request_session_telemetry.clone();
+                        let turn_id = responses_metadata.turn_id.clone();
+                        let diagnostic_permit = Arc::clone(&permit);
+                        let attempt_task = tokio::spawn(async move {
                         let mut measurement_task = measurement_task;
                         let PostDispatchRequestMeasurements {
                             mut measurements,
@@ -5300,15 +5697,27 @@ impl ModelClientSession {
                             attempt_task_clock,
                             turn_id,
                             generation,
-                        )
-                    });
-                    Some(ModelAttemptState::pending(
-                        attempt_identity,
-                        attempt_clock,
-                        attempt_task,
-                        measurement_cancellation,
-                        self.turn_timing.clone(),
-                    ))
+                        ).with_diagnostic_permit(diagnostic_permit)
+                    }.in_current_span());
+                        Some(ModelAttemptState::pending(
+                            essential,
+                            attempt_task,
+                            measurement_cancellation,
+                            self.turn_timing.clone(),
+                            permit,
+                        ))
+                    } else {
+                        if let Some(timing) = self.turn_timing.as_ref() {
+                            timing.record_model_request_diagnostics_unavailable(
+                                &attempt_identity.sampling_request_id,
+                                &attempt_identity.physical_attempt_id,
+                            );
+                        }
+                        essential_attempt.take().map(|mut guard| {
+                            guard.turn_timing = self.turn_timing.clone();
+                            ModelAttemptState::Ready(Box::new(guard))
+                        })
+                    }
                 }
                 _ => None,
             };
@@ -5358,13 +5767,34 @@ impl ModelClientSession {
         auth_context: AuthRequestTelemetryContext,
         request_route_telemetry: RequestRouteTelemetry,
         auth_env_telemetry: AuthEnvTelemetry,
+        model_request: ModelRequestTelemetryContext,
     ) -> (Arc<dyn RequestTelemetry>, Arc<dyn SseTelemetry>) {
-        let telemetry = Arc::new(ApiTelemetry::new(
+        let mut telemetry = ApiTelemetry::new(
             session_telemetry.clone(),
             auth_context,
             request_route_telemetry,
             auth_env_telemetry,
-        ));
+        );
+        // The transport logical request is this core API attempt; retries are
+        // distinguished by the lower transport ordinal, not a second UUID.
+        telemetry.logical_request_id = model_request.identity.physical_attempt_id.clone();
+        session_telemetry.record_model_transport_identity(
+            &telemetry.logical_request_id,
+            Some(&model_request.identity.sampling_request_id),
+            Some(&model_request.identity.physical_attempt_id),
+            "model_request",
+            None,
+        );
+        tracing::info!(
+            event.name = "codex.model_transport_identity",
+            logical_request_id = %telemetry.logical_request_id,
+            sampling_request_id = %model_request.identity.sampling_request_id,
+            physical_attempt_id = %model_request.identity.physical_attempt_id,
+            turn_id = model_request.turn_id.as_deref(),
+            "model transport identity"
+        );
+        telemetry.model_request = Some(model_request);
+        let telemetry = Arc::new(telemetry);
         let request_telemetry: Arc<dyn RequestTelemetry> = telemetry.clone();
         let sse_telemetry: Arc<dyn SseTelemetry> = telemetry;
         (request_telemetry, sse_telemetry)
@@ -5483,37 +5913,41 @@ impl ModelClientSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stream_with_attempt_prepared(
-        &mut self,
-        prompt: &Prompt,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
+    pub(crate) fn stream_with_attempt_prepared<'a>(
+        &'a mut self,
+        prompt: &'a Prompt,
+        model_info: &'a ModelInfo,
+        session_telemetry: &'a SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
-        inference_trace: &InferenceTraceContext,
+        responses_metadata: &'a CodexResponsesMetadata,
+        inference_trace: &'a InferenceTraceContext,
         attempt_prepared: Option<AttemptPreparedCallback>,
-    ) -> Result<ResponseStream> {
-        // Resolve before auth setup and transport selection: preconnect can refresh auth or
-        // discover that the endpoint requires HTTP. The normal connection path still checks
-        // provider/auth compatibility, expiry, and closure before reusing the socket.
-        self.finish_websocket_preconnect().await;
-        let sampling_request_id = new_sampling_request_id();
-        let request_kind = if self.logical_sampling_request_count == 0 {
-            ModelAttemptRequestKind::Initial
-        } else {
-            ModelAttemptRequestKind::Continuation
-        };
-        self.logical_sampling_request_count = self.logical_sampling_request_count.saturating_add(1);
-        let wire_api = self.client.state.provider.info().wire_api;
-        match wire_api {
-            WireApi::Responses => {
-                if self.client.responses_websocket_enabled() {
-                    self.last_stream_transport = Some(ModelAttemptTransport::ResponsesWebsocket);
-                    let request_trace = current_span_w3c_trace_context();
-                    match self
-                        .stream_responses_websocket(
+    ) -> impl std::future::Future<Output = Result<ResponseStream>> + 'a {
+        // Construct the transport future outside the caller's polling frame;
+        // the dispatch owner already heap-pins its input on this same task.
+        codex_http_client::with_request_dispatch_scope(async move {
+            // Resolve before auth setup and transport selection: preconnect can refresh auth or
+            // discover that the endpoint requires HTTP. The normal connection path still checks
+            // provider/auth compatibility, expiry, and closure before reusing the socket.
+            self.finish_websocket_preconnect().await;
+            let sampling_request_id = new_sampling_request_id();
+            let request_kind = if self.logical_sampling_request_count == 0 {
+                ModelAttemptRequestKind::Initial
+            } else {
+                ModelAttemptRequestKind::Continuation
+            };
+            self.logical_sampling_request_count =
+                self.logical_sampling_request_count.saturating_add(1);
+            let wire_api = self.client.state.provider.info().wire_api;
+            match wire_api {
+                WireApi::Responses => {
+                    if self.client.responses_websocket_enabled() {
+                        self.last_stream_transport =
+                            Some(ModelAttemptTransport::ResponsesWebsocket);
+                        let request_trace = current_span_w3c_trace_context();
+                        match Box::pin(self.stream_responses_websocket(
                             prompt,
                             model_info,
                             session_telemetry,
@@ -5527,37 +5961,42 @@ impl ModelClientSession {
                             request_trace,
                             inference_trace,
                             attempt_prepared.clone(),
-                        )
+                        ))
                         .await?
-                    {
-                        WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
-                        WebsocketStreamOutcome::FallbackToHttp => {
-                            self.try_switch_fallback_transport(session_telemetry);
+                        {
+                            WebsocketStreamOutcome::Stream(stream) => return Ok(stream),
+                            WebsocketStreamOutcome::FallbackToHttp => {
+                                self.try_switch_fallback_transport(session_telemetry);
+                            }
                         }
                     }
-                }
 
-                self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
-                self.stream_responses_api(
-                    prompt,
-                    model_info,
-                    session_telemetry,
-                    &sampling_request_id,
-                    request_kind,
-                    effort,
-                    summary,
-                    service_tier,
-                    responses_metadata,
-                    inference_trace,
-                    attempt_prepared,
-                )
-                .await
+                    self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
+                    Box::pin(self.stream_responses_api(
+                        prompt,
+                        model_info,
+                        session_telemetry,
+                        &sampling_request_id,
+                        request_kind,
+                        effort,
+                        summary,
+                        service_tier,
+                        responses_metadata,
+                        inference_trace,
+                        attempt_prepared,
+                    ))
+                    .await
+                }
             }
-        }
+        })
     }
 
     pub(crate) fn effective_input(&self) -> Option<&[ResponseItem]> {
         self.effective_input.as_deref()
+    }
+
+    pub(crate) fn effective_input_shared(&self) -> Option<Arc<[ResponseItem]>> {
+        self.effective_input.as_ref().map(Arc::clone)
     }
 
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.
@@ -5602,7 +6041,9 @@ impl ModelClientSession {
         if !failed_stream_was_websocket && !self.client.responses_websocket_enabled() {
             return false;
         }
-        let activated = self.client.activate_http_fallback(session_telemetry, recoverable);
+        let activated = self
+            .client
+            .activate_http_fallback(session_telemetry, recoverable);
         self.websocket_session = WebsocketSession::default();
         self.last_stream_transport = Some(ModelAttemptTransport::ResponsesHttp);
         activated || failed_stream_was_websocket
@@ -5680,16 +6121,27 @@ type TraceWrite = (bool, Box<dyn FnOnce(&InferenceTraceAttempt) + Send>);
 struct AsyncInferenceTraceAttempt {
     attempt: Option<Arc<InferenceTraceAttempt>>,
     writes: Option<tokio::sync::mpsc::Sender<TraceWrite>>,
+    terminal_fallback: Arc<StdMutex<Option<TraceWrite>>>,
+    terminal_requested: AtomicBool,
+    /// Replay rejects a terminal for a call whose start it never saw, so a
+    /// drop may close only an attempt whose start was already recorded.
+    start_recorded: AtomicBool,
 }
 
+/// Wraps an attempt whose start the caller already recorded. Fresh provider
+/// attempts use [`AsyncInferenceTraceAttempt::unstarted`].
 impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
     fn from(attempt: InferenceTraceAttempt) -> Self {
         static TRACE_SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
             std::sync::OnceLock::new();
+        let terminal_fallback = Arc::new(StdMutex::new(None::<TraceWrite>));
         if !attempt.is_enabled() {
             return Self {
                 attempt: None,
                 writes: None,
+                terminal_fallback,
+                terminal_requested: AtomicBool::new(false),
+                start_recorded: AtomicBool::new(true),
             };
         }
         let attempt = Arc::new(attempt);
@@ -5699,20 +6151,41 @@ impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
             return Self {
                 attempt: Some(attempt),
                 writes: None,
+                terminal_fallback,
+                terminal_requested: AtomicBool::new(false),
+                start_recorded: AtomicBool::new(true),
             };
         };
         let (writes, mut receiver) = tokio::sync::mpsc::channel::<TraceWrite>(4);
         tokio::spawn({
             let attempt = Arc::clone(&attempt);
+            let terminal_fallback = Arc::clone(&terminal_fallback);
             async move {
                 let _permit = permit;
+                let mut terminal_written = false;
                 while let Some((terminal, write)) = receiver.recv().await {
                     let attempt = Arc::clone(&attempt);
                     if let Err(error) = tokio::task::spawn_blocking(move || write(&attempt)).await {
                         warn!(%error, "inference trace incomplete: writer failed");
                     }
                     if terminal {
+                        terminal_written = true;
                         break;
+                    }
+                }
+                // The sole existing worker drains accepted start/detail work
+                // before an abandoned setup is closed. Drop never waits on
+                // storage or spawns a competing unbounded writer.
+                if !terminal_written {
+                    let fallback = terminal_fallback
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    if let Some((_, write)) = fallback
+                        && let Err(error) =
+                            tokio::task::spawn_blocking(move || write(&attempt)).await
+                    {
+                        warn!(%error, "inference trace terminal unavailable: fallback writer failed");
                     }
                 }
             }
@@ -5720,11 +6193,22 @@ impl From<InferenceTraceAttempt> for AsyncInferenceTraceAttempt {
         Self {
             attempt: Some(attempt),
             writes: Some(writes),
+            terminal_fallback,
+            terminal_requested: AtomicBool::new(false),
+            start_recorded: AtomicBool::new(true),
         }
     }
 }
 
 impl AsyncInferenceTraceAttempt {
+    /// A fresh provider attempt. `record_audited_request` records its start;
+    /// setup abandoned before then (admission failure or cancellation) writes nothing.
+    fn unstarted(attempt: InferenceTraceAttempt) -> Self {
+        let wrapped = Self::from(attempt);
+        wrapped.start_recorded.store(false, Ordering::Release);
+        wrapped
+    }
+
     async fn record_audited_request<T, U>(
         &self,
         request: &T,
@@ -5737,6 +6221,7 @@ impl AsyncInferenceTraceAttempt {
         let Some(_) = &self.writes else {
             return;
         };
+        self.start_recorded.store(true, Ordering::Release);
         let request = request.clone();
         let identity = identity.clone();
         let companion = companion.map(|(value, key)| (value.clone(), key));
@@ -5791,14 +6276,34 @@ impl AsyncInferenceTraceAttempt {
         upstream_request_id: Option<&str>,
         output_items: &[ResponseItem],
     ) {
+        self.record_failed_with_usage(error, upstream_request_id, output_items, None, None)
+            .await;
+    }
+
+    async fn record_failed_with_usage(
+        &self,
+        error: impl std::fmt::Display,
+        upstream_request_id: Option<&str>,
+        output_items: &[ResponseItem],
+        response_id: Option<&str>,
+        token_usage: Option<&TokenUsage>,
+    ) {
         let Some(_) = &self.writes else {
             return;
         };
         let error = error.to_string();
         let upstream_request_id = upstream_request_id.map(str::to_owned);
         let output_items = output_items.to_vec();
+        let response_id = response_id.map(str::to_owned);
+        let token_usage = token_usage.cloned();
         self.record(true, move |attempt| {
-            attempt.record_failed(error, upstream_request_id.as_deref(), &output_items);
+            attempt.record_failed_with_usage(
+                error,
+                upstream_request_id.as_deref(),
+                &output_items,
+                response_id.as_deref(),
+                token_usage.as_ref(),
+            );
         })
         .await;
     }
@@ -5826,11 +6331,62 @@ impl AsyncInferenceTraceAttempt {
         terminal: bool,
         record: impl FnOnce(&InferenceTraceAttempt) + Send + 'static,
     ) {
-        if let Some(writes) = &self.writes
-            && writes.try_send((terminal, Box::new(record))).is_err()
-        {
-            warn!("inference trace incomplete: optional trace queue saturated or closed");
+        if terminal && self.terminal_requested.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let occurrence = codex_rollout_trace::TraceOccurrence::now();
+        if let Some(writes) = &self.writes {
+            let write: TraceWrite = (
+                terminal,
+                Box::new(move |attempt: &InferenceTraceAttempt| {
+                    record(&attempt.at_occurrence(occurrence));
+                }),
+            );
+            if let Err(error) = writes.try_send(write) {
+                let closed = matches!(&error, tokio::sync::mpsc::error::TrySendError::Closed(_));
+                if terminal {
+                    // One reserved terminal slot outside the bounded detail
+                    // queue. Preserve the actual outcome during saturation.
+                    self.terminal_fallback
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get_or_insert_with(|| error.into_inner());
+                    if closed {
+                        warn!("inference trace terminal unavailable: optional writer closed");
+                    }
+                } else {
+                    warn!("inference trace incomplete: optional trace queue saturated or closed");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AsyncInferenceTraceAttempt {
+    fn drop(&mut self) {
+        if self.writes.is_none()
+            || !self.start_recorded.load(Ordering::Acquire)
+            || self.terminal_requested.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let occurrence = codex_rollout_trace::TraceOccurrence::now();
+        let mut fallback = self
+            .terminal_fallback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fallback.get_or_insert_with(|| {
+            (
+                true,
+                Box::new(move |attempt: &InferenceTraceAttempt| {
+                    attempt.at_occurrence(occurrence).record_cancelled(
+                        "local attempt owner dropped before terminal observation",
+                        None,
+                        &[],
+                    );
+                }),
+            )
+        });
     }
 }
 
@@ -5898,259 +6454,335 @@ where
     let attempt_identity = attempt.as_ref().map(ModelAttemptState::response_identity);
     let attempt_clock = attempt.as_ref().map(ModelAttemptState::clock);
     let (tx_event, rx_event) =
-        mpsc::channel::<Result<ResponseEvent>>(RESPONSE_STREAM_CHANNEL_CAPACITY);
+        codex_api::response_event_channel::response_event_channel(RESPONSE_STREAM_CHANNEL_CAPACITY);
     let (tx_last_response, rx_last_response) = oneshot::channel::<LastResponse>();
     let consumer_dropped = CancellationToken::new();
     let consumer_dropped_for_stream = consumer_dropped.clone();
     let dispatched_at = Instant::now();
+    let terminal_delivery_identity = attempt_identity.clone();
 
-    tokio::spawn(async move {
-        let mut tx_last_response = Some(tx_last_response);
-        let mut items_added: Vec<ResponseItem> = Vec::new();
-        let mut ttft_ms = None;
-        // First-event telemetry is one-shot. Once recorded, later deltas must
-        // not reacquire the timing mutex or clone the clock's Arc.
-        let mut first_provider_event_recorded = false;
-        let mut first_actionable_output_recorded = false;
-        let mut first_visible_output_recorded = false;
-        let mut api_stream = api_stream;
-        let mut downstream_backpressured = false;
-        let upstream_request_id = upstream_request_id.as_deref();
-        if let Some(upstream_request_id) = upstream_request_id {
-            feedback_tags!(last_model_request_id = upstream_request_id);
-        }
-        loop {
-            let event = tokio::select! {
-                _ = consumer_dropped.cancelled() => {
-                    inference_trace_attempt.record_cancelled(
-                        STREAM_DROPPED_REASON,
-                        upstream_request_id,
-                        &items_added,
-                    ).await;
-                    return;
-                }
-                event = api_stream.next() => event,
-            };
-            let Some(mut event) = event else {
-                break;
-            };
-            if let Ok(ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item)) =
-                &mut event
-            {
-                crate::stable_context::normalize_provider_context_item_id(item);
+    tokio::spawn(
+        async move {
+            let mut tx_last_response = Some(tx_last_response);
+            let mut items_added: Vec<ResponseItem> = Vec::new();
+            let mut ttft_ms = None;
+            // First-event telemetry is one-shot. Once recorded, later deltas must
+            // not reacquire the timing mutex or clone the clock's Arc.
+            let mut first_provider_event_recorded = false;
+            let mut first_actionable_output_recorded = false;
+            let mut first_visible_output_recorded = false;
+            let mut api_stream = api_stream;
+            let mut downstream_backpressured = false;
+            let upstream_request_id = upstream_request_id.as_deref();
+            if let Some(upstream_request_id) = upstream_request_id {
+                feedback_tags!(last_model_request_id = upstream_request_id);
             }
-            if let Ok(response_event) = &event
-                && let Some(clock) = attempt_clock.as_ref()
-            {
-                if !first_provider_event_recorded {
-                    clock.mark_first_provider_event();
-                    first_provider_event_recorded = true;
-                }
-                if ttft_ms.is_none() && response_event_records_model_output(response_event) {
-                    clock.mark_first_model_output();
-                    ttft_ms.get_or_insert_with(|| {
-                        let offsets = clock
-                            .offsets
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        i64::try_from(
-                            offsets
-                                .first_model_output_us
-                                .unwrap_or_default()
-                                .saturating_sub(offsets.dispatch_ready_us)
-                                / 1_000,
-                        )
-                        .unwrap_or(i64::MAX)
-                    });
-                }
-                if !first_actionable_output_recorded
-                    && response_event_records_actionable_output(response_event)
-                {
-                    clock.mark_first_actionable_output();
-                    first_actionable_output_recorded = true;
-                }
-            }
-            let records_visible_output = !first_visible_output_recorded
-                && attempt_clock.is_some()
-                && event.as_ref().is_ok_and(response_event_records_visible_output);
-            // With one sender, an empty capacity here means forwarding this
-            // nonterminal event can block polling the provider. Its completion
-            // time no longer isolates backend speed. Do not subtract this wait:
-            // it can overlap real provider work and invent an inflated rate.
-            if !matches!(&event, Ok(ResponseEvent::Completed { .. }))
-                && tx_event.capacity() == 0
-            {
-                downstream_backpressured = true;
-            }
-            match event {
-                Ok(ResponseEvent::OutputItemDone(item)) => {
-                    items_added.push(item.clone());
-                    if tx_event
-                        .send(Ok(ResponseEvent::OutputItemDone(item)))
-                        .await
-                        .is_err()
-                    {
-                        inference_trace_attempt
-                            .record_cancelled(
-                                STREAM_DROPPED_REASON,
-                                upstream_request_id,
-                                &items_added,
-                            )
-                            .await;
+            loop {
+                let event = tokio::select! {
+                    _ = consumer_dropped.cancelled() => {
+                        inference_trace_attempt.record_cancelled(
+                            STREAM_DROPPED_REASON,
+                            upstream_request_id,
+                            &items_added,
+                        ).await;
                         return;
                     }
-                    if records_visible_output && let Some(clock) = attempt_clock.as_ref() {
-                        clock.mark_first_visible_output();
-                        first_visible_output_recorded = true;
-                    }
+                    event = api_stream.next() => event,
+                };
+                let Some(mut event) = event else {
+                    break;
+                };
+                if let Ok(
+                    ResponseEvent::OutputItemAdded(item) | ResponseEvent::OutputItemDone(item),
+                ) = &mut event
+                {
+                    crate::stable_context::normalize_provider_context_item_id(item);
                 }
-                Ok(ResponseEvent::Completed {
-                    response_id,
-                    token_usage,
-                    end_turn,
-                }) => {
-                    if let Some(throughput) = stream_throughput.as_ref() {
-                        let mut throughput = throughput
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if downstream_backpressured {
-                            // A censored sample neither pollutes the baseline
-                            // nor joins unrelated slow responses into a streak.
-                            throughput.collapsed_streak = 0;
-                            throughput.latest_collapse = None;
-                        } else if let Some(usage) = token_usage.as_ref() {
-                            throughput.record(
-                                usage.output_tokens,
-                                dispatched_at.elapsed(),
-                                usage.input_tokens,
-                            );
-                        }
+                let queued_payload_bytes = event
+                    .as_ref()
+                    .map_or(0, ResponseEvent::queued_payload_bytes);
+                if queued_payload_bytes
+                    > codex_api::response_event_channel::RESPONSE_EVENT_QUEUE_BYTES
+                {
+                    event = Err(ApiError::invalid_response(
+                        "decoded response event exceeds the queue payload limit",
+                    ));
+                }
+                if let Ok(response_event) = &event
+                    && let Some(clock) = attempt_clock.as_ref()
+                {
+                    if !first_provider_event_recorded && !clock.provider_event_at_transport {
+                        clock.mark_first_provider_event();
+                        first_provider_event_recorded = true;
                     }
-                    feedback_tags!(last_model_response_id = &response_id);
-                    if let Some(attempt) = attempt.as_ref() {
-                        attempt.clock().mark_completed();
-                    }
-                    inference_trace_attempt
-                        .record_completed(
-                            &response_id,
-                            upstream_request_id,
-                            &token_usage,
-                            &items_added,
-                        )
-                        .await;
-                    // Publish authoritative history before releasing the consumer.
-                    // Optional diagnostics must not hold deferred tools or another
-                    // model request behind token measurement work.
-                    // HTTP discards this receiver. Do not clone a whole output
-                    // history just to send it into an already-closed channel.
-                    if let Some(sender) = tx_last_response.take().filter(|sender| !sender.is_closed()) {
-                        let _ = sender.send(LastResponse {
-                            response_id: response_id.clone(),
-                            items_added: items_added.clone(),
+                    if ttft_ms.is_none() && response_event_records_model_output(response_event) {
+                        clock.mark_first_model_output();
+                        ttft_ms.get_or_insert_with(|| {
+                            let offsets = clock
+                                .offsets
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            i64::try_from(
+                                offsets
+                                    .first_model_output_us
+                                    .unwrap_or_default()
+                                    .saturating_sub(offsets.dispatch_ready_us.unwrap_or_default())
+                                    / 1_000,
+                            )
+                            .unwrap_or(i64::MAX)
                         });
                     }
-                    if tx_event
-                        .send(Ok(ResponseEvent::Completed {
-                            response_id: response_id.clone(),
-                            token_usage: token_usage.clone(),
-                            end_turn,
-                        }))
-                        .await
-                        .is_err()
+                    if !first_actionable_output_recorded
+                        && response_event_records_actionable_output(response_event)
                     {
-                        return;
+                        clock.mark_first_actionable_output();
+                        first_actionable_output_recorded = true;
                     }
-                    drop(tx_event);
-                    drop(api_stream);
-                    let mut resolved_attempt = resolve_model_attempt(&mut attempt).await;
-                    if let Some(usage) = &token_usage {
-                        session_telemetry.sse_event_completed(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            Some(usage.cached_input_tokens),
-                            Some(usage.reasoning_output_tokens),
-                            resolved_attempt
-                                .as_ref()
-                                .map(ModelAttemptGuard::tool_token_count)
-                                .unwrap_or_default(),
-                            ttft_ms,
-                        );
-                    }
-                    if let Some(attempt) = resolved_attempt.as_mut() {
-                        attempt.mark_fresh_response_id_established(&response_id);
-                        attempt.observe_terminal_usage(Some(&response_id), token_usage.as_ref());
-                        attempt.finish(
-                            ModelAttemptOutcome::Success,
-                            token_usage.as_ref().map(|usage| usage.input_tokens),
-                            token_usage.as_ref().map(|usage| usage.cached_input_tokens),
-                            &items_added,
-                        );
-                    }
-                    // Completion is terminal. Dropping the upstream stream here
-                    // releases it without recording a second, failed terminal state.
-                    return;
                 }
-                Ok(event) => {
-                    if tx_event.send(Ok(event)).await.is_err() {
+                let records_visible_output = !first_visible_output_recorded
+                    && attempt_clock.is_some()
+                    && event
+                        .as_ref()
+                        .is_ok_and(response_event_records_visible_output);
+                // With one sender, an empty capacity here means forwarding this
+                // nonterminal event can block polling the provider. Its completion
+                // time no longer isolates backend speed. Do not subtract this wait:
+                // it can overlap real provider work and invent an inflated rate.
+                if !matches!(&event, Ok(ResponseEvent::Completed { .. }))
+                    && tx_event.is_backpressured(queued_payload_bytes)
+                {
+                    downstream_backpressured = true;
+                }
+                match event {
+                    Ok(ResponseEvent::OutputItemDone(item)) => {
+                        items_added.push(item.clone());
+                        if tx_event
+                            .send(Ok(ResponseEvent::OutputItemDone(item)))
+                            .await
+                            .is_err()
+                        {
+                            inference_trace_attempt
+                                .record_cancelled(
+                                    STREAM_DROPPED_REASON,
+                                    upstream_request_id,
+                                    &items_added,
+                                )
+                                .await;
+                            return;
+                        }
+                        if records_visible_output && let Some(clock) = attempt_clock.as_ref() {
+                            clock.mark_first_visible_output();
+                            first_visible_output_recorded = true;
+                        }
+                    }
+                    Ok(ResponseEvent::Completed {
+                        response_id,
+                        token_usage,
+                        end_turn,
+                    }) => {
+                        if let Some(throughput) = stream_throughput.as_ref() {
+                            let mut throughput = throughput
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if downstream_backpressured || token_usage.is_none() {
+                                // A censored sample neither pollutes the baseline
+                                // nor joins unrelated slow responses into a streak.
+                                throughput.collapsed_streak = 0;
+                                throughput.latest_collapse = None;
+                            } else if let Some(usage) = token_usage.as_ref() {
+                                throughput.record(
+                                    usage.output_tokens,
+                                    dispatched_at.elapsed(),
+                                    usage.input_tokens,
+                                    /*sustained_delivery_interval*/ false,
+                                );
+                            }
+                        }
+                        feedback_tags!(last_model_response_id = &response_id);
+                        if let Some(attempt) = attempt.as_ref() {
+                            attempt.clock().mark_completed();
+                        }
+                        if let Some(attempt) = attempt.as_mut() {
+                            // Provider truth must exist before optional trace IO or
+                            // a backpressured relay can suspend this task. Pending
+                            // diagnostics enrich it; they do not own its existence.
+                            attempt.finish_essential(
+                                ModelAttemptOutcome::Success,
+                                Some(&response_id),
+                                token_usage.as_ref(),
+                                &items_added,
+                                true,
+                            );
+                        }
                         inference_trace_attempt
-                            .record_cancelled(
-                                STREAM_DROPPED_REASON,
+                            .record_completed(
+                                &response_id,
                                 upstream_request_id,
+                                &token_usage,
                                 &items_added,
                             )
                             .await;
+                        // Publish authoritative history before releasing the consumer.
+                        // Optional diagnostics must not hold deferred tools or another
+                        // model request behind token measurement work.
+                        // HTTP discards this receiver. Do not clone a whole output
+                        // history just to send it into an already-closed channel.
+                        if let Some(sender) =
+                            tx_last_response.take().filter(|sender| !sender.is_closed())
+                        {
+                            let _ = sender.send(LastResponse {
+                                response_id: response_id.clone(),
+                                items_added: items_added.clone(),
+                            });
+                        }
+                        if tx_event
+                            .send(Ok(ResponseEvent::Completed {
+                                response_id: response_id.clone(),
+                                token_usage: token_usage.clone(),
+                                end_turn,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            if let Some(identity) = terminal_delivery_identity.as_ref() {
+                                tracing::info!(
+                                    event.name = "codex.model_terminal_delivery",
+                                    sampling_request_id = %identity.sampling_request_id,
+                                    physical_attempt_id = %identity.physical_attempt_id,
+                                    provider_completed = true,
+                                    delivery = "abandoned",
+                                    "completed provider response was not delivered"
+                                );
+                            }
+                            finish_model_attempt_with_usage(
+                                &mut attempt,
+                                items_added,
+                                Some(response_id),
+                                token_usage,
+                                ModelAttemptOutcome::Cancelled,
+                            );
+                            return;
+                        }
+                        drop(tx_event);
+                        drop(api_stream);
+                        let mut resolved_attempt = resolve_model_attempt(&mut attempt).await;
+                        if let Some(usage) = &token_usage
+                            && let (Some(input), Some(output)) =
+                                (usage.known_input(), usage.known_output())
+                        {
+                            session_telemetry.sse_event_completed(
+                                input,
+                                output,
+                                usage.known_cached_input(),
+                                usage.known_reasoning_output(),
+                                resolved_attempt
+                                    .as_ref()
+                                    .map(ModelAttemptGuard::tool_token_count)
+                                    .unwrap_or_default(),
+                                ttft_ms,
+                            );
+                        }
+                        if let Some(attempt) = resolved_attempt.as_mut() {
+                            attempt.provider_completed = true;
+                            attempt.mark_fresh_response_id_established(&response_id);
+                            attempt
+                                .observe_terminal_usage(Some(&response_id), token_usage.as_ref());
+                            attempt.finish(
+                                ModelAttemptOutcome::Success,
+                                token_usage.as_ref().and_then(TokenUsage::known_input),
+                                token_usage
+                                    .as_ref()
+                                    .and_then(TokenUsage::known_cached_input),
+                                &items_added,
+                            );
+                        }
+                        // Completion is terminal. Dropping the upstream stream here
+                        // releases it without recording a second, failed terminal state.
                         return;
                     }
-                    if records_visible_output && let Some(clock) = attempt_clock.as_ref() {
-                        clock.mark_first_visible_output();
-                        first_visible_output_recorded = true;
+                    Ok(event) => {
+                        if tx_event.send(Ok(event)).await.is_err() {
+                            inference_trace_attempt
+                                .record_cancelled(
+                                    STREAM_DROPPED_REASON,
+                                    upstream_request_id,
+                                    &items_added,
+                                )
+                                .await;
+                            return;
+                        }
+                        if records_visible_output && let Some(clock) = attempt_clock.as_ref() {
+                            clock.mark_first_visible_output();
+                            first_visible_output_recorded = true;
+                        }
                     }
-                }
-                Err(err) => {
-                    if let Some(attempt) = attempt.as_ref() {
-                        attempt.clock().mark_completed();
-                    }
-                    let response_debug_context =
-                        extract_response_debug_context_from_api_error(&err);
-                    let upstream_request_id =
-                        upstream_request_id.or(response_debug_context.request_id.as_deref());
-                    if let Some(upstream_request_id) = upstream_request_id {
-                        feedback_tags!(last_model_request_id = upstream_request_id);
-                    }
-                    let mapped = provider.map_api_error(err);
-                    inference_trace_attempt
-                        .record_failed(&mapped, upstream_request_id, &items_added)
-                        .await;
-                    session_telemetry.see_event_completed_failed(&mapped);
-                    let terminal_usage = mapped.terminal_usage().and_then(Clone::clone);
-                    let response_id = mapped.terminal_response_id().map(str::to_owned);
-                    finish_failed_model_attempt_with_usage(&mut attempt, items_added, response_id, terminal_usage);
-                    if tx_event.send(Err(mapped)).await.is_err() {
+                    Err(err) => {
+                        if let Some(attempt) = attempt.as_ref() {
+                            attempt.clock().mark_completed();
+                        }
+                        let response_debug_context =
+                            extract_response_debug_context_from_api_error(&err);
+                        let upstream_request_id =
+                            upstream_request_id.or(response_debug_context.request_id.as_deref());
+                        if let Some(upstream_request_id) = upstream_request_id {
+                            feedback_tags!(last_model_request_id = upstream_request_id);
+                        }
+                        let mapped = provider.map_api_error(err);
+                        if let Some(attempt) = attempt.as_mut() {
+                            attempt.finish_essential(
+                                ModelAttemptOutcome::Failed,
+                                mapped.terminal_response_id(),
+                                mapped.terminal_usage().and_then(Option::as_ref),
+                                &items_added,
+                                false,
+                            );
+                        }
+                        inference_trace_attempt
+                            .record_failed_with_usage(
+                                &mapped,
+                                upstream_request_id,
+                                &items_added,
+                                mapped.terminal_response_id(),
+                                mapped.terminal_usage().and_then(Option::as_ref),
+                            )
+                            .await;
+                        session_telemetry.see_event_completed_failed(&mapped);
+                        let terminal_usage = mapped.terminal_usage().and_then(Clone::clone);
+                        let response_id = mapped.terminal_response_id().map(str::to_owned);
+                        finish_failed_model_attempt_with_usage(
+                            &mut attempt,
+                            items_added,
+                            response_id,
+                            terminal_usage,
+                        );
+                        if tx_event.send(Err(mapped)).await.is_err() {
+                            return;
+                        }
+                        drop(tx_event);
                         return;
                     }
-                    drop(tx_event);
-                    return;
                 }
             }
+            if let Some(attempt) = attempt.as_ref() {
+                attempt.clock().mark_completed();
+            }
+            let mapped = provider.map_api_error(ApiError::Stream(
+                "stream closed before response.completed".to_string(),
+            ));
+            session_telemetry.see_event_completed_failed(&mapped);
+            let _ = tx_event.send(Err(mapped)).await;
+            inference_trace_attempt
+                .record_failed(
+                    "stream closed before response.completed",
+                    upstream_request_id,
+                    &items_added,
+                )
+                .await;
+            drop(tx_event);
+            finish_failed_model_attempt(&mut attempt, items_added);
         }
-        if let Some(attempt) = attempt.as_ref() {
-            attempt.clock().mark_completed();
-        }
-        let mapped = provider.map_api_error(ApiError::Stream(
-            "stream closed before response.completed".to_string(),
-        ));
-        session_telemetry.see_event_completed_failed(&mapped);
-        let _ = tx_event.send(Err(mapped)).await;
-        inference_trace_attempt
-            .record_failed(
-                "stream closed before response.completed",
-                upstream_request_id,
-                &items_added,
-            )
-            .await;
-        drop(tx_event);
-        finish_failed_model_attempt(&mut attempt, items_added);
-    });
+        .in_current_span(),
+    );
 
     (
         ResponseStream {
@@ -6422,7 +7054,25 @@ fn api_error_http_status(error: &ApiError) -> Option<u16> {
     }
 }
 
+struct ModelRequestTelemetryContext {
+    timing: Option<Arc<TurnTimingState>>,
+    startup: Option<Arc<crate::startup_timing::StartupTimingState>>,
+    identity: ResponseAttemptIdentity,
+    clock: ModelAttemptClock,
+    turn_id: Option<String>,
+    retry_index: u32,
+    dispatched: AtomicBool,
+    // Lower transport attempts are sequential and monotonically numbered.
+    // This watermark outlives capped diagnostic IDs, so duplicate callbacks
+    // cannot re-register an evicted identity and inflate the additive total.
+    highest_started_transport_attempt: StdMutex<Option<u64>>,
+    readiness: StdMutex<Option<crate::turn_timing::TurnTimingGuard>>,
+}
+
 struct ApiTelemetry {
+    websocket_response: Option<(ResponseAttemptIdentity, ModelAttemptClock)>,
+    first_response_event: AtomicBool,
+    model_request: Option<ModelRequestTelemetryContext>,
     session_telemetry: SessionTelemetry,
     auth_context: AuthRequestTelemetryContext,
     request_route_telemetry: RequestRouteTelemetry,
@@ -6439,17 +7089,90 @@ impl ApiTelemetry {
         auth_env_telemetry: AuthEnvTelemetry,
     ) -> Self {
         Self {
+            websocket_response: None,
+            first_response_event: AtomicBool::new(false),
             session_telemetry,
             auth_context,
             request_route_telemetry,
             auth_env_telemetry,
             logical_request_id: new_sampling_request_id(),
+            model_request: None,
             last_attempt: AtomicU64::new(0),
         }
     }
 }
 
 impl RequestTelemetry for ApiTelemetry {
+    fn on_request_dispatched(&self) {
+        self.on_request_dispatched_attempt(0);
+    }
+
+    fn on_request_dispatched_attempt(&self, transport_attempt: u64) {
+        if let Some(context) = &self.model_request {
+            {
+                let mut highest = context
+                    .highest_started_transport_attempt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if highest.is_some_and(|previous| transport_attempt <= previous) {
+                    return;
+                }
+                *highest = Some(transport_attempt);
+            }
+            drop(
+                context
+                    .readiness
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+            context.dispatched.store(true, Ordering::Release);
+            context.clock.mark_dispatch_ready();
+            // Safe pre-dispatch transport retries share the enclosing API
+            // request but are distinct physical entries. Keep their identity
+            // stable for duplicate notifications without deriving it from payloads.
+            let physical_attempt_id = if transport_attempt == 0 {
+                context.identity.physical_attempt_id.clone()
+            } else {
+                format!(
+                    "{}:http-{transport_attempt}",
+                    context.identity.physical_attempt_id
+                )
+            };
+            if let Some(timing) = &context.timing {
+                timing.record_model_attempt_identity(
+                    &context.identity.sampling_request_id,
+                    &physical_attempt_id,
+                );
+                timing.mark_model_attempt_dispatched(
+                    &context.identity.sampling_request_id,
+                    &physical_attempt_id,
+                    context.retry_index > 0 || transport_attempt > 0,
+                );
+            }
+            tracing::info!(
+                event.name = "codex.model_transport_identity",
+                transport = "http",
+                sampling_request_id = %context.identity.sampling_request_id,
+                physical_attempt_id,
+                transport_attempt,
+                "model transport identity at HTTP entry"
+            );
+            if let Some(startup) = &context.startup {
+                startup.freeze_at_first_transport_attempt();
+            }
+        }
+    }
+
+    fn on_request_cancelled(&self, attempt: u64, duration: Duration) {
+        self.on_request(
+            attempt,
+            None,
+            Some(&TransportError::Network("request cancelled".into())),
+            duration,
+        );
+    }
+
     fn on_transport_phase(&self, attempt: u64, observation: TransportPhaseObservation) {
         self.last_attempt.store(attempt, Ordering::Relaxed);
         self.session_telemetry.record_transport_phase(
@@ -6470,6 +7193,21 @@ impl RequestTelemetry for ApiTelemetry {
         error: Option<&TransportError>,
         duration: Duration,
     ) {
+        if let Some(context) = &self.model_request {
+            context.dispatched.store(false, Ordering::Release);
+            if let Some(timing) = &context.timing {
+                timing.mark_model_request_attempt_ended();
+            }
+            if error.is_some() {
+                *context
+                    .readiness
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = context
+                    .timing
+                    .as_ref()
+                    .map(|timing| timing.begin_local_phase(TurnLocalPhase::TransportReadiness));
+            }
+        }
         self.last_attempt.store(attempt, Ordering::Relaxed);
         let error_message = error.map(telemetry_transport_error_message);
         let status = status.map(|s| s.as_u16());
@@ -6561,7 +7299,42 @@ impl SseTelemetry for ApiTelemetry {
 }
 
 impl WebsocketTelemetry for ApiTelemetry {
+    fn on_response_event(&self) {
+        if let Some((_, clock)) = &self.websocket_response
+            && !self.first_response_event.swap(true, Ordering::Relaxed)
+        {
+            clock.mark_first_provider_event();
+        }
+    }
+    fn logical_transport_id(&self) -> Option<&str> {
+        Some(&self.logical_request_id)
+    }
+
     fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>, connection_reused: bool) {
+        self.session_telemetry.record_model_transport_identity(
+            &self.logical_request_id,
+            self.websocket_response
+                .as_ref()
+                .map(|(identity, _)| identity.sampling_request_id.as_str()),
+            self.websocket_response
+                .as_ref()
+                .map(|(identity, _)| identity.physical_attempt_id.as_str()),
+            if self.websocket_response.is_some() {
+                "model_request"
+            } else {
+                "connection_or_warmup"
+            },
+            Some(duration),
+        );
+        tracing::info!(
+            event.name = "codex.websocket_transport",
+            logical_request_id = %self.logical_request_id,
+            sampling_request_id = self.websocket_response.as_ref().map(|(identity, _)| identity.sampling_request_id.as_str()),
+            physical_attempt_id = self.websocket_response.as_ref().map(|(identity, _)| identity.physical_attempt_id.as_str()),
+            connection_reused,
+            failed = error.is_some(),
+            "websocket request observation"
+        );
         let error_message = error.map(telemetry_api_error_message);
         let status = error.and_then(api_error_http_status);
         let debug = error
@@ -6606,11 +7379,36 @@ impl WebsocketTelemetry for ApiTelemetry {
         result: &std::result::Result<Option<std::result::Result<Message, Error>>, ApiError>,
         duration: Duration,
     ) {
+        if let Some((identity, _)) = &self.websocket_response {
+            self.session_telemetry.record_model_transport_identity(
+                &self.logical_request_id,
+                Some(&identity.sampling_request_id),
+                Some(&identity.physical_attempt_id),
+                "model_response_poll",
+                Some(duration),
+            );
+            tracing::info!(
+                event.name = "codex.websocket_response_poll",
+                connection_id = %self.logical_request_id,
+                sampling_request_id = %identity.sampling_request_id,
+                physical_attempt_id = %identity.physical_attempt_id,
+                duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+                "websocket response observation"
+            );
+        }
         self.session_telemetry
-            .record_websocket_event(result, duration);
+            .record_websocket_event_with_transport(
+                result,
+                duration,
+                Some(&self.logical_request_id),
+            );
     }
 }
 
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_transport_accounting_tests.rs"]
+mod transport_accounting_tests;

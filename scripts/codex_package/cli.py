@@ -1,6 +1,7 @@
 """Command-line interface for building Codex package directories."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
 from scripts.common.process_owner import OwnedThreadPoolExecutor as ThreadPoolExecutor
+from scripts.common.atomic_json import write_json_atomic
 from contextlib import contextmanager, ExitStack
 from pathlib import Path
 from time import perf_counter
@@ -220,14 +222,19 @@ def main() -> int:
         if package_dir_arg is not None
         else Path(tempfile.mkdtemp(prefix="codex-package-")).resolve()
     )
-    validate_cli_request(args, spec, package_dir)
-
     output_paths = [package_dir, *(path.resolve() for path in args.archive_output)]
     if release_dir is not None:
         output_paths += [
             release_dir.resolve() / f"codex-package_{spec.target}_PROVENANCE.json",
             release_dir.resolve() / "codex-package_SHA256SUMS",
         ]
+    # An interrupted no-clobber activation may itself have created an output
+    # rejected by preflight. Recover that generation under its complete lock
+    # set before validating a new request; ordinary preflight stays read-only.
+    if any(_publication_reference(path).exists() for path in output_paths):
+        with publication_transaction(output_paths):
+            pass
+    validate_cli_request(args, spec, package_dir)
     with publication_transaction(output_paths):
         timings = getattr(args, "timings", False)
         reuse_package_dir = getattr(args, "reuse_package_dir", False)
@@ -310,7 +317,6 @@ def pe_machine_for_target(spec):
     return 0xAA64 if spec.target.startswith("aarch64") else 0x8664
 
 
-
 _publication = ContextVar("package_publication", default=None)
 
 
@@ -326,6 +332,51 @@ class Publication:
         self.paths = set(paths)
         self.backups = {}
         self.source_identities = {}
+        self.transaction_id = uuid.uuid4().hex
+        self.journal = None
+        self.state = None
+
+    def record(self, source, destination, backup):
+        if self.state is None:
+            paths = sorted(self.paths, key=str)
+            self.journal = paths[0].with_name(
+                f".{paths[0].name}.publish-{self.transaction_id}.json"
+            )
+            self.state = {
+                "version": 1,
+                "phase": "preparing",
+                "transaction": self.transaction_id,
+                "paths": [str(path) for path in paths],
+                "entries": [],
+            }
+            write_json_atomic(self.journal, self.state)
+            for path in paths:
+                write_json_atomic(
+                    _publication_reference(path),
+                    {
+                        "version": 1,
+                        "journal": str(self.journal),
+                        "transaction": self.transaction_id,
+                        "paths": self.state["paths"],
+                    },
+                )
+        self.state["entries"].append(
+            {
+                "destination": str(destination),
+                "source": str(source.absolute()),
+                "backup": str(backup) if backup is not None else None,
+                "old": _publication_identity(destination),
+                "new": _publication_identity(source),
+            }
+        )
+        write_json_atomic(self.journal, self.state)
+
+    def clear_journal(self):
+        if self.journal is not None:
+            # Keep the coordinator until every reference has been removed.
+            for path in self.paths:
+                _publication_reference(path).unlink(missing_ok=True)
+            self.journal.unlink(missing_ok=True)
 
     def activate(self, source, destination, *, force):
         destination = destination.resolve()
@@ -338,11 +389,12 @@ class Publication:
             ):
                 raise RuntimeError(f"output already exists: {destination}")
             backup = destination.with_name(
-                f".{destination.name}.backup-{uuid.uuid4().hex}"
+                f".{destination.name}.backup-{self.transaction_id}"
             )
         # Register before mutation, including an interrupt between rename and activation.
         self.source_identities[destination] = source.stat()
         self.backups[destination] = backup
+        self.record(source, destination, backup)
         if backup is not None:
             destination.replace(backup)
         if source.is_dir():
@@ -352,27 +404,209 @@ class Publication:
 
     def rollback(self):
         for destination, backup in reversed(list(self.backups.items())):
+            entry = next(
+                (
+                    item
+                    for item in (self.state or {}).get("entries", [])
+                    if item["destination"] == str(destination)
+                ),
+                None,
+            )
             if backup is None:
                 # A failed no-clobber activation may have lost to another writer.
                 # Only the staged inode became ours, even across an interruption.
                 if destination.exists() and os.path.samestat(
                     destination.stat(), self.source_identities[destination]
                 ):
+                    if (
+                        entry is not None
+                        and _publication_identity(destination) != entry["new"]
+                    ):
+                        raise RuntimeError(
+                            f"publication output changed externally: {destination}"
+                        )
                     _remove_output(destination)
             elif backup.exists():
-                _remove_output(destination)
+                if _publication_identity(backup) != entry["old"]:
+                    raise RuntimeError(
+                        f"publication backup changed externally: {backup}"
+                    )
+                if destination.exists():
+                    if not os.path.samestat(
+                        destination.stat(), self.source_identities[destination]
+                    ):
+                        raise RuntimeError(
+                            f"publication output replaced externally: {destination}"
+                        )
+                    if _publication_identity(destination) != entry["new"]:
+                        raise RuntimeError(
+                            f"publication output changed externally: {destination}"
+                        )
+                    _remove_output(destination)
                 backup.replace(destination)
             # A missing backup means the original rename never completed.
+        self.clear_journal()
 
     def discard_backups(self):
+        if self.state is not None:
+            self.state["phase"] = "committed"
+            write_json_atomic(self.journal, self.state)
         for backup in self.backups.values():
             if backup is not None and backup.exists():
+                entry = next(
+                    item
+                    for item in self.state["entries"]
+                    if item["backup"] == str(backup)
+                )
+                if _publication_identity(backup) != entry["old"]:
+                    raise RuntimeError(
+                        f"committed publication backup changed externally: {backup}"
+                    )
                 try:
                     _remove_output(backup)
                 except OSError as error:
                     print(
                         f"warning: committed output backup retained at {backup}: {error}"
                     )
+                    return  # Keep recovery metadata until cleanup succeeds.
+        self.clear_journal()
+
+
+def _publication_reference(path):
+    return path.with_name("." + path.name + ".publish.json")
+
+
+def _publication_identity(path):
+    if not path.exists() and not path.is_symlink():
+        return None
+    metadata = path.lstat()
+    if path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+        raise RuntimeError(f"publication refuses indirect output: {path}")
+    digest = hashlib.sha256()
+    members = sorted(path.rglob("*")) if path.is_dir() else [path]
+    for member in members:
+        info = member.lstat()
+        if member.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
+            raise RuntimeError(f"publication refuses indirect member: {member}")
+        digest.update(
+            str(member.relative_to(path) if path.is_dir() else "file").encode()
+        )
+        digest.update(b"\0directory\0" if member.is_dir() else b"\0file\0")
+        if member.is_file():
+            digest.update(bytes.fromhex(sha256_file(member)))
+    return [metadata.st_dev, metadata.st_ino, digest.hexdigest()]
+
+
+def recover_publication(paths):
+    """Recover only the declared, fully locked output set; refuse external edits."""
+    journals = set()
+    for path in paths:
+        reference = _publication_reference(path)
+        if not reference.exists():
+            continue
+        if reference.is_symlink():
+            raise RuntimeError("indirect publication recovery reference")
+        ref = json.loads(reference.read_text(encoding="utf-8"))
+        if (
+            not isinstance(ref, dict)
+            or ref.get("version") != 1
+            or not isinstance(ref.get("transaction"), str)
+            or re.fullmatch("[0-9a-f]{32}", ref["transaction"]) is None
+            or ref.get("paths") != [str(item) for item in paths]
+        ):
+            raise RuntimeError(
+                "publication recovery requires the original complete output set"
+            )
+        journal = paths[0].with_name(
+            f".{paths[0].name}.publish-{ref['transaction']}.json"
+        )
+        if ref.get("journal") != str(journal) or journal.is_symlink():
+            raise RuntimeError("invalid publication recovery coordinator")
+        journals.add(journal)
+    for journal in journals:
+        state = json.loads(journal.read_text(encoding="utf-8"))
+        if (
+            not isinstance(state, dict)
+            or state.get("version") != 1
+            or state.get("phase") not in {"preparing", "committed"}
+            or state.get("paths") != [str(path) for path in paths]
+            or not isinstance(state.get("entries"), list)
+            or journal
+            != paths[0].with_name(
+                f".{paths[0].name}.publish-{state.get('transaction')}.json"
+            )
+        ):
+            raise RuntimeError("invalid publication recovery journal")
+        seen = set()
+        # Validate every identity and path before performing any recovery mutation.
+        entries = []
+        for entry in state["entries"]:
+            if not isinstance(entry, dict) or not isinstance(
+                entry.get("destination"), str
+            ):
+                raise RuntimeError("invalid publication recovery entry")
+            destination = Path(entry["destination"])
+            backup = destination.with_name(
+                f".{destination.name}.backup-{state['transaction']}"
+            )
+            if (
+                destination not in paths
+                or destination in seen
+                or entry.get("backup") not in (None, str(backup))
+            ):
+                raise RuntimeError("invalid publication recovery paths")
+            seen.add(destination)
+            for key in ("old", "new"):
+                identity = entry.get(key)
+                if identity is None and key == "old":
+                    continue
+                if (
+                    not isinstance(identity, list)
+                    or len(identity) != 3
+                    or any(type(value) is not int for value in identity[:2])
+                    or not isinstance(identity[2], str)
+                    or re.fullmatch("[0-9a-f]{64}", identity[2]) is None
+                ):
+                    raise RuntimeError("invalid publication recovery identity")
+            current = _publication_identity(destination)
+            saved = (
+                _publication_identity(backup) if entry["backup"] is not None else None
+            )
+            if current not in (
+                None,
+                entry.get("old"),
+                entry.get("new"),
+            ) or saved not in (None, entry.get("old")):
+                raise RuntimeError(
+                    f"publication recovery found external edits: {destination}"
+                )
+            if (state["phase"] == "committed" and current != entry.get("new")) or (
+                state["phase"] == "preparing"
+                and entry.get("old") is not None
+                and saved is None
+                and current != entry["old"]
+            ):
+                raise RuntimeError(f"publication generation unavailable: {destination}")
+            entries.append((entry, destination, backup, current, saved))
+        for entry, destination, backup, current, saved in reversed(entries):
+            if _publication_identity(destination) != current or (
+                entry["backup"] is not None and _publication_identity(backup) != saved
+            ):
+                raise RuntimeError(
+                    f"publication changed during recovery: {destination}"
+                )
+            if state["phase"] == "committed":
+                if saved is not None:
+                    _remove_output(backup)
+            elif saved is not None:
+                if current is not None:
+                    _remove_output(destination)
+                backup.replace(destination)
+            elif entry["old"] is None and current is not None:
+                _remove_output(destination)
+        for path in paths:
+            _publication_reference(path).unlink(missing_ok=True)
+        journal.unlink()
 
 
 @contextmanager
@@ -389,6 +623,7 @@ def publication_transaction(paths):
             stack.enter_context(
                 exclusive_file_lock(path.with_name("." + path.name + ".publish.lock"))
             )
+        recover_publication(paths)
         current = Publication(paths)
         token = _publication.set(current)
         try:

@@ -34,6 +34,52 @@ use tokio::sync::oneshot;
 
 static NEXT_ELICITATION_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
+type StartupReply = futures::future::BoxFuture<'static, ElicitationResponse>;
+
+/// Request-scoped initialization route. It does not publish an ordinary thread
+/// or admit turns, and independent request futures cannot inherit each other's handler.
+#[derive(Clone)]
+pub struct StartupElicitationHandler {
+    reply: Arc<
+        dyn Fn(codex_protocol::ThreadId, ElicitationRequestEvent) -> StartupReply + Send + Sync,
+    >,
+}
+
+tokio::task_local! {
+    static STARTUP_ELICITATION_HANDLER: StartupElicitationHandler;
+}
+
+impl StartupElicitationHandler {
+    pub fn new<F>(
+        reply: impl Fn(codex_protocol::ThreadId, ElicitationRequestEvent) -> F + Send + Sync + 'static,
+    ) -> Self
+    where
+        F: std::future::Future<Output = ElicitationResponse> + Send + 'static,
+    {
+        Self {
+            reply: Arc::new(move |thread_id, request| Box::pin(reply(thread_id, request))),
+        }
+    }
+
+    pub async fn scope<F: std::future::Future>(&self, future: F) -> F::Output {
+        STARTUP_ELICITATION_HANDLER
+            .scope(self.clone(), future)
+            .await
+    }
+}
+
+pub struct StartupElicitationRoute(ElicitationRequestRouter);
+
+impl Drop for StartupElicitationRoute {
+    fn drop(&mut self) {
+        self.0
+            .startup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 /// Holds an owner-provided registration while an MCP elicitation is waiting for a response.
 #[derive(Clone)]
 pub struct ElicitationLifecycle {
@@ -69,6 +115,7 @@ struct ActiveElicitation {
 #[derive(Clone, Default)]
 pub struct ElicitationRequestRouter {
     requests: Arc<StdMutex<ResponderMap>>,
+    startup: Arc<StdMutex<Option<(codex_protocol::ThreadId, StartupElicitationHandler)>>>,
 }
 
 struct PendingElicitationRequest {
@@ -87,6 +134,17 @@ impl Drop for PendingElicitationRequest {
 }
 
 impl ElicitationRequestRouter {
+    /// Retired on successful construction, error, or future cancellation.
+    pub fn startup_route(&self, thread_id: codex_protocol::ThreadId) -> StartupElicitationRoute {
+        let handler = STARTUP_ELICITATION_HANDLER.try_with(Clone::clone).ok();
+        *self
+            .startup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            handler.map(|handler| (thread_id, handler));
+        StartupElicitationRoute(self.clone())
+    }
+
     async fn resolve(
         &self,
         server_name: String,
@@ -265,8 +323,22 @@ impl ElicitationRequestManager {
                         requested_schema,
                     },
                 };
-                let (tx, rx) = oneshot::channel();
                 let _active_elicitation = lifecycle.as_ref().map(ElicitationLifecycle::start);
+                let event = ElicitationRequestEvent {
+                    turn_id: None,
+                    server_name: server_name.clone(),
+                    id: ProtocolRequestId::String(public_request_id),
+                    request,
+                };
+                let startup = router
+                    .startup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some((thread_id, handler)) = startup {
+                    return Ok((handler.reply)(thread_id, event).await);
+                }
+                let (tx, rx) = oneshot::channel();
                 let pending_request = PendingElicitationRequest {
                     router: router.clone(),
                     key: (server_name.clone(), routed_request_id),
@@ -278,18 +350,15 @@ impl ElicitationRequestManager {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     lock.insert(pending_request.key.clone(), tx);
                 }
-                tx_event
-                    .send(Event {
+                crate::event_queue::send_event(
+                    &tx_event,
+                    Event {
                         id: "mcp_elicitation_request".to_string(),
-                        msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
-                            turn_id: None,
-                            server_name,
-                            id: ProtocolRequestId::String(public_request_id),
-                            request,
-                        }),
-                    })
-                    .await
-                    .context("failed to deliver elicitation request")?;
+                        msg: EventMsg::ElicitationRequest(event),
+                    },
+                )
+                .await
+                .context("failed to deliver elicitation request")?;
                 rx.await
                     .context("elicitation request channel closed unexpectedly")
             }

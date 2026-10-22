@@ -7,11 +7,14 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import BinaryIO
 
 from .layout import MANAGED_PACKAGE_PATHS
+from scripts.common.process_owner import CleanupFailed, check_operation, owned_process
 
 ZSTD_PATH_ENV = "CODEX_ZSTD"
 ZSTD_SHA256_ENV = "CODEX_ZSTD_SHA256"
@@ -65,6 +68,7 @@ def write_archive(
             )
         else:
             raise AssertionError(f"unexpected archive format: {archive_format}")
+        check_operation()
         activate_archive(temp_path, archive_path, force=force)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -185,17 +189,56 @@ def write_tar_zst_archive(
     else:
         zstd_level = "-19"
     cmd = [*zstd_command, "-T0", zstd_level, "-f", "-", "-o", str(archive_path)]
-    process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    finished = threading.Event()
+    errors = []
+    writer = None
+    deadline = time.monotonic() + 3600
     try:
-        if process.stdin is None:
-            raise RuntimeError("zstd stdin pipe was not created")
-        with process.stdin:
-            write_tar_stream(package_dir, process.stdin, entries=entries)
-        return_code = process.wait()
-    except BaseException:
-        process.kill()
-        process.wait()
-        raise
+        check_operation()
+        with owned_process(cmd, stdin=subprocess.PIPE) as process:
+
+            def produce():
+                try:
+                    with process.stdin:
+                        write_tar_stream(package_dir, process.stdin, entries=entries)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    finished.set()
+
+            writer = threading.Thread(target=produce, daemon=True)
+            writer.start()
+            # The owner, not the pipe-writing thread, watches the deadline.
+            # Killing the owned tree closes its read handles and unblocks writes.
+            while not finished.is_set() or process.poll() is None:
+                check_operation()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("zstd archive operation exceeded 3600 seconds")
+                if errors:
+                    raise errors[0]
+                if process.poll() is not None:
+                    # Early compressor exit must not leave a writer blocked on
+                    # a descendant's inherited stdin until the full budget.
+                    break
+                time.sleep(0.02)
+            if errors:
+                raise errors[0]
+            return_code = process.wait()
+            check_operation()
+    finally:
+        if writer is not None:
+            writer.join(timeout=5)
+            if writer.is_alive():
+                raise CleanupFailed(
+                    "archive producer did not stop after compressor tree cleanup"
+                )
+    check_operation()
+    if time.monotonic() >= deadline:
+        raise TimeoutError(
+            "zstd archive operation exceeded 3600 seconds during cleanup"
+        )
+    if errors:
+        raise errors[0]
     if return_code != 0:
         raise subprocess.CalledProcessError(return_code, cmd)
 

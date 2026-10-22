@@ -110,6 +110,16 @@ pub(super) async fn run_remote_compact_v2_attempt(
             });
     }
 
+    // Trimming is best effort, not a fit receipt. Required text may still be
+    // oversized; do not spend a compaction request that cannot fit either.
+    let largest_input = largest_compaction_request_input(&prompt);
+    if turn_context
+        .model_context_window()
+        .is_some_and(|limit| prompt.budget_tokens_for_input(&largest_input) >= limit)
+    {
+        return Err(codex_protocol::error::CodexErr::ContextWindowExceeded);
+    }
+
     let trace_input_history = compaction_trace
         .is_enabled()
         .then(|| history.raw_items().to_vec());
@@ -194,6 +204,12 @@ fn largest_compaction_request_input(prompt: &Prompt) -> Arc<[ResponseItem]> {
 }
 
 fn append_compaction_trigger(prompt: &mut Prompt) {
+    prompt.prompt_provenance = prompt.prompt_provenance.with_appended_items(
+        &[ResponseItem::CompactionTrigger {}],
+        &prompt.stable_context_manifest,
+    );
+    // The suffix changes History even though the projected prefix is unchanged.
+    prompt.digests.history = None;
     // Preserve sharing established by prompt projection. Pointer identity is
     // sufficient; do not compare large distinct transcripts for equality.
     type SharedInput = Arc<[ResponseItem]>;
@@ -226,38 +242,69 @@ mod tests {
     #[tokio::test]
     async fn remote_compaction_sends_the_selected_turn_base() -> anyhow::Result<()> {
         use crate::test_harness::responses;
-        use codex_analytics::{CompactionImplementation, CompactionPhase, CompactionReason, CompactionTrigger};
+        use codex_analytics::CompactionImplementation;
+        use codex_analytics::CompactionPhase;
+        use codex_analytics::CompactionReason;
+        use codex_analytics::CompactionTrigger;
         crate::test_harness::require_network!();
         let server = responses::start_mock_server().await;
         let home = tempfile::tempdir()?;
         let (session, mut turn, _events) =
             crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-                codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(),
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
                 |config| {
                     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
                     config.model_provider.supports_websockets = false;
                 },
-            ).await;
+            )
+            .await;
         let selected_base = "SELECTED_COMPACTION_TURN_BASE";
-        Arc::get_mut(&mut turn).unwrap().base_instructions = Arc::new(
-            codex_protocol::models::BaseInstructions { text: selected_base.into() },
-        );
+        Arc::get_mut(&mut turn).unwrap().base_instructions =
+            Arc::new(codex_protocol::models::BaseInstructions {
+                text: selected_base.into(),
+            });
         assert_ne!(session.get_base_instructions().await.text, selected_base);
         let step = session.capture_step_context(Arc::clone(&turn)).await?;
-        let log = responses::mount_sse_once(&server, responses::sse(vec![
-            serde_json::json!({"type":"response.output_item.done",
+        let log = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                serde_json::json!({"type":"response.output_item.done",
                 "item":{"type":"compaction","encrypted_content":"opaque"}}),
-            responses::ev_completed("compacted"),
-        ])).await;
+                responses::ev_completed("compacted"),
+            ]),
+        )
+        .await;
+        turn.turn_timing_state.mark_turn_started();
         run_remote_compact_v2_attempt(
-            &session, &step, None, &CompactionTraceContext::disabled(),
+            &session,
+            &step,
+            None,
+            &CompactionTraceContext::disabled(),
             CompactionTurnMetadata::new(
-                CompactionTrigger::Manual, CompactionReason::UserRequested,
-                CompactionImplementation::ResponsesCompactionV2, CompactionPhase::StandaloneTurn,
+                CompactionTrigger::Manual,
+                CompactionReason::UserRequested,
+                CompactionImplementation::ResponsesCompactionV2,
+                CompactionPhase::StandaloneTurn,
             ),
-            &mut CompactionAnalyticsDetails::default(), &CancellationToken::new(),
-        ).await?;
-        assert_eq!(log.single_request().body_json()["instructions"], selected_base);
+            &mut CompactionAnalyticsDetails::default(),
+            &CancellationToken::new(),
+        )
+        .await?;
+        assert_eq!(
+            log.single_request().body_json()["instructions"],
+            selected_base
+        );
+        let timing = turn.turn_timing_state.complete_snapshot().protocol_timing();
+        let request = timing
+            .model_requests
+            .last()
+            .expect("standalone compaction request");
+        assert!(request.dispatch_ms.is_some());
+        assert_eq!(request.physical_attempt_ids.len(), 1);
+        assert_eq!(timing.counters.model_request_count, 1);
+        assert_eq!(timing.milestones.first_visible_output_ms, None);
         Ok(())
     }
 
@@ -338,6 +385,72 @@ mod tests {
                 &largest_compaction_request_input(&prompt),
                 &large
             ));
+        }
+    }
+
+    #[test]
+    fn compaction_trigger_preserves_existing_provenance() {
+        use crate::context::PromptContextBreakdown;
+        use crate::context::PromptContextCategory;
+        use crate::context::PromptProvenanceSidecar;
+        use codex_protocol::models::ContentItem;
+
+        let message = |role: &str, text: &str| ResponseItem::Message {
+            id: None,
+            role: role.into(),
+            content: vec![ContentItem::InputText { text: text.into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        // Identical prose has different occurrence-level origins.
+        let items: Arc<[ResponseItem]> = vec![
+            message("developer", "same text"),
+            message("user", "same text"),
+        ]
+        .into();
+        let mut prompt = Prompt {
+            input: Arc::clone(&items),
+            stable_context_fallback_input: Arc::clone(&items),
+            tool_history_fallback_input: Arc::clone(&items),
+            stable_context_tool_history_fallback_input: Arc::clone(&items),
+            ..Default::default()
+        };
+        prompt.prompt_provenance =
+            PromptProvenanceSidecar::from_assembled_items(&items, &prompt.stable_context_manifest)
+                .with_exact_fragment(&items, "same text", PromptContextCategory::Repository);
+        prompt.digests.history = Some([1; 32]);
+        let repo_bytes = serde_json::to_vec(&items[0]).unwrap().len() as u64;
+        let task_bytes = serde_json::to_vec(&items[1]).unwrap().len() as u64;
+        append_compaction_trigger(&mut prompt);
+        assert_eq!(prompt.digests.history, None);
+        for input in [
+            &prompt.input,
+            &prompt.stable_context_fallback_input,
+            &prompt.tool_history_fallback_input,
+            &prompt.stable_context_tool_history_fallback_input,
+        ] {
+            let encoded = serde_json::to_string(input.as_ref()).unwrap();
+            let raw: Vec<&serde_json::value::RawValue> = serde_json::from_str(&encoded).unwrap();
+            let measured = PromptContextBreakdown::from_serialized_response_items(
+                input,
+                &raw,
+                &prompt.prompt_provenance,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                measured.bytes(PromptContextCategory::Repository),
+                repo_bytes
+            );
+            assert_eq!(measured.bytes(PromptContextCategory::TaskInput), task_bytes);
+            assert_eq!(
+                measured.bytes(PromptContextCategory::History),
+                serde_json::to_vec(&ResponseItem::CompactionTrigger {})
+                    .unwrap()
+                    .len() as u64
+            );
+            assert_eq!(measured.total_bytes(), encoded.len() as u64);
+            assert_eq!(&input[..2], items.as_ref());
         }
     }
 

@@ -2,6 +2,9 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use super::plugin_test_support::write_installed_plugin;
+use super::plugin_test_support::write_plugin_source;
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 use anyhow::Result;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
@@ -51,9 +54,6 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
-use super::plugin_test_support::write_installed_plugin;
-use super::plugin_test_support::write_plugin_source;
-use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 

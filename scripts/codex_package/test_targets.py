@@ -85,12 +85,18 @@ class TargetMetadataTest(unittest.TestCase):
             },
             {
                 "x86_64-pc-windows-msvc": (
-                    "codex-win32-x64", "@openai/codex-win32-x64",
-                    "win32-x64", "win32-x64", "codex.exe",
+                    "codex-win32-x64",
+                    "@openai/codex-win32-x64",
+                    "win32-x64",
+                    "win32-x64",
+                    "codex.exe",
                 ),
                 "aarch64-pc-windows-msvc": (
-                    "codex-win32-arm64", "@openai/codex-win32-arm64",
-                    "win32-arm64", "win32-arm64", "codex.exe",
+                    "codex-win32-arm64",
+                    "@openai/codex-win32-arm64",
+                    "win32-arm64",
+                    "win32-arm64",
+                    "codex.exe",
                 ),
             },
         )

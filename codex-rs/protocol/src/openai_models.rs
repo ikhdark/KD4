@@ -397,8 +397,6 @@ pub struct ModelInfo {
     pub truncation_policy: TruncationPolicyConfig,
     pub supports_parallel_tool_calls: bool,
     #[serde(default)]
-    pub supports_experimental_context: bool,
-    #[serde(default)]
     pub supports_image_detail_original: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
@@ -445,6 +443,32 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
+    /// Validate model-owned admission limits before activating a descriptor.
+    /// Tool-output truncation has a different, intentionally zero-clamping policy.
+    pub fn validate_capabilities(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("context_window", self.context_window),
+            ("max_context_window", self.max_context_window),
+            ("auto_compact_token_limit", self.auto_compact_token_limit),
+        ] {
+            if let Some(value) = value
+                && value <= 0
+            {
+                return Err(format!(
+                    "model `{}`: {field} must be positive, got {value}",
+                    self.slug
+                ));
+            }
+        }
+        if !(1..=100).contains(&self.effective_context_window_percent) {
+            return Err(format!(
+                "model `{}`: effective_context_window_percent must be in 1..=100, got {}",
+                self.slug, self.effective_context_window_percent,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn resolved_context_window(&self) -> Option<i64> {
         self.context_window.or(self.max_context_window)
     }
@@ -494,8 +518,6 @@ impl ModelInfo {
 /// instructions_* is populated and valid, it will override base_instructions.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ModelMessages {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_budget: Option<ModelTokenBudgetConfig>,
     pub instructions_template: Option<String>,
     pub instructions_variables: Option<ModelInstructionsVariables>,
     pub approvals: Option<ApprovalMessages>,
@@ -504,19 +526,6 @@ pub struct ModelMessages {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
 pub struct ApprovalMessages {
     pub on_request: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, TS, JsonSchema)]
-pub struct ModelTokenBudgetConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub use_history_notes_extension: bool,
-    pub reminder_threshold_tokens: i64,
-    pub reminder_message_template: String,
-    pub guidance_message: String,
-    pub auto_compact_fallback_prompt: String,
-    pub auto_compact_fallback_buffer_tokens: i64,
 }
 
 impl ModelMessages {
@@ -747,7 +756,6 @@ mod tests {
             truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
             supports_parallel_tool_calls: false,
             supports_image_detail_original: false,
-            supports_experimental_context: false,
             context_window: None,
             max_context_window: None,
             auto_compact_token_limit: None,
@@ -898,7 +906,6 @@ mod tests {
     #[test]
     fn get_model_instructions_uses_template_when_placeholder_present() {
         let model = test_model(Some(ModelMessages {
-            token_budget: None,
             instructions_template: Some("Hello {{ personality }}".to_string()),
             instructions_variables: Some(personality_variables()),
             approvals: None,
@@ -912,7 +919,6 @@ mod tests {
     #[test]
     fn get_model_instructions_always_strips_placeholder() {
         let model = test_model(Some(ModelMessages {
-            token_budget: None,
             instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -939,7 +945,6 @@ mod tests {
         );
 
         let model_no_personality = test_model(Some(ModelMessages {
-            token_budget: None,
             instructions_template: Some("Hello\n{{ personality }}".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -969,7 +974,6 @@ mod tests {
     #[test]
     fn get_model_instructions_falls_back_when_template_is_missing() {
         let model = test_model(Some(ModelMessages {
-            token_budget: None,
             instructions_template: None,
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -1264,7 +1268,6 @@ mod tests {
             }),
             input_modalities: vec![InputModality::Text],
             ..test_model(Some(ModelMessages {
-                token_budget: None,
                 instructions_template: Some("Hello {{ personality }}".to_string()),
                 instructions_variables: Some(personality_variables()),
                 approvals: None,

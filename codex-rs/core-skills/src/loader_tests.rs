@@ -343,6 +343,10 @@ async fn skill_roots_from_layer_stack_includes_disabled_project_layers() -> anyh
                 SkillScope::System,
                 user_folder.join("skills").join(".system")
             ),
+            (
+                SkillScope::Repo,
+                project_root.join(AGENTS_DIR_NAME).join(SKILLS_DIR_NAME)
+            ),
         ]
     );
 
@@ -395,6 +399,7 @@ async fn loads_skills_from_home_agents_dir_for_user_scope() -> anyhow::Result<()
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "agents-home-skill".to_string(),
             description: "from home agents".to_string(),
             short_description: None,
@@ -481,6 +486,7 @@ async fn load_user_skills_root(root: &Path) -> SkillLoadOutcome {
 
 fn expected_user_skill(path: &Path, name: &str, description: &str) -> SkillMetadata {
     SkillMetadata {
+        source: None,
         name: name.to_string(),
         description: description.to_string(),
         short_description: None,
@@ -551,6 +557,7 @@ dependencies:
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "dep-skill".to_string(),
             description: "from json".to_string(),
             short_description: None,
@@ -627,6 +634,7 @@ interface:
     assert_eq!(
         user_skills,
         vec![SkillMetadata {
+            source: None,
             name: "ui-skill".to_string(),
             description: "from json".to_string(),
             short_description: None,
@@ -653,20 +661,34 @@ async fn loads_skill_policy_from_yaml() {
     let skill_path = write_skill(&codex_home, "demo", "policy-skill", "from yaml");
     let cfg = make_config(&codex_home).await;
     for (metadata, implicit, products) in [
-        ("policy:\n  allow_implicit_invocation: false\n", Some(false), vec![]),
+        (
+            "policy:\n  allow_implicit_invocation: false\n",
+            Some(false),
+            vec![],
+        ),
         ("policy: {}\n", None, vec![]),
-        ("policy:\n  products:\n    - codex\n    - CHATGPT\n    - atlas\n", None,
-            vec![Product::Codex, Product::Chatgpt, Product::Atlas]),
+        (
+            "policy:\n  products:\n    - codex\n    - CHATGPT\n    - atlas\n",
+            None,
+            vec![Product::Codex, Product::Chatgpt, Product::Atlas],
+        ),
     ] {
         write_skill_metadata_at(skill_path.parent().unwrap(), metadata);
         let outcome = load_skills_for_test(&cfg).await;
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         let mut expected = expected_user_skill(&skill_path, "policy-skill", "from yaml");
-        expected.policy = Some(SkillPolicy { allow_implicit_invocation: implicit, products });
+        expected.policy = Some(SkillPolicy {
+            allow_implicit_invocation: implicit,
+            products,
+        });
         assert_eq!(outcome.skills, vec![expected.clone()]);
         assert_eq!(
             outcome.allowed_skills_for_implicit_invocation(),
-            if implicit == Some(false) { vec![] } else { vec![expected] }
+            if implicit == Some(false) {
+                vec![]
+            } else {
+                vec![expected]
+            }
         );
     }
 }
@@ -702,6 +724,7 @@ async fn accepts_icon_paths_under_assets_dir() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "ui-skill".to_string(),
             description: "from json".to_string(),
             short_description: None,
@@ -752,6 +775,7 @@ async fn ignores_invalid_brand_color() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "ui-skill".to_string(),
             description: "from json".to_string(),
             short_description: None,
@@ -802,6 +826,7 @@ async fn ignores_default_prompt_over_max_length() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "ui-skill".to_string(),
             description: "from json".to_string(),
             short_description: None,
@@ -861,6 +886,7 @@ async fn drops_interface_when_icons_are_invalid() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "ui-skill".to_string(),
             description: "from json".to_string(),
             short_description: None,
@@ -919,6 +945,7 @@ interface:
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "send-message".to_string(),
             description: "send messages".to_string(),
             short_description: None,
@@ -977,6 +1004,7 @@ interface:
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "send-message".to_string(),
             description: "send messages".to_string(),
             short_description: None,
@@ -1036,6 +1064,7 @@ async fn respects_max_scan_depth_for_user_scope() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "within-depth-skill".to_string(),
             description: "loads".to_string(),
             short_description: None,
@@ -1128,6 +1157,7 @@ async fn loads_valid_skill() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "demo-skill".to_string(),
             description: "does things carefully".to_string(),
             short_description: None,
@@ -1191,6 +1221,7 @@ async fn falls_back_to_directory_name_when_skill_name_is_missing() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "directory-derived".to_string(),
             description: "fallback name".to_string(),
             short_description: None,
@@ -1241,6 +1272,7 @@ async fn namespaces_plugin_skills_using_provided_namespace() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "sample:sample-search".to_string(),
             description: "search sample data".to_string(),
             short_description: None,
@@ -1336,9 +1368,14 @@ async fn nearest_valid_nested_plugin_namespace_overrides_outer_namespace() {
         write_plugin_manifest(&nested_plugin_root, manifest);
         let outcome = load_user_skills_root(&skills_root).await;
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
-        assert_eq!(outcome.skills, vec![expected_user_skill(
-            &skill_path, expected_name, "search description"
-        )]);
+        assert_eq!(
+            outcome.skills,
+            vec![expected_user_skill(
+                &skill_path,
+                expected_name,
+                "search description"
+            )]
+        );
     }
 }
 
@@ -1361,7 +1398,10 @@ async fn plugin_skill_name_length_enforces_qualified_boundary() {
     )
     .unwrap();
 
-    for (namespace, allowed) in [(plugin_name.clone(), true), ("p".repeat(MAX_NAME_LEN), false)] {
+    for (namespace, allowed) in [
+        (plugin_name.clone(), true),
+        ("p".repeat(MAX_NAME_LEN), false),
+    ] {
         let outcome = load_skills_from_roots(
             [SkillRoot {
                 path: plugin_root.join("skills").abs(),
@@ -1372,20 +1412,27 @@ async fn plugin_skill_name_length_enforces_qualified_boundary() {
                 plugin_root: Some(plugin_root.abs()),
             }],
             None,
-        ).await;
+        )
+        .await;
         if allowed {
             assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
             let mut expected = expected_user_skill(
-                &skill_path, &format!("{namespace}:{skill_name}"), "search sample data"
+                &skill_path,
+                &format!("{namespace}:{skill_name}"),
+                "search sample data",
             );
             expected.plugin_id = Some("sample@test".to_string());
             assert_eq!(outcome.skills, vec![expected]);
         } else {
             assert!(outcome.skills.is_empty());
-            assert_eq!(outcome.errors, vec![SkillError {
-                path: normalized(&skill_path),
-                message: "invalid qualified name: exceeds maximum length of 128 characters".to_string(),
-            }]);
+            assert_eq!(
+                outcome.errors,
+                vec![SkillError {
+                    path: normalized(&skill_path),
+                    message: "invalid qualified name: exceeds maximum length of 128 characters"
+                        .to_string(),
+                }]
+            );
         }
     }
 }
@@ -1409,6 +1456,7 @@ async fn loads_short_description_from_metadata() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "demo-skill".to_string(),
             description: "long description".to_string(),
             short_description: Some("short summary".to_string()),
@@ -1441,6 +1489,7 @@ async fn loads_unquoted_description_containing_colon_space() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "colon-description".to_string(),
             description: "AWS deployment patterns: ECS Fargate, Lambda, and S3".to_string(),
             short_description: None,
@@ -1473,6 +1522,7 @@ async fn loads_unquoted_short_description_containing_colon_space_and_apostrophe(
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "colon-short-description".to_string(),
             description: "long description".to_string(),
             short_description: Some("What's included: builds and tests".to_string()),
@@ -1505,6 +1555,7 @@ async fn loads_unrecognized_frontmatter_fields_that_need_quotes() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "repaired-unknown-fields".to_string(),
             description: "valid description".to_string(),
             short_description: None,
@@ -1537,6 +1588,7 @@ async fn preserves_block_scalar_body_while_repairing_other_fields() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "block-description-with-repair".to_string(),
             description: "Build for AWS: ECS".to_string(),
             short_description: None,
@@ -1655,6 +1707,7 @@ async fn loads_skills_from_repo_root() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "repo-skill".to_string(),
             description: "from repo".to_string(),
             short_description: None,
@@ -1691,6 +1744,7 @@ async fn loads_skills_from_agents_dir_without_codex_dir() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "agents-skill".to_string(),
             description: "from agents".to_string(),
             short_description: None,
@@ -1745,6 +1799,7 @@ async fn loads_skills_from_all_codex_dirs_under_project_root() {
         outcome.skills,
         vec![
             SkillMetadata {
+                source: None,
                 name: "nested-skill".to_string(),
                 description: "from nested".to_string(),
                 short_description: None,
@@ -1756,6 +1811,7 @@ async fn loads_skills_from_all_codex_dirs_under_project_root() {
                 plugin_id: None,
             },
             SkillMetadata {
+                source: None,
                 name: "root-skill".to_string(),
                 description: "from root".to_string(),
                 short_description: None,
@@ -1796,6 +1852,7 @@ async fn loads_skills_from_codex_dir_when_not_git_repo() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "local-skill".to_string(),
             description: "from cwd".to_string(),
             short_description: None,
@@ -1846,6 +1903,7 @@ async fn deduplicates_by_path_preferring_first_root() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "dupe-skill".to_string(),
             description: "from repo".to_string(),
             short_description: None,
@@ -1910,6 +1968,7 @@ async fn keeps_duplicate_names_from_repo_and_user() {
         outcome.skills,
         vec![
             SkillMetadata {
+                source: None,
                 name: "dupe-skill".to_string(),
                 description: "from repo".to_string(),
                 short_description: None,
@@ -1921,6 +1980,7 @@ async fn keeps_duplicate_names_from_repo_and_user() {
                 plugin_id: None,
             },
             SkillMetadata {
+                source: None,
                 name: "dupe-skill".to_string(),
                 description: "from user".to_string(),
                 short_description: None,
@@ -1984,6 +2044,7 @@ async fn keeps_duplicate_names_from_nested_codex_dirs() {
         outcome.skills,
         vec![
             SkillMetadata {
+                source: None,
                 name: "dupe-skill".to_string(),
                 description: first_description.to_string(),
                 short_description: None,
@@ -1995,6 +2056,7 @@ async fn keeps_duplicate_names_from_nested_codex_dirs() {
                 plugin_id: None,
             },
             SkillMetadata {
+                source: None,
                 name: "dupe-skill".to_string(),
                 description: second_description.to_string(),
                 short_description: None,
@@ -2084,6 +2146,7 @@ async fn loads_skills_when_cwd_is_file_in_repo() {
         outcome.skills,
         vec![
             SkillMetadata {
+                source: None,
                 name: "agents-skill".to_string(),
                 description: "from agents".to_string(),
                 short_description: None,
@@ -2095,6 +2158,7 @@ async fn loads_skills_when_cwd_is_file_in_repo() {
                 plugin_id: None,
             },
             SkillMetadata {
+                source: None,
                 name: "repo-skill".to_string(),
                 description: "from repo".to_string(),
                 short_description: None,
@@ -2163,6 +2227,7 @@ async fn loads_skills_from_system_cache_when_present() {
     assert_eq!(
         outcome.skills,
         vec![SkillMetadata {
+            source: None,
             name: "system-skill".to_string(),
             description: "from system".to_string(),
             short_description: None,
@@ -2197,5 +2262,7 @@ async fn skill_roots_include_admin_with_lowest_priority() {
         expected.insert(1, SkillScope::User);
     }
     expected.push(SkillScope::Admin);
+    // The absent cwd `.agents/skills` candidate stays a watched repo root.
+    expected.push(SkillScope::Repo);
     assert_eq!(scopes, expected);
 }

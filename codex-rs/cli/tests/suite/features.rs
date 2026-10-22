@@ -11,7 +11,7 @@ fn strict_config_rejects_unknown_config_override() -> Result<()> {
     let codex_home = TempDir::new()?;
 
     let mut cmd = codex_command(codex_home.path())?;
-    cmd.args(["--strict-config", "-c", "foo=bar", "mcp-server"])
+    cmd.args(["--strict-config", "-c", "foo=bar", "exec", "hello"])
         .assert()
         .failure()
         .stderr(contains("unknown configuration field"));
@@ -20,15 +20,15 @@ fn strict_config_rejects_unknown_config_override() -> Result<()> {
 }
 
 #[test]
-fn strict_config_is_not_supported_for_cloud_command() -> Result<()> {
+fn strict_config_is_not_supported_for_mcp_command() -> Result<()> {
     let codex_home = TempDir::new()?;
 
     let mut cmd = codex_command(codex_home.path())?;
-    cmd.args(["--strict-config", "-c", "foo=bar", "cloud", "list"])
+    cmd.args(["--strict-config", "-c", "foo=bar", "mcp", "list"])
         .assert()
         .failure()
         .stderr(contains(
-            "`--strict-config` is not supported for `codex cloud`",
+            "`--strict-config` is not supported for `codex mcp`",
         ));
 
     Ok(())
@@ -37,7 +37,10 @@ fn strict_config_is_not_supported_for_cloud_command() -> Result<()> {
 #[tokio::test]
 async fn features_enable_and_disable_persist_without_losing_other_settings() -> Result<()> {
     let codex_home = TempDir::new()?;
-    std::fs::write(codex_home.path().join("config.toml"), "model = \"test-model\"\n")?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "model = \"test-model\"\n",
+    )?;
     for (command, feature, enabled, message) in [
         ("enable", "unified_exec", true, "Enabled"),
         ("disable", "shell_tool", false, "Disabled"),
@@ -46,10 +49,12 @@ async fn features_enable_and_disable_persist_without_losing_other_settings() -> 
             .args(["features", command, feature])
             .assert()
             .success()
-            .stdout(contains(format!("{message} feature `{feature}` in config.toml.")));
-        let config: toml::Value = toml::from_str(
-            &std::fs::read_to_string(codex_home.path().join("config.toml"))?,
-        )?;
+            .stdout(contains(format!(
+                "{message} feature `{feature}` in config.toml."
+            )));
+        let config: toml::Value = toml::from_str(&std::fs::read_to_string(
+            codex_home.path().join("config.toml"),
+        )?)?;
         assert_eq!(config["model"].as_str(), Some("test-model"));
         assert_eq!(config["features"][feature].as_bool(), Some(enabled));
         assert_eq!(config["features"]["unified_exec"].as_bool(), Some(true));

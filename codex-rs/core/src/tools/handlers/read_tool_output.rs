@@ -1099,12 +1099,20 @@ async fn handle_read_tool_output(
     )
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
-    let transaction = drain_recovery_snapshot_with_byte_limit(
+    let transaction = drain_recovery_snapshot_for_delivery(
         &snapshot,
         selectors,
         token_ceiling,
         max_bytes,
         &invocation.cancellation_token,
+        (!code_mode_recovery).then(|| {
+            invocation
+                .step_context
+                .turn
+                .model_info
+                .truncation_policy
+                .into()
+        }),
     )
     .await
     .map_err(|err| FunctionCallError::RespondToModel(err.for_model()))?;
@@ -1191,17 +1199,28 @@ async fn handle_read_tool_output(
     let mut output = recovery_envelope(&output, continuation_stop.as_ref()).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to serialize recovery result: {err}"))
     })?;
+    output["historical_authenticity"] = serde_json::json!(snapshot.historical_authenticity());
     if let Some((store, call_id, source, sha256, bytes)) = completed_inspection {
-        match store
-            .record_source_inspection(source.start, call_id, sha256, bytes)
-            .await
-        {
-            Ok(reference) => output["criterion_evidence"] = serde_json::json!(reference),
-            Err(error) => output["inspection_proof_error"] = serde_json::json!(error.to_string()),
+        if source.start.canonical_path().is_none() {
+            output["inspection_proof_error"] = serde_json::json!(
+                "retained source has no opened-target provenance; bytes are recoverable but cannot certify an inspection criterion"
+            );
+        } else {
+            match store
+                .record_source_inspection(source.start, call_id, sha256, bytes)
+                .await
+            {
+                Ok(reference) => output["criterion_evidence"] = serde_json::json!(reference),
+                Err(error) => {
+                    output["inspection_proof_error"] = serde_json::json!(error.to_string())
+                }
+            }
         }
     }
+    let inner = recovery_tool_output(output, successful, evidence);
+    crate::tools::context::ensure_exact_model_delivery(&inner, &invocation)?;
     Ok(boxed_tool_output(ReadToolOutputToolOutput {
-        inner: recovery_tool_output(output, successful, evidence),
+        inner,
         exact_recovery: exact_recovery_receipt,
     }))
 }
@@ -1342,6 +1361,61 @@ pub(crate) async fn execute_recovery_transaction_with_continuations(
     drain_recovery_snapshot(&snapshot, selectors, token_ceiling, cancellation_token).await
 }
 
+async fn drain_recovery_snapshot_for_delivery(
+    snapshot: &std::sync::Arc<ToolOutputSnapshot>,
+    selectors: Vec<ToolOutputSelector>,
+    mut token_ceiling: usize,
+    max_bytes: usize,
+    cancellation_token: &CancellationToken,
+    policy: Option<codex_protocol::protocol::TruncationPolicy>,
+) -> Result<DrainedRecoveryTransaction, ReadToolOutputError> {
+    loop {
+        let result = drain_recovery_snapshot_with_byte_limit(
+            snapshot,
+            selectors.clone(),
+            token_ceiling,
+            max_bytes,
+            cancellation_token,
+        )
+        .await?;
+        let Some(policy) = policy else {
+            return Ok(result);
+        };
+        let mut envelope = recovery_envelope(&result.output, result.continuation_stop.as_ref())
+            .map_err(|error| ReadToolOutputError::Io(error.to_string()))?;
+        // This field is always present in the final direct result. Omitting it
+        // here lets a page fill the budget and then fail the exact-delivery guard.
+        envelope["historical_authenticity"] = serde_json::json!(snapshot.historical_authenticity());
+        let projected = codex_code_mode::model_visible_tool_result(
+            &ToolName::plain(READ_TOOL_OUTPUT_TOOL_NAME),
+            &envelope,
+        )
+        .unwrap_or(envelope);
+        let bytes = serde_json::to_vec(&projected)
+            .map_err(|error| ReadToolOutputError::Io(error.to_string()))?
+            .len();
+        // Check the final escaped model view in bytes. Byte policies must not
+        // round up to tokens, and the drain's retry margin is inside this cap.
+        if bytes <= policy.byte_budget() {
+            return Ok(result);
+        }
+        let margin = crate::tools::command_output_artifact::RECOVERY_RETRY_AVOIDANCE_TOKEN_MARGIN;
+        let smaller = token_ceiling
+            .saturating_add(margin)
+            .saturating_mul(policy.byte_budget())
+            / bytes.max(1);
+        let smaller = smaller
+            .saturating_sub(margin)
+            .min(token_ceiling.saturating_sub(1));
+        if smaller == 0 || cancellation_token.is_cancelled() {
+            return Err(ReadToolOutputError::InvalidRange(
+                "Recovery metadata cannot fit the current delivery budget; request fewer or narrower selectors.".into(),
+            ));
+        }
+        token_ceiling = smaller;
+    }
+}
+
 async fn drain_recovery_snapshot_with_byte_limit(
     snapshot: &std::sync::Arc<ToolOutputSnapshot>,
     selectors: Vec<ToolOutputSelector>,
@@ -1468,26 +1542,7 @@ fn bound_recovery_source_bytes(output: &mut ReadToolOutputResult, max_bytes: usi
             .filter(|_| {
                 result.text.is_some() || result.data_base64.is_some() || result.value.is_some()
             })
-            .map_or(0, |range| range.end - range.start)
-            .saturating_add(
-                result
-                    .value
-                    .as_ref()
-                    .and_then(|value| value["hydrated_ranges"].as_array())
-                    .map_or(0, |ranges| {
-                        ranges
-                            .iter()
-                            .filter_map(|range| {
-                                if !range["text"].is_string() && !range["data_base64"].is_string() {
-                                    return None;
-                                }
-                                range["canonical_range"]["end"]
-                                    .as_u64()?
-                                    .checked_sub(range["canonical_range"]["start"].as_u64()?)
-                            })
-                            .sum::<u64>()
-                    }),
-            );
+            .map_or(0, |range| range.end - range.start);
         if bytes <= remaining {
             remaining -= bytes;
             continue;
@@ -1559,12 +1614,7 @@ async fn drain_recovery_snapshot_with_source_budget(
             state.record_stop(ContinuationStopReason::Cancelled, Some(selector));
             break;
         }
-        let delivered = state
-            .output
-            .delivered_ranges()
-            .iter()
-            .map(|(start, end)| end - start)
-            .sum::<u64>();
+        let delivered = state.output.represented_source_bytes();
         let remaining = (max_bytes as u64).saturating_sub(delivered);
         if remaining == 0 {
             state.record_stop(ContinuationStopReason::Budget, Some(selector));

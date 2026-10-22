@@ -42,6 +42,13 @@ pub(crate) struct DirectMcpToolEntrypoint {
     pub(crate) tool_name: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct NativeEnvironmentContract {
+    pub(crate) explicit_addressing: bool,
+    pub(crate) primary_foreign_cwd: bool,
+    pub(crate) single_local: bool,
+}
+
 /// Coarse inputs that can change which schemas are model-visible.
 ///
 /// Runtime authorization and fine-grained subsystem state deliberately do not belong here.
@@ -59,6 +66,7 @@ pub(crate) struct ToolExposureIdentity {
     pub(crate) environment_mode: EnvironmentSurfaceMode,
     pub(crate) environment_starting: bool,
     pub(crate) windows_shell_guidance: bool,
+    pub(crate) native_environment_contract: NativeEnvironmentContract,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +80,7 @@ pub(crate) struct DynamicToolExposureIdentity {
     pub(crate) environment_mode: EnvironmentSurfaceMode,
     pub(crate) environment_starting: bool,
     pub(crate) windows_shell_guidance: bool,
+    pub(crate) native_environment_contract: NativeEnvironmentContract,
 }
 
 impl ToolExposureIdentity {
@@ -86,6 +95,7 @@ impl ToolExposureIdentity {
             environment_mode: self.environment_mode,
             environment_starting: self.environment_starting,
             windows_shell_guidance: self.windows_shell_guidance,
+            native_environment_contract: self.native_environment_contract,
         }
     }
 }
@@ -106,6 +116,7 @@ impl Default for ToolExposureIdentity {
             environment_mode: EnvironmentSurfaceMode::One,
             environment_starting: false,
             windows_shell_guidance: true,
+            native_environment_contract: NativeEnvironmentContract::default(),
         }
     }
 }

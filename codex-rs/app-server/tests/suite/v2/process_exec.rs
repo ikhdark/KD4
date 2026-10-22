@@ -169,6 +169,18 @@ async fn process_spawn_returns_before_exit_and_emits_exit_notification() -> Resu
         ProcessExitedNotification {
             process_handle,
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
+            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
             stdout: "process-out".to_string(),
             stdout_cap_reached: false,
             stderr: "process-err".to_string(),
@@ -290,6 +302,18 @@ async fn process_spawn_reports_buffered_output_cap_reached() -> Result<()> {
         ProcessExitedNotification {
             process_handle,
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: true,
+                drain_timed_out: false
+            }),
+            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: true,
+                drain_timed_out: false
+            }),
             stdout: "abc".to_string(),
             stdout_cap_reached: true,
             stderr: "123".to_string(),

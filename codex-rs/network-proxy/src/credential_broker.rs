@@ -45,9 +45,28 @@ impl CredentialBroker {
     pub(crate) fn virtualize_child_env(&self, env: &mut HashMap<String, String>) {
         let mut state = self.write_state();
         if !state.enabled {
-            env.remove(CREDENTIAL_BROKER_ACTIVE_ENV_KEY);
-            env.remove(BROKERED_CREDENTIALS_ENV_KEY);
+            env.retain(|key, _| {
+                if cfg!(windows) {
+                    !key.eq_ignore_ascii_case(CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
+                        && !key.eq_ignore_ascii_case(BROKERED_CREDENTIALS_ENV_KEY)
+                } else {
+                    key != CREDENTIAL_BROKER_ACTIVE_ENV_KEY && key != BROKERED_CREDENTIALS_ENV_KEY
+                }
+            });
             return;
+        }
+        // Match Windows' case-insensitive process environment, using the producer's
+        // lexicographically-last spelling precedence. Remove all losing real aliases.
+        #[cfg(windows)]
+        for key in providers::credential_broker_env_keys().chain([
+            CREDENTIAL_BROKER_ACTIVE_ENV_KEY,
+            BROKERED_CREDENTIALS_ENV_KEY,
+        ]) {
+            if let Some((_, value)) = env_entry(env, key) {
+                let value = value.clone();
+                env.retain(|alias, _| !alias.eq_ignore_ascii_case(key));
+                env.insert(key.to_string(), value);
+            }
         }
         env.insert(
             CREDENTIAL_BROKER_ACTIVE_ENV_KEY.to_string(),
@@ -238,14 +257,17 @@ fn update_brokered_credentials_marker(
 /// replaced by the user are ignored. The environment is not mutated; callers own the decision to
 /// remove the returned keys.
 pub fn brokered_credential_dummy_env_keys(env: &HashMap<String, String>) -> Vec<String> {
-    env.get(BROKERED_CREDENTIALS_ENV_KEY)
+    env_entry(env, BROKERED_CREDENTIALS_ENV_KEY)
+        .map(|(_, value)| value)
         .and_then(|marker| serde_json::from_str::<Vec<(String, String)>>(marker).ok())
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(key, dummy_value)| {
-            (providers::credential_broker_env_keys().any(|candidate| candidate == key.as_str())
-                && env.get(&key) == Some(&dummy_value))
-            .then_some(key)
+            if !providers::credential_broker_env_keys().any(|candidate| candidate == key.as_str()) {
+                return None;
+            }
+            let (alias, value) = env_entry(env, &key)?;
+            (value == &dummy_value).then(|| alias.clone())
         })
         .collect()
 }
@@ -254,10 +276,19 @@ pub fn brokered_credential_dummy_env_keys(env: &HashMap<String, String>) -> Vec<
 pub fn brokered_credential_env_keys(
     env: &HashMap<String, String>,
 ) -> impl Iterator<Item = &'static str> {
-    let active = env
-        .get(CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
-        .is_some_and(|value| value == "1");
+    let active =
+        env_entry(env, CREDENTIAL_BROKER_ACTIVE_ENV_KEY).is_some_and(|(_, value)| value == "1");
     providers::credential_broker_env_keys().filter(move |_| active)
+}
+
+fn env_entry<'a>(env: &'a HashMap<String, String>, key: &str) -> Option<(&'a String, &'a String)> {
+    if cfg!(windows) {
+        env.iter()
+            .filter(|(alias, _)| alias.eq_ignore_ascii_case(key))
+            .max_by(|(left, _), (right, _)| left.cmp(right))
+    } else {
+        env.get_key_value(key)
+    }
 }
 
 #[cfg(test)]

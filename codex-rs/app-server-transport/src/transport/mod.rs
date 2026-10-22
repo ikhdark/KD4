@@ -9,8 +9,8 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::OVERLOADED_ERROR_CODE;
 use codex_app_server_protocol::OverloadReason;
 use codex_app_server_protocol::overloaded_error;
-use codex_core::config::find_codex_home;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_home_dir::find_codex_home;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
@@ -25,6 +25,34 @@ use tracing::warn;
 /// is a balance between throughput and memory usage - 128 messages should be
 /// plenty for an interactive CLI.
 pub const CHANNEL_CAPACITY: usize = 128;
+pub const CONTROL_INGRESS_RESERVE: usize = 64;
+pub const INGRESS_CAPACITY: usize = CHANNEL_CAPACITY + CONTROL_INGRESS_RESERVE;
+
+/// Reserve atomically before checking the remaining ordinary allowance. A
+/// concurrent sender cannot consume the last control cell between check/send.
+pub fn try_send_with_control_reserve<T>(
+    sender: &mpsc::Sender<T>,
+    message: T,
+    control: bool,
+    reserve: usize,
+) -> Result<(), mpsc::error::TrySendError<T>> {
+    let permit = match sender.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(())) => {
+            return Err(mpsc::error::TrySendError::Full(message));
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            return Err(mpsc::error::TrySendError::Closed(message));
+        }
+    };
+    // Legacy callers/tests with a single cell still have ordinary admission.
+    let reserve = reserve.min(sender.max_capacity().saturating_sub(1));
+    if !control && sender.capacity() < reserve {
+        return Err(mpsc::error::TrySendError::Full(message));
+    }
+    permit.send(message);
+    Ok(())
+}
 
 mod remote_control;
 mod stdio;
@@ -222,11 +250,17 @@ async fn enqueue_incoming_message(
     connection_id: ConnectionId,
     message: JSONRPCMessage,
 ) -> bool {
+    let control = ingress_message_is_control(&message);
     let event = TransportEvent::IncomingMessage {
         connection_id,
         message,
     };
-    match transport_event_tx.try_send(event) {
+    match try_send_with_control_reserve(
+        transport_event_tx,
+        event,
+        control,
+        ingress_reserve(transport_event_tx),
+    ) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Closed(_)) => false,
         Err(mpsc::error::TrySendError::Full(TransportEvent::IncomingMessage {
@@ -256,6 +290,20 @@ async fn enqueue_incoming_message(
     }
 }
 
+fn ingress_message_is_control(message: &JSONRPCMessage) -> bool {
+    matches!(message, JSONRPCMessage::Request(request)
+        if codex_app_server_protocol::client_request_is_control(&request.method)
+            && serde_json::to_vec(request).is_ok_and(|bytes| bytes.len() <= 64 * 1024))
+}
+
+fn ingress_reserve(sender: &mpsc::Sender<TransportEvent>) -> usize {
+    if sender.max_capacity() >= INGRESS_CAPACITY {
+        CONTROL_INGRESS_RESERVE
+    } else {
+        0
+    }
+}
+
 fn serialize_outgoing_message(outgoing_message: OutgoingMessage) -> Option<String> {
     match serde_json::to_string(&outgoing_message) {
         Ok(json) => Some(json),
@@ -280,6 +328,57 @@ mod tests {
     use serde_json::json;
     use tokio::time::Duration;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn ordinary_ingress_cannot_consume_interrupt_reserve() {
+        let (events, mut received) = mpsc::channel(INGRESS_CAPACITY);
+        let (writer, mut replies) = mpsc::channel(2);
+        let ordinary = |id| {
+            JSONRPCMessage::Request(JSONRPCRequest {
+                id: RequestId::Integer(id),
+                method: "config/read".into(),
+                params: Some(json!({"includeLayers": false})),
+                trace: None,
+            })
+        };
+        for id in 0..CHANNEL_CAPACITY as i64 {
+            assert!(
+                enqueue_incoming_message(&events, &writer, ConnectionId(1), ordinary(id)).await
+            );
+        }
+        assert!(enqueue_incoming_message(&events, &writer, ConnectionId(1), ordinary(999)).await);
+        assert!(
+            replies.try_recv().is_ok(),
+            "ordinary overflow stays explicit"
+        );
+        for id in 0..CONTROL_INGRESS_RESERVE as i64 {
+            assert!(
+                enqueue_incoming_message(
+                    &events,
+                    &writer,
+                    ConnectionId(2),
+                    JSONRPCMessage::Request(JSONRPCRequest {
+                        id: RequestId::Integer(1000 + id),
+                        method: "turn/interrupt".into(),
+                        params: Some(json!({"threadId": "t", "turnId": "turn"})),
+                        trace: None,
+                    })
+                )
+                .await
+            );
+        }
+        assert_eq!(received.len(), INGRESS_CAPACITY);
+        for _ in 0..CHANNEL_CAPACITY {
+            received.recv().await.unwrap();
+        }
+        assert!(matches!(
+            received.recv().await,
+            Some(TransportEvent::IncomingMessage {
+                connection_id: ConnectionId(2),
+                ..
+            })
+        ));
+    }
 
     #[tokio::test]
     async fn malformed_rpc_envelopes_do_not_reach_dispatch() {

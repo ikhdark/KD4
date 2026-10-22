@@ -52,6 +52,7 @@ struct EnabledInferenceTraceContext {
     model: String,
     provider_name: String,
     request_metadata: Option<Arc<JsonValue>>,
+    occurrence: Option<crate::TraceOccurrence>,
 }
 
 /// One concrete upstream request attempt.
@@ -75,7 +76,7 @@ enum InferenceTraceAttemptState {
 struct EnabledInferenceTraceAttempt {
     context: EnabledInferenceTraceContext,
     inference_call_id: InferenceCallId,
-    terminal_recorded: AtomicBool,
+    terminal_recorded: Arc<AtomicBool>,
 }
 
 /// Non-delta response payload saved for completed or interrupted inference streams.
@@ -117,6 +118,7 @@ impl InferenceTraceContext {
                 model,
                 provider_name,
                 request_metadata: None,
+                occurrence: None,
             }),
         }
     }
@@ -140,13 +142,29 @@ impl InferenceTraceContext {
             state: InferenceTraceAttemptState::Enabled(EnabledInferenceTraceAttempt {
                 context: context.clone(),
                 inference_call_id: next_inference_call_id(),
-                terminal_recorded: AtomicBool::new(false),
+                terminal_recorded: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
 }
 
 impl InferenceTraceAttempt {
+    /// A write view sharing exactly-once termination, with the original
+    /// producer's observation rather than the eventual writer timestamp.
+    pub fn at_occurrence(&self, occurrence: crate::TraceOccurrence) -> Self {
+        let InferenceTraceAttemptState::Enabled(attempt) = &self.state else {
+            return Self::disabled();
+        };
+        let mut context = attempt.context.clone();
+        context.occurrence = Some(occurrence);
+        Self {
+            state: InferenceTraceAttemptState::Enabled(EnabledInferenceTraceAttempt {
+                context,
+                inference_call_id: attempt.inference_call_id.clone(),
+                terminal_recorded: Arc::clone(&attempt.terminal_recorded),
+            }),
+        }
+    }
     /// Whether recording this attempt can write trace data.
     pub fn is_enabled(&self) -> bool {
         matches!(&self.state, InferenceTraceAttemptState::Enabled(_))
@@ -199,7 +217,8 @@ impl InferenceTraceAttempt {
             return;
         };
         let Ok(mut request) = serde_json::to_value(request) else {
-            attempt.terminal_recorded.store(true, Ordering::Release);
+            attempt.context.writer.note_capture_gap();
+            self.record_started_without_payload(attempt);
             return;
         };
         if let Some(settings) = &attempt.context.request_metadata {
@@ -218,7 +237,7 @@ impl InferenceTraceAttempt {
             RawPayloadKind::InferenceRequest,
             &request,
         ) else {
-            attempt.terminal_recorded.store(true, Ordering::Release);
+            self.record_started_without_payload(attempt);
             return;
         };
 
@@ -231,6 +250,19 @@ impl InferenceTraceAttempt {
                 model: attempt.context.model.clone(),
                 provider_name: attempt.context.provider_name.clone(),
                 request_payload,
+            },
+        );
+    }
+
+    fn record_started_without_payload(&self, attempt: &EnabledInferenceTraceAttempt) {
+        append_with_context_best_effort(
+            &attempt.context,
+            RawTraceEventPayload::InferenceStartedWithoutPayload {
+                inference_call_id: attempt.inference_call_id.clone(),
+                thread_id: attempt.context.thread_id.clone(),
+                codex_turn_id: attempt.context.codex_turn_id.clone(),
+                model: attempt.context.model.clone(),
+                provider_name: attempt.context.provider_name.clone(),
             },
         );
     }
@@ -277,24 +309,37 @@ impl InferenceTraceAttempt {
         upstream_request_id: Option<&str>,
         output_items: &[ResponseItem],
     ) {
+        self.record_failed_with_usage(error, upstream_request_id, output_items, None, None);
+    }
+
+    pub fn record_failed_with_usage(
+        &self,
+        error: impl Display,
+        upstream_request_id: Option<&str>,
+        output_items: &[ResponseItem],
+        response_id: Option<&str>,
+        token_usage: Option<&TokenUsage>,
+    ) {
         let Some(attempt) = self.take_terminal_attempt() else {
             return;
         };
-        let partial_response_payload = if output_items.is_empty() {
-            None
-        } else {
-            write_response_payload_best_effort(
-                attempt,
-                /*response_id*/ None,
-                upstream_request_id,
-                /*token_usage*/ None,
-                output_items,
-            )
-        };
+        let partial_response_payload =
+            if output_items.is_empty() && response_id.is_none() && token_usage.is_none() {
+                None
+            } else {
+                write_response_payload_best_effort(
+                    attempt,
+                    response_id,
+                    upstream_request_id,
+                    token_usage,
+                    output_items,
+                )
+            };
         append_with_context_best_effort(
             &attempt.context,
             RawTraceEventPayload::InferenceFailed {
                 inference_call_id: attempt.inference_call_id.clone(),
+                response_id: response_id.map(str::to_owned),
                 upstream_request_id: upstream_request_id.map(str::to_string),
                 error: error.to_string(),
                 partial_response_payload,
@@ -437,9 +482,13 @@ fn append_with_context_best_effort(
         thread_id: Some(context.thread_id.clone()),
         codex_turn_id: Some(context.codex_turn_id.clone()),
     };
-    context
-        .writer
-        .append_with_context_best_effort(event_context, payload);
+    if let Err(err) =
+        context
+            .writer
+            .append_with_context_at(event_context, payload, context.occurrence.clone())
+    {
+        tracing::warn!("failed to append rollout inference event: {err:#}");
+    }
 }
 
 #[cfg(test)]
@@ -496,13 +545,14 @@ mod tests {
             "test-provider".to_string(),
         );
 
-        let context =
-            context.with_request_metadata(|| json!({"parallel_tool_calls": true}));
+        let context = context.with_request_metadata(|| json!({"parallel_tool_calls": true}));
         let attempt = context.start_attempt();
         let mut headers = HeaderMap::new();
         headers.insert("existing", HeaderValue::from_static("preserved"));
         attempt.add_request_headers(&mut headers);
-        let header = headers.get("x-codex-inference-call-id").expect("trace wire header");
+        let header = headers
+            .get("x-codex-inference-call-id")
+            .expect("trace wire header");
         assert!(Uuid::parse_str(header.to_str()?).is_ok());
         assert_eq!(Some(header.to_str()?), attempt.inference_call_id());
         assert_eq!(headers["existing"], "preserved");
@@ -534,18 +584,134 @@ mod tests {
         assert_eq!(inference.execution.status, ExecutionStatus::Completed);
         assert_eq!(inference.upstream_request_id, Some("req-1".to_string()));
         assert_eq!(rollout.raw_payloads.len(), 2);
-        let payload = &rollout.raw_payloads[&inference.raw_request_payload_id];
+        let payload = &rollout.raw_payloads[inference
+            .raw_request_payload_id
+            .as_ref()
+            .expect("captured request")];
         let captured: JsonValue =
             serde_json::from_slice(&std::fs::read(temp.path().join(&payload.path))?)?;
         assert_eq!(captured["model"], "gpt-test");
         assert_eq!(captured["input"][0]["content"][0]["text"], "hello");
-        assert_eq!(
-            captured["_codex"]["settings"]["parallel_tool_calls"],
-            true
-        );
+        assert_eq!(captured["_codex"]["settings"]["parallel_tool_calls"], true);
         assert_eq!(captured["_codex"]["sampling_request_id"], "sample-1");
         assert_eq!(captured["_codex"]["physical_attempt_id"], "attempt-2");
 
+        Ok(())
+    }
+
+    #[test]
+    fn audit_observability_trace_failed_usage_without_output() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let writer = Arc::new(TraceWriter::create(
+            temp.path(),
+            "trace".into(),
+            "rollout".into(),
+            "thread".into(),
+        )?);
+        writer.append(RawTraceEventPayload::ThreadStarted {
+            thread_id: "thread".into(),
+            agent_path: "/root".into(),
+            metadata_payload: None,
+        })?;
+        writer.append(RawTraceEventPayload::CodexTurnStarted {
+            codex_turn_id: "turn".into(),
+            thread_id: "thread".into(),
+        })?;
+        let context = InferenceTraceContext::enabled(
+            writer,
+            "thread".into(),
+            "turn".into(),
+            "model".into(),
+            "provider".into(),
+        );
+        let attempt = context.start_attempt();
+        attempt.record_started(&json!({"input": []}));
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 23,
+            total_tokens: 123,
+            ..Default::default()
+        };
+        attempt.record_failed_with_usage(
+            "incomplete",
+            Some("request"),
+            &[],
+            Some("response"),
+            Some(&usage),
+        );
+        attempt.record_failed("duplicate terminal", None, &[]);
+        let rollout = replay_bundle(temp.path())?;
+        assert_eq!(rollout.inference_calls.len(), 1);
+        let inference = rollout.inference_calls.values().next().unwrap();
+        assert_eq!(inference.execution.status, ExecutionStatus::Failed);
+        assert_eq!(inference.response_id.as_deref(), Some("response"));
+        assert_eq!(inference.usage.as_ref().unwrap().input_tokens, 100);
+        assert_eq!(inference.usage.as_ref().unwrap().output_tokens, 23);
+        // The reduced summary has no provider-total field; the receipt must
+        // still retain the independently reported total, not recompute it.
+        let payload = &rollout.raw_payloads[inference.raw_response_payload_id.as_ref().unwrap()];
+        let receipt: JsonValue =
+            serde_json::from_slice(&std::fs::read(temp.path().join(&payload.path))?)?;
+        assert_eq!(receipt["token_usage"]["total_tokens"], 123);
+        Ok(())
+    }
+
+    #[test]
+    fn payload_only_failures_preserve_attempt_lifecycle_and_capture_gaps() -> anyhow::Result<()> {
+        for (request_lost, response_lost) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let temp = TempDir::new()?;
+            let writer = Arc::new(TraceWriter::create(
+                temp.path(),
+                "trace".into(),
+                "rollout".into(),
+                "root".into(),
+            )?);
+            writer.append(RawTraceEventPayload::ThreadStarted {
+                thread_id: "root".into(),
+                agent_path: "/root".into(),
+                metadata_payload: None,
+            })?;
+            writer.append(RawTraceEventPayload::CodexTurnStarted {
+                thread_id: "root".into(),
+                codex_turn_id: "turn".into(),
+            })?;
+            // Fail only the selected create_new payload write. The event log
+            // remains writable and all failure injection is confined to TempDir.
+            if request_lost {
+                std::fs::create_dir(temp.path().join("payloads/1.json"))?;
+            }
+            if response_lost {
+                std::fs::create_dir(temp.path().join("payloads/2.json"))?;
+            }
+            let context = InferenceTraceContext::enabled(
+                Arc::clone(&writer),
+                "root".into(),
+                "turn".into(),
+                "model".into(),
+                "provider".into(),
+            );
+            let attempt = context.start_attempt();
+            attempt.record_started(&json!({"model":"model", "input":[]}));
+            attempt.record_completed("response", None, &None, &[]);
+            attempt.record_completed("duplicate", None, &None, &[]);
+            writer.append(RawTraceEventPayload::CodexTurnEnded {
+                codex_turn_id: "turn".into(),
+                status: ExecutionStatus::Completed,
+            })?;
+            let rollout = replay_bundle(temp.path())?;
+            assert_eq!(rollout.inference_calls.len(), 1);
+            let inference = rollout.inference_calls.values().next().unwrap();
+            assert_eq!(inference.execution.status, ExecutionStatus::Completed);
+            assert_eq!(inference.response_id.as_deref(), Some("response"));
+            assert_eq!(inference.raw_request_payload_id.is_none(), request_lost);
+            assert_eq!(inference.raw_response_payload_id.is_none(), response_lost);
+            assert_eq!(
+                rollout.payload_capture_gap_count,
+                Some(u64::from(request_lost) + u64::from(response_lost))
+            );
+        }
         Ok(())
     }
 

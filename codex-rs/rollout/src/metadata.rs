@@ -2,6 +2,7 @@ use crate::ARCHIVED_SESSIONS_SUBDIR;
 use crate::SESSIONS_SUBDIR;
 use crate::compression;
 use crate::list::parse_timestamp_uuid_from_filename;
+use crate::payload_artifact::PayloadDependencyVersion;
 use crate::recorder::RolloutRecorder;
 use crate::state_integration::normalize_cwd_for_state_db;
 use chrono::DateTime;
@@ -24,6 +25,7 @@ use codex_state::ExtractionOutcome;
 use codex_state::ThreadMetadataBuilder;
 use codex_state::ThreadMetadataRolloutReducer;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
@@ -51,6 +53,7 @@ pub(crate) fn builder_from_session_meta(
         session_meta.meta.source.clone(),
     );
     builder.history_mode = session_meta.meta.history_mode;
+    builder.session_id = Some(session_meta.meta.session_id);
     builder.parent_thread_id = session_meta.meta.parent_thread_id;
     builder.model_provider = session_meta.meta.model_provider.clone();
     builder.agent_nickname = session_meta.meta.agent_nickname.clone();
@@ -82,6 +85,7 @@ pub fn builder_from_items(
         | RolloutItem::Compacted(_)
         | RolloutItem::TurnContext(_)
         | RolloutItem::WorldState(_)
+        | RolloutItem::AdditionalContextState { .. }
         | RolloutItem::EventMsg(_) => None,
     }) && let Some(builder) = builder_from_session_meta(session_meta, rollout_path)
     {
@@ -111,6 +115,44 @@ pub async fn extract_metadata_from_rollout(
         .map(|(outcome, _cache_hit)| outcome)
 }
 
+pub(crate) async fn rollout_source_version(
+    path: &Path,
+) -> anyhow::Result<(PathBuf, u64, Option<SystemTime>)> {
+    let path = crate::existing_rollout_path(path)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("rollout is missing"))?;
+    let metadata = tokio::fs::metadata(&path).await?;
+    Ok((path, metadata.len(), metadata.modified().ok()))
+}
+
+/// Pre-extraction authority snapshot for a rollout. The index lookup matches
+/// the stored path spelling exactly, while reconciliation compares locations
+/// as paths. A row indexed under another spelling of this same file (such as
+/// mixed separators) is its existing authority, not a concurrent insert.
+pub(crate) async fn expected_thread_metadata_for_rollout(
+    runtime: &codex_state::StateRuntime,
+    rollout_path: &Path,
+) -> anyhow::Result<Option<codex_state::ThreadMetadata>> {
+    if let Some(metadata) = runtime
+        .thread_metadata_for_rollout_path(rollout_path)
+        .await?
+    {
+        return Ok(Some(metadata));
+    }
+    let Some((_, uuid)) = rollout_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(parse_timestamp_uuid_from_filename)
+    else {
+        return Ok(None);
+    };
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    Ok(runtime.get_thread(thread_id).await?.filter(|metadata| {
+        metadata.rollout_path == rollout_path
+            || metadata.rollout_path == rollout_path.with_extension("jsonl.zst")
+    }))
+}
+
 pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
     rollout_path: &Path,
     default_provider: &str,
@@ -119,14 +161,48 @@ pub(crate) async fn extract_metadata_from_rollout_with_cache_status(
         return Ok((outcome, true));
     }
     let mut accumulator = RolloutMetadataAccumulator::default();
-    let (_thread_id, parse_errors) = RolloutRecorder::for_each_rollout_item(rollout_path, |item| {
-        accumulator.push(item, rollout_path, default_provider);
-    })
-    .await?;
-    let outcome = accumulator
-        .finish(rollout_path, default_provider, parse_errors)
+    let (_thread_id, parse_errors, _, unresolved_payloads) =
+        RolloutRecorder::for_each_rollout_item_with_integrity(rollout_path, false, |item, _| {
+            accumulator.push(item, rollout_path, default_provider);
+        })
         .await?;
+    let mut outcome = accumulator
+        .finish(rollout_path, default_provider, parse_errors)
+        .await
+        .map_err(|error| {
+            if unresolved_payloads != 0 {
+                anyhow::Error::from(std::io::Error::other(RepairablePayloadGap(format!(
+                    "rollout metadata has repairable payload gaps: {error}"
+                ))))
+            } else {
+                error
+            }
+        })?;
+    outcome.unresolved_payloads = unresolved_payloads;
     Ok((outcome, false))
+}
+
+/// Extraction failed only after referenced payload artifacts were unreadable.
+#[derive(Debug)]
+struct RepairablePayloadGap(String);
+
+impl std::fmt::Display for RepairablePayloadGap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RepairablePayloadGap {}
+
+fn is_repairable_payload_gap(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref)
+        .is_some_and(
+            <dyn std::error::Error + std::marker::Send + std::marker::Sync + 'static>::is::<
+                RepairablePayloadGap,
+            >,
+        )
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -326,6 +402,7 @@ impl RolloutMetadataAccumulator {
             metadata,
             parent_thread_id: self.parent_thread_id,
             parse_errors,
+            unresolved_payloads: 0,
         })
     }
 }
@@ -357,23 +434,114 @@ pub(crate) async fn backfill_sessions_with_lease(
         codex_home,
         default_provider,
         backfill_lease_seconds,
+        &mut BackfillMemo::default(),
         || false,
     )
     .await;
+}
+
+/// Rollout version stamped before a read: physical path, length and mtime.
+type RolloutSourceVersion = (PathBuf, u64, Option<SystemTime>);
+
+/// Outcomes one runtime already reconciled, keyed by discovered rollout path.
+///
+/// A later pass reuses an entry only while the rollout's physical path, length
+/// and modification time are unchanged and, for a payload gap, every payload
+/// it names is too. Appends, rewrites, moves, compression and payload repair
+/// are therefore read again. Failures a retry may resolve are never kept.
+#[derive(Default)]
+pub(crate) struct BackfillMemo {
+    entries: HashMap<PathBuf, BackfillMemoEntry>,
+    last_pass: Option<PassRemainder>,
+}
+
+/// What a pass that claimed the backfill lease left unsettled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassRemainder {
+    /// Every rollout after the checkpoint settled.
+    Settled,
+    /// Only payload gaps remain, each read again at the rollout version of its
+    /// previous read with the payloads it names stamped before that read, or
+    /// reused while all of those stay unchanged.
+    ConfirmedPayloadGaps(usize),
+    /// Some payload gap was read only once at its current rollout version.
+    UnconfirmedPayloadGaps,
+    /// The pass stopped early, or a failure a retry may resolve remains.
+    Unresolved,
+}
+
+struct BackfillMemoEntry {
+    source: RolloutSourceVersion,
+    outcome: BackfillMemoOutcome,
+}
+
+enum BackfillMemoOutcome {
+    /// Reconciled, or content that no retry can repair.
+    Settled,
+    /// Indexed provisionally with unreadable payloads. It stays unsettled and
+    /// keeps the checkpoint before it. Payload versions stamped before the
+    /// read that confirmed the gap decide when to read it again; `None` until
+    /// such a read.
+    PayloadGap(Option<Vec<PayloadDependencyVersion>>),
+}
+
+impl BackfillMemo {
+    /// `Some(settled)` while nothing the last reconciliation read has changed.
+    async fn reusable_outcome(&self, path: &Path, source: &RolloutSourceVersion) -> Option<bool> {
+        let entry = self
+            .entries
+            .get(path)
+            .filter(|entry| entry.source == *source)?;
+        match &entry.outcome {
+            BackfillMemoOutcome::Settled => Some(true),
+            BackfillMemoOutcome::PayloadGap(Some(dependencies)) => {
+                crate::payload_artifact::payload_versions_match(dependencies)
+                    .await
+                    .then_some(false)
+            }
+            BackfillMemoOutcome::PayloadGap(None) => None,
+        }
+    }
+
+    /// A gap already seen at this exact rollout version: the rollout has stopped
+    /// changing, so stamping its payloads now lets the next read confirm the gap.
+    fn payload_gap_at(&self, path: &Path, source: &RolloutSourceVersion) -> bool {
+        self.entries.get(path).is_some_and(|entry| {
+            entry.source == *source && matches!(entry.outcome, BackfillMemoOutcome::PayloadGap(_))
+        })
+    }
+
+    /// What the latest [`backfill_sessions_until`] call left unsettled; `None`
+    /// when that call did not claim the lease and run a pass.
+    pub(crate) fn last_pass_remainder(&self) -> Option<PassRemainder> {
+        self.last_pass
+    }
+}
+
+/// Work done by one backfill pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BackfillPassReport {
+    /// Rollouts whose history this pass read.
+    pub(crate) extracted: usize,
+    /// Rollouts whose earlier outcome was kept because nothing it read changed.
+    pub(crate) unchanged: usize,
 }
 
 /// Backfill rollout metadata into SQLite under the shared worker lease.
 ///
 /// `should_stop` is checked between rollouts. A stopped run checkpoints its contiguous
 /// progress and releases its claim, so a caller with a deadline never abandons a held lease
-/// that would block every later worker until it expires.
+/// that would block every later worker until it expires. `memo` carries this runtime's
+/// earlier outcomes so a periodic pass reads only rollouts whose inputs changed.
 pub(crate) async fn backfill_sessions_until(
     runtime: &codex_state::StateRuntime,
     codex_home: &Path,
     default_provider: &str,
     backfill_lease_seconds: i64,
+    memo: &mut BackfillMemo,
     mut should_stop: impl FnMut() -> bool,
-) {
+) -> BackfillPassReport {
+    memo.last_pass = None;
     let metric_client = codex_otel::global();
     let timer = metric_client
         .as_ref()
@@ -389,7 +557,7 @@ pub(crate) async fn backfill_sessions_until(
         }
     };
     if backfill_state.status == BackfillStatus::Complete {
-        return;
+        return BackfillPassReport::default();
     }
     let claimed = match runtime.try_claim_backfill(backfill_lease_seconds).await {
         Ok(claimed) => claimed,
@@ -398,7 +566,7 @@ pub(crate) async fn backfill_sessions_until(
                 "failed to claim backfill worker at {}: {err}",
                 codex_home.display()
             );
-            return;
+            return BackfillPassReport::default();
         }
     };
     if !claimed {
@@ -406,7 +574,7 @@ pub(crate) async fn backfill_sessions_until(
             "state db backfill already running at {}; skipping duplicate worker",
             codex_home.display()
         );
-        return;
+        return BackfillPassReport::default();
     }
     let mut backfill_state = match runtime.get_backfill_state().await {
         Ok(state) => state,
@@ -463,6 +631,15 @@ pub(crate) async fn backfill_sessions_until(
             }
         }
     }
+    if !unresolved_failures {
+        // Rollouts that moved or disappeared are read again under their new paths.
+        let discovered = rollout_paths
+            .iter()
+            .map(|rollout| rollout.path.as_path())
+            .collect::<HashSet<_>>();
+        memo.entries
+            .retain(|path, _| discovered.contains(path.as_path()));
+    }
     rollout_paths.sort_by(|a, b| a.watermark.cmp(&b.watermark));
     if let Some(last_watermark) = backfill_state.last_watermark.as_deref() {
         rollout_paths.retain(|entry| entry.watermark.as_str() > last_watermark);
@@ -476,6 +653,12 @@ pub(crate) async fn backfill_sessions_until(
     let mut contiguous_watermark = backfill_state.last_watermark.clone();
     let mut checkpointed_watermark = backfill_state.last_watermark.clone();
     let mut stopped = false;
+    let mut report = BackfillPassReport::default();
+    // Separate payload gaps from failures a retry may resolve. Only discovery can
+    // have failed so far, and a rollout it missed is unread.
+    let mut transient_failures = unresolved_failures;
+    let mut confirmed_gaps = 0usize;
+    let mut unconfirmed_gaps = 0usize;
     'batches: for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
             if should_stop() {
@@ -483,71 +666,161 @@ pub(crate) async fn backfill_sessions_until(
                 break 'batches;
             }
             stats.scanned = stats.scanned.saturating_add(1);
-            let settled = match extract_metadata_from_rollout(&rollout.path, default_provider).await
-            {
-                Ok(outcome) => {
-                    if outcome.parse_errors > 0
-                        && let Some(ref metric_client) = metric_client
-                    {
-                        let metric_client = metric_client.clone();
-                        let parse_errors = outcome.parse_errors as i64;
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let _ = metric_client.counter(
-                                DB_ERROR_METRIC,
-                                parse_errors,
-                                &[("stage", "backfill_sessions")],
+            let Ok(source_version) = rollout_source_version(&rollout.path).await else {
+                memo.entries.remove(&rollout.path);
+                stats.failed = stats.failed.saturating_add(1);
+                unresolved_failures = true;
+                transient_failures = true;
+                continue;
+            };
+            // Re-reading unchanged inputs reproduces the same outcome, so keep it.
+            // A payload gap stays unsettled and keeps the checkpoint before it.
+            if let Some(settled) = memo.reusable_outcome(&rollout.path, &source_version).await {
+                report.unchanged = report.unchanged.saturating_add(1);
+                if settled {
+                    if !unresolved_failures {
+                        contiguous_watermark = Some(rollout.watermark.clone());
+                    }
+                } else {
+                    // Only a gap whose named payloads were stamped is reused.
+                    confirmed_gaps = confirmed_gaps.saturating_add(1);
+                    stats.failed = stats.failed.saturating_add(1);
+                    unresolved_failures = true;
+                }
+                continue;
+            }
+            // Stamp a known gap's payloads before reading it again, so a payload that
+            // appears during or after this read is still a change for the next pass.
+            let gap_dependencies = if memo.payload_gap_at(&rollout.path, &source_version) {
+                crate::payload_artifact::named_payload_versions(&source_version.0)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let Ok(expected) = expected_thread_metadata_for_rollout(runtime, &rollout.path).await
+            else {
+                memo.entries.remove(&rollout.path);
+                stats.failed = stats.failed.saturating_add(1);
+                unresolved_failures = true;
+                transient_failures = true;
+                continue;
+            };
+            report.extracted = report.extracted.saturating_add(1);
+            let (settled, remembered) =
+                match extract_metadata_from_rollout(&rollout.path, default_provider).await {
+                    Ok(outcome) => {
+                        if outcome.parse_errors > 0
+                            && let Some(ref metric_client) = metric_client
+                        {
+                            let metric_client = metric_client.clone();
+                            let parse_errors = outcome.parse_errors as i64;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = metric_client.counter(
+                                    DB_ERROR_METRIC,
+                                    parse_errors,
+                                    &[("stage", "backfill_sessions")],
+                                );
+                            })
+                            .await;
+                        }
+                        let recoverable_gap = outcome.unresolved_payloads != 0;
+                        let parent_thread_id = outcome.parent_thread_id;
+                        let mut metadata = outcome.metadata;
+                        metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
+                        if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
+                            metadata.prefer_existing_git_info(&existing_metadata);
+                            metadata.prefer_existing_explicit_title(&existing_metadata);
+                        }
+                        if rollout.archived && metadata.archived_at.is_none() {
+                            let fallback_archived_at = metadata.updated_at;
+                            metadata.archived_at = file_modified_time_utc(&rollout.path)
+                                .await
+                                .or(Some(fallback_archived_at));
+                        }
+                        if let Err(err) = runtime
+                            .reconcile_thread_metadata(
+                                &metadata,
+                                expected.as_ref(),
+                                &source_version,
+                            )
+                            .await
+                        {
+                            warn!("failed to upsert rollout {}: {err}", rollout.path.display());
+                            (false, None)
+                        } else if let Some(parent_thread_id) = parent_thread_id
+                            && let Err(err) = runtime
+                                .infer_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
+                                .await
+                        {
+                            warn!(
+                                "failed to restore parent edge for {}: {err}",
+                                rollout.path.display()
                             );
-                        })
-                        .await;
+                            (false, None)
+                        } else {
+                            stats.upserted = stats.upserted.saturating_add(1);
+                            // Provisional rows remain useful, but may not certify lineage.
+                            // Retry on a later bounded pass, with the checkpoint before this gap.
+                            if recoverable_gap {
+                                (
+                                    false,
+                                    Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)),
+                                )
+                            } else {
+                                (true, Some(BackfillMemoOutcome::Settled))
+                            }
+                        }
                     }
-                    let parent_thread_id = outcome.parent_thread_id;
-                    let mut metadata = outcome.metadata;
-                    metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
-                    if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
-                        metadata.prefer_existing_git_info(&existing_metadata);
-                        metadata.prefer_existing_explicit_title(&existing_metadata);
-                    }
-                    if rollout.archived && metadata.archived_at.is_none() {
-                        let fallback_archived_at = metadata.updated_at;
-                        metadata.archived_at = file_modified_time_utc(&rollout.path)
-                            .await
-                            .or(Some(fallback_archived_at));
-                    }
-                    if let Err(err) = runtime.upsert_thread_preserving_timestamps(&metadata).await {
-                        warn!("failed to upsert rollout {}: {err}", rollout.path.display());
-                        false
-                    } else if let Some(parent_thread_id) = parent_thread_id
-                        && let Err(err) = runtime
-                            .insert_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
-                            .await
-                    {
+                    Err(err) => {
                         warn!(
-                            "failed to restore parent edge for {}: {err}",
+                            "failed to extract rollout {}: {err}",
                             rollout.path.display()
                         );
-                        false
-                    } else {
-                        stats.upserted = stats.upserted.saturating_add(1);
-                        true
+                        // Invalid content cannot be repaired by retrying this pass, but exhausted
+                        // I/O retries do not prove a rollout is permanently unreadable. Keep the
+                        // contiguous checkpoint before it so a later worker can recover it.
+                        let retryable_io = err
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|err| err.kind() != std::io::ErrorKind::InvalidData);
+                        if !retryable_io {
+                            stats.failed = stats.failed.saturating_add(1);
+                            (true, Some(BackfillMemoOutcome::Settled))
+                        } else if is_repairable_payload_gap(&err) {
+                            (
+                                false,
+                                Some(BackfillMemoOutcome::PayloadGap(gap_dependencies)),
+                            )
+                        } else {
+                            (false, None)
+                        }
                     }
+                };
+            if !settled {
+                match &remembered {
+                    Some(BackfillMemoOutcome::PayloadGap(Some(_))) => {
+                        confirmed_gaps = confirmed_gaps.saturating_add(1);
+                    }
+                    Some(BackfillMemoOutcome::PayloadGap(None)) => {
+                        unconfirmed_gaps = unconfirmed_gaps.saturating_add(1);
+                    }
+                    Some(BackfillMemoOutcome::Settled) | None => transient_failures = true,
                 }
-                Err(err) => {
-                    warn!(
-                        "failed to extract rollout {}: {err}",
-                        rollout.path.display()
+            }
+            match remembered {
+                Some(outcome) => {
+                    memo.entries.insert(
+                        rollout.path.clone(),
+                        BackfillMemoEntry {
+                            source: source_version,
+                            outcome,
+                        },
                     );
-                    // Invalid content cannot be repaired by retrying this pass, but exhausted
-                    // I/O retries do not prove a rollout is permanently unreadable. Keep the
-                    // contiguous checkpoint before it so a later worker can recover it.
-                    let retryable_io = err
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|err| err.kind() != std::io::ErrorKind::InvalidData);
-                    if !retryable_io {
-                        stats.failed = stats.failed.saturating_add(1);
-                    }
-                    !retryable_io
                 }
-            };
+                None => {
+                    memo.entries.remove(&rollout.path);
+                }
+            }
             if settled {
                 if !unresolved_failures {
                     contiguous_watermark = Some(rollout.watermark.clone());
@@ -563,6 +836,7 @@ pub(crate) async fn backfill_sessions_until(
         {
             if let Err(err) = runtime.checkpoint_backfill(watermark).await {
                 unresolved_failures = true;
+                transient_failures = true;
                 warn!(
                     "failed to checkpoint backfill at {}: {err}",
                     codex_home.display()
@@ -601,6 +875,7 @@ pub(crate) async fn backfill_sessions_until(
         .mark_backfill_complete(contiguous_watermark.as_deref())
         .await
     {
+        transient_failures = true;
         warn!(
             "failed to mark backfill complete at {}: {err}",
             codex_home.display()
@@ -612,10 +887,19 @@ pub(crate) async fn backfill_sessions_until(
             );
         }
     }
+    memo.last_pass = Some(if stopped || transient_failures {
+        PassRemainder::Unresolved
+    } else if unconfirmed_gaps > 0 {
+        PassRemainder::UnconfirmedPayloadGaps
+    } else if confirmed_gaps > 0 {
+        PassRemainder::ConfirmedPayloadGaps(confirmed_gaps)
+    } else {
+        PassRemainder::Settled
+    });
 
     info!(
-        "state db backfill scanned={}, upserted={}, failed={}",
-        stats.scanned, stats.upserted, stats.failed
+        "state db backfill scanned={}, extracted={}, unchanged={}, upserted={}, failed={}",
+        stats.scanned, report.extracted, report.unchanged, stats.upserted, stats.failed
     );
     if metric_client.is_some() || timer.is_some() {
         // SDK instrument creation and measurement may take shared SDK locks or
@@ -647,6 +931,7 @@ pub(crate) async fn backfill_sessions_until(
         })
         .await;
     }
+    report
 }
 
 #[derive(Debug, Clone)]

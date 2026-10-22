@@ -46,20 +46,29 @@ class ProcessOwnerTest(unittest.TestCase):
                 ) as launch:
                     try:
                         result = process_owner.run_owned(
-                            [sys.executable, "-c", parent], capture_output=True,
-                            text=text_mode, encoding="utf-8" if text_mode else None,
-                            timeout=5, check=True,
+                            [sys.executable, "-c", parent],
+                            capture_output=True,
+                            text=text_mode,
+                            encoding="utf-8" if text_mode else None,
+                            timeout=5,
+                            check=True,
                         )
                     except subprocess.CalledProcessError as error:
                         result = error
                     launch.assert_called_once()
                 self.assertLess(time.monotonic() - started, 3)
                 self.assertEqual(result.returncode, code)
-                self.assertEqual(result.stdout, stdout.decode() if text_mode else stdout)
-                self.assertEqual(result.stderr, stderr.decode() if text_mode else stderr)
+                self.assertEqual(
+                    result.stdout, stdout.decode() if text_mode else stdout
+                )
+                self.assertEqual(
+                    result.stderr, stderr.decode() if text_mode else stderr
+                )
                 with socket.socket() as probe:
-                    probe.settimeout(.2)
-                    self.assertNotEqual(probe.connect_ex(("127.0.0.1", int(ready.read_text()))), 0)
+                    probe.settimeout(0.2)
+                    self.assertNotEqual(
+                        probe.connect_ex(("127.0.0.1", int(ready.read_text()))), 0
+                    )
 
     def test_successful_opt_in_descendant_is_preserved(self):
         child = "import time; time.sleep(.3); print('descendant',flush=True)"
@@ -69,8 +78,11 @@ class ProcessOwnerTest(unittest.TestCase):
             "print('primary',flush=True)"
         )
         result = process_owner.run_owned(
-            [sys.executable, "-c", parent], capture_output=True, text=True,
-            timeout=5, preserve_descendants_on_success=True,
+            [sys.executable, "-c", parent],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            preserve_descendants_on_success=True,
         )
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "primary\ndescendant\n")
@@ -86,6 +98,7 @@ class ProcessOwnerTest(unittest.TestCase):
                     "operation_timeout": TimeoutError,
                 }[mode]
                 with process_owner.operation() as operation:
+
                     @contextlib.contextmanager
                     def after_flush(*args, **kwargs):
                         with real_owned_process(*args, **kwargs) as child:
@@ -93,7 +106,7 @@ class ProcessOwnerTest(unittest.TestCase):
                             while not ready.exists():
                                 self.assertIsNone(child.poll())
                                 self.assertLess(time.monotonic(), deadline)
-                                time.sleep(.01)
+                                time.sleep(0.01)
                             if mode == "cancel":
                                 operation.cancelled.set()
                             elif mode == "operation_timeout":
@@ -102,16 +115,22 @@ class ProcessOwnerTest(unittest.TestCase):
 
                     with (
                         mock.patch.object(process_owner, "owned_process", after_flush),
-                        mock.patch.object(process_owner.subprocess, "Popen", wraps=subprocess.Popen) as launch,
+                        mock.patch.object(
+                            process_owner.subprocess, "Popen", wraps=subprocess.Popen
+                        ) as launch,
                         self.assertRaises(expected_error) as raised,
                     ):
                         process_owner.run_owned(
-                            [sys.executable, "-c",
-                             "import sys,time; from pathlib import Path; "
-                             "sys.stdout.buffer.write(b'completed step\\n'); sys.stdout.buffer.flush(); "
-                             "sys.stderr.buffer.write(b'unfinished step\\n'); sys.stderr.buffer.flush(); "
-                             f"Path({str(ready)!r}).touch(); time.sleep(60)"],
-                            capture_output=True, timeout=.2,
+                            [
+                                sys.executable,
+                                "-c",
+                                "import sys,time; from pathlib import Path; "
+                                "sys.stdout.buffer.write(b'completed step\\n'); sys.stdout.buffer.flush(); "
+                                "sys.stderr.buffer.write(b'unfinished step\\n'); sys.stderr.buffer.flush(); "
+                                f"Path({str(ready)!r}).touch(); time.sleep(60)",
+                            ],
+                            capture_output=True,
+                            timeout=0.2,
                         )
                     launch.assert_called_once()
                     self.assertEqual(raised.exception.output, b"completed step\n")
@@ -120,7 +139,9 @@ class ProcessOwnerTest(unittest.TestCase):
     def test_owned_post_cleanup_drain_is_bounded_and_never_claims_success(self):
         process = mock.Mock()
         process.poll.return_value = 7
-        process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 5, output=b"partial")
+        process.communicate.side_effect = subprocess.TimeoutExpired(
+            "fixture", 5, output=b"partial"
+        )
 
         @contextlib.contextmanager
         def owner(*args, **kwargs):
@@ -128,7 +149,9 @@ class ProcessOwnerTest(unittest.TestCase):
 
         with (
             mock.patch.object(process_owner, "owned_process", owner),
-            self.assertRaisesRegex(process_owner.CleanupFailed, "output pipes") as raised,
+            self.assertRaisesRegex(
+                process_owner.CleanupFailed, "output pipes"
+            ) as raised,
         ):
             process_owner.run_owned(["fixture"], capture_output=True)
         self.assertEqual(process.communicate.call_count, 2)
@@ -138,7 +161,7 @@ class ProcessOwnerTest(unittest.TestCase):
     def test_owned_failed_tree_cleanup_is_not_replaced_by_output_drain(self):
         process = mock.Mock()
         process.poll.return_value = 7
-        process.communicate.side_effect = subprocess.TimeoutExpired("fixture", .1)
+        process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 0.1)
 
         @contextlib.contextmanager
         def owner(*args, **kwargs):
@@ -147,28 +170,39 @@ class ProcessOwnerTest(unittest.TestCase):
 
         with (
             mock.patch.object(process_owner, "owned_process", owner),
-            self.assertRaisesRegex(process_owner.CleanupFailed, "tree exit unconfirmed"),
+            self.assertRaisesRegex(
+                process_owner.CleanupFailed, "tree exit unconfirmed"
+            ),
         ):
             process_owner.run_owned(["fixture"], capture_output=True)
         process.communicate.assert_called_once()
 
     def test_cli_below_normal_priority_is_opt_in(self):
         for flags in ([], ["--below-normal-priority"]):
-            with self.subTest(flags=flags), mock.patch.object(
-                process_owner, "run_owned",
-                return_value=subprocess.CompletedProcess(["fixture"], 7),
-            ) as run:
+            with (
+                self.subTest(flags=flags),
+                mock.patch.object(
+                    process_owner,
+                    "run_owned",
+                    return_value=subprocess.CompletedProcess(["fixture"], 7),
+                ) as run,
+            ):
                 self.assertEqual(process_owner.main([*flags, "--", "fixture"]), 7)
                 self.assertEqual(run.call_args.args[0], ["fixture"])
                 self.assertEqual(
                     run.call_args.kwargs["creationflags"],
-                    getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0) if flags else 0,
+                    getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+                    if flags
+                    else 0,
                 )
 
     def test_timeout_preserves_flushed_short_diagnostic(self):
         real_owned_process = process_owner.owned_process
         for startup_delay in (0, 0.7):
-            with self.subTest(startup_delay=startup_delay), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(startup_delay=startup_delay),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 flushed = Path(directory) / "flushed"
                 ready_at = None
 
@@ -178,8 +212,12 @@ class ProcessOwnerTest(unittest.TestCase):
                     with real_owned_process(*args, **kwargs) as child:
                         deadline = time.monotonic() + 10
                         while not flushed.exists():
-                            self.assertIsNone(child.poll(), "child exited before flushing")
-                            self.assertLess(time.monotonic(), deadline, "child did not flush")
+                            self.assertIsNone(
+                                child.poll(), "child exited before flushing"
+                            )
+                            self.assertLess(
+                                time.monotonic(), deadline, "child did not flush"
+                            )
                             time.sleep(0.01)
                         ready_at = time.monotonic()
                         yield child
@@ -236,6 +274,43 @@ class ProcessOwnerTest(unittest.TestCase):
                 observe=observer,
             )
         observer.assert_called_once()
+
+    def test_reader_error_after_prefix_cannot_certify_complete_output(self):
+        real_owned_process = process_owner.owned_process
+        observed = []
+
+        class FailingReader:
+            def __init__(self, pipe):
+                self.pipe = pipe
+                self.first = True
+
+            def read1(self, size):
+                if self.first:
+                    self.first = False
+                    return self.pipe.read(4)
+                raise OSError("injected capture failure")
+
+            def close(self):
+                self.pipe.close()
+
+        @contextlib.contextmanager
+        def failing_reader(*args, **kwargs):
+            with real_owned_process(*args, **kwargs) as child:
+                child.stdout = FailingReader(child.stdout)
+                yield child
+
+        with mock.patch.object(process_owner, "owned_process", failing_reader):
+            with self.assertRaisesRegex(
+                process_owner.CleanupFailed, "injected capture failure"
+            ) as caught:
+                process_owner.run_finite(
+                    [sys.executable, "-c", "import sys; sys.stdout.write('HEADTAIL')"],
+                    timeout=5,
+                    observe=observed.append,
+                )
+        self.assertEqual("".join(observed), "HEAD")
+        self.assertEqual(caught.exception.stdout, "HEAD")
+        self.assertEqual(caught.exception.returncode, 0)
 
     def test_version_probe_uses_owned_timeout_and_reaps_shim_child(self):
         if os.name != "nt":

@@ -76,6 +76,9 @@ pub struct ShellRequest {
 pub struct ShellRuntime {
     last_validation_attempt_output: Option<ExecToolCallOutput>,
     last_validation_attempt_started: bool,
+    raw_output: Option<crate::tools::command_output_artifact::capture::CapturedShellOutput>,
+    validation_raw_output:
+        Option<crate::tools::command_output_artifact::capture::CapturedShellOutput>,
 }
 
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
@@ -93,6 +96,8 @@ impl ShellRuntime {
         Self {
             last_validation_attempt_output: None,
             last_validation_attempt_started: false,
+            raw_output: None,
+            validation_raw_output: None,
         }
     }
 
@@ -102,6 +107,17 @@ impl ShellRuntime {
 
     pub(crate) fn take_last_validation_attempt_started(&mut self) -> bool {
         std::mem::take(&mut self.last_validation_attempt_started)
+    }
+
+    pub(crate) fn take_raw_output(
+        &mut self,
+        restored_validation: bool,
+    ) -> Option<crate::tools::command_output_artifact::capture::CapturedShellOutput> {
+        if restored_validation {
+            self.validation_raw_output.take()
+        } else {
+            self.raw_output.take()
+        }
     }
 
     fn remember_validation_attempt_error(
@@ -120,6 +136,7 @@ impl ShellRuntime {
             _ => return,
         };
         self.last_validation_attempt_output = Some(output.clone());
+        self.validation_raw_output = self.raw_output.clone();
     }
 
     fn stdout_stream(
@@ -131,6 +148,7 @@ impl ShellRuntime {
             call_id: ctx.call_id.clone(),
             tx_event: ctx.session.get_tx_event(),
             progress,
+            delivery_recovery: None,
         })
     }
 }
@@ -286,6 +304,15 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
+        // Only a sandbox enforces requested restrictions, and the orchestrator selects
+        // `SandboxType::None` when this host has no sandbox backend. Refuse such a
+        // launch like `build_exec_request` and unified exec instead of running it
+        // without enforcement. This runtime always launches on this host, so a
+        // remote-labelled environment is not exempt. Launches whose policy
+        // requested no sandbox are unchanged.
+        if attempt.sandbox_requested && attempt.sandbox == codex_sandboxing::SandboxType::None {
+            return Err(ToolError::Codex(crate::exec::unavailable_sandbox_error()));
+        }
         let _workspace_operation_permit = match req.workspace_operation_root.as_deref() {
             Some(root) => {
                 let _tool_wait = ctx.turn.turn_timing_state.begin_tool_execution();
@@ -301,20 +328,26 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                         ),
                     )
                     .await
-                    .map_err(ToolError::Rejected)?,
+                    .map_err(|reason| {
+                        crate::validation_task::record_admission_refusal(ctx);
+                        ToolError::Rejected(reason)
+                    })?,
                 )
             }
             None => None,
         };
-        let session_shell = ctx.session.user_shell();
-        let shell = req
-            .turn_environment
-            .shell
-            .as_ref()
-            .unwrap_or(session_shell.as_ref());
+        let session_shell = ctx
+            .session
+            .shell_for_environment(&req.turn_environment)
+            .await
+            .map_err(|error| ToolError::Rejected(error.to_string()))?;
+        let shell = session_shell.as_ref();
         let shell_snapshot_location = req
             .turn_environment
-            .shell_snapshot(&codex_utils_path_uri::PathUri::from_abs_path(&req.cwd))
+            .shell_snapshot_for_config(
+                &codex_utils_path_uri::PathUri::from_abs_path(&req.cwd),
+                &ctx.turn.config,
+            )
             .await;
         let (file_system_sandbox_policy, _) = attempt.permissions.to_runtime_permissions();
         let sandbox_permissions = sandbox_permissions_preserving_denied_reads(
@@ -386,6 +419,13 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             .await
             .map_err(ToolError::Codex)?;
         env.windows_sandbox_additional_read_roots = additional_read_roots;
+        crate::validation_task::begin_dispatch(
+            ctx,
+            &mut env.env,
+            !req.turn_environment.environment.is_remote(),
+        )
+        .await
+        .map_err(ToolError::Rejected)?;
         let validation_attempt_started = Arc::new(AtomicBool::new(false));
         let after_spawn = req.validation_launch.then(|| {
             let validation_attempt_started = Arc::clone(&validation_attempt_started);
@@ -395,10 +435,15 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         });
         let progress = req.stall_timeout_ms.map(|_| CommandProgress::new());
         let progress_observer = progress.as_ref().map(CommandProgress::subscribe);
-        let execution = execute_exec_request_with_after_spawn(
-            env,
-            Self::stdout_stream(ctx, progress),
-            after_spawn,
+        let thread_id = ctx.session.thread_id.to_string();
+        let execution = crate::tools::command_output_artifact::capture::capture_legacy_output(
+            &ctx.turn.config.codex_home,
+            &thread_id,
+            execute_exec_request_with_after_spawn(
+                env,
+                Self::stdout_stream(ctx, progress),
+                after_spawn,
+            ),
         );
         tokio::pin!(execution);
         let (out, stalled) = match (req.stall_timeout_ms, progress_observer, stall_cancellation) {
@@ -419,6 +464,8 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             }
             _ => (execution.await, false),
         };
+        let (out, raw_output) = out;
+        self.raw_output = Some(raw_output);
         let mut out = match out {
             Ok(out) => out,
             Err(CodexErr::Sandbox(SandboxErr::Timeout { output })) if stalled => *output,

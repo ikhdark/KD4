@@ -24,6 +24,7 @@ fn subagent_changes_do_not_resend_environment_and_replay_after_loss() {
     let build = |agent: &str| {
         let mut state = WorldState::default();
         state.add_section(EnvironmentsState {
+            primary_environment_id: None,
             current_date: Some("2026-09-28".into()),
             ..Default::default()
         });
@@ -56,12 +57,14 @@ fn subagent_changes_do_not_resend_environment_and_replay_after_loss() {
 #[test]
 fn only_latest_delivered_environment_proves_shell_status_clear_and_removal() {
     let environment = EnvironmentState {
+        owner_id: None,
         cwd: PathUri::parse("file:///repo").unwrap(),
         shell: Some("bash".into()),
         os: Some("linux".into()),
         status: EnvironmentStatus::Starting,
     };
     let mut current = EnvironmentsState {
+        primary_environment_id: None,
         environments: [("remote".to_string(), environment)].into_iter().collect(),
         current_date: Some("2026-09-21".into()),
         ..Default::default()
@@ -112,6 +115,7 @@ fn only_latest_delivered_environment_proves_shell_status_clear_and_removal() {
 fn optional_subagent_list_is_bounded_without_truncating_execution_facts() {
     let mut state = WorldState::default();
     state.add_section(EnvironmentsState {
+        primary_environment_id: None,
         current_date: Some("2026-09-21".into()),
         ..Default::default()
     });
@@ -154,9 +158,11 @@ fn latest_delivery_stands_alone_after_an_intermediate_clear_is_lost() {
     let make = |shell: Option<&str>, date: &str| {
         let mut world = WorldState::default();
         world.add_section(EnvironmentsState {
+            primary_environment_id: None,
             environments: [(
                 "remote".to_string(),
                 EnvironmentState {
+                    owner_id: None,
                     cwd: PathUri::parse("file:///repo").unwrap(),
                     status: EnvironmentStatus::Available,
                     shell: shell.map(str::to_string),

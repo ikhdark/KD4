@@ -55,6 +55,14 @@ pub type CorrelationId = String;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RolloutTrace {
     pub schema_version: u32,
+    /// Producer observations indexed by persistence sequence. Missing entries
+    /// have unknown occurrence time; writer timestamps cannot fill the gap.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub event_occurrences: BTreeMap<crate::RawEventSeq, crate::TraceOccurrence>,
+    /// Known payload/detail losses; absent means unknown for legacy captures.
+    /// Independent from execution status. Zero is not task verification.
+    #[serde(default)]
+    pub payload_capture_gap_count: Option<u64>,
     /// Unique identity for this trace capture.
     ///
     /// `rollout_id` names the Codex rollout/session being observed. `trace_id`
@@ -100,6 +108,8 @@ impl RolloutTrace {
     ) -> Self {
         Self {
             schema_version,
+            event_occurrences: BTreeMap::new(),
+            payload_capture_gap_count: None,
             trace_id,
             rollout_id,
             started_at_unix_ms,

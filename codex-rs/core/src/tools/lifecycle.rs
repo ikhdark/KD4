@@ -66,6 +66,23 @@ pub(crate) async fn notify_tool_finish(invocation: &ToolInvocation, outcome: Too
         &invocation.tool_name,
         invocation.source.clone(),
         outcome,
+        false,
+    )
+    .await;
+}
+
+pub(crate) async fn notify_required_tool_finish(
+    invocation: &ToolInvocation,
+    outcome: ToolCallOutcome,
+) {
+    notify_tool_finish_parts(
+        invocation.session.as_ref(),
+        invocation.step_context.turn.as_ref(),
+        invocation.call_id.as_str(),
+        &invocation.tool_name,
+        invocation.source.clone(),
+        outcome,
+        true,
     )
     .await;
 }
@@ -77,6 +94,29 @@ pub(crate) async fn notify_tool_aborted(
     tool_name: &ToolName,
     source: ToolCallSource,
 ) {
+    // Cancellation cannot claim successful accounting when its dependency is
+    // stalled. Bound this observation too and retain an explicit diagnostic;
+    // ordinary terminal success still waits for required accounting above.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        notify_tool_finish_parts(
+            session,
+            turn,
+            call_id,
+            tool_name,
+            source.clone(),
+            ToolCallOutcome::Aborted,
+            true,
+        ),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            call_id,
+            "cancelled tool required finish accounting is unconfirmed after its deadline"
+        );
+    }
     notify_tool_finish_parts(
         session,
         turn,
@@ -84,6 +124,7 @@ pub(crate) async fn notify_tool_aborted(
         tool_name,
         source,
         ToolCallOutcome::Aborted,
+        false,
     )
     .await;
 }
@@ -95,9 +136,15 @@ async fn notify_tool_finish_parts(
     tool_name: &ToolName,
     source: ToolCallSource,
     outcome: ToolCallOutcome,
+    required: bool,
 ) {
+    // One absolute observation budget, not a fresh timeout per contributor.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     for contributor in session.services.extensions.tool_lifecycle_contributors() {
-        let result = AssertUnwindSafe(async {
+        if contributor.requires_finish_before_completion() != required {
+            continue;
+        }
+        let callback = AssertUnwindSafe(async {
             contributor
                 .on_tool_finish(ToolFinishInput {
                     session_store: &session.services.session_extension_data,
@@ -111,10 +158,23 @@ async fn notify_tool_finish_parts(
                 })
                 .await;
         })
-        .catch_unwind()
-        .await;
+        .catch_unwind();
+        let result = if required {
+            callback.await
+        } else {
+            match tokio::time::timeout_at(deadline, callback).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        call_id,
+                        "tool finish observation deadline exceeded; observer cancelled, committed tool result preserved"
+                    );
+                    continue;
+                }
+            }
+        };
         if result.is_err() {
-            tracing::warn!(call_id, "tool lifecycle finish callback panicked");
+            tracing::warn!(call_id, required, "tool lifecycle finish callback panicked");
         }
     }
 }

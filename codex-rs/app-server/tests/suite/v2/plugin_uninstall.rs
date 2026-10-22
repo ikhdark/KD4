@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use super::plugin_test_support::write_installed_plugin;
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::ChatGptAuthFixture;
@@ -23,8 +25,6 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
-use super::plugin_test_support::write_installed_plugin;
-use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_PLUGIN_ID: &str = "plugins~Plugin_linear";

@@ -12,6 +12,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use core_test_support::require_network;
 use core_test_support::responses::ev_assistant_message;
@@ -32,9 +33,14 @@ use wiremock::matchers::path;
 async fn fork_thread_twice_drops_to_first_message() {
     require_network!();
 
-    // Start a mock server that completes three turns.
+    // Start a mock server that completes three turns. Each turn answers, because an
+    // empty completion spends the bounded missing-answer repair on another request.
     let server = MockServer::start().await;
-    let sse = sse(vec![ev_response_created("resp"), ev_completed("resp")]);
+    let sse = sse(vec![
+        ev_response_created("resp"),
+        ev_assistant_message("msg", "done"),
+        ev_completed("resp"),
+    ]);
     let first = ResponseTemplate::new(200)
         .insert_header("content-type", "text/event-stream")
         .set_body_raw(sse.clone(), "text/event-stream");
@@ -154,8 +160,11 @@ async fn fork_thread_from_history_rejects_invalid_dynamic_tools() {
     require_network!();
 
     let server = MockServer::start().await;
+    // The source turn answers; an empty completion spends the bounded
+    // missing-answer repair on another request.
     let source_sse = sse(vec![
         ev_response_created("resp-source"),
+        ev_assistant_message("msg-source", "source persisted"),
         ev_completed("resp-source"),
     ]);
     mount_sse_sequence(&server, vec![source_sse]).await;
@@ -390,23 +399,28 @@ fn contains_reasoning(items: &[RolloutItem], expected_id: &str) -> bool {
 fn assert_fork_rollout(actual: &[RolloutItem], expected_copied_prefix: &[RolloutItem]) {
     // These forks retain the parent's settings. The recorder deduplicates the
     // identical authoritative child snapshot instead of appending another copy.
-    // Context pressure is inherited, but consumed provider work belongs to the parent.
-    let expected = expected_copied_prefix.iter().cloned().map(|mut item| {
-        if let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = &mut item
-            && let Some(info) = event.info.as_mut()
-        {
-            let context_tokens = info.estimated_context_tokens
-                .unwrap_or(info.last_token_usage.total_tokens);
-            info.total_token_usage = Default::default();
-            info.last_token_usage = Default::default();
-            info.estimated_context_tokens = Some(context_tokens);
-        }
-        item
-    }).collect::<Vec<_>>();
+    // Context pressure is inherited, but consumed provider work belongs to the parent:
+    // the child starts a fresh ledger with zero reported receipts.
+    let expected = expected_copied_prefix
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            if let RolloutItem::EventMsg(EventMsg::TokenCount(event)) = &mut item
+                && let Some(info) = event.info.as_mut()
+            {
+                let context_tokens = info
+                    .estimated_context_tokens
+                    .unwrap_or(info.last_token_usage.total_tokens);
+                info.total_token_usage = TokenUsage::empty_ledger();
+                info.last_token_usage = Default::default();
+                info.estimated_context_tokens = Some(context_tokens);
+            }
+            item
+        })
+        .collect::<Vec<_>>();
     pretty_assertions::assert_eq!(
         serde_json::to_value(actual).expect("actual fork rollout prefix should serialize"),
-        serde_json::to_value(&expected)
-            .expect("expected fork rollout prefix should serialize")
+        serde_json::to_value(&expected).expect("expected fork rollout prefix should serialize")
     );
     assert!(
         actual.iter().any(|item| matches!(

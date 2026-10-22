@@ -413,19 +413,25 @@ async fn websocket_control_frames_do_not_restart_event_timeout() -> anyhow::Resu
             websocket.send(Message::Pong(Vec::new().into())).await?;
             sleep(Duration::from_millis(10)).await;
         }
-        websocket.send(Message::Text(
-            r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into(),
-        )).await?;
+        websocket
+            .send(Message::Text(
+                r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into(),
+            ))
+            .await?;
         Ok::<_, anyhow::Error>(())
     });
     let (websocket, _) = connect_async(format!("ws://{address}")).await?;
     harness.websocket.close(None).await?;
     harness.websocket = websocket;
-    let result = timeout(Duration::from_secs(2),
-        harness.next_event_with_timeout(Duration::from_millis(100))).await;
+    let result = timeout(
+        Duration::from_secs(2),
+        harness.next_event_with_timeout(Duration::from_millis(100)),
+    )
+    .await;
     peer.abort();
     let _ = peer.await;
-    let error = result.expect("event wait must remain bounded")
+    let error = result
+        .expect("event wait must remain bounded")
         .expect_err("control frames must not extend the event deadline");
     assert!(error.to_string().contains("timed out waiting"), "{error}");
     Ok(())

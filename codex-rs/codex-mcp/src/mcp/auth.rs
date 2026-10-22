@@ -439,7 +439,8 @@ mod tests {
             tools: HashMap::new(),
         });
         let mut bearer = server.configured_config().unwrap().clone();
-        if let McpServerTransportConfig::StreamableHttp { http_headers, .. } = &mut bearer.transport {
+        if let McpServerTransportConfig::StreamableHttp { http_headers, .. } = &mut bearer.transport
+        {
             *http_headers = Some(HashMap::from([(
                 "Authorization".to_string(),
                 "Bearer fixture".to_string(),

@@ -13,6 +13,115 @@ pub(crate) struct CatalogRequestProcessor {
     pub(super) config: Arc<Config>,
     pub(super) config_manager: ConfigManager,
     pub(super) workspace_settings_cache: Arc<workspace_settings::WorkspaceSettingsCache>,
+    current_catalogs: Arc<std::sync::Mutex<Vec<CurrentCatalog>>>,
+    pagination: Arc<std::sync::Mutex<ModelPaginationState>>,
+}
+
+struct CurrentCatalog {
+    provider_id: String,
+    provider: codex_model_provider_info::ModelProviderInfo,
+    http_clients: codex_http_client::HttpClientFactory,
+    manager: SharedModelsManager,
+    _worker: crate::models_refresh_worker::ModelsRefreshWorker,
+}
+
+struct ModelPaginationState {
+    nonce: String,
+    generation: u64,
+    identity: Option<String>,
+    snapshot: Option<(
+        SharedModelsManager,
+        Arc<Vec<codex_protocol::openai_models::ModelPreset>>,
+    )>,
+}
+
+impl Default for ModelPaginationState {
+    fn default() -> Self {
+        Self {
+            nonce: uuid::Uuid::now_v7().to_string(),
+            generation: 0,
+            identity: None,
+            snapshot: None,
+        }
+    }
+}
+
+impl ModelPaginationState {
+    fn bind(
+        &mut self,
+        manager: SharedModelsManager,
+        models: Arc<Vec<codex_protocol::openai_models::ModelPreset>>,
+        identity: Option<String>,
+    ) {
+        if self.identity == identity
+            && self
+                .snapshot
+                .as_ref()
+                .is_some_and(|(old_manager, old_models)| {
+                    Arc::ptr_eq(old_manager, &manager)
+                        && (Arc::ptr_eq(old_models, &models) || old_models == &models)
+                })
+        {
+            return;
+        }
+        match self.generation.checked_add(1) {
+            Some(generation) => self.generation = generation,
+            None => {
+                // Start a fresh cursor epoch rather than reuse a generation, so no
+                // earlier cursor can resume against the newly bound catalog.
+                self.nonce = uuid::Uuid::now_v7().to_string();
+                self.generation = 0;
+            }
+        }
+        self.identity = identity;
+        self.snapshot = Some((manager, models));
+    }
+
+    fn cursor(&self, hidden: bool, index: usize) -> String {
+        format!(
+            "v1:{}:{}:{}:{index}",
+            self.nonce,
+            self.generation,
+            u8::from(hidden)
+        )
+    }
+
+    fn start(
+        &self,
+        cursor: Option<&str>,
+        hidden: bool,
+        total: usize,
+    ) -> Result<usize, JSONRPCErrorError> {
+        let Some(cursor) = cursor else {
+            return Ok(0);
+        };
+        if cursor == "0" {
+            return Ok(0);
+        } // Legacy restart, never a continuation.
+        let prefix = format!(
+            "v1:{}:{}:{}:",
+            self.nonce,
+            self.generation,
+            u8::from(hidden)
+        );
+        let Some(index) = cursor.strip_prefix(&prefix) else {
+            if cursor.starts_with("v1:") || cursor.parse::<usize>().is_ok() {
+                return Err(invalid_request(
+                    "stale model cursor; restart model/list without a cursor",
+                ));
+            }
+            return Err(invalid_request(format!("invalid cursor: {cursor}")));
+        };
+        let start = index
+            .parse::<usize>()
+            .map_err(|_| invalid_request(format!("invalid cursor: {cursor}")))?;
+        if start > total {
+            return Err(invalid_request(format!(
+                "cursor {start} exceeds total models {total}"
+            )));
+        }
+        Ok(start)
+    }
 }
 
 const SKILLS_LIST_CWD_CONCURRENCY: usize = 5;
@@ -24,7 +133,8 @@ fn skills_to_info(
     skills
         .iter()
         .map(|skill| {
-            let enabled = !disabled_paths.contains(&skill.path_to_skills_md);
+            let enabled =
+                skill.source.is_some() || !disabled_paths.contains(&skill.path_to_skills_md);
             codex_app_server_protocol::SkillMetadata {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
@@ -94,6 +204,8 @@ impl CatalogRequestProcessor {
             config,
             config_manager,
             workspace_settings_cache,
+            current_catalogs: Arc::default(),
+            pagination: Arc::default(),
         }
     }
 
@@ -137,13 +249,51 @@ impl CatalogRequestProcessor {
         &self,
         params: ModelListParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        Self::list_models(
-            self.models_manager.clone(),
-            self.config.http_client_factory(),
-            params,
-        )
-        .await
-        .map(|response| Some(response.into()))
+        let config = self.load_latest_config(None).await?;
+        let http_clients = config.http_client_factory();
+        let manager = if config.model_provider_id == self.config.model_provider_id
+            && config.model_provider == self.config.model_provider
+        {
+            self.models_manager.clone()
+        } else {
+            let mut catalogs = self
+                .current_catalogs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = catalogs.iter().find(|entry| {
+                entry.provider_id == config.model_provider_id
+                    && entry.provider == config.model_provider
+                    && entry.http_clients == http_clients
+            }) {
+                entry.manager.clone()
+            } else {
+                let provider = codex_model_provider::create_model_provider(
+                    config.model_provider.clone(),
+                    Some(self.auth_manager.clone()),
+                );
+                // Manual catalogs belong to process startup, not subsequent config writes.
+                let manager = provider.models_manager(
+                    &config.model_provider_id,
+                    config.codex_home.to_path_buf(),
+                    self.config.model_catalog.clone(),
+                );
+                let worker = crate::models_refresh_worker::spawn(&manager, http_clients.clone());
+                if catalogs.len() == 8 {
+                    catalogs.remove(0);
+                }
+                catalogs.push(CurrentCatalog {
+                    provider_id: config.model_provider_id,
+                    provider: config.model_provider,
+                    http_clients: http_clients.clone(),
+                    manager: manager.clone(),
+                    _worker: worker,
+                });
+                manager
+            }
+        };
+        Self::list_models(manager, http_clients, params, &self.pagination)
+            .await
+            .map(|response| Some(response.into()))
     }
 
     pub(crate) async fn experimental_feature_list(
@@ -211,26 +361,39 @@ impl CatalogRequestProcessor {
         models_manager: SharedModelsManager,
         http_client_factory: codex_http_client::HttpClientFactory,
         params: ModelListParams,
+        pagination: &std::sync::Mutex<ModelPaginationState>,
     ) -> Result<ModelListResponse, JSONRPCErrorError> {
         let ModelListParams {
             limit,
             cursor,
             include_hidden,
         } = params;
-        let start = match cursor {
-            Some(cursor) => cursor
-                .parse::<usize>()
-                .map_err(|_| invalid_request(format!("invalid cursor: {cursor}")))?,
-            None => 0,
-        };
-        let models = supported_models(
-            models_manager,
-            include_hidden.unwrap_or(false),
-            http_client_factory,
-        )
-        .await
-        .map_err(|err| internal_error(format!("failed to list models: {err}")))?;
+        let identity = models_manager.catalog_identity();
+        let snapshot = models_manager
+            .list_models_shared(
+                codex_models_manager::manager::RefreshStrategy::OnlineIfUncached,
+                http_client_factory,
+            )
+            .await
+            .map_err(|err| internal_error(format!("failed to list models: {err}")))?;
+        if models_manager.catalog_identity() != identity {
+            return Err(invalid_request(
+                "model catalog identity changed; restart model/list without a cursor",
+            ));
+        }
+        let hidden = include_hidden.unwrap_or(false);
+        let models = snapshot
+            .iter()
+            .filter(|preset| hidden || preset.show_in_picker)
+            .cloned()
+            .map(crate::models::model_from_preset)
+            .collect::<Vec<_>>();
         let total = models.len();
+        let mut pagination = pagination
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pagination.bind(models_manager, snapshot, identity);
+        let start = pagination.start(cursor.as_deref(), hidden, total)?;
 
         let effective_limit = limit.unwrap_or(total as u32).max(1) as usize;
         let effective_limit = effective_limit.min(total);
@@ -244,7 +407,7 @@ impl CatalogRequestProcessor {
         let end = start.saturating_add(effective_limit).min(total);
         let items = models[start..end].to_vec();
         let next_cursor = if end < total {
-            Some(end.to_string())
+            Some(pagination.cursor(hidden, end))
         } else {
             None
         };
@@ -461,6 +624,10 @@ impl CatalogRequestProcessor {
         )
         .await;
         let skills_service = self.thread_manager.skills_service();
+        if force_reload {
+            // One generation fence per RPC, before parallel cwd loads.
+            skills_service.clear_cache();
+        }
         let plugins_manager = self.thread_manager.plugins_manager();
         let fs = self
             .thread_manager
@@ -509,7 +676,8 @@ impl CatalogRequestProcessor {
                         config.bundled_skills_enabled(),
                     );
                     let snapshot = skills_service
-                        .snapshot_for_cwd(&skills_input, force_reload, fs)
+                        // The RPC already fenced both cache tiers once, before parallel loads.
+                        .snapshot_for_cwd(&skills_input, false, fs)
                         .await;
                     let outcome = snapshot.outcome();
                     let errors = errors_to_info(&outcome.errors);
@@ -701,6 +869,164 @@ mod tests {
     use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
 
+    #[test]
+    fn identical_catalogs_do_not_allow_cross_identity_continuations() {
+        let models: SharedModelsManager = Arc::new(StaticModelsManager::new(
+            None,
+            ModelsResponse { models: Vec::new() },
+        ));
+        let snapshot = Arc::new(Vec::new());
+        let mut pagination = ModelPaginationState::default();
+        pagination.bind(models.clone(), snapshot.clone(), Some("account-a".into()));
+        let cursor = pagination.cursor(false, 0);
+        pagination.bind(models.clone(), snapshot.clone(), Some("account-a".into()));
+        assert_eq!(pagination.start(Some(&cursor), false, 0).unwrap(), 0);
+        assert!(pagination.start(Some(&cursor), true, 0).is_err());
+        pagination.bind(models, snapshot, Some("account-b".into()));
+        assert!(pagination.start(Some(&cursor), false, 0).is_err());
+    }
+
+    #[test]
+    fn exhausted_generation_starts_a_fresh_cursor_epoch() {
+        let models: SharedModelsManager = Arc::new(StaticModelsManager::new(
+            None,
+            ModelsResponse { models: Vec::new() },
+        ));
+        let mut pagination = ModelPaginationState::default();
+        let first_epoch_cursor = pagination.cursor(false, 0);
+        // As if the catalog had been rebound u64::MAX times in this process.
+        pagination.generation = u64::MAX;
+        pagination.bind(models, Arc::new(Vec::new()), Some("account-a".into()));
+        assert!(
+            pagination
+                .start(Some(&first_epoch_cursor), false, 0)
+                .is_err(),
+            "a cursor from an earlier epoch must stay stale after the generation is exhausted"
+        );
+        let cursor = pagination.cursor(false, 0);
+        assert_eq!(pagination.start(Some(&cursor), false, 0).unwrap(), 0);
+    }
+
+    #[derive(Debug)]
+    struct MutableCatalog(std::sync::Mutex<Vec<codex_protocol::openai_models::ModelInfo>>);
+
+    impl codex_models_manager::manager::ModelsEndpointClient for MutableCatalog {
+        fn has_authoritative_catalog(&self) -> bool {
+            true
+        }
+        fn has_command_auth(&self) -> bool {
+            false
+        }
+        fn uses_codex_backend(
+            &self,
+        ) -> codex_models_manager::manager::ModelsEndpointFuture<'_, bool> {
+            Box::pin(async { false })
+        }
+        fn list_models<'a>(
+            &'a self,
+            _version: &'a str,
+            _factory: HttpClientFactory,
+        ) -> codex_models_manager::manager::ModelsEndpointFuture<
+            'a,
+            codex_protocol::error::Result<(
+                Vec<codex_protocol::openai_models::ModelInfo>,
+                Option<String>,
+            )>,
+        > {
+            Box::pin(async { Ok((self.0.lock().unwrap().clone(), None)) })
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_catalog_rejects_continuation_instead_of_skipping_or_repeating() {
+        use codex_models_manager::manager::ModelsManager;
+        use codex_models_manager::manager::OpenAiModelsManager;
+        use codex_models_manager::manager::RefreshStrategy;
+        let records = |ids: &[&str]| {
+            ids.iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let mut model = codex_models_manager::model_info::model_info_from_slug(id);
+                    model.visibility = codex_protocol::openai_models::ModelVisibility::List;
+                    model.priority = index as i32;
+                    model
+                })
+                .collect::<Vec<_>>()
+        };
+        for changed in [
+            vec!["B", "C", "D"],
+            vec!["X", "A", "B", "C", "D"],
+            vec!["D", "C", "B", "A"],
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let endpoint = Arc::new(MutableCatalog(std::sync::Mutex::new(records(&[
+                "A", "B", "C", "D",
+            ]))));
+            let manager = Arc::new(OpenAiModelsManager::new(
+                home.path().into(),
+                endpoint.clone(),
+                None,
+                Arc::new(|| "pagination-fixture".into()),
+            ));
+            let shared: SharedModelsManager = manager.clone();
+            let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+            let pagination = std::sync::Mutex::new(ModelPaginationState::default());
+            let page = CatalogRequestProcessor::list_models(
+                shared.clone(),
+                factory.clone(),
+                ModelListParams {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+                &pagination,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                page.data
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .collect::<Vec<_>>(),
+                ["A", "B"]
+            );
+            // An equal-content refresh must not invalidate the opaque continuation.
+            manager
+                .raw_model_catalog(RefreshStrategy::Online, factory.clone())
+                .await
+                .unwrap();
+            let params = ModelListParams {
+                cursor: page.next_cursor,
+                limit: Some(2),
+                ..Default::default()
+            };
+            let stable = CatalogRequestProcessor::list_models(
+                shared.clone(),
+                factory.clone(),
+                params.clone(),
+                &pagination,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stable
+                    .data
+                    .iter()
+                    .map(|model| model.model.as_str())
+                    .collect::<Vec<_>>(),
+                ["C", "D"]
+            );
+            *endpoint.0.lock().unwrap() = records(&changed);
+            manager
+                .raw_model_catalog(RefreshStrategy::Online, factory.clone())
+                .await
+                .unwrap();
+            let error = CatalogRequestProcessor::list_models(shared, factory, params, &pagination)
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("stale model cursor"));
+        }
+    }
+
     #[tokio::test]
     async fn model_list_validates_cursors_even_when_catalog_is_empty() {
         let models: SharedModelsManager = Arc::new(StaticModelsManager::new(
@@ -708,6 +1034,7 @@ mod tests {
             ModelsResponse { models: Vec::new() },
         ));
         let http_clients = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault);
+        let pagination = std::sync::Mutex::new(ModelPaginationState::default());
 
         for cursor in [None, Some("0")] {
             let response = CatalogRequestProcessor::list_models(
@@ -717,6 +1044,7 @@ mod tests {
                     cursor: cursor.map(str::to_string),
                     ..Default::default()
                 },
+                &pagination,
             )
             .await
             .expect("the start of an empty catalog is a valid page");
@@ -726,7 +1054,10 @@ mod tests {
 
         for (cursor, expected) in [
             ("invalid", "invalid cursor: invalid"),
-            ("1", "cursor 1 exceeds total models 0"),
+            (
+                "1",
+                "stale model cursor; restart model/list without a cursor",
+            ),
         ] {
             let error = CatalogRequestProcessor::list_models(
                 models.clone(),
@@ -735,6 +1066,7 @@ mod tests {
                     cursor: Some(cursor.to_string()),
                     ..Default::default()
                 },
+                &pagination,
             )
             .await
             .expect_err("an empty catalog must not bypass cursor validation");

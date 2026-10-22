@@ -76,20 +76,22 @@ where
             return None;
         }
         match ProxyAddress::try_from(value) {
-            Ok(proxy) => {
+            Ok(mut proxy) => {
                 if proxy
                     .protocol
                     .as_ref()
                     .map(rama_net::Protocol::is_http)
                     .unwrap_or(true)
                 {
+                    // The HTTP serializer needs an explicit protocol to retain absolute-form.
+                    proxy.protocol.get_or_insert(rama_net::Protocol::HTTP);
                     return Some(proxy);
                 }
                 warn!("ignoring {key}: non-http proxy protocol");
                 return None;
             }
-            Err(err) => {
-                warn!("ignoring {key}: invalid proxy address ({err})");
+            Err(_) => {
+                warn!("ignoring {key}: invalid proxy address");
                 return None;
             }
         }
@@ -179,6 +181,33 @@ impl Service<Request<Body>> for UpstreamClient {
                 .map(|ctx| ctx.protocol.is_secure())
                 .unwrap_or(false),
         );
+        // Caller proxy credentials must never cross an origin hop. CONNECT authentication is
+        // supplied by the connector; only plain HTTP needs the configured header on this request.
+        req.headers_mut()
+            .remove(rama_http::header::PROXY_AUTHORIZATION);
+        if !request_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.protocol.is_secure())
+            && let Some(credential) = proxy.as_ref().and_then(|proxy| proxy.credential.clone())
+        {
+            use rama_http::headers::HeaderMapExt as _;
+            use rama_http::headers::ProxyAuthorization;
+            use rama_net::user::ProxyCredential;
+            match credential {
+                ProxyCredential::Basic(value) => {
+                    req.headers_mut().typed_insert(ProxyAuthorization(value))
+                }
+                ProxyCredential::Bearer(value) => {
+                    req.headers_mut().typed_insert(ProxyAuthorization(value))
+                }
+            }
+            if let Some(value) = req
+                .headers_mut()
+                .get_mut(rama_http::header::PROXY_AUTHORIZATION)
+            {
+                value.set_sensitive(true);
+            }
+        }
         match proxy.as_ref() {
             Some(proxy) => info!(
                 "HTTP upstream route selected (target={authority}, route=upstream_proxy, proxy={})",
@@ -241,6 +270,50 @@ impl Service<Request<Body>> for UpstreamClient {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("upstream {phase} failure")]
+struct UpstreamFailure {
+    phase: &'static str,
+    #[source]
+    source: BoxError,
+}
+
+pub(crate) fn failure_phase(mut error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    loop {
+        if let Some(failure) = error.downcast_ref::<UpstreamFailure>() {
+            return Some(failure.phase);
+        }
+        error = error.source()?;
+    }
+}
+
+#[derive(Clone)]
+struct PhaseConnector<S>(S, &'static str);
+
+impl<Input, S> Service<Input> for PhaseConnector<S>
+where
+    Input: Send + 'static,
+    S: Service<Input>,
+    S::Error: Into<BoxError>,
+{
+    type Output = S::Output;
+    type Error = BoxError;
+
+    async fn serve(&self, input: Input) -> Result<Self::Output, BoxError> {
+        self.0.serve(input).await.map_err(|source| {
+            let source = source.into();
+            if failure_phase(source.as_ref()).is_some() {
+                source
+            } else {
+                Box::new(UpstreamFailure {
+                    phase: self.1,
+                    source,
+                }) as BoxError
+            }
+        })
+    }
+}
+
 fn build_http_connector(
     transport: TargetCheckedTcpConnector,
     tls_root_store: Arc<rustls::RootCertStore>,
@@ -250,17 +323,23 @@ fn build_http_connector(
     BoxError,
 > {
     ensure_rustls_crypto_provider();
-    let proxy = HttpProxyConnectorLayer::optional().into_layer(transport);
     let client_config = rustls::ClientConfig::builder_with_protocol_versions(rustls::ALL_VERSIONS)
         .with_root_certificates(tls_root_store)
         .with_no_client_auth();
+    // HttpProxyConnector inserts the proxy's TlsTunnel before invoking its inner connector.
+    // Complete that TLS handshake before it can send CONNECT or authentication.
+    let proxy_tls = TlsConnectorLayer::tunnel(None)
+        .with_connector_data(TlsConnectorDataBuilder::from(client_config.clone()).build())
+        .into_layer(PhaseConnector(transport, "dns_connect"));
+    let proxy =
+        HttpProxyConnectorLayer::optional().into_layer(PhaseConnector(proxy_tls, "proxy_tls"));
     let tls_config = TlsConnectorDataBuilder::from(client_config)
         .with_alpn_protocols_http_auto()
         .build();
     let tls = TlsConnectorLayer::auto()
         .with_connector_data(tls_config)
-        .into_layer(proxy);
-    let tls = RequestVersionAdapter::new(tls);
+        .into_layer(PhaseConnector(proxy, "proxy_handshake"));
+    let tls = RequestVersionAdapter::new(PhaseConnector(tls, "origin_tls"));
     let connector = HttpConnector::new(tls);
     connector.boxed()
 }

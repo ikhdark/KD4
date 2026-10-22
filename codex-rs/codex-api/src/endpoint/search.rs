@@ -42,7 +42,13 @@ impl<T: HttpTransport> SearchClient<T> {
         let resp = self
             .session
             // Includes encrypted output and JSON overhead, not a model token cap.
-            .execute(Method::POST, Self::path(), extra_headers, Some(body), 32 * 1024 * 1024)
+            .execute(
+                Method::POST,
+                Self::path(),
+                extra_headers,
+                Some(body),
+                32 * 1024 * 1024,
+            )
             .await?;
         serde_json::from_slice(&resp.body)
             .map_err(|e| ApiError::Stream(format!("failed to decode search response: {e}")))

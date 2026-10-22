@@ -33,9 +33,7 @@ impl LoopbackResponsesServer {
             while !thread_shutdown.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if let Err(err) =
-                            handle_model_connection(stream, &thread_shutdown)
-                        {
+                        if let Err(err) = handle_model_connection(stream, &thread_shutdown) {
                             eprintln!("loopback Responses API server error: {err}");
                         }
                     }
@@ -70,10 +68,7 @@ impl Drop for LoopbackResponsesServer {
     }
 }
 
-fn handle_model_connection(
-    mut stream: TcpStream,
-    shutdown: &AtomicBool,
-) -> io::Result<()> {
+fn handle_model_connection(mut stream: TcpStream, shutdown: &AtomicBool) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let request = read_http_request(

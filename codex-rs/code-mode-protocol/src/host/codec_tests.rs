@@ -123,13 +123,18 @@ mod nested_deadline_transport {
             .nested_deadline
             .expect("second deadline");
         for recovered in [first, second] {
-            let drift = recovered.duration_since(deadline).max(deadline.duration_since(recovered));
+            let drift = recovered
+                .duration_since(deadline)
+                .max(deadline.duration_since(recovered));
             assert!(
                 drift < Duration::from_millis(50),
                 "delivery must neither refund nor prematurely consume the budget: {drift:?}"
             );
         }
-        assert_eq!(wire.deadline_shared_monotonic_nanos, Some(monotonic_deadline));
+        assert_eq!(
+            wire.deadline_shared_monotonic_nanos,
+            Some(monotonic_deadline)
+        );
     }
 
     /// Without a shared source the fallback is charged from receipt. It does

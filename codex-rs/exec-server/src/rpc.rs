@@ -31,6 +31,15 @@ use crate::connection::JsonRpcConnectionEvent;
 use crate::connection::JsonRpcTransport;
 
 pub(crate) const SESSION_ALREADY_ATTACHED_ERROR_CODE: i64 = -32010;
+pub(crate) const PROCESS_START_REFUSED_ERROR_CODE: i64 = -32011;
+
+pub(crate) fn process_start_refused(message: String) -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: PROCESS_START_REFUSED_ERROR_CODE,
+        message,
+        data: None,
+    }
+}
 const MAX_IN_FLIGHT_REGULAR_CALLS: usize = 1024;
 const RESERVED_CLEANUP_CALLS: usize = 1;
 
@@ -402,7 +411,8 @@ impl RpcClient {
         T: DeserializeOwned,
     {
         let _call_slot = self.acquire_regular_call_slot()?;
-        self.call_inner(method, params, RpcCallTimeout::None).await
+        self.call_inner(method, params, RpcCallTimeout::None, None)
+            .await
     }
 
     #[tracing::instrument(
@@ -426,7 +436,7 @@ impl RpcClient {
         T: DeserializeOwned,
     {
         let _call_slot = self.acquire_regular_call_slot()?;
-        self.call_inner(method, params, RpcCallTimeout::After(call_timeout))
+        self.call_inner(method, params, RpcCallTimeout::After(call_timeout), None)
             .await
     }
 
@@ -463,7 +473,7 @@ impl RpcClient {
                 }
             },
         };
-        self.call_inner(method, params, RpcCallTimeout::After(call_timeout))
+        self.call_inner(method, params, RpcCallTimeout::After(call_timeout), None)
             .await
     }
 
@@ -472,6 +482,7 @@ impl RpcClient {
         method: &str,
         params: &P,
         call_timeout: RpcCallTimeout,
+        submitted: Option<&AtomicBool>,
     ) -> Result<T, RpcCallError>
     where
         P: Serialize,
@@ -519,6 +530,10 @@ impl RpcClient {
                 .await
                 .map_err(|_| RpcCallError::Closed)?;
 
+            if let Some(submitted) = submitted {
+                submitted.store(true, Ordering::Release);
+            }
+
             // Do not race in-flight requests directly against the transport-close
             // watch value. The connection reader receives JSON-RPC messages and
             // the terminal disconnect event on one ordered queue, then drains any
@@ -550,6 +565,23 @@ impl RpcClient {
             }
         };
         serde_json::from_value(response).map_err(RpcCallError::Json)
+    }
+
+    pub(crate) async fn call_tracked<P: Serialize, T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: &P,
+        call_timeout: Duration,
+        submitted: &AtomicBool,
+    ) -> Result<T, RpcCallError> {
+        let _call_slot = self.acquire_regular_call_slot()?;
+        self.call_inner(
+            method,
+            params,
+            RpcCallTimeout::After(call_timeout),
+            Some(submitted),
+        )
+        .await
     }
 
     #[cfg(test)]

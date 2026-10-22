@@ -19,7 +19,10 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from scripts.common.generated_output_lock import GenerationLockError, generated_output_lock
+from scripts.common.generated_output_lock import (
+    GenerationLockError,
+    generated_output_lock,
+)
 from scripts.common.process_owner import run_finite
 
 

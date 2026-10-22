@@ -40,6 +40,7 @@ use windows_sys::Win32::System::Threading::UpdateProcThreadAttribute;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 pub(super) struct Child {
+    pub(super) observation: codex_utils_pty::process_observation::ObservedProcess,
     process: OwnedHandle,
     pub(super) stdin: Option<File>,
     pub(super) stdout: Option<File>,
@@ -273,6 +274,12 @@ pub(super) fn spawn(executable: &Path, cwd: &Path) -> io::Result<Child> {
     {
         return Err(io::Error::last_os_error());
     }
+    let observation = codex_utils_pty::process_observation::observe_process_start(
+        "powershell_parser",
+        codex_utils_pty::process_observation::ProcessRole::AuxiliaryRoot,
+        Some(process.dwProcessId),
+        None,
+    );
     // SAFETY: successful CreateProcessW transfers these two distinct handles.
     let (process, thread) = unsafe {
         (
@@ -282,6 +289,7 @@ pub(super) fn spawn(executable: &Path, cwd: &Path) -> io::Result<Child> {
     };
     drop(thread);
     Ok(Child {
+        observation,
         process,
         stdin: Some(stdin_write.into()),
         stdout: Some(stdout_read.into()),

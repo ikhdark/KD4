@@ -11,9 +11,11 @@ use codex_rollout::parse_cursor;
 use super::LocalThreadStore;
 use super::helpers::distinct_thread_title;
 use super::helpers::set_thread_name_from_title;
-use super::helpers::stored_thread_from_rollout_item;
 use super::helpers::thread_item_titles;
-use super::list_threads::list_rollout_threads_for_storage;
+use super::list_threads::BoundThreadListCursor;
+use super::list_threads::encode_rollout_cursor;
+use super::list_threads::parse_bound_cursor;
+use super::list_threads::select_rollout_threads;
 use crate::ListThreadsParams;
 use crate::SearchThreadsParams;
 use crate::StoredThreadSearchResult;
@@ -29,6 +31,7 @@ mod tests;
 struct ThreadSearchItem {
     item: codex_rollout::ThreadItem,
     snippet: String,
+    metadata: Option<codex_state::ThreadMetadata>,
 }
 
 pub(super) async fn search_threads(
@@ -46,16 +49,26 @@ pub(super) async fn search_threads(
             message: "thread/search requires search_term".to_string(),
         });
     }
+    let state_db = store.state_db().await;
+    let mut storage_path = if state_db.is_some() {
+        crate::types::ThreadListStoragePath::StateDb
+    } else {
+        crate::types::ThreadListStoragePath::ScanAndRepair
+    };
     let cursor = params
         .cursor
         .as_deref()
         .map(|cursor| {
+            if cursor.starts_with("thread-list-v1:") {
+                let bound = parse_bound_cursor(cursor)?;
+                storage_path = bound.storage_path;
+                return Ok(bound.position);
+            }
             parse_cursor(cursor).ok_or_else(|| ThreadStoreError::InvalidRequest {
                 message: format!("invalid cursor: {cursor}"),
             })
         })
         .transpose()?;
-    let state_db = store.state_db().await;
     let rollout_config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
         sqlite_home: store.config.sqlite_home.clone(),
@@ -66,7 +79,7 @@ pub(super) async fn search_threads(
     let query = RolloutSearchQuery::new(search_term).map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to prepare rollout search: {err}"),
     })?;
-    let matching_rollouts = query
+    let mut matching_rollouts = query
         .search_matches(
             rg_command.as_path(),
             store.config.codex_home.as_path(),
@@ -81,6 +94,91 @@ pub(super) async fn search_threads(
             items: Vec::new(),
             next_cursor: None,
         });
+    }
+    let candidates: Vec<_> = matching_rollouts.keys().cloned().collect();
+    for path in &candidates {
+        if state_db.is_none() {
+            if let Some(item) = codex_rollout::read_thread_item_from_rollout(path.clone()).await {
+                if !params.allowed_sources.is_empty()
+                    && item
+                        .source
+                        .as_ref()
+                        .is_none_or(|source| !params.allowed_sources.contains(source))
+                {
+                    matching_rollouts.remove(path);
+                }
+            } else {
+                if let Ok(header) = codex_rollout::read_session_meta_line(path).await
+                    && !params.allowed_sources.is_empty()
+                    && !params.allowed_sources.contains(&header.meta.source)
+                {
+                    matching_rollouts.remove(path);
+                    continue;
+                }
+                return Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "search catalog cannot represent a confirmed visible match at {}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(runtime) = state_db.as_deref() {
+        // These paths were already discovered by content search. Missing or
+        // stale index rows must not silently exclude canonical matches.
+        for path in matching_rollouts.keys() {
+            if !codex_rollout::state_integration::reconcile_rollout(
+                Some(runtime),
+                path,
+                &store.config.default_model_provider_id,
+                None,
+                &[],
+                Some(params.archived),
+            )
+            .await
+            {
+                return Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "search index reconciliation is incomplete for {}; retry after storage recovers",
+                        path.display()
+                    ),
+                });
+            }
+            let id = codex_rollout::verified_rollout_thread_id(path)
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: error.to_string(),
+                })?;
+            let row = runtime
+                .get_thread(id)
+                .await
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: error.to_string(),
+                })?;
+            let eligible = row.as_ref().is_none_or(|row| {
+                params.allowed_sources.is_empty()
+                    || serde_json::from_value::<codex_protocol::protocol::SessionSource>(
+                        serde_json::Value::String(row.source.clone()),
+                    )
+                    .is_ok_and(|source| params.allowed_sources.contains(&source))
+            });
+            if eligible
+                && row.as_ref().is_none_or(|row| {
+                    row.preview
+                        .as_ref()
+                        .or(row.first_user_message.as_ref())
+                        .is_none_or(std::string::String::is_empty)
+                })
+            {
+                return Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "search index cannot represent a confirmed visible match at {}",
+                        path.display()
+                    ),
+                });
+            }
+        }
     }
     let mut matching_items = Vec::new();
     let mut page_cursor = cursor;
@@ -97,7 +195,7 @@ pub(super) async fn search_threads(
         archived: params.archived,
         search_term: None,
         relation_filter: None,
-        storage_mode: if state_db.is_some() {
+        storage_mode: if storage_path == crate::types::ThreadListStoragePath::StateDb {
             crate::ThreadListStorageMode::StateDbOnly
         } else {
             crate::ThreadListStorageMode::ScanAndRepair
@@ -106,19 +204,19 @@ pub(super) async fn search_threads(
     let mut remaining_rollouts = matching_rollouts;
 
     loop {
-        let page = list_rollout_threads_for_storage(
+        let bound_cursor = page_cursor.map(|position| BoundThreadListCursor {
+            storage_path,
+            position,
+        });
+        let mut selected = select_rollout_threads(
             state_db.clone(),
             &rollout_config,
             store.config.default_model_provider_id.as_str(),
             &scan_params,
-            page_cursor.as_ref(),
-            if state_db.is_some() {
-                crate::types::ThreadListStoragePath::StateDb
-            } else {
-                crate::types::ThreadListStoragePath::ScanAndRepair
-            },
+            bound_cursor.as_ref(),
         )
         .await?;
+        let page = selected.page;
         for item in page.items {
             let logical_path = codex_rollout::plain_rollout_path(item.path.as_path());
             let Some(snippet) = (match remaining_rollouts.remove(logical_path.as_path()) {
@@ -133,7 +231,14 @@ pub(super) async fn search_threads(
             }) else {
                 continue;
             };
-            matching_items.push(ThreadSearchItem { item, snippet });
+            let metadata = item
+                .thread_id
+                .and_then(|id| selected.state_metadata.remove(&id));
+            matching_items.push(ThreadSearchItem {
+                item,
+                snippet,
+                metadata,
+            });
             if matching_items.len() > params.page_size {
                 break;
             }
@@ -153,7 +258,9 @@ pub(super) async fn search_threads(
         Some(
             matching_items
                 .last()
-                .and_then(|item| cursor_from_thread_search_item(item, params.sort_key))
+                .and_then(|item| {
+                    cursor_from_thread_search_item(item, params.sort_key, storage_path)
+                })
                 .ok_or_else(|| ThreadStoreError::Internal {
                     message: "failed to construct required thread search cursor".to_string(),
                 })?,
@@ -162,29 +269,25 @@ pub(super) async fn search_threads(
         None
     }
     .as_ref()
-    .map(serde_json::to_value)
-    .transpose()
-    .map_err(|err| ThreadStoreError::Internal {
-        message: format!("failed to serialize thread search cursor: {err}"),
-    })?
-    .and_then(|value| value.as_str().map(str::to_owned));
+    .map(|cursor| encode_rollout_cursor(storage_path, cursor))
+    .transpose()?;
 
     let (names, resolved_title_ids) =
         thread_item_titles(matching_items.iter().map(|item| &item.item));
-    let mut items = matching_items
-        .into_iter()
-        .filter_map(|item| {
-            stored_thread_from_rollout_item(
-                item.item,
-                params.archived,
-                store.config.default_model_provider_id.as_str(),
-            )
-            .map(|thread| StoredThreadSearchResult {
-                thread,
-                snippet: item.snippet,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(matching_items.len());
+    for item in matching_items {
+        let thread = if let Some(metadata) = item.metadata {
+            super::read_thread::stored_thread_from_sqlite_metadata_with_name(store, metadata, None)
+                .await?
+        } else {
+            super::read_thread::read_thread_by_rollout_path(store, item.item.path, true, false)
+                .await?
+        };
+        items.push(StoredThreadSearchResult {
+            thread,
+            snippet: item.snippet,
+        });
+    }
     set_thread_search_result_names(store, &mut items, names, resolved_title_ids).await;
 
     Ok(ThreadSearchPage { items, next_cursor })
@@ -193,9 +296,15 @@ pub(super) async fn search_threads(
 fn cursor_from_thread_search_item(
     item: &ThreadSearchItem,
     sort_key: ThreadSortKey,
+    storage_path: crate::types::ThreadListStoragePath,
 ) -> Option<codex_rollout::Cursor> {
+    let physical_created_at = (storage_path == crate::types::ThreadListStoragePath::ScanAndRepair)
+        .then(|| codex_rollout::rollout_created_at_key(&item.item.path))
+        .flatten();
     let timestamp = match sort_key {
-        ThreadSortKey::CreatedAt => item.item.created_at.as_deref()?,
+        ThreadSortKey::CreatedAt => physical_created_at
+            .as_deref()
+            .or(item.item.created_at.as_deref())?,
         ThreadSortKey::UpdatedAt => item
             .item
             .updated_at

@@ -16,8 +16,14 @@ fn review_prompt_template_renders_base_branch_variant() {
 fn review_prompt_template_renders_commit_variant() {
     let cwd = AbsolutePathBuf::current_dir().expect("cwd");
     for (title, expected) in [
-        (None, "Review the code changes introduced by commit deadbeef. Provide prioritized, actionable findings."),
-        (Some("Fix bug"), "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized, actionable findings."),
+        (
+            None,
+            "Review the code changes introduced by commit deadbeef. Provide prioritized, actionable findings.",
+        ),
+        (
+            Some("Fix bug"),
+            "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized, actionable findings.",
+        ),
     ] {
         assert_eq!(
             review_prompt(

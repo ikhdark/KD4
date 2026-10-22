@@ -581,6 +581,8 @@ const REMOVED_FEATURE_KEYS: &[&str] = &[
     "remote_compaction_v2",
     "chronicle",
     "telepathy",
+    "token_budget",
+    "context_management",
 ];
 
 fn migrate_config_toml(mut value: TomlValue, path: &Path) -> io::Result<TomlValue> {
@@ -1801,6 +1803,4 @@ foo = "xyzzy"
             assert!(path.as_path().ends_with(suffix));
         }
     }
-
-
 }

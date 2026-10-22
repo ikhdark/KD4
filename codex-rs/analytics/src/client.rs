@@ -53,6 +53,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -81,6 +83,7 @@ fn analytics_failure_log_metadata(
 
 #[derive(Clone)]
 pub(crate) struct AnalyticsEventsQueue {
+    pub(crate) loss_epoch: Arc<AtomicU64>,
     pub(crate) sender: mpsc::Sender<AnalyticsFact>,
     pub(crate) app_used_emitted_keys: Arc<Mutex<HashSet<UsageEventKey>>>,
     pub(crate) plugin_used_emitted_keys: Arc<Mutex<HashSet<UsageEventKey>>>,
@@ -154,22 +157,34 @@ impl AnalyticsEventsQueue {
     ) -> Self {
         let (sender, mut receiver) = mpsc::channel(ANALYTICS_EVENTS_QUEUE_SIZE);
         let http_clients = create_client_pool(http_client_factory, ClientRouteClass::Api);
+        let loss_epoch = Arc::new(AtomicU64::new(0));
+        let worker_loss_epoch = Arc::clone(&loss_epoch);
         tokio::spawn(async move {
             let mut reducer = AnalyticsReducer::default();
             while let Some(input) = receiver.recv().await {
                 let mut events = Vec::new();
+                reducer.observe_delivery_loss(worker_loss_epoch.load(Ordering::Acquire));
                 reducer.ingest(input, &mut events).await;
                 for _ in 1..ANALYTICS_EVENTS_BATCH_SIZE {
                     let Ok(input) = receiver.try_recv() else {
                         break;
                     };
+                    reducer.observe_delivery_loss(worker_loss_epoch.load(Ordering::Acquire));
                     reducer.ingest(input, &mut events).await;
+                }
+                // Read the loss epoch before the emptiness check. A loss that
+                // follows an earlier-enqueued fact must not be absorbed by this
+                // drain and then let that fact's turn start without the gap.
+                let drained_epoch = worker_loss_epoch.load(Ordering::Acquire);
+                if receiver.is_empty() {
+                    reducer.delivery_queue_drained(drained_epoch);
                 }
                 send_track_events(&auth_manager, &destination, &http_clients, events).await;
             }
         });
         Self {
             sender,
+            loss_epoch,
             app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
             plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -177,7 +192,7 @@ impl AnalyticsEventsQueue {
 
     fn try_send(&self, input: AnalyticsFact) {
         if self.sender.try_send(input).is_err() {
-            //TODO: add a metric for this
+            self.record_delivery_loss();
             tracing::warn!("dropping analytics events: queue is full");
         }
     }
@@ -186,9 +201,18 @@ impl AnalyticsEventsQueue {
         self.sender
             .try_reserve()
             .map_err(|err| {
+                self.record_delivery_loss();
                 tracing::warn!("dropping analytics events: {err}");
             })
             .ok()
+    }
+
+    fn record_delivery_loss(&self) {
+        let _ = self
+            .loss_epoch
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                Some(epoch.saturating_add(1))
+            });
     }
 
     pub(crate) fn should_enqueue_app_used(
@@ -234,7 +258,11 @@ impl AnalyticsEventsQueue {
         else {
             return true;
         };
-        let key = (tracking.thread_id.clone(), tracking.turn_id.clone(), plugin_id);
+        let key = (
+            tracking.thread_id.clone(),
+            tracking.turn_id.clone(),
+            plugin_id,
+        );
         if emitted.contains(&key) {
             return false;
         }
@@ -514,6 +542,10 @@ impl AnalyticsEventsClient {
         }
     }
 
+    pub fn track_connection_closed(&self, connection_id: u64) {
+        self.record_fact(AnalyticsFact::ConnectionClosed { connection_id });
+    }
+
     pub fn track_response(
         &self,
         connection_id: u64,
@@ -663,7 +695,10 @@ impl AnalyticsEventsClient {
             }
             ServerNotification::TurnStarted(_)
             | ServerNotification::TurnCompleted(_)
-            | ServerNotification::TurnDiffUpdated(_) => true,
+            | ServerNotification::TurnDiffUpdated(_)
+            | ServerNotification::ThreadClosed(_)
+            | ServerNotification::ThreadArchived(_)
+            | ServerNotification::ThreadUnarchived(_) => true,
             _ => false,
         };
         if !relevant {

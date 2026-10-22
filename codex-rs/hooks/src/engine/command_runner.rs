@@ -762,8 +762,6 @@ mod tests {
         assert_eq!(result.error.as_deref(), Some("hook timed out after 2s"));
     }
 
-
-
     #[tokio::test(start_paused = true)]
     async fn timeout_covers_process_admission_before_spawn() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -944,7 +942,8 @@ mod tests {
         };
         #[cfg(not(windows))]
         let script =
-            "(sleep 60; printf late > escaped.txt) & printf '%s\\n' $! > child.pid; sleep 60".to_string();
+            "(sleep 60; printf late > escaped.txt) & printf '%s\\n' $! > child.pid; sleep 60"
+                .to_string();
         let handler = test_handler(script, 1, &cwd);
         let mut command = build_command(&explicit_test_shell(), &handler);
         command.current_dir(cwd.as_path());

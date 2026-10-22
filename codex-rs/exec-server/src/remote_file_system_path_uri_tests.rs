@@ -128,6 +128,63 @@ async fn remote_file_system_preserves_server_error_categories() {
     .expect("complete remote error exchange should finish");
 }
 
+#[tokio::test]
+async fn remote_directory_case_policy_comes_from_the_selected_provider() {
+    timeout(Duration::from_secs(10), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let path = PathUri::parse("file:///Z:/remote-only/repo").unwrap();
+        let expected_path = path.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(stream).await.unwrap();
+            complete_websocket_initialize(&mut websocket).await;
+            for policy in [Some(true), Some(false), None] {
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut websocket).await
+                else {
+                    panic!("expected metadata request");
+                };
+                assert_eq!(request.method, crate::protocol::FS_GET_METADATA_METHOD);
+                let params: FsGetMetadataParams =
+                    serde_json::from_value(request.params.unwrap()).unwrap();
+                assert_eq!(params.path, expected_path);
+                assert_eq!(params.include_directory_case_sensitivity, Some(true));
+                assert_eq!(params.sandbox, None);
+                let mut result = serde_json::json!({
+                    "isDirectory": true, "isFile": false, "isSymlink": false,
+                    "size": 0, "createdAtMs": 0, "modifiedAtMs": 0,
+                });
+                if let Some(policy) = policy {
+                    result["directoryCaseSensitive"] = policy.into();
+                }
+                write_jsonrpc_websocket(
+                    &mut websocket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result,
+                    }),
+                )
+                .await;
+            }
+        });
+        let fs = RemoteFileSystem::new(LazyRemoteExecServerClient::new(
+            ExecServerTransportParams::websocket_url(
+                url,
+                DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
+            ),
+        ));
+        for policy in [Some(true), Some(false), None] {
+            assert_eq!(
+                fs.directory_case_sensitive(&path, None).await.unwrap(),
+                policy
+            );
+        }
+        server.await.unwrap();
+    })
+    .await
+    .expect("remote case-policy exchange should finish");
+}
+
 async fn record_read_file_params(
     expected_requests: usize,
     error_code: Option<i64>,

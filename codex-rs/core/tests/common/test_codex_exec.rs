@@ -18,18 +18,33 @@ impl TestCodexExecBuilder {
             .env("CODEX_HOME", self.home.path())
             .env("CODEX_SQLITE_HOME", self.home.path())
             .env(CODEX_API_KEY_ENV_VAR, "dummy");
+        // A positional prompt may append piped stdin. Give test commands a
+        // deterministic EOF unless an individual test supplies input.
+        cmd.write_stdin("");
         cmd
     }
     pub fn cmd_with_server(&self, server: &MockServer) -> assert_cmd::Command {
         let mut cmd = self.cmd();
-        let base = format!("{}/v1", server.uri());
         // The mock implements HTTP Responses/SSE, not the built-in provider's
         // WebSocket transport. Register its capabilities under a fixture ID.
         cmd.arg("-c")
-            .arg(format!(
-                "model_providers.exec_fixture={{ name='Exec HTTP fixture', base_url={}, wire_api='responses', requires_openai_auth=true, supports_websockets=false }}",
-                toml_string_literal(&base)
-            ))
+            .arg(exec_fixture_provider_override(server))
+            .args(["-c", "model_provider='exec_fixture'"]);
+        cmd
+    }
+
+    /// A Tokio command for tests that need a bounded, process-tree-contained capture.
+    pub fn contained_cmd_with_server(&self, server: &MockServer) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(
+            codex_utils_cargo_bin::cargo_bin("codex-exec")
+                .expect("should find binary for codex-exec"),
+        );
+        cmd.current_dir(self.cwd.path())
+            .env("CODEX_HOME", self.home.path())
+            .env("CODEX_SQLITE_HOME", self.home.path())
+            .env(CODEX_API_KEY_ENV_VAR, "dummy")
+            .arg("-c")
+            .arg(exec_fixture_provider_override(server))
             .args(["-c", "model_provider='exec_fixture'"]);
         cmd
     }
@@ -44,6 +59,14 @@ impl TestCodexExecBuilder {
 
 fn toml_string_literal(value: &str) -> String {
     serde_json::to_string(value).expect("serialize TOML string literal")
+}
+
+fn exec_fixture_provider_override(server: &MockServer) -> String {
+    let base = format!("{}/v1", server.uri());
+    format!(
+        "model_providers.exec_fixture={{ name='Exec HTTP fixture', base_url={}, wire_api='responses', requires_openai_auth=true, supports_websockets=false }}",
+        toml_string_literal(&base)
+    )
 }
 
 pub fn test_codex_exec() -> TestCodexExecBuilder {

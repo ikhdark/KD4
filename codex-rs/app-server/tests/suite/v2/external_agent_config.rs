@@ -696,7 +696,10 @@ async fn external_agent_config_import_sends_completion_notification_after_pendin
     assert_eq!(completed.import_id, import_id);
     assert_eq!(completed.item_type_results.len(), 1);
     let result = &completed.item_type_results[0];
-    assert_eq!(result.item_type, ExternalAgentConfigMigrationItemType::Plugins);
+    assert_eq!(
+        result.item_type,
+        ExternalAgentConfigMigrationItemType::Plugins
+    );
     assert!(result.successes.is_empty());
     assert_eq!(result.failures.len(), 1);
     assert!(!result.failures[0].message.is_empty());
@@ -900,7 +903,7 @@ async fn external_agent_config_import_creates_session_rollouts() -> Result<()> {
     assert_eq!(
         imported_items.last(),
         Some(&ThreadItem::AgentMessage {
-            id: "item-4".into(),
+            id: "item-external-import-turn-2-3".into(),
             text: "<EXTERNAL SESSION IMPORTED>".into(),
             phase: None,
         })
@@ -1060,9 +1063,9 @@ required = true
     Ok(())
 }
 
-
 #[tokio::test]
-async fn external_agent_config_import_accepts_detected_payload_and_deduplicates_across_restarts() -> Result<()> {
+async fn external_agent_config_import_accepts_detected_payload_and_deduplicates_across_restarts()
+-> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("unused").await;
     let codex_home = TempDir::new()?;
     write_mock_provider_config_toml(codex_home.path(), &server.uri())?;
@@ -1189,7 +1192,8 @@ async fn external_agent_config_import_compacts_huge_session_before_first_follow_
         &server.uri(),
         &BTreeMap::default(),
         // Leave room for the bounded user checkpoint plus current tool schemas.
-        /*auto_compact_limit*/ 60_000,
+        /*auto_compact_limit*/
+        60_000,
         /*requires_openai_auth*/ None,
         "mock_provider",
         "Summarize the conversation.",

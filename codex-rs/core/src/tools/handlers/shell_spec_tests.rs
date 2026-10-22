@@ -284,7 +284,7 @@ fn exec_command_tool_matches_expected_spec() {
     });
 
     let description = format!(
-        "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain.{}",
+        "Runs a command through `cmd`, returning output or a session ID for ongoing interaction. Resume a returned session_id with write_stdin; do not restart the command while it is live or its effects are uncertain. Supports typed retained search misses (search_miss_v1): exact streams, original evidence identity, and verified validity scope; reused results execute no new process.{}",
         exec_command_guidance_description()
     );
 
@@ -1031,6 +1031,9 @@ fn eager_command_result_projects_fields_of_the_full_contract() {
     }
     let required = full["required"].as_array().unwrap();
     for name in projected["required"].as_array().unwrap() {
-        assert!(required.contains(name), "{name} is optional in the full contract");
+        assert!(
+            required.contains(name),
+            "{name} is optional in the full contract"
+        );
     }
 }

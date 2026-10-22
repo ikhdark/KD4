@@ -6,9 +6,9 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 
+use crate::NestedCancellation;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
-use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -17,49 +17,222 @@ use crate::cell_actor::CompletionCommit;
 struct RecordingDelegate;
 
 #[tokio::test]
+async fn caught_graph_evidence_survives_display_new_cells_and_durable_restore_at_capacity() {
+    // Fill the legal 256-code-unit node-id budget ("late-" plus 251), rather
+    // than failing preflight before any graph evidence exists.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("graph-state.json");
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let mut request = execute_request(
+        r#"
+        for (const count of [8,64,65,128,256]) {
+            const error = await run_graph(Array.from({length:count}, (_, i) => ({
+                id:i === count-1 ? 'late-'+'λ'.repeat(251) : 'node-'+i,
+                run:()=>i === count-1 ? {session_id:8123, session_capabilities:{incarnation:'last',polling:true},
+                    source_sha256:'source-last', artifact_id:'artifact-last', exact:9007199254740993n}
+                    : {output:i === 0 ? 'body'.repeat(5000) : 'ok'},
+                accept:()=>{if(i === count-1) throw Error('accept failed after launch'); return true;}
+            }))).catch(error=>error);
+            store('graph-'+count, {failure:error});
+            if(Object.keys(error.results).length !== count) throw Error('original graph mutated');
+            text(error);
+        }
+        const skipped = await run_graph([
+            {id:'failed',run:()=>({artifact_id:'late-artifact'}),accept:()=>false},
+            {id:'blocked',deps:['failed'],run:()=>{throw Error('must never run');},accept:()=>true}
+        ]).catch(error=>error);
+        store('skipped', skipped);
+    "#,
+    );
+    request.state_path = Some(path.clone());
+    let cell = runtime
+        .execute(request, ObserveMode::Decision)
+        .await
+        .unwrap();
+    let CellEvent::Completed {
+        content_items,
+        error_text,
+        output_loss,
+    } = cell.initial_event().await.unwrap()
+    else {
+        panic!("graph result");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(output_loss, None);
+    assert_eq!(content_items.len(), 5);
+    for (count, item) in [8, 64, 65, 128, 256].into_iter().zip(content_items) {
+        let OutputItem::Text { text } = item else {
+            panic!("text");
+        };
+        let value: JsonValue = serde_json::from_str(&text).unwrap();
+        let results = value["results"].as_object().unwrap();
+        assert_eq!(results.len(), count);
+        for index in 0..count - 1 {
+            assert_eq!(results[&format!("node-{index}")]["status"], "fulfilled");
+        }
+        let late = &results[&format!("late-{}", "λ".repeat(251))];
+        assert_eq!(late["status"], "rejected");
+        assert_eq!(late["value"]["session_id"], 8123);
+        assert_eq!(late["value"]["session_capabilities"]["incarnation"], "last");
+        assert_eq!(late["value"]["artifact_id"], "artifact-last");
+        assert_eq!(late["value"]["source_sha256"], "source-last");
+        assert_eq!(
+            late["value"]["exact"],
+            serde_json::json!({"$bigint":"9007199254740993"})
+        );
+        assert_eq!(late["reason"]["message"], "accept failed after launch");
+    }
+    let verify = r#"
+        for(const count of [8,64,65,128,256]) {
+            const rows = load('graph-'+count).failure.results;
+            const late = rows['late-'+'λ'.repeat(251)];
+            if(Object.keys(rows).length !== count || late.status !== 'rejected' ||
+                late.value.session_id !== 8123 || late.value.exact !== 9007199254740993n ||
+                late.reason.message !== 'accept failed after launch' || rows['node-0'].value.output.length !== 20000)
+                throw Error('lost canonical graph evidence');
+        }
+        const blocked = load('skipped').results.blocked;
+        if(blocked.status !== 'skipped' || blocked.blocked_by.length !== 1 || blocked.blocked_by[0] !== 'failed')
+            throw Error('lost skipped prerequisite association');
+        text('all controls retained');
+    "#;
+    let cell = runtime
+        .execute(execute_request(verify), ObserveMode::Decision)
+        .await
+        .unwrap();
+    assert_eq!(
+        cell.initial_event().await.unwrap(),
+        CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "all controls retained".into()
+            }],
+            error_text: None,
+            output_loss: None,
+        }
+    );
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
+    restored.restore_durable_state(Some(&path)).await.unwrap();
+    let cell = restored
+        .execute(execute_request(verify), ObserveMode::Decision)
+        .await
+        .unwrap();
+    assert_eq!(
+        cell.initial_event().await.unwrap(),
+        CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "all controls retained".into()
+            }],
+            error_text: None,
+            output_loss: None,
+        }
+    );
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn inline_replay_is_ready_without_blocking_pool_and_retains_exact_admission() {
-    for text in ["λ😀\n".repeat(1000), "λ\n".into(), "x".repeat(64), "x".repeat(512 * 1024)] {
+    for text in [
+        "λ😀\n".repeat(1000),
+        "λ\n".into(),
+        "x".repeat(64),
+        "x".repeat(512 * 1024),
+    ] {
         let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
         let id = CellId::new("inline");
         let event = CellEvent::Completed {
             content_items: vec![OutputItem::Text { text }],
-            error_text: None, output_loss: None,
+            error_text: None,
+            output_loss: None,
         };
         let bytes = cell_event_bytes(&event);
-        runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
-        assert_eq!(runtime.inner.terminal_cells.lock().unwrap().lookup(&id).unwrap().1, bytes);
+        runtime
+            .inner
+            .terminal_cells
+            .lock()
+            .unwrap()
+            .insert(id.clone(), event.clone());
+        assert_eq!(
+            runtime
+                .inner
+                .terminal_cells
+                .lock()
+                .unwrap()
+                .lookup(&id)
+                .unwrap()
+                .1,
+            bytes
+        );
         let observation = runtime.begin_observe(&id, ObserveMode::Decision);
         tokio::pin!(observation);
-        let Poll::Ready(Ok(pending)) = futures::poll!(&mut observation) else { panic!("inline replay was offloaded") };
-        assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES - bytes);
+        let Poll::Ready(Ok(pending)) = futures::poll!(&mut observation) else {
+            panic!("inline replay was offloaded")
+        };
+        assert_eq!(
+            runtime.inner.replay_bytes.available_permits(),
+            TERMINAL_REPLAY_MAX_BYTES - bytes
+        );
         assert_eq!(pending.event().await.unwrap(), event);
-        assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES);
-        let dropped = runtime.begin_observe(&id, ObserveMode::Decision).await.unwrap();
-        assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES - bytes);
+        assert_eq!(
+            runtime.inner.replay_bytes.available_permits(),
+            TERMINAL_REPLAY_MAX_BYTES
+        );
+        let dropped = runtime
+            .begin_observe(&id, ObserveMode::Decision)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.inner.replay_bytes.available_permits(),
+            TERMINAL_REPLAY_MAX_BYTES - bytes
+        );
         drop(dropped);
-        assert_eq!(runtime.inner.replay_bytes.available_permits(), TERMINAL_REPLAY_MAX_BYTES);
+        assert_eq!(
+            runtime.inner.replay_bytes.available_permits(),
+            TERMINAL_REPLAY_MAX_BYTES
+        );
         assert_eq!(runtime.cached_terminal_event(&id).await.unwrap(), event);
         runtime.shutdown().await.unwrap();
-        assert!(matches!(runtime.cached_terminal_observation(&id).await, Err(Error::ShuttingDown)));
-        assert!(matches!(runtime.cached_terminal_event(&id).await, Err(Error::ShuttingDown)));
+        assert!(matches!(
+            runtime.cached_terminal_observation(&id).await,
+            Err(Error::ShuttingDown)
+        ));
+        assert!(matches!(
+            runtime.cached_terminal_event(&id).await,
+            Err(Error::ShuttingDown)
+        ));
     }
 }
 
 #[tokio::test]
 #[ignore = "narrow timing probe"]
 async fn critical_path_terminal_replay_report_benchmark() {
-    for (label, size) in [("inline-replay-small", 1024), ("inline-replay-large", 1024*1024)] {
+    for (label, size) in [
+        ("inline-replay-small", 1024),
+        ("inline-replay-large", 1024 * 1024),
+    ] {
         let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
         let id = CellId::new("cached");
-        let event = CellEvent::Completed {content_items:vec![OutputItem::Text{text:"x".repeat(size)}],error_text:None,output_loss:None};
-        runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
+        let event = CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "x".repeat(size),
+            }],
+            error_text: None,
+            output_loss: None,
+        };
+        runtime
+            .inner
+            .terminal_cells
+            .lock()
+            .unwrap()
+            .insert(id.clone(), event.clone());
         let mut samples = Vec::new();
         for _ in 0..7 {
             let start = std::time::Instant::now();
             for _ in 0..100 {
                 assert_eq!(runtime.cached_terminal_event(&id).await.unwrap(), event);
             }
-            samples.push(start.elapsed().as_secs_f64()*1000.0);
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         crate::runtime::critical_path_tests::report(label, &samples);
         runtime.shutdown().await.unwrap();
@@ -69,14 +242,22 @@ async fn critical_path_terminal_replay_report_benchmark() {
 #[test]
 fn terminal_accounting_charges_empty_items_and_escaping_and_spills_exactly() {
     for text in ["", "\u{0000}\"\\\n"] {
-        let content_items: Vec<_> = (0..200_000).map(|_| OutputItem::Text { text: text.into() }).collect();
+        let content_items: Vec<_> = (0..200_000)
+            .map(|_| OutputItem::Text { text: text.into() })
+            .collect();
         let in_memory = content_items.capacity() * std::mem::size_of::<OutputItem>();
-        let event = CellEvent::Completed { content_items, error_text: None, output_loss: None };
+        let event = CellEvent::Completed {
+            content_items,
+            error_text: None,
+            output_loss: None,
+        };
         // The in-memory term alone exceeds the serialized size here, so only
         // the exact charge shows that escaping is counted.
         assert_eq!(
             cell_event_bytes(&event),
-            serde_json::to_vec(&event).unwrap().len() + std::mem::size_of::<CellEvent>() + in_memory
+            serde_json::to_vec(&event).unwrap().len()
+                + std::mem::size_of::<CellEvent>()
+                + in_memory
         );
         assert!(cell_event_bytes(&event) > TERMINAL_CELL_CACHE_MAX_BYTES);
         let (cached, retained) = CachedCellEvent::new(event.clone());
@@ -88,12 +269,29 @@ fn terminal_accounting_charges_empty_items_and_escaping_and_spills_exactly() {
 #[tokio::test]
 async fn terminal_replay_holds_admission_until_handoff_or_cancellation() {
     let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
-    let event = CellEvent::Completed { content_items: vec![OutputItem::Text { text: "x".repeat(9 * 1024 * 1024) }], error_text: None, output_loss: None };
+    let event = CellEvent::Completed {
+        content_items: vec![OutputItem::Text {
+            text: "x".repeat(9 * 1024 * 1024),
+        }],
+        error_text: None,
+        output_loss: None,
+    };
     let bytes = cell_event_bytes(&event);
     let id = CellId::new("cached");
-    runtime.inner.terminal_cells.lock().unwrap().insert(id.clone(), event.clone());
-    let withheld = Arc::clone(&runtime.inner.replay_bytes).acquire_many_owned((TERMINAL_REPLAY_MAX_BYTES - bytes) as u32).await.unwrap();
-    let first = runtime.begin_observe(&id, ObserveMode::Decision).await.unwrap();
+    runtime
+        .inner
+        .terminal_cells
+        .lock()
+        .unwrap()
+        .insert(id.clone(), event.clone());
+    let withheld = Arc::clone(&runtime.inner.replay_bytes)
+        .acquire_many_owned((TERMINAL_REPLAY_MAX_BYTES - bytes) as u32)
+        .await
+        .unwrap();
+    let first = runtime
+        .begin_observe(&id, ObserveMode::Decision)
+        .await
+        .unwrap();
     let second = runtime.begin_observe(&id, ObserveMode::Decision);
     tokio::pin!(second);
     assert!(futures::poll!(&mut second).is_pending());
@@ -109,13 +307,22 @@ async fn terminal_replay_holds_admission_until_handoff_or_cancellation() {
 
 #[tokio::test]
 async fn immutable_catalog_reuse_preserves_revision_identity_and_short_cell_results() {
-    use codex_code_mode_protocol::{ToolDefinition, CodeModeToolKind};
+    use codex_code_mode_protocol::CodeModeToolKind;
+    use codex_code_mode_protocol::ToolDefinition;
     let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
-    let definitions: Arc<[ToolDefinition]> = (0..300).map(|index| ToolDefinition {
-        name: format!("tool_{index}"), tool_name: codex_protocol::ToolName::plain(format!("tool_{index}")),
-        description: "description of arguments and return shape ".repeat(80).into(),
-        kind: CodeModeToolKind::Function, input_schema: None, output_schema: None, default_timeout_ms: None,
-    }).collect();
+    let definitions: Arc<[ToolDefinition]> = (0..300)
+        .map(|index| ToolDefinition {
+            name: format!("tool_{index}"),
+            tool_name: codex_protocol::ToolName::plain(format!("tool_{index}")),
+            description: "description of arguments and return shape "
+                .repeat(80)
+                .into(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            output_schema: None,
+            default_timeout_ms: None,
+        })
+        .collect();
     let mut changed = definitions.to_vec();
     changed[299].description = "changed revision".into();
     let changed: Arc<[ToolDefinition]> = changed.into();
@@ -129,11 +336,18 @@ async fn immutable_catalog_reuse_preserves_revision_identity_and_short_cell_resu
         let expected = tools[299].description.to_string();
         let mut request = execute_request("text(resolve_tool('tool_299').description);");
         request.enabled_tools = Arc::clone(&tools);
-        let cell = runtime.execute(request, ObserveMode::Decision).await.unwrap();
-        assert_eq!(cell.initial_event().await.unwrap(), CellEvent::Completed {
-            content_items: vec![OutputItem::Text { text: expected }],
-            error_text: None, output_loss: None,
-        });
+        let cell = runtime
+            .execute(request, ObserveMode::Decision)
+            .await
+            .unwrap();
+        assert_eq!(
+            cell.initial_event().await.unwrap(),
+            CellEvent::Completed {
+                content_items: vec![OutputItem::Text { text: expected }],
+                error_text: None,
+                output_loss: None,
+            }
+        );
         let catalog = {
             let cached = runtime.inner.catalog.lock().unwrap();
             let (cached_tools, catalog) = cached.as_ref().unwrap();
@@ -146,10 +360,14 @@ async fn immutable_catalog_reuse_preserves_revision_identity_and_short_cell_resu
         }
         previous = Some(catalog);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while runtime.inner.active_cell_permits.available_permits() != runtime.inner.active_cell_capacity {
+            while runtime.inner.active_cell_permits.available_permits()
+                != runtime.inner.active_cell_capacity
+            {
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
     runtime.shutdown().await.unwrap();
 }
@@ -161,29 +379,56 @@ async fn durable_completion_retains_unobserved_initial_yield() {
     let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
     runtime.restore_durable_state(Some(&path)).await.unwrap();
     let host = RuntimeCellHost {
-        cell_id: CellId::new("1"), parent_tool_call_id: "yielded".into(),
-        snapshot: HashMap::new(), inner: runtime.inner.clone(), cell_permit: Mutex::new(None),
+        cell_id: CellId::new("1"),
+        parent_tool_call_id: "yielded".into(),
+        snapshot: HashMap::new(),
+        inner: runtime.inner.clone(),
+        cell_permit: Mutex::new(None),
     };
     let event = CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "after".into() }],
-        error_text: None, output_loss: None,
+        content_items: vec![OutputItem::Text {
+            text: "after".into(),
+        }],
+        error_text: None,
+        output_loss: None,
     };
-    let pending = Some(vec![OutputItem::Text { text: "before".into() }]);
+    let pending = Some(vec![OutputItem::Text {
+        text: "before".into(),
+    }]);
     let expected = CellEvent::Completed {
         content_items: vec![
-            OutputItem::Text { text: "before".into() },
-            OutputItem::Text { text: "after".into() },
+            OutputItem::Text {
+                text: "before".into(),
+            },
+            OutputItem::Text {
+                text: "after".into(),
+            },
         ],
-        error_text: None, output_loss: None,
+        error_text: None,
+        output_loss: None,
     };
-    assert_eq!(host.commit_completion(HashMap::new(), event, pending,
-        Arc::new(CellState::new(CancellationToken::new()))).await, CompletionCommit::Committed);
+    assert_eq!(
+        host.commit_completion(
+            HashMap::new(),
+            event,
+            pending,
+            Arc::new(CellState::new(CancellationToken::new()))
+        )
+        .await,
+        CompletionCommit::Committed
+    );
     runtime.shutdown().await.unwrap();
     drop(host);
     drop(runtime);
     let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
     restored.restore_durable_state(Some(&path)).await.unwrap();
-    assert_eq!(restored.cached_terminal_event(&CellId::new("1")).await.unwrap(), expected);
+    assert_eq!(
+        restored
+            .cached_terminal_event(&CellId::new("1"))
+            .await
+            .unwrap(),
+        expected
+    );
     restored.shutdown().await.unwrap();
 }
 
@@ -196,59 +441,132 @@ async fn slow_snapshot_io_does_not_hold_readers_or_hide_late_publication() {
         runtime.restore_durable_state(Some(&path)).await.unwrap();
         let durable = runtime.inner.durable_state.get().unwrap().clone();
         let (release, receiver) = std::sync::mpsc::channel();
-        let gate = Arc::new(StorageTestGate { entered: tokio::sync::Notify::new(), release: StdMutex::new(receiver) });
+        let gate = Arc::new(StorageTestGate {
+            entered: tokio::sync::Notify::new(),
+            release: StdMutex::new(receiver),
+        });
         *durable.io_gate.lock().unwrap() = Some((publishing, gate.clone()));
         let state = Arc::new(CellState::new(CancellationToken::new()));
         let host = Arc::new(RuntimeCellHost {
-            cell_id: CellId::new("1"), parent_tool_call_id: "writer".into(),
-            snapshot: HashMap::new(), inner: runtime.inner.clone(), cell_permit: Mutex::new(None),
+            cell_id: CellId::new("1"),
+            parent_tool_call_id: "writer".into(),
+            snapshot: HashMap::new(),
+            inner: runtime.inner.clone(),
+            cell_permit: Mutex::new(None),
         });
-        let event = CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None };
+        let event = CellEvent::Completed {
+            content_items: Vec::new(),
+            error_text: None,
+            output_loss: None,
+        };
         let commit = tokio::spawn({
             let state = state.clone();
             let event = event.clone();
-            async move { host.commit_completion(HashMap::from([("key".into(), StoredValue::new("key", JsonValue::Bool(true)))]),
-                event, None, state).await }
+            async move {
+                host.commit_completion(
+                    HashMap::from([("key".into(), StoredValue::new("key", JsonValue::Bool(true)))]),
+                    event,
+                    None,
+                    state,
+                )
+                .await
+            }
         });
-        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .unwrap();
         {
-            let values = tokio::time::timeout(Duration::from_millis(100), runtime.inner.stored_values.lock()).await
-                .expect("filesystem must not lock shared values");
+            let values = tokio::time::timeout(
+                Duration::from_millis(100),
+                runtime.inner.stored_values.lock(),
+            )
+            .await
+            .expect("filesystem must not lock shared values");
             assert_eq!(values.contains_key("key"), publishing);
         }
         let termination = state.request_termination();
-        let outcome = tokio::time::timeout(Duration::from_secs(2), commit).await.unwrap().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), commit)
+            .await
+            .unwrap()
+            .unwrap();
         if publishing {
             assert_eq!(outcome, CompletionCommit::Committed);
             let completed = termination.await.unwrap();
-            assert!(matches!(&completed, CellEvent::Completed { error_text: Some(error), .. }
-                if error.contains("unconfirmed")));
-            runtime.inner.terminal_cells.lock().unwrap()
+            assert!(
+                matches!(&completed, CellEvent::Completed { error_text: Some(error), .. }
+                if error.contains("unconfirmed"))
+            );
+            runtime
+                .inner
+                .terminal_cells
+                .lock()
+                .unwrap()
                 .insert(CellId::new("1"), completed);
         } else {
             assert_eq!(outcome, CompletionCommit::Rejected(event));
-            state.finish_termination(CellEvent::Terminated { content_items: Vec::new() });
-            assert!(matches!(termination.await.unwrap(), CellEvent::Terminated { .. }));
+            state.finish_termination(CellEvent::Terminated {
+                content_items: Vec::new(),
+            });
+            assert!(matches!(
+                termination.await.unwrap(),
+                CellEvent::Terminated { .. }
+            ));
         }
         release.send(()).unwrap();
         // The owned transaction retains this gate until all late I/O has settled.
         {
             let _settled = runtime.inner.commit_gate.lock().await;
             let disk: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            assert_eq!(disk["values"].get("key").is_some(), publishing,
-                "rejected staging cannot publish late; admitted publication remains real");
+            assert_eq!(
+                disk["values"].get("key").is_some(),
+                publishing,
+                "rejected staging cannot publish late; admitted publication remains real"
+            );
         }
         if publishing {
-            let confirmed = runtime.begin_observe(&CellId::new("1"), ObserveMode::Decision)
-                .await.unwrap().event().await.unwrap();
-            assert_eq!(confirmed, CellEvent::Completed {
-                content_items: Vec::new(), error_text: None, output_loss: None,
-            }, "late publication must refine the cached receipt without a runtime restart");
+            let confirmed = runtime
+                .begin_observe(&CellId::new("1"), ObserveMode::Decision)
+                .await
+                .unwrap()
+                .event()
+                .await
+                .unwrap();
+            assert_eq!(
+                confirmed,
+                CellEvent::Completed {
+                    content_items: Vec::new(),
+                    error_text: None,
+                    output_loss: None,
+                },
+                "late publication must refine the cached receipt without a runtime restart"
+            );
         }
     }
 }
 
 struct PanickingClosedDelegate;
+
+#[tokio::test]
+async fn close_panic_wakes_original_termination_without_failure_handler() {
+    let runtime = SessionRuntime::new(Arc::new(PanickingClosedDelegate));
+    let started = runtime
+        .execute(
+            execute_request("await new Promise(() => {});"),
+            ObserveMode::YieldAfter(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), runtime.terminate(&started.cell_id))
+        .await
+        .expect("close panic must not strand termination");
+    assert!(matches!(result, Err(Error::Runtime(ref error)) if error.contains("cleanup failed")));
+    runtime.shutdown().await.unwrap();
+    assert!(runtime.inner.cells.lock().await.is_empty());
+    assert_eq!(
+        runtime.inner.active_cell_permits.available_permits(),
+        runtime.inner.active_cell_capacity
+    );
+}
 
 #[tokio::test]
 async fn snapshot_staging_does_not_block_independent_cell_execution() {
@@ -259,21 +577,36 @@ async fn snapshot_staging_does_not_block_independent_cell_execution() {
     let durable = runtime.inner.durable_state.get().unwrap().clone();
     let (release, receiver) = std::sync::mpsc::channel();
     let gate = Arc::new(StorageTestGate {
-        entered: tokio::sync::Notify::new(), release: StdMutex::new(receiver),
+        entered: tokio::sync::Notify::new(),
+        release: StdMutex::new(receiver),
     });
     *durable.io_gate.lock().unwrap() = Some((false, gate.clone()));
     let host = RuntimeCellHost {
-        cell_id: CellId::new("writer"), parent_tool_call_id: "writer".into(),
-        snapshot: HashMap::new(), inner: runtime.inner.clone(), cell_permit: Mutex::new(None),
+        cell_id: CellId::new("writer"),
+        parent_tool_call_id: "writer".into(),
+        snapshot: HashMap::new(),
+        inner: runtime.inner.clone(),
+        cell_permit: Mutex::new(None),
     };
     let commit = tokio::spawn(async move {
         host.commit_completion(
-            HashMap::from([("writer".into(), StoredValue::new("writer", JsonValue::Bool(true)))]),
-            CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
-            None, Arc::new(CellState::new(CancellationToken::new())),
-        ).await
+            HashMap::from([(
+                "writer".into(),
+                StoredValue::new("writer", JsonValue::Bool(true)),
+            )]),
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: None,
+            },
+            None,
+            Arc::new(CellState::new(CancellationToken::new())),
+        )
+        .await
     });
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
     // An explicit yield proves JavaScript ran while staging is still blocked;
     // elapsed-time comparisons could pass without establishing that ordering.
     let id = tokio::time::timeout(Duration::from_secs(5), async {
@@ -281,22 +614,43 @@ async fn snapshot_staging_does_not_block_independent_cell_execution() {
             "text('independent'); await yield_control(); store('independent', true); text('done');"
         ), ObserveMode::Decision).await.unwrap();
         let id = cell.cell_id.clone();
-        assert_eq!(cell.initial_event().await.unwrap(), CellEvent::ExplicitYield {
-            content_items: vec![OutputItem::Text { text: "independent".into() }],
-        });
+        assert_eq!(
+            cell.initial_event().await.unwrap(),
+            CellEvent::ExplicitYield {
+                content_items: vec![OutputItem::Text {
+                    text: "independent".into()
+                }],
+            }
+        );
         id
-    }).await.expect("independent execution must not wait for snapshot I/O");
+    })
+    .await
+    .expect("independent execution must not wait for snapshot I/O");
     assert!(!commit.is_finished());
     *durable.io_gate.lock().unwrap() = None;
     release.send(()).unwrap();
     assert_eq!(commit.await.unwrap(), CompletionCommit::Committed);
     let completed = tokio::time::timeout(Duration::from_secs(5), async {
-        runtime.begin_observe(&id, ObserveMode::Decision).await.unwrap().event().await.unwrap()
-    }).await.unwrap();
-    assert_eq!(completed, CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "done".into() }],
-        error_text: None, output_loss: None,
-    });
+        runtime
+            .begin_observe(&id, ObserveMode::Decision)
+            .await
+            .unwrap()
+            .event()
+            .await
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        completed,
+        CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "done".into()
+            }],
+            error_text: None,
+            output_loss: None,
+        }
+    );
     let disk: JsonValue = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(disk["values"].get("writer").is_some());
     assert!(disk["values"].get("independent").is_some());
@@ -307,27 +661,71 @@ async fn snapshot_staging_does_not_block_independent_cell_execution() {
 async fn held_terminal_spill_releases_execution_capacity_and_keeps_inline_receipt() {
     let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
     let (release, receiver) = std::sync::mpsc::channel();
-    let gate = Arc::new(StorageTestGate { entered: tokio::sync::Notify::new(), release: StdMutex::new(receiver) });
+    let gate = Arc::new(StorageTestGate {
+        entered: tokio::sync::Notify::new(),
+        release: StdMutex::new(receiver),
+    });
     *runtime.inner.spill_gate.lock().unwrap() = Some(gate.clone());
-    let cell = runtime.execute(execute_request("for (let i = 0; i < 9; i++) text('x'.repeat(1024 * 1024));"),
-        ObserveMode::YieldAfter(Duration::from_secs(10))).await.unwrap();
+    let cell = runtime
+        .execute(
+            execute_request("for (let i = 0; i < 9; i++) text('x'.repeat(1024 * 1024));"),
+            ObserveMode::YieldAfter(Duration::from_secs(10)),
+        )
+        .await
+        .unwrap();
     let id = cell.cell_id.clone();
     let initial = cell.initial_event().await.unwrap();
-    assert!(matches!(initial, CellEvent::Completed { error_text: None, .. }), "{initial:?}");
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await.unwrap();
-    assert_eq!(runtime.inner.active_cell_permits.available_permits(), runtime.inner.active_cell_capacity);
+    assert!(
+        matches!(
+            initial,
+            CellEvent::Completed {
+                error_text: None,
+                ..
+            }
+        ),
+        "{initial:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.inner.active_cell_permits.available_permits(),
+        runtime.inner.active_cell_capacity
+    );
     let receipt = runtime.cached_terminal_event(&id).await.unwrap();
     assert_eq!(receipt, initial);
-    assert!(matches!(receipt, CellEvent::Completed { content_items, error_text: None, .. }
+    assert!(
+        matches!(receipt, CellEvent::Completed { content_items, error_text: None, .. }
         if content_items.len() == 9 && content_items.iter().all(|item|
-            matches!(item, OutputItem::Text { text } if text == &"x".repeat(1024 * 1024)))));
-    let next = runtime.execute(execute_request("text('next');"), ObserveMode::YieldAfter(Duration::from_secs(1))).await.unwrap();
-    assert_eq!(next.initial_event().await.unwrap(), CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "next".into() }],
-        error_text: None, output_loss: None,
-    });
-    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown()).await.unwrap().unwrap();
+            matches!(item, OutputItem::Text { text } if text == &"x".repeat(1024 * 1024))))
+    );
+    let next = runtime
+        .execute(
+            execute_request("text('next');"),
+            ObserveMode::YieldAfter(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next.initial_event().await.unwrap(),
+        CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "next".into()
+            }],
+            error_text: None,
+            output_loss: None,
+        }
+    );
+    let shutdown = tokio::time::timeout(Duration::from_secs(3), runtime.shutdown())
+        .await
+        .unwrap();
+    assert!(
+        matches!(shutdown, Err(Error::Runtime(ref error)) if error.contains("storage cleanup"))
+    );
+    assert!(!runtime.inner.storage_tasks.is_empty());
     release.send(()).unwrap();
+    runtime.shutdown().await.unwrap();
+    assert!(runtime.inner.storage_tasks.is_empty());
 }
 
 impl SessionRuntimeDelegate for RecordingDelegate {
@@ -531,7 +929,11 @@ async fn storage_limit_rejects_the_complete_cell_write_set() {
         CompletionCommit::Committed
     );
 
-    let CellEvent::Completed { error_text: Some(error), .. } = cell_state.request_termination().await.unwrap() else {
+    let CellEvent::Completed {
+        error_text: Some(error),
+        ..
+    } = cell_state.request_termination().await.unwrap()
+    else {
         panic!("storage limit must be reported in the terminal receipt");
     };
     let receipt: JsonValue = serde_json::from_str(&error).unwrap();
@@ -568,25 +970,43 @@ async fn concurrent_store_conflict_preserves_winner_and_rejects_entire_write_set
         let host = RuntimeCellHost {
             cell_id: CellId::new("stale-writer"),
             parent_tool_call_id: "parent-call".into(),
-            snapshot: snapshot.into_iter().map(|value| {
-                ("key".into(), StoredValue::new("key", JsonValue::from(value)))
-            }).collect(),
+            snapshot: snapshot
+                .into_iter()
+                .map(|value| {
+                    (
+                        "key".into(),
+                        StoredValue::new("key", JsonValue::from(value)),
+                    )
+                })
+                .collect(),
             inner: Arc::clone(&runtime.inner),
             cell_permit: Mutex::new(None),
         };
         runtime.inner.stored_values.lock().await.insert(
-            "key".into(), StoredValue::new("key", JsonValue::from(winner)),
+            "key".into(),
+            StoredValue::new("key", JsonValue::from(winner)),
         );
         let state = Arc::new(CellState::new(CancellationToken::new()));
         host.commit_completion(
             HashMap::from([
-                ("key".into(), StoredValue::new("key", JsonValue::from(proposed))),
-                ("other".into(), StoredValue::new("other", JsonValue::from(true))),
+                (
+                    "key".into(),
+                    StoredValue::new("key", JsonValue::from(proposed)),
+                ),
+                (
+                    "other".into(),
+                    StoredValue::new("other", JsonValue::from(true)),
+                ),
             ]),
-            CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: None,
+            },
             None,
             state,
-        ).await;
+        )
+        .await;
         {
             let values = runtime.inner.stored_values.lock().await;
             assert_eq!(values["key"].value.as_ref(), &JsonValue::from(winner));
@@ -601,38 +1021,62 @@ async fn concurrent_store_conflict_preserves_winner_and_rejects_entire_write_set
         let host = RuntimeCellHost {
             cell_id: CellId::new("stale-reader"),
             parent_tool_call_id: "parent-call".into(),
-            snapshot: snapshot.into_iter().map(|value| {
-                ("input".into(), StoredValue::new("input", JsonValue::from(value)))
-            }).collect(),
+            snapshot: snapshot
+                .into_iter()
+                .map(|value| {
+                    (
+                        "input".into(),
+                        StoredValue::new("input", JsonValue::from(value)),
+                    )
+                })
+                .collect(),
             inner: Arc::clone(&runtime.inner),
             cell_permit: Mutex::new(None),
         };
         runtime.inner.stored_values.lock().await.insert(
-            "input".into(), StoredValue::new("input", JsonValue::from(1)),
+            "input".into(),
+            StoredValue::new("input", JsonValue::from(1)),
         );
         let mut output = StoredValue::new("derived", JsonValue::from(0));
-        output.read_dependencies = Some(Arc::new(std::collections::HashSet::from(["input".into()])));
+        output.read_dependencies =
+            Some(Arc::new(std::collections::HashSet::from(["input".into()])));
         let state = Arc::new(CellState::new(CancellationToken::new()));
-        let commit = host.commit_completion(
-            HashMap::from([("derived".into(), output)]),
-            CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
-            None,
-            Arc::clone(&state),
-        ).await;
+        let commit = host
+            .commit_completion(
+                HashMap::from([("derived".into(), output)]),
+                CellEvent::Completed {
+                    content_items: Vec::new(),
+                    error_text: None,
+                    output_loss: None,
+                },
+                None,
+                Arc::clone(&state),
+            )
+            .await;
         assert_eq!(commit, CompletionCommit::Committed);
-        let CellEvent::Completed { error_text: Some(error), .. } = state.request_termination().await.unwrap() else {
+        let CellEvent::Completed {
+            error_text: Some(error),
+            ..
+        } = state.request_termination().await.unwrap()
+        else {
             panic!("expected a rejected transaction receipt");
         };
         let receipt: JsonValue = serde_json::from_str(&error).unwrap();
-        assert_eq!(receipt["conflicting_keys"], serde_json::json!([
-            {"key":"input", "key_truncated":false, "read":true, "write":false}
-        ]));
+        assert_eq!(
+            receipt["conflicting_keys"],
+            serde_json::json!([
+                {"key":"input", "key_truncated":false, "read":true, "write":false}
+            ])
+        );
         assert_eq!(receipt["external_effects_rolled_back"], false);
         assert_eq!(receipt["automatic_replay_allowed"], false);
         {
             let values = runtime.inner.stored_values.lock().await;
             assert_eq!(values["input"].value.as_ref(), &JsonValue::from(1));
-            assert!(!values.contains_key("derived"), "stale reads cannot authorize derived writes");
+            assert!(
+                !values.contains_key("derived"),
+                "stale reads cannot authorize derived writes"
+            );
         }
         runtime.shutdown().await.unwrap();
     }
@@ -650,10 +1094,16 @@ async fn terminal_result_remains_observable_after_active_cell_removal() {
         .unwrap();
     let cell_id = started.cell_id.clone();
     let completed = started.initial_event().await.unwrap();
-    assert_eq!(completed, CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "done".into() }],
-        error_text: None, output_loss: None,
-    });
+    assert_eq!(
+        completed,
+        CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "done".into()
+            }],
+            error_text: None,
+            output_loss: None,
+        }
+    );
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -679,28 +1129,68 @@ async fn terminal_result_remains_observable_after_active_cell_removal() {
 #[test]
 fn expired_terminal_evidence_is_bounded_and_never_inferred_from_ids() {
     let mut cache = TerminalCellCache::default();
-    cache.insert(CellId::new("completed"), CellEvent::Completed {
-        content_items: Vec::new(), error_text: None, output_loss: None,
-    });
-    cache.insert(CellId::new("interrupted"), CellEvent::Terminated { content_items: Vec::new() });
+    cache.insert(
+        CellId::new("completed"),
+        CellEvent::Completed {
+            content_items: Vec::new(),
+            error_text: None,
+            output_loss: None,
+        },
+    );
+    cache.insert(
+        CellId::new("interrupted"),
+        CellEvent::Terminated {
+            content_items: Vec::new(),
+        },
+    );
     for id in 0..TERMINAL_CELL_CACHE_CAPACITY {
-        cache.insert(CellId::new(id.to_string()), CellEvent::Completed {
-            content_items: Vec::new(), error_text: None, output_loss: None,
-        });
+        cache.insert(
+            CellId::new(id.to_string()),
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: None,
+            },
+        );
     }
-    assert!(matches!(cache.lookup(&CellId::new("completed")), Err(Error::ExpiredResult { completed: true, .. })));
-    assert!(matches!(cache.lookup(&CellId::new("interrupted")), Err(Error::ExpiredResult { completed: false, .. })));
+    assert!(matches!(
+        cache.lookup(&CellId::new("completed")),
+        Err(Error::ExpiredResult {
+            completed: true,
+            ..
+        })
+    ));
+    assert!(matches!(
+        cache.lookup(&CellId::new("interrupted")),
+        Err(Error::ExpiredResult {
+            completed: false,
+            ..
+        })
+    ));
     for id in ["reserved-but-unstarted", "never-allocated"] {
-        assert!(matches!(cache.lookup(&CellId::new(id)), Err(Error::MissingCell(_))));
+        assert!(matches!(
+            cache.lookup(&CellId::new(id)),
+            Err(Error::MissingCell(_))
+        ));
     }
     for id in TERMINAL_CELL_CACHE_CAPACITY..3 * TERMINAL_CELL_CACHE_CAPACITY {
-        cache.insert(CellId::new(id.to_string()), CellEvent::Completed {
-            content_items: Vec::new(), error_text: None, output_loss: None,
-        });
+        cache.insert(
+            CellId::new(id.to_string()),
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: None,
+            },
+        );
     }
     assert_eq!(cache.expired.len(), TERMINAL_CELL_CACHE_CAPACITY);
-    assert!(matches!(cache.lookup(&CellId::new("completed")), Err(Error::MissingCell(_))),
-        "once lifecycle evidence expires, completion is unknown rather than inferred");
+    assert!(
+        matches!(
+            cache.lookup(&CellId::new("completed")),
+            Err(Error::MissingCell(_))
+        ),
+        "once lifecycle evidence expires, completion is unknown rather than inferred"
+    );
 }
 
 #[tokio::test]
@@ -712,7 +1202,10 @@ async fn durable_cells_restore_values_and_terminal_receipts_without_reexecution(
         r#"store("artifact", {artifact_id: "retained-evidence"}); text("completed once");"#,
     );
     request.state_path = Some(path.clone());
-    let started = runtime.execute(request, ObserveMode::Decision).await.unwrap();
+    let started = runtime
+        .execute(request, ObserveMode::Decision)
+        .await
+        .unwrap();
     let old_id = started.cell_id.clone();
     let original = started.initial_event().await.unwrap();
     runtime.shutdown().await.unwrap();
@@ -721,15 +1214,29 @@ async fn durable_cells_restore_values_and_terminal_receipts_without_reexecution(
     let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
     let mut request = execute_request(r#"text(load("artifact").artifact_id);"#);
     request.state_path = Some(path);
-    let started = restored.execute(request, ObserveMode::Decision).await.unwrap();
+    let started = restored
+        .execute(request, ObserveMode::Decision)
+        .await
+        .unwrap();
     assert_ne!(started.cell_id, old_id, "restored IDs must never be reused");
-    assert_eq!(started.initial_event().await.unwrap(), CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "retained-evidence".into() }],
-        error_text: None,
-        output_loss: None,
-    });
     assert_eq!(
-        restored.begin_observe(&old_id, ObserveMode::Decision).await.unwrap().event().await.unwrap(),
+        started.initial_event().await.unwrap(),
+        CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "retained-evidence".into()
+            }],
+            error_text: None,
+            output_loss: None,
+        }
+    );
+    assert_eq!(
+        restored
+            .begin_observe(&old_id, ObserveMode::Decision)
+            .await
+            .unwrap()
+            .event()
+            .await
+            .unwrap(),
         original,
         "observing a recovered terminal cell must return its original receipt, not run it",
     );
@@ -743,25 +1250,43 @@ async fn late_persistence_opt_in_runs_cell_without_replacing_live_state() {
         let path = directory.path().join("state.json");
         let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
         let permit = if active_cell {
-            Some(Arc::clone(&runtime.inner.active_cell_permits).acquire_owned().await.unwrap())
+            Some(
+                Arc::clone(&runtime.inner.active_cell_permits)
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            )
         } else {
             // A genuine collision remains memory-only; promotion is tested below.
             let (existing, _) = snapshot::DurableState::open(path.clone()).unwrap();
             drop(existing);
             runtime.inner.stored_values.lock().await.insert(
-                "existing".into(), StoredValue::new("existing", JsonValue::from("kept")),
+                "existing".into(),
+                StoredValue::new("existing", JsonValue::from("kept")),
             );
             None
         };
         let mut request = execute_request(r#"store("ran", true); text("executed");"#);
         request.state_path = Some(path.clone());
-        let event = runtime.execute(request, ObserveMode::Decision).await.unwrap()
-            .initial_event().await.unwrap();
-        let CellEvent::Completed { content_items, error_text, .. } = event else {
+        let event = runtime
+            .execute(request, ObserveMode::Decision)
+            .await
+            .unwrap()
+            .initial_event()
+            .await
+            .unwrap();
+        let CellEvent::Completed {
+            content_items,
+            error_text,
+            ..
+        } = event
+        else {
             panic!("cell must complete");
         };
         assert_eq!(error_text, None);
-        assert!(matches!(&content_items[0], OutputItem::Text { text } if text.contains("in-memory state only")));
+        assert!(
+            matches!(&content_items[0], OutputItem::Text { text } if text.contains("in-memory state only"))
+        );
         assert!(matches!(&content_items[1], OutputItem::Text { text } if text == "executed"));
         assert!(runtime.inner.durable_state.get().is_none());
         assert_eq!(path.exists(), !active_cell);
@@ -806,8 +1331,14 @@ fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     cache.insert(CellId::new("4"), oversized.clone());
     assert_eq!(cache.get(&CellId::new("4")), Some(oversized));
     assert_eq!(cache.order.len(), 3);
-    assert_eq!(cache.retained_bytes, cell_event_bytes(&completed(half)) + cell_event_bytes(&completed(1)));
-    assert!(matches!(cache.entry(&CellId::new("4")).as_deref(), Some(CachedCellEvent::Spilled(..))));
+    assert_eq!(
+        cache.retained_bytes,
+        cell_event_bytes(&completed(half)) + cell_event_bytes(&completed(1))
+    );
+    assert!(matches!(
+        cache.entry(&CellId::new("4")).as_deref(),
+        Some(CachedCellEvent::Spilled(..))
+    ));
 
     for index in 0..TERMINAL_CELL_CACHE_CAPACITY + 10 {
         cache.insert(CellId::new(format!("small-{index}")), completed(0));
@@ -815,7 +1346,10 @@ fn terminal_cache_bounds_retained_output_bytes_and_keeps_the_newest_event() {
     assert_eq!(cache.order.len(), TERMINAL_CELL_CACHE_CAPACITY);
     assert_eq!(cache.events.len(), TERMINAL_CELL_CACHE_CAPACITY);
     assert_eq!(cache.get(&CellId::new("4")), None);
-    assert_eq!(cache.retained_bytes, TERMINAL_CELL_CACHE_CAPACITY * cell_event_bytes(&completed(0)));
+    assert_eq!(
+        cache.retained_bytes,
+        TERMINAL_CELL_CACHE_CAPACITY * cell_event_bytes(&completed(0))
+    );
 }
 
 #[tokio::test]
@@ -826,33 +1360,77 @@ async fn named_state_promotes_discovers_and_retires_without_reexecuting_producer
     let event = runtime.execute(execute_request(
         r#"for (let i=0;i<256;i++) store('batch-'+String(i).padStart(3,'0'), {evidence:i});"#,
     ), ObserveMode::Decision).await.unwrap().initial_event().await.unwrap();
-    assert!(matches!(event, CellEvent::Completed { error_text: None, .. }));
+    assert!(matches!(
+        event,
+        CellEvent::Completed {
+            error_text: None,
+            ..
+        }
+    ));
     // Wait for the completed actor to release its admission permit.
     tokio::time::timeout(Duration::from_secs(5), async {
-        while runtime.inner.active_cell_permits.available_permits() != runtime.inner.active_cell_capacity {
+        while runtime.inner.active_cell_permits.available_permits()
+            != runtime.inner.active_cell_capacity
+        {
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
-    let mut request = execute_request(r#"
+    })
+    .await
+    .unwrap();
+    let mut request = execute_request(
+        r#"
         let keys=[], after;
         do { const page=listKeys({after,limit:7}); keys.push(...page.keys); after=page.next_after; } while(after);
         if(keys.length!==256 || load(keys[0]).evidence!==0) throw Error('discovery');
         if(!deleteStored(keys[0]) || load(keys[0])!==undefined) throw Error('retirement');
         store('replacement', {evidence:'retained'});
-    "#);
+    "#,
+    );
     request.state_path = Some(path.clone());
-    let event = runtime.execute(request, ObserveMode::Decision).await.unwrap().initial_event().await.unwrap();
-    assert!(matches!(event, CellEvent::Completed { error_text: None, .. }), "{event:?}");
+    let event = runtime
+        .execute(request, ObserveMode::Decision)
+        .await
+        .unwrap()
+        .initial_event()
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            event,
+            CellEvent::Completed {
+                error_text: None,
+                ..
+            }
+        ),
+        "{event:?}"
+    );
     runtime.shutdown().await.unwrap();
     drop(runtime);
     let restored = SessionRuntime::new(Arc::new(RecordingDelegate));
-    let mut request = execute_request(r#"
+    let mut request = execute_request(
+        r#"
         if(load('batch-000')!==undefined || load('replacement').evidence!=='retained' ||
             load('batch-255').evidence!==255) throw Error('durability');
-    "#);
+    "#,
+    );
     request.state_path = Some(path);
-    let event = restored.execute(request, ObserveMode::Decision).await.unwrap().initial_event().await.unwrap();
-    assert!(matches!(event, CellEvent::Completed { error_text: None, .. }), "{event:?}");
+    let event = restored
+        .execute(request, ObserveMode::Decision)
+        .await
+        .unwrap()
+        .initial_event()
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            event,
+            CellEvent::Completed {
+                error_text: None,
+                ..
+            }
+        ),
+        "{event:?}"
+    );
     restored.shutdown().await.unwrap();
 }
 
@@ -867,21 +1445,51 @@ async fn named_state_deletion_rejects_concurrent_replacement() {
         inner: Arc::clone(&runtime.inner),
         cell_permit: Mutex::new(None),
     };
-    runtime.inner.stored_values.lock().await.insert("key".into(), StoredValue::new("key", JsonValue::from(2)));
+    runtime
+        .inner
+        .stored_values
+        .lock()
+        .await
+        .insert("key".into(), StoredValue::new("key", JsonValue::from(2)));
     let state = Arc::new(CellState::new(CancellationToken::new()));
-    host.commit_completion(HashMap::from([("key".into(), StoredValue::deletion("key"))]),
-        CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None },
-        None, Arc::clone(&state)).await;
-    assert!(matches!(state.request_termination().await.unwrap(), CellEvent::Completed { error_text: Some(_), .. }));
-    assert_eq!(*runtime.inner.stored_values.lock().await["key"].value, JsonValue::from(2));
+    host.commit_completion(
+        HashMap::from([("key".into(), StoredValue::deletion("key"))]),
+        CellEvent::Completed {
+            content_items: Vec::new(),
+            error_text: None,
+            output_loss: None,
+        },
+        None,
+        Arc::clone(&state),
+    )
+    .await;
+    assert!(matches!(
+        state.request_termination().await.unwrap(),
+        CellEvent::Completed {
+            error_text: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(
+        *runtime.inner.stored_values.lock().await["key"].value,
+        JsonValue::from(2)
+    );
     runtime.shutdown().await.unwrap();
 }
 
 #[test]
 fn qualified_cell_ids_preserve_legacy_snapshot_counter_parsing() {
     assert_eq!(cell_id_sequence("17"), Some(17));
-    assert_eq!(cell_id_sequence("00000000-0000-4000-8000-000000000001/17"), Some(17));
-    for invalid in ["foreign/17", "g2:17", "00000000-0000-4000-8000-000000000001/17/2", ""] {
+    assert_eq!(
+        cell_id_sequence("00000000-0000-4000-8000-000000000001/17"),
+        Some(17)
+    );
+    for invalid in [
+        "foreign/17",
+        "g2:17",
+        "00000000-0000-4000-8000-000000000001/17/2",
+        "",
+    ] {
         assert_eq!(cell_id_sequence(invalid), None);
     }
 }
@@ -936,12 +1544,18 @@ fn buffered_json_batches_writes_and_reports_flush_failures() {
 
     // Small values stay buffered until flush. Dropping the buffer would hide
     // this error and make publication of incomplete evidence look successful.
-    for (fail_write, fail_flush, expected) in [
-        (true, false, "write failed"),
-        (false, true, "flush failed"),
-    ] {
-        let mut writer = Writer { fail_write, fail_flush, ..Writer::default() };
-        assert_eq!(write_buffered_json(&mut writer, &true), Err(expected.into()));
+    for (fail_write, fail_flush, expected) in
+        [(true, false, "write failed"), (false, true, "flush failed")]
+    {
+        let mut writer = Writer {
+            fail_write,
+            fail_flush,
+            ..Writer::default()
+        };
+        assert_eq!(
+            write_buffered_json(&mut writer, &true),
+            Err(expected.into())
+        );
     }
 }
 
@@ -953,20 +1567,31 @@ fn buffered_snapshot_flushes_before_publication_and_restores_exact_evidence() {
     let original = std::fs::read(&path).unwrap();
     let value = serde_json::json!({"rows": vec!["line\nλ😀\"\\"; 2_000]});
     let event = CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "receipt\nλ😀".repeat(2_000) }],
+        content_items: vec![OutputItem::Text {
+            text: "receipt\nλ😀".repeat(2_000),
+        }],
         error_text: Some("original error".into()),
         output_loss: Some(codex_code_mode_protocol::OutputLoss {
             discarded_items: 2,
             discarded_bytes_lower_bound: 3,
         }),
     };
-    let staged = state.stage(
-        "call".into(),
-        HashMap::from([("evidence".into(), StoredValue::new("evidence", value.clone()))]),
-        "1".into(),
-        event.clone(),
-    ).unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), original, "staging must not publish");
+    let staged = state
+        .stage(
+            "call".into(),
+            HashMap::from([(
+                "evidence".into(),
+                StoredValue::new("evidence", value.clone()),
+            )]),
+            "1".into(),
+            event.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "staging must not publish"
+    );
     state.publish(staged).unwrap();
     drop(state);
     let (restored, values) = snapshot::DurableState::open(path).unwrap();
@@ -977,7 +1602,9 @@ fn buffered_snapshot_flushes_before_publication_and_restores_exact_evidence() {
 #[test]
 fn buffered_spill_read_preserves_receipts_and_rejects_corruption() {
     let event = CellEvent::Completed {
-        content_items: vec![OutputItem::Text { text: "receipt\nλ😀\"\\".repeat(2_000) }],
+        content_items: vec![OutputItem::Text {
+            text: "receipt\nλ😀\"\\".repeat(2_000),
+        }],
         error_text: Some("original error".into()),
         output_loss: Some(codex_code_mode_protocol::OutputLoss {
             discarded_items: 2,
@@ -985,23 +1612,35 @@ fn buffered_spill_read_preserves_receipts_and_rejects_corruption() {
         }),
     };
     let bytes = serde_json::to_vec(&event).unwrap();
-    for suffix in [None, Some(b" ".as_slice()), Some(b"!".as_slice()), Some(b"".as_slice())] {
+    for suffix in [
+        None,
+        Some(b" ".as_slice()),
+        Some(b"!".as_slice()),
+        Some(b"".as_slice()),
+    ] {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut payload = bytes.clone();
         match suffix {
-            Some([]) => { payload.pop(); }
+            Some([]) => {
+                payload.pop();
+            }
             Some(suffix) => payload.extend_from_slice(suffix),
             None => {}
         }
         std::fs::write(file.path(), payload).unwrap();
-        let cached = CachedCellEvent::Spilled(file, cell_event_bytes(&event), terminal_completion(&event));
+        let cached =
+            CachedCellEvent::Spilled(file, cell_event_bytes(&event), terminal_completion(&event));
         let result = cached.read();
         if suffix == Some(b"!".as_slice()) || suffix == Some(b"".as_slice()) {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("cannot be decoded") && error.contains("do not replay"));
         } else {
             assert_eq!(result.unwrap(), event);
-            assert_eq!(cached.read().unwrap(), event, "recovery must reopen at the start");
+            assert_eq!(
+                cached.read().unwrap(),
+                event,
+                "recovery must reopen at the start"
+            );
         }
     }
 }
@@ -1013,9 +1652,13 @@ async fn capacity_rejects_until_a_terminal_cell_releases_its_permit() {
     for slot in 0..runtime.inner.active_cell_capacity {
         if slot + 1 == runtime.inner.active_cell_capacity {
             let mut heavy = execute_request("store('rejected', true);");
-            heavy.source.push_str(&" ".repeat(CELL_INPUT_BYTES_PER_SLOT));
+            heavy
+                .source
+                .push_str(&" ".repeat(CELL_INPUT_BYTES_PER_SLOT));
             assert!(matches!(
-                runtime.execute(heavy, ObserveMode::YieldAfter(Duration::from_millis(1))).await,
+                runtime
+                    .execute(heavy, ObserveMode::YieldAfter(Duration::from_millis(1)))
+                    .await,
                 Err(Error::ActiveCellLimit(_))
             ));
             assert_eq!(runtime.inner.active_cell_permits.available_permits(), 1);
@@ -1043,7 +1686,10 @@ async fn capacity_rejects_until_a_terminal_cell_releases_its_permit() {
         panic!("excess cell must be rejected at the active cell limit");
     };
     assert_eq!(reported, active_cell_ids);
-    assert_eq!(runtime.inner.cells.lock().await.len(), runtime.inner.active_cell_capacity);
+    assert_eq!(
+        runtime.inner.cells.lock().await.len(),
+        runtime.inner.active_cell_capacity
+    );
 
     runtime
         .terminate(&active_cell_ids[0])
@@ -1312,20 +1958,52 @@ async fn drop_terminates_cells_when_the_registry_is_locked() {
 fn spilled_terminal_eviction_retains_completion_and_interruption() {
     let mut cache = TerminalCellCache::default();
     for (id, event) in [
-        ("completed", CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None }),
-        ("interrupted", CellEvent::Terminated { content_items: Vec::new() }),
+        (
+            "completed",
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: None,
+            },
+        ),
+        (
+            "interrupted",
+            CellEvent::Terminated {
+                content_items: Vec::new(),
+            },
+        ),
     ] {
-        let spill = CachedCellEvent::Spilled(tempfile::NamedTempFile::new().unwrap(), 1,
-            terminal_completion(&event));
+        let spill = CachedCellEvent::Spilled(
+            tempfile::NamedTempFile::new().unwrap(),
+            1,
+            terminal_completion(&event),
+        );
         cache.insert_cached(CellId::new(id), (Arc::new(spill), 0));
     }
     for id in 0..TERMINAL_CELL_CACHE_CAPACITY {
-        cache.insert(CellId::new(id.to_string()), CellEvent::Completed {
-            content_items: Vec::new(), error_text: None, output_loss: None,
-        });
+        cache.insert(
+            CellId::new(id.to_string()),
+            CellEvent::Completed {
+                content_items: Vec::new(),
+                error_text: None,
+                output_loss: None,
+            },
+        );
     }
-    assert!(matches!(cache.lookup(&CellId::new("completed")), Err(Error::ExpiredResult { completed: true, .. })));
-    assert!(matches!(cache.lookup(&CellId::new("interrupted")), Err(Error::ExpiredResult { completed: false, .. })));
+    assert!(matches!(
+        cache.lookup(&CellId::new("completed")),
+        Err(Error::ExpiredResult {
+            completed: true,
+            ..
+        })
+    ));
+    assert!(matches!(
+        cache.lookup(&CellId::new("interrupted")),
+        Err(Error::ExpiredResult {
+            completed: false,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -1335,20 +2013,141 @@ fn durable_receipts_preserve_completion_order_across_restart() {
     let (state, _) = snapshot::DurableState::open(path.clone()).unwrap();
     drop(state);
     // Exercise legacy migration without hundreds of synchronous publications.
-    let mut seed: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut seed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     seed["version"] = 5.into();
     seed.as_object_mut().unwrap().remove("completed_cell_order");
-    let event = CellEvent::Completed { content_items: Vec::new(), error_text: None, output_loss: None };
-    seed["completed_cells"] = serde_json::to_value((2..=256).map(|id|
-        (id.to_string(), event.clone())).collect::<std::collections::BTreeMap<_, _>>()).unwrap();
+    let event = CellEvent::Completed {
+        content_items: Vec::new(),
+        error_text: None,
+        output_loss: None,
+    };
+    seed["completed_cells"] = serde_json::to_value(
+        (2..=256)
+            .map(|id| (id.to_string(), event.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )
+    .unwrap();
     std::fs::write(&path, serde_json::to_vec(&seed).unwrap()).unwrap();
     let (state, _) = snapshot::DurableState::open(path.clone()).unwrap();
-    state.publish(state.stage("late".into(), HashMap::new(), "1".into(), event.clone()).unwrap()).unwrap();
+    state
+        .publish(
+            state
+                .stage("late".into(), HashMap::new(), "1".into(), event.clone())
+                .unwrap(),
+        )
+        .unwrap();
     drop(state);
     let (state, _) = snapshot::DurableState::open(path).unwrap();
     assert_eq!(state.completed_cells().last().unwrap().0, "1");
-    state.publish(state.stage("next".into(), HashMap::new(), "257".into(), event.clone()).unwrap()).unwrap();
+    state
+        .publish(
+            state
+                .stage("next".into(), HashMap::new(), "257".into(), event.clone())
+                .unwrap(),
+        )
+        .unwrap();
     assert_eq!(state.completed_cell("1"), Some(event));
     assert!(state.completed_cell("2").is_none());
     assert_eq!(state.completed_cells().len(), TERMINAL_CELL_CACHE_CAPACITY);
+}
+#[tokio::test]
+async fn first_termination_receipt_includes_expired_publication_admission_and_never_publishes_late()
+{
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.json");
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    assert_eq!(
+        runtime.restore_durable_state(Some(&path)).await.unwrap(),
+        None
+    );
+    let gate = Arc::clone(&runtime.inner.commit_gate).lock_owned().await;
+    let mut ids = Vec::new();
+    for _ in 0..8 {
+        let started = runtime
+            .execute(
+                execute_request("text('captured'); await new Promise(r=>setTimeout(r,60000));"),
+                ObserveMode::YieldAfter(Duration::from_millis(5)),
+            )
+            .await
+            .unwrap();
+        let id = started.cell_id.clone();
+        assert!(matches!(
+            started.initial_event().await.unwrap(),
+            CellEvent::Yielded { .. }
+        ));
+        let event = tokio::time::timeout(Duration::from_secs(5), runtime.terminate(&id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&event, CellEvent::Terminated { content_items } if content_items.iter().any(|item|
+            matches!(item, OutputItem::Text { text } if text.contains("durability is unconfirmed"))))
+        );
+        assert_eq!(runtime.cached_terminal_event(&id).await.unwrap(), event);
+        ids.push(id);
+    }
+    drop(gate);
+    runtime.shutdown().await.unwrap();
+    let durable = runtime.inner.durable_state.get().unwrap();
+    for id in ids {
+        assert!(
+            durable.completed_cell(id.as_str()).is_none(),
+            "unadmitted publisher ran late"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stalled_optional_spills_keep_count_and_payload_admission_until_settlement() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let (release, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(StorageTestGate {
+        entered: tokio::sync::Notify::new(),
+        release: StdMutex::new(receiver),
+    });
+    *runtime.inner.spill_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let mut admitted = None;
+    for index in 0..6 {
+        let started = runtime
+            .execute(
+                execute_request("for(let i=0;i<9;i++) text('x'.repeat(1024*1024));"),
+                ObserveMode::YieldAfter(Duration::from_secs(10)),
+            )
+            .await
+            .unwrap();
+        let id = started.cell_id.clone();
+        let event = started.initial_event().await.unwrap();
+        if index < TERMINAL_SPILL_JOBS {
+            tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.inner.cells.lock().await.contains_key(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.cached_terminal_event(&id).await.unwrap(), event);
+        if index >= TERMINAL_SPILL_JOBS - 1 {
+            assert_eq!(runtime.inner.spill_jobs.available_permits(), 0);
+            let remaining = runtime.inner.spill_bytes.available_permits();
+            assert_eq!(*admitted.get_or_insert(remaining), remaining);
+        }
+    }
+    drop(release); // also releases every blocked native job during unwinding
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.inner.spill_jobs.available_permits() != TERMINAL_SPILL_JOBS {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        runtime.inner.spill_bytes.available_permits(),
+        TERMINAL_SPILL_BYTES
+    );
+    runtime.shutdown().await.unwrap();
 }

@@ -53,6 +53,10 @@ pub struct RuntimeMetricsSummary {
     pub responses_api_engine_service_tbt_ms: u64,
     pub turn_ttft_ms: u64,
     pub turn_ttfm_ms: u64,
+    /// Sub-millisecond carry in the same order as the thirteen duration fields.
+    /// This keeps poll boundaries from rounding away short observations.
+    #[doc(hidden)]
+    pub duration_residual_ns: [i32; 13],
 }
 
 impl RuntimeMetricsSummary {
@@ -70,39 +74,68 @@ impl RuntimeMetricsSummary {
             && self.responses_api_engine_service_tbt_ms == 0
             && self.turn_ttft_ms == 0
             && self.turn_ttfm_ms == 0
+            && self.duration_residual_ns.iter().all(|value| *value == 0)
     }
 
-    /// Accumulate activity totals while retaining the latest nonzero collection
-    /// window for server and first-response timings displayed by the TUI.
+    /// Accumulate process-local histogram observation sums. These are neither
+    /// a latest-response vector nor exclusive turn/inference durations.
     pub fn merge(&mut self, other: Self) {
-        self.tool_calls.merge(other.tool_calls);
-        self.api_calls.merge(other.api_calls);
-        self.streaming_events.merge(other.streaming_events);
-        self.websocket_calls.merge(other.websocket_calls);
-        self.websocket_events.merge(other.websocket_events);
-        if other.responses_api_overhead_ms > 0 {
-            self.responses_api_overhead_ms = other.responses_api_overhead_ms;
+        for (index, (left, right)) in [
+            (&mut self.tool_calls, other.tool_calls),
+            (&mut self.api_calls, other.api_calls),
+            (&mut self.streaming_events, other.streaming_events),
+            (&mut self.websocket_calls, other.websocket_calls),
+            (&mut self.websocket_events, other.websocket_events),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            left.count = left.count.saturating_add(right.count);
+            merge_duration_ms(
+                &mut left.duration_ms,
+                &mut self.duration_residual_ns[index],
+                right.duration_ms,
+                other.duration_residual_ns[index],
+            );
         }
-        if other.responses_api_inference_time_ms > 0 {
-            self.responses_api_inference_time_ms = other.responses_api_inference_time_ms;
-        }
-        if other.responses_api_engine_iapi_ttft_ms > 0 {
-            self.responses_api_engine_iapi_ttft_ms = other.responses_api_engine_iapi_ttft_ms;
-        }
-        if other.responses_api_engine_service_ttft_ms > 0 {
-            self.responses_api_engine_service_ttft_ms = other.responses_api_engine_service_ttft_ms;
-        }
-        if other.responses_api_engine_iapi_tbt_ms > 0 {
-            self.responses_api_engine_iapi_tbt_ms = other.responses_api_engine_iapi_tbt_ms;
-        }
-        if other.responses_api_engine_service_tbt_ms > 0 {
-            self.responses_api_engine_service_tbt_ms = other.responses_api_engine_service_tbt_ms;
-        }
-        if other.turn_ttft_ms > 0 {
-            self.turn_ttft_ms = other.turn_ttft_ms;
-        }
-        if other.turn_ttfm_ms > 0 {
-            self.turn_ttfm_ms = other.turn_ttfm_ms;
+        for (offset, (left, right)) in [
+            (
+                &mut self.responses_api_overhead_ms,
+                other.responses_api_overhead_ms,
+            ),
+            (
+                &mut self.responses_api_inference_time_ms,
+                other.responses_api_inference_time_ms,
+            ),
+            (
+                &mut self.responses_api_engine_iapi_ttft_ms,
+                other.responses_api_engine_iapi_ttft_ms,
+            ),
+            (
+                &mut self.responses_api_engine_service_ttft_ms,
+                other.responses_api_engine_service_ttft_ms,
+            ),
+            (
+                &mut self.responses_api_engine_iapi_tbt_ms,
+                other.responses_api_engine_iapi_tbt_ms,
+            ),
+            (
+                &mut self.responses_api_engine_service_tbt_ms,
+                other.responses_api_engine_service_tbt_ms,
+            ),
+            (&mut self.turn_ttft_ms, other.turn_ttft_ms),
+            (&mut self.turn_ttfm_ms, other.turn_ttfm_ms),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let index = offset + 5;
+            merge_duration_ms(
+                left,
+                &mut self.duration_residual_ns[index],
+                right,
+                other.duration_residual_ns[index],
+            );
         }
     }
 
@@ -114,6 +147,13 @@ impl RuntimeMetricsSummary {
             responses_api_engine_service_ttft_ms: self.responses_api_engine_service_ttft_ms,
             responses_api_engine_iapi_tbt_ms: self.responses_api_engine_iapi_tbt_ms,
             responses_api_engine_service_tbt_ms: self.responses_api_engine_service_tbt_ms,
+            duration_residual_ns: std::array::from_fn(|index| {
+                if (5..11).contains(&index) {
+                    self.duration_residual_ns[index]
+                } else {
+                    0
+                }
+            }),
             ..RuntimeMetricsSummary::default()
         }
     }
@@ -121,7 +161,7 @@ impl RuntimeMetricsSummary {
     pub(crate) fn from_snapshot(snapshot: &ResourceMetrics) -> Self {
         let mut summary = Self::default();
         // Accumulate fractional milliseconds across all attribute points and scopes
-        // before rounding at the public integer-summary boundary.
+        // and retain fractional carry across polling windows.
         let mut durations = [0.0; 13];
         for metric in snapshot
             .scope_metrics()
@@ -164,19 +204,22 @@ impl RuntimeMetricsSummary {
                 }
             }
         }
-        summary.tool_calls.duration_ms = f64_to_u64(durations[0]);
-        summary.api_calls.duration_ms = f64_to_u64(durations[1]);
-        summary.streaming_events.duration_ms = f64_to_u64(durations[2]);
-        summary.websocket_calls.duration_ms = f64_to_u64(durations[3]);
-        summary.websocket_events.duration_ms = f64_to_u64(durations[4]);
-        summary.responses_api_overhead_ms = f64_to_u64(durations[5]);
-        summary.responses_api_inference_time_ms = f64_to_u64(durations[6]);
-        summary.responses_api_engine_iapi_ttft_ms = f64_to_u64(durations[7]);
-        summary.responses_api_engine_service_ttft_ms = f64_to_u64(durations[8]);
-        summary.responses_api_engine_iapi_tbt_ms = f64_to_u64(durations[9]);
-        summary.responses_api_engine_service_tbt_ms = f64_to_u64(durations[10]);
-        summary.turn_ttft_ms = f64_to_u64(durations[11]);
-        summary.turn_ttfm_ms = f64_to_u64(durations[12]);
+        let rounded =
+            durations.map(|value| round_duration_ns((value * 1_000_000.0).round() as u128));
+        summary.tool_calls.duration_ms = rounded[0].0;
+        summary.api_calls.duration_ms = rounded[1].0;
+        summary.streaming_events.duration_ms = rounded[2].0;
+        summary.websocket_calls.duration_ms = rounded[3].0;
+        summary.websocket_events.duration_ms = rounded[4].0;
+        summary.responses_api_overhead_ms = rounded[5].0;
+        summary.responses_api_inference_time_ms = rounded[6].0;
+        summary.responses_api_engine_iapi_ttft_ms = rounded[7].0;
+        summary.responses_api_engine_service_ttft_ms = rounded[8].0;
+        summary.responses_api_engine_iapi_tbt_ms = rounded[9].0;
+        summary.responses_api_engine_service_tbt_ms = rounded[10].0;
+        summary.turn_ttft_ms = rounded[11].0;
+        summary.turn_ttfm_ms = rounded[12].0;
+        summary.duration_residual_ns = rounded.map(|(_, residual)| residual);
         summary
     }
 }
@@ -191,12 +234,22 @@ fn sum_counter_metric(metric: &Metric) -> u64 {
     }
 }
 
-fn f64_to_u64(value: f64) -> u64 {
-    if !value.is_finite() || value <= 0.0 {
-        return 0;
+fn round_duration_ns(value: u128) -> (u64, i32) {
+    let rounded_ms = value / 1_000_000 + u128::from(value % 1_000_000 >= 500_000);
+    if rounded_ms > u128::from(u64::MAX) {
+        return (u64::MAX, 0);
     }
-    let clamped = value.min(u64::MAX as f64);
-    clamped.round() as u64
+    (
+        rounded_ms as u64,
+        (value as i128 - rounded_ms as i128 * 1_000_000) as i32,
+    )
+}
+
+fn merge_duration_ms(total: &mut u64, residual: &mut i32, other: u64, other_residual: i32) {
+    let nanos = (i128::from(*total) + i128::from(other)) * 1_000_000
+        + i128::from(*residual)
+        + i128::from(other_residual);
+    (*total, *residual) = round_duration_ns(nanos.max(0) as u128);
 }
 
 #[cfg(test)]
@@ -206,6 +259,65 @@ mod tests {
     use crate::MetricsConfig;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use std::time::Duration;
+
+    #[test]
+    fn audit_observability_runtime_poll_partition_uses_observation_sums() {
+        let first = RuntimeMetricsSummary {
+            responses_api_engine_iapi_ttft_ms: 120,
+            responses_api_engine_service_tbt_ms: 50,
+            ..Default::default()
+        };
+        let second = RuntimeMetricsSummary {
+            responses_api_engine_iapi_ttft_ms: 80,
+            ..Default::default()
+        };
+        let mut separate = first;
+        separate.merge(second);
+        let mut together = RuntimeMetricsSummary::default();
+        together.merge(RuntimeMetricsSummary {
+            responses_api_engine_iapi_ttft_ms: 200,
+            responses_api_engine_service_tbt_ms: 50,
+            ..Default::default()
+        });
+        assert_eq!(separate, together);
+        separate.merge(RuntimeMetricsSummary::default());
+        assert_eq!(separate, together);
+    }
+
+    #[test]
+    fn audit_observability_fractional_windows_match_one_collection() {
+        let metrics = MetricsClient::new(
+            MetricsConfig::in_memory("test", "test", "1", InMemoryMetricExporter::default())
+                .with_runtime_reader(),
+        )
+        .unwrap();
+        let record = || {
+            metrics
+                .record_count_and_duration(
+                    API_CALL_COUNT_METRIC,
+                    RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC,
+                    1,
+                    Duration::from_micros(400),
+                    &[],
+                )
+                .unwrap()
+        };
+        record();
+        let mut split = RuntimeMetricsSummary::from_snapshot(&metrics.snapshot().unwrap());
+        record();
+        split.merge(RuntimeMetricsSummary::from_snapshot(
+            &metrics.snapshot().unwrap(),
+        ));
+        record();
+        record();
+        let combined = RuntimeMetricsSummary::from_snapshot(&metrics.snapshot().unwrap());
+        assert_eq!(split, combined);
+        assert_eq!(split.responses_api_engine_iapi_ttft_ms, 1); // 800 us rounded once
+        assert_eq!(split.duration_residual_ns[7], -200_000);
+        split.merge(RuntimeMetricsSummary::default());
+        assert_eq!(split, combined);
+        metrics.shutdown().unwrap();
+    }
 
     #[test]
     fn snapshot_sums_fractional_attribute_points_before_rounding_and_saturates_counts() {

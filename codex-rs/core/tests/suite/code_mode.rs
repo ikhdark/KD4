@@ -810,7 +810,10 @@ async fn missing_process_host_fails_closed_in_code_mode_only() -> Result<()> {
         "Code Mode only keeps exec advertised"
     );
     let output = raw_custom_tool_output_text(&request, "call-1");
-    assert!(output.contains("failed to spawn code-mode host"), "{output}");
+    assert!(
+        output.contains("failed to spawn code-mode host"),
+        "{output}"
+    );
     assert!(!output.contains("must-not-run"), "{output}");
 
     Ok(())
@@ -956,14 +959,19 @@ async fn code_mode_known_persistence_failure_blocks_next_turn_provider_request()
 
     // Initialization has completed. Preserve its empty snapshot, if present,
     // and obstruct only subsequent tool-history writes in this isolated home.
+    // The live session keeps its storage-owner lock open inside `tool-history`,
+    // and Windows cannot rename a directory with an open file beneath it, so
+    // block this thread's ledger path rather than the whole directory.
     let history_path = test.codex_home_path().join("tool-history");
-    if history_path.exists() {
+    let thread_id = test.session_configured.thread_id;
+    let ledger_path = history_path.join(format!("{thread_id}.json"));
+    if ledger_path.exists() {
         fs::rename(
-            &history_path,
-            test.codex_home_path().join("tool-history-before-failure"),
+            &ledger_path,
+            history_path.join(format!("{thread_id}.json.before-failure")),
         )?;
     }
-    fs::write(&history_path, b"filesystem obstruction")?;
+    fs::create_dir(&ledger_path)?;
 
     let first_request = responses::mount_sse_once(
         &server,
@@ -1018,7 +1026,7 @@ async fn code_mode_known_persistence_failure_blocks_next_turn_provider_request()
     assert!(
         error
             .message
-            .contains("failed to create tool-history ledger directory"),
+            .contains("failed to read checkpoint journal boundary"),
         "{}",
         error.message
     );
@@ -1033,11 +1041,15 @@ async fn code_mode_known_persistence_failure_blocks_next_turn_provider_request()
         after_failure_count, model_request_count,
         "known persistence failure must prevent provider dispatch"
     );
-    assert_eq!(fs::read(&history_path)?, b"filesystem obstruction");
+    assert!(fs::metadata(&ledger_path)?.is_dir());
+    assert!(
+        fs::read_dir(&ledger_path)?.next().is_none(),
+        "failed writes must leave the obstruction untouched"
+    );
 
     // Repair and use the real shutdown checkpoint to prove the failed queue
     // retained the registration produced by the actual code-mode tool runtime.
-    fs::remove_file(&history_path)?;
+    fs::remove_dir(&ledger_path)?;
     test.codex.submit(Op::Shutdown).await?;
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -1056,9 +1068,7 @@ async fn code_mode_known_persistence_failure_blocks_next_turn_provider_request()
     })
     .await
     .expect("repaired shutdown must finish");
-    let ledger: Value = serde_json::from_slice(&fs::read(
-        history_path.join(format!("{}.json", test.session_configured.thread_id)),
-    )?)?;
+    let ledger: Value = serde_json::from_slice(&fs::read(&ledger_path)?)?;
     assert_eq!(
         ledger["state"]["non_workspace_code_mode_calls"],
         serde_json::json!(["queued-non-workspace-call"]),
@@ -1170,7 +1180,14 @@ text(reads.map(read => read.value).join(""));"#
     let stale = workspace_invalidation(&final_raw, "call-0")
         .expect("changed source must append a freshness notice");
     assert_eq!(stale["stale_workspace_evidence"], true);
-    assert!(stale.get("current_nested_results").is_some(), "{stale}");
+    assert!(stale.get("retained_nested_results").is_some(), "{stale}");
+    assert!(
+        stale["retained_nested_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|result| result["workspace_evidence_freshness"] == "unknown")
+    );
     assert_eq!(
         custom_tool_output_last_non_empty_text(&final_raw, "call-0")
             .unwrap()
@@ -2502,9 +2519,11 @@ async fn code_mode_update_plan_nested_tool_returns_authoritative_result() -> Res
     let (_test, second_mock) = run_code_mode_turn(
         &server,
         "use exec to run update_plan",
+        // Unresolved plan steps now block final acceptance with a bounded repair
+        // (audit 115), so record the step as done to keep this about the result.
         r#"
 const result = await tools.update_plan({
-  plan: [{ step: "Run update_plan from code mode", status: "in_progress" }],
+  plan: [{ step: "Run update_plan from code mode", status: "completed" }],
 });
 text(JSON.stringify(result));
 "#,
@@ -2956,7 +2975,12 @@ throw new Error("boom");
     let items = custom_tool_output_items(&req, "call-1");
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(r"(?s)\A", r"Script failed with cell ID ", cell_id_pattern!(), r"\z"),
+        concat!(
+            r"(?s)\A",
+            r"Script failed with cell ID ",
+            cell_id_pattern!(),
+            r"\z"
+        ),
         text_item(&items, /*index*/ 0),
     );
     assert_regex_match(
@@ -4448,7 +4472,12 @@ text(circular);
     );
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(r"(?s)\A", r"Script failed with cell ID ", cell_id_pattern!(), r"\z"),
+        concat!(
+            r"(?s)\A",
+            r"Script failed with cell ID ",
+            cell_id_pattern!(),
+            r"\z"
+        ),
         text_item(&items, /*index*/ 0),
     );
     assert!(text_item(&items, /*index*/ 1).contains("Script error:"));
@@ -4479,10 +4508,11 @@ image("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUl
         Some(false),
         "code_mode image output failed unexpectedly"
     );
-    assert_eq!(items.len(), 2);
-    assert_eq!(text_item(&items, /*index*/ 0), "");
+    // Media-bearing packets keep their native item positions at admission;
+    // no consolidated (here empty) text item is synthesized before the image.
+    assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(
-        items[1],
+        items[0],
         serde_json::json!({
             "type": "input_image",
             "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
@@ -4507,10 +4537,10 @@ async fn code_mode_replaces_malformed_image() -> Result<()> {
 
     let req = second_mock.single_request();
     let items = custom_tool_output_items(&req, "call-1");
-    assert_eq!(items.len(), 2);
-    assert_eq!(text_item(&items, 0), "");
+    // The rejected image is replaced in place; no empty text item precedes it.
+    assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(
-        items[1],
+        items[0],
         serde_json::json!({
             "type": "input_text",
             "text": "image content omitted because it could not be processed"
@@ -4560,10 +4590,12 @@ async fn code_mode_resizes_explicit_original_image() -> Result<()> {
     let items = custom_tool_output_items(&req, "call-1");
     let (_, success) = custom_tool_output_body_and_success(&req, "call-1");
     assert_ne!(success, Some(false));
-    let resized_url = items[1]["image_url"]
+    // Media packets keep native positions: the image comes first, followed by
+    // image preparation's resize disclosure.
+    let resized_url = items[0]["image_url"]
         .as_str()
         .expect("code mode image output should contain a data URL");
-    assert_eq!(items[1]["detail"], "original");
+    assert_eq!(items[0]["detail"], "original");
     let (_, resized_base64) = resized_url
         .split_once(',')
         .expect("resized image should contain a data URL prefix");
@@ -4597,7 +4629,12 @@ async fn code_mode_image_helper_rejects_remote_url() -> Result<()> {
     );
     assert_eq!(items.len(), 2);
     assert_regex_match(
-        concat!(r"(?s)\A", r"Script failed with cell ID ", cell_id_pattern!(), r"\z"),
+        concat!(
+            r"(?s)\A",
+            r"Script failed with cell ID ",
+            cell_id_pattern!(),
+            r"\z"
+        ),
         text_item(&items, /*index*/ 0),
     );
     assert_eq!(
@@ -4672,28 +4709,36 @@ image(out);
         Some(false),
         "code_mode view_image call failed unexpectedly"
     );
-    assert_eq!(items.len(), 2, "{items:?}");
+    // Media packets keep native positions: no empty text item is synthesized,
+    // and only a still-running cell prefixes its status.
+    let (image_item, status_items) = items.split_last().expect("image output item");
+    assert!(status_items.len() <= 1, "{items:?}");
     assert_eq!(
-        items[1].get("type").and_then(Value::as_str),
+        image_item.get("type").and_then(Value::as_str),
         Some("input_image"),
         "{items:?}"
     );
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"(?:Script running with cell ID ",
-            cell_id_pattern!(),
-            r")?\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
+    if !status_items.is_empty() {
+        assert_regex_match(
+            concat!(
+                r"(?s)\A",
+                r"Script running with cell ID ",
+                cell_id_pattern!(),
+                r"\z"
+            ),
+            text_item(&items, /*index*/ 0),
+        );
+    }
 
-    let emitted_image_url = items[1]
+    let emitted_image_url = image_item
         .get("image_url")
         .and_then(Value::as_str)
         .expect("image helper should emit an input_image item with image_url");
     assert!(emitted_image_url.starts_with("data:image/png;base64,"));
-    assert_eq!(items[1].get("detail").and_then(Value::as_str), Some(detail));
+    assert_eq!(
+        image_item.get("detail").and_then(Value::as_str),
+        Some(detail)
+    );
 
     Ok(())
 }
@@ -4727,29 +4772,34 @@ image(imageItem);
         Some(false),
         "code_mode mcp image scenario call failed unexpectedly"
     );
-    assert_eq!(items.len(), 2);
-    assert_regex_match(
-        concat!(
-            r"(?s)\A",
-            r"(?:Script running with cell ID ",
-            cell_id_pattern!(),
-            r")?\z"
-        ),
-        text_item(&items, /*index*/ 0),
-    );
+    // Media packets keep native positions: no empty text item is synthesized,
+    // and only a still-running cell prefixes its status.
+    let (image_item, status_items) = items.split_last().expect("image output item");
+    assert!(status_items.len() <= 1, "{items:?}");
+    if !status_items.is_empty() {
+        assert_regex_match(
+            concat!(
+                r"(?s)\A",
+                r"Script running with cell ID ",
+                cell_id_pattern!(),
+                r"\z"
+            ),
+            text_item(&items, /*index*/ 0),
+        );
+    }
 
     assert_eq!(
-        items[1].get("type").and_then(Value::as_str),
+        image_item.get("type").and_then(Value::as_str),
         Some("input_image")
     );
 
-    let emitted_image_url = items[1]
+    let emitted_image_url = image_item
         .get("image_url")
         .and_then(Value::as_str)
         .expect("image helper should emit an input_image item with image_url");
     assert!(emitted_image_url.starts_with("data:image/png;base64,"));
     assert_eq!(
-        items[1].get("detail").and_then(Value::as_str),
+        image_item.get("detail").and_then(Value::as_str),
         Some("original")
     );
 
@@ -5216,7 +5266,7 @@ text(JSON.stringify(tool));
         parsed,
         serde_json::json!({
             "name": "view_image",
-            "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Image detail level. Defaults to `high`; use `low` for lower-cost overview inspection. When available, `original` preserves exact resolution.\n  detail?: \"low\" | \"high\";\n  // Local filesystem path to an image file.\n  path: string;\n}, options?: { timeout_ms?: number }): Promise<{\n  // Image detail hint returned by view_image: `low` for overview inspection, `high` for default resized behavior, or `original` when original resolution is preserved.\n  detail: \"low\" | \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```",
+            "description": "View a local image file from the filesystem when visual inspection is needed. Use this for images already available on disk.\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Image detail level. Defaults to `high`; use `low` for lower-cost overview inspection. When available, `original` retains source resolution within safety limits (6000 pixels per side and 10000 32-pixel patches); any resizing is disclosed with the image.\n  detail?: \"low\" | \"high\";\n  // Local filesystem path to an image file.\n  path: string;\n}, options?: { timeout_ms?: number }): Promise<{\n  // Requested image detail: `low` for overview inspection, `high` for default resized behavior, or `original` for the larger bounded resolution budget. Preparation discloses any original-detail resizing.\n  detail: \"low\" | \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```",
         })
     );
 

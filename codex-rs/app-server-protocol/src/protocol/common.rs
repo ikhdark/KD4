@@ -129,6 +129,15 @@ macro_rules! experimental_type_entry {
     };
 }
 
+/// Resource admission is independent of semantic serialization: process cleanup
+/// still follows process registration, but must not need an ordinary work slot.
+pub fn client_request_is_control(method: &str) -> bool {
+    matches!(
+        method,
+        "turn/interrupt" | "command/exec/terminate" | "process/kill"
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientRequestSerializationScope {
     Global(&'static str),
@@ -260,6 +269,18 @@ macro_rules! encode_client_request_params {
     };
 }
 
+/// Decode failures after the wire envelope has already been validated.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientRequestDecodeError {
+    #[error("Unknown method: {0}")]
+    UnknownMethod(String),
+    #[error("Invalid parameters for {method}: {source}")]
+    InvalidParams {
+        method: &'static str,
+        source: serde_json::Error,
+    },
+}
+
 macro_rules! client_request_definitions {
     (
         $(
@@ -296,6 +317,19 @@ macro_rules! client_request_definitions {
         }
 
         impl ClientRequest {
+            /// Keep method membership separate from parameter decoding without
+            /// interpreting serde's diagnostic text. The legacy TryFrom API is unchanged.
+            pub fn decode_jsonrpc(request: JSONRPCRequest) -> Result<Self, ClientRequestDecodeError> {
+                match request.method.as_str() {
+                    $(
+                        $wire $( $(| $alias)* )? => Self::try_from(request).map_err(|source| {
+                            ClientRequestDecodeError::InvalidParams { method: $wire, source }
+                        }),
+                    )*
+                    _ => Err(ClientRequestDecodeError::UnknownMethod(request.method)),
+                }
+            }
+
             pub fn id(&self) -> &RequestId {
                 match self {
                     $(Self::$variant { request_id, .. } => request_id,)*
@@ -310,6 +344,10 @@ macro_rules! client_request_definitions {
 
             pub fn method(&self) -> String {
                 self.method_name().to_string()
+            }
+
+            pub fn is_control(&self) -> bool {
+                client_request_is_control(self.method_name())
             }
 
             pub fn serialization_scope(&self) -> Option<ClientRequestSerializationScope> {
@@ -1787,7 +1825,7 @@ server_request_definitions! {
 pub struct FuzzyFileSearchParams {
     pub query: String,
     pub roots: Vec<String>,
-    // if provided, will cancel any previous request that used the same value
+    // If provided, cancels the previous request with this value on the same connection.
     pub cancellation_token: Option<String>,
 }
 
@@ -1872,18 +1910,25 @@ pub struct FuzzyFileSearchSessionUpdatedNotification {
     /// Number of indexed files and directories, including entries that did not match.
     #[serde(default)]
     pub scanned_file_count: usize,
-    /// True only after scanning finishes without omitting paths. A completed
-    /// notification with this still false indicates an incomplete traversal.
+    /// True only after scanning and current-query matching finish without omissions.
+    /// False during matching, or when limits, cancellation or errors interrupt search.
     #[serde(default)]
     pub walk_complete: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, Default)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
 pub struct FuzzyFileSearchSessionCompletedNotification {
     pub session_id: String,
     pub query: String,
+    /// Terminal results are delivered even if best-effort progress updates were lost.
+    /// Absent only in legacy server payloads; absence does not prove completeness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub results: Option<FuzzyFileSearchResponse>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 server_notification_definitions! {
@@ -1897,6 +1942,7 @@ server_notification_definitions! {
     ThreadUnarchived => "thread/unarchived" (v2::ThreadUnarchivedNotification),
     #[delivery(required)]
     ThreadClosed => "thread/closed" (v2::ThreadClosedNotification),
+    #[delivery(required)]
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
     #[delivery(required)]
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
@@ -1909,6 +1955,7 @@ server_notification_definitions! {
     #[delivery(required)]
     #[experimental("thread/settings/updated")]
     ThreadSettingsUpdated => "thread/settings/updated" (v2::ThreadSettingsUpdatedNotification),
+    #[delivery(required)]
     ThreadTokenUsageUpdated => "thread/tokenUsage/updated" (v2::ThreadTokenUsageUpdatedNotification),
     TurnStarted => "turn/started" (v2::TurnStartedNotification),
     HookStarted => "hook/started" (v2::HookStartedNotification),
@@ -1959,6 +2006,7 @@ server_notification_definitions! {
     ExternalAgentConfigImportProgress => "externalAgentConfig/import/progress" (v2::ExternalAgentConfigImportProgressNotification),
     #[delivery(required)]
     ExternalAgentConfigImportCompleted => "externalAgentConfig/import/completed" (v2::ExternalAgentConfigImportCompletedNotification),
+    #[delivery(required)]
     FsChanged => "fs/changed" (v2::FsChangedNotification),
     #[delivery(required)]
     ReasoningSummaryTextDelta => "item/reasoning/summaryTextDelta" (v2::ReasoningSummaryTextDeltaNotification),
@@ -2053,7 +2101,10 @@ mod tests {
             (CoreAuthMode::ChatgptAuthTokens, AuthMode::ChatgptAuthTokens),
             (CoreAuthMode::Headers, AuthMode::Headers),
             (CoreAuthMode::AgentIdentity, AuthMode::AgentIdentity),
-            (CoreAuthMode::PersonalAccessToken, AuthMode::PersonalAccessToken),
+            (
+                CoreAuthMode::PersonalAccessToken,
+                AuthMode::PersonalAccessToken,
+            ),
             (CoreAuthMode::BedrockApiKey, AuthMode::BedrockApiKey),
         ] {
             let api = AuthMode::from(core);
@@ -2157,6 +2208,7 @@ mod tests {
                 FuzzyFileSearchSessionCompletedNotification {
                     session_id: "session".to_string(),
                     query: "query".to_string(),
+                    ..Default::default()
                 },
             ),
             ServerNotification::WindowsSandboxSetupCompleted(
@@ -2176,6 +2228,11 @@ mod tests {
     #[test]
     fn authoritative_state_transition_notifications_require_delivery() {
         let notifications = [
+            ServerNotification::SkillsChanged(v2::SkillsChangedNotification {}),
+            ServerNotification::FsChanged(v2::FsChangedNotification {
+                watch_id: "watch".to_string(),
+                changed_paths: vec![AbsolutePathBuf::try_from(std::env::temp_dir()).unwrap()],
+            }),
             ServerNotification::ThreadNameUpdated(v2::ThreadNameUpdatedNotification {
                 thread_id: "thread".to_string(),
                 thread_name: Some("renamed thread".to_string()),
@@ -2227,6 +2284,10 @@ mod tests {
                 cap_reached: false,
             }),
             ServerNotification::ProcessExited(v2::ProcessExitedNotification {
+                stdout_base64: None,
+                stderr_base64: None,
+                stdout_capture: None,
+                stderr_capture: None,
                 process_handle: "process".to_string(),
                 exit_code: 0,
                 stdout: String::new(),
@@ -2811,7 +2872,10 @@ mod tests {
             }),
             serde_json::to_value(&request)?,
         );
-        assert_eq!(serde_json::from_value::<ClientRequest>(serde_json::to_value(&request)?)?, request);
+        assert_eq!(
+            serde_json::from_value::<ClientRequest>(serde_json::to_value(&request)?)?,
+            request
+        );
         Ok(())
     }
 
@@ -3362,10 +3426,30 @@ mod tests {
     #[test]
     fn serialize_account_login_chatgpt() -> Result<()> {
         for (streamlined, hosted, app_brand, expected_params) in [
-            (false, false, None, json!({"type":"chatgpt", "appBrand":null})),
-            (true, false, None, json!({"type":"chatgpt", "appBrand":null, "codexStreamlinedLogin":true})),
-            (true, true, Some(v2::LoginAppBrand::Chatgpt), json!({"type":"chatgpt", "appBrand":"chatgpt", "codexStreamlinedLogin":true, "useHostedLoginSuccessPage":true})),
-            (false, true, None, json!({"type":"chatgpt", "appBrand":null, "useHostedLoginSuccessPage":true})),
+            (
+                false,
+                false,
+                None,
+                json!({"type":"chatgpt", "appBrand":null}),
+            ),
+            (
+                true,
+                false,
+                None,
+                json!({"type":"chatgpt", "appBrand":null, "codexStreamlinedLogin":true}),
+            ),
+            (
+                true,
+                true,
+                Some(v2::LoginAppBrand::Chatgpt),
+                json!({"type":"chatgpt", "appBrand":"chatgpt", "codexStreamlinedLogin":true, "useHostedLoginSuccessPage":true}),
+            ),
+            (
+                false,
+                true,
+                None,
+                json!({"type":"chatgpt", "appBrand":null, "useHostedLoginSuccessPage":true}),
+            ),
         ] {
             let request = ClientRequest::LoginAccount {
                 request_id: RequestId::Integer(3),
@@ -4071,6 +4155,7 @@ mod tests {
         ServerNotification::ThreadSettingsUpdated(v2::ThreadSettingsUpdatedNotification {
             thread_id: "thr_123".to_string(),
             thread_settings: v2::ThreadSettings {
+                environments: None,
                 cwd: absolute_path("/tmp/repo"),
                 approval_policy: v2::AskForApproval::Never,
                 sandbox_policy: v2::SandboxPolicy::DangerFullAccess,
@@ -4137,7 +4222,8 @@ mod tests {
         // A params mismatch on a still-registered method must not count as removal.
         for err in [envelope_err, serde_err] {
             assert!(
-                err.to_string().contains(&format!("unknown variant `{method}`")),
+                err.to_string()
+                    .contains(&format!("unknown variant `{method}`")),
                 "{method} must be rejected as an unknown method: {err}"
             );
         }

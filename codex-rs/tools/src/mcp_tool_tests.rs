@@ -59,8 +59,14 @@ fn mcp_projection_keeps_conditional_tools_discoverable_without_narrowing_branche
     assert!(projected.get("oneOf").is_none());
     assert!(projected.get("anyOf").is_some());
     assert!(projected.get("additionalProperties").is_none());
-    assert_eq!(projected["properties"]["literal"]["enum"], input["properties"]["literal"]["enum"]);
-    assert_eq!(serde_json::Value::Object(tool.input_schema.as_ref().clone()), input);
+    assert_eq!(
+        projected["properties"]["literal"]["enum"],
+        input["properties"]["literal"]["enum"]
+    );
+    assert_eq!(
+        serde_json::Value::Object(tool.input_schema.as_ref().clone()),
+        input
+    );
 }
 
 #[test]
@@ -95,16 +101,19 @@ fn parse_mcp_tool_preserves_top_level_output_schema() {
                 /*required*/ None,
                 /*additional_properties*/ None
             ),
-            output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({
-                "properties": {
-                    "result": {
-                        "properties": {
-                            "nested": {}
+            output_schema: Some(
+                mcp_call_tool_result_output_schema(serde_json::json!({
+                    "properties": {
+                        "result": {
+                            "properties": {
+                                "nested": {}
+                            }
                         }
-                    }
-                },
-                "required": ["result"]
-            })).into()),
+                    },
+                    "required": ["result"]
+                }))
+                .into()
+            ),
             defer_loading: false,
         }
     );
@@ -135,9 +144,12 @@ fn parse_mcp_tool_preserves_output_schema_without_inferred_type() {
                 /*required*/ None,
                 /*additional_properties*/ None
             ),
-            output_schema: Some(mcp_call_tool_result_output_schema(serde_json::json!({
-                "enum": ["ok", "error"]
-            })).into()),
+            output_schema: Some(
+                mcp_call_tool_result_output_schema(serde_json::json!({
+                    "enum": ["ok", "error"]
+                }))
+                .into()
+            ),
             defer_loading: false,
         }
     );

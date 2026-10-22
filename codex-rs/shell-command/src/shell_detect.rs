@@ -100,8 +100,8 @@ fn get_shell_path(
     binary_name: &str,
     fallback_paths: &[&str],
 ) -> Option<PathBuf> {
-    if let Some(path) = provided_path.and_then(|path| file_exists(path)) {
-        return Some(path);
+    if let Some(path) = provided_path {
+        return file_exists(path).or_else(|| which::which(path).ok());
     }
 
     if let Ok(path) = which::which(binary_name) {
@@ -128,8 +128,14 @@ const POWERSHELL_FALLBACK_PATHS: &[&str] =
     &[r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"#];
 
 fn get_powershell_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
+    if let Some(path) = path {
+        return get_shell_path(Some(path), "", &[]).map(|shell_path| DetectedShell {
+            shell_type: ShellType::PowerShell,
+            shell_path,
+        });
+    }
     let shell_path = select_powershell_host(
-        || path.and_then(|path| file_exists(path)),
+        || None,
         || find_binary_or_fallback("pwsh", PWSH_FALLBACK_PATHS),
         || find_binary_or_fallback("powershell", POWERSHELL_FALLBACK_PATHS),
     );
@@ -351,6 +357,17 @@ mod tests {
         assert_eq!(
             powershell_host_kind("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
             Some(PowerShellHostKind::WindowsPowerShell)
+        );
+    }
+
+    #[test]
+    fn explicit_missing_host_never_falls_back_to_an_installed_host() {
+        let missing = std::env::temp_dir().join("codex-missing-explicit-host/powershell.exe");
+        assert_eq!(get_shell(ShellType::PowerShell, Some(&missing)), None);
+        let requested = PathBuf::from("powershell.exe");
+        assert_eq!(
+            get_shell(ShellType::PowerShell, Some(&requested)).map(|shell| shell.shell_path),
+            which::which(&requested).ok(),
         );
     }
 

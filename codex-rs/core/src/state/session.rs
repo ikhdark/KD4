@@ -45,9 +45,67 @@ use codex_utils_output_truncation::TruncationPolicy;
 pub(crate) struct PromptTokenCalibration {
     basis: Option<(String, String)>,
     samples: VecDeque<(u64, u64)>,
+    covered_prompt: Option<crate::client_common::PromptCalibrationBasis>,
+    observed_input_tokens: Option<i64>,
 }
 
 impl PromptTokenCalibration {
+    pub(crate) fn observe_prompt(
+        &mut self,
+        provider: &str,
+        model: &str,
+        prompt: crate::client_common::PromptCalibrationBasis,
+        measured: Option<u64>,
+        observed_input: Option<u64>,
+    ) {
+        if self
+            .covered_prompt
+            .as_ref()
+            .is_none_or(|previous| !prompt.extends(previous))
+        {
+            self.samples.clear();
+        }
+        self.observe(
+            provider,
+            model,
+            measured.map(|measured| (prompt.local_tokens.max(0) as u64, measured)),
+        );
+        self.observed_input_tokens =
+            observed_input.map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX));
+        self.covered_prompt = Some(prompt);
+    }
+
+    pub(crate) fn estimate_prompt(
+        &self,
+        provider: &str,
+        model: &str,
+        prompt: &crate::client_common::PromptCalibrationBasis,
+    ) -> i64 {
+        let Some(previous) = self
+            .covered_prompt
+            .as_ref()
+            .filter(|previous| prompt.extends(previous))
+        else {
+            return prompt.local_tokens;
+        };
+        // Only the observed prefix is calibrated. Newly appended content has
+        // independent cost, and changed schemas/projections cannot reuse it.
+        let observed = self
+            .basis
+            .as_ref()
+            .filter(|(p, m)| p == provider && m == model)
+            .and(self.observed_input_tokens)
+            .unwrap_or(0);
+        self.estimate_ratio(provider, model, previous.local_tokens)
+            .max(observed)
+            .saturating_add(
+                prompt
+                    .local_tokens
+                    .saturating_sub(previous.local_tokens)
+                    .max(0),
+            )
+    }
+
     pub(crate) fn observe(&mut self, provider: &str, model: &str, sample: Option<(u64, u64)>) {
         if self
             .basis
@@ -70,6 +128,15 @@ impl PromptTokenCalibration {
     }
 
     pub(crate) fn estimate(&self, provider: &str, model: &str, local: i64) -> i64 {
+        // A bare scalar has no representation identity. Only prepared prompts
+        // can reuse production calibration, including downward calibration.
+        if self.covered_prompt.is_some() {
+            return local;
+        }
+        self.estimate_ratio(provider, model, local)
+    }
+
+    fn estimate_ratio(&self, provider: &str, model: &str, local: i64) -> i64 {
         if self
             .basis
             .as_ref()
@@ -97,7 +164,6 @@ pub(crate) struct SessionState {
     /// Estimated retirable tokens re-sent by each request checked since history
     /// was last rewritten; see `retire_consumed_tool_outputs_before_limit`.
     pub(crate) proactive_retirement_carried_tokens: u64,
-    pub(crate) server_reasoning_included: bool,
     pub(crate) mcp_dependency_prompted: HashSet<String>,
     pub(crate) additional_context: AdditionalContextStore,
     /// Settings used by the latest regular user turn, used for turn-to-turn
@@ -106,9 +172,6 @@ pub(crate) struct SessionState {
     previous_turn_settings: Option<PreviousTurnSettings>,
     /// Runtime accounting state for the active auto-compaction window.
     auto_compact_window: AutoCompactWindow,
-    token_budget_reminder_emitted: bool,
-    auto_compact_fallback_emitted: bool,
-    pub(crate) new_context_window_requested: bool,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
     /// Transport-only preconnect scheduled before MCP/tool initialization.
@@ -142,14 +205,10 @@ impl SessionState {
             latest_rate_limits: None,
             prompt_token_calibration: PromptTokenCalibration::default(),
             proactive_retirement_carried_tokens: 0,
-            server_reasoning_included: false,
             mcp_dependency_prompted: HashSet::new(),
             additional_context: AdditionalContextStore::default(),
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
-            token_budget_reminder_emitted: false,
-            auto_compact_fallback_emitted: false,
-            new_context_window_requested: false,
             startup_prewarm: None,
             startup_transport: None,
             current_time_reminder: CurrentTimeReminderState::default(),
@@ -296,6 +355,11 @@ impl SessionState {
         self.auto_compact_window.snapshot()
     }
 
+    pub(crate) fn auto_compact_window_server_observed_prefill(&self) -> Option<i64> {
+        self.auto_compact_window
+            .server_observed_prefill_input_tokens()
+    }
+
     pub(crate) fn auto_compact_window_number(&self) -> u64 {
         self.auto_compact_window.window_number()
     }
@@ -309,28 +373,7 @@ impl SessionState {
         window_number: u64,
         ids: AutoCompactWindowIds,
     ) {
-        if self.auto_compact_window.ids() != ids {
-            self.token_budget_reminder_emitted = false;
-            self.auto_compact_fallback_emitted = false;
-            self.new_context_window_requested = false;
-        }
         self.auto_compact_window.restore(window_number, ids);
-    }
-
-    pub(crate) fn claim_token_budget_reminder(&mut self) -> bool {
-        !std::mem::replace(&mut self.token_budget_reminder_emitted, true)
-    }
-
-    pub(crate) fn claim_auto_compact_fallback(&mut self) -> bool {
-        !std::mem::replace(&mut self.auto_compact_fallback_emitted, true)
-    }
-
-    pub(crate) fn release_token_budget_reminder(&mut self) {
-        self.token_budget_reminder_emitted = false;
-    }
-
-    pub(crate) fn release_auto_compact_fallback(&mut self) {
-        self.auto_compact_fallback_emitted = false;
     }
 
     #[cfg(test)]
@@ -361,14 +404,6 @@ impl SessionState {
 
     pub(crate) fn set_token_usage_full(&mut self, context_window: i64) {
         self.history.set_token_usage_full(context_window);
-    }
-
-    pub(crate) fn set_server_reasoning_included(&mut self, included: bool) {
-        self.server_reasoning_included = included;
-    }
-
-    pub(crate) fn server_reasoning_included(&self) -> bool {
-        self.server_reasoning_included
     }
 
     pub(crate) fn record_mcp_dependency_prompted<I>(&mut self, names: I)

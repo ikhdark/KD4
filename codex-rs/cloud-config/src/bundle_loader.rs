@@ -11,14 +11,6 @@ use codex_login::AuthManager;
 use codex_login::AuthRouteConfig;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::OnceLock;
-use tokio::task::JoinHandle;
-
-fn refresher_task_slot() -> &'static Mutex<Option<JoinHandle<()>>> {
-    static REFRESHER_TASK: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
-    REFRESHER_TASK.get_or_init(|| Mutex::new(None))
-}
 
 pub fn cloud_config_bundle_loader(
     auth_manager: Arc<AuthManager>,
@@ -28,26 +20,20 @@ pub fn cloud_config_bundle_loader(
 ) -> CloudConfigBundleLoader {
     let service = CloudConfigBundleService::new(
         auth_manager,
-        Arc::new(BackendBundleClient::new(chatgpt_base_url, http_client_factory)),
+        Arc::new(BackendBundleClient::new(
+            chatgpt_base_url,
+            http_client_factory,
+        )),
         codex_home,
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
-    let refresh_service = service.clone();
-    let refresh_task =
-        tokio::spawn(async move { refresh_service.refresh_cache_in_background().await });
-    let mut refresher_guard = refresher_task_slot().lock().unwrap_or_else(|err| {
-        tracing::warn!("cloud config bundle refresher task slot was poisoned");
-        err.into_inner()
-    });
-    if let Some(existing_task) = refresher_guard.replace(refresh_task) {
-        existing_task.abort();
-    }
     retryable_service_loader(service)
 }
 
 pub(crate) fn retryable_service_loader<C: crate::backend::BundleClient + 'static>(
     service: CloudConfigBundleService<C>,
 ) -> CloudConfigBundleLoader {
+    let validity_service = service.clone();
     CloudConfigBundleLoader::retryable(move || {
         let service = service.clone();
         // Spawn at attempt creation, not first polling: admitted work remains
@@ -64,6 +50,7 @@ pub(crate) fn retryable_service_loader<C: crate::backend::BundleClient + 'static
             })?
         }
     })
+    .with_publication_guard(move |publish| validity_service.publish_if_current(publish))
 }
 
 pub async fn cloud_config_bundle_loader_for_storage(

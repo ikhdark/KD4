@@ -40,6 +40,12 @@ impl WorldStateSection for SubagentsState {
         true
     }
 
+    fn required() -> bool {
+        // This already-bounded activity snapshot replaces prior execution facts,
+        // including agents that stopped. It must not leave an old list current.
+        true
+    }
+
     fn matches_legacy_fragment(role: &str, text: &str) -> bool {
         role == "user" && Self::matches_text(text)
     }

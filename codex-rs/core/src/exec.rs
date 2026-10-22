@@ -26,7 +26,9 @@ use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
+#[cfg(test)]
 use crate::spawn::spawn_child_async;
+use crate::spawn::spawn_child_with_observation_async;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
@@ -186,6 +188,14 @@ fn network_proxy_environment_error(
     CodexErr::Io(io::Error::other(format!(
         "failed to prepare network proxy for environment `{environment_id}`: {err}"
     )))
+}
+
+/// Refusal for a command whose restrictions require a sandbox that this host cannot provide.
+pub(crate) fn unavailable_sandbox_error() -> CodexErr {
+    CodexErr::Io(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed",
+    ))
 }
 
 /// Mechanism to terminate an exec invocation before it finishes naturally.
@@ -382,6 +392,10 @@ impl CommandProgress {
     }
 }
 
+#[path = "exec_delivery_recovery.rs"]
+mod delivery_recovery;
+pub use delivery_recovery::OutputDeltaRecovery;
+
 #[derive(Clone)]
 pub struct StdoutStream {
     pub sub_id: String,
@@ -389,6 +403,7 @@ pub struct StdoutStream {
     pub tx_event: Sender<Event>,
     /// Notifies an owner-held command watchdog whenever stdout or stderr advances.
     pub(crate) progress: Option<CommandProgress>,
+    pub(crate) delivery_recovery: Option<Arc<OutputDeltaRecovery>>,
 }
 
 impl StdoutStream {
@@ -400,7 +415,20 @@ impl StdoutStream {
             call_id,
             tx_event,
             progress: None,
+            delivery_recovery: None,
         }
+    }
+
+    pub fn with_delivery_recovery(
+        sub_id: String,
+        call_id: String,
+        tx_event: Sender<Event>,
+        cap: usize,
+    ) -> (Self, Arc<OutputDeltaRecovery>) {
+        let recovery = Arc::new(OutputDeltaRecovery::new(cap));
+        let mut stream = Self::without_progress(sub_id, call_id, tx_event);
+        stream.delivery_recovery = Some(Arc::clone(&recovery));
+        (stream, recovery)
     }
 }
 
@@ -491,10 +519,7 @@ pub fn build_exec_request(
             enforce_managed_network,
         )
     {
-        return Err(CodexErr::Io(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed",
-        )));
+        return Err(unavailable_sandbox_error());
     }
 
     if let Some(network) = network.as_ref() {
@@ -780,7 +805,7 @@ async fn exec_windows_sandbox(
         .map(|overrides| overrides.additional_deny_read_paths.clone())
         .unwrap_or_default();
     let retained_bytes_cap = capture_policy.retained_bytes_cap();
-    let aggregate_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
+    let aggregate_capture = Arc::new(Mutex::new(OutputCapture::aggregate(retained_bytes_cap)));
     let aggregate_capture_for_sink = Arc::clone(&aggregate_capture);
     let limiter = Arc::new(OutputDeltaLimiter::default());
     let live_output_enabled = Arc::new(AtomicBool::new(true));
@@ -790,7 +815,7 @@ async fn exec_windows_sandbox(
             aggregate_capture_for_sink
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .append(chunk);
+                .append_process_bytes(chunk);
             let Some(stream) = stdout_stream.as_ref() else {
                 return;
             };
@@ -973,6 +998,7 @@ struct OutputCapture {
     truncated: bool,
     omitted_bytes: usize,
     drain_timed_out: bool,
+    raw: Option<crate::tools::command_output_artifact::capture::SharedLegacyRawCapture>,
 }
 
 impl OutputCapture {
@@ -988,6 +1014,30 @@ impl OutputCapture {
             truncated: false,
             omitted_bytes: 0,
             drain_timed_out: false,
+            raw: None,
+        }
+    }
+
+    fn aggregate(max_bytes: Option<usize>) -> Self {
+        let mut capture = Self::new(max_bytes);
+        capture.raw = crate::tools::command_output_artifact::capture::current_legacy_capture();
+        capture
+    }
+
+    fn append_process_bytes(&mut self, bytes: &[u8]) {
+        if let Some(raw) = &self.raw {
+            raw.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write_chunk(bytes);
+        }
+        self.append(bytes);
+    }
+
+    fn mark_raw_gap(&self) {
+        if let Some(raw) = &self.raw {
+            raw.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mark_output_gap();
         }
     }
 
@@ -1018,6 +1068,7 @@ impl OutputCapture {
     }
 
     fn mark_drain_timeout(&mut self) {
+        self.mark_raw_gap();
         self.truncated = true;
         if !self.drain_timed_out {
             self.drain_timed_out = true;
@@ -1115,7 +1166,7 @@ async fn exec(
     })?;
     let arg0_ref = arg0.as_deref();
     let managed_root = ManagedRootProcess::reserve_with_reclaim().await?;
-    let child = spawn_child_async(SpawnChildRequest {
+    let (child, observation) = spawn_child_with_observation_async(SpawnChildRequest {
         program: PathBuf::from(program),
         args: args.into(),
         arg0: arg0_ref,
@@ -1131,28 +1182,38 @@ async fn exec(
         creation_flags: 0,
     })
     .await?;
-
+    // Creation already happened, even if containment fails below.
+    crate::tools::tool_dispatch_trace::mark_exec_process_spawned();
     if let Err(err) = managed_root.attach_and_resume(
         child
             .id()
             .ok_or_else(|| io::Error::other("missing child process id"))?,
     ) {
         if let Err(cleanup_error) = managed_root.cleanup_after_failed_attach(child).await {
+            observation.cleanup_observed("attach_failed_cleanup_failed");
             tracing::warn!("Failed to clean up uncontained exec child: {cleanup_error}");
+        } else {
+            observation.cleanup_observed("attach_failed_cleanup_completed");
+            crate::tools::tool_dispatch_trace::mark_exec_process_exited();
         }
         return Err(err.into());
     }
     if let Some(after_spawn) = after_spawn {
         after_spawn();
     }
-    consume_output(
+    let result = consume_output(
         child,
         expiration,
         capture_policy,
         stdout_stream,
         managed_root,
     )
-    .await
+    .await;
+    if result.is_ok() {
+        observation.cleanup_observed("root_reaped; descendants_unknown");
+        crate::tools::tool_dispatch_trace::mark_exec_process_exited();
+    }
+    result
 }
 
 async fn terminate_and_reap_child_process_tree(
@@ -1190,7 +1251,7 @@ async fn consume_output(
     let output_delta_limiter = Arc::new(OutputDeltaLimiter::default());
     let stdout_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
     let stderr_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
-    let aggregate_capture = Arc::new(Mutex::new(OutputCapture::new(retained_bytes_cap)));
+    let aggregate_capture = Arc::new(Mutex::new(OutputCapture::aggregate(retained_bytes_cap)));
     let stdout_handle = tokio::spawn(read_output_into_capture(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
@@ -1309,6 +1370,7 @@ async fn await_captured_output_until_deadline(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         retained.truncated = true;
+                        retained.mark_raw_gap();
                         retained.append(notice.as_bytes());
                     }
                 }
@@ -1400,7 +1462,7 @@ async fn read_output_into_capture<R: AsyncRead + Unpin + Send + 'static>(
             aggregate_capture
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .append(&tmp[..n]);
+                .append_process_bytes(&tmp[..n]);
         }
         capture
             .lock()
@@ -1502,6 +1564,11 @@ fn try_send_limited_output_delta(
     chunk: Vec<u8>,
     limiter: &OutputDeltaLimiter,
 ) -> OutputDeltaSendOutcome {
+    if let Some(recovery) = &stream.delivery_recovery {
+        let admit = matches!(limiter.claim(), OutputDeltaDecision::Emit);
+        recovery.publish(stream, is_stderr, chunk, admit);
+        return OutputDeltaSendOutcome::Continue;
+    }
     let (chunk, outcome) = match limiter.claim() {
         OutputDeltaDecision::Emit => (chunk, OutputDeltaSendOutcome::Continue),
         OutputDeltaDecision::EmitCapNotice => (
@@ -1511,6 +1578,13 @@ fn try_send_limited_output_delta(
         OutputDeltaDecision::Suppress => return OutputDeltaSendOutcome::Stop,
     };
     let event = output_delta_event(stream, is_stderr, chunk);
+    // Live deltas are best-effort; the end event carries the aggregated output.
+    // An oversized delta ends this command's live output. A momentarily full
+    // queue drops only this delta. Neither closes the session channel that
+    // later required events share.
+    if !codex_mcp::event_queue::event_fits_budget(&event) {
+        return OutputDeltaSendOutcome::Stop;
+    }
     match stream.tx_event.try_send(event) {
         Ok(()) | Err(async_channel::TrySendError::Full(_)) => outcome,
         Err(async_channel::TrySendError::Closed(_)) => OutputDeltaSendOutcome::Stop,

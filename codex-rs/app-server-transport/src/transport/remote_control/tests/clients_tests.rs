@@ -24,7 +24,16 @@ fn client_management_handle(
         environment_id: None,
     });
     RemoteControlHandle {
-        policy: RemoteControlPolicy::Allowed,
+        policy: Arc::new(
+            watch::channel((
+                RemoteControlPolicy::Allowed,
+                auth_manager
+                    .policy_auth_snapshot()
+                    .ok()
+                    .map(|(epoch, _)| epoch),
+            ))
+            .0,
+        ),
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
         desired_state_persistence_lock: Arc::new(Semaphore::new(1)),

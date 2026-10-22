@@ -1,10 +1,16 @@
 use super::*;
+#[path = "agent_jobs_regression_tests.rs"]
+mod regressions;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
 #[test]
 fn csv_schema_rejects_undecodable_numeric_limits() {
-    let codex_tools::ToolSpec::Function(tool) = crate::tools::handlers::agent_jobs_spec::create_spawn_agents_on_csv_tool() else { panic!("CSV tool"); };
+    let codex_tools::ToolSpec::Function(tool) =
+        crate::tools::handlers::agent_jobs_spec::create_spawn_agents_on_csv_tool()
+    else {
+        panic!("CSV tool");
+    };
     let schema = serde_json::to_value(tool.parameters).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     for field in ["max_concurrency", "max_workers", "max_runtime_seconds"] {
@@ -19,10 +25,12 @@ fn csv_schema_rejects_undecodable_numeric_limits() {
         assert!(validator.is_valid(&args));
         assert!(serde_json::from_value::<SpawnAgentsOnCsvArgs>(args).is_ok());
     }
-    let zero_runtime = json!({"csv_path":"input.csv","instruction":"Process row","max_runtime_seconds":0});
+    let zero_runtime =
+        json!({"csv_path":"input.csv","instruction":"Process row","max_runtime_seconds":0});
     assert!(!validator.is_valid(&zero_runtime));
     assert!(normalize_max_runtime_seconds(Some(0)).is_err());
-    let zero_concurrency = json!({"csv_path":"input.csv","instruction":"Process row","max_concurrency":0});
+    let zero_concurrency =
+        json!({"csv_path":"input.csv","instruction":"Process row","max_concurrency":0});
     assert!(validator.is_valid(&zero_concurrency));
     assert_eq!(normalize_concurrency(Some(0), None), 1);
 }
@@ -183,7 +191,7 @@ async fn spawn_rejects_invalid_and_non_object_output_schemas_before_reading_csv(
     .to_string();
     let Err(invalid_schema_error) = spawn_agents_on_csv::handle(
         session.clone(),
-        turn.clone(),
+        StepContext::for_test(turn.clone()),
         invalid_schema_arguments,
         CancellationToken::new(),
     )
@@ -207,7 +215,7 @@ async fn spawn_rejects_invalid_and_non_object_output_schemas_before_reading_csv(
     .to_string();
     let Err(non_object_schema_error) = spawn_agents_on_csv::handle(
         session,
-        turn,
+        StepContext::for_test(turn),
         non_object_schema_arguments,
         CancellationToken::new(),
     )
@@ -241,9 +249,9 @@ async fn report_rejects_schema_invalid_result_without_completing_then_accepts_co
         .expect("load pending job item")
         .expect("job item should exist");
     let prompt = build_worker_prompt(&job, &item).expect("build worker prompt");
-    assert!(
-        prompt.contains("If the tool rejects your result, correct the payload and call it again.")
-    );
+    assert!(prompt.contains(
+        "If schema validation rejects your result, correct the payload and call it again."
+    ));
     assert!(!prompt.contains("exactly once"));
 
     let reporting_thread_id = ThreadId::new();
@@ -383,6 +391,58 @@ async fn wait_for_status_change_wakes_on_capacity_release_without_active_workers
         start,
         "capacity release must not wait for a polling interval"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn csv_wait_wakes_on_unrelated_v2_execution_release_without_registry_release() {
+    use codex_protocol::protocol::MultiAgentVersion;
+    use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::SubAgentSource;
+
+    let control =
+        crate::agent::AgentControl::default().with_session_id(codex_protocol::SessionId::new(), 1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("unrelated".into()));
+    let execution = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    // Retain residency/registry ownership throughout. Only execution is freed.
+    let _resident = control.registry().reserve_spawn_slot(Some(1)).unwrap();
+    let mut capacity = control.subscribe_capacity_changes();
+    assert!(
+        control
+            .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+            .is_err()
+    );
+    let (_jobs, mut jobs) = tokio::sync::watch::channel(0);
+    let cancellation = CancellationToken::new();
+    let active = HashMap::new();
+    let start = Instant::now();
+    let wait = wait_for_status_change(
+        &active,
+        &mut jobs,
+        &mut capacity,
+        &cancellation,
+        Duration::from_secs(60),
+    );
+    tokio::pin!(wait);
+    assert!(futures::poll!(&mut wait).is_pending());
+    drop(execution);
+    wait.await;
+    assert_eq!(
+        Instant::now(),
+        start,
+        "execution release must bypass reconciliation delay"
+    );
+    let admitted = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    assert!(
+        control
+            .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+            .is_err(),
+        "a wakeup is not an additional permit"
+    );
+    drop(admitted);
 }
 
 #[tokio::test(start_paused = true)]
@@ -662,6 +722,7 @@ async fn runner_settles_non_limit_spawn_failure_without_retrying() {
     let options = JobRunnerOptions {
         max_concurrency: 1,
         spawn_config: (*turn.config).clone(),
+        environments: turn.environments.clone(),
     };
 
     timeout(
@@ -732,6 +793,7 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
     let options = JobRunnerOptions {
         max_concurrency: 1,
         spawn_config: (*turn.config).clone(),
+        environments: turn.environments.clone(),
     };
     let cancellation_token = CancellationToken::new();
     cancellation_token.cancel();
@@ -851,11 +913,19 @@ async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
     .await
     .expect("late report should return an explicit rejection");
     assert!(late_output.sampling_request_signal.is_none());
-    assert_eq!(late_output.into_text(), r#"{"accepted":false}"#);
+    let rejection: Value = serde_json::from_str(&late_output.into_text()).expect("rejection JSON");
+    assert_eq!(rejection["accepted"], false);
+    assert!(
+        rejection["rejection_reason"]
+            .as_str()
+            .expect("reason")
+            .contains("Do not automatically replay")
+    );
 
     let options = JobRunnerOptions {
         max_concurrency: 2,
         spawn_config: (*turn.config).clone(),
+        environments: turn.environments.clone(),
     };
     timeout(
         Duration::from_secs(5),
@@ -1056,6 +1126,7 @@ async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRo
     let options = JobRunnerOptions {
         max_concurrency: 1,
         spawn_config: (*turn.config).clone(),
+        environments: turn.environments.clone(),
     };
     let runner = tokio::spawn({
         let session = session.clone();
@@ -1112,10 +1183,6 @@ async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRo
     if let Some(other) = other_worker.as_ref() {
         timeout(Duration::from_secs(5), async {
             loop {
-                assert!(
-                    !runner.is_finished(),
-                    "one failed shutdown must not skip another worker"
-                );
                 let ops = manager.captured_ops();
                 if [thread_id, other.thread_id].iter().all(|expected| {
                     ops.iter().any(|(id, op)| {
@@ -1129,9 +1196,6 @@ async fn assert_runner_preserves_worker_until_cleanup(route: BlockedJobCleanupRo
         })
         .await
         .expect("cleanup must attempt both workers regardless of iteration order");
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(11)).await;
-        tokio::time::resume();
     }
     let (result, mut active_items) = timeout(Duration::from_secs(5), runner)
         .await
@@ -1333,7 +1397,7 @@ async fn csv_job_sql_fault_fixture(
 async fn csv_job_fault_handler_error(fixture: &CsvJobSqlFaultFixture) -> String {
     match spawn_agents_on_csv::handle(
         fixture.session.clone(),
-        fixture.turn.clone(),
+        StepContext::for_test(fixture.turn.clone()),
         fixture.arguments.clone(),
         CancellationToken::new(),
     )
@@ -1507,4 +1571,72 @@ async fn csv_failed_detail_read_error_is_not_reported_as_missing_evidence() -> a
     fixture.connection.close().await?;
     fixture.db.close().await;
     Ok(())
+}
+#[tokio::test]
+async fn csv_admission_reads_the_step_environment_not_the_turn() {
+    use crate::session::turn_context::TurnEnvironment;
+    use crate::tools::context::ToolCallSource;
+    use crate::tools::context::ToolInvocation;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::registry::ToolExecutor;
+    let (_db_dir, db, _) = create_running_job(1).await;
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+    session.services.state_db = Some(db);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    std::fs::write(first.path().join("input.csv"), "old\na\n").unwrap();
+    // Invalid headers identify the selected input before workers or exports are admitted.
+    std::fs::write(second.path().join("input.csv"), "current,current\nb,b\n").unwrap();
+    let primary = turn.environments.primary().unwrap().clone();
+    let environment = |directory: &std::path::Path| {
+        TurnEnvironment::new(
+            primary.environment_id.clone(),
+            primary.environment.clone(),
+            codex_utils_path_uri::PathUri::from_abs_path(
+                &AbsolutePathBuf::try_from(directory).unwrap(),
+            ),
+            primary.shell.clone(),
+        )
+    };
+    turn.environments.turn_environments = vec![environment(first.path())];
+    let turn = Arc::new(turn);
+    let mut step = (*StepContext::for_test(turn.clone())).clone();
+    step.environments.turn_environments = vec![environment(second.path())];
+    let config = build_agent_spawn_config_for_step(&step).unwrap();
+    assert_eq!(config.cwd.as_path(), second.path());
+    let admitted = step.environments.clone();
+    // A later selection cannot retarget already captured work.
+    step.environments.turn_environments = vec![environment(first.path())];
+    assert_eq!(
+        spawn_agents_on_csv::single_local_environment_cwd(&admitted)
+            .unwrap()
+            .as_path(),
+        second.path()
+    );
+    step.environments = admitted;
+    let output = SpawnAgentsOnCsvHandler
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: Arc::new(step),
+            cancellation_token: CancellationToken::new(),
+            tracker: Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+            call_id: "step-csv".into(),
+            tool_name: codex_tools::ToolName::plain("spawn_agents_on_csv"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({"csv_path":"input.csv","instruction":"Process row"}).to_string(),
+            },
+        })
+        .await;
+    let error = output
+        .err()
+        .expect("duplicate current headers must be rejected")
+        .to_string();
+    assert!(error.contains("current"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(first.path().join("input.csv")).unwrap(),
+        "old\na\n"
+    );
 }

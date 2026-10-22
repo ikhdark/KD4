@@ -125,7 +125,6 @@ timeout = 5
     Ok(())
 }
 
-
 #[tokio::test]
 async fn hooks_list_shows_discovered_plugin_hook() -> Result<()> {
     let codex_home = TempDir::new()?;

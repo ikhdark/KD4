@@ -1,4 +1,3 @@
-pub use codex_protocol::items::WebSearchItem;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -51,7 +50,8 @@ pub struct TurnStartedEvent {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct TurnCompletedEvent {
-    pub usage: Usage,
+    /// None means no accounting snapshot was received, not measured zero.
+    pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surfaced_result: Option<codex_app_server_protocol::SurfacedToolResult>,
     pub timing: Option<codex_app_server_protocol::TurnTiming>,
@@ -108,6 +108,9 @@ pub enum ItemProgress {
 /// cumulative, so a resumed thread's usage includes its earlier turns.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS, Default)]
 pub struct Usage {
+    /// Missing/invalid provider components remain unknown, not measured zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<codex_protocol::protocol::TokenUsageCoverage>,
     /// The number of input tokens used by the thread.
     pub input_tokens: i64,
     /// The number of cached input tokens used by the thread.
@@ -134,9 +137,13 @@ pub struct ItemUpdatedEvent {
 }
 
 /// Fatal error emitted by the stream.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, TS)]
 pub struct ThreadErrorEvent {
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
 }
 
 /// Canonical representation of a thread item and its domain-specific payload.
@@ -154,6 +161,8 @@ pub enum ThreadItemDetails {
     /// Response from the agent.
     /// Either a natural-language response or a JSON string when structured output is requested.
     AgentMessage(AgentMessageItem),
+    /// Canonical user-facing plan, not a claim of implemented work.
+    Plan(PlanItem),
     /// Agent's reasoning summary.
     Reasoning(ReasoningItem),
     /// Marks context compaction. The enclosing event distinguishes start from completion.
@@ -187,6 +196,28 @@ pub enum ThreadItemDetails {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 pub struct AgentMessageItem {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub phase: Option<codex_protocol::models::MessagePhase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct PlanItem {
+    pub text: String,
+}
+
+/// Exec owns the enclosing item ID; provider identity is separate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct WebSearchItem {
+    pub call_id: String,
+    pub query: String,
+    pub action: codex_protocol::models::WebSearchAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
 }
 
 /// Agent's reasoning summary.
@@ -345,6 +376,9 @@ pub enum CollabAgentStatus {
 /// Last known state of a collab agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 pub struct CollabAgentState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stop_cause: Option<codex_protocol::protocol::TurnExecutionStopCause>,
     pub status: CollabAgentStatus,
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use codex_login::CodexAuth;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
@@ -326,7 +327,9 @@ async fn failed_remote_compaction_falls_back_to_local_compaction_and_continues()
             .filter(|item| {
                 item["role"] == "user"
                     && item["content"].as_array().is_some_and(|content| {
-                        content.iter().any(|part| part["text"] == "continue after the tool")
+                        content
+                            .iter()
+                            .any(|part| part["text"] == "continue after the tool")
                     })
             })
             .count(),
@@ -349,6 +352,106 @@ async fn failed_remote_compaction_falls_back_to_local_compaction_and_continues()
             .expect("retained unread tool result")
             .contains(DUMMY_FUNCTION_NAME),
         "fallback must retain the actual unsupported-tool diagnostic, not a synthetic output"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrecoverable_mid_turn_remote_compaction_failure_fails_the_turn_once() -> Result<()> {
+    require_network!();
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_auto_compact_token_limit = Some(200_000);
+                config.model_auto_compact_token_limit_scope =
+                    codex_protocol::config_types::AutoCompactTokenLimitScope::Total;
+                config.model_provider.request_max_retries = Some(0);
+                config.model_provider.stream_max_retries = Some(0);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+    let requests = responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            responses::sse(vec![
+                responses::ev_function_call("before-compact", DUMMY_FUNCTION_NAME, "{}"),
+                responses::ev_completed_with_tokens("r1", /*total_tokens*/ 500_000),
+            ]),
+            // A plain message is not a v2 checkpoint. That validation failure is
+            // not eligible for the local fallback, so the turn cannot continue.
+            responses::sse(vec![
+                responses::ev_assistant_message("not-a-checkpoint", "plain-text summary"),
+                responses::ev_completed("compact"),
+            ]),
+        ],
+    )
+    .await;
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "continue after the tool".into(),
+                text_elements: vec![],
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let mut errors = Vec::new();
+    let mut compactions_started = Vec::new();
+    let mut compactions_completed = Vec::new();
+    let completed = loop {
+        match wait_for_event_with_timeout(&codex, |_| true, REMOTE_COMPACT_TURN_COMPLETE_TIMEOUT)
+            .await
+        {
+            EventMsg::ItemStarted(codex_protocol::protocol::ItemStartedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => compactions_started.push(item.id),
+            EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => compactions_completed.push(item.id),
+            EventMsg::Error(event) => errors.push(event),
+            EventMsg::TurnComplete(turn) => break turn,
+            _ => {}
+        }
+    };
+    assert_eq!(compactions_started.len(), 1);
+    assert_eq!(
+        compactions_completed, compactions_started,
+        "failed remote compaction must complete its started item exactly once"
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "an unrecoverable compaction failure must be reported exactly once: {errors:?}"
+    );
+    assert!(
+        errors[0]
+            .message
+            .contains("expected exactly one compaction output item"),
+        "the report must carry the compaction failure: {errors:?}"
+    );
+    assert_eq!(
+        completed.error.as_ref(),
+        Some(&errors[0]),
+        "the turn must end as failed with the reported error"
+    );
+    let requests = requests.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "a failed compaction must neither fall back to local compaction nor sample again"
+    );
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains("compaction_trigger")
     );
     Ok(())
 }

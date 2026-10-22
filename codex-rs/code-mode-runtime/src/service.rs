@@ -110,11 +110,16 @@ impl InProcessCodeModeSession {
             yield_time_ms,
             recovery,
         } = request;
-        let terminal_only = recovery.as_ref().is_some_and(|recovery| recovery.terminal_only);
+        let terminal_only = recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.terminal_only);
         let runtime_cell_id = if terminal_only {
             // The wire keeps the old public ID so the receipt is returned with
             // its original generation. It is never sent to a live actor.
-            let raw = cell_id.as_str().split_once(':').map_or(cell_id.as_str(), |(_, raw)| raw);
+            let raw = cell_id
+                .as_str()
+                .split_once(':')
+                .map_or(cell_id.as_str(), |(_, raw)| raw);
             runtime::CellId::new(raw)
         } else {
             runtime_cell_id(&cell_id)
@@ -122,18 +127,30 @@ impl InProcessCodeModeSession {
         let mut observation = if terminal_only {
             Err(runtime::Error::MissingCell(runtime_cell_id.clone()))
         } else {
-            self.runtime.begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms)).await
+            self.runtime
+                .begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms))
+                .await
         };
-        if matches!(&observation, Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_)))
-            && let Some(recovery) = recovery
+        if matches!(
+            &observation,
+            Err(runtime::Error::MissingCell(_) | runtime::Error::ClosedCell(_))
+        ) && let Some(recovery) = recovery
         {
-            if let Err(error) = self.runtime.restore_existing_durable_state(&recovery.path).await {
+            if let Err(error) = self
+                .runtime
+                .restore_existing_durable_state(&recovery.path)
+                .await
+            {
                 return Box::pin(async move { Err(error.to_string()) });
             }
             observation = if terminal_only {
-                self.runtime.recovered_terminal_observation(&runtime_cell_id).await
+                self.runtime
+                    .recovered_terminal_observation(&runtime_cell_id)
+                    .await
             } else {
-                self.runtime.begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms)).await
+                self.runtime
+                    .begin_observe(&runtime_cell_id, observe_mode_for_yield_time(yield_time_ms))
+                    .await
             };
         }
         match observation {

@@ -670,10 +670,14 @@ mod tests {
             two_lines: std::sync::mpsc::Sender<()>,
         }
         impl Read for Counted {
-            fn read(&mut self, bytes: &mut [u8]) -> IoResult<usize> { self.cursor.read(bytes) }
+            fn read(&mut self, bytes: &mut [u8]) -> IoResult<usize> {
+                self.cursor.read(bytes)
+            }
         }
         impl BufRead for Counted {
-            fn fill_buf(&mut self) -> IoResult<&[u8]> { self.cursor.fill_buf() }
+            fn fill_buf(&mut self) -> IoResult<&[u8]> {
+                self.cursor.fill_buf()
+            }
             fn consume(&mut self, amount: usize) {
                 self.cursor.consume(amount);
                 if self.read.fetch_add(amount, Ordering::SeqCst) + amount == 16 {
@@ -683,10 +687,16 @@ mod tests {
         }
         let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (ready, entered) = std::sync::mpsc::channel();
-        let input = Counted { cursor: std::io::Cursor::new(b"1234567\n".repeat(128)), read: Arc::clone(&read), two_lines: ready };
+        let input = Counted {
+            cursor: std::io::Cursor::new(b"1234567\n".repeat(128)),
+            read: Arc::clone(&read),
+            two_lines: ready,
+        };
         let (tx, rx) = mpsc::channel(STDIN_READ_AHEAD);
         let reader = std::thread::spawn(move || read_stdin_lines(input, tx, 8));
-        entered.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        entered
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
         assert_eq!(read.load(Ordering::SeqCst), 16);
         drop(rx);
         reader.join().unwrap();

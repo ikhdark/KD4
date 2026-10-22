@@ -6,6 +6,7 @@ use std::path::Path;
 mod full_suite;
 pub use full_suite::FullSuiteBudget;
 pub use full_suite::check_full_suite_command;
+pub use full_suite::owned_suite_nonexecution;
 
 #[path = "managed_cargo_lane.rs"]
 mod managed_cargo_lane;
@@ -215,7 +216,12 @@ fn preflight_command_issues(
     let argv_commands = argv_commands(command, preflight_shell_type).unwrap_or_default();
 
     for argv in &argv_commands {
-        lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)?;
+        // A basename cannot prove that a native executable does not exist.
+        if let Err(issue) = lint_direct_argv_powershell_cmdlet(argv, preflight_shell_type)
+            && let Some(advisories) = literal_glob_advisories.as_deref_mut()
+        {
+            advisories.push(issue);
+        }
         lint_known_flag_typos(argv)?;
         if let Err(issue) = lint_rg_literal_glob_paths(argv, preflight_shell_type) {
             match literal_glob_advisories.as_deref_mut() {
@@ -320,10 +326,10 @@ pub async fn preflight_invocation_for_kd4_runtime(
                 outcome = repaired;
             }
         }
-        // Reuse the already parsed stages. This is advice for the next read,
-        // never a rewrite, rejection, or extra filesystem probe.
+        // The parser's cached literal stages are advice only. Validation keeps
+        // the complete invocation; neither path adds filesystem probes.
         if let Some(notice) = source_paging_advisory(
-            &outcome.validation_invocations,
+            command,
             shell_type.or_else(|| infer_direct_shell_type(command)),
         ) {
             outcome.advisory = Some(match outcome.advisory {
@@ -497,7 +503,7 @@ fn repair_rg_leaf_glob(
 }
 
 fn source_paging_advisory(
-    stages: &[CommandInvocation],
+    command: &[String],
     shell_type: Option<ShellType>,
 ) -> Option<&'static str> {
     if shell_type != Some(ShellType::PowerShell) {
@@ -505,10 +511,8 @@ fn source_paging_advisory(
     }
     let mut reads = 0;
     let mut paged = false;
-    for stage in stages {
-        let CommandInvocation::Argv { program, args } = stage else {
-            return None;
-        };
+    for argv in argv_commands(command, shell_type)? {
+        let (program, args) = argv.split_first()?;
         if program.eq_ignore_ascii_case("Get-Content") {
             // Encoding conversions, byte streams and live tails are not native
             // UTF-8 snapshot reads. Do not suggest replacing their semantics.
@@ -656,7 +660,7 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     // runs its other commands too; discarding all of them for one literal glob
     // path forces the whole script to be regenerated.
     let mut literal_glob_advisories = Vec::new();
-    let issue = match preflight_command_issues(
+    let mut issue = match preflight_command_issues(
         command,
         shell_type,
         (!invocation.is_argv()).then_some(&mut literal_glob_advisories),
@@ -705,7 +709,20 @@ fn preflight_invocation_with_equivalent_repair_detailed(
     // A repair is execution-safe only for direct argv. Rewriting a script could
     // discard pipelines, redirection, variable expansion, or a later mutating
     // command even when the first parsed argv happens to look read-only.
-    if !invocation.is_argv() {
+    let exact_direct_argv = invocation.to_direct_argv();
+    if !matches!(&issue.rejected, CommandPreflightRejected::Argv(argv)
+        if exact_direct_argv.as_ref() == Some(argv) && argv.as_slice() == command
+            && shell_type.or_else(|| infer_direct_shell_type(command)).is_none())
+    {
+        // The leaf is not a retry for its wrapper, streams or other stages.
+        // Issues without a leaf retry (script syntax, glob paths) keep their
+        // own remediation.
+        if issue.retry.take().is_some() {
+            issue.guidance = Some(
+                "Correct the flag in the original invocation, preserving its shell and all stages."
+                    .into(),
+            );
+        }
         return Err(issue);
     }
 
@@ -752,25 +769,12 @@ fn preflight_invocation_with_equivalent_repair_detailed(
 }
 
 fn validation_invocations(
-    argv_commands: Vec<Vec<String>>,
+    _argv_commands: Vec<Vec<String>>,
     fallback: &CommandInvocation,
 ) -> Vec<CommandInvocation> {
-    let invocations = argv_commands
-        .into_iter()
-        .filter_map(|argv| {
-            let mut arguments = argv.into_iter();
-            let program = arguments.next()?;
-            Some(CommandInvocation::Argv {
-                program,
-                args: arguments.collect(),
-            })
-        })
-        .collect::<Vec<_>>();
-    if invocations.is_empty() {
-        vec![fallback.clone()]
-    } else {
-        invocations
-    }
+    // Both handlers consume this for authority, not display. Preserve source
+    // operators, expansions, host modes and exit guards with their leaves.
+    vec![fallback.clone()]
 }
 
 fn git_status_read_only_equivalent(invocation: &CommandInvocation) -> Option<CommandInvocation> {
@@ -913,88 +917,187 @@ fn parse_cmd_plain_commands(command: &[String]) -> Option<Vec<Vec<String>>> {
     split_cmd_plain_commands(script.as_ref())
 }
 
-fn split_cmd_plain_commands(script: &str) -> Option<Vec<Vec<String>>> {
+/// Conservative PowerShell source ownership for admission, not argv or exit
+/// proof. Quoted data stays whole; only active separators and subexpressions
+/// introduce possible commands. No shell process is launched.
+fn possible_powershell_commands(script: &str) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
-    for command in split_cmd_command_segments(script)? {
-        let argv = split_cmd_words(command)?;
-        if !argv.is_empty() {
-            commands.push(argv);
-        }
-    }
-    Some(commands)
-}
-
-fn split_cmd_command_segments(script: &str) -> Option<Vec<&str>> {
-    let mut segments = Vec::new();
-    let mut start = 0;
-    let mut in_double_quote = false;
-    let mut chars = script.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
-        match ch {
-            '"' => in_double_quote = !in_double_quote,
-            '>' | '<' if !in_double_quote => return None,
-            '&' | '|' if !in_double_quote => {
-                let segment = script[start..index].trim();
-                if !segment.is_empty() {
-                    segments.push(segment);
-                }
-                if chars.peek().is_some_and(|(_, next)| *next == ch) {
-                    chars.next();
-                }
-                start = chars
-                    .peek()
-                    .map_or(index + ch.len_utf8(), |(next_index, _)| *next_index);
-            }
-            _ => {}
-        }
-    }
-    if in_double_quote {
-        return None;
-    }
-    let segment = script[start..].trim();
-    if !segment.is_empty() {
-        segments.push(segment);
-    }
-    Some(segments)
-}
-
-fn split_cmd_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
-    let mut in_double_quote = false;
-    let mut chars = command.chars().peekable();
+    let mut quote = None;
+    let mut subexpressions = Vec::new();
+    let mut chars = script.chars().peekable();
     while let Some(ch) = chars.next() {
-        match ch {
-            '"' => in_double_quote = !in_double_quote,
-            '^' => {
-                if let Some(escaped) = chars.next() {
-                    word.push(escaped);
-                } else {
-                    word.push(ch);
-                }
+        if ch == char::from(96) && quote != Some('\'') {
+            if let Some(escaped) = chars.next() {
+                word.push(escaped);
             }
-            ch if ch.is_whitespace() && !in_double_quote => {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-            }
-            _ => word.push(ch),
+            continue;
         }
-    }
-    if in_double_quote {
-        return None;
+        if ch == '<' && quote.is_none() && chars.peek() == Some(&'#') {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '#' && chars.peek() == Some(&'>') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '#' && quote.is_none() && word.is_empty() {
+            for ch in chars.by_ref() {
+                if ch == '\n' {
+                    break;
+                }
+            }
+            if !words.is_empty() {
+                commands.push(std::mem::take(&mut words));
+            }
+            continue;
+        }
+        if ch == '$' && quote != Some('\'') && chars.peek() == Some(&'(') {
+            chars.next();
+            subexpressions.push(quote.take());
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            if !words.is_empty() {
+                commands.push(std::mem::take(&mut words));
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            if quote == Some(ch) {
+                if ch == '\'' && chars.peek() == Some(&'\'') {
+                    chars.next();
+                    word.push('\'');
+                } else {
+                    quote = None;
+                }
+            } else if quote.is_none() {
+                quote = Some(ch);
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        if quote.is_some() {
+            word.push(ch);
+            continue;
+        }
+        if matches!(ch, ';' | '|' | '&' | '(' | ')' | '{' | '}' | '\r' | '\n') {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            if !words.is_empty() {
+                commands.push(std::mem::take(&mut words));
+            }
+            if ch == ')'
+                && let Some(previous) = subexpressions.pop()
+            {
+                quote = previous;
+            }
+        } else if ch.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(ch);
+        }
     }
     if !word.is_empty() {
         words.push(word);
     }
-    Some(words)
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    for argv in &mut commands {
+        if argv.first().is_some_and(|word| word.starts_with('$')) {
+            if let Some(index) = argv.iter().position(|word| word == "=") {
+                argv.drain(..=index);
+            } else if let Some((_, value)) = argv[0].split_once('=') {
+                argv[0] = value.to_owned();
+            }
+        }
+    }
+    commands
+}
+
+fn split_cmd_plain_commands(script: &str) -> Option<Vec<Vec<String>>> {
+    let mut commands = Vec::new();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quoted = false;
+    let mut chars = script.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // Expansion, blocks, CALL and non-plain builtins need a native
+            // grammar/state proof, not literal path or lint authority.
+            '%' | '!' | '(' | ')' => return None,
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            '^' if !quoted => {
+                let escaped = chars.next()?;
+                if matches!(escaped, '\r' | '\n') {
+                    return None;
+                }
+                word.push(escaped);
+                started = true;
+            }
+            '<' | '>' if !quoted => return None,
+            '&' | '|' | '\r' | '\n' if !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+                if !words.is_empty() {
+                    commands.push(std::mem::take(&mut words));
+                }
+                if chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            _ => {
+                word.push(ch);
+                started = true;
+            }
+        }
+    }
+    if quoted {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    if commands.iter().any(|argv| {
+        argv.first().is_some_and(|program| {
+            matches!(
+                program.to_ascii_lowercase().as_str(),
+                "call" | "for" | "if" | "rem" | "set" | "cmd"
+            ) || program.starts_with('@')
+        })
+    }) {
+        return None;
+    }
+    Some(commands)
 }
 
 fn lint_known_flag_typos(argv: &[String]) -> Result<(), CommandPreflightIssue> {
     let Some(program) = argv.first().map(|program| program_name(program)) else {
         return Ok(());
     };
-
     let mut index = 1;
     while let Some(arg) = argv.get(index) {
         if arg == "--" {
@@ -1068,10 +1171,12 @@ fn lint_rg_literal_glob_paths(
     argv: &[String],
     shell_type: Option<ShellType>,
 ) -> Result<(), CommandPreflightIssue> {
-    if matches!(
-        shell_type,
-        Some(ShellType::Bash | ShellType::Zsh | ShellType::Sh)
-    ) {
+    if (!cfg!(windows) && shell_type.is_none())
+        || matches!(
+            shell_type,
+            Some(ShellType::Bash | ShellType::Zsh | ShellType::Sh)
+        )
+    {
         return Ok(());
     }
 
@@ -1117,6 +1222,13 @@ fn lint_direct_argv_powershell_cmdlet(
         return Ok(());
     }
 
+    if argv
+        .first()
+        .is_some_and(|program| program.contains(['/', '\\']))
+    {
+        return Ok(());
+    }
+
     let Some(program) = argv.first().map(|program| program_name(program)) else {
         return Ok(());
     };
@@ -1130,7 +1242,7 @@ fn lint_direct_argv_powershell_cmdlet(
             CommandPreflightIssueCode::DirectArgvPowerShellCmdlet,
             CommandPreflightRejected::Argv(argv.to_vec()),
             format!(
-                "`{program}` is a PowerShell cmdlet or alias, not a standalone executable for direct argv mode."
+                "`{program}` also names a PowerShell cmdlet or alias. If no native executable resolves, use explicit PowerShell source; the direct invocation is unchanged."
             ),
             None,
             Some(CommandPreflightRetry::PowerShellScript {
@@ -1150,7 +1262,6 @@ fn known_flag_fix<'a>(program: &str, arg: &'a str) -> Option<(&'a str, &'static 
         ("rg" | "rga", "--ignorecase") => Some((flag, "--ignore-case")),
         ("rg" | "rga", "--files-with-match") => Some((flag, "--files-with-matches")),
         ("grep", "--ignorecase") => Some((flag, "--ignore-case")),
-        ("git", "--worktree") => Some((flag, "--work-tree")),
         ("cargo", "--pakage") => Some((flag, "--package")),
         ("npm", "--workpace") => Some((flag, "--workspace")),
         ("pytest", "--max-fail") => Some((flag, "--maxfail")),

@@ -29,6 +29,7 @@ const STDERR_TAIL_MAX_BYTES = 64 * 1024;
 const STDERR_TRUNCATION_MARKER = `[stderr truncated; showing last ${STDERR_TAIL_MAX_BYTES} bytes]\n`;
 
 class FakeChildProcess extends EventEmitter {
+  pid: number | undefined = 123;
   stdin = new PassThrough();
   stdout = new PassThrough();
   stderr = new PassThrough();
@@ -92,7 +93,7 @@ function newlineFreeStderrOverCap(): Buffer {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("CodexExec", () => {
-  it("bounds stdout drain only after owner exit and retains complete trailing lines", async () => {
+  it("bounds stdout drain after owner exit and rejects an incomplete capture", async () => {
     const { CodexExec } = await import("../src/exec");
     jest.useFakeTimers();
     const child = new FakeChildProcess();
@@ -105,16 +106,22 @@ describe("CodexExec", () => {
           lines.push(line);
         }
         settled = true;
-      })();
+      })().catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
       child.stdout.write("before exit\n");
       await jest.advanceTimersByTimeAsync(5_000);
       expect(settled).toBe(false);
       child.emit("exit", 0, null);
       child.stdout.write("trailing complete record\n");
+      child.stderr.end();
       await jest.advanceTimersByTimeAsync(999);
       expect(settled).toBe(false);
       await jest.advanceTimersByTimeAsync(1);
-      await run;
+      expect(await run).toMatchObject({
+        message: expect.stringContaining("output capture did not reach EOF"),
+      });
       expect(lines).toEqual(["before exit", "trailing complete record"]);
       expect(child.stdout.destroyed).toBe(true);
       expect(child.killSignals).toEqual([]);
@@ -127,63 +134,116 @@ describe("CodexExec", () => {
     { completed: false, exitCode: 0 },
     { completed: true, exitCode: 0 },
     { completed: true, exitCode: 2 },
-  ])("keeps turn completion evidence authoritative after stdout drain: %j", async ({ completed, exitCode }) => {
+  ])(
+    "keeps turn completion evidence authoritative after stdout drain: %j",
+    async ({ completed, exitCode }) => {
+      const { CodexExec } = await import("../src/exec");
+      const { Thread, TurnRunError } = await import("../src/thread");
+      jest.useFakeTimers();
+      const child = new FakeChildProcess();
+      const spawned = new Promise<void>((resolve) => {
+        spawnMock.mockImplementationOnce(() => {
+          resolve();
+          return child as unknown as child_process.ChildProcess;
+        });
+      });
+      const item = { id: "partial", type: "agent_message", text: "observed answer" };
+      const terminal = {
+        type: "turn.completed",
+        usage: { input_tokens: 3, cached_input_tokens: 0, output_tokens: 2 },
+      };
+      let settled = false;
+      try {
+        const result = new Thread(new CodexExec("codex"), {}, {}).run("hello").then(
+          (turn) => {
+            settled = true;
+            return { turn, error: undefined };
+          },
+          (error: unknown) => {
+            settled = true;
+            return { turn: undefined, error };
+          },
+        );
+        await spawned;
+        child.stdout.write(
+          JSON.stringify({ type: "thread.started", thread_id: "drain-thread" }) + "\n",
+        );
+        child.stdout.write(JSON.stringify({ type: "item.completed", item }) + "\n");
+        child.emit("exit", exitCode, null);
+        // The terminal arrives after owner exit, while a descendant still holds
+        // stdout open. EOF/drain expiry itself must never manufacture success.
+        if (completed) child.stdout.write(JSON.stringify(terminal) + "\n");
+        child.stderr.end();
+        await jest.advanceTimersByTimeAsync(999);
+        expect(settled).toBe(false);
+        await jest.advanceTimersByTimeAsync(1);
+        const outcome = await result;
+        {
+          expect(outcome.turn).toBeUndefined();
+          expect(outcome.error).toBeInstanceOf(TurnRunError);
+          expect(outcome.error).toMatchObject({
+            threadId: "drain-thread",
+            items: [item],
+            finalResponse: item.text,
+            terminal: completed ? terminal : undefined,
+            message: expect.stringContaining(
+              exitCode === 2 ? "exited with code 2" : "output capture did not reach EOF",
+            ),
+          });
+        }
+        expect(child.stdout.destroyed).toBe(true);
+        expect(child.killSignals).toEqual([]);
+      } finally {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  it("interrupts an active stdout read on abort even when the root ignores termination", async () => {
     const { CodexExec } = await import("../src/exec");
-    const { Thread, TurnRunError } = await import("../src/thread");
     jest.useFakeTimers();
     const child = new FakeChildProcess();
-    const spawned = new Promise<void>((resolve) => {
-      spawnMock.mockImplementationOnce(() => {
-        resolve();
-        return child as unknown as child_process.ChildProcess;
-      });
-    });
-    const item = { id: "partial", type: "agent_message", text: "observed answer" };
-    const terminal = {
-      type: "turn.completed",
-      usage: { input_tokens: 3, cached_input_tokens: 0, output_tokens: 2 },
-    };
-    let settled = false;
+    const controller = new AbortController();
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
     try {
-      const result = new Thread(new CodexExec("codex"), {}, {}).run("hello").then(
-        (turn) => { settled = true; return { turn, error: undefined }; },
-        (error: unknown) => { settled = true; return { turn: undefined, error }; },
-      );
-      await spawned;
-      child.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "drain-thread" }) + "\n");
-      child.stdout.write(JSON.stringify({ type: "item.completed", item }) + "\n");
-      child.emit("exit", exitCode, null);
-      // The terminal arrives after owner exit, while a descendant still holds
-      // stdout open. EOF/drain expiry itself must never manufacture success.
-      if (completed) child.stdout.write(JSON.stringify(terminal) + "\n");
-      child.stderr.end();
-      await jest.advanceTimersByTimeAsync(999);
-      expect(settled).toBe(false);
-      await jest.advanceTimersByTimeAsync(1);
-      const outcome = await result;
-      if (completed && exitCode === 0) {
-        expect(outcome.error).toBeUndefined();
-        expect(outcome.turn).toMatchObject({
-          items: [item], finalResponse: item.text, usage: terminal.usage,
-        });
-      } else {
-        expect(outcome.turn).toBeUndefined();
-        expect(outcome.error).toBeInstanceOf(TurnRunError);
-        expect(outcome.error).toMatchObject({
-          threadId: "drain-thread",
-          items: [item],
-          finalResponse: item.text,
-          terminal: completed ? terminal : undefined,
-          message: expect.stringContaining(completed ? "exited with code 2" : "Incomplete turn stream"),
-        });
-      }
+      const run = (async () => {
+        for await (const _line of new CodexExec("codex").run({
+          input: "hi",
+          signal: controller.signal,
+        })) {
+          /* drain */
+        }
+      })().catch((error: unknown) => error);
+      child.stdout.write("partial line without newline");
+      controller.abort();
+      await jest.advanceTimersByTimeAsync(2_000);
+      expect(await run).toMatchObject({ name: "AbortError", code: "ABORT_ERR" });
       expect(child.stdout.destroyed).toBe(true);
-      expect(child.killSignals).toEqual([]);
+      expect(child.stderr.destroyed).toBe(true);
+      expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
     } finally {
-      child.stdout.destroy();
-      child.stderr.destroy();
       jest.useRealTimers();
     }
+  });
+
+  it("closes failed-spawn readers without waiting for an exit event that cannot arrive", async () => {
+    const { CodexExec } = await import("../src/exec");
+    const child = new FakeChildProcess();
+    child.pid = undefined;
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+    const failed = Object.assign(new Error("executable not found"), { code: "ENOENT" });
+    const run = (async () => {
+      for await (const _line of new CodexExec("missing").run({ input: "hi" })) {
+        /* drain */
+      }
+    })().catch((error: unknown) => error);
+    child.emit("error", failed);
+    expect(await run).toBe(failed);
+    expect(child.stdout.destroyed).toBe(true);
+    expect(child.stderr.destroyed).toBe(true);
+    expect(child.killSignals).toEqual([]);
   });
 
   it("consumes a rejected deadline input and releases its timer", async () => {
@@ -227,6 +287,10 @@ describe("CodexExec", () => {
       literal: '"high"',
     },
     {
+      value: "focused",
+      literal: '"focused"',
+    },
+    {
       value: 'x"\\\nflag=true\t',
       literal: String.raw`"x\"\\\nflag=true\t"`,
     },
@@ -239,11 +303,13 @@ describe("CodexExec", () => {
     const { Codex } = await import("../src/codex");
     spawnMock.mockClear();
     const child = createCompletedChild(Buffer.alloc(0), 0);
-    child.stdout.write('{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}\n');
+    child.stdout.write(
+      '{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}\n',
+    );
     spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
     const thread = new Codex({ codexPathOverride: "codex" }).startThread({
       // JavaScript callers can supply strings outside the TypeScript unions.
-      modelReasoningEffort: value as "high",
+      modelReasoningEffort: value,
       webSearchMode: value as "live",
       approvalPolicy: value as "never",
     });
@@ -267,7 +333,9 @@ describe("CodexExec", () => {
     const { Codex } = await import("../src/codex");
     spawnMock.mockClear();
     const child = createCompletedChild(Buffer.alloc(0), 0);
-    child.stdout.write('{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}\n');
+    child.stdout.write(
+      '{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}\n',
+    );
     spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
     await new Codex({
       codexPathOverride: "codex",
@@ -281,6 +349,42 @@ describe("CodexExec", () => {
       "--experimental-json",
       "--config",
       String.raw`rules=[{"key\u007f" = "value\u007f"}]`,
+    ]);
+  });
+
+  it("preserves literal config key segments in CLI overrides", async () => {
+    const { Codex } = await import("../src/codex");
+    spawnMock.mockClear();
+    const child = createCompletedChild(Buffer.alloc(0), 0);
+    child.stdout.write(
+      '{"type":"turn.completed","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}\n',
+    );
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+    await new Codex({
+      codexPathOverride: "codex",
+      config: {
+        mcp_servers: { "docs.v1": { enabled: false } },
+        projects: { "C:\\Users\\Mark\\repo.v1": { trust_level: "trusted" } },
+        "a.b": true,
+        a: { b: false },
+        'space \"猫\\\u007f': {},
+      },
+    })
+      .startThread()
+      .run("hello");
+    expect(spawnMock.mock.calls[0]?.[1]).toEqual([
+      "exec",
+      "--experimental-json",
+      "--config",
+      'mcp_servers."docs.v1".enabled=false',
+      "--config",
+      String.raw`projects."C:\\Users\\Mark\\repo.v1".trust_level="trusted"`,
+      "--config",
+      '"a.b"=true',
+      "--config",
+      "a.b=false",
+      "--config",
+      String.raw`"space \"猫\\\u007f"={}`,
     ]);
   });
 
@@ -299,7 +403,9 @@ describe("CodexExec", () => {
 
     const codex = new Codex({ codexPathOverride: "codex" });
     await expect(codex.startThread().run("unread prompt")).rejects.toMatchObject({
-      name: "TurnRunError", message: "write EPIPE", cause: inputError,
+      name: "TurnRunError",
+      message: "write EPIPE",
+      cause: inputError,
     });
     expect(spawnMock).toHaveBeenCalledTimes(1);
   });
@@ -323,34 +429,64 @@ describe("CodexExec", () => {
   it("retains terminal accounting when the real producer exits nonzero", async () => {
     const { Codex } = await import("../src/codex");
     const terminal = {
-      type: "turn.failed", error: { message: "connection lost" },
-      disposition: "transport_lost", usage: null, timing: { duration_ms: 0 },
+      type: "turn.failed",
+      error: { message: "connection lost" },
+      disposition: "transport_lost",
+      usage: null,
+      timing: { duration_ms: 0 },
     };
-    const events = [{ type: "thread.started", thread_id: "failed-thread" },
-      { type: "error", message: "transport error" }, terminal];
+    const events = [
+      { type: "thread.started", thread_id: "failed-thread" },
+      { type: "error", message: "transport error" },
+      terminal,
+    ];
     spawnMock.mockImplementationOnce((_file, _args, options) =>
-      _actualChildProcess.spawn(process.execPath, ["-e",
-        `process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write(${JSON.stringify(events.map(event => JSON.stringify(event)).join("\n") + "\n")}, () => process.exit(1)); });`,
-      ], options),
+      _actualChildProcess.spawn(
+        process.execPath,
+        [
+          "-e",
+          `process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write(${JSON.stringify(events.map((event) => JSON.stringify(event)).join("\n") + "\n")}, () => process.exit(1)); });`,
+        ],
+        options,
+      ),
     );
-    await expect(new Codex({ codexPathOverride: process.execPath }).startThread().run("hello"))
-      .rejects.toMatchObject({ name: "TurnRunError", threadId: "failed-thread", terminal,
-        cause: expect.objectContaining({ message: expect.stringContaining("exited with code 1") }) });
+    await expect(
+      new Codex({ codexPathOverride: process.execPath }).startThread().run("hello"),
+    ).rejects.toMatchObject({
+      name: "TurnRunError",
+      threadId: "failed-thread",
+      terminal,
+      cause: expect.objectContaining({ message: expect.stringContaining("exited with code 1") }),
+    });
   });
 
-  it.each(["", JSON.stringify({ type: "item.updated", item: { id: "partial", type: "agent_message", text: "unfinished" } }) + "\n"])(
-    "rejects clean producer EOF without completion: %j", async (output) => {
-      const { Codex } = await import("../src/codex");
-      spawnMock.mockImplementationOnce((_file, _args, options) =>
-        _actualChildProcess.spawn(process.execPath, ["-e",
+  it.each([
+    "",
+    JSON.stringify({
+      type: "item.updated",
+      item: { id: "partial", type: "agent_message", text: "unfinished" },
+    }) + "\n",
+  ])("rejects clean producer EOF without completion: %j", async (output) => {
+    const { Codex } = await import("../src/codex");
+    spawnMock.mockImplementationOnce((_file, _args, options) =>
+      _actualChildProcess.spawn(
+        process.execPath,
+        [
+          "-e",
           `process.stdin.resume(); process.stdin.on('end', () => process.stdout.write(${JSON.stringify(output)}));`,
-        ], options),
-      );
-      await expect(new Codex({ codexPathOverride: process.execPath }).startThread().run("hello"))
-        .rejects.toMatchObject({ name: "TurnRunError", terminal: undefined,
-          finalResponse: output ? "unfinished" : "", message: expect.stringContaining("Incomplete turn stream") });
-    },
-  );
+        ],
+        options,
+      ),
+    );
+    await expect(
+      new Codex({ codexPathOverride: process.execPath }).startThread().run("hello"),
+    ).rejects.toMatchObject({
+      name: "TurnRunError",
+      terminal: undefined,
+      finalResponse: output ? "unfinished" : "",
+      message: expect.stringContaining("Incomplete turn stream"),
+    });
+  });
 
   it("rejects when exit happens before stdout closes", async () => {
     const { CodexExec } = await import("../src/exec");
@@ -614,7 +750,8 @@ describe("CodexExec", () => {
     it("accepts an alias pin matching the native manifest", async () => {
       const { Codex } = await import("../src/codex");
       const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-      manifest.optionalDependencies["@openai/codex-test-platform"] = "npm:@openai/codex@0.149.0-kd4";
+      manifest.optionalDependencies["@openai/codex-test-platform"] =
+        "npm:@openai/codex@0.149.0-kd4";
       writeFileSync(manifestPath, JSON.stringify(manifest));
       expect(() => new Codex()).not.toThrow();
       expect(spawnMock).not.toHaveBeenCalled();
@@ -631,10 +768,13 @@ describe("CodexExec", () => {
             JSON.stringify({
               type: "item.completed",
               item: { id: "item-1", type: "agent_message", text: "runtime launched" },
-            }) + "\n" + JSON.stringify({
-              type: "turn.completed",
-              usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 },
-            }) + "\n",
+            }) +
+              "\n" +
+              JSON.stringify({
+                type: "turn.completed",
+                usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 },
+              }) +
+              "\n",
           );
           child.stderr.end();
           child.emit("exit", 0, null);

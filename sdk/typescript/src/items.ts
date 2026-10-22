@@ -137,7 +137,12 @@ export type AgentMessageItem = {
   type: "agent_message";
   /** Either natural-language text or JSON when structured output is requested. */
   text: string;
+  /** Absent on legacy producers. Commentary is not an accepted final answer. */
+  phase?: "commentary" | "final_answer";
 };
+
+/** Canonical planning content; not a claim that the plan was implemented. */
+export type PlanItem = { id: string; type: "plan"; text: string };
 
 /** Agent's reasoning summary. */
 export type ReasoningItem = {
@@ -162,9 +167,14 @@ export type WebSearchAction =
 /** Captures a web search request. Completes when results are returned to the agent. */
 export type WebSearchItem = {
   id: string;
+  /** Provider identity; id is the unambiguous exec item identity. */
+  call_id?: string;
   type: "web_search";
   query: string;
   action: WebSearchAction;
+  /** Absent for historical/hosted searches without a recorded outcome. */
+  status?: string;
+  error?: string;
 };
 
 /** Describes a non-fatal error surfaced as an item. */
@@ -193,6 +203,7 @@ export type TodoListItem = {
 /** Canonical union of thread items and their type-specific payloads. */
 export type ThreadItem =
   | AgentMessageItem
+  | PlanItem
   | ReasoningItem
   | ContextCompactionItem
   | CommandExecutionItem

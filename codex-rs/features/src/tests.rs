@@ -19,8 +19,6 @@ use std::collections::BTreeMap;
 use toml::Table;
 use toml::Value as TomlValue;
 
-
-
 #[test]
 fn unknown_feature_settings_emit_a_visible_warning_for_booleans_and_tables() {
     let table: Table = toml::from_str(
@@ -30,8 +28,19 @@ fn unknown_feature_settings_emit_a_visible_warning_for_booleans_and_tables() {
     let EventMsg::Warning(warning) = event.msg else {
         panic!("unknown settings must be visible warnings");
     };
-    assert!(warning.message.contains("future_feature, memory_tool, task_completion_reviewer"));
-    let preview: serde_json::Value = serde_json::from_str(warning.message.split_once("Compatibility preview (no settings changed): ").unwrap().1).unwrap();
+    assert!(
+        warning
+            .message
+            .contains("future_feature, memory_tool, task_completion_reviewer")
+    );
+    let preview: serde_json::Value = serde_json::from_str(
+        warning
+            .message
+            .split_once("Compatibility preview (no settings changed): ")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
     assert_eq!(preview[0]["classification"], "unknown");
     assert_eq!(preview[1]["classification"], "removed");
     assert_eq!(preview[1]["applied"], false);
@@ -46,9 +55,7 @@ fn unknown_keys_from_other_layers_name_that_layer_instead_of_the_user_config() {
     let event = crate::unknown_features_warning_event_with_origins(
         Some(&table),
         "/home/u/.codex/config.toml",
-        |key| {
-            (key == "future_feature").then(|| "enterprise-managed (Acme, 42)".to_string())
-        },
+        |key| (key == "future_feature").then(|| "enterprise-managed (Acme, 42)".to_string()),
     )
     .unwrap();
     let EventMsg::Warning(warning) = event.msg else {
@@ -213,13 +220,16 @@ fn user_settable_registry_excludes_internal_features_and_legacy_aliases() {
     assert!(user_settable_features().all(|spec| !matches!(spec.stage, Stage::Internal)));
 }
 
-
-
 #[test]
 fn default_enabled_features_are_stable() {
     let defaults = Features::with_defaults();
     for spec in crate::FEATURES {
-        assert_eq!(defaults.enabled(spec.id), spec.default_enabled, "{}", spec.key);
+        assert_eq!(
+            defaults.enabled(spec.id),
+            spec.default_enabled,
+            "{}",
+            spec.key
+        );
         if defaults.enabled(spec.id) {
             assert!(
                 matches!(spec.stage, Stage::Stable),
@@ -604,8 +614,6 @@ computer_use = {enabled}
     }
 }
 
-
-
 #[test]
 fn image_generation_toggle_resolves_feature_state() {
     let mut entries = BTreeMap::new();
@@ -619,8 +627,6 @@ fn image_generation_toggle_resolves_feature_state() {
     features.apply_map(&entries);
     assert!(features.enabled(Feature::ImageGeneration));
 }
-
-
 
 #[test]
 fn renamed_feature_variants_keep_canonical_config_keys() {
@@ -640,8 +646,6 @@ fn renamed_feature_variants_keep_canonical_config_keys() {
         );
     }
 }
-
-
 
 #[test]
 fn enable_fanout_is_under_development() {
@@ -718,8 +722,6 @@ fn from_sources_applies_base_profile_and_overrides() {
 #[test]
 fn structured_features_have_one_serialized_storage_location() {
     let structured = [
-        Feature::ContextManagement,
-        Feature::TokenBudget,
         Feature::CodeMode,
         Feature::MultiAgentV2,
         Feature::CurrentTimeReminder,
@@ -997,10 +999,10 @@ enable_fanout = true
 #[test]
 fn unstable_warning_event_uses_each_structured_feature_toggle_field() {
     let mut features = Features::with_defaults();
-    features.enable(Feature::ContextManagement);
+    features.enable(Feature::CurrentTimeReminder);
     for (input, expected) in [
-        ("context_management = { experimental_mode = true }", true),
-        ("context_management = { experimental_mode = false }", false),
+        ("current_time_reminder = { enabled = true }", true),
+        ("current_time_reminder = { enabled = false }", false),
     ] {
         let configured_features: Table = toml::from_str(input).expect("features table");
         let warning = unstable_features_warning_event(

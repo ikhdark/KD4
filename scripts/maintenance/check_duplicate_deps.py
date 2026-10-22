@@ -39,7 +39,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     return check_duplicate_deps(args)
 
 
-def check_dependency_policy(extra_args: Sequence[str], *, runner: Runner = subprocess.run) -> int:
+def check_dependency_policy(
+    extra_args: Sequence[str], *, runner: Runner = subprocess.run
+) -> int:
     """Report every independent policy result without weakening duplicate policy."""
     commands = [
         ["just", "deps-advisories-check"],

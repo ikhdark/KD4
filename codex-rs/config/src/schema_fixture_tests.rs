@@ -37,7 +37,10 @@ fn config_schema_matches_fixture() {
     let tmp = TempDir::new().expect("create temp dir");
     let path = tmp.path().join("config.schema.json");
     write_config_schema(&path).expect("write schema");
-    assert_eq!(std::fs::read_to_string(path).expect("read schema"), generated);
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read schema"),
+        generated
+    );
 }
 #[test]
 fn config_schema_hides_unsupported_inline_mcp_bearer_token() {

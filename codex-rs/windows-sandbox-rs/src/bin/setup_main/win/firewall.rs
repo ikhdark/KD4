@@ -475,8 +475,7 @@ fn configure_rule_network_scope(rule: &INetFwRule3, spec: &BlockRuleSpec<'_>) ->
         // None means all ports, not "leave the old scope unchanged". Other
         // protocols do not support a RemotePorts property.
         let remote_ports = spec.remote_ports.or_else(|| {
-            (spec.protocol == NET_FW_IP_PROTOCOL_TCP.0
-                || spec.protocol == NET_FW_IP_PROTOCOL_UDP.0)
+            (spec.protocol == NET_FW_IP_PROTOCOL_TCP.0 || spec.protocol == NET_FW_IP_PROTOCOL_UDP.0)
                 .then_some("*")
         });
         if let Some(remote_ports) = remote_ports {
@@ -769,9 +768,21 @@ mod tests {
     fn local_policy_modify_state_distinguishes_query_failure_from_ineffective_policy() {
         assert!(validate_local_policy_modify_result(S_OK, NET_FW_MODIFY_STATE_OK).is_ok());
         for (result, state, expected) in [
-            (S_OK, NET_FW_MODIFY_STATE_GP_OVERRIDE, SetupErrorCode::HelperFirewallPolicyIneffective),
-            (S_FALSE, NET_FW_MODIFY_STATE_OK, SetupErrorCode::HelperFirewallPolicyIneffective),
-            (windows::core::HRESULT::from_win32(5), NET_FW_MODIFY_STATE_OK, SetupErrorCode::HelperFirewallPolicyAccessFailed),
+            (
+                S_OK,
+                NET_FW_MODIFY_STATE_GP_OVERRIDE,
+                SetupErrorCode::HelperFirewallPolicyIneffective,
+            ),
+            (
+                S_FALSE,
+                NET_FW_MODIFY_STATE_OK,
+                SetupErrorCode::HelperFirewallPolicyIneffective,
+            ),
+            (
+                windows::core::HRESULT::from_win32(5),
+                NET_FW_MODIFY_STATE_OK,
+                SetupErrorCode::HelperFirewallPolicyAccessFailed,
+            ),
         ] {
             let err = validate_local_policy_modify_result(result, state)
                 .expect_err("ineffective or unavailable policy must fail closed");

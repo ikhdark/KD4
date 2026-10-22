@@ -1,4 +1,80 @@
 use super::AuthRequestTelemetryContext;
+
+#[test]
+fn websocket_identity_ignores_assertion_time_but_not_authority_or_route() {
+    struct TimestampedAssertion {
+        time: u64,
+        authority: u8,
+    }
+    impl codex_api::AuthProvider for TimestampedAssertion {
+        fn add_auth_headers(&self, headers: &mut http::HeaderMap) {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                http::HeaderValue::from_str(&format!("AgentAssertion {}", self.time)).unwrap(),
+            );
+        }
+        fn connection_identity(&self) -> Option<Vec<u8>> {
+            Some(vec![self.authority])
+        }
+    }
+    let provider = codex_api::Provider {
+        name: "fixture".into(),
+        base_url: "https://example.invalid/v1".into(),
+        query_params: None,
+        headers: http::HeaderMap::new(),
+        retry: codex_api::RetryConfig {
+            max_retries: 0,
+            base_delay: std::time::Duration::ZERO,
+            retry_429: false,
+            retry_5xx: false,
+            retry_transport: false,
+        },
+        stream_idle_timeout: std::time::Duration::from_secs(1),
+    };
+    let first = super::websocket_setup_fingerprint(
+        &provider,
+        &TimestampedAssertion {
+            time: 10,
+            authority: 1,
+        },
+    );
+    let later = super::websocket_setup_fingerprint(
+        &provider,
+        &TimestampedAssertion {
+            time: 12,
+            authority: 1,
+        },
+    );
+    assert!(first.is_some());
+    assert_eq!(
+        first, later,
+        "an unchanged authority must reuse its healthy connection"
+    );
+    assert_ne!(
+        first,
+        super::websocket_setup_fingerprint(
+            &provider,
+            &TimestampedAssertion {
+                time: 12,
+                authority: 2
+            }
+        )
+    );
+    let changed_route = codex_api::Provider {
+        base_url: "https://other.invalid/v1".into(),
+        ..provider
+    };
+    assert_ne!(
+        first,
+        super::websocket_setup_fingerprint(
+            &changed_route,
+            &TimestampedAssertion {
+                time: 12,
+                authority: 1
+            }
+        )
+    );
+}
 use super::CanonicalPrefixHash;
 use super::LastResponse;
 use super::MODEL_ATTEMPT_RECONCILIATION_TOLERANCE_BYTES;
@@ -12,12 +88,12 @@ use super::PendingUnauthorizedRetry;
 use super::Prompt;
 use super::PromptContextBaseline;
 use super::REQUEST_SCHEMA_CACHE_CAPACITY;
+use super::ReasoningSummaryConfig;
 use super::RequestSchemaCacheKey;
 use super::RequestSchemaCacheValue;
 use super::RequestSchemaSerializationCache;
 use super::STREAM_THROUGHPUT_COLLAPSE_STREAK;
 use super::SharedModelHttpClients;
-use super::StreamThroughputCollapse;
 use super::UnauthorizedRecoveryExecution;
 use super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION;
 use super::WebsocketCachePublicationPermit;
@@ -151,8 +227,41 @@ fn websocket_rotates_before_the_server_connection_age_limit() {
 /// these cases continue to exercise the rate logic itself.
 const SMALL_INHERITED_CONTEXT_TOKENS: i64 = 1_000;
 
+fn pending_test_attempt(
+    identity: crate::client_common::ResponseAttemptIdentity,
+    clock: ModelAttemptClock,
+    task: tokio::task::JoinHandle<ModelAttemptGuard>,
+    cancellation: tokio_util::sync::CancellationToken,
+    timing: Option<Arc<TurnTimingState>>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) -> ModelAttemptState {
+    ModelAttemptState::pending(
+        ModelAttemptGuard::new(
+            test_session_telemetry(),
+            identity,
+            0,
+            ModelAttemptRetryReason::None,
+            ModelAttemptRequestKind::Initial,
+            ModelAttemptTransport::ResponsesHttp,
+            None,
+            ModelRequestMeasurements::default(),
+            clock,
+            None,
+            None,
+        ),
+        task,
+        cancellation,
+        timing,
+        permit,
+    )
+}
+
 fn record_response_rate(throughput: &mut WebsocketStreamThroughput, tokens_per_second: i64) {
-    record_response_rate_at_context(throughput, tokens_per_second, SMALL_INHERITED_CONTEXT_TOKENS);
+    record_response_rate_at_context(
+        throughput,
+        tokens_per_second,
+        SMALL_INHERITED_CONTEXT_TOKENS,
+    );
 }
 
 fn record_response_rate_at_context(
@@ -161,10 +270,35 @@ fn record_response_rate_at_context(
     input_tokens: i64,
 ) {
     throughput.record(
-        tokens_per_second * 100,
-        Duration::from_secs(100),
+        4_000,
+        Duration::from_secs_f64(4_000.0 / tokens_per_second as f64),
         input_tokens,
+        /*sustained_delivery_interval: synthetic oracle*/ true,
     );
+}
+
+#[test]
+fn request_average_waits_never_become_a_throughput_rotation_signal() {
+    for pre_output_seconds in [0, 10, 60] {
+        let mut throughput = WebsocketStreamThroughput::default();
+        for _ in 0..5 {
+            record_response_rate(&mut throughput, 100);
+        }
+        let baseline = throughput.recent_tokens_per_second.clone();
+        for _ in 0..2 {
+            throughput.record(
+                200,
+                Duration::from_secs(2 + pre_output_seconds),
+                5_000,
+                false,
+            );
+            assert_eq!(throughput.take_collapse(), None);
+        }
+        assert_eq!(
+            throughput.recent_tokens_per_second, baseline,
+            "unknown intervals must not contaminate sustained history"
+        );
+    }
 }
 
 #[test]
@@ -189,17 +323,25 @@ fn websocket_throughput_collapse_needs_a_baseline_and_consecutive_slow_responses
         "recovery resets the streak"
     );
     // Too small to say anything about the stream rate.
-    throughput.record(100, Duration::from_secs(60), SMALL_INHERITED_CONTEXT_TOKENS);
+    throughput.record(
+        100,
+        Duration::from_secs(60),
+        SMALL_INHERITED_CONTEXT_TOKENS,
+        true,
+    );
     assert_eq!(throughput.take_collapse(), None);
 
     record_response_rate(&mut throughput, 12);
+    let collapse = throughput.take_collapse().expect("two slow responses");
+    // Duration quantizes 4_000 / 12 seconds to nanoseconds. Bound only that
+    // unavoidable rate error; keep the baseline and inherited context exact.
+    let elapsed = Duration::from_secs_f64(4_000.0 / 12.0).as_secs_f64();
+    let quantization_error = 4_000.0 * 1e-9 / (elapsed * elapsed);
+    assert!((collapse.observed_tokens_per_second - 12.0).abs() <= quantization_error);
+    assert_eq!(collapse.baseline_tokens_per_second, 40.0);
     assert_eq!(
-        throughput.take_collapse(),
-        Some(StreamThroughputCollapse {
-            observed_tokens_per_second: 12.0,
-            baseline_tokens_per_second: 40.0,
-            inherited_input_tokens: SMALL_INHERITED_CONTEXT_TOKENS,
-        })
+        collapse.inherited_input_tokens,
+        SMALL_INHERITED_CONTEXT_TOKENS
     );
     assert_eq!(throughput.take_collapse(), None, "reported once");
 }
@@ -221,6 +363,38 @@ fn websocket_throughput_does_not_compare_different_workloads() {
     record_response_rate(&mut throughput, 2);
     record_response_rate(&mut throughput, 2);
     assert!(throughput.take_collapse().is_some());
+}
+
+#[test]
+fn healthy_websocket_output_shortening_does_not_trigger_rotation() {
+    let mut throughput = WebsocketStreamThroughput::default();
+    for _ in 0..5 {
+        throughput.record(1_000, Duration::from_secs(20), 1_000, true);
+    }
+    // Identical ten-second first output and 100 token/s generation, only
+    // output length changes. Whole-response rates alone falsely collapse.
+    for _ in 0..2 {
+        throughput.record(150, Duration::from_millis(11_500), 1_000, true);
+        assert_eq!(throughput.take_collapse(), None);
+    }
+}
+
+#[test]
+fn predispatch_terminal_closes_the_observed_queue_without_a_dispatch() {
+    let clock = ModelAttemptClock {
+        started: std::time::Instant::now() - Duration::from_secs(5),
+        ..ModelAttemptClock::new()
+    };
+    clock.offsets.lock().unwrap().queue_started_us = Some(100);
+    clock.mark_completed();
+    let offsets = clock.offsets.lock().unwrap();
+    assert_eq!(offsets.dispatch_ready_us, None);
+    assert!(offsets.queue_us >= 4_999_900);
+    assert_eq!(offsets.queue_started_us, None);
+    let (construction, queue, transport) = model_attempt_phase_durations(&offsets);
+    assert_eq!(queue, offsets.queue_us);
+    assert_eq!(construction + queue, offsets.completed_us.unwrap());
+    assert_eq!(transport, None);
 }
 
 #[test]
@@ -330,7 +504,7 @@ fn throughput_collapse_replaces_websocket_history_and_sticky_turn_state() {
 }
 
 #[tokio::test]
-async fn websocket_throughput_excludes_downstream_stalls_but_not_terminal_delivery() {
+async fn websocket_throughput_censors_stalls_and_unattributable_terminal_rates() {
     for stalled_before_completion in [true, false] {
         let mut rates = WebsocketStreamThroughput::default();
         for _ in 0..5 {
@@ -414,9 +588,11 @@ async fn websocket_throughput_excludes_downstream_stalls_but_not_terminal_delive
             );
         } else {
             assert_eq!(
-                rates.recent_tokens_per_second.len(),
-                original_rates.len() + 1
+                rates.recent_tokens_per_second, original_rates,
+                "request-average usage has no matched sustained interval, even without backpressure"
             );
+            assert_eq!(rates.collapsed_streak, 0);
+            assert_eq!(rates.take_collapse(), None);
         }
     }
 }
@@ -453,7 +629,10 @@ async fn prompt_cache_routing_is_stable_per_agent_tree() {
     let child = test_model_client(SessionSource::SubAgent(SubAgentSource::Review));
     let resumed = test_model_client_with_thread_id(first.state.thread_id, SessionSource::Cli);
     let metadata = CodexResponsesMetadata::new(
-        "installation".into(), "agent-tree".into(), first.state.thread_id.to_string(), "window".into(),
+        "installation".into(),
+        "agent-tree".into(),
+        first.state.thread_id.to_string(),
+        "window".into(),
     );
     let mut child_metadata = metadata.clone();
     child_metadata.thread_id = child.state.thread_id.to_string();
@@ -912,7 +1091,7 @@ async fn websocket_fallback_only_current_completed_requests_clear_failures() {
             .lock()
             .unwrap()
             .epoch;
-        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let (sender, receiver) = codex_api::response_event_channel::response_event_channel(2);
         let (mut stream, _) = super::map_response_stream(
             codex_api::ResponseStream {
                 rx_event: receiver,
@@ -1637,6 +1816,53 @@ fn model_request_measurements_flatten_namespaces_and_mark_observed_tool_use() {
 }
 
 #[test]
+fn final_response_schema_is_charged_in_both_measurement_paths() {
+    let mut request = history_test_request(Vec::new());
+    let baseline = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &Default::default(),
+        &request.instructions,
+    )
+    .unwrap();
+    request.text = codex_api::create_text_param_for_request(
+        None,
+        &Some(json!({"type":"object", "description":"schema".repeat(1_000)})),
+        true,
+    );
+    let measured = ModelRequestMeasurements::for_responses_request(
+        &request,
+        &Default::default(),
+        &request.instructions,
+    )
+    .unwrap();
+    let expected = u64::try_from(
+        serde_json::to_vec(request.text.as_ref().unwrap())
+            .unwrap()
+            .len()
+            .div_ceil(4),
+    )
+    .unwrap();
+    assert_eq!(
+        measured.full_prompt_estimated_tokens - baseline.full_prompt_estimated_tokens,
+        expected
+    );
+    let encoded = serde_json::to_vec(&request).unwrap();
+    let transport = ModelRequestMeasurements::for_responses_request_from_encoded_cancellable(
+        &request,
+        &Default::default(),
+        &request.instructions,
+        None,
+        &encoded,
+        encoded.len() as u64,
+    )
+    .unwrap();
+    assert_eq!(
+        measured.full_prompt_estimated_tokens,
+        transport.full_prompt_estimated_tokens
+    );
+}
+
+#[test]
 fn responses_lite_prompt_categories_measure_embedded_base_and_tools() {
     let base_instructions = "base instruction content ".repeat(64);
     let embedded_tools = vec![json!({
@@ -1972,6 +2198,11 @@ async fn model_request_measurements_recover_reprojected_input_after_dispatch() {
                     physical_attempt_id: "attempt".into(),
                 },
             )),
+            Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
         )
         .await
         .unwrap();
@@ -2028,6 +2259,11 @@ mod request_setting_tests {
             /*logical_request_bytes*/ None,
             encoded,
             None,
+            Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
         )
         .await
         .unwrap()
@@ -2800,7 +3036,7 @@ fn model_attempt_offsets_require_monotonic_elapsed_values_and_allow_nulls() {
         queue_us: 4,
         connection_setup_started_us: None,
         connection_setup_us: 0,
-        dispatch_ready_us: 10,
+        dispatch_ready_us: Some(10),
         stream_established_us: Some(20),
         first_provider_event_us: Some(30),
         first_actionable_output_us: Some(35),
@@ -3112,7 +3348,9 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
 
 #[tokio::test]
 async fn websocket_send_preserves_appended_manifest_proof_but_rejects_replacements() {
-    use crate::test_harness::responses::{ev_completed, ev_response_created, start_websocket_server};
+    use crate::test_harness::responses::ev_completed;
+    use crate::test_harness::responses::ev_response_created;
+    use crate::test_harness::responses::start_websocket_server;
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("first"), ev_completed("first")],
         vec![ev_response_created("second"), ev_completed("second")],
@@ -3618,13 +3856,19 @@ async fn stable_context_fallback_request_replays_authoritative_projected_input()
         None,
     );
     let projected = history_test_item("projected delta", None);
-    let expected = vec![current.clone(), projected.clone()];
+    let mut expected = vec![current.clone(), projected.clone()];
     crate::stable_context::mark_trusted_stable_context_item(&mut old);
     crate::stable_context::mark_trusted_stable_context_item(&mut current);
     let projection = project_stable_context(
         vec![old, projected, current].into(),
         StableContextTarget::Sampling,
     );
+    // Reordering re-marks the trusted producer with a fresh core marker instead
+    // of erasing its origin; both requests must replay that projected item.
+    assert!(crate::stable_context::is_trusted_stable_context_item(
+        &projection.items[0]
+    ));
+    expected[0].set_id(projection.items[0].id().cloned());
     let prompt = Prompt {
         input: projection.items,
         stable_context_fallback_input: projection.fallback_items,
@@ -4059,6 +4303,11 @@ async fn terminal_request_disables_calls_without_changing_cached_tools() {
         let mut model = test_model_info();
         model.use_responses_lite = lite;
         model.supports_reasoning_summaries = true;
+        // This serialization control intentionally requests an advertised High.
+        model.supported_reasoning_levels = serde_json::from_value(json!([
+            {"effort":"medium","description":""}, {"effort":"high","description":""}
+        ]))
+        .unwrap();
         let mut prompt = request_schema_cache_test_prompt();
         prompt.parallel_tool_calls = true;
         let build = |prompt: &Prompt| {
@@ -4194,6 +4443,71 @@ fn maximum_reasoning_respects_catalog_limits_and_preserves_lower_effort() {
     assert_eq!(
         crate::client::request_effort_for_model(&model, Some(ReasoningEffort::Low)),
         Some(ReasoningEffort::Low)
+    );
+}
+
+#[tokio::test]
+async fn reasoning_effort_without_summaries_survives_request_serialization() {
+    let client = test_model_client(SessionSource::Cli);
+    let setup = client.current_client_setup().await.unwrap();
+    let metadata = test_responses_metadata_for_client(
+        &client,
+        None,
+        format!("{}:0", client.state.thread_id),
+        None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut model = test_model_info();
+    model.default_reasoning_level = Some(ReasoningEffort::High);
+    model.supported_reasoning_levels = serde_json::from_value(json!([
+        {"effort":"high","description":""}
+    ]))
+    .unwrap();
+    for configured in [None, Some(ReasoningEffort::High)] {
+        let effort = crate::client::request_effort_for_model(&model, configured);
+        crate::client::validate_request_effort_for_model(&model, effort.as_ref()).unwrap();
+        let request = client
+            .build_responses_request(
+                &setup.api_provider,
+                &Prompt::default(),
+                &model,
+                effort,
+                ReasoningSummaryConfig::Detailed,
+                None,
+                &metadata,
+            )
+            .unwrap();
+        let wire = serde_json::to_value(request).unwrap();
+        assert_eq!(wire["reasoning"]["effort"], "high");
+        assert!(wire["reasoning"].get("summary").is_none());
+    }
+    for effort in [
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Custom("future".into()),
+    ] {
+        let request = client
+            .build_responses_request(
+                &setup.api_provider,
+                &Prompt::default(),
+                &model,
+                Some(effort.clone()),
+                ReasoningSummaryConfig::None,
+                None,
+                &metadata,
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["reasoning"]["effort"],
+            effort.to_string(),
+        );
+        // The stricter child-agent contract remains separate from main turns.
+        assert!(crate::client::validate_request_effort_for_model(&model, Some(&effort)).is_err());
+    }
+    model.used_fallback_model_metadata = true;
+    assert!(
+        crate::client::validate_request_effort_for_model(&model, Some(&ReasoningEffort::High))
+            .is_ok()
     );
 }
 
@@ -4451,7 +4765,7 @@ async fn provider_response_ids_cannot_replace_trusted_context() {
         };
         assert_eq!(added, done);
         let expected_id = if provider_id == "msg_sctx_provider" {
-            "msg_msg_sctx_provider"
+            "msg_provider_msg_sctx_provider"
         } else {
             provider_id
         };
@@ -4481,10 +4795,16 @@ async fn provider_response_ids_cannot_replace_trusted_context() {
                 .manifest
                 .active_content_hash(crate::stable_context::StableContextKind::Repository),
         );
+        // Projection re-marks the trusted producer with a fresh core marker
+        // instead of erasing its origin; the provider item never acquires it.
+        assert!(crate::stable_context::is_trusted_stable_context_item(
+            &projection.items[0]
+        ));
+        assert!(!crate::stable_context::is_trusted_stable_context_item(
+            &done
+        ));
         let mut projected_trusted = trusted.clone();
-        if let ResponseItem::Message { id, .. } = &mut projected_trusted {
-            *id = None;
-        }
+        projected_trusted.set_id(projection.items[0].id().cloned());
         assert_eq!(projection.items.as_ref(), &[projected_trusted, done]);
     }
 }
@@ -4522,12 +4842,17 @@ async fn response_stream_does_not_wait_for_and_cancels_pending_request_measureme
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
-        Some(ModelAttemptState::pending(
+        Some(pending_test_attempt(
             identity,
             clock,
             attempt_task,
             measurement_cancellation.clone(),
             None,
+            Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
         )),
         /*stream_throughput*/ None,
     );
@@ -4589,12 +4914,17 @@ async fn response_completed_does_not_wait_for_pending_request_measurements() {
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
-        Some(ModelAttemptState::pending(
+        Some(pending_test_attempt(
             identity,
             clock,
             attempt_task,
             measurement_cancellation,
             None,
+            Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
         )),
         /*stream_throughput*/ None,
     );
@@ -5323,6 +5653,11 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
                 None,
                 None,
                 None,
+                Arc::new(
+                    Arc::new(tokio::sync::Semaphore::new(1))
+                        .try_acquire_owned()
+                        .unwrap(),
+                ),
             )
             .await
             .unwrap();
@@ -5349,10 +5684,17 @@ async fn cache_diagnostics_log_selected_representation_without_otel() {
                 Some("turn".into()),
                 None,
             );
-            attempt.observe_terminal_usage(Some("provider-response"), Some(&codex_protocol::protocol::TokenUsage {
-                input_tokens: 100, cached_input_tokens: 90, output_tokens: 20,
-                reasoning_output_tokens: 7, total_tokens: 120,
-            }));
+            attempt.observe_terminal_usage(
+                Some("provider-response"),
+                Some(&codex_protocol::protocol::TokenUsage {
+                    input_tokens: 100,
+                    cached_input_tokens: 90,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 7,
+                    total_tokens: 120,
+                    coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
+                }),
+            );
             for _ in 0..2 {
                 attempt.finish(
                     codex_otel::ModelAttemptOutcome::Success,
@@ -5458,12 +5800,17 @@ async fn failed_stream_releases_consumer_and_freezes_clock_while_diagnostics_are
         test_session_telemetry(),
         InferenceTraceAttempt::disabled(),
         test_model_provider(),
-        Some(ModelAttemptState::pending(
+        Some(pending_test_attempt(
             identity,
             clock.clone(),
             task,
             Default::default(),
             None,
+            Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
         )),
         /*stream_throughput*/ None,
     );
@@ -5577,6 +5924,29 @@ fn appended_developer_context_keeps_an_intact_fixed_prefix_reusable() {
 }
 
 #[tokio::test]
+async fn audit_observability_retained_diagnostic_guard_keeps_its_admission() {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::new(Arc::clone(&semaphore).try_acquire_owned().unwrap());
+    let guard = ModelAttemptGuard::new(
+        test_session_telemetry(),
+        new_attempt_identity(&new_sampling_request_id()),
+        0,
+        ModelAttemptRetryReason::None,
+        ModelAttemptRequestKind::Initial,
+        ModelAttemptTransport::ResponsesHttp,
+        None,
+        ModelRequestMeasurements::default(),
+        ModelAttemptClock::new(),
+        None,
+        None,
+    )
+    .with_diagnostic_permit(permit);
+    assert_eq!(semaphore.available_permits(), 0);
+    drop(guard);
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
 async fn cancelled_diagnostic_task_records_unavailable_in_completed_snapshot() {
     let timing = Arc::new(TurnTimingState::default());
     timing.mark_turn_started();
@@ -5589,12 +5959,17 @@ async fn cancelled_diagnostic_task_records_unavailable_in_completed_snapshot() {
     timing.complete_snapshot();
     let task = tokio::spawn(std::future::pending::<ModelAttemptGuard>());
     task.abort();
-    let attempt = ModelAttemptState::pending(
+    let attempt = pending_test_attempt(
         identity,
         ModelAttemptClock::new(),
         task,
         tokio_util::sync::CancellationToken::new(),
         Some(Arc::clone(&timing)),
+        Arc::new(
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
+        ),
     );
     assert!(attempt.resolve().await.is_none());
     assert_eq!(
@@ -5968,7 +6343,7 @@ async fn inference_stream_preserves_independent_first_output_milestones() {
         None,
         None,
     );
-    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let (sender, receiver) = codex_api::response_event_channel::response_event_channel(1);
     let (mut stream, history) = super::map_response_stream(
         codex_api::ResponseStream {
             rx_event: receiver,
@@ -6097,7 +6472,7 @@ async fn inference_stream_repeated_deltas_do_not_lock_first_event_timing() {
         None,
         None,
     );
-    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let (sender, receiver) = codex_api::response_event_channel::response_event_channel(1);
     let (mut stream, _) = super::map_response_stream(
         codex_api::ResponseStream {
             rx_event: receiver,
@@ -6145,4 +6520,318 @@ async fn inference_stream_repeated_deltas_do_not_lock_first_event_timing() {
         Some(Ok(ResponseEvent::Completed { .. }))
     ));
     assert!(stream.next().await.is_none());
+}
+#[tokio::test]
+async fn observed_completion_receipt_survives_closed_receiver_with_gated_diagnostics() {
+    #[derive(Clone)]
+    struct Receipts(Arc<Mutex<Vec<BTreeMap<String, String>>>>, Arc<Notify>);
+    impl<S: Subscriber> Layer<S> for Receipts {
+        fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+            let mut visitor = TagCollectorVisitor::default();
+            event.record(&mut visitor);
+            if visitor.tags.get("event.name").map(String::as_str) == Some("codex.model_cache") {
+                self.0.lock().unwrap().push(visitor.tags);
+                self.1.notify_one();
+            }
+        }
+    }
+    for pending in [false, true] {
+        let receipts = Receipts(Arc::default(), Arc::new(Notify::new()));
+        let _subscriber = tracing_subscriber::registry()
+            .with(receipts.clone())
+            .set_default();
+        let span = tracing::info_span!("completion_receipt_boundary");
+        let _entered = span.enter();
+        let identity = new_attempt_identity("receipt-test");
+        let turn_timing = Arc::new(TurnTimingState::default());
+        turn_timing.mark_turn_started();
+        drop(turn_timing.begin_model_request_wait());
+        turn_timing.record_model_attempt_identity(
+            &identity.sampling_request_id,
+            &identity.physical_attempt_id,
+        );
+        let make_guard = || {
+            let mut guard = ModelAttemptGuard::new(
+                test_session_telemetry(),
+                identity.clone(),
+                0,
+                ModelAttemptRetryReason::None,
+                ModelAttemptRequestKind::Initial,
+                ModelAttemptTransport::ResponsesHttp,
+                None,
+                ModelRequestMeasurements::default(),
+                ModelAttemptClock::new(),
+                None,
+                None,
+            );
+            guard.turn_timing = Some(Arc::clone(&turn_timing));
+            guard
+        };
+        let measurement_gate = Arc::new(Notify::new());
+        let attempt = if pending {
+            let guard = make_guard();
+            let delayed = make_guard();
+            let gate = Arc::clone(&measurement_gate);
+            ModelAttemptState::pending(
+                guard,
+                tokio::spawn(async move {
+                    gate.notified().await;
+                    delayed
+                }),
+                tokio_util::sync::CancellationToken::new(),
+                Some(Arc::clone(&turn_timing)),
+                Arc::new(
+                    Arc::new(tokio::sync::Semaphore::new(1))
+                        .try_acquire_owned()
+                        .unwrap(),
+                ),
+            )
+        } else {
+            ModelAttemptState::Ready(Box::new(make_guard()))
+        };
+        let observed = Arc::new(Notify::new());
+        let mut events = (0..super::RESPONSE_STREAM_CHANNEL_CAPACITY)
+            .map(|_| ResponseEvent::Created)
+            .collect::<VecDeque<_>>();
+        events.push_back(ResponseEvent::Completed {
+            response_id: "provider-completed".into(),
+            end_turn: Some(true),
+            token_usage: Some(codex_protocol::protocol::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                reasoning_output_tokens: 7,
+                total_tokens: 30,
+                coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
+                ..Default::default()
+            }),
+        });
+        let (stream, _) = super::map_response_events(
+            None,
+            NotifyAfterEventStream {
+                events,
+                yielded: 0,
+                notify_after: super::RESPONSE_STREAM_CHANNEL_CAPACITY + 1,
+                notify: Arc::clone(&observed),
+            },
+            test_session_telemetry(),
+            InferenceTraceAttempt::disabled(),
+            test_model_provider(),
+            Some(attempt),
+            None,
+        );
+        observed.notified().await;
+        // The relay is still full and its receiver alive: completion evidence
+        // must precede both delivery and receiver loss, even with gated diagnostics.
+        tokio::time::timeout(Duration::from_secs(2), receipts.1.notified())
+            .await
+            .expect("known receipt must not wait for optional measurements");
+        let profile = turn_timing.complete_snapshot().protocol_timing();
+        let usage = profile.model_requests[0].token_usage.as_ref().unwrap();
+        assert_eq!(usage.total_tokens, 30);
+        assert_eq!(usage.reasoning_tokens, 7);
+        assert_eq!(
+            profile.model_requests[0].response_id_by_attempt[&identity.physical_attempt_id],
+            "provider-completed"
+        );
+        drop(stream);
+        let records = receipts.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].get("response_id").map(String::as_str),
+            Some("provider-completed")
+        );
+        assert_eq!(
+            records[0].get("output_tokens").map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(
+            records[0]
+                .get("reasoning_output_tokens")
+                .map(String::as_str),
+            Some("7")
+        );
+        assert_eq!(
+            records[0].get("provider_completed").map(String::as_str),
+            Some("true")
+        );
+        drop(records);
+        measurement_gate.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn setup_attempt_drop_records_local_cancellation_before_a_stream_exists() -> anyhow::Result<()>
+{
+    let temp = TempDir::new()?;
+    let attempt = super::AsyncInferenceTraceAttempt::from(started_inference_attempt(&temp)?);
+    drop(attempt);
+    let rollout = replay_until_cancelled(&temp).await?;
+    let inference = rollout.inference_calls.values().next().unwrap();
+    assert_eq!(
+        inference.observed_terminal_status,
+        Some(ExecutionStatus::Cancelled)
+    );
+    assert!(inference.observed_terminal.is_some());
+    assert!(inference.response_item_ids.is_empty());
+    assert!(inference.usage.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn provider_attempt_dropped_before_its_start_never_closes_an_unknown_call()
+-> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    // The helper's own call is started; the provider attempts below are fresh.
+    let (_started, writer) = started_inference_attempt_with_writer(&temp)?;
+    let context = InferenceTraceContext::enabled(
+        writer,
+        "thread-root".to_string(),
+        "turn-1".to_string(),
+        "gpt-test".to_string(),
+        "test-provider".to_string(),
+    );
+    // Sampling admission can fail or be cancelled before the audited start.
+    drop(super::AsyncInferenceTraceAttempt::unstarted(
+        context.start_attempt(),
+    ));
+    // Drop-time terminals are written asynchronously. Replay rejects a terminal
+    // for a call it never saw start, which would invalidate the whole bundle.
+    for _ in 0..20 {
+        let rollout = replay_bundle(temp.path())?;
+        assert_eq!(rollout.inference_calls.len(), 1);
+        assert!(
+            rollout
+                .inference_calls
+                .values()
+                .all(|call| call.observed_terminal_status.is_none())
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Once its start is recorded, abandoning the same kind of attempt still closes it.
+    let attempt = super::AsyncInferenceTraceAttempt::unstarted(context.start_attempt());
+    attempt
+        .record_audited_request(
+            &json!({"model": "gpt-test", "input": []}),
+            &new_attempt_identity("sampling"),
+            None::<(&serde_json::Value, &str)>,
+        )
+        .await;
+    drop(attempt);
+    let rollout = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rollout = replay_bundle(temp.path())?;
+            if rollout
+                .inference_calls
+                .values()
+                .any(|call| call.observed_terminal_status == Some(ExecutionStatus::Cancelled))
+            {
+                break anyhow::Ok(rollout);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(rollout.inference_calls.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn saturated_trace_detail_queue_retains_the_actual_terminal_outcome() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let attempt = super::AsyncInferenceTraceAttempt::from(started_inference_attempt(&temp)?);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    attempt
+        .record(false, move |_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        })
+        .await;
+    entered_rx.await?;
+    for _ in 0..4 {
+        attempt.record(false, |_| {}).await;
+    }
+    attempt.record_failed("observed failure", None, &[]).await;
+    attempt
+        .record_cancelled("duplicate later cancellation", None, &[])
+        .await;
+    drop(attempt);
+    drop(release_tx);
+    let rollout = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rollout = replay_bundle(temp.path())?;
+            if rollout
+                .inference_calls
+                .values()
+                .next()
+                .is_some_and(|inference| {
+                    inference.observed_terminal_status == Some(ExecutionStatus::Failed)
+                })
+            {
+                break anyhow::Ok(rollout);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(rollout.inference_calls.len(), 1);
+    Ok(())
+}
+#[tokio::test]
+async fn decoded_core_queue_stops_a_large_valid_prefix_and_releases_on_drop() {
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let produced = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = Dropped(dropped.clone());
+    let observed = produced.clone();
+    let item: ResponseItem =
+        serde_json::from_value(json!({"id":"m","type":"message","role":"assistant","content":[]}))
+            .unwrap();
+    let events = [ResponseEvent::Created, ResponseEvent::OutputItemAdded(item)]
+        .into_iter()
+        .chain((0..64).map(|_| ResponseEvent::OutputTextDelta("x".repeat(1024 * 1024))))
+        .map(Ok::<_, ApiError>);
+    let upstream = futures::stream::iter(events).inspect(move |_| {
+        let _keep_alive = &signal;
+        observed.fetch_add(1, Ordering::SeqCst);
+    });
+    let (stream, _) = super::map_response_events(
+        None,
+        upstream,
+        test_session_telemetry(),
+        InferenceTraceAttempt::disabled(),
+        test_model_provider(),
+        None,
+        None,
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while produced.load(Ordering::SeqCst) < 34 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        produced.load(Ordering::SeqCst),
+        34,
+        "32 MiB plus one in-flight event, not 1600 large events"
+    );
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        produced.load(Ordering::SeqCst),
+        34,
+        "dropping a byte-blocked consumer must stop upstream work"
+    );
 }

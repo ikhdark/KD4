@@ -608,8 +608,6 @@ mod tests {
         assert_eq!(completed[0].run.id, runs[0].id);
     }
 
-
-
     fn handler() -> ConfiguredHandler {
         ConfiguredHandler {
             event_name: HookEventName::PostToolUse,

@@ -4,7 +4,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STARTUP_TIMING_SCHEMA_VERSION: u16 = 1;
+const STARTUP_TIMING_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct ClockSample {
@@ -70,6 +70,9 @@ pub(crate) struct StartupTimingSnapshot {
     pub(crate) inclusive_duration_ns: u128,
     pub(crate) profile_valid: bool,
     pub(crate) prewarm_status: Option<String>,
+    pub(crate) prewarm_cancel_requested: bool,
+    /// Aggregate of the initial selected environments, not process-manager allocation.
+    pub(crate) executor_status: &'static str,
     pub(crate) phases: StartupPhaseTiming,
     pub(crate) invalid_transition_count: u32,
     pub(crate) clock_regression_count: u32,
@@ -81,12 +84,15 @@ impl StartupTimingSnapshot {
         tracing::trace!(
             target: "codex_core::session::turn",
             startup_timing_schema_version = self.schema_version,
+            startup_timing_boundary = "first_client_transport_attempt_entry",
             startup_timing_correlation_id = %self.correlation_id,
             startup_timing_started_at_unix_ms = self.started_at_unix_ms,
             startup_timing_completed_at_unix_ms = self.completed_at_unix_ms,
             startup_timing_duration_ns = self.inclusive_duration_ns,
             startup_timing_profile_valid = self.profile_valid,
             startup_prewarm_status = ?self.prewarm_status,
+            startup_prewarm_cancel_requested = self.prewarm_cancel_requested,
+            startup_executor_status = self.executor_status,
             startup_session_initialization_ns = self.phases.session_initialization_ns,
             startup_transport_preconnect_ns = self.phases.transport_preconnect_ns,
             startup_prewarm_preparation_ns = self.phases.prewarm_preparation_ns,
@@ -100,7 +106,7 @@ impl StartupTimingSnapshot {
             startup_timing_invalid_transition_count = self.invalid_transition_count,
             startup_timing_clock_regression_count = self.clock_regression_count,
             startup_timing_saturation_count = self.saturation_count,
-            "startup timing snapshot frozen at first model send"
+            "startup timing snapshot frozen at first client transport attempt entry"
         );
     }
 }
@@ -136,6 +142,8 @@ struct StartupTimingInner {
     active: ActivePhases,
     phases: StartupPhaseTiming,
     prewarm_status: Option<String>,
+    prewarm_cancel_requested: bool,
+    executor_status: &'static str,
     invalid_transition_count: u32,
     clock_regression_count: u32,
     saturation_count: u32,
@@ -166,6 +174,8 @@ impl StartupTimingState {
                 active: ActivePhases::default(),
                 phases: StartupPhaseTiming::default(),
                 prewarm_status: None,
+                prewarm_cancel_requested: false,
+                executor_status: "not_observed",
                 invalid_transition_count: 0,
                 clock_regression_count: 0,
                 saturation_count: 0,
@@ -175,8 +185,8 @@ impl StartupTimingState {
     }
 
     pub(crate) fn finish_session_initialization(&self) {
-        let sample = self.clock.sample();
         let mut inner = self.inner();
+        let sample = self.clock.sample();
         inner.advance(sample.monotonic_ns);
         if inner.completed_snapshot.is_some() || !inner.session_initializing {
             inner.invalid_transition();
@@ -186,8 +196,11 @@ impl StartupTimingState {
     }
 
     pub(crate) fn begin_phase(self: &Arc<Self>, phase: StartupPhase) -> StartupTimingGuard {
-        let sample = self.clock.sample();
-        let active = self.inner().begin_phase(sample.monotonic_ns, phase);
+        let active = {
+            let mut inner = self.inner();
+            let sample = self.clock.sample();
+            inner.begin_phase(sample.monotonic_ns, phase)
+        };
         StartupTimingGuard {
             timing: Arc::clone(self),
             phase,
@@ -197,16 +210,53 @@ impl StartupTimingState {
 
     pub(crate) fn record_prewarm_status(&self, status: impl Into<String>) {
         let mut inner = self.inner();
-        if inner.completed_snapshot.is_none() {
+        if inner.completed_snapshot.is_none() && !inner.prewarm_cancel_requested {
             inner.prewarm_status = Some(status.into());
         }
     }
 
-    /// Freeze the correlated startup snapshot at the first real model-send boundary.
+    /// Close speculative observation at handoff without awaiting task cleanup.
+    /// Late task starts/drops are harmless; required phases remain strict.
+    pub(crate) fn cutoff_speculative_prewarm(&self, status: &str) {
+        let mut inner = self.inner();
+        if inner.completed_snapshot.is_some() || inner.prewarm_cancel_requested {
+            return;
+        }
+        inner.advance(self.clock.sample().monotonic_ns);
+        inner.prewarm_cancel_requested = true;
+        inner.prewarm_status = Some(status.to_string());
+        inner.active.transport_preconnect = 0;
+        inner.active.prewarm_preparation = 0;
+        inner.active.prewarm_request = 0;
+    }
+
+    pub(crate) fn record_executor_status(&self, status: &'static str) {
+        let mut inner = self.inner();
+        if inner.completed_snapshot.is_none() {
+            inner.executor_status = status;
+        }
+    }
+
+    /// Freeze at the first real client transport-attempt entry (not wire send).
     /// Repeated calls return the exact same snapshot.
+    #[cfg(test)]
     pub(crate) fn complete_snapshot(&self) -> StartupTimingSnapshot {
+        let mut inner = self.inner();
         let sample = self.clock.sample();
-        self.inner().complete(sample)
+        inner.complete(sample)
+    }
+
+    /// Client transport-attempt entry is not proof of successful send or provider receipt.
+    /// Speculative generate=false traffic must not call this boundary.
+    pub(crate) fn freeze_at_first_transport_attempt(&self) {
+        let snapshot = {
+            let mut inner = self.inner();
+            if inner.completed_snapshot.is_some() {
+                return;
+            }
+            inner.complete(self.clock.sample())
+        };
+        snapshot.trace_frozen_at_first_model_send();
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, StartupTimingInner> {
@@ -221,16 +271,17 @@ impl Drop for StartupTimingGuard {
         if !self.active {
             return;
         }
+        let mut inner = self.timing.inner();
         let sample = self.timing.clock.sample();
-        self.timing
-            .inner()
-            .end_phase(sample.monotonic_ns, self.phase);
+        inner.end_phase(sample.monotonic_ns, self.phase);
     }
 }
 
 impl StartupTimingInner {
     fn begin_phase(&mut self, now_ns: u128, phase: StartupPhase) -> bool {
-        if self.completed_snapshot.is_some() {
+        if self.completed_snapshot.is_some()
+            || (self.prewarm_cancel_requested && phase.is_speculative())
+        {
             return false;
         }
         self.advance(now_ns);
@@ -244,7 +295,9 @@ impl StartupTimingInner {
     }
 
     fn end_phase(&mut self, now_ns: u128, phase: StartupPhase) {
-        if self.completed_snapshot.is_some() {
+        if self.completed_snapshot.is_some()
+            || (self.prewarm_cancel_requested && phase.is_speculative())
+        {
             return;
         }
         self.advance(now_ns);
@@ -336,12 +389,13 @@ impl StartupTimingInner {
             self.invalid_transition();
             self.session_initializing = false;
         }
-        let active_count = self.active.transport_preconnect
-            + self.active.prewarm_preparation
-            + self.active.prewarm_request
-            + self.active.first_turn_prewarm_wait
-            + self.active.executor_readiness;
-        if active_count != 0 {
+        // Mandatory pre-turn compaction can enter the transport before the
+        // regular-turn prewarm handoff. Observe unfinished speculative work
+        // truthfully at this cutoff; only unfinished required work is invalid.
+        let speculative_active = self.active.transport_preconnect > 0
+            || self.active.prewarm_preparation > 0
+            || self.active.prewarm_request > 0;
+        if self.active.first_turn_prewarm_wait > 0 || self.active.executor_readiness > 0 {
             self.invalid_transition();
         }
         let snapshot = StartupTimingSnapshot {
@@ -355,7 +409,13 @@ impl StartupTimingInner {
             profile_valid: self.invalid_transition_count == 0
                 && self.clock_regression_count == 0
                 && self.saturation_count == 0,
-            prewarm_status: self.prewarm_status.clone(),
+            prewarm_status: if speculative_active {
+                Some("in_progress_at_cutoff".to_string())
+            } else {
+                self.prewarm_status.clone()
+            },
+            prewarm_cancel_requested: self.prewarm_cancel_requested,
+            executor_status: self.executor_status,
             phases: self.phases.clone(),
             invalid_transition_count: self.invalid_transition_count,
             clock_regression_count: self.clock_regression_count,
@@ -377,6 +437,15 @@ impl StartupTimingInner {
 
     fn invalid_transition(&mut self) {
         self.invalid_transition_count = self.invalid_transition_count.saturating_add(1);
+    }
+}
+
+impl StartupPhase {
+    fn is_speculative(self) -> bool {
+        matches!(
+            self,
+            Self::TransportPreconnect | Self::PrewarmPreparation | Self::PrewarmRequest
+        )
     }
 }
 
@@ -463,15 +532,70 @@ mod tests {
     }
 
     #[test]
+    fn audit_observability_startup_samples_under_transition_lock() {
+        #[derive(Default)]
+        struct CheckingClock {
+            owner: Mutex<std::sync::Weak<StartupTimingState>>,
+            next: AtomicU64,
+        }
+        impl StartupClock for CheckingClock {
+            fn sample(&self) -> ClockSample {
+                if let Some(owner) = self.owner.lock().unwrap().upgrade() {
+                    assert!(
+                        matches!(
+                            owner.inner.try_lock(),
+                            Err(std::sync::TryLockError::WouldBlock)
+                        ),
+                        "clock sampling must be serialized with the transition"
+                    );
+                }
+                ClockSample {
+                    monotonic_ns: self.next.fetch_add(1, Ordering::SeqCst).into(),
+                    wall_unix_ms: 0,
+                }
+            }
+        }
+        let clock = Arc::new(CheckingClock::default());
+        let timing = StartupTimingState::with_clock("locked".into(), clock.clone());
+        *clock.owner.lock().unwrap() = Arc::downgrade(&timing);
+        timing.finish_session_initialization();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let timing = Arc::clone(&timing);
+                scope.spawn(move || {
+                    for _ in 0..32 {
+                        drop(timing.begin_phase(StartupPhase::TransportPreconnect));
+                    }
+                });
+            }
+        });
+        assert!(timing.complete_snapshot().profile_valid);
+    }
+
+    #[test]
+    fn audit_observability_startup_preserves_real_clock_regressions() {
+        let clock = Arc::new(ManualClock::default());
+        let timing = StartupTimingState::with_clock("regression".into(), clock.clone());
+        clock.advance(10);
+        timing.finish_session_initialization();
+        clock.monotonic_ns.store(5, Ordering::SeqCst);
+        let snapshot = timing.complete_snapshot();
+        assert_eq!(snapshot.clock_regression_count, 1);
+        assert!(!snapshot.profile_valid);
+    }
+
+    #[test]
     fn startup_snapshot_trace_includes_every_snapshot_field() {
         let snapshot = StartupTimingSnapshot {
-            schema_version: 1,
+            schema_version: STARTUP_TIMING_SCHEMA_VERSION,
             correlation_id: "trace-thread".to_string(),
             started_at_unix_ms: 101,
             completed_at_unix_ms: 202,
             inclusive_duration_ns: 303,
             profile_valid: false,
             prewarm_status: Some("ready".to_string()),
+            prewarm_cancel_requested: false,
+            executor_status: "ready",
             phases: StartupPhaseTiming {
                 session_initialization_ns: 401,
                 transport_preconnect_ns: 402,
@@ -505,13 +629,16 @@ mod tests {
         .expect("startup timing trace should be UTF-8");
         for expected in [
             "codex_core::session::turn",
-            "startup_timing_schema_version=1",
+            "startup_timing_schema_version=3",
+            "startup_timing_boundary=\"first_client_transport_attempt_entry\"",
             "startup_timing_correlation_id=trace-thread",
             "startup_timing_started_at_unix_ms=101",
             "startup_timing_completed_at_unix_ms=202",
             "startup_timing_duration_ns=303",
             "startup_timing_profile_valid=false",
             "startup_prewarm_status=Some(\"ready\")",
+            "startup_prewarm_cancel_requested=false",
+            "startup_executor_status=\"ready\"",
             "startup_session_initialization_ns=401",
             "startup_transport_preconnect_ns=402",
             "startup_prewarm_preparation_ns=403",
@@ -523,12 +650,64 @@ mod tests {
             "startup_timing_invalid_transition_count=501",
             "startup_timing_clock_regression_count=502",
             "startup_timing_saturation_count=503",
-            "startup timing snapshot frozen at first model send",
+            "startup timing snapshot frozen at first client transport attempt entry",
         ] {
             assert!(
                 logs.contains(expected),
                 "missing {expected:?} in trace: {logs}"
             );
         }
+    }
+
+    #[test]
+    fn speculative_cutoff_closes_observation_before_late_cleanup() {
+        let clock = Arc::new(ManualClock::default());
+        let timing = StartupTimingState::with_clock("cutoff".into(), clock.clone());
+        timing.finish_session_initialization();
+        let preparation = timing.begin_phase(StartupPhase::PrewarmPreparation);
+        let transport = timing.begin_phase(StartupPhase::TransportPreconnect);
+        clock.advance(7);
+        timing.cutoff_speculative_prewarm("not_ready");
+        clock.advance(5);
+        drop(timing.begin_phase(StartupPhase::PrewarmRequest));
+        let snapshot = timing.complete_snapshot();
+        assert!(snapshot.profile_valid);
+        assert!(snapshot.prewarm_cancel_requested);
+        assert_eq!(snapshot.phases.prewarm_preparation_ns, 7);
+        assert_eq!(snapshot.phases.transport_preconnect_ns, 7);
+        drop((preparation, transport));
+        timing.record_prewarm_status("late ready");
+        assert_eq!(timing.complete_snapshot(), snapshot);
+    }
+
+    #[test]
+    fn speculative_cutoff_does_not_excuse_required_readiness() {
+        let clock = Arc::new(ManualClock::default());
+        let timing = StartupTimingState::with_clock("required".into(), clock);
+        timing.finish_session_initialization();
+        let _required = timing.begin_phase(StartupPhase::ExecutorReadiness);
+        timing.cutoff_speculative_prewarm("not_ready");
+        let snapshot = timing.complete_snapshot();
+        assert!(!snapshot.profile_valid);
+        assert_eq!(snapshot.invalid_transition_count, 1);
+    }
+
+    #[test]
+    fn early_compaction_send_observes_unfinished_speculation_without_claiming_cancellation() {
+        let clock = Arc::new(ManualClock::default());
+        let timing = StartupTimingState::with_clock("early-compaction".into(), clock.clone());
+        timing.finish_session_initialization();
+        let preparation = timing.begin_phase(StartupPhase::PrewarmPreparation);
+        clock.advance(9);
+        let snapshot = timing.complete_snapshot();
+        assert!(snapshot.profile_valid);
+        assert_eq!(
+            snapshot.prewarm_status.as_deref(),
+            Some("in_progress_at_cutoff")
+        );
+        assert!(!snapshot.prewarm_cancel_requested);
+        assert_eq!(snapshot.phases.prewarm_preparation_ns, 9);
+        drop(preparation);
+        assert_eq!(timing.complete_snapshot(), snapshot);
     }
 }

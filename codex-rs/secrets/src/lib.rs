@@ -237,7 +237,10 @@ mod tests {
             SecretsBackendKind::Local,
             keyring,
         );
-        assert_eq!(reopened.get(&scope, &name)?, Some("scoped-token".to_string()));
+        assert_eq!(
+            reopened.get(&scope, &name)?,
+            Some("scoped-token".to_string())
+        );
         let expected = vec![SecretListEntry {
             scope: scope.clone(),
             name: name.clone(),

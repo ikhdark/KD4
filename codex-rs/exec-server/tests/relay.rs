@@ -148,8 +148,12 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
         .await
         .context("Noise harness client should connect")???;
 
-    let requests = registry.received_requests().await.context("registry requests")?;
-    let validations = requests.iter()
+    let requests = registry
+        .received_requests()
+        .await
+        .context("registry requests")?;
+    let validations = requests
+        .iter()
         .filter(|request| request.url.path().ends_with("/validate"))
         .collect::<Vec<_>>();
     assert_eq!(validations.len(), 1);
@@ -186,18 +190,21 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
     let completed = timeout(TEST_TIMEOUT, async {
         let mut after_seq = None;
         loop {
-            let read = client.read(codex_exec_server::ReadParams {
-                process_id: response.process_id.clone(),
-                after_seq,
-                max_bytes: None,
-                wait_ms: Some(1_000),
-            }).await?;
+            let read = client
+                .read(codex_exec_server::ReadParams {
+                    process_id: response.process_id.clone(),
+                    after_seq,
+                    max_bytes: None,
+                    wait_ms: Some(1_000),
+                })
+                .await?;
             if read.closed {
                 break Ok::<_, codex_exec_server::ExecServerError>(read);
             }
             after_seq = read.next_seq.checked_sub(1);
         }
-    }).await??;
+    })
+    .await??;
     assert!(completed.exited);
     assert_eq!(completed.exit_code, Some(0));
     assert_eq!(completed.failure, None);

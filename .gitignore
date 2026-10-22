@@ -101,6 +101,7 @@ personal/
 /.codex/audits/
 /.codex/gitdiff/
 /.codex/benchmark-runs/
+/.codex/tmp/
 
 # os
 .DS_Store

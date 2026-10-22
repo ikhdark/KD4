@@ -90,6 +90,27 @@ impl Ord for TrackedPath {
     }
 }
 
+/// Maps turn mutation revisions to the source revisions that validation
+/// settles against. The mutation revision also invalidates cached evidence, so
+/// it still advances for an uncertain command whose Git-visible workspace (or,
+/// outside any Git repository, whose bounded workspace tree) was observed
+/// unchanged. Absent a mismatching tracked path, that observation is not a
+/// source change; every other recorded effect advances both revisions.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ValidationRevisionMap {
+    /// Ascending mutation revisions that only invalidated evidence.
+    evidence_only: Vec<u64>,
+}
+
+impl ValidationRevisionMap {
+    pub(crate) fn validation_revision_at(&self, mutation_revision: u64) -> u64 {
+        let evidence_only = self
+            .evidence_only
+            .partition_point(|revision| *revision <= mutation_revision);
+        mutation_revision.saturating_sub(evidence_only as u64)
+    }
+}
+
 /// Tracks the net text diff for the current turn from committed apply_patch
 /// mutations. Unattributed changes recheck only these tracked paths.
 pub struct TurnDiffTracker {
@@ -97,13 +118,16 @@ pub struct TurnDiffTracker {
     invalidation_reported: bool,
     first_invalidation_cause: Option<serde_json::Value>,
     display_roots_by_environment: HashMap<String, PathBuf>,
+    remote_environments: HashSet<String>,
     baseline_by_path: HashMap<TrackedPath, TrackedContent>,
     current_by_path: HashMap<TrackedPath, TrackedContent>,
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     mutation_revision: u64,
     attributed_mutation_revision: u64,
-    /// Exact patch effects since each validation baseline. Unknown effects
-    /// invalidate the proof without discarding the ordinary net diff.
+    validation_revisions: ValidationRevisionMap,
+    /// Exact patch effects since each validation baseline, in validation
+    /// revisions. Unknown effects invalidate the proof without discarding the
+    /// ordinary net diff.
     validation_path_revisions: HashMap<TrackedPath, u64>,
     validation_unknown_revision: u64,
     rendered_diffs: BTreeMap<(String, TrackedPath), String>,
@@ -131,11 +155,13 @@ impl Default for TurnDiffTracker {
             invalidation_reported: false,
             first_invalidation_cause: None,
             display_roots_by_environment: HashMap::new(),
+            remote_environments: HashSet::new(),
             baseline_by_path: HashMap::new(),
             current_by_path: HashMap::new(),
             origin_by_current_path: HashMap::new(),
             mutation_revision: 0,
             attributed_mutation_revision: 0,
+            validation_revisions: ValidationRevisionMap::default(),
             validation_path_revisions: HashMap::new(),
             validation_unknown_revision: 0,
             rendered_diffs: BTreeMap::new(),
@@ -202,10 +228,47 @@ impl TurnDiffTracker {
         &mut self,
         display_roots: impl IntoIterator<Item = (String, PathBuf)>,
     ) {
-        self.display_roots_by_environment = display_roots
+        let roots = display_roots
             .into_iter()
             .map(|(environment_id, root)| (environment_id, normalize_tracked_path(&root)))
             .collect();
+        if self.display_roots_by_environment != roots {
+            self.display_roots_by_environment = roots;
+            self.rerender_display_scope();
+        }
+    }
+
+    fn rerender_display_scope(&mut self) {
+        self.rendered_diffs.clear();
+        self.display_keys.clear();
+        let paths = self
+            .baseline_by_path
+            .keys()
+            .chain(self.current_by_path.keys())
+            .cloned()
+            .collect();
+        self.refresh_unified_diff(paths);
+    }
+
+    pub(crate) fn observe_environment_scope(
+        &mut self,
+        environments: &crate::environment_selection::TurnEnvironmentSnapshot,
+        selected: &crate::session::turn_context::TurnEnvironment,
+    ) {
+        let mut roots = self.display_roots_by_environment.clone();
+        for selection in environments.to_selections() {
+            roots
+                .entry(selection.environment_id)
+                .or_insert_with(|| PathBuf::from(selection.cwd.inferred_native_path_string()));
+        }
+        let remote_changed = selected.environment.is_remote()
+            && self
+                .remote_environments
+                .insert(selected.environment_id.clone());
+        self.set_environment_display_roots(roots);
+        if remote_changed {
+            self.rerender_display_scope();
+        }
     }
 
     pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
@@ -228,6 +291,7 @@ impl TurnDiffTracker {
         }
 
         self.validation_unknown_revision = previous_unknown_revision;
+        let validation_revision = self.current_validation_revision();
 
         let mut changed = HashSet::new();
         for change in delta.changes() {
@@ -239,16 +303,33 @@ impl TurnDiffTracker {
             {
                 paths.push(TrackedPath::new(environment_id, path));
             }
+            // An exact operation is not necessarily a continuous owned chain:
+            // an independent writer can change the file between two patches.
+            let continuous = self.patch_preimages_match(environment_id, change);
+            let mut partners = HashSet::new();
             for path in &paths {
                 self.validation_path_revisions
-                    .insert(path.clone(), self.mutation_revision);
+                    .insert(path.clone(), validation_revision);
                 self.collect_diff_partners(path, &mut changed);
+                self.collect_diff_partners(path, &mut partners);
             }
-            if paths
-                .iter()
-                .any(|path| self.unavailable_paths.contains(path))
+            if !continuous
+                || partners
+                    .iter()
+                    .any(|path| self.unavailable_paths.contains(path))
             {
-                self.unavailable_paths.extend(paths.iter().cloned());
+                for path in &partners {
+                    self.validation_path_revisions
+                        .insert(path.clone(), validation_revision);
+                }
+                self.unavailable_paths.extend(partners);
+                if !continuous {
+                    self.unattributed_paths.extend(paths.iter().cloned());
+                    self.record_invalidation_cause(serde_json::json!({
+                        "tool": "apply_patch", "mutation_class": "patch_preimage_discontinuity",
+                        "environment_id": environment_id,
+                    }));
+                }
             }
             self.apply_change(environment_id, change);
             for path in &paths {
@@ -387,6 +468,32 @@ impl TurnDiffTracker {
         cwd: Option<&Path>,
         mutation: CommandMutation,
     ) {
+        self.record_command_end(command, environment_id, cwd, mutation, false);
+    }
+
+    /// Records an uncertain command whose own Git-visible workspace observation
+    /// (outside any Git repository, its bounded tree observation) was
+    /// unchanged. Its revision still invalidates cached evidence, including
+    /// ignored content. Only a mismatching tracked path, which reconciliation
+    /// reports as a known path, is a source change for validation.
+    pub(crate) fn record_git_unchanged_command_end_at(
+        &mut self,
+        command: &[String],
+        environment_id: &str,
+        cwd: Option<&Path>,
+        mutation: CommandMutation,
+    ) {
+        self.record_command_end(command, environment_id, cwd, mutation, true);
+    }
+
+    fn record_command_end(
+        &mut self,
+        command: &[String],
+        environment_id: &str,
+        cwd: Option<&Path>,
+        mutation: CommandMutation,
+        git_visible_unchanged: bool,
+    ) {
         // A command can write before failing or timing out, so every observed
         // mutation advances the generic turn revision. Known touched paths
         // lose exactness without discarding unrelated apply_patch diffs.
@@ -395,7 +502,13 @@ impl TurnDiffTracker {
             CommandMutation::KnownMutation { paths: Some(paths) } => {
                 if paths.is_empty() {
                     self.mutation_revision = self.mutation_revision.saturating_add(1);
-                    self.validation_unknown_revision = self.mutation_revision;
+                    if git_visible_unchanged {
+                        self.validation_revisions
+                            .evidence_only
+                            .push(self.mutation_revision);
+                    } else {
+                        self.validation_unknown_revision = self.current_validation_revision();
+                    }
                 } else {
                     self.record_mutation();
                 }
@@ -430,6 +543,13 @@ impl TurnDiffTracker {
             }
             CommandMutation::KnownMutation { paths: None } => {
                 self.record_unknown_mutation();
+            }
+            CommandMutation::Uncertain if git_visible_unchanged => {
+                self.mutation_revision = self.mutation_revision.saturating_add(1);
+                self.validation_revisions
+                    .evidence_only
+                    .push(self.mutation_revision);
+                self.invalidate();
             }
             CommandMutation::Uncertain | CommandMutation::UnattributedWorkspaceChange => {
                 // This revision invalidates cached evidence; it is not proof
@@ -558,11 +678,22 @@ impl TurnDiffTracker {
 
     /// Files that existed before this turn and that it modified or deleted,
     /// sorted by display path, with their text before the turn and after it
-    /// (`None` once deleted), following a rename to its destination.
+    /// (`None` once deleted), following a rename to its destination. Uncertain
+    /// pairs must not be used to attribute existing-test edits to this turn.
     pub(crate) fn changed_existing_contents(&self) -> Vec<(String, String, Option<String>)> {
+        if !self.valid {
+            return Vec::new();
+        }
         self.baseline_by_path
             .iter()
             .filter_map(|(path, before)| {
+                if self.unavailable_paths.contains(path)
+                    || self
+                        .rename_destination(path)
+                        .is_some_and(|destination| self.unavailable_paths.contains(destination))
+                {
+                    return None;
+                }
                 let after = self.current_by_path.get(path).or_else(|| {
                     self.rename_destination(path)
                         .and_then(|destination| self.current_by_path.get(destination))
@@ -585,14 +716,36 @@ impl TurnDiffTracker {
             .collect()
     }
 
+    pub(crate) fn uncertain_content_paths(&self) -> Vec<String> {
+        self.unavailable_paths
+            .iter()
+            .chain(self.baseline_by_path.keys().filter(|_| !self.valid))
+            .chain(self.current_by_path.keys().filter(|_| !self.valid))
+            .map(|path| self.display_path(path))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(crate) fn current_mutation_revision(&self) -> u64 {
         self.mutation_revision
     }
 
+    /// The source revision validation settlement and readiness compare.
+    pub(crate) fn current_validation_revision(&self) -> u64 {
+        self.validation_revisions
+            .validation_revision_at(self.mutation_revision)
+    }
+
+    pub(crate) fn validation_revisions(&self) -> &ValidationRevisionMap {
+        &self.validation_revisions
+    }
+
+    /// `revision` is a validation revision.
     pub(crate) fn validation_changes_since(&self, revision: u64) -> Option<Vec<(String, PathBuf)>> {
         if !self.valid
             || self.validation_unknown_revision > revision
-            || revision > self.mutation_revision
+            || revision > self.current_validation_revision()
         {
             return None;
         }
@@ -663,6 +816,23 @@ impl TurnDiffTracker {
                 .map(|path| self.display_path(path))
                 .collect());
         }
+        // Creation/deletion needs a mode to be an exact patch. Unknown remote
+        // metadata is an export limitation, never permission to query a host namesake.
+        let unknown_modes = self
+            .baseline_by_path
+            .iter()
+            .chain(self.current_by_path.iter())
+            .filter(|(path, content)| {
+                self.remote_environments.contains(&path.environment_id)
+                    && content.mode.is_none()
+                    && (self.baseline_by_path.contains_key(*path)
+                        != self.current_by_path.contains_key(*path))
+            })
+            .map(|(path, _)| self.display_path(path))
+            .collect::<BTreeSet<_>>();
+        if !unknown_modes.is_empty() {
+            return Err(unknown_modes.into_iter().collect());
+        }
         let diff = if self.aggregate_dirty {
             self.flatten_diff()
         } else {
@@ -704,7 +874,7 @@ impl TurnDiffTracker {
 
     fn record_mutation(&mut self) {
         self.mutation_revision = self.mutation_revision.saturating_add(1);
-        self.validation_unknown_revision = self.mutation_revision;
+        self.validation_unknown_revision = self.current_validation_revision();
         self.attributed_mutation_revision = self.attributed_mutation_revision.saturating_add(1);
     }
 
@@ -791,6 +961,41 @@ impl TurnDiffTracker {
         let origin = self.origin_by_current_path.remove(path)?;
         self.destination_by_origin.remove(&origin);
         Some(origin)
+    }
+
+    fn patch_preimages_match(&self, environment_id: &str, change: &AppliedPatchChange) -> bool {
+        let matches = |path: &Path, incoming: Option<&str>| {
+            let path = TrackedPath::new(environment_id, path);
+            // Revisions also retain known absence after an owned add/delete
+            // cancels out and neither content map has an entry anymore.
+            let known = self.validation_path_revisions.contains_key(&path)
+                || self.baseline_by_path.contains_key(&path)
+                || self.current_by_path.contains_key(&path);
+            !known
+                || self
+                    .current_by_path
+                    .get(&path)
+                    .map(|value| value.content.as_str())
+                    == incoming
+        };
+        match &change.change {
+            AppliedPatchFileChange::Add {
+                overwritten_content,
+                ..
+            } => matches(&change.path, overwritten_content.as_deref()),
+            AppliedPatchFileChange::Delete { content } => matches(&change.path, Some(content)),
+            AppliedPatchFileChange::Update {
+                old_content,
+                move_path,
+                overwritten_move_content,
+                ..
+            } => {
+                matches(&change.path, Some(old_content))
+                    && move_path
+                        .as_ref()
+                        .is_none_or(|path| matches(path, overwritten_move_content.as_deref()))
+            }
+        }
     }
 
     fn apply_change(&mut self, environment_id: &str, change: &AppliedPatchChange) {
@@ -1004,6 +1209,9 @@ impl TurnDiffTracker {
     fn file_mode(&self, path: &TrackedPath) -> Option<&str> {
         if let Some(mode) = self.patch_modes.get(path) {
             return Some(mode.as_str());
+        }
+        if self.remote_environments.contains(&path.environment_id) {
+            return None;
         }
         let filesystem_path = if path.path.is_absolute() {
             path.path.clone()

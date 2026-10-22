@@ -138,11 +138,58 @@ pub(crate) struct ColdReviewContext {
     pub assignment: Assignment,
     pub effective_contract: codex_agent_task_store::EffectiveTaskContract,
     pub attempt_id: AttemptId,
+    /// None means no current receipt, not a declaration of zero changed paths.
+    pub target_receipt_scope: Option<ColdReviewReceiptScope>,
     pub applicable_instructions: Vec<String>,
     pub attempt_specific_diff: String,
     pub observed_writes: Vec<ColdReviewWriteEvidence>,
     pub relevant_contracts: Vec<String>,
     pub nearest_tests: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ColdReviewReceiptScope {
+    pub assignment_id: AssignmentId,
+    pub attempt_id: AttemptId,
+    pub status: codex_agent_task_store::AgentStatusClaim,
+    pub declared_paths: Vec<String>,
+    pub provenance: &'static str,
+    pub freshness: &'static str,
+}
+
+pub(crate) fn cold_review_receipt_scope(
+    task: &codex_agent_task_store::AgentTask,
+) -> Result<Option<ColdReviewReceiptScope>, CapabilityPolicyError> {
+    let Some(receipt) = task.receipt.as_ref() else {
+        return Ok(None);
+    };
+    if receipt.assignment_id != task.assignment.assignment_id {
+        return Err(CapabilityPolicyError::ColdReviewAssignmentMismatch {
+            expected: task.assignment.assignment_id,
+            actual: receipt.assignment_id,
+        });
+    }
+    if receipt.attempt_id != task.current_attempt.attempt_id {
+        return Err(CapabilityPolicyError::ColdReviewAttemptMismatch {
+            expected: task.current_attempt.attempt_id,
+            actual: receipt.attempt_id,
+        });
+    }
+    let mut paths = Vec::with_capacity(receipt.declared_changes.len());
+    for change in &receipt.declared_changes {
+        normalize_repo_path_lexically(&change.path)?;
+        // Stored declarations are already normalized. Do not resolve old paths
+        // against today's filesystem or copy worker-authored summaries.
+        paths.push(change.path.clone());
+    }
+    Ok(Some(ColdReviewReceiptScope {
+        assignment_id: receipt.assignment_id,
+        attempt_id: receipt.attempt_id,
+        status: receipt.status,
+        declared_paths: paths,
+        provenance: "worker_declared",
+        freshness: "unverified",
+    }))
 }
 
 /// Inputs are limited to independently recoverable review evidence. Worker reasoning and
@@ -196,9 +243,12 @@ pub(crate) fn build_cold_review_context(
     observed_writes.sort_by(|left, right| compare_repo_paths(&left.path, &right.path));
 
     Ok(ColdReviewContext {
-        effective_contract: input.assignment.effective_contract(input.amendment.as_ref()),
+        effective_contract: input
+            .assignment
+            .effective_contract(input.amendment.as_ref()),
         assignment: input.assignment,
         attempt_id: input.attempt_id,
+        target_receipt_scope: None,
         applicable_instructions: input.applicable_instructions,
         attempt_specific_diff: input.attempt_specific_diff,
         observed_writes,

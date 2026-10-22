@@ -34,6 +34,7 @@ use crate::raw_event::RawTraceEventPayload;
 #[derive(Debug)]
 pub struct TraceWriter {
     inner: Mutex<TraceWriterInner>,
+    payload_capture_gaps: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug)]
@@ -78,6 +79,7 @@ impl TraceWriter {
         write_json_file(&bundle_dir.join(MANIFEST_FILE_NAME), &manifest)?;
 
         Ok(Self {
+            payload_capture_gaps: std::sync::atomic::AtomicU64::new(0),
             inner: Mutex::new(TraceWriterInner {
                 manifest,
                 payloads_dir,
@@ -105,7 +107,10 @@ impl TraceWriter {
         // Payload files are created before the event that references them. A
         // replay interrupted after an event is appended should never point at a
         // payload file that the writer planned but had not written yet.
-        write_json_file(&absolute_path, value)?;
+        if let Err(error) = write_json_file(&absolute_path, value) {
+            self.note_capture_gap();
+            return Err(error);
+        }
         Ok(RawPayloadRef {
             raw_payload_id,
             kind,
@@ -128,6 +133,17 @@ impl TraceWriter {
         }
     }
 
+    /// O(1), no I/O or queued task. The next existing lifecycle event publishes
+    /// the cumulative loss, including when optional detail admission failed.
+    pub(crate) fn note_capture_gap(&self) {
+        use std::sync::atomic::Ordering;
+        let _ =
+            self.payload_capture_gaps
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    Some(count.saturating_add(1))
+                });
+    }
+
     /// Appends one raw event with no extra envelope context.
     pub fn append(&self, payload: RawTraceEventPayload) -> Result<RawTraceEvent> {
         self.append_with_context(RawTraceEventContext::default(), payload)
@@ -146,6 +162,15 @@ impl TraceWriter {
         context: RawTraceEventContext,
         payload: RawTraceEventPayload,
     ) -> Result<RawTraceEvent> {
+        self.append_with_context_at(context, payload, None)
+    }
+
+    pub(crate) fn append_with_context_at(
+        &self,
+        context: RawTraceEventContext,
+        payload: RawTraceEventPayload,
+        occurrence: Option<crate::TraceOccurrence>,
+    ) -> Result<RawTraceEvent> {
         let mut inner = self.lock_inner();
         anyhow::ensure!(
             !inner.append_failed,
@@ -153,6 +178,11 @@ impl TraceWriter {
         );
         let event = RawTraceEvent {
             schema_version: RAW_TRACE_EVENT_SCHEMA_VERSION,
+            occurrence,
+            payload_capture_gap_count: Some(
+                self.payload_capture_gaps
+                    .load(std::sync::atomic::Ordering::Acquire),
+            ),
             seq: inner.next_seq,
             wall_time_unix_ms: unix_time_ms(),
             rollout_id: inner.manifest.rollout_id.clone(),
@@ -383,7 +413,7 @@ mod tests {
         );
         assert_eq!(
             rollout.inference_calls["inference-1"].raw_request_payload_id,
-            inference_request.raw_payload_id,
+            Some(inference_request.raw_payload_id),
         );
         assert_eq!(
             rollout.inference_calls["inference-1"].raw_response_payload_id,

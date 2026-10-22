@@ -19,7 +19,10 @@ class CheckV8BoundaryTest(unittest.TestCase):
             packages.append(command[command.index("-p") + 1])
             self.assertEqual(command[-2:], ["--target", "x86_64-pc-windows-msvc"])
             return subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="codex-core v0.0.0\nv8-like v1.0.0\n", stderr=""
+                args=[],
+                returncode=0,
+                stdout="codex-core v0.0.0\nv8-like v1.0.0\n",
+                stderr="",
             )
 
         self.assertEqual(
@@ -33,7 +36,10 @@ class CheckV8BoundaryTest(unittest.TestCase):
     def test_graph_with_v8_fails(self) -> None:
         def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="codex-cli v0.0.0\nv8 v152.2.0\n", stderr=""
+                args=[],
+                returncode=0,
+                stdout="codex-cli v0.0.0\nv8 v152.2.0\n",
+                stderr="",
             )
 
         self.assertEqual(check_v8_boundary.check_v8_boundary([], runner=runner), 1)
@@ -56,12 +62,28 @@ class CheckV8BoundaryTest(unittest.TestCase):
             check_v8_boundary.check_v8_boundary(["--offline"], runner=runner), 0
         )
         host = subprocess.run(
-            ["cargo", "tree", "-p", "codex-code-mode-host", "-e", "normal",
-             "--prefix", "none", "--format", "{p}", "--offline"],
-            cwd=CODEX_RS, capture_output=True, text=True, check=True,
+            [
+                "cargo",
+                "tree",
+                "-p",
+                "codex-code-mode-host",
+                "-e",
+                "normal",
+                "--prefix",
+                "none",
+                "--format",
+                "{p}",
+                "--offline",
+            ],
+            cwd=CODEX_RS,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         # Guard the probe itself: the host must still link V8 under this format.
-        self.assertTrue(any(line.startswith("v8 ") for line in host.stdout.splitlines()))
+        self.assertTrue(
+            any(line.startswith("v8 ") for line in host.stdout.splitlines())
+        )
 
 
 if __name__ == "__main__":

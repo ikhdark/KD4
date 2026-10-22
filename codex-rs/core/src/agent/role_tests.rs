@@ -172,6 +172,7 @@ async fn apply_role_returns_unavailable_for_missing_user_role_file() {
             description: None,
             config_file: Some(PathBuf::from("/path/does/not/exist.toml")),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -192,6 +193,7 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -247,6 +249,7 @@ async fn apply_role_reports_independent_model_and_reasoning_locks() {
                 description: None,
                 config_file: Some(role_path),
                 nickname_candidates: None,
+                config_snapshot: Default::default(),
             },
         );
 
@@ -290,6 +293,7 @@ model = "role-model"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -319,6 +323,7 @@ async fn apply_role_preserves_unspecified_keys() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -418,6 +423,7 @@ service_tier = "priority"
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -448,6 +454,7 @@ async fn apply_role_preserves_existing_service_tier_without_override() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -513,6 +520,7 @@ async fn apply_role_takes_precedence_over_existing_session_flags_for_same_key() 
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -555,6 +563,7 @@ enabled = false
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     );
 
@@ -596,6 +605,7 @@ fn spawn_tool_spec_build_deduplicates_user_defined_built_in_roles() {
                 description: Some("user override".to_string()),
                 config_file: None,
                 nickname_candidates: None,
+                config_snapshot: Default::default(),
             },
         ),
         ("researcher".to_string(), AgentRoleConfig::default()),
@@ -622,6 +632,7 @@ fn spawn_tool_spec_lists_user_defined_roles_before_built_ins() {
             description: Some("first".to_string()),
             config_file: None,
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     )]);
 
@@ -649,6 +660,7 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
             description: Some("Research carefully.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     )]);
 
@@ -660,7 +672,7 @@ fn spawn_tool_spec_marks_role_locked_model_and_reasoning_effort() {
 }
 
 #[test]
-fn spawn_tool_spec_keeps_configured_role_files_fresh_after_building_defaults() {
+fn spawn_tool_spec_refreshes_role_files_only_in_a_new_config_generation() {
     let defaults = spawn_tool_spec::build(&BTreeMap::new());
     assert!(defaults.contains("default: {\nDefault agent.\n}"));
     let tempdir = TempDir::new().expect("create temp dir");
@@ -671,6 +683,7 @@ fn spawn_tool_spec_keeps_configured_role_files_fresh_after_building_defaults() {
             description: Some("Research carefully.".to_string()),
             config_file: Some(role_path.clone()),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     )]);
 
@@ -678,6 +691,9 @@ fn spawn_tool_spec_keeps_configured_role_files_fresh_after_building_defaults() {
     let first = spawn_tool_spec::build(&roles);
     assert!(first.contains("This role's model is set to `first-model`"));
     fs::write(&role_path, "model = \"second-model\"\n").expect("update role config");
+    assert_eq!(spawn_tool_spec::build(&roles), first);
+    let mut roles = roles;
+    roles.get_mut("researcher").unwrap().config_snapshot = Default::default();
     let updated = spawn_tool_spec::build(&roles);
     assert!(updated.contains("This role's model is set to `second-model`"));
     assert!(!updated.contains("first-model"));
@@ -699,6 +715,7 @@ fn spawn_tool_spec_marks_role_locked_reasoning_effort_only() {
             description: Some("Review carefully.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     )]);
 
@@ -724,6 +741,7 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
             description: Some("Stay fast.".to_string()),
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     )]);
 
@@ -772,9 +790,51 @@ fn spawn_tool_spec_keeps_locks_without_optional_description() {
             description: None,
             config_file: Some(role_path),
             nickname_candidates: None,
+            config_snapshot: Default::default(),
         },
     )]);
     let spec = spawn_tool_spec::build(&roles);
     assert!(spec.contains("locked: {\nno description\n- This role's model is set to `gpt-5` and its reasoning effort is set to `high`. These settings cannot be changed."));
     assert!(spec.contains("This role's service tier is set to `priority`."));
+}
+#[tokio::test]
+async fn advertised_role_snapshot_survives_file_edit_and_deletion_at_dispatch() {
+    let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+    let path = write_role_config(&home, "researcher.toml",
+    "model = 'saved-model'\nmodel_reasoning_effort = 'high'\nsandbox_mode = 'read-only'\ndeveloper_instructions = 'saved instructions'\n").await;
+    config.agent_roles.insert(
+        "alias".into(),
+        AgentRoleConfig {
+            config_file: Some(path.clone()),
+            ..Default::default()
+        },
+    );
+    let description = spawn_tool_spec::build(&config.agent_roles);
+    assert!(description.contains("`saved-model`"));
+    fs::write(
+        &path,
+        "model = 'unexpected-model'\nmodel_reasoning_effort = 'low'\n",
+    )
+    .unwrap();
+    for deleted in [false, true] {
+        if deleted {
+            fs::remove_file(&path).unwrap();
+        }
+        let mut child = config.clone();
+        let locks = apply_role_to_config(&mut child, Some("alias"))
+            .await
+            .unwrap();
+        assert!(locks.model && locks.reasoning_effort && locks.permissions);
+        assert_eq!(child.model.as_deref(), Some("saved-model"));
+        assert_eq!(child.model_reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(
+            child.developer_instructions.as_deref(),
+            Some("saved instructions")
+        );
+        assert_eq!(
+            child.permissions.permission_profile(),
+            &PermissionProfile::read_only()
+        );
+        assert_eq!(spawn_tool_spec::build(&child.agent_roles), description);
+    }
 }

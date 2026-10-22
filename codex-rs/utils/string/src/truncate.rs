@@ -130,9 +130,7 @@ pub struct TokenCountEstimate {
 
 impl TokenCountEstimate {
     pub fn new(text: &str) -> Self {
-        Self {
-            bytes: text.len(),
-        }
+        Self { bytes: text.len() }
     }
 
     pub fn tokens(self) -> usize {
@@ -212,7 +210,7 @@ fn split_budget(budget: usize) -> (usize, usize) {
 
 fn format_truncation_marker(use_tokens: bool, removed_count: u64) -> String {
     if use_tokens {
-        format!("…{removed_count} tokens truncated…")
+        format!("…approximately {removed_count} tokens truncated…")
     } else {
         format!("…{removed_count} chars truncated…")
     }

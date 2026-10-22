@@ -1,4 +1,4 @@
-use codex_http_client::HttpClient;
+use codex_http_client::RouteAwareClientPool as HttpClient;
 use http::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
@@ -7,7 +7,7 @@ use serde::de::{self};
 use std::time::Duration;
 use tokio::time::Instant;
 
-use crate::default_client::create_raw_auth_client_async;
+use crate::default_client::create_raw_auth_client_pool;
 use crate::pkce::PkceCodes;
 use crate::server::ServerOptions;
 use std::io;
@@ -22,6 +22,7 @@ pub struct DeviceCode {
     pub user_code: String,
     device_auth_id: String,
     interval: u64,
+    prepared: std::sync::Arc<crate::auth::PreparedAuthCommit>,
 }
 
 #[derive(Deserialize)]
@@ -191,10 +192,13 @@ fn print_device_code_prompt(verification_url: &str, code: &str) {
 }
 
 pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<DeviceCode> {
+    let prepared = std::sync::Arc::new(crate::auth::PreparedAuthCommit::new(
+        &opts.codex_home,
+        opts.cli_auth_credentials_store_mode,
+        opts.auth_keyring_backend_kind,
+    )?);
     let base_url = opts.issuer.trim_end_matches('/');
-    // The route selected for the issuer is reused for all device-auth endpoint paths; the endpoint
-    // paths are not resolved separately.
-    let client = create_raw_auth_client_async(base_url, &opts.auth_route_config).await?;
+    let client = create_raw_auth_client_pool(&opts.auth_route_config);
     let api_base_url = format!("{base_url}/api/accounts");
     let uc = request_user_code(&client, &api_base_url, &opts.client_id).await?;
 
@@ -203,6 +207,7 @@ pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<Device
         user_code: uc.user_code,
         device_auth_id: uc.device_auth_id,
         interval: uc.interval,
+        prepared,
     })
 }
 
@@ -210,18 +215,19 @@ pub async fn request_device_code(opts: &ServerOptions) -> std::io::Result<Device
 pub struct PendingDeviceCodeLogin {
     opts: ServerOptions,
     tokens: crate::server::ExchangedTokens,
+    prepared: std::sync::Arc<crate::auth::PreparedAuthCommit>,
 }
 
 impl PendingDeviceCodeLogin {
     pub async fn persist(self) -> std::io::Result<()> {
         crate::server::persist_tokens_async(
-            &self.opts.codex_home,
+            &self.opts,
             None,
             self.tokens.id_token,
             self.tokens.access_token,
             self.tokens.refresh_token,
-            self.opts.cli_auth_credentials_store_mode,
-            self.opts.auth_keyring_backend_kind,
+            self.prepared,
+            None,
         )
         .await
     }
@@ -242,7 +248,7 @@ pub async fn prepare_device_code_login(
     device_code: DeviceCode,
 ) -> std::io::Result<PendingDeviceCodeLogin> {
     let base_url = opts.issuer.trim_end_matches('/');
-    let client = create_raw_auth_client_async(base_url, &opts.auth_route_config).await?;
+    let client = create_raw_auth_client_pool(&opts.auth_route_config);
     let api_base_url = format!("{base_url}/api/accounts");
 
     let code_resp = poll_for_token(
@@ -278,7 +284,11 @@ pub async fn prepare_device_code_login(
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
     }
 
-    Ok(PendingDeviceCodeLogin { opts, tokens })
+    Ok(PendingDeviceCodeLogin {
+        opts,
+        tokens,
+        prepared: device_code.prepared,
+    })
 }
 
 pub async fn run_device_code_login(opts: ServerOptions) -> std::io::Result<()> {

@@ -27,7 +27,6 @@ codex-app-server-test-client = { workspace = true }
 codex-arg0 = { workspace = true }
 codex-api = { workspace = true }
 codex-chatgpt = { workspace = true }
-codex-cloud-tasks = { path = "../cloud-tasks" }
 codex-utils-cli = { workspace = true }
 codex-utils-oss = { workspace = true }
 codex-config = { workspace = true }
@@ -42,7 +41,6 @@ codex-git-utils = { workspace = true }
 codex-install-context = { workspace = true }
 codex-login = { workspace = true }
 codex-mcp = { workspace = true }
-codex-mcp-server = { workspace = true }
 codex-model-provider = { workspace = true }
 codex-models-manager = { workspace = true }
 codex-plugin = { workspace = true }
@@ -55,7 +53,6 @@ codex-rollout-trace = { workspace = true }
 codex-state = { workspace = true }
 codex-stdio-to-uds = { workspace = true }
 codex-terminal-detection = { workspace = true }
-codex-tui = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-build-info = { workspace = true }
 codex-windows-sandbox = { workspace = true }

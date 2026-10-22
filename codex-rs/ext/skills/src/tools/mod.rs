@@ -66,6 +66,7 @@ impl SkillToolContext {
                 SkillListQuery {
                     continuation: None,
                     turn_id: turn_id.to_string(),
+                    bound_executor_roots: Vec::new(),
                     executor_roots: Vec::new(),
                     host_snapshot: None,
                     include_host_skills: false,
@@ -87,6 +88,7 @@ impl SkillToolContext {
                         self.providers.list_orchestrator_for_turn(SkillListQuery {
                             continuation: None,
                             turn_id: turn_id.to_string(),
+                            bound_executor_roots: Vec::new(),
                             executor_roots: Vec::new(),
                             host_snapshot: None,
                             include_host_skills: false,

@@ -83,11 +83,24 @@ async fn resume_includes_initial_messages_from_rollout_events() -> Result<()> {
         [
             EventMsg::ThreadSettingsApplied(_),
             EventMsg::TurnStarted(started),
+            EventMsg::ItemCompleted(user_item),
             EventMsg::UserMessage(first_user),
             EventMsg::ItemCompleted(canonical),
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
         ] => {
+            // The canonical user item is durable alongside its legacy event.
+            assert_eq!(user_item.turn_id, started.turn_id);
+            let codex_protocol::items::TurnItem::UserMessage(user) = &user_item.item else {
+                panic!("expected canonical user message: {user_item:?}");
+            };
+            assert_eq!(
+                user.content,
+                vec![UserInput::Text {
+                    text: "Record some messages".into(),
+                    text_elements: text_elements.clone(),
+                }]
+            );
             assert_eq!(first_user.message, "Record some messages");
             assert_eq!(first_user.text_elements, text_elements);
             assert_eq!(canonical.turn_id, started.turn_id);
@@ -187,6 +200,7 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
         [
             EventMsg::ThreadSettingsApplied(_),
             EventMsg::TurnStarted(started),
+            EventMsg::ItemCompleted(user_item),
             EventMsg::UserMessage(first_user),
             EventMsg::AgentReasoning(reasoning),
             EventMsg::AgentReasoningRawContent(raw),
@@ -195,6 +209,18 @@ async fn resume_includes_initial_messages_from_reasoning_events() -> Result<()> 
             EventMsg::TokenCount(_),
             EventMsg::TurnComplete(completed),
         ] => {
+            // The canonical user item is durable alongside its legacy event.
+            assert_eq!(user_item.turn_id, started.turn_id);
+            let codex_protocol::items::TurnItem::UserMessage(user) = &user_item.item else {
+                panic!("expected canonical user message: {user_item:?}");
+            };
+            assert_eq!(
+                user.content,
+                vec![UserInput::Text {
+                    text: "Record reasoning messages".into(),
+                    text_elements: Vec::new(),
+                }]
+            );
             assert_eq!(first_user.message, "Record reasoning messages");
             assert_eq!(reasoning.text, "Summarized step");
             assert_eq!(raw.text, "raw detail");

@@ -286,8 +286,13 @@ async fn openai_model_header_casing_only_mismatch_does_not_warn() -> Result<()> 
 
     let server = start_mock_server().await;
     let requested_header = REQUESTED_MODEL.to_ascii_uppercase();
-    let response = sse_response(sse_completed("resp-1"))
-        .insert_header("OpenAI-Model", requested_header.as_str());
+    // Deliver a final answer so completion needs no missing-answer repair request.
+    let response = sse_response(sse(vec![
+        ev_response_created("resp-1"),
+        ev_assistant_message("msg-1", "done"),
+        core_test_support::responses::ev_completed("resp-1"),
+    ]))
+    .insert_header("OpenAI-Model", requested_header.as_str());
     let _mock = mount_response_once(&server, response).await;
 
     let mut builder = test_codex().with_model(REQUESTED_MODEL);

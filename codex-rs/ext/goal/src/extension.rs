@@ -199,6 +199,24 @@ impl<C> TurnLifecycleContributor for GoalExtension<C>
 where
     C: Send + Sync + 'static,
 {
+    fn on_turn_settled<'a>(
+        &'a self,
+        input: TurnStopInput<'a>,
+    ) -> ExtensionFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let runtime = goal_runtime_handle(input.thread_store)?;
+            let intent = runtime.take_terminal_intent(input.turn_store.level_id())?;
+            Some(match intent.commit().await {
+                Ok(result) => format!(
+                    "The staged goal terminal update was accepted after sibling effects settled: {result}"
+                ),
+                Err(error) => format!(
+                    "The staged goal terminal update was not accepted: {error}. Reconcile remaining independent authorized work and current input before requesting another terminal update."
+                ),
+            })
+        })
+    }
+
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
@@ -374,6 +392,10 @@ impl<C> ToolLifecycleContributor for GoalExtension<C>
 where
     C: Send + Sync + 'static,
 {
+    fn requires_finish_before_completion(&self) -> bool {
+        true
+    }
+
     fn on_tool_finish<'a>(&'a self, input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
@@ -454,13 +476,35 @@ where
 
     fn tools(
         &self,
-        _session_store: &ExtensionData,
+        session_store: &ExtensionData,
         thread_store: &ExtensionData,
+    ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>> {
+        self.surface_snapshot(session_store, thread_store).tools
+    }
+
+    fn surface_snapshot(
+        &self,
+        session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+    ) -> codex_extension_api::ToolSurfaceSnapshot {
+        // Capture the state once. Re-reading it after constructing executors can
+        // stamp an inactive catalog with the active revision (or vice versa).
+        let revision = self.surface_revision(session_store, thread_store);
+        let tools = self.tools_for_surface_revision(thread_store, revision);
+        codex_extension_api::ToolSurfaceSnapshot { revision, tools }
+    }
+}
+
+impl<C: Send + Sync + 'static> GoalExtension<C> {
+    fn tools_for_surface_revision(
+        &self,
+        thread_store: &ExtensionData,
+        revision: u64,
     ) -> Vec<Arc<dyn codex_extension_api::ToolExecutor<codex_extension_api::ToolCall>>> {
         let Some(runtime) = goal_runtime_handle(thread_store) else {
             return Vec::new();
         };
-        if !runtime.tools_visible() {
+        if revision == 0 {
             return Vec::new();
         }
 
@@ -475,7 +519,7 @@ where
                 self.event_emitter.clone(),
                 self.metrics.clone(),
             ));
-        if !accounting_state.has_active_goal() {
+        if revision == 1 {
             return vec![create];
         }
 

@@ -364,10 +364,7 @@ async fn terminal_goal_accounting_failure_preserves_and_retries_progress() -> an
                     json!({ "status": "blocked", "goal_ref": goal_ref(runtime.as_ref(), thread_id).await? }),
                 );
                 invocation.turn_id = "recovered-turn".to_string();
-                let tools = harness.tools();
-                tool_by_name(&tools, "update_goal")
-                    .handle(invocation)
-                    .await?;
+                settle_goal_update(&harness, invocation).await?;
             } else {
                 harness.stop_turn("recovered-turn").await;
             }
@@ -443,6 +440,7 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
             },
             "remainingTokens": 123,
             "completionBudgetReport": serde_json::Value::Null,
+            "terminalTransition": serde_json::Value::Null,
         })
     );
 
@@ -464,9 +462,14 @@ async fn goal_tools_require_persistence_and_non_review_session() -> anyhow::Resu
     for (source, persistent, expected) in [
         (SessionSource::Cli, true, vec!["create_goal"]),
         (SessionSource::Cli, false, Vec::new()),
-        (SessionSource::SubAgent(SubAgentSource::Review), true, Vec::new()),
+        (
+            SessionSource::SubAgent(SubAgentSource::Review),
+            true,
+            Vec::new(),
+        ),
     ] {
-        let tools = installed_tools_with_start(runtime.clone(), thread_id, source, persistent).await;
+        let tools =
+            installed_tools_with_start(runtime.clone(), thread_id, source, persistent).await;
         assert_eq!(tool_names(&tools), expected);
     }
     Ok(())
@@ -509,10 +512,7 @@ async fn installed_goal_tools_only_replace_complete_goal() -> anyhow::Result<()>
         )
     );
 
-    let tools = harness.tools();
-    let update_tool = tool_by_name(&tools, "update_goal");
-    update_tool
-        .handle(tool_call(
+    settle_goal_update(&harness, tool_call(
             "update_goal",
             "call-complete-goal",
             json!({ "status": "complete", "goal_ref": goal_ref(runtime.as_ref(), thread_id).await? }),
@@ -543,8 +543,10 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
         .start_turn("turn-1", &token_usage(0, 0, 0, 0, 0))
         .await;
 
-    let inactive = harness.tools();
-    assert_eq!(harness.tool_surface_revision(), 1);
+    let inactive_snapshot = harness.tool_surface_snapshot();
+    assert_eq!(inactive_snapshot.revision, 1);
+    assert_eq!(harness.tool_surface_revision(), inactive_snapshot.revision);
+    let inactive = inactive_snapshot.tools;
     assert_eq!(tool_names(&inactive), ["create_goal"]);
     assert_eq!(
         tool_by_name(&inactive, "create_goal").exposure(),
@@ -559,8 +561,12 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
         ))
         .await?;
 
-    let active = harness.tools();
-    assert_eq!(harness.tool_surface_revision(), 2);
+    let active_snapshot = harness.tool_surface_snapshot();
+    assert_eq!(active_snapshot.revision, 2);
+    assert_eq!(harness.tool_surface_revision(), active_snapshot.revision);
+    // Captured catalogs remain immutable across the transition.
+    assert_eq!(tool_names(&inactive), ["create_goal"]);
+    let active = active_snapshot.tools;
     assert_eq!(
         tool_names(&active),
         ["get_goal", "create_goal", "update_goal"]
@@ -583,15 +589,15 @@ async fn goal_tool_surface_tracks_inactive_and_active_state() -> anyhow::Result<
         ToolExposure::Direct
     );
 
-    tool_by_name(&active, "update_goal")
-        .handle(tool_call(
+    settle_goal_update(&harness, tool_call(
             "update_goal",
             "call-complete-goal",
             json!({ "status": "complete", "goal_ref": goal_ref(runtime.as_ref(), thread_id).await? }),
         ))
         .await?;
-    let inactive_again = harness.tools();
-    assert_eq!(harness.tool_surface_revision(), 1);
+    let inactive_snapshot = harness.tool_surface_snapshot();
+    assert_eq!(inactive_snapshot.revision, 1);
+    let inactive_again = inactive_snapshot.tools;
     assert_eq!(tool_names(&inactive_again), ["create_goal"]);
     Ok(())
 }
@@ -770,7 +776,8 @@ async fn parallel_tool_finish_accounts_active_goal_progress_once() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn budget_limited_goal_keeps_accruing_through_tool_and_turn_completion() -> anyhow::Result<()> {
+async fn budget_limited_goal_keeps_accruing_through_tool_and_turn_completion() -> anyhow::Result<()>
+{
     for stop_turn in [false, true] {
         let runtime = test_runtime().await?;
         let thread_id = test_thread_id()?;
@@ -785,17 +792,29 @@ async fn budget_limited_goal_keeps_accruing_through_tool_and_turn_completion() -
             ))
             .await?;
         harness.sink.clear();
-        harness.record_token_usage("turn-1", &token_usage(20, 5, 10, 0, 30)).await;
-        harness.notify_tool_finish("turn-1", "call-shell-1", "shell").await;
-        harness.record_token_usage("turn-1", &token_usage(24, 5, 16, 0, 40)).await;
+        harness
+            .record_token_usage("turn-1", &token_usage(20, 5, 10, 0, 30))
+            .await;
+        harness
+            .notify_tool_finish("turn-1", "call-shell-1", "shell")
+            .await;
+        harness
+            .record_token_usage("turn-1", &token_usage(24, 5, 16, 0, 40))
+            .await;
         let event_id = if stop_turn {
             harness.stop_turn("turn-1").await;
             "turn-1:turn-stop"
         } else {
-            harness.notify_tool_finish("turn-1", "call-shell-2", "shell").await;
+            harness
+                .notify_tool_finish("turn-1", "call-shell-2", "shell")
+                .await;
             "call-shell-2"
         };
-        let goal = runtime.thread_goals().get_thread_goal(thread_id).await?.expect("goal");
+        let goal = runtime
+            .thread_goals()
+            .get_thread_goal(thread_id)
+            .await?
+            .expect("goal");
         assert_eq!(goal.tokens_used, 35);
         assert_eq!(goal.status, codex_state::ThreadGoalStatus::BudgetLimited);
         assert_eq!(
@@ -1132,7 +1151,7 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
         "call-update-goal",
         json!({ "status": "blocked", "goal_ref": goal_ref(runtime.as_ref(), thread_id).await? }),
     );
-    let output = update_tool.handle(invocation.clone()).await?;
+    let output = settle_goal_update(&harness, invocation.clone()).await?;
     let result = output.code_mode_result(&invocation.payload);
     // Accounting measures real elapsed time, including scheduling and storage waits.
     // It starts after this clock and stops before the tool returns, so zero is
@@ -1159,6 +1178,17 @@ async fn update_goal_can_block_and_accounts_final_progress() -> anyhow::Result<(
             },
             "remainingTokens": serde_json::Value::Null,
             "completionBudgetReport": serde_json::Value::Null,
+            "terminalTransition": {
+                "goalId": runtime.thread_goals().get_thread_goal(thread_id).await?.unwrap().goal_id,
+                "objective": "ship goal extension backend",
+                "turnId": "turn-1",
+                "transitionId": "call-update-goal",
+                "intendedStatus": "blocked",
+                "reason": "model-tool",
+                "outcome": "confirmed_terminal",
+                "persistenceConfirmed": true,
+                "error": serde_json::Value::Null,
+            },
         })
     );
 
@@ -1658,6 +1688,19 @@ impl GoalExtensionHarness {
             })
     }
 
+    fn tool_surface_snapshot(&self) -> codex_extension_api::ToolSurfaceSnapshot {
+        let mut snapshot = codex_extension_api::ToolSurfaceSnapshot {
+            revision: 0,
+            tools: Vec::new(),
+        };
+        for contributor in self.registry.tool_contributors() {
+            let part = contributor.surface_snapshot(&self.session_store, &self.thread_store);
+            snapshot.revision = snapshot.revision.rotate_left(7).wrapping_add(part.revision);
+            snapshot.tools.extend(part.tools);
+        }
+        snapshot
+    }
+
     async fn start_turn(&self, turn_id: &str, usage: &TokenUsage) {
         self.start_turn_with_mode(turn_id, ModeKind::Default, usage)
             .await;
@@ -1787,6 +1830,158 @@ fn tool_by_name<'a>(
         .expect("requested goal tool should exist")
 }
 
+struct TestTaskReadiness {
+    ready: AtomicBool,
+    checks: std::sync::atomic::AtomicUsize,
+}
+
+impl codex_extension_api::TaskAcceptance for TestTaskReadiness {
+    fn is_current(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+    fn check(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), FunctionCallError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            if self.ready.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(FunctionCallError::RespondToModel(
+                    "independent required work remains".into(),
+                ))
+            }
+        })
+    }
+}
+
+async fn settle_goal_update(
+    harness: &GoalExtensionHarness,
+    call: ToolCall,
+) -> Result<Box<dyn codex_extension_api::ToolOutput>, FunctionCallError> {
+    let turn_store = ExtensionData::new(&call.turn_id);
+    let payload = call.payload.clone();
+    let readiness = Arc::new(TestTaskReadiness {
+        ready: AtomicBool::new(true),
+        checks: Default::default(),
+    });
+    let output = tool_by_name(&harness.tools(), "update_goal")
+        .handle_with_task_acceptance(call, readiness.clone())
+        .await?;
+    assert_eq!(
+        output.code_mode_result(&payload)["terminal_update_pending"],
+        true
+    );
+    assert_eq!(
+        readiness.checks.load(Ordering::SeqCst),
+        0,
+        "tools must not wait for settlement"
+    );
+    for contributor in harness.registry.turn_lifecycle_contributors() {
+        if let Some(notice) = contributor
+            .on_turn_settled(TurnStopInput {
+                session_store: &harness.session_store,
+                thread_store: &harness.thread_store,
+                turn_store: &turn_store,
+            })
+            .await
+        {
+            if let Some(result) = notice.strip_prefix(
+                "The staged goal terminal update was accepted after sibling effects settled: ",
+            ) {
+                return Ok(Box::new(codex_extension_api::JsonToolOutput::new(
+                    serde_json::from_str(result).expect("host publishes the committed goal result"),
+                )));
+            }
+            return Err(FunctionCallError::RespondToModel(notice));
+        }
+    }
+    Err(FunctionCallError::RespondToModel(
+        "missing settled goal result".into(),
+    ))
+}
+
+#[tokio::test]
+async fn audit115_goal_terminal_intent_observes_later_sibling_work() -> anyhow::Result<()> {
+    for status in ["complete", "blocked"] {
+        let db = test_runtime().await?;
+        let id = test_thread_id()?;
+        seed_thread_metadata(&db, id).await?;
+        let harness = GoalExtensionHarness::new(db.clone(), id).await?;
+        let create = tool_call(
+            "create_goal",
+            "create",
+            json!({"objective":"finish all independent work"}),
+        );
+        tool_by_name(&harness.tools(), "create_goal")
+            .handle(create)
+            .await?;
+        let readiness = Arc::new(TestTaskReadiness {
+            ready: AtomicBool::new(true),
+            checks: Default::default(),
+        });
+        let call = tool_call(
+            "update_goal",
+            "terminal",
+            json!({"status":status,"goal_ref":goal_ref(&db,id).await?}),
+        );
+        let output = tool_by_name(&harness.tools(), "update_goal")
+            .handle_with_task_acceptance(call.clone(), readiness.clone())
+            .await?;
+        assert_eq!(
+            output.code_mode_result(&call.payload)["terminal_update_pending"],
+            true
+        );
+        assert_eq!(
+            db.thread_goals().get_thread_goal(id).await?.unwrap().status,
+            codex_state::ThreadGoalStatus::Active
+        );
+        assert!(harness.runtime_handle().terminal_transition().is_none());
+        assert_eq!(readiness.checks.load(Ordering::SeqCst), 0);
+        // A sibling invalidates the earlier state before the host settlement.
+        readiness.ready.store(false, Ordering::SeqCst);
+        let turn_store = ExtensionData::new("turn-1");
+        let mut rejected = false;
+        for contributor in harness.registry.turn_lifecycle_contributors() {
+            if let Some(notice) = contributor
+                .on_turn_settled(TurnStopInput {
+                    session_store: &harness.session_store,
+                    thread_store: &harness.thread_store,
+                    turn_store: &turn_store,
+                })
+                .await
+            {
+                rejected |= notice.contains("independent required work remains");
+            }
+        }
+        assert!(rejected);
+        assert_eq!(readiness.checks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            db.thread_goals().get_thread_goal(id).await?.unwrap().status,
+            codex_state::ThreadGoalStatus::Active
+        );
+        assert!(
+            harness.runtime_handle().terminal_transition().is_none(),
+            "rejection must not suppress continuation"
+        );
+        // Once all authorized work is accounted for, the same terminal intent
+        // can commit; a rejected intent is neither cached proof nor a stop.
+        settle_goal_update(&harness, call).await?;
+        assert_eq!(
+            db.thread_goals()
+                .get_thread_goal(id)
+                .await?
+                .unwrap()
+                .status
+                .as_str(),
+            status
+        );
+    }
+    Ok(())
+}
+
 fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         turn_id: "turn-1".to_string(),
@@ -1898,6 +2093,7 @@ fn token_usage(
         output_tokens,
         reasoning_output_tokens,
         total_tokens,
+        coverage: None,
     }
 }
 
@@ -2055,8 +2251,7 @@ async fn terminal_goal_tool_preserves_failed_accounting_debt() -> anyhow::Result
             "finish",
             json!({"status":status, "goal_ref":result["goalRef"]}),
         );
-        let result = tool_by_name(&harness.tools(), "update_goal")
-            .handle(call.clone())
+        let result = settle_goal_update(&harness, call.clone())
             .await?
             .code_mode_result(&call.payload);
         assert_eq!(result["goal"]["status"], status);
@@ -2075,6 +2270,168 @@ async fn terminal_goal_tool_preserves_failed_accounting_debt() -> anyhow::Result
         let goal = db.thread_goals().get_thread_goal(id).await?.unwrap();
         assert_eq!(goal.tokens_used, 23);
         assert_eq!(goal.status.as_str(), status);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_terminal_writes_expose_and_restore_fail_stop_intent() -> anyhow::Result<()> {
+    for stop in ["complete", "blocked", "turn-error", "usage-limit"] {
+        let db = test_runtime().await?;
+        let id = test_thread_id()?;
+        seed_thread_metadata(&db, id).await?;
+        let harness = GoalExtensionHarness::new(db.clone(), id).await?;
+        let create = tool_call(
+            "create_goal",
+            "create",
+            json!({"objective":"finish safely"}),
+        );
+        let result = tool_by_name(&harness.tools(), "create_goal")
+            .handle(create.clone())
+            .await?
+            .code_mode_result(&create.payload);
+        let faults = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(codex_state::goals_db_path(db.codex_home())),
+        )
+        .await?;
+        sqlx::query("CREATE TRIGGER reject_stop BEFORE UPDATE OF status ON thread_goals WHEN OLD.status = 'active' AND NEW.status IN ('complete','blocked','usage_limited') BEGIN SELECT RAISE(ABORT, 'terminal write rejected'); END")
+            .execute(&faults).await?;
+        if stop == "turn-error" {
+            harness
+                .notify_turn_error("turn-1", CodexErrorInfo::Other)
+                .await;
+        } else if stop == "usage-limit" {
+            harness
+                .runtime_handle()
+                .usage_limit_active_goal_for_turn("turn-1")
+                .await
+                .expect_err("injected stop rejection");
+        } else {
+            let call = tool_call(
+                "update_goal",
+                "stop",
+                json!({"status":stop,"goal_ref":result["goalRef"]}),
+            );
+            let error = settle_goal_update(&harness, call)
+                .await
+                .err()
+                .expect("terminal write must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("automatic continuation remains stopped")
+            );
+        }
+        assert_eq!(
+            db.thread_goals().get_thread_goal(id).await?.unwrap().status,
+            codex_state::ThreadGoalStatus::Active
+        );
+        let transition = harness
+            .runtime_handle()
+            .terminal_transition()
+            .expect("stop state must be observable");
+        assert_eq!(
+            transition.outcome,
+            codex_state::GoalTerminalTransitionOutcome::FailedUnconfirmed
+        );
+        assert!(transition.persistence_confirmed);
+        assert!(
+            transition
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("terminal write rejected")
+        );
+        assert_eq!(
+            db.thread_goals().get_terminal_transition(id).await?,
+            Some(transition.clone())
+        );
+        let get = tool_call("get_goal", "inspect", json!({}));
+        let visible = tool_by_name(&harness.tools(), "get_goal")
+            .handle(get.clone())
+            .await?
+            .code_mode_result(&get.payload);
+        assert_eq!(visible["goal"]["status"], "active");
+        assert_eq!(
+            visible["terminalTransition"]["outcome"],
+            "failed_unconfirmed"
+        );
+        // A fresh runtime must not mistake the same Active row for permission
+        // to restart. The stop metadata is restored independently of status.
+        let resumed = GoalExtensionHarness::new(db.clone(), id).await?;
+        resumed.resume_thread().await;
+        assert_eq!(
+            resumed.runtime_handle().terminal_transition(),
+            Some(transition)
+        );
+        // Editing a budget is not authorization to restart an unresolved stop.
+        resumed
+            .goal_service
+            .set_thread_goal(
+                &db,
+                GoalSetRequest {
+                    thread_id: id,
+                    objective: GoalObjectiveUpdate::Keep,
+                    status: None,
+                    token_budget: GoalTokenBudgetUpdate::Set(Some(10000)),
+                },
+            )
+            .await?;
+        assert!(resumed.runtime_handle().terminal_transition().is_some());
+        assert!(
+            db.thread_goals()
+                .get_terminal_transition(id)
+                .await?
+                .is_some()
+        );
+        sqlx::query("DROP TRIGGER reject_stop")
+            .execute(&faults)
+            .await?;
+        if matches!(stop, "complete" | "blocked") {
+            let call = tool_call(
+                "update_goal",
+                "retry",
+                json!({"status":stop,"goal_ref":result["goalRef"]}),
+            );
+            settle_goal_update(&resumed, call).await?;
+            assert_eq!(
+                db.thread_goals()
+                    .get_thread_goal(id)
+                    .await?
+                    .unwrap()
+                    .status
+                    .as_str(),
+                stop
+            );
+            assert_eq!(
+                resumed
+                    .runtime_handle()
+                    .terminal_transition()
+                    .unwrap()
+                    .outcome,
+                codex_state::GoalTerminalTransitionOutcome::ConfirmedTerminal
+            );
+        }
+        resumed
+            .goal_service
+            .set_thread_goal(
+                &db,
+                GoalSetRequest {
+                    thread_id: id,
+                    objective: GoalObjectiveUpdate::Keep,
+                    status: Some(ThreadGoalStatus::Active),
+                    token_budget: GoalTokenBudgetUpdate::Keep,
+                },
+            )
+            .await?;
+        assert!(resumed.runtime_handle().terminal_transition().is_none());
+        assert!(
+            db.thread_goals()
+                .get_terminal_transition(id)
+                .await?
+                .is_none()
+        );
     }
     Ok(())
 }

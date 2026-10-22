@@ -184,8 +184,10 @@ pub struct ReadThreadByRolloutPathParams {
 /// Storage selection policy for local thread listings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadListStorageMode {
-    /// Prefer SQLite for a new listing, falling back to JSONL scan-and-repair only when the
-    /// initial SQLite query is unavailable or fails.
+    /// Prefer SQLite only with proven current source coverage. Without a durable
+    /// coverage watermark, use canonical JSONL scan-and-repair for new listings.
+    /// Existing bound cursors and DB-owned relationship/project filters retain
+    /// their selected backend.
     #[default]
     PreferStateDb,
     /// Require SQLite and surface storage failures to the caller.
@@ -298,6 +300,8 @@ pub enum StoredTurnItemsView {
 /// Store-owned status for a persisted turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StoredTurnStatus {
+    /// Imported history with unknown source completion; not a running turn.
+    Imported,
     /// The turn completed normally.
     Completed,
     /// The turn was interrupted before normal completion.
@@ -414,6 +418,9 @@ pub struct ItemPage {
 pub struct StoredThread {
     /// Thread id.
     pub thread_id: ThreadId,
+    /// Shared session-tree identity, unknown only for legacy or row-only summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     /// Optional extra configuration fields for the thread.
     pub extra_config: Option<ExtraConfig>,
     /// Local rollout path when the backing store is filesystem-based.
@@ -897,7 +904,10 @@ mod tests {
                 first
             );
         }
-        assert_eq!(canonical_history_mode_from_rollout_items(&[]), ThreadHistoryMode::Legacy);
+        assert_eq!(
+            canonical_history_mode_from_rollout_items(&[]),
+            ThreadHistoryMode::Legacy
+        );
     }
 
     #[test]

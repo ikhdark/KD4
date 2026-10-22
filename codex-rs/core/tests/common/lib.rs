@@ -10,6 +10,7 @@ pub use core_test_support_base::*;
 pub mod apps_test_server;
 pub mod context_snapshot;
 pub mod hooks;
+pub mod login_port;
 pub mod process;
 mod session_helpers;
 pub mod test_codex;

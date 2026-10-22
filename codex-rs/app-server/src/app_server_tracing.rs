@@ -63,6 +63,7 @@ pub(crate) fn typed_request_span(
     request: &ClientRequest,
     connection_id: ConnectionId,
     session: &ConnectionSessionState,
+    parent_trace: Option<&W3cTraceContext>,
 ) -> Span {
     let method = request.method();
     let span = app_server_request_span_template(&method, "in-process", request.id(), connection_id);
@@ -78,7 +79,7 @@ pub(crate) fn typed_request_span(
             .or(session.client_version()),
     );
 
-    attach_parent_context(&span, &method, request.id(), /*parent_trace*/ None);
+    attach_parent_context(&span, &method, request.id(), parent_trace);
     span
 }
 
@@ -110,6 +111,11 @@ fn app_server_request_span_template(
         app_server.client_name = field::Empty,
         app_server.client_version = field::Empty,
         turn.id = field::Empty,
+        app_server.outcome = field::Empty,
+        app_server.delivery_outcome = field::Empty,
+        rpc.jsonrpc.error_code = field::Empty,
+        error.type = field::Empty,
+        otel.status_code = field::Empty,
     )
 }
 

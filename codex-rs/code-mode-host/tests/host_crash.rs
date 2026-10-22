@@ -71,7 +71,10 @@ async fn start_live_cell(session: &Arc<dyn CodeModeSession>) -> CellId {
         .expect("start live cell");
     let cell_id = started.cell_id.clone();
     assert!(matches!(
-        started.initial_response().await.expect("live cell response"),
+        started
+            .initial_response()
+            .await
+            .expect("live cell response"),
         RuntimeResponse::ExplicitYield { .. }
     ));
     cell_id
@@ -117,14 +120,20 @@ async fn kill_host(session: &Arc<dyn CodeModeSession>, live_cell: CellId) {
     .await
     .expect("live cell must observe the host exit");
     assert!(
-        !matches!(observed, Ok(WaitOutcome::LiveCell(RuntimeResponse::ExplicitYield { .. }))),
+        !matches!(
+            observed,
+            Ok(WaitOutcome::LiveCell(RuntimeResponse::ExplicitYield { .. }))
+        ),
         "a cell of a killed host cannot still be live: {observed:?}"
     );
 }
 
 fn assert_replacement_notice(error: &str) {
     for expected in ["runtime was replaced", "lost", "did not run", "persist"] {
-        assert!(error.contains(expected), "missing `{expected}` in notice: {error}");
+        assert!(
+            error.contains(expected),
+            "missing `{expected}` in notice: {error}"
+        );
     }
 }
 
@@ -139,7 +148,10 @@ async fn killed_host_reports_lost_state_before_running_more_code() {
         .create_session(Arc::new(NoopCodeModeSessionDelegate))
         .await
         .expect("create session");
-    assert_eq!(run(&session, r#"store("memory", 2); text("stored");"#, None).await, Ok("stored".to_string()));
+    assert_eq!(
+        run(&session, r#"store("memory", 2); text("stored");"#, None).await,
+        Ok("stored".to_string())
+    );
     let live = start_live_cell(&session).await;
     kill_host(&session, live).await;
     let first = run(&session, r#"text(String(load("memory")));"#, None).await;
@@ -162,15 +174,30 @@ async fn killed_host_reports_lost_state_before_running_more_code() {
         .await
         .expect("create session");
     assert_eq!(
-        run(&session, r#"store("durable", 1); text("stored");"#, Some(&state_path)).await,
+        run(
+            &session,
+            r#"store("durable", 1); text("stored");"#,
+            Some(&state_path)
+        )
+        .await,
         Ok("stored".to_string())
     );
     let live = start_live_cell(&session).await;
     kill_host(&session, live).await;
-    let first = run(&session, r#"text(String(load("durable")));"#, Some(&state_path)).await;
+    let first = run(
+        &session,
+        r#"text(String(load("durable")));"#,
+        Some(&state_path),
+    )
+    .await;
     assert_replacement_notice(&first.expect_err("the first cell after a replacement must not run"));
     assert_eq!(
-        run(&session, r#"text(String(load("durable")));"#, Some(&state_path)).await,
+        run(
+            &session,
+            r#"text(String(load("durable")));"#,
+            Some(&state_path)
+        )
+        .await,
         Ok("1".to_string()),
         "persisted values return with the next persist cell"
     );

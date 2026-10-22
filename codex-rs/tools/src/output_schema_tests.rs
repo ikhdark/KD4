@@ -85,11 +85,20 @@ fn lazy_schema_equality_is_transitive_across_materialization() {
                 "type": types,
                 "required": required,
                 "default": default,
-            })).unwrap(),
+            }))
+            .unwrap(),
         )))
     };
-    let left = schema(serde_json::json!(["b", "a"]), serde_json::json!(["object", "null"]), serde_json::json!([1, 2]));
-    let right = schema(serde_json::json!(["a", "b"]), serde_json::json!(["null", "object"]), serde_json::json!([1, 2]));
+    let left = schema(
+        serde_json::json!(["b", "a"]),
+        serde_json::json!(["object", "null"]),
+        serde_json::json!([1, 2]),
+    );
+    let right = schema(
+        serde_json::json!(["a", "b"]),
+        serde_json::json!(["null", "object"]),
+        serde_json::json!([1, 2]),
+    );
     let materialized = ToolOutputSchema::from(left.to_value());
 
     // PartialEq requires transitivity; set keyword order cannot make two
@@ -100,7 +109,11 @@ fn lazy_schema_equality_is_transitive_across_materialization() {
     assert_eq!(right, left);
 
     // Literal arrays are ordered data, not schema keyword sets.
-    let different = schema(serde_json::json!(["a", "b"]), serde_json::json!(["null", "object"]), serde_json::json!([2, 1]));
+    let different = schema(
+        serde_json::json!(["a", "b"]),
+        serde_json::json!(["null", "object"]),
+        serde_json::json!([2, 1]),
+    );
     assert_ne!(left, different);
     assert_ne!(materialized, different);
 }

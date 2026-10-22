@@ -112,7 +112,13 @@ mod tests {
             let command = vec_str(&["fd", ".", option, "touch", "marker"]);
             let script = shlex_join(&command);
             for command in [command, vec_str(&["bash", "-lc", &script])] {
-                assert!(matches!(parse_command(&command).as_slice(), [ParsedCommand::Unknown { .. }]), "{command:?}");
+                assert!(
+                    matches!(
+                        parse_command(&command).as_slice(),
+                        [ParsedCommand::Unknown { .. }]
+                    ),
+                    "{command:?}"
+                );
             }
         }
     }
@@ -497,7 +503,10 @@ mod tests {
                 vec_str(&["zsh", "-lc", source]),
             ] {
                 assert!(
-                    matches!(parse_command(&command).as_slice(), [ParsedCommand::Unknown { .. }]),
+                    matches!(
+                        parse_command(&command).as_slice(),
+                        [ParsedCommand::Unknown { .. }]
+                    ),
                     "ambiguous cwd must not be summarized as a file read: {command:?}"
                 );
             }
@@ -1549,7 +1558,9 @@ pub(crate) fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
 
 fn sed_read_path(tokens: &[String]) -> Option<String> {
     let (path, formatter) = tokens.split_last()?;
-    let formatter = formatter.strip_suffix(&["--".to_string()]).unwrap_or(formatter);
+    let formatter = formatter
+        .strip_suffix(&["--".to_string()])
+        .unwrap_or(formatter);
     (formatter.len() >= 3 && !path.starts_with('-') && is_small_sed_formatter(formatter))
         .then(|| path.clone())
 }
@@ -2195,7 +2206,9 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             || (matches!(head.as_str(), "rg" | "rga" | "ripgrep-all")
                 && !crate::command_safety::is_safe_command::is_safe_ripgrep(main_cmd)))
     {
-        return ParsedCommand::Unknown { cmd: shlex_join(main_cmd) };
+        return ParsedCommand::Unknown {
+            cmd: shlex_join(main_cmd),
+        };
     }
     match main_cmd.split_first() {
         Some((head, tail)) if matches!(head.as_str(), "ls" | "eza" | "exa") => {
@@ -2315,15 +2328,21 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             },
         },
         Some((head, tail)) if head == "fd" => {
-            if tail.iter().take_while(|arg| arg.as_str() != "--").any(|arg| {
-                matches!(arg.as_str(), "-x" | "--exec" | "-X" | "--exec-batch")
-                    || arg.starts_with("--exec=")
-                    || arg.starts_with("--exec-batch=")
-                    || (arg.starts_with('-')
-                        && !arg.starts_with("--")
-                        && (arg.contains('x') || arg.contains('X')))
-            }) {
-                return ParsedCommand::Unknown { cmd: shlex_join(main_cmd) };
+            if tail
+                .iter()
+                .take_while(|arg| arg.as_str() != "--")
+                .any(|arg| {
+                    matches!(arg.as_str(), "-x" | "--exec" | "-X" | "--exec-batch")
+                        || arg.starts_with("--exec=")
+                        || arg.starts_with("--exec-batch=")
+                        || (arg.starts_with('-')
+                            && !arg.starts_with("--")
+                            && (arg.contains('x') || arg.contains('X')))
+                })
+            {
+                return ParsedCommand::Unknown {
+                    cmd: shlex_join(main_cmd),
+                };
             }
             let (query, path) = parse_fd_query_and_path(tail);
             if query.is_some() {

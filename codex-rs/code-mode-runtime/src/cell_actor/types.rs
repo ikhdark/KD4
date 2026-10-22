@@ -25,6 +25,7 @@ pub(crate) enum CellError {
     Busy,
     AlreadyTerminating,
     Closed,
+    CleanupFailed,
 }
 
 pub(crate) struct CellToolCall {
@@ -66,7 +67,7 @@ pub(crate) trait CellHost: Send + Sync + 'static {
         cell_state: Arc<CellState>,
     ) -> impl Future<Output = CompletionCommit> + Send;
 
-    fn closed(&self, event: Option<CellEvent>) -> impl Future<Output = ()> + Send;
+    fn closed(&self, event: Option<CellEvent>) -> impl Future<Output = Option<CellEvent>> + Send;
 }
 
 #[derive(Clone)]
@@ -85,7 +86,10 @@ impl CellHandle {
 
     pub(crate) fn observe(&self, mode: ObserveMode) -> CellEventFuture {
         if !self.state.accepting_observations() {
-            return self.state.terminal_event().map_or_else(closed_event, ready_event);
+            return self
+                .state
+                .terminal_event()
+                .map_or_else(closed_event, ready_event);
         }
         let (response_tx, response_rx) = oneshot::channel();
         if self
@@ -93,7 +97,10 @@ impl CellHandle {
             .send(CellCommand::Observe { mode, response_tx })
             .is_err()
         {
-            return self.state.terminal_event().map_or_else(closed_event, ready_event);
+            return self
+                .state
+                .terminal_event()
+                .map_or_else(closed_event, ready_event);
         }
         let state = Arc::clone(&self.state);
         Box::pin(async move {
@@ -106,12 +113,22 @@ impl CellHandle {
 
     pub(crate) fn terminate(&self) -> CellEventFuture {
         let event = self.state.request_termination();
-        let closed = self.state.closed.clone();
+        let state = Arc::clone(&self.state);
         Box::pin(async move {
             let event = event.await?;
             // Termination is not complete until the host releases session resources.
-            closed.cancelled().await;
-            Ok(event)
+            state.closed.cancelled().await;
+            if state
+                .close_failed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(CellError::CleanupFailed);
+            }
+            Ok(if matches!(event, CellEvent::Terminated { .. }) {
+                state.terminal_event().unwrap_or(event)
+            } else {
+                event
+            })
         })
     }
 }
@@ -130,6 +147,7 @@ pub(crate) struct CellState {
     terminal_event: Mutex<Option<CellEvent>>,
     cancellation_token: CancellationToken,
     closed: CancellationToken,
+    close_failed: std::sync::atomic::AtomicBool,
 }
 
 enum CellPhase {
@@ -173,6 +191,7 @@ impl CellState {
             terminal_event: Mutex::new(None),
             cancellation_token,
             closed: CancellationToken::new(),
+            close_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -303,7 +322,10 @@ impl CellState {
     /// Refine a receipt after owned I/O, but never rewrite a terminal outcome
     /// already claimed by termination or delivered to an observer.
     pub(crate) fn update_unclaimed_completion(&self, completed: CellEvent) {
-        let mut phase = self.phase.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut phase = self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let CellPhase::Completed { event, .. } = &mut *phase {
             *event = completed;
         }
@@ -456,6 +478,24 @@ impl CellState {
 
     pub(crate) fn mark_closed(&self) {
         self.closed.cancel();
+    }
+
+    pub(crate) fn mark_close_failed(&self) {
+        self.close_failed
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Drop any still-pending termination sender as well as waking callers
+        // that already received their terminal event before actor failure.
+        self.tombstone();
+        self.closed.cancel();
+    }
+
+    pub(crate) fn finalize_termination_receipt(&self, event: Option<CellEvent>) {
+        if let Some(event @ CellEvent::Terminated { .. }) = event {
+            *self
+                .terminal_event
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+        }
     }
 }
 

@@ -32,9 +32,14 @@ impl StateRuntime {
         let mut query = project_list_query(cursor, limit, sort_key, sort_direction)?;
         let rows = query.build().fetch_all(self.pool.as_ref()).await?;
         let mut projects: Vec<Project> = Vec::new();
+        let mut has_more = false;
         for row in rows {
             let id: String = row.try_get("id")?;
             if projects.last().is_none_or(|project| project.id != id) {
+                if projects.len() == limit {
+                    has_more = true;
+                    break;
+                }
                 projects.push(project_from_row(&row, Vec::new())?);
             }
             if let Some(path) = row.try_get::<Option<String>, _>("root_path")? {
@@ -44,9 +49,8 @@ impl StateRuntime {
                 project.roots.push(ProjectRoot { path });
             }
         }
-        let next_cursor = (projects.len() > limit)
-            .then(|| project_cursor(&projects[limit - 1], sort_key, sort_direction));
-        projects.truncate(limit);
+        let next_cursor =
+            has_more.then(|| project_cursor(&projects[limit - 1], sort_key, sort_direction));
         Ok(ProjectsPage {
             projects,
             next_cursor,
@@ -220,11 +224,13 @@ impl StateRuntime {
         before_project_id: Option<&str>,
     ) -> anyhow::Result<Option<bool>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let mut project_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM projects ORDER BY position ASC, id ASC",
+        let stored_positions = sqlx::query_as::<_, (String, i64)>(
+            "SELECT id, position FROM projects ORDER BY position ASC, id ASC",
         )
         .fetch_all(&mut *tx)
         .await?;
+        let mut project_ids: Vec<_> = stored_positions.iter().map(|(id, _)| id.clone()).collect();
+        let stored_positions: BTreeMap<_, _> = stored_positions.into_iter().collect();
         let Some(current_index) = project_ids.iter().position(|id| id == project_id) else {
             tx.rollback().await?;
             return Ok(None);
@@ -249,6 +255,9 @@ impl StateRuntime {
             return Ok(Some(false));
         }
         for (position, id) in project_ids.iter().enumerate() {
+            if stored_positions.get(id) == Some(&(position as i64)) {
+                continue;
+            }
             sqlx::query("UPDATE projects SET position = ? WHERE id = ?")
                 .bind(position as i64)
                 .bind(id)

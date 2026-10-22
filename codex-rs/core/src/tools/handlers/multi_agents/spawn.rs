@@ -75,7 +75,7 @@ async fn handle_spawn_agent(
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
-    let mut config = build_agent_spawn_config(turn.as_ref())?;
+    let mut config = build_agent_spawn_config_for_step(&step_context)?;
     let parent_service_tier = inherit_live_service_tier(&session, &mut config).await;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
@@ -112,6 +112,13 @@ async fn handle_spawn_agent(
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), role_locks)?;
+    if let Some(cwd) = step_context
+        .environments
+        .primary()
+        .and_then(|primary| primary.cwd().to_abs_path().ok())
+    {
+        config.cwd = cwd;
+    }
     let resolved_model = config.model.clone().unwrap_or_default();
     let resolved_reasoning_effort = config.model_reasoning_effort.clone().unwrap_or_default();
 
@@ -147,7 +154,8 @@ async fn handle_spawn_agent(
             fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
             fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
             parent_thread_id: Some(session.thread_id),
-            environments: Some(turn.environments.to_selections()),
+            environments: Some(step_context.environments.to_selections()),
+            captured_environments: Some(step_context.environments.clone()),
             ..Default::default()
         },
     ))

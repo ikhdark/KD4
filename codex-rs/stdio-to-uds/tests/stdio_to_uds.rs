@@ -23,6 +23,52 @@ async fn stdin_eof_half_closes_socket_before_reading_response() -> anyhow::Resul
     assert_socket_relay(/*wait_for_client_eof*/ true).await
 }
 
+#[tokio::test]
+async fn peer_close_exits_process_with_parent_stdin_still_open() -> anyhow::Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let path = dir.path().join("socket");
+    let mut listener = UnixListener::bind(&path).await?;
+    let server = tokio::spawn(async move {
+        let mut stream = listener.accept().await?;
+        stream.write_all(b"final bytes before stdin closes").await?;
+        anyhow::Ok(())
+    });
+    let child = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut child = Command::new(codex_utils_cargo_bin::cargo_bin("codex-stdio-to-uds")?)
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let held_stdin = child.stdin.take().context("child stdin")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("peer EOF must end the process without releasing parent stdin");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut output = Vec::new();
+        child
+            .stdout
+            .take()
+            .context("child stdout")?
+            .read_to_end(&mut output)?;
+        drop(held_stdin);
+        Ok((status, output))
+    });
+    let (status, output) = child.await??;
+    assert!(status.success());
+    assert_eq!(output, b"final bytes before stdin closes");
+    server.await??;
+    Ok(())
+}
+
 async fn assert_socket_relay(wait_for_client_eof: bool) -> anyhow::Result<()> {
     // Keep both peer behaviors: responding immediately after the request and
     // waiting for EOF before responding. The latter must not deadlock when the

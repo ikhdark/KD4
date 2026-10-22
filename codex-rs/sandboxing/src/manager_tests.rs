@@ -110,10 +110,6 @@ fn sandbox_selection_respects_policy_preference_and_backend_availability() {
     }
 }
 
-
-
-
-
 #[test]
 fn unsandboxed_transform_preserves_foreign_cwd_and_unrestricted_file_system_policy() {
     let cwd_uri = PathUri::parse("file:///workspace/remote").expect("POSIX path URI");
@@ -487,8 +483,6 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
         b"helper"
     );
 }
-
-
 
 #[test]
 fn restricted_token_accepts_native_writable_roots_without_legacy_cwd() {

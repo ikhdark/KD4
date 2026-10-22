@@ -15,6 +15,7 @@ use crate::protocol::FS_CANONICALIZE_METHOD;
 use crate::protocol::FS_COPY_METHOD;
 use crate::protocol::FS_CREATE_DIRECTORY_METHOD;
 use crate::protocol::FS_GET_METADATA_METHOD;
+use crate::protocol::FS_MUTATE_FILE_IF_MATCHES_METHOD;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_READ_FILE_BOUNDED_METHOD;
 use crate::protocol::FS_READ_FILE_METHOD;
@@ -29,6 +30,8 @@ use crate::protocol::FsCreateDirectoryParams;
 use crate::protocol::FsCreateDirectoryResponse;
 use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsGetMetadataResponse;
+use crate::protocol::FsMutateFileIfMatchesParams;
+use crate::protocol::FsMutateFileIfMatchesResponse;
 use crate::protocol::FsReadDirectoryEntry;
 use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadDirectoryResponse;
@@ -70,8 +73,13 @@ pub(crate) struct FsHelperReadDirectoryBoundedResponse {
 pub(crate) enum FsHelperRequest {
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileParams),
+    // A distinct operation makes older helpers refuse rather than ignore the cap.
+    #[serde(rename = "fs/readFileCapped")]
+    ReadFileCapped { path: PathUri, max_bytes: usize },
     #[serde(rename = "fs/readFileBounded")]
     ReadFileBounded(FsReadFileBoundedParams),
+    #[serde(rename = "fs/readFileBoundedWithSource")]
+    ReadFileBoundedWithSource(FsReadFileBoundedParams),
     #[serde(rename = "fs/writeFile")]
     WriteFile(FsWriteFileParams),
     #[serde(rename = "fs/createDirectory")]
@@ -90,6 +98,8 @@ pub(crate) enum FsHelperRequest {
     Remove(FsRemoveParams),
     #[serde(rename = "fs/copy")]
     Copy(FsCopyParams),
+    #[serde(rename = "fs/mutateFileIfMatches")]
+    MutateFileIfMatches(FsMutateFileIfMatchesParams),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +116,11 @@ pub(crate) enum FsHelperPayload {
     ReadFile(FsReadFileResponse),
     #[serde(rename = "fs/readFileBounded")]
     ReadFileBounded(FsReadFileBoundedResponse),
+    #[serde(rename = "fs/readFileBoundedWithSource")]
+    ReadFileBoundedWithSource {
+        data_base64: Option<String>,
+        source: Option<std::path::PathBuf>,
+    },
     #[serde(rename = "fs/writeFile")]
     WriteFile(FsWriteFileResponse),
     #[serde(rename = "fs/createDirectory")]
@@ -124,6 +139,8 @@ pub(crate) enum FsHelperPayload {
     Remove(FsRemoveResponse),
     #[serde(rename = "fs/copy")]
     Copy(FsCopyResponse),
+    #[serde(rename = "fs/mutateFileIfMatches")]
+    MutateFileIfMatches(FsMutateFileIfMatchesResponse),
 }
 
 impl FsHelperPayload {
@@ -131,6 +148,7 @@ impl FsHelperPayload {
         match self {
             Self::ReadFile(_) => FS_READ_FILE_METHOD,
             Self::ReadFileBounded(_) => FS_READ_FILE_BOUNDED_METHOD,
+            Self::ReadFileBoundedWithSource { .. } => "fs/readFileBoundedWithSource",
             Self::WriteFile(_) => FS_WRITE_FILE_METHOD,
             Self::CreateDirectory(_) => FS_CREATE_DIRECTORY_METHOD,
             Self::GetMetadata(_) => FS_GET_METADATA_METHOD,
@@ -140,6 +158,7 @@ impl FsHelperPayload {
             Self::Walk(_) => FS_WALK_METHOD,
             Self::Remove(_) => FS_REMOVE_METHOD,
             Self::Copy(_) => FS_COPY_METHOD,
+            Self::MutateFileIfMatches(_) => FS_MUTATE_FILE_IF_MATCHES_METHOD,
         }
     }
 
@@ -157,6 +176,21 @@ impl FsHelperPayload {
             Self::ReadFileBounded(response) => Ok(response),
             other => Err(unexpected_response(
                 FS_READ_FILE_BOUNDED_METHOD,
+                other.operation(),
+            )),
+        }
+    }
+
+    pub(crate) fn expect_read_file_bounded_with_source(
+        self,
+    ) -> Result<(Option<String>, Option<std::path::PathBuf>), JSONRPCErrorError> {
+        match self {
+            Self::ReadFileBoundedWithSource {
+                data_base64,
+                source,
+            } => Ok((data_base64, source)),
+            other => Err(unexpected_response(
+                "fs/readFileBoundedWithSource",
                 other.operation(),
             )),
         }
@@ -245,6 +279,41 @@ impl FsHelperPayload {
             other => Err(unexpected_response(FS_COPY_METHOD, other.operation())),
         }
     }
+
+    pub(crate) fn expect_mutate_file_if_matches(
+        self,
+    ) -> Result<FsMutateFileIfMatchesResponse, JSONRPCErrorError> {
+        match self {
+            Self::MutateFileIfMatches(response) => Ok(response),
+            other => Err(unexpected_response(
+                FS_MUTATE_FILE_IF_MATCHES_METHOD,
+                other.operation(),
+            )),
+        }
+    }
+}
+
+/// Decoded expected preimage and replacement bytes of a conditional mutation.
+type MutationPayloads = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Decodes the optional preimage and replacement of a conditional mutation.
+pub(crate) fn decode_mutation_payloads(
+    expected_base64: Option<String>,
+    replacement_base64: Option<String>,
+) -> Result<MutationPayloads, JSONRPCErrorError> {
+    let decode = |field: &str, data: Option<String>| {
+        data.map(|data| STANDARD.decode(data))
+            .transpose()
+            .map_err(|err| {
+                invalid_request(format!(
+                    "{FS_MUTATE_FILE_IF_MATCHES_METHOD} requires valid base64 {field}: {err}"
+                ))
+            })
+    };
+    Ok((
+        decode("expectedBase64", expected_base64)?,
+        decode("replacementBase64", replacement_base64)?,
+    ))
 }
 
 fn unexpected_response(expected: &str, actual: &str) -> JSONRPCErrorError {
@@ -258,6 +327,15 @@ pub(crate) async fn run_direct_request(
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
     let file_system = DirectFileSystem;
     match request {
+        FsHelperRequest::ReadFileCapped { path, max_bytes } => {
+            let data = file_system
+                .read_file_capped(&path, max_bytes, None)
+                .await
+                .map_err(map_fs_error)?;
+            Ok(FsHelperPayload::ReadFile(FsReadFileResponse {
+                data_base64: STANDARD.encode(data),
+            }))
+        }
         FsHelperRequest::ReadFile(params) => {
             let data = file_system
                 .read_file(&params.path, /*sandbox*/ None)
@@ -288,6 +366,24 @@ pub(crate) async fn run_direct_request(
                     data_base64: data.map(|data| STANDARD.encode(data)),
                 },
             ))
+        }
+        FsHelperRequest::ReadFileBoundedWithSource(params) => {
+            if params.confined_root.is_some() {
+                return Err(invalid_request(
+                    "source acquisition does not accept confinedRoot".to_string(),
+                ));
+            }
+            let read = file_system
+                .read_file_bounded_with_source(&params.path, params.max_bytes, None)
+                .await
+                .map_err(map_fs_error)?;
+            let (data_base64, source) = read.map_or((None, None), |(bytes, source)| {
+                (Some(STANDARD.encode(bytes)), source)
+            });
+            Ok(FsHelperPayload::ReadFileBoundedWithSource {
+                data_base64,
+                source,
+            })
         }
         FsHelperRequest::WriteFile(params) => {
             let bytes = STANDARD.decode(params.data_base64).map_err(|err| {
@@ -322,6 +418,15 @@ pub(crate) async fn run_direct_request(
                 .await
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::GetMetadata(FsGetMetadataResponse {
+                directory_case_sensitive: if params.include_directory_case_sensitivity == Some(true)
+                {
+                    file_system
+                        .directory_case_sensitive(&params.path, None)
+                        .await
+                        .map_err(map_fs_error)?
+                } else {
+                    None
+                },
                 is_directory: metadata.is_directory,
                 is_file: metadata.is_file,
                 is_symlink: metadata.is_symlink,
@@ -412,11 +517,24 @@ pub(crate) async fn run_direct_request(
                 .map_err(map_fs_error)?;
             Ok(FsHelperPayload::Copy(FsCopyResponse {}))
         }
+        FsHelperRequest::MutateFileIfMatches(params) => {
+            let (expected, replacement) =
+                decode_mutation_payloads(params.expected_base64, params.replacement_base64)?;
+            let outcome = file_system
+                .mutate_file_if_matches(&params.path, expected, replacement, /*sandbox*/ None)
+                .await
+                .map_err(map_fs_error)?;
+            Ok(FsHelperPayload::MutateFileIfMatches(
+                FsMutateFileIfMatchesResponse {
+                    outcome: outcome.into(),
+                },
+            ))
+        }
     }
 }
 
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
-    match err.kind() {
+    let mut error = match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
         io::ErrorKind::InvalidInput => invalid_request(err.to_string()),
         io::ErrorKind::PermissionDenied => JSONRPCErrorError {
@@ -425,6 +543,44 @@ fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
             message: err.to_string(),
         },
         _ => internal_error(err.to_string()),
+    };
+    let mut data = codex_exec_server_protocol::file_system_error_data(err.kind());
+    // `CopyFailure` holds only integers, booleans and strings, so it serializes;
+    // the error message already carries the same recovery text regardless.
+    if let Some(copy) = codex_file_system::CopyFailure::from_io_error(&err)
+        && let Ok(copy) = serde_json::to_value(copy)
+    {
+        data["copy"] = copy;
+    }
+    error.data = Some(data);
+    error
+}
+
+#[cfg(test)]
+mod filesystem_error_tests {
+    use super::*;
+
+    #[test]
+    fn helper_preserves_native_error_categories() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::NotADirectory,
+            io::ErrorKind::IsADirectory,
+            io::ErrorKind::DirectoryNotEmpty,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            let error = map_fs_error(io::Error::new(kind, "native failure"));
+            assert_eq!(
+                codex_exec_server_protocol::file_system_error_kind(error.data.as_ref()),
+                Some(kind)
+            );
+            assert_eq!(error.message, "native failure");
+        }
     }
 }
 
@@ -493,6 +649,56 @@ mod tests {
             assert!(response_path.starts_with("file:"));
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn helper_mutates_only_a_matching_preimage() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let file = directory.path().join("file.txt");
+        std::fs::write(&file, b"old")?;
+        let path = PathUri::from_host_native_path(file.clone()).expect("path URI");
+        // Sandboxed callers reach the helper only through this wire format.
+        let mutate = |expected: &[u8], replacement: Option<&[u8]>| {
+            let request = FsHelperRequest::MutateFileIfMatches(FsMutateFileIfMatchesParams {
+                path: path.clone(),
+                expected_base64: Some(STANDARD.encode(expected)),
+                replacement_base64: replacement.map(|bytes| STANDARD.encode(bytes)),
+                sandbox: None,
+            });
+            let wire = serde_json::to_value(request).expect("serialize request");
+            let request: FsHelperRequest = serde_json::from_value(wire).expect("parse request");
+            async move {
+                let payload = run_direct_request(request).await.expect("helper request");
+                let wire = serde_json::to_value(FsHelperResponse::Ok(payload))
+                    .expect("serialize response");
+                let FsHelperResponse::Ok(payload) =
+                    serde_json::from_value(wire).expect("parse response")
+                else {
+                    panic!("helper response should succeed");
+                };
+                payload
+                    .expect_mutate_file_if_matches()
+                    .expect("mutation outcome")
+                    .outcome
+            }
+        };
+
+        assert_eq!(
+            mutate(b"stale", Some(b"new")).await,
+            crate::protocol::FsFileMutationOutcome::Conflict
+        );
+        assert_eq!(std::fs::read(&file)?, b"old");
+        assert_eq!(
+            mutate(b"old", Some(b"new")).await,
+            crate::protocol::FsFileMutationOutcome::Committed
+        );
+        assert_eq!(std::fs::read(&file)?, b"new");
+        assert_eq!(
+            mutate(b"new", None).await,
+            crate::protocol::FsFileMutationOutcome::Committed
+        );
+        assert!(!file.exists());
         Ok(())
     }
 }

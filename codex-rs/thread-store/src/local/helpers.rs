@@ -239,6 +239,7 @@ pub(super) fn stored_thread_from_rollout_item(
     Some(StoredThread {
         project_id: None,
         thread_id,
+        session_id: None,
         extra_config: None,
         rollout_path: Some(rollout_path),
         forked_from_id: None,

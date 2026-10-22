@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
@@ -12,10 +14,16 @@ async fn exec_uses_codex_api_key_env_var() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let repo_root = codex_utils_cargo_bin::repo_root()?;
 
+    // Deliver a final answer: an answerless response would trigger the single
+    // missing-answer repair request, which this once-only mock does not serve.
     mount_sse_once_match(
         &server,
         header("Authorization", "Bearer dummy"),
-        sse(vec![ev_completed("request_0")]),
+        sse(vec![
+            ev_response_created("request_0"),
+            ev_assistant_message("msg_0", "api key accepted"),
+            ev_completed("request_0"),
+        ]),
     )
     .await;
 

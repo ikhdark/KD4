@@ -14,7 +14,6 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
-use crate::session_prefix::inter_agent_completion_communication;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
@@ -87,6 +86,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) captured_environments: Option<TurnEnvironmentSnapshot>,
     pub(crate) typed_task_binding: Option<codex_agent_task_store::AgentTaskBindingDraft>,
     pub(crate) agent_job_binding: Option<AgentJobBinding>,
 }
@@ -99,8 +99,9 @@ pub(crate) struct LiveAgent {
 }
 
 /// Model usage for one thread, separated by token class.
-#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct ThreadUsageTotals {
+    pub(crate) coverage: Option<codex_protocol::protocol::TokenUsageCoverage>,
     pub(crate) input_tokens: u64,
     pub(crate) cached_input_tokens: u64,
     pub(crate) output_tokens: u64,
@@ -108,27 +109,47 @@ pub(crate) struct ThreadUsageTotals {
     pub(crate) total_tokens: u64,
 }
 
+impl Default for ThreadUsageTotals {
+    fn default() -> Self {
+        Self {
+            coverage: codex_protocol::protocol::TokenUsage::empty_ledger().coverage,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+        }
+    }
+}
+
 impl ThreadUsageTotals {
     fn accumulate(&mut self, usage: &codex_protocol::protocol::TokenUsage) {
-        self.input_tokens = self
-            .input_tokens
-            .saturating_add(usage.input_tokens.max(0) as u64);
-        self.cached_input_tokens = self
-            .cached_input_tokens
-            .saturating_add(usage.cached_input_tokens.max(0) as u64);
-        self.output_tokens = self
-            .output_tokens
-            .saturating_add(usage.output_tokens.max(0) as u64);
-        self.reasoning_output_tokens = self
-            .reasoning_output_tokens
-            .saturating_add(usage.reasoning_output_tokens.max(0) as u64);
-        self.total_tokens = self
-            .total_tokens
-            .saturating_add(usage.total_tokens.max(0) as u64);
+        *self = self.checked_sum(Self {
+            coverage: usage.coverage,
+            input_tokens: usage.input_tokens.max(0) as u64,
+            cached_input_tokens: usage.cached_input_tokens.max(0) as u64,
+            output_tokens: usage.output_tokens.max(0) as u64,
+            reasoning_output_tokens: usage.reasoning_output_tokens.max(0) as u64,
+            total_tokens: usage.total_tokens.max(0) as u64,
+        });
     }
 
     fn checked_sum(self, other: Self) -> Self {
+        let coverage = self.coverage.zip(other.coverage).map(|(mut left, right)| {
+            left.add_assign(&right);
+            left.saturated |= [
+                (self.input_tokens, other.input_tokens),
+                (self.cached_input_tokens, other.cached_input_tokens),
+                (self.output_tokens, other.output_tokens),
+                (self.reasoning_output_tokens, other.reasoning_output_tokens),
+                (self.total_tokens, other.total_tokens),
+            ]
+            .into_iter()
+            .any(|(left, right)| left.checked_add(right).is_none());
+            left
+        });
         Self {
+            coverage,
             input_tokens: self.input_tokens.saturating_add(other.input_tokens),
             cached_input_tokens: self
                 .cached_input_tokens
@@ -139,6 +160,42 @@ impl ThreadUsageTotals {
                 .saturating_add(other.reasoning_output_tokens),
             total_tokens: self.total_tokens.saturating_add(other.total_tokens),
         }
+    }
+
+    pub(crate) fn known_classes(self) -> [(&'static str, Option<u64>); 5] {
+        let known = |value, reported| {
+            self.coverage.and_then(|coverage| {
+                (!coverage.saturated && reported == Some(coverage.receipts)).then_some(value)
+            })
+        };
+        [
+            (
+                "input",
+                known(self.input_tokens, self.coverage.map(|c| c.input_tokens)),
+            ),
+            (
+                "cached_input",
+                known(
+                    self.cached_input_tokens,
+                    self.coverage.map(|c| c.cached_input_tokens),
+                ),
+            ),
+            (
+                "output",
+                known(self.output_tokens, self.coverage.map(|c| c.output_tokens)),
+            ),
+            (
+                "reasoning_output",
+                known(
+                    self.reasoning_output_tokens,
+                    self.coverage.map(|c| c.reasoning_output_tokens),
+                ),
+            ),
+            (
+                "total",
+                known(self.total_tokens, self.coverage.map(|c| c.total_tokens)),
+            ),
+        ]
     }
 }
 
@@ -270,6 +327,8 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
+    /// Captured before child startup can suspend; never follows a later parent grant.
+    pub(crate) inherited_validation_task_scope: Option<(String, String)>,
     #[cfg(test)]
     test_hooks: Arc<AgentControlTestHooks>,
 }
@@ -281,6 +340,10 @@ impl AgentControl {
             manager,
             ..Default::default()
         }
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<AgentRegistry> {
+        &self.state
     }
 
     pub(crate) fn model_http_clients(&self) -> Option<Arc<crate::client::SharedModelHttpClients>> {
@@ -446,6 +509,18 @@ impl AgentControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
     }
 
+    /// Registers an already-running thread as one of this tree's agents, as a
+    /// committed spawn would, without starting a turn on it.
+    #[cfg(test)]
+    pub(crate) fn register_running_agent_for_test(&self, thread_id: ThreadId) -> CodexResult<()> {
+        self.state
+            .reserve_spawn_slot(/*max_threads*/ None)?
+            .commit(AgentMetadata {
+                agent_id: Some(thread_id),
+                ..Default::default()
+            })
+    }
+
     /// Wait for the actual child loop before retiring its accounting identity.
     pub(crate) async fn wait_for_agent_termination(&self, agent_id: ThreadId) -> CodexResult<()> {
         let state = self.upgrade()?;
@@ -549,6 +624,21 @@ impl AgentControl {
         .await
     }
 
+    pub(crate) fn retained_input_queue(
+        &self,
+        id: ThreadId,
+    ) -> Option<Arc<crate::session::InputQueue>> {
+        self.state.retained_input_queue(id)
+    }
+
+    pub(crate) fn remember_input_queue(
+        &self,
+        id: ThreadId,
+        queue: Arc<crate::session::InputQueue>,
+    ) {
+        self.state.remember_input_queue(id, queue);
+    }
+
     async fn submit_inter_agent_communication(
         &self,
         agent_id: ThreadId,
@@ -560,8 +650,15 @@ impl AgentControl {
         let last_task_message = last_task_message_from_communication(&communication);
         let communication_log_metadata = crate::agent_communication::logging_enabled()
             .then(|| crate::agent_communication::agent_communication_log_metadata(&communication));
-        let result = self
-            .handle_thread_request_result(
+        let queue = (!communication.trigger_turn)
+            .then(|| self.state.input_queue_for_delivery(agent_id))
+            .flatten();
+        let result = if let Some(queue) = queue {
+            state
+                .enqueue_queue_only_communication(agent_id, &queue, communication)
+                .await
+        } else {
+            self.handle_thread_request_result(
                 agent_id,
                 state,
                 state
@@ -572,7 +669,8 @@ impl AgentControl {
                     )
                     .await,
             )
-            .await;
+            .await
+        };
         if let (Some(metadata), Ok(communication_id)) =
             (communication_log_metadata, result.as_ref())
         {
@@ -600,7 +698,7 @@ impl AgentControl {
         self.handle_thread_request_result(
             agent_id,
             &state,
-            state.send_op(agent_id, Op::Interrupt).await,
+            state.send_op_with_instance(agent_id, Op::Interrupt).await,
         )
         .await
     }
@@ -609,12 +707,22 @@ impl AgentControl {
         &self,
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
-        result: CodexResult<String>,
+        request: CodexResult<(Arc<crate::codex_thread::CodexThread>, CodexResult<String>)>,
     ) -> CodexResult<String> {
+        let (expected_thread, result) = request?;
         if matches!(result, Err(CodexErr::InternalAgentDied)) {
-            let _ = state.remove_thread(&agent_id).await;
-            self.forget_v2_residency(agent_id);
-            self.state.release_spawned_thread(agent_id);
+            let retain_cold_identity =
+                expected_thread.multi_agent_version() == Some(MultiAgentVersion::V2);
+            state
+                .remove_thread_if_same_with_cleanup(&agent_id, &expected_thread, || {
+                    self.forget_v2_residency(agent_id);
+                    // V2 runtime death is a cold-residency transition, not a logical close.
+                    // A loader may already own the retained identity while rebuilding it.
+                    if !retain_cold_identity {
+                        self.state.release_spawned_thread(agent_id);
+                    }
+                })
+                .await;
         }
         result
     }
@@ -668,10 +776,66 @@ impl AgentControl {
         self.state.agent_metadata_for_thread(agent_id)
     }
 
+    pub(crate) fn get_agent_id_for_path(&self, path: &AgentPath) -> Option<ThreadId> {
+        self.state.agent_id_for_path(path)
+    }
+
     pub(crate) fn ensure_agent_known(&self, agent_id: ThreadId) -> CodexResult<AgentMetadata> {
         self.state
             .agent_metadata_for_thread(agent_id)
             .ok_or(CodexErr::ThreadNotFound(agent_id))
+    }
+
+    /// Tool-facing admission includes retained closed children, but never another root's UUID.
+    ///
+    /// Once the tree root is registered, an ID that names no live or stored thread
+    /// returns `ThreadNotFound`: it cannot belong to another tree, so tools keep their
+    /// not-found result for it.
+    pub(crate) async fn ensure_agent_in_tree(&self, agent_id: ThreadId) -> CodexResult<()> {
+        if self.state.agent_metadata_for_thread(agent_id).is_some() {
+            return Ok(());
+        }
+        let denied = || {
+            CodexErr::UnsupportedOperation(format!(
+                "agent {agent_id} is not part of this session tree"
+            ))
+        };
+        let root = self
+            .state
+            .agent_id_for_path(&AgentPath::root())
+            .ok_or_else(denied)?;
+        let state = self.upgrade()?;
+        let mut current = agent_id;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            if current == root || self.state.agent_metadata_for_thread(current).is_some() {
+                return Ok(());
+            }
+            let stored = match state
+                .read_stored_thread(ReadThreadParams {
+                    thread_id: current,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
+            {
+                Ok(stored) => stored,
+                // A live but unstored thread has no verifiable lineage.
+                Err(CodexErr::ThreadNotFound(_)) if current == agent_id => {
+                    return Err(match state.get_thread(agent_id).await {
+                        Ok(_) => denied(),
+                        Err(_) => CodexErr::ThreadNotFound(agent_id),
+                    });
+                }
+                Err(_) => return Err(denied()),
+            };
+            let parent = stored.parent_thread_id.ok_or_else(denied)?;
+            if stored.source.parent_thread_id() != Some(parent) {
+                return Err(denied());
+            }
+            current = parent;
+        }
+        Err(denied())
     }
 
     pub(crate) async fn list_live_agent_subtree_thread_ids(
@@ -699,21 +863,9 @@ impl AgentControl {
     ) -> CodexResult<SubtreeUsage> {
         let state = self.upgrade()?;
         let mut usage = SubtreeUsage::default();
-        let mut thread_ids = HashSet::from([agent_id]);
-        if let Some(agent_graph_store) = state.agent_graph_store() {
-            thread_ids.extend(
-                agent_graph_store
-                    .list_thread_spawn_descendants(agent_id, /*status_filter*/ None)
-                    .await
-                    .map_err(|err| {
-                        CodexErr::Fatal(format!("failed to load thread-spawn descendants: {err}"))
-                    })?,
-            );
-            // Persisted edges deliberately exclude ephemeral children. Keep
-            // completeness false: an unloaded ephemeral member is unknowable
-            // from either this graph or the currently loaded thread registry.
-        }
-        thread_ids.extend(self.list_live_agent_subtree_thread_ids(agent_id).await?);
+        let thread_ids = state
+            .reconciled_agent_subtree(agent_id, self.state.known_spawn_edges())
+            .await?;
         for thread_id in thread_ids {
             // Membership is structural; a member without readable usage is still
             // a descendant and is reported separately as missing usage.
@@ -767,10 +919,192 @@ impl AgentControl {
         if let Some(thread_id) = self.state.agent_id_for_path(&agent_path) {
             return Ok(thread_id);
         }
+        if let Some(binding) = self.task_coordinator().binding_for_agent_path(&agent_path)
+            && let Some(thread_id) = binding
+                .thread_id
+                .as_deref()
+                .and_then(|id| ThreadId::from_string(id).ok())
+        {
+            self.rehydrate_bound_agent(thread_id).await?;
+            return Ok(thread_id);
+        }
         Err(CodexErr::UnsupportedOperation(format!(
             "live agent path `{}` not found",
             agent_path.as_str()
         )))
+    }
+
+    /// Rebuild the open graph's identities without opening any descendant runtime.
+    pub(crate) async fn restore_cold_descendants(
+        &self,
+        root_thread_id: ThreadId,
+    ) -> CodexResult<()> {
+        let state = self.upgrade()?;
+        let Some(graph) = state.agent_graph_store() else {
+            return Ok(());
+        };
+        let root_path = self
+            .get_agent_metadata(root_thread_id)
+            .and_then(|metadata| metadata.agent_path)
+            .unwrap_or_else(AgentPath::root);
+        let mut queue = VecDeque::from([(root_thread_id, root_path)]);
+        let mut seen = HashSet::from([root_thread_id]);
+        while let Some((parent, parent_path)) = queue.pop_front() {
+            let children = graph
+                .list_thread_spawn_children(
+                    parent,
+                    Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+                )
+                .await
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+            for child in children {
+                if !seen.insert(child) {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "repeated cold agent edge to {child}"
+                    )));
+                }
+                let stored = state
+                    .read_stored_thread(ReadThreadParams {
+                        thread_id: child,
+                        include_archived: false,
+                        include_history: false,
+                    })
+                    .await?;
+                let path = stored.source.get_agent_path().ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "retained agent {child} has no canonical path"
+                    ))
+                })?;
+                if stored.parent_thread_id != Some(parent)
+                    || stored.source.parent_thread_id() != Some(parent)
+                    || path.as_str().rsplit_once('/').map(|(prefix, _)| prefix)
+                        != Some(parent_path.as_str())
+                {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "retained agent `{path}` has inconsistent lineage"
+                    )));
+                }
+                if let Some(binding) = self.task_coordinator().binding_for_agent_path(&path) {
+                    if binding.thread_id.as_deref() != Some(child.to_string().as_str()) {
+                        return Err(CodexErr::InvalidRequest(format!(
+                            "retained agent `{path}` has a conflicting binding"
+                        )));
+                    }
+                    self.rehydrate_binding(binding).await?;
+                } else {
+                    self.state.restore_cold_agent(
+                        AgentMetadata {
+                            agent_id: Some(child),
+                            agent_path: Some(path.clone()),
+                            agent_nickname: stored.agent_nickname,
+                            agent_role: stored.agent_role,
+                            last_task_message: None,
+                        },
+                        parent,
+                    )?;
+                }
+                queue.push_back((child, path));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn rehydrate_bound_agent(&self, thread_id: ThreadId) -> CodexResult<()> {
+        if self.state.agent_metadata_for_thread(thread_id).is_some() {
+            return Ok(());
+        }
+        let binding = self
+            .task_coordinator()
+            .bindings_for_recovery()
+            .into_iter()
+            .find(|binding| binding.thread_id.as_deref() == Some(thread_id.to_string().as_str()))
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        self.rehydrate_binding(binding).await
+    }
+
+    async fn rehydrate_binding(
+        &self,
+        binding: codex_agent_task_store::AgentTaskBinding,
+    ) -> CodexResult<()> {
+        let thread_id = binding
+            .thread_id
+            .as_deref()
+            .and_then(|id| ThreadId::from_string(id).ok())
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(format!(
+                    "retained agent `{}` has no valid thread id",
+                    binding.agent_path
+                ))
+            })?;
+        if self.state.agent_metadata_for_thread(thread_id).is_some() {
+            return Ok(());
+        }
+        self.ensure_agent_in_tree(thread_id).await?;
+        let coordinator = self.task_coordinator();
+        if coordinator.root_session_id().as_deref() != Some(binding.root_session_id.as_str()) {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+        let current = coordinator
+            .get_agent_task_authorization(binding.assignment_id)
+            .await
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        if current.current_attempt.attempt_id != binding.attempt_id {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+        let state = self.upgrade()?;
+        let stored = state
+            .read_stored_thread(codex_thread_store::ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await?;
+        let parent = stored
+            .parent_thread_id
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        let path = stored
+            .source
+            .get_agent_path()
+            .ok_or(CodexErr::ThreadNotFound(thread_id))?;
+        if path.as_str() != binding.agent_path || stored.source.parent_thread_id() != Some(parent) {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+        // Like cold-tree restore, a cold agent's membership comes only from a durable
+        // open spawn edge. Without the graph no closure is recorded durably, so only a
+        // runtime that is still loaded shows the agent was not closed: close unloads it.
+        let open = match state.agent_graph_store() {
+            Some(graph) => graph
+                .list_thread_spawn_children(
+                    parent,
+                    Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+                )
+                .await
+                .map_err(|error| CodexErr::Fatal(error.to_string()))?
+                .contains(&thread_id),
+            None => state.get_thread(thread_id).await.is_ok(),
+        };
+        if !open {
+            return Err(CodexErr::ThreadNotFound(thread_id));
+        }
+        if coordinator
+            .binding_for_assignment(binding.assignment_id)
+            .as_ref()
+            != Some(&binding)
+        {
+            return Err(CodexErr::InvalidRequest(format!(
+                "retained agent `{path}` binding changed during recovery"
+            )));
+        }
+        self.state.restore_cold_agent(
+            AgentMetadata {
+                agent_id: Some(thread_id),
+                agent_path: Some(path),
+                agent_nickname: stored.agent_nickname,
+                agent_role: stored.agent_role,
+                last_task_message: None,
+            },
+            parent,
+        )
     }
 
     /// Subscribe to status updates for `agent_id`, yielding the latest value and changes.
@@ -825,6 +1159,34 @@ impl AgentControl {
             })
             .transpose()?;
 
+        // Hydrate identities only. No child runtime, bootstrap input or model call is started.
+        let mut bindings = self.task_coordinator().bindings_for_recovery();
+        bindings.sort_by(|left, right| left.agent_path.cmp(&right.agent_path));
+        for binding in bindings {
+            // An unstarted launch has no thread yet; its in-flight spawn owns the path.
+            if binding.thread_id.is_none() {
+                continue;
+            }
+            let path = AgentPath::try_from(binding.agent_path.as_str())
+                .map_err(CodexErr::InvalidRequest)?;
+            if resolved_prefix
+                .as_ref()
+                .is_some_and(|prefix| !agent_matches_prefix(Some(&path), prefix))
+            {
+                continue;
+            }
+            match self.rehydrate_binding(binding).await {
+                Ok(()) => {}
+                // Closed, superseded, archived, deleted or closing agents are not open
+                // members. Omit them instead of failing the listing for every agent.
+                Err(CodexErr::ThreadNotFound(_) | CodexErr::UnsupportedOperation(_)) => {}
+                Err(error) => {
+                    return Err(CodexErr::InvalidRequest(format!(
+                        "retained agent `{path}` is unavailable: {error}"
+                    )));
+                }
+            }
+        }
         let mut live_agents = self.state.live_agents();
         live_agents.sort_by(|left, right| {
             left.agent_path
@@ -948,6 +1310,7 @@ impl AgentControl {
                     ),
                 }
             }
+            let mut protected_host_summary = None;
             if let (Some(child_agent_path), Some(binding)) =
                 (child_agent_path.as_ref(), watched_binding.as_ref())
             {
@@ -995,6 +1358,8 @@ impl AgentControl {
                             }) {
                                 return;
                             }
+                            protected_host_summary =
+                                crate::agent::status::completion_diagnostics_from_task(&task);
                             if let Some(durable_status) =
                                 agent_status_from_task(&task, Some((binding.attempt_id, &status)))
                             {
@@ -1034,13 +1399,16 @@ impl AgentControl {
                     "Receipt: get_agent_task({{\"assignment_id\":\"{}\"}})\nProducer attempt: {}",
                     binding.assignment_id, binding.attempt_id,
                 ));
-                let Some(communication) = inter_agent_completion_communication(
-                    parent_agent_path,
-                    child_agent_path,
-                    child_thread_id,
-                    &status,
-                    receipt.as_deref(),
-                ) else {
+                let Some(communication) =
+                    crate::session_prefix::inter_agent_completion_communication_with_diagnostics(
+                        parent_agent_path,
+                        child_agent_path,
+                        child_thread_id,
+                        &status,
+                        receipt.as_deref(),
+                        protected_host_summary.as_deref(),
+                    )
+                else {
                     return;
                 };
                 let context =
@@ -1174,9 +1542,13 @@ impl AgentControl {
         let state = self.upgrade()?;
         let mut children_by_parent = HashMap::<ThreadId, Vec<(ThreadId, AgentMetadata)>>::new();
 
-        let edges = state
+        let mut edges = state
             .list_live_thread_spawn_edges()
             .await
+            .into_iter()
+            .collect::<HashSet<_>>();
+        edges.extend(self.state.known_spawn_edges());
+        let edges = edges
             .into_iter()
             .filter(|(parent, _)| requested_parent.is_none_or(|requested| requested == *parent))
             .collect::<Vec<_>>();
@@ -1240,26 +1612,13 @@ impl AgentControl {
         &self,
         root_thread_id: ThreadId,
     ) -> CodexResult<Vec<ThreadId>> {
-        let mut children_by_parent = self.live_thread_spawn_children(None).await?;
-        let mut descendants = Vec::new();
-        let mut stack = children_by_parent
-            .remove(&root_thread_id)
-            .unwrap_or_default()
+        Ok(self
+            .upgrade()?
+            .reconciled_agent_subtree(root_thread_id, self.state.known_spawn_edges())
+            .await?
             .into_iter()
-            .map(|(child_thread_id, _)| child_thread_id)
-            .rev()
-            .collect::<Vec<_>>();
-
-        while let Some(thread_id) = stack.pop() {
-            descendants.push(thread_id);
-            if let Some(children) = children_by_parent.remove(&thread_id) {
-                for (child_thread_id, _) in children.into_iter().rev() {
-                    stack.push(child_thread_id);
-                }
-            }
-        }
-
-        Ok(descendants)
+            .skip(1)
+            .collect())
     }
 }
 
@@ -1281,6 +1640,7 @@ fn typed_actor_heartbeat(status: &AgentStatus) -> TypedActorHeartbeat {
         }
         AgentStatus::Completed(_)
         | AgentStatus::CompletedWithSurface { .. }
+        | AgentStatus::Stopped { .. }
         | AgentStatus::Errored(_) => TypedActorHeartbeat::Idle,
         AgentStatus::Shutdown | AgentStatus::NotFound => TypedActorHeartbeat::Stop,
     }

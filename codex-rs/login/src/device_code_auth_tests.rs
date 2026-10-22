@@ -32,11 +32,8 @@ async fn token_poll_deadline_bounds_a_delayed_success_response() -> anyhow::Resu
         )
         .mount(&server)
         .await;
-    let client = create_raw_auth_client_async(
-        &server.uri(),
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await?;
+    let client =
+        create_raw_auth_client_pool(&crate::test_support::transport_default_auth_route_config());
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         poll_for_token_with_timeout(
@@ -65,11 +62,8 @@ async fn token_poll_does_not_send_another_request_after_expiry() -> anyhow::Resu
         .respond_with(ResponseTemplate::new(403))
         .mount(&server)
         .await;
-    let client = create_raw_auth_client_async(
-        &server.uri(),
-        &crate::test_support::transport_default_auth_route_config(),
-    )
-    .await?;
+    let client =
+        create_raw_auth_client_pool(&crate::test_support::transport_default_auth_route_config());
     let result = tokio::time::timeout(
         Duration::from_secs(2),
         poll_for_token_with_timeout(

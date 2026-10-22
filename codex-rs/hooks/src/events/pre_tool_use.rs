@@ -501,7 +501,8 @@ mod tests {
                 let mut request = request_for_tool_use("rewrite-precedence");
                 request.cwd =
                     codex_utils_absolute_path::AbsolutePathBuf::current_dir().expect("cwd");
-                let outcome = super::run(&handlers, &shell, request, &ScopedRunGate::unscoped()).await;
+                let outcome =
+                    super::run(&handlers, &shell, request, &ScopedRunGate::unscoped()).await;
                 assert_eq!(outcome.should_block, deny);
                 assert_eq!(
                     outcome.updated_input,

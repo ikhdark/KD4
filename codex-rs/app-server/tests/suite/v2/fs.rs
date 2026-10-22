@@ -513,10 +513,11 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     let read_id = mcp
         .send_raw_request("fs/readFile", Some(json!({ "path": "relative.txt" })))
         .await?;
+    // Relative paths fail parameter decoding, which names the method.
     expect_error_message(
         &mut mcp,
         read_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/readFile: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -532,7 +533,7 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         write_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/writeFile: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -548,7 +549,7 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         create_directory_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/createDirectory: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -558,7 +559,7 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         get_metadata_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/getMetadata: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -568,7 +569,7 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         read_directory_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/readDirectory: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -585,7 +586,7 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         remove_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/remove: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -602,7 +603,7 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         copy_source_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/copy: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -619,7 +620,7 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         copy_destination_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/copy: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
@@ -632,14 +633,17 @@ async fn fs_methods_reject_invalid_requests() -> Result<()> {
     expect_error_message(
         &mut mcp,
         watch_id,
-        "Invalid request: AbsolutePathBuf deserialized without a base path",
+        "Invalid parameters for fs/watch: AbsolutePathBuf deserialized without a base path",
     )
     .await?;
 
     assert!(!codex_home.path().join("blob.bin").exists());
     assert!(!codex_home.path().join("dest").exists());
     assert!(!source_dir.join("nested").join("copy").exists());
-    assert_eq!(std::fs::read_to_string(codex_home.path().join("absolute.txt"))?, "hello");
+    assert_eq!(
+        std::fs::read_to_string(codex_home.path().join("absolute.txt"))?,
+        "hello"
+    );
 
     Ok(())
 }
@@ -793,8 +797,6 @@ async fn fs_watch_allows_missing_file_targets() -> Result<()> {
 
     Ok(())
 }
-
-
 
 fn fs_changed_notification(notification: JSONRPCNotification) -> Result<FsChangedNotification> {
     let params = notification

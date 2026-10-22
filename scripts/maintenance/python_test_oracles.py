@@ -35,7 +35,11 @@ def descendants(node):
     """Do not credit deferred nested functions/lambdas as executed."""
     yield node
     # Defaults, decorators and annotations are not part of calling the body.
-    children = node.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else ast.iter_child_nodes(node)
+    children = (
+        node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        else ast.iter_child_nodes(node)
+    )
     for child in children:
         if isinstance(
             child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
@@ -160,8 +164,10 @@ def global_references(tree, source, path):
     references = set()
     module_scope = symtable.symtable(source, path, "exec")
 
-    def visit(node, scope):
+    def visit(node, scope, shadowed=frozenset()):
         if isinstance(node, ast.Name) and scope is not None:
+            if node.id in shadowed:
+                return
             try:
                 symbol = scope.lookup(node.id)
             except KeyError:
@@ -170,7 +176,11 @@ def global_references(tree, source, path):
                 global_symbol = module_scope.lookup(node.id)
             except KeyError:
                 global_symbol = None
-            if global_symbol and global_symbol.is_imported() and global_symbol.is_assigned():
+            if (
+                global_symbol
+                and global_symbol.is_imported()
+                and global_symbol.is_assigned()
+            ):
                 return
             if scope.get_type() == "module" or (
                 symbol.is_global() and not symbol.is_assigned()
@@ -183,33 +193,81 @@ def global_references(tree, source, path):
                     continue
                 for child in value if isinstance(value, list) else [value]:
                     if isinstance(child, ast.AST):
-                        visit(child, None if field in {"type_params", "returns"} else scope)
-            children = [] if scope is None else [child for child in scope.get_children()
-                if child.get_name() == node.name and child.get_lineno() == node.lineno]
+                        visit(
+                            child,
+                            None if field in {"type_params", "returns"} else scope,
+                            shadowed,
+                        )
+            children = (
+                []
+                if scope is None
+                else [
+                    child
+                    for child in scope.get_children()
+                    if child.get_name() == node.name
+                    and child.get_lineno() == node.lineno
+                ]
+            )
             child_scope = children[0] if len(children) == 1 else None
             for child in node.body:
                 visit(child, child_scope)
             return
-        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-            name = {ast.ListComp: "listcomp", ast.SetComp: "setcomp",
-                    ast.DictComp: "dictcomp", ast.GeneratorExp: "genexpr"}[type(node)]
-            children = [] if scope is None else [child for child in scope.get_children()
-                if child.get_name() == name and child.get_lineno() == node.lineno]
+        if isinstance(
+            node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        ):
+            name = {
+                ast.ListComp: "listcomp",
+                ast.SetComp: "setcomp",
+                ast.DictComp: "dictcomp",
+                ast.GeneratorExp: "genexpr",
+            }[type(node)]
+            children = (
+                []
+                if scope is None
+                else [
+                    child
+                    for child in scope.get_children()
+                    if child.get_name() == name and child.get_lineno() == node.lineno
+                ]
+            )
             child_scope = children[0] if len(children) == 1 else None
+            # PEP 709 inlines list/set/dict comprehensions on Python 3.12+.
+            # Explicit targets remain local even without a child symbol table.
+            inlined = not children and not isinstance(node, ast.GeneratorExp)
+            if inlined:
+                child_scope = scope
+            targets = frozenset(
+                target.id
+                for generator in node.generators
+                for target in ast.walk(generator.target)
+                if isinstance(target, ast.Name)
+            )
+            body_shadowed = shadowed | targets
             # The outermost iterator is evaluated in the containing scope.
             for index, generator in enumerate(node.generators):
-                visit(generator.iter, scope if index == 0 else child_scope)
-                visit(generator.target, child_scope)
+                visit(
+                    generator.iter,
+                    scope if index == 0 else child_scope,
+                    shadowed if index == 0 else body_shadowed,
+                )
+                visit(generator.target, child_scope, body_shadowed)
                 for condition in generator.ifs:
-                    visit(condition, child_scope)
-            for value in (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,):
-                visit(value, child_scope)
+                    visit(condition, child_scope, body_shadowed)
+            for value in (
+                (node.key, node.value)
+                if isinstance(node, ast.DictComp)
+                else (node.elt,)
+            ):
+                visit(value, child_scope, body_shadowed)
             return
-        if isinstance(node, (ast.Lambda, ast.arg)) or type(node).__name__ == "TypeAlias":
+        if (
+            isinstance(node, (ast.Lambda, ast.arg))
+            or type(node).__name__ == "TypeAlias"
+        ):
             # Do not guess mappings for deferred bodies or annotation scopes.
             return
         for child in ast.iter_child_nodes(node):
-            visit(child, scope)
+            visit(child, scope, shadowed)
 
     visit(tree, module_scope)
     return references
@@ -236,11 +294,16 @@ class Program:
                 # A supplied snapshot does not establish import roots or loader
                 # precedence. Never combine aliases/functions from two owners.
                 paths = [path for path, _, _ in candidates]
-                self.unknown.extend({
-                    "path": path, "reason": "ambiguous_module_identity",
-                    "module": module, "candidates": paths,
-                    "detail": "multiple supplied paths map to this module; import ownership is unresolved",
-                } for path in paths)
+                self.unknown.extend(
+                    {
+                        "path": path,
+                        "reason": "ambiguous_module_identity",
+                        "module": module,
+                        "candidates": paths,
+                        "detail": "multiple supplied paths map to this module; import ownership is unresolved",
+                    }
+                    for path in paths
+                )
                 continue
             path, source, package = candidates[0]
             try:
@@ -312,7 +375,9 @@ class Program:
             if candidate in self.functions or candidate in self.constants
             # A matching fully qualified spelling without an import is not a
             # relationship to a supplied definition.
-            else name if name not in self.functions else ""
+            else name
+            if name not in self.functions
+            else ""
         )
 
     def reached(self, identity):
@@ -414,7 +479,11 @@ def patch_target(program, module, node):
     ):
         attribute = node.args[1]
         receiver = program.resolve(module, node.args[0])
-        if receiver and isinstance(attribute, ast.Constant) and isinstance(attribute.value, str):
+        if (
+            receiver
+            and isinstance(attribute, ast.Constant)
+            and isinstance(attribute.value, str)
+        ):
             return receiver + "." + attribute.value
     return None
 
@@ -473,6 +542,7 @@ def boundary_reached(program, test, callee, boundary):
 
     Unresolved wrapper/branch paths remain None, not real-tool coverage.
     """
+
     def direct_reach(function, call, env):
         if isinstance(function, ast.AsyncFunctionDef) or any(
             isinstance(node, (ast.Yield, ast.YieldFrom))
@@ -486,15 +556,39 @@ def boundary_reached(program, test, callee, boundary):
         # reached call; keep those paths unknown rather than clearing a warning.
         uncertain = any(
             (
-                isinstance(node, (
-                    ast.For, ast.AsyncFor, ast.While, ast.IfExp, ast.BoolOp,
-                    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
-                    ast.Try, ast.TryStar, ast.With, ast.AsyncWith, ast.Match,
-                ))
+                isinstance(
+                    node,
+                    (
+                        ast.For,
+                        ast.AsyncFor,
+                        ast.While,
+                        ast.IfExp,
+                        ast.BoolOp,
+                        ast.ListComp,
+                        ast.SetComp,
+                        ast.DictComp,
+                        ast.GeneratorExp,
+                        ast.Try,
+                        ast.TryStar,
+                        ast.With,
+                        ast.AsyncWith,
+                        ast.Match,
+                    ),
+                )
                 and call in ast.walk(node)
             )
             or (
-                isinstance(node, (ast.Return, ast.Raise, ast.Break, ast.Continue, ast.Assert, ast.Call))
+                isinstance(
+                    node,
+                    (
+                        ast.Return,
+                        ast.Raise,
+                        ast.Break,
+                        ast.Continue,
+                        ast.Assert,
+                        ast.Call,
+                    ),
+                )
                 and (node.lineno, node.col_offset) < (call.lineno, call.col_offset)
                 and call not in ast.walk(node)
             )
@@ -519,8 +613,14 @@ def boundary_reached(program, test, callee, boundary):
     # existing test patch decorators have understood behavior here; production
     # decorators and arbitrary test wrappers are not boundary coverage proof.
     if producer.decorator_list or any(
-        not isinstance(decorator, ast.Call) or program.resolve(module, decorator.func)
-        not in {"unittest.mock.patch", "unittest.mock.patch.object", "mock.patch", "mock.patch.object"}
+        not isinstance(decorator, ast.Call)
+        or program.resolve(module, decorator.func)
+        not in {
+            "unittest.mock.patch",
+            "unittest.mock.patch.object",
+            "mock.patch",
+            "mock.patch.object",
+        }
         or patch_target(program, module, decorator) is None
         for decorator in function.decorator_list
     ):
@@ -533,7 +633,9 @@ def boundary_reached(program, test, callee, boundary):
     if not calls:
         return None
     patches = patch_targets(program, module, function)
-    boundary_receivers = call_lookup_targets(program, producer_module, boundary.func) - {
+    boundary_receivers = call_lookup_targets(
+        program, producer_module, boundary.func
+    ) - {
         producer_module + "." + spelling(boundary.func),
         program.resolve(producer_module, boundary.func),
     }
@@ -559,8 +661,10 @@ def boundary_reached(program, test, callee, boundary):
         env.update(
             {kw.arg: expand(kw.value, caller_env) for kw in call.keywords if kw.arg}
         )
-        path = (direct_reach(function, call, caller_env),
-                direct_reach(producer, boundary, env))
+        path = (
+            direct_reach(function, call, caller_env),
+            direct_reach(producer, boundary, env),
+        )
         states.append(False if False in path else None if None in path else True)
     return True if True in states else None if None in states else False
 

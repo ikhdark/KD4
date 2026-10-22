@@ -59,26 +59,7 @@ fn collect_missing_call_outputs(
     items: &[ResponseItem],
     report_prompt_invariant_violations: bool,
 ) -> Vec<(usize, ResponseItem)> {
-    let mut function_output_ids = HashSet::new();
-    let mut tool_search_output_ids = HashSet::new();
-    let mut custom_tool_output_ids = HashSet::new();
-    for item in items.iter() {
-        match item {
-            ResponseItem::FunctionCallOutput { call_id, .. } => {
-                function_output_ids.insert(call_id.as_str());
-            }
-            ResponseItem::ToolSearchOutput {
-                call_id: Some(call_id),
-                ..
-            } => {
-                tool_search_output_ids.insert(call_id.as_str());
-            }
-            ResponseItem::CustomToolCallOutput { call_id, .. } => {
-                custom_tool_output_ids.insert(call_id.as_str());
-            }
-            _ => {}
-        }
-    }
+    let paired = crate::tool_occurrence::pairs(items);
 
     // Collect synthetic outputs to insert immediately after their calls.
     // Store original call indexes in ascending order for a single merge pass.
@@ -86,9 +67,7 @@ fn collect_missing_call_outputs(
 
     for (idx, item) in items.iter().enumerate() {
         match item {
-            ResponseItem::FunctionCall { id, call_id, .. }
-                if !function_output_ids.contains(call_id.as_str()) =>
-            {
+            ResponseItem::FunctionCall { id, call_id, .. } if paired[idx].is_none() => {
                 info!("Function call output is missing for call id: {call_id}");
                 missing_outputs_to_insert.push((
                     idx,
@@ -106,7 +85,7 @@ fn collect_missing_call_outputs(
                 id,
                 call_id: Some(call_id),
                 ..
-            } if !tool_search_output_ids.contains(call_id.as_str()) => {
+            } if paired[idx].is_none() => {
                 info!("Tool search output is missing for call id: {call_id}");
                 missing_outputs_to_insert.push((
                     idx,
@@ -121,9 +100,7 @@ fn collect_missing_call_outputs(
                     },
                 ));
             }
-            ResponseItem::CustomToolCall { id, call_id, .. }
-                if !custom_tool_output_ids.contains(call_id.as_str()) =>
-            {
+            ResponseItem::CustomToolCall { id, call_id, .. } if paired[idx].is_none() => {
                 if report_prompt_invariant_violations {
                     error_or_panic(format!(
                         "Custom tool call output is missing for call id: {call_id}"
@@ -147,7 +124,7 @@ fn collect_missing_call_outputs(
                 id,
                 call_id: Some(call_id),
                 ..
-            } if !function_output_ids.contains(call_id.as_str()) => {
+            } if paired[idx].is_none() => {
                 if report_prompt_invariant_violations {
                     error_or_panic(format!(
                         "Local shell call output is missing for call id: {call_id}"

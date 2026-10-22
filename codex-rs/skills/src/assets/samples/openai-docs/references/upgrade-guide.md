@@ -20,7 +20,7 @@ Upgrade with the narrowest safe change set:
 - update only the prompts that are directly tied to that model usage
 - do not automatically upgrade older or ambiguous model usages that may be intentionally pinned, such as historical docs, examples, tests, eval baselines, comparison code, or low-cost fallback/routing paths. Unless the user explicitly asks to upgrade all model usage, leave those sites unchanged and list them as confirmation-needed
 - prefer prompt-only upgrades when possible
-- if the upgrade would require API-surface changes, parameter rewrites, tool rewiring, provider migration, or broader code edits, mark it as blocked instead of stretching the scope
+- if the upgrade requires API-surface changes, parameter rewrites, tool rewiring, provider migration, or broader code edits outside the user-authorized scope, mark it as blocked pending that scope decision. When those changes are already authorized, implement and validate them; continue independent authorized work
 
 ## Upgrade workflow
 
@@ -35,12 +35,12 @@ Upgrade with the narrowest safe change set:
 4. Decide the upgrade class.
    - `model string only`
    - `model string + light prompt rewrite`
-   - `blocked without code changes`
+   - `implementation required` (blocked only when outside authorized scope)
 5. Run the compatibility gate.
    - Check whether the current integration can accept `gpt-5.5` without API-surface changes or implementation changes.
    - Check whether structured outputs, tool schemas, function names, and downstream parsers can remain unchanged.
    - For long-running Responses or tool-heavy agents, check whether `phase` is already preserved or round-tripped when the host replays assistant items or uses preambles.
-   - If compatibility depends on code changes, return `blocked`.
+   - If compatibility depends on code changes outside authorized scope, return `blocked`; otherwise implement and validate the authorized changes.
    - If compatibility is unclear, return `unknown` rather than improvising.
 6. Apply the upgrade when it is in scope.
    - Default replacement string: `gpt-5.5`.
@@ -104,12 +104,12 @@ Default action:
 - for dependency-aware or tool-heavy workflows, add prerequisite checks, missing-context handling, explicit tool budgets, stop conditions, and validation guidance
 - for coding or terminal workflows, add repo-specific constraints, acceptance criteria, and concrete validation commands
 - for multi-agent support or triage workflows, add task ownership, handoff, completeness, and stopping criteria
-- for long-running Responses agents with preambles or multiple assistant messages, explicitly review whether `phase` is already handled; if adding or preserving `phase` would require code edits, mark the path as `blocked`
+- for long-running Responses agents with preambles or multiple assistant messages, explicitly review whether `phase` is already handled; if adding or preserving `phase` requires code edits, implement and validate them when authorized, or mark the path as `blocked` pending that scope decision
 - do not classify a coding or tool-using Responses workflow as `blocked` just because the visible snippet is minimal; prefer `model string + light prompt rewrite` unless the repo clearly shows that a safe GPT-5.5 path would require host-side code changes
 
 ### `blocked`
 
-Choose this when:
+Choose this when required implementation changes are outside the user-authorized scope, for example:
 
 - the upgrade appears to require API-surface changes
 - the upgrade appears to require parameter rewrites or reasoning-setting changes that are not exposed outside implementation code
@@ -121,7 +121,7 @@ Choose this when:
 Default action:
 
 - do not improvise a broader upgrade
-- report the blocker and explain that the fix is out of scope for this guide
+- report the blocker and the missing scope decision; already authorized implementation is not blocked by this guide
 - if useful, describe the smallest follow-up implementation task that would unblock the migration
 
 ## Compatibility checklist
@@ -137,7 +137,7 @@ Before applying or recommending a model-and-prompt-only upgrade, check:
 7. For long-running Responses or tool-heavy agents, is `phase` already preserved if the host relies on preambles, replayed assistant items, or multiple assistant messages?
 8. Are latency, token, or price assumptions validated by tests, realistic spot checks, or an existing eval suite rather than inferred from general model positioning?
 
-If item 1 is no, items 3 through 4 point to implementation work, or item 7 is no and the fix needs code changes, return `blocked`.
+If item 1 is no, items 3 through 4 point to implementation work, or item 7 is no and the fix needs code changes, return `blocked` only when those changes are outside user-authorized scope. Otherwise implement and validate the authorized changes.
 
 If item 2 is no, return `unknown` unless the user can point to the prompt location.
 
@@ -145,7 +145,7 @@ Important:
 
 - Existing use of tools, agents, or multiple usage sites is not by itself a blocker.
 - If the current host can keep the same API surface and the same tool definitions, prefer `model string + light prompt rewrite` over `blocked`.
-- Reserve `blocked` for cases that truly require implementation changes, not cases that only need stronger prompt steering.
+- Reserve `blocked` for missing authorization or evidence, not already authorized implementation or cases that only need stronger prompt steering.
 - Do not claim token savings without task-level validation.
 
 ## Scope boundaries
@@ -159,7 +159,7 @@ This guide may:
 - flag compatibility blockers
 - propose validation with existing tests, realistic spot checks, or existing eval suites
 
-This guide may not:
+Without explicit user authorization for broader implementation, this guide may not:
 
 - move Chat Completions code to Responses
 - move Responses code to another API surface
@@ -170,7 +170,7 @@ This guide may not:
 - add or retrofit `phase` handling in implementation code
 - edit business logic, orchestration logic, SDK usage, IDE configuration, shell hooks, or plugin integration behavior except for model-string replacements and directly related prompt edits
 
-If a safe GPT-5.5 upgrade requires any of those changes, mark the path as blocked and out of scope.
+If a safe GPT-5.5 upgrade requires any of those changes outside the user-authorized scope, mark the path as blocked pending that scope decision. When those changes are already authorized, implement and validate them; continue independent authorized work.
 
 ## Validation plan
 

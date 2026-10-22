@@ -57,9 +57,8 @@ const OPEN_SESSION_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
 
-
-
 pub(super) struct Connection {
+    observation: codex_utils_pty::process_observation::ObservedProcess,
     command_tx: mpsc::Sender<DriverCommand>,
     execute_claim_tx: mpsc::UnboundedSender<RequestId>,
     alive: Arc<AtomicBool>,
@@ -108,10 +107,11 @@ struct ConnectionSupervisor {
 
 impl CallerCancellation {
     fn new() -> Self {
-        Self {
-            token: CancellationToken::new(),
-            armed: true,
-        }
+        Self::with_token(CancellationToken::new())
+    }
+
+    fn with_token(token: CancellationToken) -> Self {
+        Self { token, armed: true }
     }
 
     fn token(&self) -> CancellationToken {
@@ -132,6 +132,10 @@ impl Drop for CallerCancellation {
 }
 
 impl Connection {
+    pub(super) fn observe_reference(&self) {
+        self.observation.reference();
+    }
+
     pub(super) async fn spawn(host_program: &Path) -> Result<Self, String> {
         let mut command = Command::new(host_program);
         // Without a console to inherit, as under a console-less Desktop
@@ -159,6 +163,12 @@ impl Connection {
                     host_program.display()
                 )
             })?;
+        let observation = codex_utils_pty::process_observation::observe_process_start(
+            "code_mode_host",
+            codex_utils_pty::process_observation::ProcessRole::AuxiliaryRoot,
+            child.id(),
+            None,
+        );
         let process_id = child
             .id()
             .ok_or_else(|| "spawned code-mode host has no process id".to_string())?;
@@ -200,19 +210,26 @@ impl Connection {
         let handshake = async {
             let catalog_capability = codex_code_mode_protocol::host::Capability::new(
                 codex_code_mode_protocol::host::TOOL_CATALOG_CAPABILITY,
-            ).map_err(|error| error.to_string())?;
+            )
+            .map_err(|error| error.to_string())?;
             let state_capability = codex_code_mode_protocol::host::Capability::new(
                 codex_code_mode_protocol::host::NAMED_STATE_CAPABILITY,
-            ).map_err(|error| error.to_string())?;
+            )
+            .map_err(|error| error.to_string())?;
             let receipt_capability = codex_code_mode_protocol::host::Capability::new(
                 codex_code_mode_protocol::host::RECEIPT_RECOVERY_CAPABILITY,
-            ).map_err(|error| error.to_string())?;
+            )
+            .map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
                 CapabilitySet::empty(),
-                CapabilitySet::try_new([catalog_capability.clone(), state_capability.clone(), receipt_capability.clone()])
-                    .map_err(|error| error.to_string())?,
+                CapabilitySet::try_new([
+                    catalog_capability.clone(),
+                    state_capability.clone(),
+                    receipt_capability.clone(),
+                ])
+                .map_err(|error| error.to_string())?,
             )
             .map_err(|err| err.to_string())?;
             writer
@@ -249,13 +266,14 @@ impl Connection {
                 return Err("timed out negotiating with the code-mode host".to_string());
             }
         };
-        let (tool_catalog_references, named_state_snapshots, receipt_recovery) = match handshake_result {
-            Ok(enabled) => enabled,
-            Err(err) => {
-                kill_and_reap(&mut child, &managed).await;
-                return Err(err);
-            }
-        };
+        let (tool_catalog_references, named_state_snapshots, receipt_recovery) =
+            match handshake_result {
+                Ok(enabled) => enabled,
+                Err(err) => {
+                    kill_and_reap(&mut child, &managed).await;
+                    return Err(err);
+                }
+            };
 
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
@@ -305,6 +323,7 @@ impl Connection {
         );
 
         Ok(Self {
+            observation,
             command_tx,
             execute_claim_tx,
             alive,
@@ -332,18 +351,20 @@ impl Connection {
         let cleanup = SessionCleanup::new();
         let cancellation = CallerCancellation::new();
         let (response_tx, response_rx) = oneshot::channel();
-        let result = self.control_request(
-            "open session",
-            OPEN_SESSION_TIMEOUT,
-            DriverCommand::OpenSession {
-                session,
-                delegate,
-                cleanup: cleanup.clone(),
-                caller_cancellation: cancellation.token(),
-                response_tx,
-            },
-            response_rx,
-        ).await;
+        let result = self
+            .control_request(
+                "open session",
+                OPEN_SESSION_TIMEOUT,
+                DriverCommand::OpenSession {
+                    session,
+                    delegate,
+                    cleanup: cleanup.clone(),
+                    caller_cancellation: cancellation.token(),
+                    response_tx,
+                },
+                response_rx,
+            )
+            .await;
         cancellation.disarm();
         result?;
         Ok(cleanup)
@@ -377,12 +398,25 @@ impl Connection {
         Ok(delivered.started)
     }
 
+    #[cfg(test)]
     pub(super) async fn wait(
         &self,
         session: RemoteSession,
         request: WaitRequest,
     ) -> Result<WaitOutcome, String> {
-        let cancellation = CallerCancellation::new();
+        self.wait_releasable(session, request, CancellationToken::new())
+            .await
+    }
+
+    /// Cancelling `release` asks the host to release this observer early while
+    /// its response is still received; dropping the future abandons it.
+    pub(super) async fn wait_releasable(
+        &self,
+        session: RemoteSession,
+        request: WaitRequest,
+        release: CancellationToken,
+    ) -> Result<WaitOutcome, String> {
+        let cancellation = CallerCancellation::with_token(release.child_token());
         let (response_tx, response_rx) = oneshot::channel();
         self.send(DriverCommand::Wait {
             session,
@@ -405,9 +439,14 @@ impl Connection {
         self.control_request(
             "terminate cell",
             TERMINATE_TIMEOUT,
-            DriverCommand::Terminate { session, cell_id, response_tx },
+            DriverCommand::Terminate {
+                session,
+                cell_id,
+                response_tx,
+            },
             response_rx,
-        ).await
+        )
+        .await
     }
 
     pub(super) async fn shutdown_session(&self, session: RemoteSession) -> Result<(), String> {
@@ -415,9 +454,13 @@ impl Connection {
         self.control_request(
             "shutdown session",
             SHUTDOWN_SESSION_TIMEOUT,
-            DriverCommand::ShutdownSession { session, response_tx },
+            DriverCommand::ShutdownSession {
+                session,
+                response_tx,
+            },
             response_rx,
-        ).await
+        )
+        .await
     }
 
     async fn control_request<T>(
@@ -442,7 +485,8 @@ impl Connection {
             // OpenSession retains its existing abandoned-session cleanup.
             accepted.armed = destructive;
             self.receive(response_rx).await
-        }).await;
+        })
+        .await;
         accepted.armed = false;
         match result {
             Ok(result) => result,
@@ -603,6 +647,75 @@ mod tests {
     use codex_code_mode_protocol::host::SessionId;
 
     #[tokio::test]
+    async fn session_wait_keeps_host_result_when_observer_drops_before_or_after_send() {
+        use super::super::ProcessOwnedCodeModeSession;
+        use super::super::SessionBinding;
+        use super::super::SessionState;
+        for send_before_drop in [false, true] {
+            let (command_tx, mut commands) = mpsc::channel(4);
+            let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+            let connection = Arc::new(Connection {
+                observation: Default::default(),
+                command_tx,
+                execute_claim_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                failure: Arc::new(std::sync::Mutex::new(None)),
+                cancellation: CancellationToken::new(),
+            });
+            let session = ProcessOwnedCodeModeSession::new();
+            *session.inner.state.lock().unwrap() = SessionState::Open(SessionBinding {
+                connection,
+                remote: RemoteSession {
+                    id: SessionId::new("custody").unwrap(),
+                    generation: 1,
+                },
+                cleanup: SessionCleanup::new(),
+            });
+            let request = WaitRequest {
+                cell_id: CellId::new("1".into()),
+                yield_time_ms: 0,
+                recovery: None,
+            };
+            let outcome = || {
+                WaitOutcome::LiveCell(codex_code_mode_protocol::RuntimeResponse::Yielded {
+                    cell_id: request.cell_id.clone(),
+                    content_items: Vec::new(),
+                })
+            };
+            let mut observer = Box::pin(session.wait(request.clone()));
+            assert!(futures::poll!(&mut observer).is_pending());
+            let DriverCommand::Wait {
+                response_tx,
+                caller_cancellation,
+                ..
+            } = commands.recv().await.unwrap()
+            else {
+                panic!("expected one host wait");
+            };
+            let mut response = Some(response_tx);
+            if send_before_drop {
+                response.take().unwrap().send(Ok(outcome())).unwrap();
+            }
+            drop(observer);
+            assert!(
+                !caller_cancellation.is_cancelled(),
+                "steering must not abandon receiving custody"
+            );
+            if let Some(response) = response {
+                response.send(Ok(outcome())).unwrap();
+            }
+            assert_eq!(session.wait(request.clone()).await, Ok(outcome()));
+            assert!(
+                commands.try_recv().is_err(),
+                "resume must consume the original wait, not run it again"
+            );
+            assert!(session.inner.pending_waits.lock().unwrap().is_empty());
+            // Avoid starting shutdown IPC in this transport-only fixture.
+            *session.inner.state.lock().unwrap() = SessionState::Closed;
+        }
+    }
+
+    #[tokio::test]
     async fn writer_cancellation_releases_backpressured_pipe_without_replay() {
         use tokio::io::AsyncReadExt;
 
@@ -610,24 +723,42 @@ mod tests {
         for _ in 0..7 {
             let (pipe, mut host) = tokio::io::duplex(1);
             let (frames, rx) = mpsc::channel(2);
-            frames.send(EncodedFrame::encode(&"first frame").unwrap()).await.unwrap();
-            frames.send(EncodedFrame::encode(&"must not be replayed").unwrap()).await.unwrap();
+            frames
+                .send(EncodedFrame::encode(&"first frame").unwrap())
+                .await
+                .unwrap();
+            frames
+                .send(EncodedFrame::encode(&"must not be replayed").unwrap())
+                .await
+                .unwrap();
             let cancellation = CancellationToken::new();
             let pump = drive_writer(FramedWriter::new(pipe), rx, cancellation.clone());
             tokio::pin!(pump);
-            assert!(futures::poll!(&mut pump).is_pending(), "one-byte pipe must backpressure");
+            assert!(
+                futures::poll!(&mut pump).is_pending(),
+                "one-byte pipe must backpressure"
+            );
             let started = std::time::Instant::now();
             cancellation.cancel();
             tokio::time::timeout(Duration::from_millis(100), &mut pump)
-                .await.expect("cancel must not wait for a host read").unwrap();
+                .await
+                .expect("cancel must not wait for a host read")
+                .unwrap();
             samples.push(started.elapsed().as_micros());
             let mut partial = Vec::new();
             host.read_to_end(&mut partial).await.unwrap();
-            assert_eq!(partial.len(), 1, "never restart a partial frame or dispatch its successor");
+            assert_eq!(
+                partial.len(),
+                1,
+                "never restart a partial frame or dispatch its successor"
+            );
             assert!(frames.is_closed());
         }
         samples.sort_unstable();
-        eprintln!("writer_cancel_backpressure_us={samples:?} median={}", samples[3]);
+        eprintln!(
+            "writer_cancel_backpressure_us={samples:?} median={}",
+            samples[3]
+        );
     }
 
     #[tokio::test]
@@ -635,21 +766,32 @@ mod tests {
         let (pipe, host) = tokio::io::duplex(1024);
         let (frames, rx) = mpsc::channel(2);
         for message in ["first", "second"] {
-            frames.send(EncodedFrame::encode(&message).unwrap()).await.unwrap();
+            frames
+                .send(EncodedFrame::encode(&message).unwrap())
+                .await
+                .unwrap();
         }
         drop(frames);
         let result = drive_writer(FramedWriter::new(pipe), rx, CancellationToken::new()).await;
         assert!(result.unwrap_err().contains("outgoing stream closed"));
         let mut reader = FramedReader::new(host);
         assert_eq!(reader.read::<String>().await.unwrap(), Some("first".into()));
-        assert_eq!(reader.read::<String>().await.unwrap(), Some("second".into()));
+        assert_eq!(
+            reader.read::<String>().await.unwrap(),
+            Some("second".into())
+        );
         assert_eq!(reader.read::<String>().await.unwrap(), None);
 
         let (pipe, host) = tokio::io::duplex(1);
         drop(host);
         let (frames, rx) = mpsc::channel(1);
-        frames.send(EncodedFrame::encode(&"failure").unwrap()).await.unwrap();
-        let error = drive_writer(FramedWriter::new(pipe), rx, CancellationToken::new()).await.unwrap_err();
+        frames
+            .send(EncodedFrame::encode(&"failure").unwrap())
+            .await
+            .unwrap();
+        let error = drive_writer(FramedWriter::new(pipe), rx, CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(error.contains("failed to write code-mode host message"));
     }
 
@@ -658,6 +800,7 @@ mod tests {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
+            observation: Default::default(),
             command_tx,
             execute_claim_tx,
             alive: Arc::new(AtomicBool::new(true)),
@@ -671,7 +814,8 @@ mod tests {
         tokio::pin!(shutdown);
         assert!(futures::poll!(&mut shutdown).is_pending());
         // Keep both the command channel and host reply sender open.
-        let DriverCommand::ShutdownSession { response_tx, .. } = commands.recv().await.unwrap() else {
+        let DriverCommand::ShutdownSession { response_tx, .. } = commands.recv().await.unwrap()
+        else {
             panic!("expected shutdown command");
         };
         let started = tokio::time::Instant::now();
@@ -680,7 +824,86 @@ mod tests {
         assert!(error.contains("effects are uncertain"));
         assert!(!connection.is_alive());
         assert!(connection.cancellation.is_cancelled());
-        assert!(response_tx.send(Ok(())).is_err(), "late ack cannot report success");
+        assert!(
+            response_tx.send(Ok(())).is_err(),
+            "late ack cannot report success"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_shutdown_observation_keeps_the_last_host_lease_until_acknowledged() {
+        use super::super::ProcessOwnedCodeModeSession;
+        use super::super::SessionBinding;
+        use super::super::SessionState;
+        let (command_tx, mut commands) = mpsc::channel(4);
+        let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
+        let connection = Arc::new(Connection {
+            observation: Default::default(),
+            command_tx,
+            execute_claim_tx,
+            alive: Arc::new(AtomicBool::new(true)),
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            cancellation: CancellationToken::new(),
+        });
+        let session = ProcessOwnedCodeModeSession::new();
+        *session.inner.state.lock().unwrap() = SessionState::Open(SessionBinding {
+            connection: Arc::clone(&connection),
+            remote: RemoteSession {
+                id: SessionId::new("pending-storage").unwrap(),
+                generation: 1,
+            },
+            cleanup: SessionCleanup::new(),
+        });
+        let mut observer = Box::pin(session.shutdown());
+        assert!(futures::poll!(&mut observer).is_pending());
+        for _ in 0..16 {
+            let DriverCommand::ShutdownSession { response_tx, .. } = commands.recv().await.unwrap()
+            else {
+                panic!("only close observation may be retried");
+            };
+            response_tx
+                .send(Err(
+                    codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.into(),
+                ))
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            observer.await,
+            Err(codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.into())
+        );
+        assert!(connection.is_alive());
+        assert!(!connection.cancellation.is_cancelled());
+        assert_eq!(
+            session
+                .inner
+                .process_host
+                .state
+                .lock()
+                .unwrap()
+                .active_sessions,
+            1
+        );
+        assert!(matches!(
+            *session.inner.state.lock().unwrap(),
+            SessionState::Closing
+        ));
+        let DriverCommand::ShutdownSession { response_tx, .. } = commands.recv().await.unwrap()
+        else {
+            panic!("expected retained close owner");
+        };
+        response_tx.send(Ok(())).unwrap();
+        session.shutdown().await.unwrap();
+        assert_eq!(
+            session
+                .inner
+                .process_host
+                .state
+                .lock()
+                .unwrap()
+                .active_sessions,
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -688,6 +911,7 @@ mod tests {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
+            observation: Default::default(),
             command_tx,
             execute_claim_tx,
             alive: Arc::new(AtomicBool::new(true)),
@@ -711,24 +935,40 @@ mod tests {
             );
             tokio::pin!(observer);
             assert!(futures::poll!(&mut observer).is_pending());
-            let DriverCommand::Terminate { response_tx, .. } = commands.recv().await.unwrap() else {
+            let DriverCommand::Terminate { response_tx, .. } = commands.recv().await.unwrap()
+            else {
                 panic!("expected termination command");
             };
-            assert!(observer.await.is_err(), "the outer observer reports uncertainty, not termination");
+            assert!(
+                observer.await.is_err(),
+                "the outer observer reports uncertainty, not termination"
+            );
             response_tx
         }; // Drop the timed-out control future, as the core caller does.
         tokio::time::advance(TERMINATE_TIMEOUT).await;
         tokio::task::yield_now().await;
 
-        assert!(!connection.is_alive(), "dropping the observer must not disable fail-closed control ownership");
+        assert!(
+            !connection.is_alive(),
+            "dropping the observer must not disable fail-closed control ownership"
+        );
         assert!(connection.cancellation.is_cancelled());
-        assert!(connection.failure_message().contains("effects are uncertain"));
-        assert!(response_tx.send(Ok(WaitOutcome::LiveCell(
-            codex_code_mode_protocol::RuntimeResponse::Terminated {
-                cell_id,
-                content_items: Vec::new(),
-            },
-        ))).is_err(), "late acknowledgment must not become a success receipt");
+        assert!(
+            connection
+                .failure_message()
+                .contains("effects are uncertain")
+        );
+        assert!(
+            response_tx
+                .send(Ok(WaitOutcome::LiveCell(
+                    codex_code_mode_protocol::RuntimeResponse::Terminated {
+                        cell_id,
+                        content_items: Vec::new(),
+                    },
+                )))
+                .is_err(),
+            "late acknowledgment must not become a success receipt"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -736,29 +976,46 @@ mod tests {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
+            observation: Default::default(),
             command_tx,
             execute_claim_tx,
             alive: Arc::new(AtomicBool::new(true)),
             failure: Arc::new(std::sync::Mutex::new(None)),
             cancellation: CancellationToken::new(),
         };
-        let remote = RemoteSession { id: SessionId::new("busy-host").unwrap(), generation: 1 };
+        let remote = RemoteSession {
+            id: SessionId::new("busy-host").unwrap(),
+            generation: 1,
+        };
         let (response_tx, _response_rx) = oneshot::channel();
-        connection.command_tx.send(DriverCommand::Terminate {
-            session: remote.clone(),
-            cell_id: CellId::new("already-queued".into()),
-            response_tx,
-        }).await.unwrap();
-        let mut termination = Box::pin(connection.terminate(remote, CellId::new("unadmitted".into())));
+        connection
+            .command_tx
+            .send(DriverCommand::Terminate {
+                session: remote.clone(),
+                cell_id: CellId::new("already-queued".into()),
+                response_tx,
+            })
+            .await
+            .unwrap();
+        let mut termination =
+            Box::pin(connection.terminate(remote, CellId::new("unadmitted".into())));
         assert!(futures::poll!(&mut termination).is_pending());
         drop(termination);
 
-        assert!(connection.is_alive(), "an unaccepted command has no host effects");
+        assert!(
+            connection.is_alive(),
+            "an unaccepted command has no host effects"
+        );
         assert!(!connection.cancellation.is_cancelled());
         assert!(connection.failure.lock().unwrap().is_none());
-        assert!(matches!(commands.recv().await, Some(DriverCommand::Terminate { cell_id, .. })
-            if cell_id.as_str() == "already-queued"));
-        assert!(matches!(commands.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(
+            matches!(commands.recv().await, Some(DriverCommand::Terminate { cell_id, .. })
+            if cell_id.as_str() == "already-queued")
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -766,6 +1023,7 @@ mod tests {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
+            observation: Default::default(),
             command_tx,
             execute_claim_tx,
             alive: Arc::new(AtomicBool::new(true)),
@@ -774,17 +1032,22 @@ mod tests {
         };
         let cell_id = CellId::new("finished-cell".into());
         let mut termination = Box::pin(connection.terminate(
-            RemoteSession { id: SessionId::new("responsive-host").unwrap(), generation: 1 },
+            RemoteSession {
+                id: SessionId::new("responsive-host").unwrap(),
+                generation: 1,
+            },
             cell_id.clone(),
         ));
         assert!(futures::poll!(&mut termination).is_pending());
         let DriverCommand::Terminate { response_tx, .. } = commands.recv().await.unwrap() else {
             panic!("expected termination command");
         };
-        let outcome = || WaitOutcome::LiveCell(codex_code_mode_protocol::RuntimeResponse::Terminated {
-            cell_id: cell_id.clone(),
-            content_items: Vec::new(),
-        });
+        let outcome = || {
+            WaitOutcome::LiveCell(codex_code_mode_protocol::RuntimeResponse::Terminated {
+                cell_id: cell_id.clone(),
+                content_items: Vec::new(),
+            })
+        };
         response_tx.send(Ok(outcome())).unwrap();
         assert_eq!(termination.await.unwrap(), outcome());
         assert!(connection.is_alive());
@@ -797,6 +1060,7 @@ mod tests {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
+            observation: Default::default(),
             command_tx,
             execute_claim_tx,
             alive: Arc::new(AtomicBool::new(true)),
@@ -804,17 +1068,28 @@ mod tests {
             cancellation: CancellationToken::new(),
         };
         let mut opening = Box::pin(connection.open_session(
-            RemoteSession { id: SessionId::new("opening-host").unwrap(), generation: 1 },
+            RemoteSession {
+                id: SessionId::new("opening-host").unwrap(),
+                generation: 1,
+            },
             Arc::new(crate::NoopCodeModeSessionDelegate),
         ));
         assert!(futures::poll!(&mut opening).is_pending());
-        let DriverCommand::OpenSession { caller_cancellation, response_tx, .. } = commands.recv().await.unwrap() else {
+        let DriverCommand::OpenSession {
+            caller_cancellation,
+            response_tx,
+            ..
+        } = commands.recv().await.unwrap()
+        else {
             panic!("expected open command");
         };
         drop(opening);
         assert!(caller_cancellation.is_cancelled());
         assert!(response_tx.is_closed());
-        assert!(connection.is_alive(), "open retains the driver's abandoned-session cleanup");
+        assert!(
+            connection.is_alive(),
+            "open retains the driver's abandoned-session cleanup"
+        );
         assert!(!connection.cancellation.is_cancelled());
     }
 
@@ -823,6 +1098,7 @@ mod tests {
         let (command_tx, mut commands) = mpsc::channel(1);
         let (execute_claim_tx, _claims) = mpsc::unbounded_channel();
         let connection = Connection {
+            observation: Default::default(),
             command_tx,
             execute_claim_tx,
             alive: Arc::new(AtomicBool::new(true)),
@@ -835,7 +1111,11 @@ mod tests {
                 id: codex_code_mode_protocol::host::SessionId::new("long-cell").unwrap(),
                 generation: 1,
             },
-            WaitRequest { cell_id: cell_id.clone(), yield_time_ms: 0, recovery: None },
+            WaitRequest {
+                cell_id: cell_id.clone(),
+                yield_time_ms: 0,
+                recovery: None,
+            },
         );
         tokio::pin!(wait);
         assert!(futures::poll!(&mut wait).is_pending());

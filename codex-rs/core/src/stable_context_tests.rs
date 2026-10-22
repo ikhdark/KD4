@@ -100,6 +100,45 @@ fn visible_text(items: &[ResponseItem]) -> Vec<&str> {
         .collect()
 }
 
+/// Every text section of each message, so a presence marker and its payload
+/// are checked as the one source they form.
+fn message_texts(items: &[ResponseItem]) -> Vec<Vec<&str>> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|content| match content {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Projection marks each trusted source with a fresh origin ID rather than
+/// copying an occurrence's durable ID, so compare everything else.
+fn without_trusted_ids(items: &[ResponseItem]) -> Vec<ResponseItem> {
+    items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            if is_trusted_stable_context_item(&item)
+                && let ResponseItem::Message { id, .. } = &mut item
+            {
+                *id = None;
+            }
+            item
+        })
+        .collect()
+}
+
 fn repository(text: &str) -> String {
     UserInstructions {
         directory: Some("/repo".to_string()),
@@ -226,9 +265,9 @@ fn trusted_context_producer_marker_survives_rollout_serialization() {
     assert_ne!(provider.id(), resumed.id());
     let normalized = provider.clone();
     normalize_provider_context_item_id(&mut provider);
-    assert_eq!(
+    assert_ne!(
         provider, normalized,
-        "provider ID normalization is idempotent"
+        "raw IDs resembling an escape must be escaped too; ingress normalizes exactly once"
     );
     let provider_projection =
         project_stable_context(vec![provider.clone()].into(), StableContextTarget::Sampling);
@@ -240,6 +279,41 @@ fn trusted_context_producer_marker_survives_rollout_serialization() {
         visible_text(&projection.items),
         vec![repository_context.as_str()]
     );
+}
+
+#[test]
+fn audit_instruction_authority_provider_id_injective_and_builtin_removal() {
+    let ids = [
+        "msg_sctx_x",
+        "msg_compaction_summary_x",
+        "msg_turn_advice_x",
+        "msg_msg_sctx_x",
+        "msg_provider_msg_sctx_x",
+        "msg_provider_msg_provider_msg_sctx_x",
+    ];
+    let mut normalized = HashSet::new();
+    for raw in ids {
+        let mut item = output_message("answer");
+        if let ResponseItem::Message { id, .. } = &mut item {
+            *id = Some(serde_json::from_value(serde_json::json!(raw)).unwrap());
+        }
+        normalize_provider_context_item_id(&mut item);
+        assert!(!is_trusted_stable_context_item(&item));
+        assert!(normalized.insert(item.id().unwrap().clone()));
+    }
+    let old = vec![
+        text_message(
+            "developer",
+            "<permissions instructions>old policy</permissions instructions>",
+        ),
+        text_message("user", "<environment_context>old cwd</environment_context>"),
+    ];
+    let removed = disabled_builtin_retractions(&old, false, false, false);
+    assert_eq!(removed.len(), 2);
+    let mut history = old;
+    history.extend(removed);
+    assert!(project_compaction_context(history.clone().into()).is_empty());
+    assert!(disabled_builtin_retractions(&history, false, false, false).is_empty());
 }
 
 #[test]
@@ -375,7 +449,18 @@ fn selected_skill_compacts_each_catalog_without_collapsing_authority() {
     );
 
     let second = project_stable_context(first.items.clone(), StableContextTarget::Sampling);
-    assert_eq!(second.items, first.items);
+    // Re-projection keeps every trusted source trusted; only fresh origin IDs differ.
+    let trusted = |items: &[ResponseItem]| {
+        items
+            .iter()
+            .map(is_trusted_stable_context_item)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(trusted(&second.items), trusted(&first.items));
+    assert_eq!(
+        without_trusted_ids(&second.items),
+        without_trusted_ids(&first.items)
+    );
 }
 
 #[test]
@@ -394,18 +479,34 @@ fn configured_developer_instructions_are_latest_wins_without_exposing_identity_m
         StableContextTarget::Sampling,
     );
 
-    let text = visible_text(&projection.items);
+    // The hoisted projection keeps a presence marker with its payload as one
+    // trusted source (`project_items`). Latest-wins keeps one current policy
+    // and retires the old policy together with its marker.
+    let texts = message_texts(&projection.items);
+    let current = configured_developer_instructions_sections(Some("current developer policy"));
+    let current = current.iter().map(String::as_str).collect::<Vec<_>>();
     assert_eq!(
-        text.iter()
-            .filter(|text| **text == "current developer policy")
-            .count(),
-        1
+        texts
+            .iter()
+            .filter(|texts| texts.contains(&"current developer policy"))
+            .collect::<Vec<_>>(),
+        vec![&current]
     );
-    assert!(!text.contains(&"old developer policy"));
-    assert!(text.contains(&"ordinary developer conversation"));
     assert!(
-        text.iter()
-            .all(|text| !text.contains("configured_developer_instructions"))
+        texts
+            .iter()
+            .flatten()
+            .all(|text| *text != "old developer policy")
+    );
+    assert!(texts.contains(&vec!["ordinary developer conversation"]));
+    assert_eq!(
+        texts
+            .iter()
+            .flatten()
+            .filter(|text| text.contains("configured_developer_instructions"))
+            .count(),
+        1,
+        "only the current payload carries its marker"
     );
 }
 
@@ -417,19 +518,20 @@ fn configured_developer_instructions_precede_collaboration_in_canonical_prefix()
     let projection = project_stable_context(
         vec![
             text_message("developer", &collaboration),
-            text_message_with_sections("developer", configured),
+            text_message_with_sections("developer", configured.clone()),
             text_message("user", "do work"),
         ]
         .into(),
         StableContextTarget::Sampling,
     );
 
+    // The configured item is hoisted with its presence marker and payload.
     assert_eq!(
-        visible_text(&projection.items),
+        message_texts(&projection.items),
         vec![
-            "configured developer policy",
-            collaboration.as_str(),
-            "do work"
+            configured.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![collaboration.as_str()],
+            vec!["do work"],
         ]
     );
 }
@@ -1003,17 +1105,12 @@ fn runtime_context_variants_are_stable_and_replace_by_semantic_slot() {
 #[test]
 fn freshness_only_repository_notice_keeps_the_substantive_instructions() {
     let body = repository("Preserve the offline database and run the scoped acceptance check.");
-    let observation = UserInstructions {
-        directory: Some("/repo".to_string()),
-        text: "The previously provided instruction body is unchanged.".to_string(),
-    }
-    .with_observation("Instruction sources were refreshed for this sampling step.")
-    .render();
+    let observation = "<repository_observation>\nInstruction sources were refreshed for this sampling step.\n</repository_observation>".to_string();
     let projection = project_stable_context(
         vec![
             text_message("user", &body),
             text_message("user", "continue the work"),
-            text_message("user", &observation),
+            text_message("developer", &observation),
         ]
         .into(),
         StableContextTarget::Sampling,

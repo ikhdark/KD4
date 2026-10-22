@@ -30,7 +30,6 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
-use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TurnContextItem;
@@ -49,7 +48,6 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
@@ -1079,6 +1077,17 @@ impl ContextManager {
         )
     }
 
+    pub(crate) fn reserved_tool_call_ids(&self) -> std::collections::HashSet<String> {
+        let mut ids = self.tool_history.reserved_call_ids();
+        ids.extend(
+            self.items
+                .iter()
+                .filter_map(crate::tool_occurrence::identity)
+                .map(|(_, _, id)| id.to_string()),
+        );
+        ids
+    }
+
     /// Sums the projected prompt from the per-position cache of its source
     /// items. The projection keeps source order, replaces outputs in place,
     /// removes budget-dropped pairs, and appends notices, so every projected
@@ -1285,53 +1294,17 @@ impl ContextManager {
         Some(base_tokens.saturating_add(items_tokens))
     }
 
-    pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
+    pub(crate) fn replace(&mut self, mut items: Vec<ResponseItem>) {
+        items.retain(|item| {
+            !matches!(item, ResponseItem::Message { role, .. } if role == "system")
+                || crate::stable_context::is_trusted_selected_skill_item(item)
+        });
         Arc::make_mut(&mut self.tool_history).retain_for_history(&items);
         self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
         self.invalidate_prepared_history();
         self.world_state_baseline = None;
         self.realized_context_baseline = RealizedContextBaseline::Unknown;
-    }
-
-    /// Replace image content in the last turn if it originated from a tool output.
-    /// Returns true when a tool image was replaced, false otherwise.
-    pub(crate) fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
-        let Some(turn_start) = self.items.iter().rposition(is_user_turn_boundary) else {
-            return false;
-        };
-
-        let mut replaced = false;
-        let placeholder = placeholder.to_string();
-        for item in Arc::make_mut(&mut self.items)
-            .iter_mut()
-            .skip(turn_start.saturating_add(1))
-        {
-            let output = match item {
-                ResponseItem::FunctionCallOutput { output, .. }
-                | ResponseItem::CustomToolCallOutput { output, .. } => output,
-                _ => continue,
-            };
-            let Some(content_items) = output.content_items_mut() else {
-                continue;
-            };
-            for content_item in content_items {
-                if matches!(
-                    content_item,
-                    FunctionCallOutputContentItem::InputImage { .. }
-                ) {
-                    *content_item = FunctionCallOutputContentItem::InputText {
-                        text: placeholder.clone(),
-                    };
-                    replaced = true;
-                }
-            }
-        }
-        if replaced {
-            self.history_version = self.history_version.saturating_add(1);
-            self.invalidate_prepared_history();
-        }
-        replaced
     }
 
     /// Drop the last `num_turns` instruction turns from this history.
@@ -1404,6 +1377,17 @@ impl ContextManager {
         _server_reasoning_included: bool,
         base_instructions: &BaseInstructions,
     ) -> i64 {
+        self.get_total_token_usage_for_modalities(
+            base_instructions,
+            &codex_protocol::openai_models::default_input_modalities(),
+        )
+    }
+
+    pub(crate) fn get_total_token_usage_for_modalities(
+        &self,
+        base_instructions: &BaseInstructions,
+        input_modalities: &[InputModality],
+    ) -> i64 {
         let items_after_last_model_generated = self.items_after_last_model_generated_item();
         let local_tail_contains_instruction_boundary = self
             .items
@@ -1417,18 +1401,18 @@ impl ContextManager {
                         .any(is_user_turn_boundary)
                 },
             );
-        if local_tail_contains_instruction_boundary {
+        if local_tail_contains_instruction_boundary
+            || self
+                .token_info
+                .as_ref()
+                .is_none_or(|info| info.estimated_context_tokens.is_some())
+        {
             // Server usage is stale across an instruction boundary, so estimate
             // the whole history that sampling will actually send.
-            let raw_items: Arc<[ResponseItem]> = Arc::from(self.raw_items());
-            let projected = self.sampling_items_for_estimate(Arc::clone(&raw_items));
             return self
-                .estimate_projected_items_token_count(
-                    &raw_items,
-                    &projected,
+                .estimate_prepared_token_count_with_base_instructions(
+                    input_modalities,
                     base_instructions,
-                    /*pending_user_boundary*/ false,
-                    /*policy*/ None,
                 )
                 .unwrap_or(0);
         }
@@ -1479,6 +1463,71 @@ impl ContextManager {
         item: &ResponseItem,
         policy: TruncationPolicy,
     ) -> ResponseItem {
+        let exact_read = crate::tool_history::item_call_id(item).is_some_and(|call_id| {
+            self.items
+                .iter()
+                .rev()
+                .find_map(|prior| match prior {
+                    ResponseItem::FunctionCall {
+                        call_id: id,
+                        name,
+                        namespace,
+                        ..
+                    }
+                    | ResponseItem::CustomToolCall {
+                        call_id: id,
+                        name,
+                        namespace,
+                        ..
+                    } if id == call_id => Some(
+                        namespace.is_none()
+                            && matches!(name.as_str(), "read_file" | "read_tool_output"),
+                    ),
+                    _ => None,
+                })
+                .unwrap_or(false)
+        });
+        let truncate_output = |output: &FunctionCallOutputPayload| {
+            let bounded = truncate_function_output_payload(output, policy);
+            if !exact_read || bounded == *output {
+                return bounded;
+            }
+            // A legacy/resumed packet may face a smaller policy than its owner
+            // used. Invalidate its exact-delivery claims instead of cutting its
+            // selected bytes while retaining complete=true and the old range.
+            let mut notice = serde_json::json!({
+                "complete":false, "delivered_selection_complete":false,
+                "error":"Exact selection exceeds the current delivery budget; request a narrower selection.",
+            });
+            if let FunctionCallOutputBody::Text(text) = &output.body
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            {
+                for key in ["artifact_id", "source_sha256", "canonical_sha256"] {
+                    if let Some(value) = value[key].as_str().filter(|value| value.len() <= 128) {
+                        notice[key] = value.into();
+                    }
+                }
+            }
+            FunctionCallOutputPayload {
+                // A too-small policy cannot carry the normal envelope. Never
+                // cut serialized JSON and leave it looking like exact evidence.
+                body: FunctionCallOutputBody::Text({
+                    let text = notice.to_string();
+                    if text.len() <= policy.byte_budget() {
+                        text
+                    } else if policy.byte_budget() >= 18 {
+                        "{\"complete\":false}".into()
+                    } else if policy.byte_budget() >= 2 {
+                        "{}".into()
+                    } else if policy.byte_budget() == 1 {
+                        "0".into()
+                    } else {
+                        String::new()
+                    }
+                }),
+                success: Some(false),
+            }
+        };
         if let Some(call_id) = crate::tool_history::item_call_id(item)
             && matches!(
                 item,
@@ -1512,7 +1561,7 @@ impl ContextManager {
             } => ResponseItem::FunctionCallOutput {
                 id: id.clone(),
                 call_id: call_id.clone(),
-                output: truncate_function_output_payload(output, policy),
+                output: truncate_output(output),
                 internal_chat_message_metadata_passthrough: metadata.clone(),
             },
             ResponseItem::CustomToolCallOutput {
@@ -1525,7 +1574,7 @@ impl ContextManager {
                 id: id.clone(),
                 call_id: call_id.clone(),
                 name: name.clone(),
-                output: truncate_function_output_payload(output, policy),
+                output: truncate_output(output),
                 internal_chat_message_metadata_passthrough: metadata.clone(),
             },
             ResponseItem::AdditionalTools { .. }
@@ -1593,6 +1642,7 @@ impl ContextManager {
 }
 
 fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
+    let counterparts = crate::tool_occurrence::pairs(items);
     let update_calls = items
         .iter()
         .enumerate()
@@ -1608,30 +1658,21 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
         .collect::<Vec<_>>();
     // Rejections/cancellation after an accepted update remain verbatim. They
     // must not resurrect every obsolete checklist in compaction input.
-    let latest = update_calls.iter().rev().find_map(|(call_index, call_id)| {
-        items
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(output_index, item)| {
-                let ResponseItem::FunctionCallOutput {
-                    call_id: output_id,
-                    output,
-                    ..
-                } = item
-                else {
-                    return None;
-                };
-                if output_id != call_id || output.success == Some(false) {
-                    return None;
-                }
-                let FunctionCallOutputBody::Text(text) = &output.body else {
-                    return None;
-                };
-                let value: serde_json::Value = serde_json::from_str(text).ok()?;
-                value.get("current_plan").filter(|plan| plan.is_object())?;
-                Some((*call_index, output_index, value))
-            })
+    let latest = update_calls.iter().rev().find_map(|(call_index, _)| {
+        let output_index = counterparts[*call_index]?;
+        let item = &items[output_index];
+        let ResponseItem::FunctionCallOutput { output, .. } = item else {
+            return None;
+        };
+        if output.success == Some(false) {
+            return None;
+        }
+        let FunctionCallOutputBody::Text(text) = &output.body else {
+            return None;
+        };
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        value.get("current_plan").filter(|plan| plan.is_object())?;
+        Some((*call_index, output_index, value))
     });
     let Some((latest_call_index, latest_output_index, mut authoritative_output)) = latest else {
         return;
@@ -1664,45 +1705,36 @@ fn project_update_plan_history(items: &mut Vec<ResponseItem>) {
     };
     output.body = FunctionCallOutputBody::Text(authoritative_output.to_string());
 
-    let update_call_ids = update_calls
+    let update_item_indices = update_calls
         .iter()
-        .filter(|(index, call_id)| {
-            *index <= latest_call_index
-                && items.iter().any(|item| {
-                    let ResponseItem::FunctionCallOutput {
-                        call_id: output_id,
-                        output,
-                        ..
-                    } = item
-                    else {
-                        return false;
-                    };
-                    output_id == call_id
-                        && output.success != Some(false)
-                        && output.body.to_text().is_some_and(|text| {
-                            serde_json::from_str::<serde_json::Value>(&text)
-                                .is_ok_and(|value| value["current_plan"].is_object())
-                        })
-                })
+        .filter_map(|(index, _)| {
+            if *index > latest_call_index {
+                return None;
+            }
+            let output_index = counterparts[*index]?;
+            let accepted = {
+                let item = &items[output_index];
+                let ResponseItem::FunctionCallOutput { output, .. } = item else {
+                    return None;
+                };
+                output.success != Some(false)
+                    && output.body.to_text().is_some_and(|text| {
+                        serde_json::from_str::<serde_json::Value>(&text)
+                            .is_ok_and(|value| value["current_plan"].is_object())
+                    })
+            };
+            accepted.then_some([*index, output_index])
         })
-        .map(|(_, call_id)| call_id.as_str())
+        .flatten()
         .collect::<BTreeSet<_>>();
     let mut index = 0;
     let mut retained = 0;
     let mut insertion_index = 0;
-    items.retain(|item| {
+    items.retain(|_| {
         if index == latest_call_index {
             insertion_index = retained;
         }
-        let belongs_to_update_plan = matches!(
-            item,
-            ResponseItem::FunctionCall { name, namespace: None, call_id, .. }
-                if name == "update_plan" && update_call_ids.contains(call_id.as_str())
-        ) || matches!(
-            item,
-            ResponseItem::FunctionCallOutput { call_id, .. }
-                if update_call_ids.contains(call_id.as_str())
-        );
+        let belongs_to_update_plan = update_item_indices.contains(&index);
         index += 1;
         retained += usize::from(!belongs_to_update_plan);
         !belongs_to_update_plan
@@ -2161,7 +2193,10 @@ pub(crate) fn truncate_function_output_payload(
 /// calls).
 fn is_api_message(message: &ResponseItem) -> bool {
     match message {
-        ResponseItem::Message { role, .. } => role.as_str() != "system",
+        ResponseItem::Message { role, .. } => {
+            role.as_str() != "system"
+                || crate::stable_context::is_trusted_selected_skill_item(message)
+        }
         ResponseItem::AdditionalTools { .. }
         | ResponseItem::AgentMessage { .. }
         | ResponseItem::FunctionCallOutput { .. }
@@ -2414,14 +2449,7 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
         if bytes.len() > MAX_PROMPT_IMAGE_SOURCE_BYTES {
             return None;
         }
-        let reader = match image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format() {
-            Ok(reader) => reader,
-            Err(error) => {
-                tracing::trace!("failed to identify original-detail image bytes: {error}");
-                return None;
-            }
-        };
-        let dimensions = match reader.into_dimensions() {
+        let dimensions = match codex_utils_image::prompt_image_dimensions(&bytes) {
             Ok(dimensions) => dimensions,
             Err(error) => {
                 tracing::trace!("failed to inspect original-detail image bytes: {error}");
@@ -2554,19 +2582,7 @@ fn completed_turn_boundary_with_pending_user(
 }
 
 pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
-    if matches!(item, ResponseItem::AgentMessage { .. }) {
-        return true;
-    }
-    let ResponseItem::Message { role, content, .. } = item else {
-        return false;
-    };
-
-    (role == "user" && !is_contextual_user_message(item))
-        || (role == "assistant" && is_inter_agent_instruction_content(content))
-}
-
-fn is_inter_agent_instruction_content(content: &[ContentItem]) -> bool {
-    InterAgentCommunication::is_message_content(content)
+    codex_context_fragments::is_user_turn_boundary(item)
 }
 
 fn user_message_positions(items: &[ResponseItem]) -> Vec<usize> {

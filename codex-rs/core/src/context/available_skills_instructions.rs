@@ -60,7 +60,7 @@ impl ContextualUserFragment for SkillsUsageInstructions {
 
 impl ContextualUserFragment for AvailableSkillsInstructions {
     fn role(&self) -> &'static str {
-        "developer"
+        "user"
     }
 
     fn markers(&self) -> (&'static str, &'static str) {

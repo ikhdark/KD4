@@ -165,6 +165,7 @@ pub(super) struct ExecutorProcessTransport {
     /// When the pushed event stream lags, use this as the retained-output read
     /// cursor to recover missed stdout/stderr chunks from the executor.
     last_seq: u64,
+    exit_known: bool,
 }
 
 impl ExecutorProcessTransport {
@@ -182,6 +183,7 @@ impl ExecutorProcessTransport {
             stderr: LineBuffer::default(),
             closed: false,
             last_seq: 0,
+            exit_known: false,
         }
     }
 
@@ -248,11 +250,30 @@ impl ExecutorProcessTransport {
                 return None;
             }
 
-            match self.events.recv().await {
+            let received = match self.events.recv().await {
+                Ok(event) => match self.recover_forward_gap(event).await {
+                    Ok(Some(event)) => Ok(event),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        warn!(
+                            "Failed to recover remote MCP initial output ({}): {error}",
+                            self.program_name
+                        );
+                        self.stdout.clear();
+                        self.closed = true;
+                        continue;
+                    }
+                },
+                Err(error) => Err(error),
+            };
+            match received {
                 Ok(ExecProcessEvent::OutputGap { through_seq }) => {
                     // A JSON-RPC byte stream cannot safely resume through a
                     // missing frame. Report transport loss, not process death.
-                    warn!("Remote MCP output lost through sequence {through_seq} ({})", self.program_name);
+                    warn!(
+                        "Remote MCP output lost through sequence {through_seq} ({})",
+                        self.program_name
+                    );
                     self.closed = true;
                 }
                 Ok(ExecProcessEvent::Output(chunk)) => {
@@ -263,6 +284,7 @@ impl ExecutorProcessTransport {
                 }
                 Ok(ExecProcessEvent::Exited { seq, .. }) => {
                     self.note_seq(seq);
+                    self.exit_known = true;
                     // Wait for `Closed` before ending the rmcp stream so any
                     // output flushed during process shutdown can still be
                     // decoded into JSON-RPC messages.
@@ -302,6 +324,25 @@ impl ExecutorProcessTransport {
         self.last_seq = self.last_seq.max(seq);
     }
 
+    async fn recover_forward_gap(
+        &mut self,
+        event: ExecProcessEvent,
+    ) -> io::Result<Option<ExecProcessEvent>> {
+        let seq = match &event {
+            ExecProcessEvent::Output(chunk) => Some(chunk.seq),
+            ExecProcessEvent::Exited { seq, .. } | ExecProcessEvent::Closed { seq, .. } => {
+                Some(*seq)
+            }
+            _ => None,
+        };
+        if seq.is_some_and(|seq| seq > self.last_seq.saturating_add(1)) {
+            self.recover_events(Some(event)).await?;
+            Ok(None)
+        } else {
+            Ok(Some(event))
+        }
+    }
+
     fn should_accept_seq(&mut self, seq: u64) -> bool {
         if seq <= self.last_seq {
             return false;
@@ -311,6 +352,10 @@ impl ExecutorProcessTransport {
     }
 
     async fn recover_lagged_events(&mut self) -> io::Result<()> {
+        self.recover_events(None).await
+    }
+
+    async fn recover_events(&mut self, trigger: Option<ExecProcessEvent>) -> io::Result<()> {
         let response = self
             .process
             .read(
@@ -321,23 +366,35 @@ impl ExecutorProcessTransport {
             .await
             .map_err(io::Error::other)?;
         if response.output_gap.is_some() {
-            return Err(io::Error::other("remote MCP output contains an unrecoverable gap"));
+            return Err(io::Error::other(
+                "remote MCP output contains an unrecoverable gap",
+            ));
         }
-        for chunk in response.chunks {
-            self.push_process_output_if_new(chunk);
+        let recovered = codex_exec_server::replay_process_events(
+            self.last_seq,
+            self.exit_known,
+            response,
+            trigger,
+        )
+        .map_err(io::Error::other)?;
+        for event in recovered {
+            match event {
+                ExecProcessEvent::Output(chunk) => self.push_process_output_if_new(chunk),
+                ExecProcessEvent::Exited { seq, .. } => {
+                    self.note_seq(seq);
+                    self.exit_known = true;
+                }
+                ExecProcessEvent::Closed { seq, .. } => {
+                    self.note_seq(seq);
+                    self.closed = true;
+                }
+                ExecProcessEvent::OutputGap { .. } | ExecProcessEvent::Failed(_) => {
+                    return Err(io::Error::other("remote MCP output could not be recovered"));
+                }
+            }
             if self.closed {
                 break;
             }
-        }
-        self.last_seq = self.last_seq.max(response.next_seq.saturating_sub(1));
-        if let Some(message) = response.failure {
-            warn!(
-                "Remote MCP server process failed ({}): {message}",
-                self.program_name
-            );
-            self.closed = true;
-        } else if response.closed {
-            self.closed = true;
         }
         Ok(())
     }

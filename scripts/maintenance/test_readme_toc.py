@@ -5,11 +5,60 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.maintenance import readme_toc
 
 
 class ReadmeTocTest(unittest.TestCase):
+    def test_partial_stage_write_preserves_original_and_removes_temporary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "README.md"
+            original = b"# Title\n<!-- Begin ToC -->\nold\n<!-- End ToC -->\n## New\n"
+            path.write_bytes(original)
+            create = readme_toc.tempfile.NamedTemporaryFile
+
+            @contextlib.contextmanager
+            def partial(*args, **kwargs):
+                with create(*args, **kwargs) as stage:
+                    write = stage.write
+
+                    def fail(text):
+                        write(text[:7])
+                        raise OSError("partial stage")
+
+                    with mock.patch.object(stage, "write", side_effect=fail):
+                        yield stage
+
+            with (
+                mock.patch.object(readme_toc.tempfile, "NamedTemporaryFile", partial),
+                self.assertRaises(OSError),
+            ):
+                readme_toc.check_or_fix(path, fix=True)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_failed_staging_or_replacement_preserves_authored_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "README.md"
+            original = b"# Title\r\n<!-- Begin ToC -->\r\nold\r\n<!-- End ToC -->\r\n## New\r\n"
+            for boundary in ("fsync", "replace"):
+                path.write_bytes(original)
+                mode = path.stat().st_mode
+                with (
+                    self.subTest(boundary=boundary),
+                    mock.patch.object(
+                        readme_toc.os,
+                        boundary,
+                        side_effect=OSError("injected write failure"),
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    readme_toc.check_or_fix(path, fix=True)
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(path.stat().st_mode, mode)
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_literal_identifiers_survive_inline_formatting(self) -> None:
         self.assertEqual(
             readme_toc.generate_toc_lines(

@@ -133,14 +133,58 @@ struct ProjectDocOmission {
 /// manifest (and changing prompt identity) at every sampling boundary.
 pub(crate) struct ProjectDocOmissionRecovery {
     thread_id: String,
-    cached: tokio::sync::Mutex<Option<(String, String)>>,
+    cached: Arc<tokio::sync::Mutex<Option<ProjectDocManifestReceipt>>>,
+}
+
+struct ProjectDocManifestReceipt {
+    home: std::path::PathBuf,
+    hash: String,
+    bytes: u64,
+    artifact_id: String,
+    notice: String,
 }
 
 impl ProjectDocOmissionRecovery {
+    async fn receipt_available(thread_id: &str, receipt: &ProjectDocManifestReceipt) -> bool {
+        let Ok(bytes) = crate::tools::command_output_artifact::read_complete_canonical_snapshot(
+            &receipt.home,
+            thread_id,
+            &receipt.artifact_id,
+            usize::try_from(receipt.bytes).unwrap_or(usize::MAX),
+        )
+        .await
+        else {
+            return false;
+        };
+        bytes.len() as u64 == receipt.bytes && hex::encode(Sha256::digest(&bytes)) == receipt.hash
+    }
+
+    pub(crate) async fn cached_manifest_available(&self) -> bool {
+        let Ok(cached) = Arc::clone(&self.cached).try_lock_owned() else {
+            return false;
+        };
+        if cached.is_none() {
+            return true;
+        }
+        let thread_id = self.thread_id.clone();
+        // Keep the existing cache lock with the I/O owner through an observer
+        // timeout. Stalled storage must not block cached consumers forever or
+        // allow subsequent consumers to start duplicate validation reads.
+        let validation = tokio::spawn(async move {
+            match cached.as_ref() {
+                Some(receipt) => Self::receipt_available(&thread_id, receipt).await,
+                None => true,
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), validation)
+            .await
+            .is_ok_and(|result| result.unwrap_or(false))
+    }
+
     pub(crate) fn new(thread_id: String) -> Self {
         Self {
             thread_id,
-            cached: tokio::sync::Mutex::new(None),
+            cached: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -156,10 +200,12 @@ impl ProjectDocOmissionRecovery {
         let canonical =
             codex_tools::CanonicalToolResult::json(serde_json::json!({"documents":documents}));
         let mut cached = self.cached.lock().await;
-        if let Some((hash, notice)) = cached.as_ref()
-            && hash == &canonical.sha256
+        if let Some(receipt) = cached.as_ref()
+            && receipt.home == config.codex_home.as_path()
+            && receipt.hash == canonical.sha256
+            && Self::receipt_available(&self.thread_id, receipt).await
         {
-            return notice.clone();
+            return receipt.notice.clone();
         }
         let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
             config.codex_home.as_path(),
@@ -177,8 +223,16 @@ impl ProjectDocOmissionRecovery {
         };
         let notice = project_doc_omission_notice(documents, recovery.as_deref()
             .unwrap_or("\nPath manifest recovery unavailable; inspect the named environments before relying on omitted instructions.")).0;
-        if recovery.is_some() {
-            *cached = Some((canonical.sha256, notice.clone()));
+        if recovery.is_some()
+            && let Some(artifact_id) = artifact.artifact_id()
+        {
+            *cached = Some(ProjectDocManifestReceipt {
+                home: config.codex_home.to_path_buf(),
+                hash: canonical.sha256,
+                bytes: canonical.exact_bytes,
+                artifact_id,
+                notice: notice.clone(),
+            });
         }
         notice
     }
@@ -189,7 +243,7 @@ struct LoadedProjectDoc {
     read: ProjectDocRead,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ProjectDocCandidate {
     path: PathUri,
     size: u64,
@@ -197,6 +251,8 @@ struct ProjectDocCandidate {
 
 pub(crate) struct ProjectInstructionsDiscovery {
     environments: Vec<EnvironmentProjectInstructionsDiscovery>,
+    environment_labels_required: bool,
+    complete: bool,
 }
 
 struct EnvironmentProjectInstructionsDiscovery {
@@ -206,7 +262,7 @@ struct EnvironmentProjectInstructionsDiscovery {
     result: io::Result<Vec<ProjectDocCandidate>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ProjectDocRead {
     retained_data: Vec<u8>,
     original_bytes: u64,
@@ -214,7 +270,7 @@ struct ProjectDocRead {
 }
 
 /// Last accepted source bytes, separate from generated truncation/encoding notices.
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RetainedProjectDoc {
     environment_id: String,
     cwd: PathUri,
@@ -271,9 +327,13 @@ pub(crate) async fn discover_project_instructions_with_markers(
     if config.project_doc_max_bytes == 0 {
         return ProjectInstructionsDiscovery {
             environments: Vec::new(),
+            environment_labels_required: false,
+            complete: true,
         };
     }
 
+    let environment_labels_required = environments.to_selections().len() > 1;
+    let complete = environments.starting.is_empty();
     let project_root_markers: Arc<[String]> = Arc::from(project_root_markers.to_vec());
     let environments =
         futures::stream::iter(environments.turn_environments.clone().into_iter().map(
@@ -308,7 +368,11 @@ pub(crate) async fn discover_project_instructions_with_markers(
         .collect::<Vec<_>>()
         .await;
 
-    ProjectInstructionsDiscovery { environments }
+    ProjectInstructionsDiscovery {
+        environments,
+        environment_labels_required,
+        complete,
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +400,8 @@ pub(crate) async fn load_project_instructions_with_fallback(
     previous: Option<(&LoadedAgentsMd, &[RetainedProjectDoc])>,
 ) -> ProjectInstructionsLoad {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
+    loaded.environment_labels_required =
+        discovery.environment_labels_required || discovery.environments.len() > 1;
     let mut remaining_source_bytes = config.project_doc_max_bytes;
     let mut remaining_rendered_bytes = project_doc_rendered_max_bytes(config.project_doc_max_bytes);
     let aggregate_reserve =
@@ -343,7 +409,7 @@ pub(crate) async fn load_project_instructions_with_fallback(
     remaining_rendered_bytes = remaining_rendered_bytes.saturating_sub(aggregate_reserve);
     let mut omitted_documents = Vec::new();
     let mut retained_sources = Vec::new();
-    let mut complete = true;
+    let mut complete = discovery.complete;
     if remaining_source_bytes == 0 {
         return ProjectInstructionsLoad {
             loaded: (!loaded.is_empty()).then_some(loaded),
@@ -366,12 +432,7 @@ pub(crate) async fn load_project_instructions_with_fallback(
             (discovery, retained)
         })
         .collect::<Vec<_>>();
-    let contributing_environments = environments
-        .iter()
-        .filter(|(discovery, retained)| {
-            !retained.is_empty() || matches!(&discovery.result, Ok(paths) if !paths.is_empty())
-        })
-        .count();
+    let environment_labels_required = loaded.environment_labels_required;
     let mut first_project_environment = true;
     for (
         EnvironmentProjectInstructionsDiscovery {
@@ -402,16 +463,15 @@ pub(crate) async fn load_project_instructions_with_fallback(
         if first_project_environment && loaded.user_instructions.is_some() {
             generated_overhead += AGENTS_MD_SEPARATOR.len();
         }
-        if contributing_environments > 1 {
+        if environment_labels_required {
             if !first_project_environment {
                 generated_overhead += 2;
             }
-            generated_overhead += format!(
+            generated_overhead += ContextUserInstructions::escaped_text_len(&format!(
                 "for `{}` with cwd {}\n\n",
                 environment_id,
                 cwd.inferred_native_path_string()
-            )
-            .len();
+            ));
         }
         if generated_overhead >= remaining_rendered_bytes {
             omitted_documents.extend(candidates.iter().map(|candidate| ProjectDocOmission {
@@ -481,7 +541,10 @@ pub(crate) async fn load_project_instructions_with_fallback(
             Some(owner) => owner.notice(config, &omitted_documents).await,
             None => aggregate_project_doc_omission_notice(&omitted_documents),
         };
-        debug_assert!(notice.len().saturating_add(2) <= aggregate_reserve);
+        debug_assert!(
+            ContextUserInstructions::escaped_text_len(&notice).saturating_add(2)
+                <= aggregate_reserve
+        );
         loaded.entries.push(InstructionEntry {
             contents: notice,
             provenance: InstructionProvenance::Internal,
@@ -580,7 +643,10 @@ async fn read_discovered_agents_md(
     );
     if !rendered.omitted_documents.is_empty() {
         let notice = aggregate_project_doc_omission_notice(&rendered.omitted_documents);
-        debug_assert!(notice.len().saturating_add(2) <= aggregate_reserve);
+        debug_assert!(
+            ContextUserInstructions::escaped_text_len(&notice).saturating_add(2)
+                <= aggregate_reserve
+        );
         let mut loaded = rendered.loaded.take().unwrap_or_default();
         loaded.entries.push(InstructionEntry {
             contents: notice,
@@ -679,7 +745,9 @@ fn render_project_docs(
     }) = project_docs.next()
     {
         let separator_bytes = usize::from(!entries.is_empty()) * 2;
-        let source_header_bytes = project_instruction_source_header(&candidate.path).len();
+        let source_header_bytes = ContextUserInstructions::escaped_text_len(
+            &project_instruction_source_header(&candidate.path),
+        );
         let Some((text, retained_bytes)) = render_project_doc_to_budget(
             &mut read,
             &candidate.path,
@@ -715,7 +783,7 @@ fn render_project_docs(
             );
         }
 
-        let rendered_bytes = text.len();
+        let rendered_bytes = ContextUserInstructions::escaped_text_len(&text);
         retained_sources.push(RetainedProjectDoc {
             environment_id: environment_id.to_string(),
             cwd: cwd.clone(),
@@ -774,7 +842,11 @@ fn project_doc_omission_notice(documents: &[ProjectDocOmission], recovery: &str)
             serde_json::json!({"environment_id":document.environment_id,"path":document.path})
         );
         // Reserve a bounded overflow count plus the executable recovery call.
-        if notice.len() + row.len() + recovery.len() + 80 + 2
+        if ContextUserInstructions::escaped_text_len(&notice)
+            + ContextUserInstructions::escaped_text_len(&row)
+            + ContextUserInstructions::escaped_text_len(recovery)
+            + 80
+            + 2
             > PROJECT_DOC_AGGREGATE_NOTICE_RESERVE_BYTES
         {
             break;
@@ -818,13 +890,14 @@ fn render_project_doc_to_budget(
                 retained_bytes,
             ));
         }
-        if text.len() <= max_bytes {
+        let encoded_bytes = ContextUserInstructions::escaped_text_len(&text);
+        if encoded_bytes <= max_bytes {
             return Some((text, retained_bytes));
         }
         if retained_bytes == 0 {
             return None;
         }
-        let excess = text.len().saturating_sub(max_bytes).max(1);
+        let excess = encoded_bytes.saturating_sub(max_bytes).max(1);
         truncate_project_doc_to_budget(read, retained_bytes.saturating_sub(excess));
     }
 }
@@ -1122,23 +1195,27 @@ async fn agents_md_paths_with_metrics_and_markers(
     } else {
         ProjectDiscoveryReuse::Miss("cwd_unavailable")
     };
-    let project_root = match reuse {
-        ProjectDiscoveryReuse::Hit(root) => {
+    // Configuration evidence has a different lifetime from project-file scope.
+    // Revalidate the bounded lexical ancestor chain, including nearer markers.
+    let project_root = find_nearest_ancestor_with_markers(
+        fs,
+        &dir,
+        project_root_markers.to_vec(),
+        FindUpErrorPolicy::Propagate,
+        /*sandbox*/ None,
+    )
+    .await?;
+    match reuse {
+        ProjectDiscoveryReuse::Hit(root) if project_root.as_ref() == Some(&root) => {
             record_project_discovery_reuse(metrics, "agents_md", "hit", "matched");
-            Some(root)
+        }
+        ProjectDiscoveryReuse::Hit(_) => {
+            record_project_discovery_reuse(metrics, "agents_md", "miss", "boundary_changed");
         }
         ProjectDiscoveryReuse::Miss(reason) => {
             record_project_discovery_reuse(metrics, "agents_md", "miss", reason);
-            find_nearest_ancestor_with_markers(
-                fs,
-                &dir,
-                project_root_markers.to_vec(),
-                FindUpErrorPolicy::Propagate,
-                /*sandbox*/ None,
-            )
-            .await?
         }
-    };
+    }
     let search_dirs = if let Some(root) = project_root {
         let mut dirs = Vec::new();
         let mut cursor = dir.clone();
@@ -1260,6 +1337,8 @@ pub fn project_doc_candidate_filenames(config: &Config) -> Vec<&str> {
 /// guidance.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
+    /// Labels are necessary even if only one selected environment has documents.
+    environment_labels_required: bool,
     /// Host-provided user instructions.
     user_instructions: Option<UserInstructions>,
 
@@ -1273,6 +1352,16 @@ pub(crate) struct RepositoryStableContextBundle {
     pub(crate) rendered: Arc<str>,
     pub(crate) reused: bool,
     pub(crate) semantic_replacement: bool,
+    pub(crate) source_snapshot: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AcceptedProjectSources {
+    version: u8,
+    active_cwd: PathUri,
+    entries: Vec<InstructionEntry>,
+    sources: Vec<RetainedProjectDoc>,
+    environment_labels_required: bool,
 }
 
 struct RenderedStableContext {
@@ -1336,17 +1425,89 @@ impl RepositoryStableContextBundle {
             rendered: Arc::clone(&self.rendered),
             reused: true,
             semantic_replacement: false,
+            source_snapshot: self.source_snapshot.clone(),
         }
     }
 }
 
 impl LoadedAgentsMd {
+    /// Exact instruction sources loaded for this sampling step, including
+    /// configured fallback filenames. A filename alone does not imply loading.
+    pub(crate) fn runtime_input_paths(&self) -> Vec<(String, std::path::PathBuf)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.provenance {
+                InstructionProvenance::Project {
+                    source_path,
+                    environment_id,
+                    ..
+                } => Some((
+                    environment_id.clone(),
+                    std::path::PathBuf::from(source_path.inferred_native_path_string()),
+                )),
+                InstructionProvenance::Internal => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn accepted_project_sources(
+        &self,
+        active_cwd: &PathUri,
+        sources: &[RetainedProjectDoc],
+    ) -> serde_json::Value {
+        serde_json::to_value(AcceptedProjectSources {
+            version: 1,
+            active_cwd: active_cwd.clone(),
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry.provenance, InstructionProvenance::Project { .. }))
+                .cloned()
+                .collect(),
+            sources: sources.to_vec(),
+            environment_labels_required: self.environment_labels_required,
+        })
+        .unwrap_or(serde_json::Value::Null)
+    }
+
+    pub(crate) fn restore_project_sources(
+        value: &serde_json::Value,
+        config: &Config,
+        user_instructions: Option<UserInstructions>,
+    ) -> Option<(Self, Vec<RetainedProjectDoc>)> {
+        let saved: AcceptedProjectSources = serde_json::from_value(value.clone()).ok()?;
+        if saved.version != 1
+            || saved.active_cwd != PathUri::from_abs_path(&config.cwd)
+            || saved
+                .sources
+                .iter()
+                .map(|source| source.read.retained_data.len())
+                .sum::<usize>()
+                > config.project_doc_max_bytes
+            || saved
+                .entries
+                .iter()
+                .any(|entry| !matches!(entry.provenance, InstructionProvenance::Project { .. }))
+        {
+            return None;
+        }
+        Some((
+            Self {
+                user_instructions,
+                entries: saved.entries,
+                environment_labels_required: saved.environment_labels_required,
+            },
+            saved.sources,
+        ))
+    }
+
     /// Creates loaded instructions containing one user-level AGENTS.md entry.
     pub fn new_user(contents: String, path: AbsolutePathBuf) -> Self {
         if contents.trim().is_empty() {
             return Self::default();
         }
         Self {
+            environment_labels_required: false,
             user_instructions: Some(UserInstructions {
                 text: contents,
                 source: path,
@@ -1357,6 +1518,7 @@ impl LoadedAgentsMd {
 
     fn from_user_instructions(user_instructions: Option<UserInstructions>) -> Self {
         Self {
+            environment_labels_required: false,
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),
             entries: Vec::new(),
@@ -1373,6 +1535,7 @@ impl LoadedAgentsMd {
             return Self::default();
         }
         Self {
+            environment_labels_required: false,
             user_instructions: None,
             entries: vec![InstructionEntry {
                 contents,
@@ -1392,6 +1555,24 @@ impl LoadedAgentsMd {
     /// Returns the concatenated model-visible instruction text.
     pub fn text(&self) -> String {
         self.render_stable_context().text
+    }
+
+    /// Cached/timeout consumers must not republish a locator whose artifact
+    /// could not be verified. Only host-owned omission notices are rewritten.
+    pub(crate) fn without_unverified_omission_receipts(&self) -> Self {
+        let mut loaded = self.clone();
+        for entry in &mut loaded.entries {
+            if matches!(entry.provenance, InstructionProvenance::Internal)
+                && entry.contents.starts_with("Project docs omitted:")
+                && let Some(start) = entry
+                    .contents
+                    .find("\nRecover omitted paths with read_tool_output:")
+            {
+                entry.contents.truncate(start);
+                entry.contents.push_str("\nPath manifest recovery unavailable; inspect the named environments before relying on omitted instructions.");
+            }
+        }
+        loaded
     }
 
     /// Stable digest of the exact model-visible instruction text.
@@ -1420,6 +1601,7 @@ impl LoadedAgentsMd {
             rendered,
             reused: false,
             semantic_replacement: false,
+            source_snapshot: None,
         }
     }
 
@@ -1436,6 +1618,7 @@ impl LoadedAgentsMd {
 
         let mut hasher = Sha256::new();
         hasher.update(b"codex.repository-context-structure.v1");
+        hasher.update([u8::from(self.environment_labels_required)]);
         update_part(
             &mut hasher,
             active_cwd.inferred_native_path_string().as_bytes(),
@@ -1583,8 +1766,7 @@ impl LoadedAgentsMd {
         &self,
         text: String,
     ) -> ContextUserInstructions {
-        // One contributing project environment retains the legacy cwd wrapper. With two or more,
-        // the body labels every contributing environment itself, so the outer cwd is omitted.
+        // Multiple selected environments need labels even for a sole contributor.
         let directory = if self.has_multiple_project_environments() {
             None
         } else {
@@ -1607,6 +1789,9 @@ impl LoadedAgentsMd {
     }
 
     fn has_multiple_project_environments(&self) -> bool {
+        if self.environment_labels_required {
+            return true;
+        }
         let mut first_environment_id = None;
         self.entries.iter().any(|entry| {
             let InstructionProvenance::Project { environment_id, .. } = &entry.provenance else {
@@ -1633,7 +1818,7 @@ impl LoadedAgentsMd {
 }
 
 /// One model-visible instruction and its provenance.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct InstructionEntry {
     /// Model-visible instruction text.
     contents: String,
@@ -1642,7 +1827,7 @@ struct InstructionEntry {
     provenance: InstructionProvenance,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum InstructionProvenance {
     /// Workspace instructions discovered from project AGENTS.md files.
     Project {

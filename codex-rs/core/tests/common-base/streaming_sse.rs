@@ -37,7 +37,12 @@ impl StreamingSseServer {
     /// (both in queue order) before it is written. A gated chunk reads its
     /// replacement after the gate opens, so a test can send content that
     /// depends on output observed while that response was held.
-    pub async fn replace_chunk_body(&self, response_index: usize, chunk_index: usize, body: String) {
+    pub async fn replace_chunk_body(
+        &self,
+        response_index: usize,
+        chunk_index: usize,
+        body: String,
+    ) {
         self.chunk_bodies
             .lock()
             .await
@@ -497,8 +502,16 @@ mod tests {
     async fn invalid_requests_return_distinct_errors() {
         let (server, _) = start_streaming_sse_server(Vec::new()).await;
         for (request, status, expected_body) in [
-            ("POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n", 500, "no responses queued"),
-            ("GET /v1/unknown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", 404, "not found"),
+            (
+                "POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+                500,
+                "no responses queued",
+            ),
+            (
+                "GET /v1/unknown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                404,
+                "not found",
+            ),
             ("BAD\r\n\r\n", 400, "bad request"),
         ] {
             let mut stream = connect(server.uri()).await;
@@ -621,8 +634,6 @@ mod tests {
         server.shutdown().await;
     }
 
-
-
     #[tokio::test]
     async fn responses_post_drains_request_body() {
         let response_body = r#"event: response.completed
@@ -659,7 +670,8 @@ data: {"type":"response.completed","response":{"id":"resp-1"}}
         let requests = server.requests().await;
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&requests[0]).expect("recorded JSON request"),
+            serde_json::from_slice::<serde_json::Value>(&requests[0])
+                .expect("recorded JSON request"),
             payload,
         );
 

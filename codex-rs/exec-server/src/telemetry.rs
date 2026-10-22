@@ -15,12 +15,17 @@ const REQUESTS_TOTAL_DESCRIPTION: &str = "Total number of exec-server requests."
 const REQUEST_DURATION_METRIC: &str = "exec_server_request_duration_seconds";
 const REQUEST_DURATION_DESCRIPTION: &str = "Duration of exec-server requests in seconds.";
 const PROCESSES_ACTIVE_METRIC: &str = "exec_server_processes_active";
-const PROCESSES_ACTIVE_DESCRIPTION: &str = "Number of active exec-server processes.";
+const PROCESSES_ACTIVE_DESCRIPTION: &str =
+    "Number of exec-server processes with live exit observation.";
+const PROCESS_OBSERVATION_LOST_METRIC: &str = "exec_server_process_observation_lost_total";
+const PROCESS_OBSERVATION_LOST_DESCRIPTION: &str =
+    "Process observations lost without a confirmed exit.";
 const PROCESSES_FINISHED_TOTAL_METRIC: &str = "exec_server_processes_finished_total";
 const PROCESSES_FINISHED_TOTAL_DESCRIPTION: &str =
-    "Total number of finished exec-server processes.";
+    "Total number of confirmed process exits observed by exec-server.";
 const PROCESS_DURATION_METRIC: &str = "exec_server_process_duration_seconds";
-const PROCESS_DURATION_DESCRIPTION: &str = "Duration of exec-server processes in seconds.";
+const PROCESS_DURATION_DESCRIPTION: &str =
+    "Duration from executor registration to observed process exit, in seconds.";
 const REMOTE_REGISTRATION_METRICS: OperationMetrics = OperationMetrics {
     total_name: "exec_server_remote_registration_total",
     total_description: "Total number of remote exec-server registration attempts.",
@@ -97,10 +102,43 @@ pub(crate) struct ConnectionMetricGuard {
 pub(crate) struct ProcessMetricGuard {
     telemetry: ExecServerTelemetry,
     started_at: Instant,
+    outcome: Option<(&'static str, Duration)>,
+}
+
+pub(crate) struct RequestMetricGuard {
+    telemetry: ExecServerTelemetry,
+    method: &'static str,
+    started_at: Instant,
     result: &'static str,
 }
 
+impl RequestMetricGuard {
+    pub(crate) fn set_result(&mut self, result: &'static str) {
+        self.result = result;
+    }
+}
+
+impl Drop for RequestMetricGuard {
+    fn drop(&mut self) {
+        self.telemetry
+            .request_completed(self.method, self.result, self.started_at.elapsed());
+    }
+}
+
 impl ExecServerTelemetry {
+    pub(crate) fn request_started_at(
+        &self,
+        method: &'static str,
+        started_at: Instant,
+    ) -> RequestMetricGuard {
+        RequestMetricGuard {
+            telemetry: self.clone(),
+            method,
+            started_at,
+            result: "abandoned",
+        }
+    }
+
     pub fn new(metrics: MetricsClient) -> Self {
         let active = Arc::new(Mutex::new(ActiveCounts::default()));
         register_active_gauges(&metrics, &active);
@@ -170,7 +208,7 @@ impl ExecServerTelemetry {
         ProcessMetricGuard {
             telemetry: self.clone(),
             started_at: Instant::now(),
-            result: "unknown",
+            outcome: None,
         }
     }
 
@@ -187,6 +225,17 @@ impl ExecServerTelemetry {
                 PROCESS_DURATION_DESCRIPTION,
                 duration,
                 &[("result", result)],
+            );
+        });
+    }
+
+    fn process_observation_lost(&self) {
+        self.with_inner(|inner| {
+            inner.adjust_process_count(-1);
+            inner.counter(
+                PROCESS_OBSERVATION_LOST_METRIC,
+                PROCESS_OBSERVATION_LOST_DESCRIPTION,
+                &[],
             );
         });
     }
@@ -229,15 +278,20 @@ impl Drop for ConnectionMetricGuard {
 }
 
 impl ProcessMetricGuard {
-    pub(crate) fn finish(mut self, result: &'static str) {
-        self.result = result;
+    pub(crate) fn finish(mut self, result: &'static str, observed_at: Instant) {
+        self.outcome = Some((
+            result,
+            observed_at.saturating_duration_since(self.started_at),
+        ));
     }
 }
 
 impl Drop for ProcessMetricGuard {
     fn drop(&mut self) {
-        self.telemetry
-            .process_finished(self.result, self.started_at.elapsed());
+        match self.outcome {
+            Some((result, duration)) => self.telemetry.process_finished(result, duration),
+            None => self.telemetry.process_observation_lost(),
+        }
     }
 }
 

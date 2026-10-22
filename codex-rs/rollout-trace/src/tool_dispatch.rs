@@ -101,6 +101,7 @@ pub enum ToolDispatchPayload {
 pub enum ToolDispatchResult {
     DirectResponse { response_item: ResponseInputItem },
     CodeModeResponse { value: JsonValue },
+    DetailOmitted { reason: &'static str },
 }
 
 /// Raw invocation payload for the canonical Codex tool boundary.
@@ -120,6 +121,9 @@ enum DispatchedToolTraceResponse<'a> {
     },
     CodeModeResponse {
         value: &'a JsonValue,
+    },
+    DetailOmitted {
+        reason: &'a str,
     },
     Error {
         error: String,
@@ -172,6 +176,9 @@ impl ToolDispatchTraceContext {
             ToolDispatchResult::CodeModeResponse { value } => {
                 DispatchedToolTraceResponse::CodeModeResponse { value }
             }
+            ToolDispatchResult::DetailOmitted { reason } => {
+                DispatchedToolTraceResponse::DetailOmitted { reason }
+            }
         };
         append_tool_call_ended(context, status, &response);
     }
@@ -179,6 +186,20 @@ impl ToolDispatchTraceContext {
     /// Records a dispatch failure before the tool produced a normal result payload.
     pub fn record_failed(&self, error: impl Display) {
         self.record_error(ExecutionStatus::Failed, error);
+    }
+
+    /// Records cancellation after the owning runtime has completed cleanup.
+    pub fn record_process_observations(&self, observations: JsonValue) {
+        let ToolDispatchTraceContextState::Enabled(context) = &self.state else {
+            return;
+        };
+        append_with_context_best_effort(
+            context,
+            RawTraceEventPayload::ProcessStartsObserved {
+                tool_call_id: context.tool_call_id.clone(),
+                observations,
+            },
+        );
     }
 
     /// Records cancellation after the owning runtime has completed cleanup.
@@ -502,8 +523,12 @@ mod tests {
         assert!(!suppresses_tool_dispatch_trace(&invocation(
             codex_code_mode::PUBLIC_TOOL_NAME,
             None,
-            ToolDispatchRequester::Model { model_visible_call_id: "call-function".into() },
-            ToolDispatchPayload::Function { arguments: "{}".into() },
+            ToolDispatchRequester::Model {
+                model_visible_call_id: "call-function".into()
+            },
+            ToolDispatchPayload::Function {
+                arguments: "{}".into()
+            },
         )));
         assert!(suppresses_tool_dispatch_trace(&invocation(
             codex_code_mode::PUBLIC_TOOL_NAME,

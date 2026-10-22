@@ -359,9 +359,15 @@ mod tests {
             }]
         );
         assert_eq!(outcome.effective_mcp_servers(), active.mcp_servers);
-        assert_eq!(outcome.effective_apps(), vec![AppConnectorId("active@test".to_string())]);
+        assert_eq!(
+            outcome.effective_apps(),
+            vec![AppConnectorId("active@test".to_string())]
+        );
         assert_eq!(outcome.effective_plugin_hook_sources(), active.hook_sources);
-        assert_eq!(outcome.effective_plugin_hook_warnings(), active.hook_load_warnings);
+        assert_eq!(
+            outcome.effective_plugin_hook_warnings(),
+            active.hook_load_warnings
+        );
         let [summary] = outcome.capability_summaries() else {
             panic!("only the active plugin may advertise capabilities");
         };

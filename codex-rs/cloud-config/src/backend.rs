@@ -2,6 +2,8 @@ use codex_backend_client::Client as BackendClient;
 use codex_backend_client::ConfigBundleResponse;
 use codex_backend_client::DeliveredTomlFragment;
 use codex_config::CloudConfigBundle;
+use codex_config::CloudConfigBundleLoadError;
+use codex_config::CloudConfigBundleLoadErrorCode;
 use codex_config::CloudConfigFragment;
 use codex_config::CloudConfigTomlBundle;
 use codex_config::CloudRequirementsFragment;
@@ -26,6 +28,7 @@ impl RetryableFailureKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BundleRequestError {
     Retryable(RetryableFailureKind),
+    Terminal(CloudConfigBundleLoadError),
     Unauthorized {
         status_code: Option<u16>,
         message: String,
@@ -74,8 +77,38 @@ impl BundleClient for BackendBundleClient {
                         status_code,
                         message: err.to_string(),
                     }
-                } else {
+                } else if matches!(err, codex_backend_client::RequestError::LocalAuth(_)) {
+                    BundleRequestError::Terminal(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Auth,
+                        status_code,
+                        "failed to construct authenticated cloud config request",
+                    ))
+                } else if matches!(err, codex_backend_client::RequestError::InvalidResponse(_)) {
+                    BundleRequestError::Terminal(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::InvalidBundle,
+                        status_code,
+                        "invalid cloud config bundle response",
+                    ))
+                } else if matches!(
+                    &err,
+                    codex_backend_client::RequestError::IncompleteResponse { status, .. }
+                        if status.is_success()
+                ) {
+                    // A success whose body was cut off is a transport failure,
+                    // not a terminal HTTP status.
+                    BundleRequestError::Retryable(RetryableFailureKind::Request {
+                        status_code: None,
+                    })
+                } else if status_code.is_none_or(|status| {
+                    status == 408 || status == 429 || (500..600).contains(&status)
+                }) {
                     BundleRequestError::Retryable(RetryableFailureKind::Request { status_code })
+                } else {
+                    BundleRequestError::Terminal(CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::RequestFailed,
+                        status_code,
+                        "cloud config bundle request failed with a terminal HTTP status",
+                    ))
                 }
             })?;
 
@@ -141,6 +174,87 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn terminal_http_and_malformed_success_are_not_transient() {
+        for (status, body, code) in [
+            (
+                "403 Forbidden",
+                "{}",
+                CloudConfigBundleLoadErrorCode::RequestFailed,
+            ),
+            (
+                "404 Not Found",
+                "{}",
+                CloudConfigBundleLoadErrorCode::RequestFailed,
+            ),
+            (
+                "422 Unprocessable Entity",
+                "{}",
+                CloudConfigBundleLoadErrorCode::RequestFailed,
+            ),
+            ("200 OK", "{", CloudConfigBundleLoadErrorCode::InvalidBundle),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let client = BackendBundleClient::new(
+                base_url,
+                HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            );
+            let auth = CodexAuth::from_external_chatgpt_tokens(
+                "e30.e30.sig",
+                "account-a",
+                Some("enterprise"),
+            )
+            .unwrap();
+            let result = client.get_bundle(&auth).await;
+            server.await.unwrap();
+            assert!(
+                matches!(result, Err(BundleRequestError::Terminal(error)) if error.code() == code)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_success_body_is_retryable_transport_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            // Promise a longer body, then close the connection mid-body.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+        });
+        let client = BackendBundleClient::new(
+            base_url,
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
+        let auth =
+            CodexAuth::from_external_chatgpt_tokens("e30.e30.sig", "account-a", Some("enterprise"))
+                .unwrap();
+        let result = client.get_bundle(&auth).await;
+        server.await.unwrap();
+        assert_eq!(
+            result,
+            Err(BundleRequestError::Retryable(
+                RetryableFailureKind::Request { status_code: None }
+            ))
+        );
+    }
 
     #[tokio::test]
     async fn bundle_requests_reuse_connection_with_fresh_auth_after_errors() {

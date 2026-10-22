@@ -6,8 +6,7 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_config::version_for_toml;
-use codex_file_system::acquire_atomic_write_lock;
-use codex_file_system::resolve_symlink_write_paths;
+use codex_file_system::acquire_resolved_atomic_write_lock;
 use codex_file_system::write_atomically;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
@@ -650,35 +649,14 @@ fn apply_blocking_to_resolved_file(
     edits: &[ConfigEdit],
     expected_version: Option<&str>,
 ) -> anyhow::Result<ConfigApplyOutcome> {
-    // Aliases must share the target's lock, including aliases in parent paths.
-    let resolve_target = || -> anyhow::Result<_> {
-        let mut paths = resolve_symlink_write_paths(resolved_config_file)?;
-        let parent = paths
-            .write_path
-            .parent()
-            .context("config target has no parent")?;
-        std::fs::create_dir_all(parent)?;
-        paths.write_path = std::fs::canonicalize(parent)?.join(
-            paths
-                .write_path
-                .file_name()
-                .context("config target has no file name")?,
-        );
-        paths.read_path = Some(paths.write_path.clone());
-        Ok(paths)
-    };
-    let write_paths = resolve_target()?;
-    let _lock = acquire_atomic_write_lock(&write_paths.write_path).with_context(|| {
-        format!(
-            "failed to lock config at {}",
-            resolved_config_file.display()
-        )
-    })?;
+    let (write_paths, _lock) = acquire_resolved_atomic_write_lock(resolved_config_file)
+        .with_context(|| {
+            format!(
+                "failed to lock config at {}",
+                resolved_config_file.display()
+            )
+        })?;
 
-    anyhow::ensure!(
-        resolve_target()?.write_path == write_paths.write_path,
-        "config target changed while acquiring its persistence lock; retry the edit"
-    );
     let serialized = match write_paths.read_path {
         Some(path) => match std::fs::read_to_string(&path) {
             Ok(contents) => contents,

@@ -208,7 +208,10 @@ fn remote_control_server_request_error_classifies_status_before_timeout() {
 async fn request_timeouts_before_headers_and_during_body_are_transient() {
     for (partial_response, expected_status) in [
         (None, None),
-        (Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{"[..]), Some(StatusCode::OK)),
+        (
+            Some(&b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{"[..]),
+            Some(StatusCode::OK),
+        ),
     ] {
         let err = timed_out_request(partial_response).await;
         assert_transient_timeout(&err, expected_status);

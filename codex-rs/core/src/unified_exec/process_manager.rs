@@ -1,7 +1,6 @@
 use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Notify;
@@ -63,6 +62,7 @@ use crate::unified_exec::process::OutputHandles;
 use crate::unified_exec::process::SpawnLifecycleHandle;
 use crate::unified_exec::process::UnifiedExecProcess;
 use codex_network_proxy::NetworkProxy;
+use codex_network_proxy::PROXY_ENV_KEYS;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
 use codex_protocol::error::CodexErr;
@@ -253,6 +253,25 @@ fn env_overlay_for_exec_server(
         .collect()
 }
 
+/// The executor rebuilds the child environment from this policy and its own process environment,
+/// then applies the overlay, which can add or replace variables but never remove them. Without a
+/// managed proxy route (a disabled managed proxy grants no loopback port), keep the executor from
+/// reconstructing proxy routing variables: its Windows sandbox firewall allows exactly the
+/// loopback ports those variables name.
+fn exec_env_policy_without_proxy_routes(
+    mut policy: codex_exec_server::ExecEnvPolicy,
+) -> codex_exec_server::ExecEnvPolicy {
+    policy
+        .exclude
+        .extend(PROXY_ENV_KEYS.iter().map(|key| (*key).to_string()));
+    policy.r#set.retain(|key, _| {
+        !PROXY_ENV_KEYS
+            .iter()
+            .any(|proxy_key| proxy_key.eq_ignore_ascii_case(key))
+    });
+    policy
+}
+
 async fn exec_server_env_for_request(
     request: &ExecRequest,
 ) -> Result<
@@ -265,6 +284,10 @@ async fn exec_server_env_for_request(
     let request_env = request.env.clone();
     let env_config = request.exec_server_env_config.clone();
     let has_managed_network = request.exec_server_managed_network.is_some();
+    let managed_network_without_proxy_route = request
+        .exec_server_managed_network
+        .as_ref()
+        .is_some_and(|context| context.loopback_ports.is_empty());
     tokio::task::spawn_blocking(move || {
         if let Some(exec_server_env_config) = &env_config {
             let mut env =
@@ -276,7 +299,12 @@ async fn exec_server_env_for_request(
                     }
                 }
             }
-            (Some(exec_server_env_config.policy.clone()), env)
+            let policy = if managed_network_without_proxy_route {
+                exec_env_policy_without_proxy_routes(exec_server_env_config.policy.clone())
+            } else {
+                exec_server_env_config.policy.clone()
+            };
+            (Some(policy), env)
         } else {
             (None, request_env)
         }
@@ -554,55 +582,66 @@ impl Drop for PendingProcessRegistration {
             self.session
                 .terminal_tasks
                 .spawn(run_pending_process_cleanup(cleanup));
-        } else if let Some(sender) = pending_process_cleanup_sender() {
-            if let Err(error) = sender.send(cleanup) {
-                tracing::error!(
-                    process_id = self.process_id,
-                    %error,
-                    "cannot enqueue cancelled unified exec startup cleanup"
-                );
-            }
         } else {
-            tracing::error!(
-                process_id = self.process_id,
-                "unified exec cleanup worker is unavailable"
-            );
+            enqueue_pending_process_cleanup(cleanup);
         }
     }
 }
 
 fn pending_process_cleanup_sender()
--> Option<&'static tokio::sync::mpsc::UnboundedSender<Arc<PendingProcessCleanup>>> {
-    static SENDER: OnceLock<
+-> Option<tokio::sync::mpsc::UnboundedSender<Arc<PendingProcessCleanup>>> {
+    static SENDER: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<Arc<PendingProcessCleanup>>>,
-    > = OnceLock::new();
-    SENDER
-        .get_or_init(|| {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    tracing::error!(%error, "failed to build unified exec cleanup runtime");
-                    return None;
-                }
-            };
-            let (sender, receiver) =
-                tokio::sync::mpsc::unbounded_channel::<Arc<PendingProcessCleanup>>();
-            match std::thread::Builder::new()
-                .name("codex-unified-exec-cleanup".to_string())
-                .spawn(move || {
-                    runtime.block_on(drain_pending_process_cleanups(receiver));
-                }) {
-                Ok(_handle) => Some(sender),
-                Err(error) => {
-                    tracing::error!(%error, "failed to spawn unified exec cleanup worker");
-                    None
-                }
+    > = std::sync::Mutex::new(None);
+    let mut cached = SENDER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(sender) = cached.as_ref().filter(|sender| !sender.is_closed()) {
+        return Some(sender.clone());
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(%error, "failed to build unified exec cleanup runtime");
+            return None;
+        }
+    };
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Arc<PendingProcessCleanup>>();
+    match std::thread::Builder::new()
+        .name("codex-unified-exec-cleanup".to_string())
+        .spawn(move || runtime.block_on(drain_pending_process_cleanups(receiver)))
+    {
+        Ok(_handle) => {
+            *cached = Some(sender.clone());
+            Some(sender)
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to spawn unified exec cleanup worker");
+            None
+        }
+    }
+}
+
+fn enqueue_pending_process_cleanup(cleanup: Arc<PendingProcessCleanup>) {
+    // A failed bootstrap must retain the work, not just allow the next caller
+    // to retry creating a worker. Only this lock drains the retry backlog.
+    static BACKLOG: std::sync::Mutex<Vec<Arc<PendingProcessCleanup>>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut backlog = BACKLOG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    backlog.push(cleanup);
+    if let Some(sender) = pending_process_cleanup_sender() {
+        while let Some(cleanup) = backlog.pop() {
+            if let Err(error) = sender.send(cleanup) {
+                backlog.push(error.0);
+                break;
             }
-        })
-        .as_ref()
+        }
+    }
 }
 
 async fn drain_pending_process_cleanups(
@@ -669,7 +708,13 @@ async fn cleanup_pending_process_registration(
                 (store.remove(cleanup.process_id), false)
             }
             (Some(_), Some(_)) => (None, true),
-            _ => (None, false),
+            _ => {
+                // Startup custody, rather than the caller future, owns this
+                // reservation until every spawned process is confirmed gone.
+                store.reserved_process_ids.remove(&cleanup.process_id);
+                store.reserved_process_slots.remove(&cleanup.process_id);
+                (None, false)
+            }
         }
     } else {
         (None, false)
@@ -834,6 +879,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         wall_time,
         context.source.clone(),
         context.tracker.clone(),
+        None,
     )
     .await
 }
@@ -952,21 +998,6 @@ impl UnifiedExecProcessManager {
         message: String,
     ) -> UnifiedExecError {
         let started = Instant::now();
-        let (call_id, hook_command, tty) = {
-            let store = self.process_store.lock().await;
-            store
-                .processes
-                .get(&process_id)
-                .filter(|entry| Arc::ptr_eq(&entry.process, process))
-                .map(|entry| {
-                    (
-                        entry.call_id.clone(),
-                        Some(entry.hook_command.clone()),
-                        entry.tty,
-                    )
-                })
-                .unwrap_or_default()
-        };
         let message = process.failure_message().unwrap_or(message);
         let (message, cleanup_confirmed) = match process.fail_and_terminate(message.clone()).await {
             Ok(()) => (message, true),
@@ -981,6 +1012,35 @@ impl UnifiedExecProcessManager {
                     false,
                 )
             }
+        };
+        self.process_failure_output(process_id, process, message, cleanup_confirmed, started)
+            .await
+    }
+
+    // Project the owner's cleanup disposition without retrying termination or
+    // manufacturing an exit. In particular cancellation already spent its bound.
+    async fn process_failure_output(
+        &self,
+        process_id: u32,
+        process: &Arc<UnifiedExecProcess>,
+        message: String,
+        cleanup_confirmed: bool,
+        started: Instant,
+    ) -> UnifiedExecError {
+        let (call_id, hook_command, tty) = {
+            let store = self.process_store.lock().await;
+            store
+                .processes
+                .get(&process_id)
+                .filter(|entry| Arc::ptr_eq(&entry.process, process))
+                .map(|entry| {
+                    (
+                        entry.call_id.clone(),
+                        Some(entry.hook_command.clone()),
+                        entry.tty,
+                    )
+                })
+                .unwrap_or_default()
         };
         let snapshot = process.snapshot_tool_output(tty).await;
         let mut raw_output = snapshot.aggregated_output.clone();
@@ -1173,16 +1233,6 @@ impl UnifiedExecProcessManager {
         }
     }
 
-    async fn release_process_id_reservation(&self, reservation: &mut ProcessIdReservation) {
-        let mut store = self.process_store.lock().await;
-        // Disarm delayed cancellation cleanup before making the number reusable.
-        reservation.transfer_to_store();
-        store.reserved_process_ids.remove(&reservation.process_id());
-        store
-            .reserved_process_slots
-            .remove(&reservation.process_id());
-    }
-
     pub(crate) async fn exec_command(
         &self,
         mut request: ExecCommandRequest,
@@ -1197,6 +1247,9 @@ impl UnifiedExecProcessManager {
             request.attempt_key.clone(),
             request.process_id,
         );
+        // Transfer the existing reservation to provisional custody before the
+        // first await. Cleanup, commit, or a confirmed exit now releases it.
+        process_id_reservation.transfer_to_store();
         let request_started_at = Instant::now();
         let mut cancelled = false;
         // Finish an accepted event and its legacy dispatch before cancellation
@@ -1245,18 +1298,35 @@ impl UnifiedExecProcessManager {
             }
         }
         if cancelled && registration.committed {
-            let terminated_processes = self
+            match self
                 .terminate_unpublished_processes_for_call_ids(std::slice::from_ref(
                     &context.call_id,
                 ))
                 .await
-                .map_err(|error| {
-                    UnifiedExecError::process_failed(format!(
-                        "unified exec cancellation cleanup failed: {error}"
-                    ))
-                })?;
-            if terminated_processes > 0 {
-                mark_exec_process_exited();
+            {
+                Ok(terminated_processes) => {
+                    if terminated_processes > 0 {
+                        mark_exec_process_exited();
+                    }
+                }
+                Err(error) => {
+                    let message = format!("unified exec cancellation cleanup failed: {error}");
+                    // `commit` requires an attached primary process; keep the
+                    // plain failure only as a defensive fallback.
+                    result = Err(match registration.primary_process.as_ref() {
+                        Some(process) => {
+                            self.process_failure_output(
+                                request.process_id,
+                                process,
+                                message,
+                                /*cleanup_confirmed*/ false,
+                                request_started_at,
+                            )
+                            .await
+                        }
+                        None => UnifiedExecError::process_failed(message),
+                    });
+                }
             }
         } else if !registration.committed {
             let process_was_attached = registration.primary_process.is_some();
@@ -1310,12 +1380,11 @@ impl UnifiedExecProcessManager {
         let (process, mut deferred_network_approval) = match launch {
             Ok((process, deferred_network_approval)) => (process, deferred_network_approval),
             Err(err) => {
-                self.release_process_id_reservation(process_id_reservation)
-                    .await;
                 return Err(err);
             }
         };
         process.set_validation(request.validation.clone());
+        let _ = process.environment.set(request.turn_environment.clone());
         let mut stall_handoff = Some(Box::pin(process.interaction_requested().notified_owned()));
         if let Some(notified) = stall_handoff.as_mut() {
             notified.as_mut().enable();
@@ -1346,7 +1415,8 @@ impl UnifiedExecProcessManager {
             ExecCommandSource::UnifiedExecStartup,
             Some(request.process_id.to_string()),
             request.turn_environment.environment_id.clone(),
-        );
+        )
+        .with_captured_environment(&request.turn_environment);
         let event_delivery_guard = event_delivery.lock().await;
         emitter
             .begin(event_ctx)
@@ -1436,7 +1506,9 @@ impl UnifiedExecProcessManager {
         .await;
         let output_ranges = collected.ranges;
         let collected = collected.bytes;
-        if cancellation_token.is_cancelled() || process.has_exited() {
+        // Observer shutdown wakes the collector but is not an exit receipt.
+        // The independent watcher records a later confirmed termination.
+        if process.has_exited() {
             mark_exec_process_exited();
         }
         if !process_started_alive {
@@ -1627,14 +1699,13 @@ impl UnifiedExecProcessManager {
                 wall_time,
                 context.source.clone(),
                 context.tracker.clone(),
+                None,
             )
             .await
             .err();
             registration.pending_startup_completion = None;
             drop(event_delivery_guard);
 
-            self.release_process_id_reservation(process_id_reservation)
-                .await;
             if tool_history_error.is_none() {
                 process.check_for_sandbox_denial_with_text(&text).await?;
             }
@@ -1876,6 +1947,7 @@ impl UnifiedExecProcessManager {
             ..
         } = prepared_handles;
         let mut status_after_write = None;
+        let mut input_error = None;
         let yield_time_ms = {
             // Empty polls use configurable background timeout bounds. Non-empty
             // writes keep a fixed max cap so interactive stdin remains responsive.
@@ -1969,6 +2041,10 @@ impl UnifiedExecProcessManager {
                     Err(err) => {
                         let status = self.refresh_process_state(process_id, &process).await;
                         if matches!(status, ProcessStatus::Exited { .. }) {
+                            input_error = Some(match err {
+                                UnifiedExecError::StdinClosed => "Input was not delivered because stdin closed. The process exit does not acknowledge this interaction.".to_string(),
+                                error => format!("Input delivery was not acknowledged: {error}. Delivery is uncertain; do not resend automatically. The process exit is independent."),
+                            });
                             status_after_write = Some(status);
                         } else if let UnifiedExecError::ProcessFailed { message } = err {
                             return Err(self
@@ -2084,7 +2160,7 @@ impl UnifiedExecProcessManager {
             } else {
                 None
             },
-            error: None,
+            error: input_error,
             validation: process.validation(),
             event_call_id,
             chunk_id,
@@ -2392,7 +2468,23 @@ impl UnifiedExecProcessManager {
             .await
         {
             let termination_error = process.terminate_confirmed().await.err();
-            self.release_process_id(process_id).await;
+            if termination_error.is_none() {
+                self.release_process_id(process_id).await;
+            } else {
+                // The command ledger rejected this incarnation. Transfer its
+                // existing charge back to provisional custody, not a usable
+                // stored command and not an uncharged cleanup vector.
+                let mut store = self.process_store.lock().await;
+                if store
+                    .processes
+                    .get(&process_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.process, &process))
+                {
+                    store.processes.remove(&process_id);
+                    store.reserved_process_ids.insert(process_id);
+                    store.reserved_process_slots.insert(process_id);
+                }
+            }
             let message = match termination_error {
                 Some(termination_error) => format!(
                     "{error}; additionally failed to terminate the untracked process: {termination_error}"
@@ -2446,6 +2538,7 @@ impl UnifiedExecProcessManager {
         spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
+        exec_backend: Option<Arc<dyn codex_exec_server::ExecBackend>>,
         pending_spawns: &PendingSpawnRegistration,
     ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
         let setup_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("sandbox_setup");
@@ -2477,10 +2570,14 @@ impl UnifiedExecProcessManager {
             spawn_lifecycle,
             raw_output_artifact,
             environment,
+            exec_backend,
             pending_spawns,
         )
         .await
         .map_err(|err| match err {
+            error @ UnifiedExecError::RemoteStart { .. } => {
+                ToolError::Codex(CodexErr::Io(std::io::Error::other(error)))
+            }
             UnifiedExecError::SandboxDenied { output, .. } => {
                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                     output,
@@ -2500,6 +2597,7 @@ impl UnifiedExecProcessManager {
         mut spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
+        exec_backend: Option<Arc<dyn codex_exec_server::ExecBackend>>,
         pending_spawns: &PendingSpawnRegistration,
     ) -> Result<Arc<UnifiedExecProcess>, UnifiedExecError> {
         let spawn_phase = crate::tools::tool_dispatch_trace::begin_tool_phase("process_spawn");
@@ -2544,11 +2642,28 @@ impl UnifiedExecProcessManager {
             }
 
             let params = exec_server_params_for_request(process_id, request, tty).await?;
-            let started = environment
-                .get_exec_backend()
+            let started = exec_backend
+                .unwrap_or_else(|| environment.get_exec_backend())
                 .start(params)
                 .await
-                .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+                .map_err(|error| {
+                    if matches!(
+                        &error,
+                        codex_exec_server::ExecServerError::ProcessStart { .. }
+                    ) {
+                        UnifiedExecError::RemoteStart {
+                            error: Box::new(error),
+                        }
+                    } else {
+                        UnifiedExecError::create_process(error.to_string())
+                    }
+                })?;
+            codex_utils_pty::process_observation::observe_process_start(
+                "remote_exec",
+                codex_utils_pty::process_observation::ProcessRole::RequestedRoot,
+                None,
+                Some(format!("{:?}", started.process.process_id())),
+            );
             spawn_lifecycle.after_spawn();
             mark_exec_process_spawned();
             drop(spawn_timing);
@@ -2775,6 +2890,14 @@ impl UnifiedExecProcessManager {
             .await
             .map(|result| (result.output, result.deferred_network_approval))
             .map_err(|err| match err {
+                ToolError::Codex(CodexErr::Io(error))
+                    if error.get_ref().is_some_and(<dyn std::error::Error + std::marker::Send + std::marker::Sync + 'static>::is::<UnifiedExecError>) =>
+                {
+                    match error.into_inner().and_then(|source| source.downcast::<UnifiedExecError>().ok()) {
+                        Some(error) => *error,
+                        None => UnifiedExecError::create_process("remote start evidence became unavailable".into()),
+                    }
+                }
                 ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. })) => {
                     let output = *output;
                     let message = if output.aggregated_output.text.is_empty() {

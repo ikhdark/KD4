@@ -1647,7 +1647,6 @@ mod tests {
         Ok(())
     }
 
-
     #[test]
     fn deserialize_managed_permission_profiles() -> Result<()> {
         let requirements: ConfigRequirementsToml = from_str(
@@ -1693,7 +1692,6 @@ mod tests {
         Ok(())
     }
 
-
     #[test]
     fn filesystem_requirements_table_cannot_define_a_permission_profile() {
         let err = from_str::<ConfigRequirementsToml>(
@@ -1711,8 +1709,6 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
-
-
 
     #[test]
     fn deserialize_computer_use_requirements() -> Result<()> {
@@ -1862,7 +1858,6 @@ mod tests {
             }
         );
     }
-
 
     #[test]
     fn merge_unset_fields_does_not_overwrite_existing_values() -> Result<()> {
@@ -2111,9 +2106,6 @@ mod tests {
             assert_eq!(merged, expected);
         }
     }
-
-
-
 
     #[test]
     fn merge_app_requirements_descending_preserves_higher_tool_approval_mode() {
@@ -2391,7 +2383,8 @@ mod tests {
 
     #[test]
     fn windows_sandbox_requirements_enforce_allowed_modes_and_prefer_elevated() -> Result<()> {
-        use WindowsSandboxModeToml::{Elevated, Unelevated};
+        use WindowsSandboxModeToml::Elevated;
+        use WindowsSandboxModeToml::Unelevated;
         for (input, expected, modes) in [
             ("['elevated']", Elevated, vec![Elevated]),
             ("['unelevated']", Unelevated, vec![Unelevated]),
@@ -2432,8 +2425,6 @@ mod tests {
         );
         Ok(())
     }
-
-
 
     #[test]
     fn deserialize_allowed_sandbox_modes() -> Result<()> {
@@ -2658,7 +2649,10 @@ mod tests {
 
     #[test]
     fn web_search_requirements_enforce_modes_and_choose_the_preferred_default() -> Result<()> {
-        use WebSearchMode::{Cached, Disabled, Indexed, Live};
+        use WebSearchMode::Cached;
+        use WebSearchMode::Disabled;
+        use WebSearchMode::Indexed;
+        use WebSearchMode::Live;
         for (input, initial, accepted, allowed) in [
             (
                 "['cached']",
@@ -2704,9 +2698,6 @@ mod tests {
         }
         Ok(())
     }
-
-
-
 
     #[test]
     fn deserialize_feature_requirements() -> Result<()> {

@@ -17,7 +17,6 @@ use std::io::Write;
 use std::io::{self};
 use std::net::SocketAddr;
 use std::net::TcpStream;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -26,10 +25,11 @@ use std::time::Duration;
 
 use crate::auth::AuthDotJson;
 use crate::auth::AuthKeyringBackendKind;
-use crate::auth::save_auth;
+use crate::auth::PreparedAuthCommit;
 use crate::callback_params::LoginCallbackResult;
 use crate::callback_params::login_callback_result_from_state;
 use crate::default_client::create_raw_auth_client;
+use crate::default_client::create_raw_auth_client_pool;
 use crate::default_client::originator;
 use crate::outbound_proxy::AuthRouteConfig;
 use crate::pkce::PkceCodes;
@@ -57,6 +57,61 @@ use tracing::info;
 use tracing::warn;
 
 pub(super) const DEFAULT_ISSUER: &str = "https://auth.openai.com";
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_admission_fences_the_blocking_credential_commit() -> io::Result<()> {
+        for cancel_before_commit in [true, false] {
+            let home = tempfile::tempdir()?;
+            let opts = ServerOptions::new(
+                home.path().into(),
+                crate::auth::CLIENT_ID.into(),
+                None,
+                AuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+                crate::test_support::transport_default_auth_route_config(),
+            );
+            let prepared = Arc::new(PreparedAuthCommit::new(
+                home.path(),
+                AuthCredentialsStoreMode::File,
+                AuthKeyringBackendKind::Direct,
+            )?);
+            let admission = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let shutdown = ShutdownHandle {
+                shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+                admission: admission.clone(),
+            };
+            if cancel_before_commit {
+                assert!(shutdown.try_cancel());
+            }
+            let result = persist_tokens_async(
+                &opts,
+                None,
+                "header.e30.sig".into(),
+                "access".into(),
+                "refresh".into(),
+                prepared,
+                Some(admission),
+            )
+            .await;
+            if cancel_before_commit {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+                assert!(!home.path().join("auth.json").exists());
+            } else {
+                result?;
+                assert!(
+                    !shutdown.try_cancel(),
+                    "an admitted successful commit cannot be reported canceled"
+                );
+                assert!(home.path().join("auth.json").exists());
+            }
+        }
+        Ok(())
+    }
+}
 const DEFAULT_PORT: u16 = 1455;
 // Keep in sync with the Codex CLI Hydra redirect URI allow-list.
 const FALLBACK_PORT: u16 = 1457;
@@ -113,21 +168,26 @@ impl ServerOptions {
 pub struct LoginServer {
     pub auth_url: String,
     pub actual_port: u16,
-    server_handle: tokio::task::JoinHandle<io::Result<LoginCallbackResult>>,
+    _server_handle: tokio::task::JoinHandle<io::Result<LoginCallbackResult>>,
+    completion: tokio::sync::oneshot::Receiver<io::Result<LoginCallbackResult>>,
     shutdown_handle: ShutdownHandle,
 }
 
 impl LoginServer {
     /// Waits for the login callback loop to finish.
     pub async fn block_until_done(self) -> io::Result<()> {
-        self.block_until_done_with_callback_result()
+        // The CLI owns the runtime: credential commit alone is too early to
+        // exit while the browser still needs the local redirect/success page.
+        // App-server callers keep the commit-only callback-metadata API below.
+        self._server_handle
             .await
+            .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
             .map(|_| ())
     }
 
     /// Waits for login to finish and returns allowlisted callback metadata.
     pub async fn block_until_done_with_callback_result(self) -> io::Result<LoginCallbackResult> {
-        self.server_handle
+        self.completion
             .await
             .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
     }
@@ -147,12 +207,32 @@ impl LoginServer {
 #[derive(Clone, Debug)]
 pub struct ShutdownHandle {
     shutdown_notify: Arc<tokio::sync::Notify>,
+    admission: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl ShutdownHandle {
     /// Signals the login loop to terminate.
     pub fn shutdown(&self) {
-        self.shutdown_notify.notify_one();
+        self.try_cancel();
+    }
+
+    /// Cancellation is accepted only before the credential commit is admitted.
+    pub fn try_cancel(&self) -> bool {
+        if self
+            .admission
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.shutdown_notify.notify_one();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -172,6 +252,13 @@ pub async fn run_login_server_async(opts: ServerOptions) -> io::Result<LoginServ
 }
 
 fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginServer> {
+    let prepared = Arc::new(PreparedAuthCommit::new(
+        &opts.codex_home,
+        opts.cli_auth_credentials_store_mode,
+        opts.auth_keyring_backend_kind,
+    )?);
+    let admission = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let (completion_tx, completion) = tokio::sync::oneshot::channel();
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
 
@@ -221,11 +308,20 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let server_handle = {
         let shutdown_notify = shutdown_notify.clone();
+        let admission = admission.clone();
         let server = server;
         tokio::spawn(async move {
+            let mut completion_tx = Some(completion_tx);
             let mut callback_result: Option<LoginCallbackResult> = None;
+            let mut display_deadline = None;
             let result = loop {
                 tokio::select! {
+                    _ = async {
+                        match display_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => break callback_result.ok_or_else(|| io::Error::other("Login was not completed")),
                     _ = shutdown_notify.notified() => {
                         break Err(io::Error::other("Login was not completed"));
                     }
@@ -235,8 +331,10 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                         };
 
                         let url_raw = req.url().to_string();
-                        let response =
-                            process_request(
+                        let response = tokio::select! {
+                            biased;
+                            _ = shutdown_notify.notified() => break Err(io::Error::new(io::ErrorKind::Interrupted, "Login cancelled")),
+                            response = process_request(
                                 &url_raw,
                                 &opts,
                                 &redirect_uri,
@@ -244,8 +342,10 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                 actual_port,
                                 &state,
                                 callback_result.is_some(),
-                            )
-                            .await;
+                                prepared.clone(),
+                                admission.clone(),
+                            ) => response,
+                        };
 
                         let exit_result = match response {
                             HandledRequest::Response(response) => {
@@ -253,7 +353,9 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                 None
                             }
                             HandledRequest::RedirectWithHeader { header, result } => {
+                                if let Some(tx) = completion_tx.take() { let _ = tx.send(Ok(result)); }
                                 callback_result = Some(result);
+                                display_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(60));
                                 let redirect = Response::empty(302).with_header(header);
                                 let _ = tokio::task::spawn_blocking(move || req.respond(redirect)).await;
                                 None
@@ -277,6 +379,7 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
                                 }))
                             }
                             HandledRequest::RedirectAndExit { header, result } => {
+                                if let Some(tx) = completion_tx.take() { let _ = tx.send(Ok(result)); }
                                 match tokio::task::spawn_blocking(move || {
                                     send_response_with_disconnect(
                                         req,
@@ -309,6 +412,13 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
             // Ensure that the server is unblocked so the thread dedicated to
             // running `server.recv()` in a loop exits cleanly.
             server.unblock();
+            if let Some(tx) = completion_tx.take() {
+                let terminal = result
+                    .as_ref()
+                    .map(Clone::clone)
+                    .map_err(|err| io::Error::new(err.kind(), err.to_string()));
+                let _ = tx.send(terminal);
+            }
             result
         })
     };
@@ -316,8 +426,12 @@ fn start_login_server(opts: ServerOptions, server: Server) -> io::Result<LoginSe
     Ok(LoginServer {
         auth_url,
         actual_port,
-        server_handle,
-        shutdown_handle: ShutdownHandle { shutdown_notify },
+        _server_handle: server_handle,
+        completion,
+        shutdown_handle: ShutdownHandle {
+            shutdown_notify,
+            admission,
+        },
     })
 }
 
@@ -339,6 +453,7 @@ enum HandledRequest {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_request(
     url_raw: &str,
     opts: &ServerOptions,
@@ -347,6 +462,8 @@ async fn process_request(
     actual_port: u16,
     state: &str,
     callback_completed: bool,
+    prepared: Arc<PreparedAuthCommit>,
+    admission: Arc<std::sync::atomic::AtomicU8>,
 ) -> HandledRequest {
     let parsed_url = match url::Url::parse(&format!("http://localhost{url_raw}")) {
         Ok(u) => u,
@@ -361,6 +478,11 @@ async fn process_request(
 
     match path.as_str() {
         "/auth/callback" => {
+            if callback_completed {
+                return HandledRequest::Response(
+                    Response::from_string("Login already completed").with_status_code(200),
+                );
+            }
             let params: std::collections::HashMap<String, String> =
                 parsed_url.query_pairs().into_owned().collect();
             let has_code = params.get("code").is_some_and(|code| !code.is_empty());
@@ -452,13 +574,13 @@ async fn process_request(
                     .await
                     .ok();
                     if let Err(err) = persist_tokens_async(
-                        &opts.codex_home,
+                        opts,
                         api_key.clone(),
                         tokens.id_token.clone(),
                         tokens.access_token.clone(),
                         tokens.refresh_token.clone(),
-                        opts.cli_auth_credentials_store_mode,
-                        opts.auth_keyring_backend_kind,
+                        prepared,
+                        Some(admission),
                     )
                     .await
                     {
@@ -845,9 +967,7 @@ pub(crate) async fn exchange_code_for_tokens(
         refresh_token: String,
     }
 
-    // The route selected for the issuer is reused for token exchange; the token endpoint path is
-    // not resolved separately.
-    let client = create_raw_auth_client(issuer.trim_end_matches('/'), auth_route_config)?;
+    let client = create_raw_auth_client_pool(auth_route_config);
     let token_endpoint = format!("{}/oauth/token", issuer.trim_end_matches('/'));
     info!(
         issuer = %sanitize_url_for_logging(issuer),
@@ -870,6 +990,12 @@ pub(crate) async fn exchange_code_for_tokens(
     let resp = match resp {
         Ok(resp) => resp,
         Err(error) => {
+            let codex_http_client::RouteAwareRequestError::Request(error) = error else {
+                return Err(io::Error::other(format!(
+                    "auth route failure: {}",
+                    error.safe_category()
+                )));
+            };
             let error = redact_sensitive_error_url(error);
             error!(
                 is_timeout = error.is_timeout(),
@@ -908,16 +1034,23 @@ pub(crate) async fn exchange_code_for_tokens(
 
 /// Persists exchanged credentials using the configured local auth store.
 pub(crate) async fn persist_tokens_async(
-    codex_home: &Path,
+    opts: &ServerOptions,
     api_key: Option<String>,
     id_token: String,
     access_token: String,
     refresh_token: String,
-    auth_credentials_store_mode: AuthCredentialsStoreMode,
-    keyring_backend_kind: AuthKeyringBackendKind,
+    prepared: Arc<PreparedAuthCommit>,
+    admission: Option<Arc<std::sync::atomic::AtomicU8>>,
 ) -> io::Result<()> {
     // Reuse existing synchronous logic but run it off the async runtime.
-    let codex_home = codex_home.to_path_buf();
+    let oauth_context = (opts.issuer != DEFAULT_ISSUER || opts.client_id != crate::auth::CLIENT_ID)
+        .then(|| crate::auth::OAuthContext {
+            issuer: opts.issuer.clone(),
+            client_id: opts.client_id.clone(),
+        });
+    if let Some(context) = &oauth_context {
+        context.endpoint("/oauth/token")?;
+    }
     tokio::task::spawn_blocking(move || {
         let mut tokens = TokenData {
             id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
@@ -932,6 +1065,7 @@ pub(crate) async fn persist_tokens_async(
             tokens.account_id = Some(acc.to_string());
         }
         let auth = AuthDotJson {
+            oauth_context,
             auth_mode: Some(AuthMode::Chatgpt),
             openai_api_key: api_key,
             tokens: Some(tokens),
@@ -940,12 +1074,22 @@ pub(crate) async fn persist_tokens_async(
             personal_access_token: None,
             bedrock_api_key: None,
         };
-        save_auth(
-            &codex_home,
-            &auth,
-            auth_credentials_store_mode,
-            keyring_backend_kind,
-        )
+        if let Some(admission) = admission
+            && admission
+                .compare_exchange(
+                    0,
+                    2,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Login cancelled before credential commit",
+            ));
+        }
+        prepared.save(&auth)
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
@@ -1196,6 +1340,80 @@ pub(crate) async fn obtain_api_key(
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn token_exchange_resolves_the_endpoint_path_not_the_issuer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let unused_origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let wrong_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", unused_origin.local_addr().unwrap());
+        codex_http_client::cache_system_proxy_route_for_test(
+            &issuer,
+            format!("http://{}", wrong_proxy.local_addr().unwrap()),
+        );
+        codex_http_client::cache_system_proxy_route_for_test(
+            &format!("{issuer}/oauth/token"),
+            format!("http://{}", token_proxy.local_addr().unwrap()),
+        );
+        let server = async {
+            let (mut stream, _) = token_proxy.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(stream.read_u8().await.unwrap());
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            assert!(headers.starts_with(&format!("POST {issuer}/oauth/token HTTP/1.1\r\n")));
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            stream.read_exact(&mut vec![0; length]).await.unwrap();
+            let body = r#"{"id_token":"id","access_token":"access","refresh_token":"refresh"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        };
+        let config = crate::outbound_proxy::AuthRouteConfig::from_http_client_factory(
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::RespectSystemProxy,
+            ),
+        );
+        let pkce = crate::pkce::PkceCodes {
+            code_verifier: "verifier".to_string(),
+            code_challenge: "challenge".to_string(),
+        };
+        let exchange = super::exchange_code_for_tokens(
+            &issuer,
+            "client",
+            "http://localhost/callback",
+            &pkce,
+            "code",
+            &config,
+        );
+        let (tokens, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(exchange, server)
+        })
+        .await
+        .unwrap();
+        assert_eq!(tokens.unwrap().access_token, "access");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), wrong_proxy.accept())
+                .await
+                .is_err()
+        );
+    }
 
     use super::TokenEndpointErrorDetail;
     use super::html_escape;

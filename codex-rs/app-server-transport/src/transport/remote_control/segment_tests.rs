@@ -171,7 +171,7 @@ fn invalidates_incomplete_stream_assemblies() {
 }
 
 #[test]
-fn resets_incomplete_client_assembly_when_stream_changes() {
+fn interleaved_streams_for_one_client_reassemble_independently() {
     let message = JSONRPCMessage::Notification(JSONRPCNotification {
         method: "initialized".to_string(),
         params: None,
@@ -218,7 +218,7 @@ fn resets_incomplete_client_assembly_when_stream_changes() {
     )) {
         ClientSegmentObservation::Forward(reassembled) => *reassembled,
         ClientSegmentObservation::Pending | ClientSegmentObservation::Dropped => {
-            panic!("replacement stream should reassemble")
+            panic!("second stream should reassemble independently")
         }
     };
     assert_eq!(
@@ -231,17 +231,58 @@ fn resets_incomplete_client_assembly_when_stream_changes() {
         panic!("replacement chunks must become a client message");
     };
     assert_eq!(actual, message);
+    let ClientSegmentObservation::Forward(first) = reassembler.observe(chunk_envelope(
+        client_id,
+        Some(first_stream_id),
+        /*seq_id*/ 7,
+        /*segment_id*/ 1,
+        /*segment_count*/ 2,
+        raw.len(),
+        &raw[split..],
+    )) else {
+        panic!("the first stream's prefix must survive the second stream");
+    };
+    let ClientEvent::ClientMessage { message: actual } = first.event else {
+        panic!("expected first message");
+    };
+    assert_eq!(actual, message);
+}
+
+#[test]
+fn aggregate_assembly_reservations_release_on_stream_and_client_invalidation() {
+    let mut reassembler = ClientSegmentReassembler::default();
+    let client = ClientId("client".into());
+    let a = StreamId("a".into());
+    let b = StreamId("b".into());
+    let limit = super::segment::REMOTE_CONTROL_REASSEMBLED_MAX_BYTES;
+    let prefix = |stream: &StreamId| {
+        chunk_envelope(client.clone(), Some(stream.clone()), 1, 0, 2, limit, b"{")
+    };
     assert!(matches!(
-        reassembler.observe(chunk_envelope(
-            client_id,
-            Some(first_stream_id),
-            /*seq_id*/ 7,
-            /*segment_id*/ 1,
-            /*segment_count*/ 2,
-            raw.len(),
-            &raw[split..],
-        )),
+        reassembler.observe(prefix(&a)),
+        ClientSegmentObservation::Pending
+    ));
+    assert!(matches!(
+        reassembler.observe(prefix(&b)),
         ClientSegmentObservation::Dropped
+    ));
+    reassembler.invalidate_stream(&client, &b);
+    assert!(
+        matches!(
+            reassembler.observe(prefix(&b)),
+            ClientSegmentObservation::Dropped
+        ),
+        "unrelated invalidation must not release A's reservation"
+    );
+    reassembler.invalidate_stream(&client, &a);
+    assert!(matches!(
+        reassembler.observe(prefix(&b)),
+        ClientSegmentObservation::Pending
+    ));
+    reassembler.invalidate_client(&client);
+    assert!(matches!(
+        reassembler.observe(prefix(&a)),
+        ClientSegmentObservation::Pending
     ));
 }
 
@@ -259,18 +300,36 @@ fn stale_and_duplicate_chunks_preserve_the_current_message() {
         let mut reassembler = ClientSegmentReassembler::default();
         assert!(matches!(
             reassembler.observe(chunk_envelope(
-                client_id.clone(), stream_id.clone(), 8, 0, 2, raw.len(), &raw[..split],
+                client_id.clone(),
+                stream_id.clone(),
+                8,
+                0,
+                2,
+                raw.len(),
+                &raw[..split],
             )),
             ClientSegmentObservation::Pending
         ));
         assert!(matches!(
             reassembler.observe(chunk_envelope(
-                client_id.clone(), stream_id.clone(), seq_id, segment_id, 2, raw.len(), chunk,
+                client_id.clone(),
+                stream_id.clone(),
+                seq_id,
+                segment_id,
+                2,
+                raw.len(),
+                chunk,
             )),
             ClientSegmentObservation::Dropped
         ));
         let ClientSegmentObservation::Forward(reassembled) = reassembler.observe(chunk_envelope(
-            client_id.clone(), stream_id.clone(), 8, 1, 2, raw.len(), &raw[split..],
+            client_id.clone(),
+            stream_id.clone(),
+            8,
+            1,
+            2,
+            raw.len(),
+            &raw[split..],
         )) else {
             panic!("current message must survive seq={seq_id} segment={segment_id}");
         };
@@ -359,7 +418,9 @@ fn splits_server_messages_when_chunk_sizes_plateau() {
     };
     // Reserve 16 base64 bytes: independently demonstrate a legal partition
     // into 12-byte chunks, even with nearly frame-sized routing metadata.
-    let metadata_size = serde_json::to_vec(&witness).expect("metadata should serialize").len();
+    let metadata_size = serde_json::to_vec(&witness)
+        .expect("metadata should serialize")
+        .len();
     witness.client_id = ClientId("x".repeat(REMOTE_CONTROL_SEGMENT_MAX_BYTES - metadata_size - 16));
     let count = raw.len().div_ceil(12);
     assert!(count <= max_count);
@@ -370,32 +431,50 @@ fn splits_server_messages_when_chunk_sizes_plateau() {
             message_size_bytes: raw.len(),
             message_chunk_base64: base64::engine::general_purpose::STANDARD.encode(chunk),
         };
-        assert!(serde_json::to_vec(&witness).expect("witness should serialize").len()
-            <= REMOTE_CONTROL_SEGMENT_MAX_BYTES);
+        assert!(
+            serde_json::to_vec(&witness)
+                .expect("witness should serialize")
+                .len()
+                <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
+        );
     }
 
     let segments = split_server_envelope_for_transport(ServerEnvelope {
-        event: ServerEvent::ServerMessage { message: Box::new(message) },
+        event: ServerEvent::ServerMessage {
+            message: Box::new(message),
+        },
         ..witness.clone()
-    }).expect("a demonstrated legal partition must not be skipped");
+    })
+    .expect("a demonstrated legal partition must not be skipped");
     assert!(segments.len() <= max_count);
     let mut reconstructed = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         assert_eq!(segment.client_id, witness.client_id);
         assert_eq!(segment.stream_id, witness.stream_id);
         assert_eq!(segment.seq_id, witness.seq_id);
-        assert!(serde_json::to_vec(segment).expect("segment should serialize").len()
-            <= REMOTE_CONTROL_SEGMENT_MAX_BYTES);
+        assert!(
+            serde_json::to_vec(segment)
+                .expect("segment should serialize")
+                .len()
+                <= REMOTE_CONTROL_SEGMENT_MAX_BYTES
+        );
         let ServerEvent::ServerMessageChunk {
-            segment_id, segment_count, message_size_bytes, message_chunk_base64,
-        } = &segment.event else {
+            segment_id,
+            segment_count,
+            message_size_bytes,
+            message_chunk_base64,
+        } = &segment.event
+        else {
             panic!("oversized envelope must be segmented");
         };
         assert_eq!(*segment_id, index);
         assert_eq!(*segment_count, segments.len());
         assert_eq!(*message_size_bytes, raw.len());
-        reconstructed.extend(base64::engine::general_purpose::STANDARD
-            .decode(message_chunk_base64).expect("valid base64"));
+        reconstructed.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(message_chunk_base64)
+                .expect("valid base64"),
+        );
     }
     assert_eq!(reconstructed, raw);
 }
@@ -410,7 +489,9 @@ fn segmentation_rejects_exhausted_count_budget() {
             range: None,
         },
     ));
-    let raw_size = serde_json::to_vec(&message).expect("message should serialize").len();
+    let raw_size = serde_json::to_vec(&message)
+        .expect("message should serialize")
+        .len();
     let mut envelope = ServerEnvelope {
         event: ServerEvent::ServerMessageChunk {
             segment_id: 0,
@@ -425,9 +506,12 @@ fn segmentation_rejects_exhausted_count_budget() {
     // Even the smallest possible routing metadata leaves only 16 base64
     // bytes (12 raw bytes) per frame. No partition within 1024 frames can fit.
     let metadata_size = serde_json::to_vec(&envelope).unwrap().len();
-    envelope.client_id = ClientId("x".repeat(REMOTE_CONTROL_SEGMENT_MAX_BYTES - metadata_size - 16));
+    envelope.client_id =
+        ClientId("x".repeat(REMOTE_CONTROL_SEGMENT_MAX_BYTES - metadata_size - 16));
     assert!(raw_size > 12 * super::segment::REMOTE_CONTROL_SEGMENT_COUNT_MAX);
-    envelope.event = ServerEvent::ServerMessage { message: Box::new(message) };
+    envelope.event = ServerEvent::ServerMessage {
+        message: Box::new(message),
+    };
     let error = split_server_envelope_for_transport(envelope)
         .expect_err("exhausting the finite count budget must fail");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

@@ -30,8 +30,6 @@ use tokio::sync::oneshot;
 #[cfg(any(not(unix), test))]
 use tokio::task::JoinHandle;
 
-#[cfg(windows)]
-use crate::WINDOWS_PROCESS_OPERATION_TIMEOUT;
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
 use crate::process::ProcessSignal;
@@ -43,8 +41,10 @@ use crate::process::TerminalSize;
 #[cfg(unix)]
 use crate::process::exit_code_from_status;
 use crate::process::publish_exit_status;
-#[cfg(windows)]
-use crate::run_windows_process_operation;
+
+#[cfg(all(test, unix))]
+#[path = "unix_lifecycle_tests.rs"]
+mod unix_lifecycle_tests;
 
 /// Returns true when ConPTY support is available (Windows only).
 #[cfg(windows)]
@@ -77,14 +77,13 @@ impl ChildTerminator for PtyChildTerminator {
 #[cfg(unix)]
 struct RawPidTerminator {
     process_group: Arc<crate::process::ProcessGroupControl>,
+    master: File,
 }
 
 #[cfg(unix)]
 impl ChildTerminator for RawPidTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
-        match signal {
-            ProcessSignal::Interrupt => self.process_group.signal(signal),
-        }
+        self.process_group.signal_terminal(&self.master, signal)
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
@@ -145,7 +144,11 @@ where
 // Native readers return WouldBlock when no bytes are available. Queue backpressure and
 // retry delays belong to this abortable async owner, never to a lifetime-long worker.
 #[cfg(any(not(unix), test))]
-fn spawn_pty_reader<R>(mut reader: R, output: mpsc::Sender<Vec<u8>>) -> JoinHandle<()>
+fn spawn_pty_reader<R>(
+    mut reader: R,
+    output: mpsc::Sender<Vec<u8>>,
+    complete: Arc<AtomicBool>,
+) -> JoinHandle<()>
 where
     R: std::io::Read + Send + 'static,
 {
@@ -162,7 +165,10 @@ where
             };
             reader = returned_reader;
             match result {
-                Ok(0) => break,
+                Ok(0) => {
+                    complete.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
                 Ok(n) => {
                     buf.truncate(n);
                     if output.send(buf).await.is_err() {
@@ -225,7 +231,20 @@ pub async fn spawn_process_with_inherited_fds(
     }
     #[cfg(not(unix))]
     {
-        spawn_process_portable(program, args, cwd, env, arg0, size).await
+        let (program, args, cwd, env, arg0) = (
+            program.to_owned(),
+            args.to_vec(),
+            cwd.to_owned(),
+            env.clone(),
+            arg0.clone(),
+        );
+        // Setup owns admission even if the observing caller is cancelled while
+        // the Windows loader is still running. An unclaimed result drops its
+        // ProcessHandle; the detached waiter retains the charge until exit.
+        tokio::spawn(async move {
+            spawn_process_portable(&program, &args, &cwd, &env, &arg0, size).await
+        })
+        .await?
     }
 }
 
@@ -238,6 +257,7 @@ async fn spawn_process_portable(
     arg0: &Option<String>,
     size: TerminalSize,
 ) -> Result<SpawnedProcess> {
+    let admission = crate::ManagedRootProcess::reserve()?;
     let pty_system = platform_native_pty_system();
     let pair = pty_system.openpty(size.into())?;
     let portable_pty::PtyPair { master, slave } = pair;
@@ -257,14 +277,20 @@ async fn spawn_process_portable(
     }
 
     #[cfg(windows)]
-    let (slave, mut child) =
-        run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
-            let child = slave
-                .spawn_command(command_builder)
-                .map_err(std::io::Error::other)?;
-            Ok((slave, child))
-        })
-        .await?;
+    let observation_context = crate::process_observation::ProcessObservationContext::current();
+    #[cfg(windows)]
+    let (slave, mut child, admission) = tokio::task::spawn_blocking(move || {
+        let child = crate::process_observation::ProcessObservationContext::scope_sync(
+            observation_context,
+            || {
+                slave
+                    .spawn_command(command_builder)
+                    .map_err(std::io::Error::other)
+            },
+        )?;
+        Ok::<_, std::io::Error>((slave, child, admission))
+    })
+    .await??;
     #[cfg(not(windows))]
     let mut child = slave.spawn_command(command_builder)?;
 
@@ -273,7 +299,11 @@ async fn spawn_process_portable(
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let reader_handle = spawn_pty_reader(reader, stdout_tx);
+    let capture = crate::process::OutputCapture::default();
+    capture
+        .stderr
+        .store(true, std::sync::atomic::Ordering::Release);
+    let reader_handle = spawn_pty_reader(reader, stdout_tx, Arc::clone(&capture.stdout));
 
     let writer_handle = spawn_pty_writer(writer, writer_rx);
 
@@ -289,10 +319,11 @@ async fn spawn_process_portable(
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle = tokio::spawn(async move {
+        let _admission = admission;
         let code = 'wait: {
             #[cfg(windows)]
-            if let Some(native_child) =
-                (child.as_mut() as &mut dyn portable_pty::Child).downcast_mut::<crate::win::WinChild>()
+            if let Some(native_child) = (child.as_mut() as &mut dyn portable_pty::Child)
+                .downcast_mut::<crate::win::WinChild>()
             {
                 match native_child.await {
                     Ok(status) => break 'wait status.exit_code() as i32,
@@ -351,7 +382,8 @@ async fn spawn_process_portable(
         exit_code,
         Some(pty_handles),
         /*resizer*/ None,
-    );
+    )
+    .with_output_capture(capture);
 
     Ok(SpawnedProcess {
         session: handle,
@@ -371,6 +403,7 @@ async fn spawn_process_preserving_fds(
     size: TerminalSize,
     inherited_fds: &[RawFd],
 ) -> Result<SpawnedProcess> {
+    let admission = crate::ManagedRootProcess::reserve()?;
     let (master, slave) = open_unix_pty(size)?;
     let mut command = StdCommand::new(program);
     if let Some(arg0) = arg0 {
@@ -428,50 +461,58 @@ async fn spawn_process_preserving_fds(
     set_nonblocking(master.as_raw_fd())?;
     let reader = tokio::io::unix::AsyncFd::new(master.try_clone()?)?;
     let writer = tokio::io::unix::AsyncFd::new(master.try_clone()?)?;
+    let signal_master = master.try_clone()?;
 
     let mut child = command.spawn()?;
+    let observation = crate::process_observation::observe_process_start(
+        "unified_unix_pty",
+        crate::process_observation::ProcessRole::RequestedRoot,
+        Some(child.id()),
+        None,
+    );
     drop(slave);
     let process_group = Arc::new(crate::process::ProcessGroupControl::new(child.id()));
 
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
+    let capture = crate::process::OutputCapture::default();
+    capture
+        .stderr
+        .store(true, std::sync::atomic::Ordering::Release);
+    let complete = Arc::clone(&capture.stdout);
     let reader_handle = tokio::spawn(async move {
         use std::io::Read;
         let mut buf = [0u8; 8_192];
         while let Ok(mut ready) = reader.readable().await {
             match ready.try_io(|fd| fd.get_ref().read(&mut buf)) {
-                Ok(Ok(0)) => break,
+                Ok(Ok(0)) => {
+                    complete.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
                 Ok(Ok(n)) => {
                     if stdout_tx.send(buf[..n].to_vec()).await.is_err() {
                         break;
                     }
                 }
                 Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => continue,
+                // Unix PTY masters report EIO when the slave has closed.
+                Ok(Err(error)) if error.raw_os_error() == Some(libc::EIO) => {
+                    complete.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                }
                 Ok(Err(_)) => break,
                 Err(_) => continue,
             }
         }
     });
 
+    let (stdin_close_tx, stdin_close_rx) = tokio::sync::watch::channel(None);
     let writer_handle = tokio::spawn(async move {
-        use std::io::Write;
-        let mut writer_rx = writer_rx;
-        while let Some(bytes) = writer_rx.recv().await {
-            let mut remaining = bytes.as_slice();
-            while !remaining.is_empty() {
-                let Ok(mut ready) = writer.writable().await else {
-                    return;
-                };
-                match ready.try_io(|fd| fd.get_ref().write(remaining)) {
-                    Ok(Ok(0)) => return,
-                    Ok(Ok(n)) => remaining = &remaining[n..],
-                    Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => continue,
-                    Ok(Err(_)) => return,
-                    Err(_) => continue,
-                }
-            }
-        }
+        let result = write_unix_pty_stdin(writer, writer_rx).await;
+        stdin_close_tx.send_replace(Some(
+            result.map_err(|error| (error.kind(), error.to_string())),
+        ));
     });
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
@@ -481,6 +522,7 @@ async fn spawn_process_preserving_fds(
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_group = Arc::clone(&process_group);
     let wait_handle = tokio::spawn(async move {
+        let _admission = admission;
         wait_group.disarm_after_exit().await;
         let mut warned = false;
         let code = loop {
@@ -496,6 +538,7 @@ async fn spawn_process_preserving_fds(
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
+        observation.cleanup_observed("root_reaped; descendants_unknown");
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_tx.send(code);
     });
@@ -507,7 +550,10 @@ async fn spawn_process_preserving_fds(
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(RawPidTerminator { process_group }),
+        Box::new(RawPidTerminator {
+            process_group,
+            master: signal_master,
+        }),
         reader_handle,
         Vec::new(),
         writer_handle,
@@ -516,7 +562,9 @@ async fn spawn_process_preserving_fds(
         exit_code,
         Some(pty_handles),
         /*resizer*/ None,
-    );
+    )
+    .with_output_capture(capture)
+    .with_stdin_close_receipt(stdin_close_rx);
 
     Ok(SpawnedProcess {
         session: handle,
@@ -524,6 +572,54 @@ async fn spawn_process_preserving_fds(
         stderr_rx,
         exit_rx,
     })
+}
+
+#[cfg(unix)]
+async fn write_unix_pty_bytes(
+    writer: &tokio::io::unix::AsyncFd<File>,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    while !bytes.is_empty() {
+        let mut ready = writer.writable().await?;
+        match ready.try_io(|fd| fd.get_ref().write(bytes)) {
+            Ok(Ok(0)) => return Err(std::io::Error::from(ErrorKind::WriteZero)),
+            Ok(Ok(n)) => bytes = &bytes[n..],
+            Ok(Err(error)) if error.kind() == ErrorKind::Interrupted => continue,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn write_unix_pty_stdin(
+    writer: tokio::io::unix::AsyncFd<File>,
+    mut input: mpsc::Receiver<Vec<u8>>,
+) -> std::io::Result<()> {
+    while let Some(bytes) = input.recv().await {
+        write_unix_pty_bytes(&writer, &bytes).await?;
+    }
+    // Inspect mode only after accepted bytes have reached the terminal, never
+    // guess a Ctrl-D byte for a raw or custom-configured line discipline.
+    let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: the writer owns the fd and mode is writable termios storage.
+    if unsafe { libc::tcgetattr(writer.as_raw_fd(), mode.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: tcgetattr initialized mode on success.
+    let mode = unsafe { mode.assume_init() };
+    let eof = mode.c_cc[libc::VEOF];
+    // SAFETY: fpathconf reads the configuration of this live terminal fd.
+    let disabled = unsafe { libc::fpathconf(writer.as_raw_fd(), libc::_PC_VDISABLE) };
+    if mode.c_lflag & libc::ICANON == 0 || disabled < 0 || i64::from(eof) == disabled as i64 {
+        return Err(std::io::Error::new(
+            ErrorKind::Unsupported,
+            "terminal EOF requires canonical input with VEOF enabled; raw terminal input cannot be half-closed",
+        ));
+    }
+    write_unix_pty_bytes(&writer, &[eof, eof]).await
 }
 
 #[cfg(unix)]
@@ -608,7 +704,11 @@ mod pty_fd_tests {
         }
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
         let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-        let reader = super::spawn_pty_reader(Reader(Some(dropped_tx)), output_tx);
+        let reader = super::spawn_pty_reader(
+            Reader(Some(dropped_tx)),
+            output_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while output_rx.len() != 1 {
                 tokio::task::yield_now().await;

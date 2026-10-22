@@ -25,10 +25,20 @@ use std::time::Duration;
 async fn websocket_model_switch_to_responses_lite_omits_top_level_tools() -> Result<()> {
     require_network!();
 
+    // Each turn delivers a final answer; an empty turn response would trigger the
+    // single missing-answer repair request on the same connection.
     let server = start_websocket_server(vec![vec![
         vec![ev_response_created("warm-1"), ev_completed("warm-1")],
-        vec![ev_response_created("resp-1"), ev_completed("resp-1")],
-        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+        vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ],
     ]])
     .await;
 
@@ -297,10 +307,16 @@ async fn websocket_first_turn_handles_handshake_delay_with_startup_prewarm() -> 
 async fn websocket_cold_resume_and_fork_each_start_with_prewarm() -> Result<()> {
     require_network!();
 
+    // Turn responses deliver final answers so no missing-answer repair request
+    // spills onto the next lifecycle phase's connection.
     let server = start_websocket_server(vec![
         vec![
             vec![ev_response_created("warm-new"), ev_completed("warm-new")],
-            vec![ev_response_created("resp-new"), ev_completed("resp-new")],
+            vec![
+                ev_response_created("resp-new"),
+                ev_assistant_message("msg-new", "done"),
+                ev_completed("resp-new"),
+            ],
         ],
         vec![
             vec![
@@ -309,12 +325,17 @@ async fn websocket_cold_resume_and_fork_each_start_with_prewarm() -> Result<()> 
             ],
             vec![
                 ev_response_created("resp-resume"),
+                ev_assistant_message("msg-resume", "done"),
                 ev_completed("resp-resume"),
             ],
         ],
         vec![
             vec![ev_response_created("warm-fork"), ev_completed("warm-fork")],
-            vec![ev_response_created("resp-fork"), ev_completed("resp-fork")],
+            vec![
+                ev_response_created("resp-fork"),
+                ev_assistant_message("msg-fork", "done"),
+                ev_completed("resp-fork"),
+            ],
         ],
     ])
     .await;

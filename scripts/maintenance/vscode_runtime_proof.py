@@ -104,19 +104,25 @@ def build_probes(run_codex: bool, *, path_only: bool = False) -> list[BinaryProb
             for candidate in extension_candidates()
         )
     # Capture and deduplicate before scheduling; workers never mutate the cache.
-    paths = {
-        Path(path).resolve(): path for _, path, _ in candidates if path
-    } if run_codex else {}
+    paths = (
+        {Path(path).resolve(): path for _, path, _ in candidates if path}
+        if run_codex
+        else {}
+    )
     versions = {}
     if paths:
         with ThreadPoolExecutor(max_workers=min(4, len(paths))) as executor:
             futures = {
-                key: executor.submit(copy_context().run, run_version, path, enabled=True)
+                key: executor.submit(
+                    copy_context().run, run_version, path, enabled=True
+                )
                 for key, path in paths.items()
             }
             versions = {key: future.result() for key, future in futures.items()}
     return [
-        BinaryProbe(label, path, exists, versions.get(Path(path).resolve()) if path else None)
+        BinaryProbe(
+            label, path, exists, versions.get(Path(path).resolve()) if path else None
+        )
         for label, path, exists in candidates
     ]
 

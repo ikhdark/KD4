@@ -84,7 +84,10 @@ impl CliProgressReporter {
                         Some((acc.0.checked_add(*t)?, acc.1.checked_add(*c)?))
                     })
                     .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "model pull progress exceeds u64")
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "model pull progress exceeds u64",
+                        )
                     })?;
                 if sum_total > 0 {
                     if !self.printed_header {

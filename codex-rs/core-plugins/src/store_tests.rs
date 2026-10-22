@@ -312,7 +312,10 @@ fn remote_plugin_install_metadata_follows_installed_cache_lifecycle() {
         .write_remote_plugin_id(&plugin_id, "plugins~Plugin_updated")
         .expect("replace remote identity");
     assert_eq!(
-        store.write_remote_plugin_id(&plugin_id, "   ").unwrap_err().to_string(),
+        store
+            .write_remote_plugin_id(&plugin_id, "   ")
+            .unwrap_err()
+            .to_string(),
         "invalid remote plugin install metadata: remote plugin id must not be blank"
     );
     assert_eq!(
@@ -710,11 +713,13 @@ fn install_rejects_source_containing_staging_and_reserved_versions() {
             .contains("contains its installation staging directory")
     );
     assert!(!store.is_installed(&id));
+    // Only the stable per-entry lock file remains; it is never unlinked.
     assert_eq!(
         fs::read_dir(tmp.path().join("plugins/cache/debug"))
             .unwrap()
-            .count(),
-        0
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from(".plugin-lock-sample-plugin")]
     );
     for version in [
         ".codex-remote-plugin-install.json",
@@ -803,4 +808,84 @@ fn install_rejects_unsupported_junction_entries() {
         "{error}"
     );
     assert!(!store.is_installed(&id));
+}
+#[test]
+fn pending_install_excludes_replacement_and_uninstall_until_rollback_finishes() {
+    let tmp = tempdir().unwrap();
+    write_plugin(tmp.path(), "source", "sample");
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let id = PluginId::new("sample".into(), "debug".into()).unwrap();
+    let source = AbsolutePathBuf::try_from(tmp.path().join("source")).unwrap();
+    store.install(source.clone(), id.clone()).unwrap();
+    fs::write(source.join("skills/SKILL.md"), "replacement").unwrap();
+    let pending = store.begin_install(source.clone(), id.clone()).unwrap();
+    let other_store = PluginStore::new(tmp.path().to_path_buf());
+    assert!(
+        other_store
+            .begin_install(source.clone(), id.clone())
+            .is_err()
+    );
+    assert!(other_store.begin_uninstall(&id).is_err());
+    drop(pending);
+    let installed = tmp
+        .path()
+        .join("plugins/cache/debug/sample/local/skills/SKILL.md");
+    assert_eq!(fs::read_to_string(&installed).unwrap(), "skill");
+    other_store.install(source, id).unwrap();
+    assert_eq!(fs::read_to_string(installed).unwrap(), "replacement");
+}
+
+#[test]
+fn pending_install_does_not_lock_other_plugin_keys() {
+    let tmp = tempdir().unwrap();
+    write_plugin(tmp.path(), "one", "one");
+    write_plugin(tmp.path(), "two", "two");
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let first = store
+        .begin_install(
+            AbsolutePathBuf::try_from(tmp.path().join("one")).unwrap(),
+            PluginId::new("one".into(), "debug".into()).unwrap(),
+        )
+        .unwrap();
+    store
+        .install(
+            AbsolutePathBuf::try_from(tmp.path().join("two")).unwrap(),
+            PluginId::new("two".into(), "debug".into()).unwrap(),
+        )
+        .unwrap();
+    drop(first);
+    assert!(
+        tmp.path()
+            .join("plugins/cache/debug/two/local/skills/SKILL.md")
+            .is_file()
+    );
+}
+
+#[test]
+fn rollback_retains_an_unexpected_publication_instead_of_erasing_it() {
+    let tmp = tempdir().unwrap();
+    write_plugin(tmp.path(), "source", "sample");
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let id = PluginId::new("sample".into(), "debug".into()).unwrap();
+    let mut pending = store
+        .begin_install(
+            AbsolutePathBuf::try_from(tmp.path().join("source")).unwrap(),
+            id,
+        )
+        .unwrap();
+    fs::write(
+        pending.target_root.join(".codex-install-owner"),
+        "foreign publication",
+    )
+    .unwrap();
+    assert!(pending.rollback().is_err());
+    drop(pending);
+    assert_eq!(
+        fs::read_to_string(
+            tmp.path()
+                .join("plugins/cache/debug/sample/.codex-install-owner")
+        )
+        .unwrap(),
+        "foreign publication"
+    );
 }

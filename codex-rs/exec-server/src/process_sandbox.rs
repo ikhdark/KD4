@@ -61,16 +61,30 @@ impl PreparedExecRequest {
             .command
             .split_first()
             .ok_or_else(|| "argv must not be empty".to_string())?;
-        let cwd_metadata = tokio::fs::metadata(self.cwd.as_path()).await
-            .map_err(|error| format!("process not started: stage=cwd_metadata cwd={} program={program:?}: {error}", self.cwd.as_path().display()))?;
+        let cwd_metadata = tokio::fs::metadata(self.cwd.as_path())
+            .await
+            .map_err(|error| {
+                format!(
+                    "process not started: stage=cwd_metadata cwd={} program={program:?}: {error}",
+                    self.cwd.as_path().display()
+                )
+            })?;
         if !cwd_metadata.is_dir() {
-            return Err(format!("process not started: stage=cwd_metadata cwd={} is not a directory", self.cwd.as_path().display()));
+            return Err(format!(
+                "process not started: stage=cwd_metadata cwd={} is not a directory",
+                self.cwd.as_path().display()
+            ));
         }
         if std::path::Path::new(program).is_absolute() {
-            let metadata = tokio::fs::metadata(program).await
-                .map_err(|error| format!("process not started: stage=executable_metadata program={program:?}: {error}"))?;
+            let metadata = tokio::fs::metadata(program).await.map_err(|error| {
+                format!(
+                    "process not started: stage=executable_metadata program={program:?}: {error}"
+                )
+            })?;
             if !metadata.is_file() {
-                return Err(format!("process not started: stage=executable_metadata program={program:?} is not a file"));
+                return Err(format!(
+                    "process not started: stage=executable_metadata program={program:?} is not a file"
+                ));
             }
         }
         let spawned = if tty {
@@ -102,7 +116,12 @@ impl PreparedExecRequest {
             )
             .await
         };
-        spawned.map_err(|err| format!("process spawn failed: stage=spawn program={program:?} cwd={} tty={tty}: {err}", self.cwd.as_path().display()))
+        spawned.map_err(|err| {
+            format!(
+                "process spawn failed: stage=spawn program={program:?} cwd={} tty={tty}: {err}",
+                self.cwd.as_path().display()
+            )
+        })
     }
 }
 

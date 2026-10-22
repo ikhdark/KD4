@@ -119,7 +119,9 @@ pub(super) fn build_turns_with_token_usage_replay(
             if matches!(item, RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)))
                 && token_usage_replay.turn_owner.as_ref().is_some_and(|owner| {
                     owner.position.is_some_and(|position| {
-                        builder.active_turn_position().is_none_or(|last| position > last)
+                        builder
+                            .active_turn_position()
+                            .is_none_or(|last| position > last)
                     })
                 })
             {
@@ -162,6 +164,7 @@ mod tests {
                         output_tokens: 30,
                         reasoning_output_tokens: 10,
                         total_tokens: 150,
+                        coverage: None,
                     },
                     last_token_usage: TokenUsage {
                         input_tokens: 70,
@@ -169,6 +172,7 @@ mod tests {
                         output_tokens: 20,
                         reasoning_output_tokens: 5,
                         total_tokens: 90,
+                        coverage: None,
                     },
                     model_context_window: Some(200_000),
                 }
@@ -218,7 +222,10 @@ mod tests {
         retained.push(rollback.clone());
         let (turns, replay) = build_turns_with_token_usage_replay(&retained);
         assert_eq!(turns.len(), 1);
-        assert_eq!(replay.into_snapshot(&turns).expect("A remains").turn_id, turns[0].id);
+        assert_eq!(
+            replay.into_snapshot(&turns).expect("A remains").turn_id,
+            turns[0].id
+        );
 
         let mut replaced = token_usage_history();
         replaced.insert(3, rollback);
@@ -226,7 +233,10 @@ mod tests {
         replaced.push(fresh);
         let (turns, replay) = build_turns_with_token_usage_replay(&replaced);
         assert_eq!(turns.len(), 1);
-        assert_eq!(replay.into_snapshot(&turns).expect("fresh B count").turn_id, turns[0].id);
+        assert_eq!(
+            replay.into_snapshot(&turns).expect("fresh B count").turn_id,
+            turns[0].id
+        );
     }
 
     fn token_usage_history() -> Vec<RolloutItem> {
@@ -252,6 +262,7 @@ mod tests {
                         output_tokens: 30,
                         reasoning_output_tokens: 10,
                         total_tokens: 150,
+                        coverage: None,
                     },
                     last_token_usage: TokenUsage {
                         input_tokens: 70,
@@ -259,6 +270,7 @@ mod tests {
                         output_tokens: 20,
                         reasoning_output_tokens: 5,
                         total_tokens: 90,
+                        coverage: None,
                     },
                     model_context_window: Some(200_000),
                 }),

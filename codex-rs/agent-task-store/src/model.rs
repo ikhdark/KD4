@@ -76,6 +76,83 @@ impl AgentRole {
 pub struct AcceptanceCriterion {
     pub id: String,
     pub text: String,
+    /// Omitted legacy policies are claims, never implicitly verified proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_policy: Option<CriterionEvidencePolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionEvidenceRequirement {
+    ReportOnly,
+    SourceInspection,
+    ValidationExecution,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceFreshness {
+    Historical,
+    #[default]
+    Current,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CriterionEvidencePolicy {
+    pub kind: CriterionEvidenceRequirement,
+    /// Exact immutable assignment requirement, not an agent-authored coverage label.
+    #[serde(default)]
+    pub required_evidence: Option<String>,
+    #[serde(default)]
+    pub freshness: EvidenceFreshness,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CriterionAssessment {
+    pub criterion_id: String,
+    pub satisfied: bool,
+    pub reason: String,
+}
+
+impl AcceptanceCriterion {
+    fn validate_evidence_policy(&self) -> StoreResult<()> {
+        let Some(policy) = &self.evidence_policy else {
+            return Ok(());
+        };
+        if policy.kind == CriterionEvidenceRequirement::ReportOnly {
+            if policy.required_evidence.is_some() {
+                return Err(StoreError::InvalidAssignment(
+                    "report_only cannot claim an execution requirement".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let requirement = policy
+            .required_evidence
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                StoreError::InvalidAssignment(
+                    "proof policies require an exact required_evidence binding".into(),
+                )
+            })?;
+        if policy.kind == CriterionEvidenceRequirement::SourceInspection
+            && !requirement.strip_prefix("inspect:").is_some_and(|path| {
+                !path.is_empty()
+                    && !path.contains('\\')
+                    && !path.contains(':')
+                    && !path.starts_with('/')
+                    && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+            })
+        {
+            return Err(StoreError::InvalidAssignment(
+                "source_inspection policies require inspect:<normalized repository-relative file>"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -250,6 +327,17 @@ impl AssignmentDraft {
         for criterion in &self.acceptance_criteria {
             validate_nonempty("criterion id", &criterion.id)?;
             validate_nonempty("criterion text", &criterion.text)?;
+            criterion.validate_evidence_policy()?;
+            if let Some(required) = criterion
+                .evidence_policy
+                .as_ref()
+                .and_then(|policy| policy.required_evidence.as_ref())
+                && !self.required_evidence.contains(required)
+            {
+                return Err(StoreError::InvalidAssignment(
+                    "criterion policy must bind an assignment required_evidence entry".into(),
+                ));
+            }
             if !criterion_ids.insert(criterion.id.as_str()) {
                 return Err(StoreError::InvalidAssignment(format!(
                     "duplicate acceptance criterion id {}",
@@ -443,7 +531,9 @@ impl Assignment {
                 if self.admission_origin == AssignmentAdmissionOrigin::Typed
                     && self.required_evidence.is_empty()
                 {
-                    return invalid("workers require at least one proof obligation in required_evidence");
+                    return invalid(
+                        "workers require at least one proof obligation in required_evidence",
+                    );
                 }
             }
             AgentRole::Reviewer => {
@@ -455,7 +545,9 @@ impl Assignment {
             }
             AgentRole::Verifier => {
                 if self.required_evidence.is_empty() {
-                    return invalid("verifiers require at least one focused proof obligation in required_evidence");
+                    return invalid(
+                        "verifiers require at least one focused proof obligation in required_evidence",
+                    );
                 }
             }
             AgentRole::Integrator => {
@@ -554,16 +646,29 @@ pub struct EffectiveTaskContract {
 }
 
 impl Assignment {
-    pub fn effective_criteria<'a>(&'a self, amendment: Option<&'a AttemptAmendment>) -> &'a [AcceptanceCriterion] {
-        amendment.and_then(|value| value.acceptance_criteria.as_deref())
+    pub fn effective_criteria<'a>(
+        &'a self,
+        amendment: Option<&'a AttemptAmendment>,
+    ) -> &'a [AcceptanceCriterion] {
+        amendment
+            .and_then(|value| value.acceptance_criteria.as_deref())
             .unwrap_or(&self.acceptance_criteria)
     }
 
-    pub fn effective_contract(&self, amendment: Option<&AttemptAmendment>) -> EffectiveTaskContract {
+    pub fn effective_contract(
+        &self,
+        amendment: Option<&AttemptAmendment>,
+    ) -> EffectiveTaskContract {
         EffectiveTaskContract {
-            objective: amendment.and_then(|value| value.objective.as_ref()).unwrap_or(&self.objective).clone(),
+            objective: amendment
+                .and_then(|value| value.objective.as_ref())
+                .unwrap_or(&self.objective)
+                .clone(),
             acceptance_criteria: self.effective_criteria(amendment).to_vec(),
-            stop_condition: amendment.and_then(|value| value.stop_condition.as_ref()).unwrap_or(&self.stop_condition).clone(),
+            stop_condition: amendment
+                .and_then(|value| value.stop_condition.as_ref())
+                .unwrap_or(&self.stop_condition)
+                .clone(),
         }
     }
 }
@@ -587,6 +692,7 @@ impl AttemptAmendment {
             for criterion in criteria {
                 validate_nonempty("amended criterion id", &criterion.id)?;
                 validate_nonempty("amended criterion text", &criterion.text)?;
+                criterion.validate_evidence_policy()?;
                 if !ids.insert(criterion.id.as_str()) {
                     return Err(StoreError::InvalidAssignment(format!(
                         "duplicate amended criterion id {}",
@@ -626,10 +732,12 @@ pub struct Attempt {
     pub sealed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskActor {
+    /// Trusted home-wide maintenance only; never construct from a model tool.
     Root,
+    RootSession(String),
     Attempt(AttemptId),
 }
 
@@ -656,10 +764,6 @@ pub struct WorkspaceManifestEntry {
     pub content_hash: Option<String>,
     pub existed: bool,
 }
-
-
-
-
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceTaskStatus {
@@ -695,13 +799,25 @@ pub struct IsolationHandoff {
     pub integrated_at: Option<DateTime<Utc>>,
 }
 
-
 impl TaskActor {
-    pub(crate) fn require_root(self) -> StoreResult<()> {
+    pub(crate) fn require_root(&self) -> StoreResult<()> {
         match self {
-            Self::Root => Ok(()),
+            Self::Root | Self::RootSession(_) => Ok(()),
             Self::Attempt(_) => Err(StoreError::RootAuthorityRequired),
         }
+    }
+
+    pub(crate) fn require_root_for(&self, root_session_id: &str) -> StoreResult<()> {
+        self.require_root()?;
+        if let Self::RootSession(root) = self
+            && root != root_session_id
+        {
+            return Err(StoreError::RootSessionMismatch {
+                expected: root.clone(),
+                requested: root_session_id.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -751,6 +867,10 @@ impl ObservationKind {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RuntimeObservation {
+    /// Host scheduling metadata, never an authored acceptance claim. Unknown
+    /// future codes remain retrievable without inferring a successful result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_stop_cause: Option<String>,
     pub event_id: MutationEventId,
     pub wake_event_id: WakeEventId,
     pub assignment_id: AssignmentId,
@@ -805,6 +925,9 @@ impl ValidationCall {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceInspectionStart {
+    /// Canonical acquisition target for recovery; not workspace freshness proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) canonical_path: Option<std::path::PathBuf>,
     pub(crate) attempt_id: AttemptId,
     pub(crate) path: String,
     pub(crate) workspace_id: String,
@@ -812,6 +935,9 @@ pub struct SourceInspectionStart {
 }
 
 impl SourceInspectionStart {
+    pub fn canonical_path(&self) -> Option<&std::path::Path> {
+        self.canonical_path.as_deref()
+    }
     pub fn matches_attempt(&self, attempt_id: AttemptId) -> bool {
         self.attempt_id == attempt_id
     }
@@ -1038,7 +1164,6 @@ pub struct AgentGate {
     pub sealed_at: Option<DateTime<Utc>>,
 }
 
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttributionConfidence {
@@ -1066,9 +1191,6 @@ pub struct MutationEvidence {
     #[serde(default)]
     pub end_epoch: Option<u64>,
 }
-
-
-
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTaskBindingDraft {
@@ -1186,14 +1308,30 @@ pub fn evaluate_risk_gate(facts: &RiskFacts) -> RiskGateDecision {
     }
 }
 
+/// The exact successful prerequisite admitted with an assignment, not a claim
+/// that it remains accepted or that its filesystem inputs remain current.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DependencyAdmission {
+    pub assignment_id: AssignmentId,
+    pub attempt_id: AttemptId,
+    pub receipt_sha256: String,
+    pub gates: Vec<AgentGate>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTask {
     pub assignment: Assignment,
+    /// Empty on legacy records whose admission provenance was not captured.
+    #[serde(default)]
+    pub dependency_admissions: Vec<DependencyAdmission>,
     pub current_attempt: Attempt,
     pub gates: Vec<AgentGate>,
     pub receipt: Option<AgentReceipt>,
     #[serde(default)]
     pub validation_calls: Vec<ValidationCall>,
+    /// Derived at this read, not durable proof or a reusable freshness receipt.
+    #[serde(default)]
+    pub criterion_assessments: Vec<CriterionAssessment>,
     #[serde(default)]
     pub workspace_status: WorkspaceTaskStatus,
     #[serde(default)]
@@ -1204,6 +1342,11 @@ pub struct AgentTask {
 }
 
 impl AgentTask {
+    pub fn criterion_is_satisfied(&self, id: &str) -> bool {
+        self.criterion_assessments
+            .iter()
+            .any(|assessment| assessment.criterion_id == id && assessment.satisfied)
+    }
     /// Projects already loaded receipt/call state; never performs IO or upgrades prose.
     pub fn completion_evidence_summary(&self) -> String {
         let Some(receipt) = &self.receipt else {
@@ -1234,15 +1377,14 @@ impl AgentTask {
             let status = match (result.status, evidence) {
                 (CriterionStatus::NotRun, _) => "not run",
                 (CriterionStatus::Failed, _) => "reported failed",
-                (CriterionStatus::Passed, Some(reference)) =>
-                {
-                    match reference.kind {
-                        CriterionEvidenceKind::ValidationExecution =>
-                            "supported by a successful validation execution (test coverage not established; freshness unverified)",
-                        CriterionEvidenceKind::SourceInspection =>
-                            "supported by complete source acquisition (semantic inspection and correctness not established; freshness unverified)",
+                (CriterionStatus::Passed, Some(reference)) => match reference.kind {
+                    CriterionEvidenceKind::ValidationExecution => {
+                        "supported by a successful validation execution (test coverage not established; freshness unverified)"
                     }
-                }
+                    CriterionEvidenceKind::SourceInspection => {
+                        "supported by complete source acquisition (semantic inspection and correctness not established; freshness unverified)"
+                    }
+                },
                 (CriterionStatus::Passed, None) => "reported complete; behavior unverified",
             };
             // IDs are exact when shown. Oversized IDs remain available in the receipt.
@@ -1275,6 +1417,7 @@ impl AgentTask {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTaskAuthorization {
+    pub root_session_id: String,
     pub admission_origin: AssignmentAdmissionOrigin,
     pub current_attempt: Attempt,
 }

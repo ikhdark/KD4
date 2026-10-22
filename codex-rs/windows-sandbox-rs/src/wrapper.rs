@@ -196,7 +196,9 @@ async fn run_windows_sandbox_wrapper_request(request: WindowsSandboxWrapperReque
         })
         .await?;
 
-    Ok(crate::forward_sandbox_session_stdio(spawned).await)
+    Ok(crate::forward_sandbox_session_stdio(spawned)
+        .await
+        .exit_code())
 }
 
 fn parse_windows_sandbox_wrapper_args(args: Vec<String>) -> Result<WindowsSandboxWrapperRequest> {

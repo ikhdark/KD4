@@ -18,11 +18,22 @@ pub async fn ensure_oss_ready(config: &Config) -> std::io::Result<()> {
     };
 
     // Verify local LM Studio is reachable.
-    let (lmstudio_client, models) = LMStudioClient::try_from_provider_with_models(config).await?;
+    let (lmstudio_client, mut models) =
+        LMStudioClient::try_from_provider_with_models(config).await?;
 
     if !models.iter().any(|m| m == model) {
         lmstudio_client.download_model(model).await?;
+        models.push(model.to_owned());
     }
+
+    let provider = &config.model_providers[codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID];
+    codex_model_provider::store_discovered_local_models(
+        codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID,
+        provider,
+        config.codex_home.to_path_buf(),
+        models,
+    )
+    .await;
 
     // Load the model in the background
     tokio::spawn({

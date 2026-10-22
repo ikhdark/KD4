@@ -51,10 +51,14 @@ pub(crate) async fn create_file_system_context(
             let runtime_paths = ExecServerRuntimePaths::new(helper_paths.codex_exe.clone())?;
             let codex_home = tempfile::TempDir::new()?;
             let env = std::collections::HashMap::from([(
-                "CODEX_HOME".to_string(), codex_home.path().display().to_string(),
+                "CODEX_HOME".to_string(),
+                codex_home.path().display().to_string(),
             )]);
             Ok(FileSystemContext {
-                file_system: Arc::new(LocalFileSystem::with_runtime_paths_and_env(runtime_paths, env)),
+                file_system: Arc::new(LocalFileSystem::with_runtime_paths_and_env(
+                    runtime_paths,
+                    env,
+                )),
                 _helper_paths: Some(helper_paths),
                 _codex_home: Some(codex_home),
                 _server: None,

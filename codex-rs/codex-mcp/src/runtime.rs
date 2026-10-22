@@ -34,6 +34,7 @@ pub struct SandboxState {
 pub struct McpRuntimeContext {
     environment_manager: Arc<EnvironmentManager>,
     local_stdio_fallback_cwd: PathBuf,
+    selected_environments: std::collections::HashMap<String, Option<Arc<Environment>>>,
 }
 
 impl McpRuntimeContext {
@@ -44,6 +45,59 @@ impl McpRuntimeContext {
         Self {
             environment_manager,
             local_stdio_fallback_cwd,
+            selected_environments: Default::default(),
+        }
+    }
+
+    pub fn with_selected_environments(
+        mut self,
+        environments: std::collections::HashMap<String, Option<Arc<Environment>>>,
+    ) -> Self {
+        self.selected_environments = environments;
+        self
+    }
+
+    pub fn local_fallback_cwd(&self) -> PathBuf {
+        self.local_stdio_fallback_cwd.clone()
+    }
+
+    pub fn selected_scope_matches(&self, other: &Self) -> bool {
+        self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
+            && self.selected_environments.len() == other.selected_environments.len()
+            && self.selected_environments.iter().all(|(id, left)| {
+                other
+                    .selected_environments
+                    .get(id)
+                    .is_some_and(|right| match (left, right) {
+                        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                        (None, None) => true,
+                        _ => false,
+                    })
+            })
+    }
+
+    pub fn server_scope_matches(
+        &self,
+        other: &Self,
+        config: &codex_config::McpServerConfig,
+    ) -> bool {
+        if config.is_local_environment()
+            && matches!(
+                config.transport,
+                codex_config::McpServerTransportConfig::Stdio { cwd: None, .. }
+            )
+            && self.local_stdio_fallback_cwd != other.local_stdio_fallback_cwd
+        {
+            return false;
+        }
+        match (
+            self.resolve_server_environment("scope", config),
+            other.resolve_server_environment("scope", config),
+        ) {
+            (Ok(Some(left)), Ok(Some(right))) => Arc::ptr_eq(&left, &right),
+            (Ok(None), Ok(None)) => true,
+            (Err(left), Err(right)) => left == right,
+            _ => false,
         }
     }
 
@@ -53,7 +107,6 @@ impl McpRuntimeContext {
 
     pub(crate) fn is_compatible_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.environment_manager, &other.environment_manager)
-            && self.local_stdio_fallback_cwd == other.local_stdio_fallback_cwd
     }
 
     pub(crate) fn resolve_server_environment(
@@ -61,6 +114,14 @@ impl McpRuntimeContext {
         server_name: &str,
         config: &codex_config::McpServerConfig,
     ) -> Result<Option<Arc<Environment>>, String> {
+        if let Some(selected) = self.selected_environments.get(&config.environment_id) {
+            return selected.clone().map(Some).ok_or_else(|| {
+                format!(
+                    "MCP server `{server_name}` selected environment `{}` is unavailable",
+                    config.environment_id,
+                )
+            });
+        }
         // Resolve `"local"` through the shared registry when available. Local
         // HTTP is the one current exception: it can use the ambient HTTP client
         // even when no local Environment is configured.
@@ -289,5 +350,37 @@ mod tests {
             Err(error) => panic!("local stdio MCP should resolve: {error}"),
         };
         assert!(resolved_runtime.is_some());
+    }
+    #[test]
+    fn identical_logical_ids_do_not_reuse_a_different_captured_environment() {
+        let manager = Arc::new(EnvironmentManager::without_environments());
+        let first = Arc::new(Environment::default_for_tests());
+        let replacement = Arc::new(Environment::default_for_tests());
+        let make = |owner| {
+            McpRuntimeContext::new(Arc::clone(&manager), PathBuf::from("C:/host"))
+                .with_selected_environments(HashMap::from([("remote".to_string(), Some(owner))]))
+        };
+        let original = make(Arc::clone(&first));
+        let same = make(Arc::clone(&first));
+        let replaced = make(replacement);
+        let server = stdio_server("remote");
+        assert!(original.server_scope_matches(&same, &server));
+        assert!(!original.server_scope_matches(&replaced, &server));
+        assert!(Arc::ptr_eq(
+            &original
+                .resolve_server_environment("server", &server)
+                .unwrap()
+                .unwrap(),
+            &first
+        ));
+        let unrelated_change = McpRuntimeContext::new(manager, PathBuf::from("C:/host"))
+            .with_selected_environments(HashMap::from([
+                ("remote".to_string(), Some(first)),
+                (
+                    "unrelated".to_string(),
+                    Some(Arc::new(Environment::default_for_tests())),
+                ),
+            ]));
+        assert!(original.server_scope_matches(&unrelated_change, &server));
     }
 }

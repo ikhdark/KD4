@@ -132,8 +132,10 @@ fn matches_explicit_context(
 
     body_and_close
         .strip_suffix(closing_tag)
-        .is_some_and(|body| max_body_bytes.is_none_or(|limit| body.len() <= limit)
-            && matches_rendered_text_value(body))
+        .is_some_and(|body| {
+            max_body_bytes.is_none_or(|limit| body.len() <= limit)
+                && matches_rendered_text_value(body)
+        })
 }
 
 fn matches_rendered_attr_value(mut value: &str) -> bool {
@@ -256,7 +258,7 @@ fn escape_text_with_token_budget(value: &str) -> String {
 
     let mut omitted_tokens = approx_tokens_from_byte_count(escaped_bytes.saturating_sub(max_bytes));
     for _ in 0..4 {
-        let marker = format!("…{omitted_tokens} tokens truncated…");
+        let marker = format!("…approximately {omitted_tokens} tokens truncated…");
         let bounds = escaped_bounds(
             value,
             max_bytes.saturating_sub(marker.len()),
@@ -270,7 +272,7 @@ fn escape_text_with_token_budget(value: &str) -> String {
         omitted_tokens = next_omitted_tokens;
     }
 
-    let marker = format!("…{omitted_tokens} tokens truncated…");
+    let marker = format!("…approximately {omitted_tokens} tokens truncated…");
     let bounds = escaped_bounds(
         value,
         max_bytes.saturating_sub(marker.len()),
@@ -378,8 +380,13 @@ mod policy_tests {
 
     #[test]
     fn application_policy_keeps_middle_while_external_data_remains_bounded() {
-        let value = format!("{}Never modify X.{}", "before ".repeat(1500), " after".repeat(1500));
-        let policy = AdditionalContextDeveloperFragment::new("policy".into(), value.clone()).render();
+        let value = format!(
+            "{}Never modify X.{}",
+            "before ".repeat(1500),
+            " after".repeat(1500)
+        );
+        let policy =
+            AdditionalContextDeveloperFragment::new("policy".into(), value.clone()).render();
         assert!(policy.contains(&value));
         assert!(AdditionalContextDeveloperFragment::matches_text(&policy));
         let external = AdditionalContextUserFragment::new("data".into(), value).render();

@@ -28,7 +28,6 @@ use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -54,7 +53,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
                 "confidence_score": 0.9,
                 "priority": 1,
                 "code_location": {
-                    "absolute_file_path": "/tmp/file.rs",
+                    "absolute_file_path": std::env::temp_dir().join("review-file.rs"),
                     "line_range": {"start": 10, "end": 20}
                 }
             }
@@ -179,17 +178,17 @@ async fn review_op_emits_lifecycle_and_review_output() {
     // Deep compare full structure using PartialEq (floats are f32 on both sides).
     let expected = ReviewOutputEvent {
         findings: vec![ReviewFinding {
-            title: "Prefer Stylize helpers".to_string(),
+            title: "[P1] Prefer Stylize helpers".to_string(),
             body: "Use .dim()/.bold() chaining instead of manual Style where possible.".to_string(),
             confidence_score: 0.9,
             priority: 1,
             code_location: ReviewCodeLocation {
-                absolute_file_path: PathBuf::from("/tmp/file.rs"),
+                absolute_file_path: std::env::temp_dir().join("review-file.rs"),
                 line_range: ReviewLineRange { start: 10, end: 20 },
             },
         }],
         overall_correctness: "patch is incorrect".to_string(),
-        overall_explanation: "All good with some improvements suggested.".to_string(),
+        overall_explanation: "Source validation: unverified custom scope; locations and freshness are not established by the host.\n\nAll good with some improvements suggested.".to_string(),
         overall_confidence_score: 0.8,
     };
     assert_eq!(expected, review);
@@ -486,6 +485,11 @@ async fn review_filters_agent_message_related_events() {
         {
             panic!("delegate assistant completion surfaced during review")
         }
+        EventMsg::ItemStarted(started)
+            if matches!(&started.item, TurnItem::AgentMessage(message) if message.id == "msg-1") =>
+        {
+            panic!("delegate assistant start surfaced during review")
+        }
         _ => false,
     })
     .await;
@@ -512,7 +516,7 @@ async fn review_emits_one_rendered_agent_message_on_structured_output() {
                 "confidence_score": 0.5,
                 "priority": 1,
                 "code_location": {
-                    "absolute_file_path": "/tmp/file.rs",
+                    "absolute_file_path": std::env::temp_dir().join("review-file.rs"),
                     "line_range": {"start": 1, "end": 2}
                 }
             }
@@ -567,7 +571,9 @@ async fn review_emits_one_rendered_agent_message_on_structured_output() {
         _ => false,
     })
     .await;
-    let expected: ReviewOutputEvent = serde_json::from_str(&review_json).unwrap();
+    let mut expected: ReviewOutputEvent = serde_json::from_str(&review_json).unwrap();
+    expected.findings[0].title = "[P1] Example".to_string();
+    expected.overall_explanation = "Source validation: unverified custom scope; locations and freshness are not established by the host.\n\nok".to_string();
     assert_eq!(agent_messages, vec![render_review_output_text(&expected)]);
     assert!(saw_entered && saw_exited, "missing review lifecycle events");
 

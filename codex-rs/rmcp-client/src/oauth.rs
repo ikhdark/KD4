@@ -411,9 +411,9 @@ fn save_oauth_tokens_with_keyring_with_fallback_to_file<K: KeyringStore + Clone 
         // behind a stale Secrets entry.
         Err(error)
             if error.downcast_ref::<OAuthStoreLockFailure>().is_some()
-                || error.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                    error.kind() == std::io::ErrorKind::WouldBlock
-                }) =>
+                || error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
         {
             Err(error)
         }
@@ -1221,10 +1221,7 @@ mod tests {
         let tokens = sample_tokens();
         let expected = tokens.clone();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
-        store.set_error(
-            &key,
-            KeyringError::Invalid("error".into(), "load".into()),
-        );
+        store.set_error(&key, KeyringError::Invalid("error".into(), "load".into()));
 
         super::save_oauth_tokens_to_file(env.path(), &tokens)?;
 
@@ -1259,9 +1256,7 @@ mod tests {
 
         let fallback_path = super::fallback_file_path(env.path());
         assert!(!fallback_path.exists(), "fallback file should be removed");
-        let stored = store
-            .saved_value(&key)
-            .expect("value saved to keyring");
+        let stored = store.saved_value(&key).expect("value saved to keyring");
         assert_eq!(serde_json::from_str::<StoredOAuthTokens>(&stored)?, tokens);
         Ok(())
     }
@@ -1295,10 +1290,7 @@ mod tests {
         let store = MockKeyringStore::default();
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
-        store.set_error(
-            &key,
-            KeyringError::Invalid("error".into(), "save".into()),
-        );
+        store.set_error(&key, KeyringError::Invalid("error".into(), "save".into()));
 
         super::save_oauth_tokens_with_keyring_with_fallback_to_file(
             &store,
@@ -1565,10 +1557,7 @@ mod tests {
         let store = MockKeyringStore::default();
         let tokens = sample_tokens();
         let key = super::compute_store_key(&tokens.server_name, &tokens.url)?;
-        store.set_error(
-            &key,
-            KeyringError::Invalid("error".into(), "delete".into()),
-        );
+        store.set_error(&key, KeyringError::Invalid("error".into(), "delete".into()));
         super::save_oauth_tokens_to_file(env.path(), &tokens).unwrap();
 
         let result = super::delete_oauth_tokens_from_keyring_and_file(

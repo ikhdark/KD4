@@ -28,10 +28,10 @@ pub(super) const MAX_RECORDED_EVENTS: usize = 4_096;
 const TASK_DURATION_METRIC: &str = "codex.multi_agent.task.duration_ms";
 pub(super) const TASK_FIRST_MEANINGFUL_PROGRESS_DURATION_METRIC: &str =
     "codex.multi_agent.task.first_meaningful_progress.duration_ms";
-const TASK_CRITICAL_PATH_IDLE_DURATION_METRIC: &str =
-    "codex.multi_agent.task.critical_path_idle.duration_ms";
-const TASK_CRITICAL_PATH_IDLE_RATIO_METRIC: &str =
-    "codex.multi_agent.task.critical_path_idle.basis_points";
+const TASK_COORDINATOR_ZERO_ACTIVE_DURATION_METRIC: &str =
+    "codex.multi_agent.task.coordinator_zero_active.duration_ms";
+const TASK_COORDINATOR_ZERO_ACTIVE_RATIO_METRIC: &str =
+    "codex.multi_agent.task.coordinator_zero_active.basis_points";
 const TASK_TOKEN_USAGE_METRIC: &str = "codex.multi_agent.task.token_usage";
 const TOKEN_CLASS_TAG: &str = "token_class";
 const SUBTREE_TOKEN_USAGE_METRIC: &str = "codex.multi_agent.subtree.token_usage";
@@ -172,6 +172,7 @@ pub(crate) struct RoleUsage {
 /// cached input and reasoning output have materially different costs from fresh input.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct TokenClassTotals {
+    pub coverage: Option<codex_protocol::protocol::TokenUsageCoverage>,
     pub input: u64,
     pub cached_input: u64,
     pub output: u64,
@@ -180,13 +181,41 @@ pub(crate) struct TokenClassTotals {
 }
 
 impl TokenClassTotals {
+    pub(crate) fn from_usage(usage: &codex_protocol::protocol::TokenUsage) -> Self {
+        Self {
+            coverage: usage.coverage,
+            input: usage.input_tokens.max(0) as u64,
+            cached_input: usage.cached_input_tokens.max(0) as u64,
+            output: usage.output_tokens.max(0) as u64,
+            reasoning_output: usage.reasoning_output_tokens.max(0) as u64,
+            total: usage.total_tokens.max(0) as u64,
+        }
+    }
+
+    fn known(
+        self,
+        value: u64,
+        field: impl FnOnce(&codex_protocol::protocol::TokenUsageCoverage) -> u64,
+    ) -> Option<u64> {
+        let coverage = self.coverage?;
+        (!coverage.saturated && field(&coverage) == coverage.receipts).then_some(value)
+    }
+
     /// Non-cached input tokens, the portion billed at the full input rate.
+    #[cfg(test)]
     pub(crate) fn uncached_input(self) -> u64 {
         self.input.saturating_sub(self.cached_input)
     }
 
     fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
+            coverage: match (self.coverage, other.coverage) {
+                (Some(mut left), Some(right)) => {
+                    left.add_assign(&right);
+                    Some(left)
+                }
+                _ => None,
+            },
             input: self.input.checked_add(other.input)?,
             cached_input: self.cached_input.checked_add(other.cached_input)?,
             output: self.output.checked_add(other.output)?,
@@ -195,13 +224,24 @@ impl TokenClassTotals {
         })
     }
 
-    fn classes(self) -> [(&'static str, u64); 5] {
+    fn classes(self) -> [(&'static str, Option<u64>); 5] {
         [
-            ("input", self.input),
-            ("cached_input", self.cached_input),
-            ("uncached_input", self.uncached_input()),
-            ("output", self.output),
-            ("reasoning_output", self.reasoning_output),
+            ("input", self.known(self.input, |c| c.input_tokens)),
+            (
+                "cached_input",
+                self.known(self.cached_input, |c| c.cached_input_tokens),
+            ),
+            (
+                "uncached_input",
+                self.known(self.input, |c| c.input_tokens)
+                    .zip(self.known(self.cached_input, |c| c.cached_input_tokens))
+                    .map(|(input, cached)| input.saturating_sub(cached)),
+            ),
+            ("output", self.known(self.output, |c| c.output_tokens)),
+            (
+                "reasoning_output",
+                self.known(self.reasoning_output, |c| c.reasoning_output_tokens),
+            ),
         ]
     }
 }
@@ -267,7 +307,8 @@ impl From<AgentStatusClaim> for FinalOutcome {
 pub(crate) struct TaskMetricInput {
     pub task_id: OpaqueId,
     pub duration: Duration,
-    pub critical_path_idle_time: Duration,
+    /// Time with no active assignments anywhere in this coordinator, within this task's lifetime.
+    pub coordinator_zero_active_time: Duration,
     pub role_usage: Vec<RoleUsage>,
     #[cfg(test)]
     pub concurrency: Vec<ConcurrencySlice>,
@@ -289,8 +330,9 @@ pub(crate) struct TaskMetricInput {
 pub(crate) struct TaskMetrics {
     pub task_id: OpaqueId,
     pub duration: Duration,
-    pub critical_path_idle_time: Duration,
-    pub critical_path_idle_basis_points: u16,
+    /// Coordinator occupancy only; this does not measure this task's required dependency path.
+    pub coordinator_zero_active_time: Duration,
+    pub coordinator_zero_active_basis_points: u16,
     pub total_usage: UsageTotals,
     pub usage_by_role: BTreeMap<RoleCapability, UsageTotals>,
     pub concurrency_utilization_basis_points: u16,
@@ -331,7 +373,7 @@ pub(crate) enum MetricsError {
     TooManyRows,
     RecorderFinished,
     InvalidEventTime,
-    InvalidCriticalPathIdleTime,
+    InvalidCoordinatorZeroActiveTime,
     InvalidConcurrencySlice,
     InvalidAcceptanceClosure,
     ArithmeticOverflow,
@@ -365,8 +407,8 @@ impl TaskMetrics {
         if input.role_usage.len() > MAX_METRIC_ROWS {
             return Err(MetricsError::TooManyRows);
         }
-        if input.critical_path_idle_time > input.duration {
-            return Err(MetricsError::InvalidCriticalPathIdleTime);
+        if input.coordinator_zero_active_time > input.duration {
+            return Err(MetricsError::InvalidCoordinatorZeroActiveTime);
         }
         if input
             .acceptance_first_pass_closed
@@ -392,9 +434,9 @@ impl TaskMetrics {
         Ok(Self {
             task_id: input.task_id,
             duration: input.duration,
-            critical_path_idle_time: input.critical_path_idle_time,
-            critical_path_idle_basis_points: ratio(
-                input.critical_path_idle_time.as_nanos(),
+            coordinator_zero_active_time: input.coordinator_zero_active_time,
+            coordinator_zero_active_basis_points: ratio(
+                input.coordinator_zero_active_time.as_nanos(),
                 input.duration.as_nanos(),
             ),
             total_usage,
@@ -432,13 +474,13 @@ impl TaskMetrics {
         let outcome_tags = [(OUTCOME_TAG, outcome)];
         session_telemetry.record_duration(TASK_DURATION_METRIC, self.duration, &outcome_tags);
         session_telemetry.record_duration(
-            TASK_CRITICAL_PATH_IDLE_DURATION_METRIC,
-            self.critical_path_idle_time,
+            TASK_COORDINATOR_ZERO_ACTIVE_DURATION_METRIC,
+            self.coordinator_zero_active_time,
             &outcome_tags,
         );
         session_telemetry.histogram(
-            TASK_CRITICAL_PATH_IDLE_RATIO_METRIC,
-            i64::from(self.critical_path_idle_basis_points),
+            TASK_COORDINATOR_ZERO_ACTIVE_RATIO_METRIC,
+            i64::from(self.coordinator_zero_active_basis_points),
             &outcome_tags,
         );
         session_telemetry.histogram(
@@ -455,12 +497,15 @@ impl TaskMetrics {
             // Report the provider-reported total and each class separately. A single
             // collapsed scalar cannot distinguish a child that re-read the repository
             // from one that reused a cached prompt prefix.
-            session_telemetry.histogram(
-                TASK_TOKEN_USAGE_METRIC,
-                saturating_metric_value(usage.tokens.total),
-                &tags,
-            );
+            if let Some(total) = usage.tokens.known(usage.tokens.total, |c| c.total_tokens) {
+                session_telemetry.histogram(
+                    TASK_TOKEN_USAGE_METRIC,
+                    saturating_metric_value(total),
+                    &tags,
+                );
+            }
             for (token_class, value) in usage.tokens.classes() {
+                let Some(value) = value else { continue };
                 session_telemetry.histogram(
                     TASK_TOKEN_USAGE_METRIC,
                     saturating_metric_value(value),
@@ -525,7 +570,8 @@ impl TaskMetrics {
 }
 
 /// Bounded, online recorder for one task. Elapsed timestamps are monotonic durations measured
-/// from task start. An interval is critical-path idle when its reported active-turn count is zero.
+/// from task start. Zero-active time uses coordinator-wide assignment occupancy, not task
+/// dependencies or progress: unrelated active assignments can hide a stalled required task.
 #[derive(Debug)]
 pub(crate) struct TaskMetricRecorder {
     task_id: OpaqueId,
@@ -534,7 +580,7 @@ pub(crate) struct TaskMetricRecorder {
     capacity: u32,
     weighted_active_time: Duration,
     weighted_capacity_time: Duration,
-    critical_path_idle_time: Duration,
+    coordinator_zero_active_time: Duration,
     usage_by_role: BTreeMap<RoleCapability, UsageTotals>,
     recorded_events: usize,
     finished: bool,
@@ -554,7 +600,7 @@ impl TaskMetricRecorder {
             capacity,
             weighted_active_time: Duration::ZERO,
             weighted_capacity_time: Duration::ZERO,
-            critical_path_idle_time: Duration::ZERO,
+            coordinator_zero_active_time: Duration::ZERO,
             usage_by_role: BTreeMap::new(),
             recorded_events: 0,
             finished: false,
@@ -611,7 +657,7 @@ impl TaskMetricRecorder {
     ) -> Result<(), MetricsError> {
         self.ensure_recordable()?;
         validate_concurrency_state(active_turns, capacity)?;
-        let (weighted_active_time, weighted_capacity_time, critical_path_idle_time) =
+        let (weighted_active_time, weighted_capacity_time, coordinator_zero_active_time) =
             self.integrated_until(elapsed)?;
         self.recorded_events = self
             .recorded_events
@@ -622,7 +668,7 @@ impl TaskMetricRecorder {
         self.capacity = capacity;
         self.weighted_active_time = weighted_active_time;
         self.weighted_capacity_time = weighted_capacity_time;
-        self.critical_path_idle_time = critical_path_idle_time;
+        self.coordinator_zero_active_time = coordinator_zero_active_time;
         Ok(())
     }
 
@@ -635,7 +681,7 @@ impl TaskMetricRecorder {
         if self.finished {
             return Ok(None);
         }
-        let (weighted_active_time, weighted_capacity_time, critical_path_idle_time) =
+        let (weighted_active_time, weighted_capacity_time, coordinator_zero_active_time) =
             self.integrated_until(elapsed)?;
         let role_usage = self
             .usage_by_role
@@ -651,7 +697,7 @@ impl TaskMetricRecorder {
             TaskMetricInput {
                 task_id: self.task_id,
                 duration: elapsed,
-                critical_path_idle_time,
+                coordinator_zero_active_time,
                 role_usage,
                 #[cfg(test)]
                 concurrency: Vec::new(),
@@ -678,7 +724,7 @@ impl TaskMetricRecorder {
         self.last_elapsed = elapsed;
         self.weighted_active_time = weighted_active_time;
         self.weighted_capacity_time = weighted_capacity_time;
-        self.critical_path_idle_time = critical_path_idle_time;
+        self.coordinator_zero_active_time = coordinator_zero_active_time;
         self.finished = true;
         Ok(Some(metrics))
     }
@@ -716,17 +762,17 @@ impl TaskMetricRecorder {
             weighted_add(self.weighted_active_time, interval, self.active_turns)?;
         let weighted_capacity_time =
             weighted_add(self.weighted_capacity_time, interval, self.capacity)?;
-        let critical_path_idle_time = if self.active_turns == 0 {
-            self.critical_path_idle_time
+        let coordinator_zero_active_time = if self.active_turns == 0 {
+            self.coordinator_zero_active_time
                 .checked_add(interval)
                 .ok_or(MetricsError::ArithmeticOverflow)?
         } else {
-            self.critical_path_idle_time
+            self.coordinator_zero_active_time
         };
         Ok((
             weighted_active_time,
             weighted_capacity_time,
-            critical_path_idle_time,
+            coordinator_zero_active_time,
         ))
     }
 }
@@ -812,8 +858,17 @@ impl TerminalTaskMetrics {
         session_telemetry.counter(
             TASK_TERMINAL_STATE_METRIC,
             1,
-            &[("state", attempt_state_metric_label(self.state)),
-              ("usage_scope", if self.usage_history_partial { "partial_process_history" } else { "observed_attempt_deltas" })],
+            &[
+                ("state", attempt_state_metric_label(self.state)),
+                (
+                    "usage_scope",
+                    if self.usage_history_partial {
+                        "partial_process_history"
+                    } else {
+                        "observed_attempt_deltas"
+                    },
+                ),
+            ],
         );
     }
 }
@@ -844,13 +899,9 @@ pub(crate) fn emit_subtree_usage(
         ("descendants", usage.descendants),
         ("combined", combined),
     ] {
-        for (token_class, value) in [
-            ("input", totals.input_tokens),
-            ("cached_input", totals.cached_input_tokens),
-            ("output", totals.output_tokens),
-            ("reasoning_output", totals.reasoning_output_tokens),
-            ("total", totals.total_tokens),
-        ] {
+        for (token_class, value) in totals.known_classes() {
+            // Numeric compatibility sums do not certify absent components.
+            let Some(value) = value else { continue };
             session_telemetry.histogram(
                 SUBTREE_TOKEN_USAGE_METRIC,
                 saturating_metric_value(value),
@@ -871,7 +922,8 @@ pub(crate) fn emit_subtree_usage(
 
 pub(crate) fn terminal_metrics_ready(task: &AgentTask) -> bool {
     if !task.current_attempt.state.is_terminal()
-        || task.gates.iter().any(|gate| !gate.status.is_sealed())
+        || (task.current_attempt.state == codex_agent_task_store::AttemptState::Completed
+            && task.gates.iter().any(|gate| !gate.status.is_sealed()))
     {
         return false;
     }
@@ -885,7 +937,11 @@ pub(crate) fn terminal_metrics_ready(task: &AgentTask) -> bool {
 
 fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
     let receipt = task.receipt.as_ref();
-    let acceptance_total = saturating_u32(task.assignment.effective_criteria(task.current_attempt.amendment.as_ref()).len());
+    let acceptance_total = saturating_u32(
+        task.assignment
+            .effective_criteria(task.current_attempt.amendment.as_ref())
+            .len(),
+    );
     let acceptance_final_closed = receipt
         .map(|receipt| {
             saturating_u32(
@@ -1040,6 +1096,9 @@ fn add_usage(
     tokens: TokenClassTotals,
     calls: u64,
 ) -> Result<(), MetricsError> {
+    if totals.calls == 0 && totals.tokens == TokenClassTotals::default() {
+        totals.tokens.coverage = Some(Default::default());
+    }
     totals.tokens = totals
         .tokens
         .checked_add(tokens)

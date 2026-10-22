@@ -22,6 +22,8 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::require_network;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_image_generation_call;
 use core_test_support::responses::ev_response_created;
@@ -63,6 +65,17 @@ fn read_only_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -
             ..Default::default()
         },
     }
+}
+
+/// A completed response that delivers a final answer. A response without one
+/// now triggers the turn's single missing-answer repair request, which would
+/// consume the next turn's scripted response.
+fn sse_answered(id: &str) -> String {
+    sse(vec![
+        ev_response_created(id),
+        ev_assistant_message(&format!("msg-{id}"), "done"),
+        ev_completed(id),
+    ])
 }
 
 fn test_model_info(
@@ -109,7 +122,6 @@ fn test_model_info(
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
-        supports_experimental_context: false,
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,
@@ -131,7 +143,7 @@ async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
     let server = MockServer::start().await;
     let resp_mock = mount_sse_sequence(
         &server,
-        vec![sse_completed("resp-1"), sse_completed("resp-2")],
+        vec![sse_answered("resp-1"), sse_answered("resp-2")],
     )
     .await;
 
@@ -227,7 +239,7 @@ async fn model_switch_with_unchanged_personality_reinjects_personality_delta() -
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
         &server,
-        vec![sse_completed("resp-1"), sse_completed("resp-2")],
+        vec![sse_answered("resp-1"), sse_answered("resp-2")],
     )
     .await;
 
@@ -316,7 +328,7 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
     let server = start_mock_server().await;
     let resp_mock = mount_sse_sequence(
         &server,
-        vec![sse_completed("resp-1"), sse_completed("resp-2")],
+        vec![sse_answered("resp-1"), sse_answered("resp-2")],
     )
     .await;
 
@@ -471,9 +483,9 @@ async fn default_service_tier_override_is_omitted_from_http_turn() -> Result<()>
     let resp_mock = mount_sse_sequence(
         &server,
         vec![
-            sse_completed("resp-1"),
-            sse_completed("resp-2"),
-            sse_completed("resp-3"),
+            sse_answered("resp-1"),
+            sse_answered("resp-2"),
+            sse_answered("resp-3"),
         ],
     )
     .await;
@@ -535,7 +547,7 @@ async fn model_change_from_image_to_text_strips_prior_image_content() -> Result<
 
     let responses = mount_sse_sequence(
         &server,
-        vec![sse_completed("resp-1"), sse_completed("resp-2")],
+        vec![sse_answered("resp-1"), sse_answered("resp-2")],
     )
     .await;
 
@@ -748,9 +760,10 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_123", "completed", "lobster", "Zm9v"),
+                ev_assistant_message("msg-resp-1", "generated a lobster"),
                 ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
-            sse_completed("resp-2"),
+            sse_answered("resp-2"),
         ],
     )
     .await;
@@ -854,9 +867,10 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
             sse(vec![
                 ev_response_created("resp-1"),
                 ev_image_generation_call("ig_rollback", "completed", "lobster", "Zm9v"),
+                ev_assistant_message("msg-resp-1", "generated a lobster"),
                 ev_completed_with_tokens("resp-1", /*total_tokens*/ 10),
             ]),
-            sse_completed("resp-2"),
+            sse_answered("resp-2"),
         ],
     )
     .await;
@@ -989,7 +1003,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
-        supports_experimental_context: false,
         context_window: Some(large_context_window),
         max_context_window: None,
         auto_compact_token_limit: None,
@@ -1016,10 +1029,12 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
+                ev_assistant_message("msg-resp-1", "done"),
                 ev_completed_with_tokens("resp-1", /*total_tokens*/ 100),
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
+                ev_assistant_message("msg-resp-2", "done"),
                 ev_completed_with_tokens("resp-2", /*total_tokens*/ 120),
             ]),
         ],
@@ -1155,5 +1170,66 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
     assert_eq!(requests[0].body_json()["model"], large_model_slug);
     assert_eq!(requests[1].body_json()["model"], smaller_model_slug);
 
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_tier_preference_survives_temporarily_unsupported_model() -> Result<()> {
+    require_network!();
+    let server = start_mock_server().await;
+    let unsupported = test_model_info("no-flex", "no-flex", "no tier", default_input_modalities());
+    let mut supported = test_model_info(
+        "with-flex",
+        "with-flex",
+        "flex tier",
+        default_input_modalities(),
+    );
+    supported.service_tiers = vec![ModelServiceTier {
+        id: "flex".into(),
+        name: "Flex".into(),
+        description: "flex".into(),
+    }];
+    let requests = mount_sse_sequence(
+        &server,
+        ["r1", "r2"]
+            .into_iter()
+            .map(|id| {
+                sse(vec![
+                    ev_response_created(id),
+                    core_test_support::responses::ev_assistant_message(id, "done"),
+                    core_test_support::responses::ev_completed(id),
+                ])
+            })
+            .collect(),
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_model("no-flex")
+        .with_config(move |config| {
+            config.features.enable(Feature::FastMode).unwrap();
+            config.service_tier = Some("flex".into());
+            config.model_catalog = Some(ModelsResponse {
+                models: vec![unsupported, supported],
+            });
+        });
+    let test = builder.build(&server).await?;
+    test.submit_turn("initial").await?;
+    test.codex
+        .submit(read_only_user_turn(
+            &test,
+            vec![UserInput::Text {
+                text: "recover".into(),
+                text_elements: Vec::new(),
+            }],
+            "with-flex".into(),
+        ))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let actual = requests.requests();
+    assert_eq!(actual.len(), 2);
+    assert!(actual[0].body_json().get("service_tier").is_none());
+    assert_eq!(actual[1].body_json()["service_tier"], "flex");
     Ok(())
 }

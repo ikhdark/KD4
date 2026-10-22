@@ -1,11 +1,11 @@
 mod callbacks;
+#[cfg(test)]
+pub(crate) mod critical_path_tests;
 mod globals;
 mod module_loader;
 mod output_projection;
 mod timers;
 mod value;
-#[cfg(test)]
-pub(crate) mod critical_path_tests;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -53,13 +53,26 @@ const TEXT_ITEM_ENCODING_OVERHEAD: usize = r#"{"type":"input_text","text":""}"#.
 
 #[derive(Debug)]
 pub(crate) enum RuntimeCommand {
-    ToolResponse { id: String, result: JsonValue },
-    ToolError { id: String, error_text: String },
-    NotificationResponse { id: String },
-    NotificationError { id: String, error_text: String },
+    ToolResponse {
+        id: String,
+        result: JsonValue,
+    },
+    ToolError {
+        id: String,
+        error_text: String,
+    },
+    NotificationResponse {
+        id: String,
+    },
+    NotificationError {
+        id: String,
+        error_text: String,
+    },
     TimersReady,
     #[cfg(test)]
-    InspectForTest { response: tokio::sync::oneshot::Sender<RuntimeInspection> },
+    InspectForTest {
+        response: tokio::sync::oneshot::Sender<RuntimeInspection>,
+    },
     Terminate,
 }
 
@@ -125,11 +138,14 @@ impl StoredValue {
     pub(crate) fn new(key: &str, value: JsonValue) -> Self {
         let serialized: Option<Arc<serde_json::value::RawValue>> =
             serde_json::value::to_raw_value(&value).ok().map(Arc::from);
-        let bytes = serialized.as_ref().and_then(|json| {
-            stored_value_entry_bytes(key, &JsonValue::Null)
-                .checked_sub(4)
-                .and_then(|key_bytes| key_bytes.checked_add(json.get().len()))
-        }).unwrap_or(usize::MAX);
+        let bytes = serialized
+            .as_ref()
+            .and_then(|json| {
+                stored_value_entry_bytes(key, &JsonValue::Null)
+                    .checked_sub(4)
+                    .and_then(|key_bytes| key_bytes.checked_add(json.get().len()))
+            })
+            .unwrap_or(usize::MAX);
         Self {
             bytes,
             value: Arc::new(value),
@@ -214,7 +230,10 @@ impl OutputAdmission {
 
     fn record_loss(state: &mut OutputAdmissionState, bytes: usize) -> Option<RuntimeEvent> {
         state.output_loss.discarded_items = state.output_loss.discarded_items.saturating_add(1);
-        state.output_loss.discarded_bytes_lower_bound = state.output_loss.discarded_bytes_lower_bound.saturating_add(bytes as u64);
+        state.output_loss.discarded_bytes_lower_bound = state
+            .output_loss
+            .discarded_bytes_lower_bound
+            .saturating_add(bytes as u64);
         if !state.overflow_reported {
             state.overflow_reported = true;
             return Some(RuntimeEvent::ContentItem {
@@ -230,14 +249,30 @@ impl OutputAdmission {
     /// Rejects text whose raw bytes alone cannot fit, before copying it out of
     /// V8. Admission still charges the full encoded size after conversion.
     pub(super) fn reject_before_conversion(&self, bytes: usize) -> Option<Option<RuntimeEvent>> {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let required = bytes.saturating_add(TEXT_ITEM_ENCODING_OVERHEAD);
-        if required <= self.max_bytes.saturating_sub(state.admitted_bytes) { return None; }
+        self.reject_before_conversion_with_overhead(bytes, TEXT_ITEM_ENCODING_OVERHEAD)
+    }
+
+    pub(super) fn reject_before_conversion_with_overhead(
+        &self,
+        bytes: usize,
+        overhead: usize,
+    ) -> Option<Option<RuntimeEvent>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let required = bytes.saturating_add(overhead);
+        if required <= self.max_bytes.saturating_sub(state.admitted_bytes) {
+            return None;
+        }
         Some(Self::record_loss(&mut state, bytes))
     }
 
     fn output_loss(&self) -> Option<codex_code_mode_protocol::OutputLoss> {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.output_loss.discarded_items > 0).then(|| state.output_loss.clone())
     }
 
@@ -314,47 +349,69 @@ fn spare_runtime() -> &'static Mutex<Option<std_mpsc::Sender<RuntimeStart>>> {
 
 fn create_spare_runtime() -> std::io::Result<std_mpsc::Sender<RuntimeStart>> {
     let (sender, receiver) = std_mpsc::channel::<RuntimeStart>();
-    thread::Builder::new().name("code-mode-spare".into()).spawn(move || {
-        if let Err(error) = ensure_v8_initialized() {
-            if let Ok(start) = receiver.recv() {
-                let _ = start.isolate_handle_tx.send(Err(error));
+    thread::Builder::new()
+        .name("code-mode-spare".into())
+        .spawn(move || {
+            if let Err(error) = ensure_v8_initialized() {
+                if let Ok(start) = receiver.recv() {
+                    let _ = start.isolate_handle_tx.send(Err(error));
+                }
+                return;
             }
-            return;
-        }
-        // Isolates and contexts never cross threads and never execute a second
-        // cell. Only the startup request crosses this one-use channel.
-        let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
-        isolate.set_host_import_module_dynamically_callback(module_loader::dynamic_import_callback);
-        isolate.set_promise_reject_callback(module_loader::promise_rejected);
-        v8::scope!(let scope, isolate);
-        let context = v8::Context::new(scope, Default::default());
-        let scope = &mut v8::ContextScope::new(scope, context);
-        let projector = output_projection::prepare(scope);
-        let Ok(start) = receiver.recv() else { return; };
-        let event_tx = start.event_tx.clone();
-        let failure_handler = start.task_failure_handler.clone();
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
-            #[cfg(test)]
-            let _startup_test_exit = start.startup_test_gate.map(|gate| {
-                gate.entered.notify_one();
-                gate.release.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
-                StartupTestExit(gate)
-            });
-            let projector = match projector {
-                Ok(projector) => projector,
-                Err(error) => { let _ = start.isolate_handle_tx.send(Err(error)); return; }
+            // Isolates and contexts never cross threads and never execute a second
+            // cell. Only the startup request crosses this one-use channel.
+            let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+            isolate.set_host_import_module_dynamically_callback(
+                module_loader::dynamic_import_callback,
+            );
+            isolate.set_promise_reject_callback(module_loader::promise_rejected);
+            v8::scope!(let scope, isolate);
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let projector = output_projection::prepare(scope);
+            let Ok(start) = receiver.recv() else {
+                return;
             };
-            run_runtime(scope, projector, start.config, start.event_tx, start.command_rx,
-                start.isolate_handle_tx, start.runtime_command_tx);
-        })) {
-            report_runtime_panic(payload, event_tx, failure_handler);
-        }
-    })?;
+            let event_tx = start.event_tx.clone();
+            let failure_handler = start.task_failure_handler.clone();
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                #[cfg(test)]
+                let _startup_test_exit = start.startup_test_gate.map(|gate| {
+                    gate.entered.notify_one();
+                    gate.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    StartupTestExit(gate)
+                });
+                let projector = match projector {
+                    Ok(projector) => projector,
+                    Err(error) => {
+                        let _ = start.isolate_handle_tx.send(Err(error));
+                        return;
+                    }
+                };
+                run_runtime(
+                    scope,
+                    projector,
+                    start.config,
+                    start.event_tx,
+                    start.command_rx,
+                    start.isolate_handle_tx,
+                    start.runtime_command_tx,
+                );
+            })) {
+                report_runtime_panic(payload, event_tx, failure_handler);
+            }
+        })?;
     Ok(sender)
 }
 
 pub(crate) fn prewarm_runtime() {
-    let mut spare = spare_runtime().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut spare = spare_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if spare.is_none() {
         match create_spare_runtime() {
             Ok(sender) => *spare = Some(sender),
@@ -372,9 +429,19 @@ pub(crate) async fn spawn_runtime(
     output_admission: Arc<OutputAdmission>,
     task_failure_handler: Option<TaskFailureHandler>,
 ) -> Result<(std_mpsc::Sender<RuntimeCommand>, RuntimeTerminationHandle), String> {
-    let catalog = Arc::new(EnabledToolCatalog::from_definitions(&request.enabled_tools)?);
-    spawn_runtime_with_catalog(stored_values, request, catalog, default_tool_timeout_ms,
-        event_tx, output_admission, task_failure_handler).await
+    let catalog = Arc::new(EnabledToolCatalog::from_definitions(
+        &request.enabled_tools,
+    )?);
+    spawn_runtime_with_catalog(
+        stored_values,
+        request,
+        catalog,
+        default_tool_timeout_ms,
+        event_tx,
+        output_admission,
+        task_failure_handler,
+    )
+    .await
 }
 
 pub(crate) async fn spawn_runtime_with_catalog(
@@ -403,19 +470,30 @@ pub(crate) async fn spawn_runtime_with_catalog(
         output_admission,
     };
 
-    let sender = spare_runtime().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take().map(Ok).unwrap_or_else(create_spare_runtime)
+    let sender = spare_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .map(Ok)
+        .unwrap_or_else(create_spare_runtime)
         .map_err(|error| format!("failed to start code mode runtime: {error}"))?;
     let start = RuntimeStart {
-        config, event_tx, command_rx, isolate_handle_tx, runtime_command_tx, task_failure_handler,
+        config,
+        event_tx,
+        command_rx,
+        isolate_handle_tx,
+        runtime_command_tx,
+        task_failure_handler,
         #[cfg(test)]
         startup_test_gate: STARTUP_TEST_GATE.try_with(Arc::clone).ok(),
     };
     if let Err(error) = sender.send(start) {
         // The spare died before accepting work; the returned request has never
         // run and can safely be delivered to a replacement exactly once.
-        create_spare_runtime().map_err(|error| error.to_string())?
-            .send(error.0).map_err(|_| "code mode runtime unavailable".to_string())?;
+        create_spare_runtime()
+            .map_err(|error| error.to_string())?
+            .send(error.0)
+            .map_err(|_| "code mode runtime unavailable".to_string())?;
     }
     prewarm_runtime();
 
@@ -476,15 +554,15 @@ fn report_runtime_panic(
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     task_failure_handler: Option<TaskFailureHandler>,
 ) {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic payload");
-            if let Some(task_failure_handler) = task_failure_handler {
-                task_failure_handler(format!("code-mode V8 runtime thread panicked: {message}"));
-            }
-            let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic payload");
+    if let Some(task_failure_handler) = task_failure_handler {
+        task_failure_handler(format!("code-mode V8 runtime thread panicked: {message}"));
+    }
+    let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
 }
 
 struct RuntimeConfig {
@@ -505,17 +583,28 @@ pub(crate) struct EnabledToolCatalog {
 }
 
 impl EnabledToolCatalog {
-    pub(crate) fn from_definitions(definitions: &[codex_code_mode_protocol::ToolDefinition]) -> Result<Self, String> {
-        Self::new(definitions.iter().map(|definition| EnabledToolMetadata {
-            global_name: normalize_code_mode_identifier(&definition.name),
-            tool_name: definition.tool_name.clone(),
-            description: Arc::clone(&definition.description),
-            kind: definition.kind,
-            default_timeout_ms: definition.default_timeout_ms.map(|timeout| timeout.min(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS)),
-        }).collect())
+    pub(crate) fn from_definitions(
+        definitions: &[codex_code_mode_protocol::ToolDefinition],
+    ) -> Result<Self, String> {
+        Self::new(
+            definitions
+                .iter()
+                .map(|definition| EnabledToolMetadata {
+                    global_name: normalize_code_mode_identifier(&definition.name),
+                    tool_name: definition.tool_name.clone(),
+                    description: Arc::clone(&definition.description),
+                    kind: definition.kind,
+                    default_timeout_ms: definition
+                        .default_timeout_ms
+                        .map(|timeout| timeout.min(codex_code_mode_protocol::MAX_TOOL_TIMEOUT_MS)),
+                })
+                .collect(),
+        )
     }
 
-    pub(crate) fn input_bytes(&self) -> usize { self.input_bytes }
+    pub(crate) fn input_bytes(&self) -> usize {
+        self.input_bytes
+    }
 
     fn new(tools: Vec<EnabledToolMetadata>) -> Result<Self, String> {
         let mut by_global_name: HashMap<String, usize> = HashMap::with_capacity(tools.len());
@@ -538,19 +627,25 @@ impl EnabledToolCatalog {
                 aliases.push(format!("{namespace}.{}", tool.tool_name.name));
             }
             for alias in aliases {
-                by_requested_name.entry(alias)
+                by_requested_name
+                    .entry(alias)
                     .and_modify(|existing| {
-                        if *existing != Some(index) { *existing = None; }
+                        if *existing != Some(index) {
+                            *existing = None;
+                        }
                     })
                     .or_insert(Some(index));
             }
         }
         let alias_bytes = by_requested_name.keys().fold(
-            by_requested_name.capacity().saturating_mul(std::mem::size_of::<(String, Option<usize>)>()),
+            by_requested_name
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Option<usize>)>()),
             |bytes, name| bytes.saturating_add(name.len()),
         );
         let input_bytes = tools.iter().fold(alias_bytes, |bytes, tool| {
-            bytes.saturating_add(std::mem::size_of::<EnabledToolMetadata>())
+            bytes
+                .saturating_add(std::mem::size_of::<EnabledToolMetadata>())
                 .saturating_add(tool.global_name.len().saturating_mul(2))
                 .saturating_add(tool.tool_name.name.len())
                 .saturating_add(tool.tool_name.namespace.as_ref().map_or(0, String::len))
@@ -576,31 +671,50 @@ impl EnabledToolCatalog {
     /// discovery reports for a namespaced tool. Ambiguous identities stay
     /// unresolved rather than dispatching to an arbitrary tool.
     fn resolve_requested_name(&self, requested_name: &str) -> Option<usize> {
-        self.by_requested_name.get(requested_name).copied().flatten()
+        self.by_requested_name
+            .get(requested_name)
+            .copied()
+            .flatten()
     }
 
     fn resolution_diagnostic(&self, requested: Option<&str>) -> serde_json::Value {
         let valid = requested.is_some_and(|name| !name.trim().is_empty() && name.len() <= 4096);
         let name = requested.filter(|_| valid).unwrap_or_default();
-        let exact = self.tools.iter().filter(|tool| {
-            tool.tool_name.to_string() == name || tool.tool_name.name == name
-                || name.split_once('.').is_some_and(|(namespace, local_name)| {
-                    tool.tool_name.namespace.as_deref() == Some(namespace)
-                        && tool.tool_name.name == local_name
-                })
-        }).collect::<Vec<_>>();
+        let exact = self
+            .tools
+            .iter()
+            .filter(|tool| {
+                tool.tool_name.to_string() == name
+                    || tool.tool_name.name == name
+                    || name.split_once('.').is_some_and(|(namespace, local_name)| {
+                        tool.tool_name.namespace.as_deref() == Some(namespace)
+                            && tool.tool_name.name == local_name
+                    })
+            })
+            .collect::<Vec<_>>();
         let ambiguous = exact.len() > 1;
         let candidates = if exact.is_empty() && valid {
-            self.tools.iter().filter(|tool| tool.global_name.contains(name)).collect::<Vec<_>>()
-        } else { exact };
+            self.tools
+                .iter()
+                .filter(|tool| tool.global_name.contains(name))
+                .collect::<Vec<_>>()
+        } else {
+            exact
+        };
         let total = candidates.len();
         let mut bytes = 0;
-        let candidates = candidates.into_iter().filter_map(|tool| {
-            let size = serde_json::to_string(&tool.global_name).ok()?.len();
-            if bytes + size > 2048 { return None; }
-            bytes += size;
-            Some(tool.global_name.clone())
-        }).take(8).collect::<Vec<_>>();
+        let candidates = candidates
+            .into_iter()
+            .filter_map(|tool| {
+                let size = serde_json::to_string(&tool.global_name).ok()?.len();
+                if bytes + size > 2048 {
+                    return None;
+                }
+                bytes += size;
+                Some(tool.global_name.clone())
+            })
+            .take(8)
+            .collect::<Vec<_>>();
         serde_json::json!({
             "status": if !valid { "invalid_name" } else if ambiguous { "ambiguous" } else { "not_found" },
             "omitted_candidate_count": total.saturating_sub(candidates.len()),
@@ -617,7 +731,7 @@ pub(super) struct RuntimeState {
     pending_notifications: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     unhandled_rejections: Vec<v8::Global<v8::Promise>>,
-    rejection_tracking_overflow: bool,
+    untracked_rejections: usize,
     stored_values: HashMap<String, StoredValue>,
     total_stored_value_bytes: usize,
     stored_value_writes: HashMap<String, StoredValue>,
@@ -680,7 +794,10 @@ pub(crate) fn stored_values_with_writes_within_limits(
     current: &HashMap<String, StoredValue>,
     writes: &HashMap<String, StoredValue>,
 ) -> bool {
-    let entry_count = current.keys().filter(|key| !writes.contains_key(*key)).count()
+    let entry_count = current
+        .keys()
+        .filter(|key| !writes.contains_key(*key))
+        .count()
         + writes.values().filter(|value| !value.deleted).count();
     if entry_count > MAX_SESSION_STORED_VALUES {
         return false;
@@ -728,7 +845,9 @@ impl RuntimeState {
 
     pub(super) fn stored_value_completion(&mut self) -> HashMap<String, StoredValue> {
         #[cfg(test)]
-        { self.completion_collections += 1; }
+        {
+            self.completion_collections += 1;
+        }
         std::mem::take(&mut self.stored_value_writes)
     }
 }
@@ -775,7 +894,7 @@ fn run_runtime(
         pending_notifications: HashMap::new(),
         pending_timeouts: HashMap::new(),
         unhandled_rejections: Vec::new(),
-        rejection_tracking_overflow: false,
+        untracked_rejections: 0,
         stored_values: config.stored_values,
         total_stored_value_bytes,
         stored_value_writes: HashMap::new(),
@@ -841,9 +960,15 @@ fn run_runtime(
                     heap_bytes,
                     completion_collections: state.completion_collections,
                     rust_conversion_bytes: state.rust_conversion_bytes,
-                    stored_payload_address: state.stored_value_writes.get("payload")
-                        .and_then(|stored| stored.value.as_str()).map(|value| value.as_ptr() as usize).unwrap_or(0),
-                    stored_payload_shared: state.stored_value_writes.get("payload")
+                    stored_payload_address: state
+                        .stored_value_writes
+                        .get("payload")
+                        .and_then(|stored| stored.value.as_str())
+                        .map(|value| value.as_ptr() as usize)
+                        .unwrap_or(0),
+                    stored_payload_shared: state
+                        .stored_value_writes
+                        .get("payload")
                         .zip(state.stored_values.get("payload"))
                         .is_some_and(|(writes, local)| Arc::ptr_eq(&writes.value, &local.value)),
                 });
@@ -881,8 +1006,10 @@ fn run_runtime(
                 }
             }
             RuntimeCommand::TimersReady => {
-                let fired = scope.get_slot::<RuntimeState>()
-                    .map(|state| state.timer_scheduler.take_fired()).unwrap_or_default();
+                let fired = scope
+                    .get_slot::<RuntimeState>()
+                    .map(|state| state.timer_scheduler.take_fired())
+                    .unwrap_or_default();
                 for id in fired {
                     match timers::invoke_timeout_callback(scope, id) {
                         Ok(ControlFlow::Continue(())) => {}
@@ -896,6 +1023,14 @@ fn run_runtime(
                         }
                     }
                     scope.perform_microtask_checkpoint();
+                    if let CompletionState::Completed {
+                        stored_value_writes,
+                        error_text,
+                    } = module_loader::completion_state(scope, pending_promise.as_ref())
+                    {
+                        send_result(scope, &event_tx, stored_value_writes, error_text);
+                        return;
+                    }
                 }
             }
         }
@@ -931,20 +1066,17 @@ fn capture_scope_send_error(
         .map(RuntimeState::stored_value_completion)
         .unwrap_or_default();
 
-    send_result(
-        scope,
-        event_tx,
-        stored_value_writes,
-        error_text,
-    );
+    send_result(scope, event_tx, stored_value_writes, error_text);
 }
 
 fn unawaited_tool_error(scope: &v8::PinScope<'_, '_>) -> Option<String> {
     scope.get_slot::<RuntimeState>().and_then(|state| {
-        (!state.pending_tool_calls.is_empty()).then(|| format!(
-            "cell completed with {} unawaited tool call(s); outstanding tool work is cancelled",
-            state.pending_tool_calls.len()
-        ))
+        (!state.pending_tool_calls.is_empty()).then(|| {
+            format!(
+                "cell completed with {} unawaited tool call(s); outstanding tool work is cancelled",
+                state.pending_tool_calls.len()
+            )
+        })
     })
 }
 
@@ -960,37 +1092,46 @@ fn send_result(
     // Catching an admission error and completing successfully can compact and
     // commit retained evidence. A failed quota-exceeding cell is transactional:
     // do not commit the prefix of its writes.
-    if error_text.is_some() && scope.get_slot::<RuntimeState>()
-        .is_some_and(|state| state.storage_limit_rejected) {
+    if error_text.is_some()
+        && scope
+            .get_slot::<RuntimeState>()
+            .is_some_and(|state| state.storage_limit_rejected)
+    {
         stored_value_writes.clear();
     }
-    let reads = scope.get_slot::<RuntimeState>()
+    let reads = scope
+        .get_slot::<RuntimeState>()
         .and_then(|state| state.stored_value_reads.clone())
         .map(Arc::new);
     for stored in stored_value_writes.values_mut() {
         stored.read_dependencies = reads.clone();
     }
-    let error_text = error_text.map(|mut text| {
-            if text.len() > MAX_ERROR_TEXT_BYTES {
-                // Error frames stay small, but settled helper evidence belongs
-                // in the existing bounded content/artifact path before clipping.
-                if text.contains("\nHelper ")
-                    && let Some(state) = scope.get_slot::<RuntimeState>()
-                {
-                    state.emit_output(FunctionCallOutputContentItem::InputText { text: text.clone() });
-                }
-                let mut end = MAX_ERROR_TEXT_BYTES - ERROR_TRUNCATION_SUFFIX.len();
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text.truncate(end);
-                text.push_str(ERROR_TRUNCATION_SUFFIX);
+    let error_text = error_text.map(|text| {
+        if text.len() > MAX_ERROR_TEXT_BYTES {
+            // Error frames stay small, but settled helper evidence belongs
+            // in the existing bounded content/artifact path before clipping.
+            if text.contains("\nHelper ")
+                && let Some(state) = scope.get_slot::<RuntimeState>()
+            {
+                state.emit_output(FunctionCallOutputContentItem::InputText { text: text.clone() });
             }
-            text
-        });
+            let mut end = MAX_ERROR_TEXT_BYTES - ERROR_TRUNCATION_SUFFIX.len();
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            // Drop the oversized backing buffer before notification drain.
+            let mut bounded = String::with_capacity(MAX_ERROR_TEXT_BYTES);
+            bounded.push_str(&text[..end]);
+            bounded.push_str(ERROR_TRUNCATION_SUFFIX);
+            return bounded;
+        }
+        text
+    });
     let _ = event_tx.send(RuntimeEvent::Result {
         stored_value_writes,
-        output_loss: scope.get_slot::<RuntimeState>().and_then(|state| state.output_admission.output_loss()),
+        output_loss: scope
+            .get_slot::<RuntimeState>()
+            .and_then(|state| state.output_admission.output_loss()),
         error_text,
     });
 }
@@ -1056,11 +1197,13 @@ mod tests {
             Some("other")
         );
         assert!(catalog.index_of("sample").is_none());
-        let mut tools = (0..20).map(|index| {
-            let mut tool = metadata(&format!("source{index}__lookup"), "");
-            tool.tool_name = ToolName::namespaced(format!("source{index}"), "lookup");
-            tool
-        }).collect::<Vec<_>>();
+        let mut tools = (0..20)
+            .map(|index| {
+                let mut tool = metadata(&format!("source{index}__lookup"), "");
+                tool.tool_name = ToolName::namespaced(format!("source{index}"), "lookup");
+                tool
+            })
+            .collect::<Vec<_>>();
         // A dotted identity collision remains non-callable even with diagnostics.
         tools[1].tool_name = tools[0].tool_name.clone();
         let catalog = EnabledToolCatalog::new(tools).unwrap();
@@ -1077,17 +1220,30 @@ mod tests {
     #[test]
     fn compatibility_alias_cannot_redirect_to_a_new_native_tool() {
         let metadata = |global_name: &str, tool_name| EnabledToolMetadata {
-            global_name: global_name.into(), tool_name, description: "".into(),
-            default_timeout_ms: None, kind: CodeModeToolKind::Function,
+            global_name: global_name.into(),
+            tool_name,
+            description: "".into(),
+            default_timeout_ms: None,
+            kind: CodeModeToolKind::Function,
         };
         let catalog = EnabledToolCatalog::new(vec![
-            metadata("acme__lookup__stable_identity", ToolName::namespaced("acme", "lookup")),
+            metadata(
+                "acme__lookup__stable_identity",
+                ToolName::namespaced("acme", "lookup"),
+            ),
             metadata("acme__lookup", ToolName::plain("acme__lookup")),
-        ]).unwrap();
+        ])
+        .unwrap();
         assert_eq!(catalog.resolve_requested_name("acme__lookup"), None);
         assert_eq!(catalog.resolve_requested_name("acme.lookup"), Some(0));
-        assert_eq!(catalog.resolve_requested_name("acme__lookup__stable_identity"), Some(0));
-        assert_eq!(catalog.resolution_diagnostic(Some("acme__lookup"))["status"], "ambiguous");
+        assert_eq!(
+            catalog.resolve_requested_name("acme__lookup__stable_identity"),
+            Some(0)
+        );
+        assert_eq!(
+            catalog.resolution_diagnostic(Some("acme__lookup"))["status"],
+            "ambiguous"
+        );
     }
 
     #[tokio::test]
@@ -1099,9 +1255,15 @@ mod tests {
         ] {
             let (event_tx, mut event_rx) = mpsc::unbounded_channel();
             let (_commands, _termination) = spawn_runtime(
-                HashMap::new(), execute_request(source), 60_000, event_tx,
-                std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)), None,
-            ).await.unwrap();
+                HashMap::new(),
+                execute_request(source),
+                60_000,
+                event_tx,
+                std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
+                None,
+            )
+            .await
+            .unwrap();
             let completed = tokio::time::timeout(Duration::from_secs(5), async {
                 while let Some(event) = event_rx.recv().await {
                     if let RuntimeEvent::Result { error_text, .. } = event {
@@ -1110,7 +1272,9 @@ mod tests {
                     }
                 }
                 false
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert!(completed);
         }
     }
@@ -1160,9 +1324,15 @@ if (results.next.value !== 8 || results.next.step_id !== "plan-step") throw Erro
 "#;
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (_commands, _termination) = spawn_runtime(
-            HashMap::new(), execute_request(source), 60_000, event_tx,
-            std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)), None,
-        ).await.unwrap();
+            HashMap::new(),
+            execute_request(source),
+            60_000,
+            event_tx,
+            std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
+            None,
+        )
+        .await
+        .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(event) = event_rx.recv().await {
                 if let RuntimeEvent::Result { error_text, .. } = event {
@@ -1171,7 +1341,9 @@ if (results.next.value !== 8 || results.next.step_id !== "plan-step") throw Erro
                 }
             }
             panic!("runtime closed without completing the graph");
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1225,13 +1397,22 @@ if (results.next.value !== 8 || results.next.step_id !== "plan-step") throw Erro
             exited: tokio::sync::Notify::new(),
         });
         let started = super::STARTUP_TEST_GATE
-            .scope(gate, spawn_runtime(
-                HashMap::new(), execute_request("text('unreachable');"), 60_000, event_tx,
-                std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
-                task_failure_handler,
-            ))
+            .scope(
+                gate,
+                spawn_runtime(
+                    HashMap::new(),
+                    execute_request("text('unreachable');"),
+                    60_000,
+                    event_tx,
+                    std::sync::Arc::new(OutputAdmission::new(super::MAX_BUFFERED_OUTPUT_BYTES)),
+                    task_failure_handler,
+                ),
+            )
             .await;
-        assert_eq!(started.err(), Some("failed to initialize code mode runtime".to_string()));
+        assert_eq!(
+            started.err(),
+            Some("failed to initialize code mode runtime".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1429,10 +1610,17 @@ if (results.next.value !== 8 || results.next.step_id !== "plan-step") throw Erro
                         overflow_count += 1;
                     }
                 }
-                RuntimeEvent::Result { error_text, output_loss, .. } => {
+                RuntimeEvent::Result {
+                    error_text,
+                    output_loss,
+                    ..
+                } => {
                     assert_eq!(error_text, None);
                     let loss = output_loss.expect("discarded output must be reported structurally");
-                    assert_eq!(loss.discarded_items, (1_000 - (content_count - overflow_count)) as u64);
+                    assert_eq!(
+                        loss.discarded_items,
+                        (1_000 - (content_count - overflow_count)) as u64
+                    );
                     assert_eq!(loss.discarded_bytes_lower_bound, loss.discarded_items * 32);
                     break;
                 }

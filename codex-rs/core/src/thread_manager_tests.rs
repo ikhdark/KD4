@@ -206,6 +206,16 @@ struct FakeAgentGraphStore {
 }
 
 impl codex_agent_graph_store::AgentGraphStore for FakeAgentGraphStore {
+    fn list_reconciled_thread_spawn_edges(
+        &self,
+        root: ThreadId,
+        mut live_edges: Vec<(ThreadId, ThreadId)>,
+    ) -> codex_agent_graph_store::AgentGraphStoreFuture<'_, Vec<(ThreadId, ThreadId)>> {
+        assert_eq!(root, self.root_thread_id);
+        live_edges.extend(self.descendant_thread_ids.iter().map(|id| (root, *id)));
+        Box::pin(async move { Ok(live_edges) })
+    }
+
     fn upsert_thread_spawn_edge(
         &self,
         _parent_thread_id: ThreadId,
@@ -600,6 +610,58 @@ async fn shutdown_all_threads_bounded_preserves_a_replacement_runtime() {
 }
 
 #[tokio::test]
+async fn bounded_shutdown_retains_exact_removal_past_its_deadline() {
+    let temp_dir = tempdir().unwrap();
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+    );
+    let original = manager.start_thread(config.clone()).await.unwrap();
+    let replacement = manager.start_thread(config).await.unwrap();
+    manager.remove_thread(&replacement.thread_id).await.unwrap();
+    // Isolate registry retirement from execution and storage delays.
+    original.thread.shutdown_and_wait().await.unwrap();
+    let lease = manager
+        .state
+        .acquire_thread_registry_lease(original.thread_id)
+        .await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        manager.shutdown_all_threads_bounded(Duration::from_millis(20)),
+    )
+    .await
+    .expect("registry retirement must share the bounded observation");
+    assert_eq!(report.timed_out, vec![original.thread_id]);
+    assert!(report.completed.is_empty());
+    manager
+        .state
+        .threads
+        .write()
+        .await
+        .insert(original.thread_id, Arc::clone(&replacement.thread));
+    drop(lease);
+    // Queue behind the retained exact-instance removal before checking it.
+    let settled = manager
+        .state
+        .acquire_thread_registry_lease(original.thread_id)
+        .await;
+    assert!(Arc::ptr_eq(
+        &manager.get_thread(original.thread_id).await.unwrap(),
+        &replacement.thread
+    ));
+    drop(settled);
+    manager.remove_thread(&original.thread_id).await.unwrap();
+    replacement.thread.shutdown_and_wait().await.unwrap();
+}
+
+#[tokio::test]
 async fn thread_created_guard_only_blocks_replacement_of_the_guarded_thread() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -715,6 +777,7 @@ async fn code_mode_session_provider_is_shared_across_threads() {
             completed,
             submit_failed: Vec::new(),
             timed_out: Vec::new(),
+            failures: Vec::new(),
         }
     );
 }
@@ -734,7 +797,15 @@ async fn start_thread_discovers_a_usable_default_shell() {
         Arc::new(crate::test_support::EmptyUserInstructionsProvider),
     );
     let started = manager.start_thread(config).await.expect("start thread");
-    let shell = &started.thread.codex.session.services.user_shell;
+    let shell = started
+        .thread
+        .codex
+        .session
+        .services
+        .user_shell
+        .resolve()
+        .await
+        .expect("selected local shell should resolve");
     let arguments = shell
         .derive_exec_args("echo shell-discovery-ready", false)
         .expect("default shell arguments");
@@ -1800,9 +1871,16 @@ async fn missing_error_path_rollback_resumed_thread_preserves_persistence_and_ow
         .expect("shutdown source thread");
     let _ = manager.remove_thread(&source.thread_id).await;
 
+    // A resume cache cannot invent accepted history; persist the pre-existing
+    // turn through the store as a real earlier session would have.
+    let hello = RolloutItem::ResponseItem(user_msg("hello"));
+    thread_store
+        .append_persisted_items_ordered(source.thread_id, std::slice::from_ref(&hello))
+        .await
+        .expect("persist pre-existing thread history");
     let resumed_history = InitialHistory::Resumed(ResumedHistory {
         conversation_id: source.thread_id,
-        history: Arc::new(vec![RolloutItem::ResponseItem(user_msg("hello"))]),
+        history: Arc::new(vec![hello]),
         rollout_path,
     });
     let resumed = manager
@@ -2348,6 +2426,23 @@ fn user_only_legacy_event_history_is_mid_turn_and_forked_safely() {
 }
 
 #[test]
+fn nth_user_fork_counts_legacy_assistant_encoded_mail_turns() {
+    let rollout = crate::session::tests::legacy_inter_agent_mail_rollout();
+    let forked = fork_history_from_snapshot(
+        ForkSnapshot::TruncateBeforeNthUserMessage(1),
+        InitialHistory::Forked(rollout.clone()),
+        InterruptedTurnHistoryMarker::ContextualUser,
+    );
+
+    // The recorded rollback removed the legacy mail turn, so the second
+    // surviving user message is u2 (record 10), not the end of the rollout.
+    assert_eq!(
+        serde_json::to_value(forked.get_rollout_items()).expect("serialize forked history"),
+        serde_json::to_value(&rollout[..10]).expect("serialize expected history")
+    );
+}
+
+#[test]
 fn sampling_boundary_fork_excludes_uncommitted_suffix() {
     let committed_user = RolloutItem::ResponseItem(user_msg("committed"));
     let boundary = RolloutItem::SamplingBoundary(SamplingBoundaryItem {
@@ -2482,8 +2577,14 @@ fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
         SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id: None,
-            active_turn_start_index: Some(1),
+            // The raw user item opens the implicit turn; its legacy mirror joins it.
+            active_turn_start_index: Some(0),
         },
+    );
+    // Resume recovers the same unanswered legacy request.
+    assert_eq!(
+        resumed_rollout_unfinished_turn(mixed_history.get_rollout_items()),
+        Some(None)
     );
 }
 
@@ -2933,4 +3034,89 @@ fn reconstructed_legacy_permissions_use_worker_and_reach_resume_and_fork() {
         .expect("projection test thread")
         .join()
         .expect("projection test succeeds");
+}
+#[test]
+fn ctxaudit_sampling_boundary_fork_preserves_source_integrity_notice() {
+    let input = RolloutItem::ResponseItem(user_msg("committed"));
+    let boundary = RolloutItem::SamplingBoundary(SamplingBoundaryItem {
+        sampling_request_id: "request".into(),
+        physical_attempt_id: "attempt".into(),
+        workspace_freshness_notices: Vec::new(),
+        turn_id: Some("turn".into()),
+        unresolved_context: true,
+        timing_checkpoint: None,
+    });
+    let notice = RolloutItem::ResponseItem(ResponseItem::Message {
+        id: Some(codex_protocol::ResponseItemId::new("msg_rollout_gap")),
+        role: "developer".into(),
+        content: vec![ContentItem::InputText {
+            text: "incomplete source".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let suffix = RolloutItem::ResponseItem(user_msg("excluded"));
+    let history = InitialHistory::Forked(vec![
+        input.clone(),
+        boundary.clone(),
+        suffix,
+        notice.clone(),
+    ]);
+    let forked = fork_history_from_snapshot(
+        ForkSnapshot::TruncateToLastSamplingBoundary,
+        history,
+        InterruptedTurnHistoryMarker::ContextualUser,
+    );
+    assert_eq!(
+        serde_json::to_value(forked.get_rollout_items()).unwrap(),
+        serde_json::to_value(vec![input, boundary, notice]).unwrap()
+    );
+}
+#[tokio::test]
+async fn ctxaudit_midturn_fork_carries_loader_integrity_notice() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("damaged.jsonl");
+    let source = vec![
+        RolloutItem::ResponseItem(user_msg("retained request")),
+        RolloutItem::ResponseItem(assistant_msg("retained answer")),
+        RolloutItem::ResponseItem(user_msg("excluded active request")),
+        RolloutItem::ResponseItem(assistant_msg("excluded partial answer")),
+    ];
+    let mut bytes = String::from("malformed interior record\n");
+    for item in source {
+        bytes.push_str(
+            &serde_json::to_string(&codex_protocol::protocol::RolloutLine {
+                timestamp: "2026-10-19T00:00:00Z".into(),
+                item,
+            })
+            .unwrap(),
+        );
+        bytes.push('\n');
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+    assert_eq!(errors, 1);
+    for active_turn_start_index in [Some(2), None] {
+        let fork = truncate_before_nth_user_message(
+            InitialHistory::Forked(items.clone()),
+            usize::MAX,
+            &SnapshotTurnState {
+                ends_mid_turn: true,
+                active_turn_id: None,
+                active_turn_start_index,
+            },
+        );
+        let retained = fork.get_rollout_items();
+        assert_eq!(
+            serde_json::to_value(&retained[..2]).unwrap(),
+            serde_json::to_value(&items[..2]).unwrap()
+        );
+        assert_eq!(
+            retained.len(),
+            3,
+            "excluded task content must not follow the diagnostic"
+        );
+        assert!(matches!(&retained[2], RolloutItem::ResponseItem(item)
+            if codex_rollout::is_rollout_reconstruction_notice(item)));
+    }
 }

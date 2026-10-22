@@ -186,6 +186,38 @@ impl RemoteFileSystem {
         Ok(())
     }
 
+    async fn mutate_file_if_matches(
+        &self,
+        path: &PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<codex_file_system::FileMutationOutcome> {
+        trace!("remote fs mutate_file_if_matches");
+        // Both payloads travel in one request; keep it within the write budget.
+        let payload_bytes =
+            expected.as_ref().map_or(0, Vec::len) + replacement.as_ref().map_or(0, Vec::len);
+        if payload_bytes > MAX_FILE_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "file mutation is too large for exec-server: {payload_bytes} bytes exceeds the {MAX_FILE_PAYLOAD_BYTES}-byte request limit"
+                ),
+            ));
+        }
+        let client = self.client.get().await.map_err(map_remote_error)?;
+        let response = client
+            .fs_mutate_file_if_matches(crate::protocol::FsMutateFileIfMatchesParams {
+                path: path.clone(),
+                expected_base64: expected.map(|bytes| STANDARD.encode(bytes)),
+                replacement_base64: replacement.map(|bytes| STANDARD.encode(bytes)),
+                sandbox: remote_sandbox_context(sandbox),
+            })
+            .await
+            .map_err(map_remote_error)?;
+        Ok(response.outcome.into())
+    }
+
     async fn create_directory(
         &self,
         path: &PathUri,
@@ -216,6 +248,7 @@ impl RemoteFileSystem {
             .fs_get_metadata(FsGetMetadataParams {
                 path: path.clone(),
                 sandbox: remote_sandbox_context(sandbox),
+                include_directory_case_sensitivity: None,
             })
             .await
             .map_err(map_remote_error)?;
@@ -283,9 +316,19 @@ impl RemoteFileSystem {
             }
             Err(error) => return Err(map_remote_error(error)),
         };
-        if !options.filters.is_empty() && response.applied_filters.as_ref() != Some(&options.filters) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-                "remote filesystem did not apply requested walk filters; update the execution server or use an unfiltered audit"));
+        if !options.follow_directory_symlinks && !response.no_follow_enforced {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "remote filesystem did not enforce no-follow enumeration; update the execution server",
+            ));
+        }
+        if !options.filters.is_empty()
+            && response.applied_filters.as_ref() != Some(&options.filters)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "remote filesystem did not apply requested walk filters; update the execution server or use an unfiltered audit",
+            ));
         }
         Ok(response)
     }
@@ -333,6 +376,41 @@ impl RemoteFileSystem {
 }
 
 impl ExecutorFileSystem for RemoteFileSystem {
+    fn mutate_file_if_matches<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(RemoteFileSystem::mutate_file_if_matches(
+            self,
+            path,
+            expected,
+            replacement,
+            sandbox,
+        ))
+    }
+
+    fn directory_case_sensitive<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            let client = self.client.get().await.map_err(map_remote_error)?;
+            let response = client
+                .fs_get_metadata(FsGetMetadataParams {
+                    path: path.clone(),
+                    sandbox: remote_sandbox_context(sandbox),
+                    include_directory_case_sensitivity: Some(true),
+                })
+                .await
+                .map_err(map_remote_error)?;
+            Ok(response.directory_case_sensitive)
+        })
+    }
+
     fn canonicalize<'a>(
         &'a self,
         path: &'a PathUri,
@@ -464,14 +542,34 @@ fn remote_sandbox_context(
 }
 
 fn map_remote_error(error: ExecServerError) -> io::Error {
+    if let ExecServerError::Server { data, message, .. } = &error
+        && let Some(kind) = codex_exec_server_protocol::file_system_error_kind(data.as_ref())
+    {
+        if let Some(copy) = data
+            .as_ref()
+            .and_then(|data| data.get("copy"))
+            .and_then(|copy| {
+                serde_json::from_value::<codex_file_system::CopyFailure>(copy.clone()).ok()
+            })
+        {
+            return io::Error::new(kind, copy);
+        }
+        return io::Error::new(kind, message.clone());
+    }
     match error {
-        ExecServerError::Server { code, message } if code == NOT_FOUND_ERROR_CODE => {
+        ExecServerError::Server { code, message, .. } if code == NOT_FOUND_ERROR_CODE => {
             io::Error::new(io::ErrorKind::NotFound, message)
         }
         ExecServerError::Server {
             code: INVALID_REQUEST_ERROR_CODE | INVALID_PARAMS_ERROR_CODE,
             message,
+            ..
         } => io::Error::new(io::ErrorKind::InvalidInput, message),
+        ExecServerError::Server {
+            code: METHOD_NOT_FOUND_ERROR_CODE,
+            message,
+            ..
+        } => io::Error::new(io::ErrorKind::Unsupported, message),
         ExecServerError::Closed | ExecServerError::Disconnected(_) => {
             io::Error::new(io::ErrorKind::BrokenPipe, "exec-server transport closed")
         }
@@ -503,6 +601,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_filesystem_errors_preserve_data_through_the_client() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::AlreadyExists,
+            io::ErrorKind::NotADirectory,
+            io::ErrorKind::IsADirectory,
+            io::ErrorKind::DirectoryNotEmpty,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Unsupported,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            let wire = codex_exec_server_protocol::JSONRPCErrorError {
+                code: -32603,
+                message: "native failure".into(),
+                data: Some(codex_exec_server_protocol::file_system_error_data(kind)),
+            };
+            let wire = serde_json::from_str(&serde_json::to_string(&wire).unwrap()).unwrap();
+            let mapped = map_remote_error(ExecServerError::from(crate::rpc::RpcCallError::Server(
+                wire,
+            )));
+            assert_eq!(mapped.kind(), kind);
+            assert_eq!(mapped.to_string(), "native failure");
+        }
+        for data in [
+            None,
+            Some(serde_json::json!({"filesystemError":{"version":1,"kind":"future"}})),
+        ] {
+            let error = map_remote_error(ExecServerError::Server {
+                code: -32603,
+                message: "unknown failure".into(),
+                data,
+            });
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+        }
+        assert_eq!(
+            map_remote_error(ExecServerError::Server {
+                code: -32601,
+                message: "missing method".into(),
+                data: None,
+            })
+            .kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    #[test]
     fn remote_sandbox_context_only_preserves_cwd_when_required() {
         assert_eq!(remote_sandbox_context(None), None);
         for required in [false, true] {
@@ -512,16 +660,24 @@ mod tests {
                         value: FileSystemSpecialPath::project_roots(None),
                     }
                 } else {
-                    FileSystemPath::Path { path: absolute_test_path("remote-root") }
+                    FileSystemPath::Path {
+                        path: absolute_test_path("remote-root"),
+                    }
                 },
-                access: if required { FileSystemAccessMode::Write } else { FileSystemAccessMode::Read },
+                access: if required {
+                    FileSystemAccessMode::Write
+                } else {
+                    FileSystemAccessMode::Read
+                },
             }]);
             let permissions = PermissionProfile::from_runtime_permissions(
-                &policy, NetworkSandboxPolicy::Restricted,
+                &policy,
+                NetworkSandboxPolicy::Restricted,
             );
             let cwd = path_uri("host-checkout");
             let original = FileSystemSandboxContext::from_permission_profile_with_cwd(
-                permissions, cwd.clone(),
+                permissions,
+                cwd.clone(),
             );
             let mut expected = original.clone();
             expected.cwd = required.then_some(cwd.clone());

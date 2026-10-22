@@ -20,8 +20,8 @@ pub fn paths_match_after_normalization(left: impl AsRef<Path>, right: impl AsRef
         return left == right;
     }
     path_values_equal(
-        dunce::simplified(left.as_ref()),
-        dunce::simplified(right.as_ref()),
+        crate::normalize_path_for_platform(left.as_ref()).as_ref(),
+        crate::normalize_path_for_platform(right.as_ref()).as_ref(),
         cfg!(windows),
     )
 }
@@ -47,7 +47,7 @@ fn path_values_equal(left: &Path, right: &Path, case_insensitive: bool) -> bool 
 }
 
 pub fn normalize_for_native_workdir(path: impl AsRef<Path>) -> PathBuf {
-    dunce::simplified(path.as_ref()).to_path_buf()
+    crate::normalize_path_for_platform(path.as_ref()).into_owned()
 }
 
 #[cfg(test)]

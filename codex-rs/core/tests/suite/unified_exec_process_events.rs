@@ -211,8 +211,10 @@ async fn serve_exec_with_pushed_events(
         if serve_evidence_filesystem_request(&mut websocket, &request).await {
             continue;
         }
+        // Session process handles start with the incarnation-bound
+        // `process/startOwned`; its params flatten the legacy start fields.
         match request["method"].as_str() {
-            Some("process/start")
+            Some("process/start" | "process/startOwned")
                 if request["params"]["processId"].as_str() == Some(REPLAY_BARRIER_PROCESS_ID) =>
             {
                 send_exec_server_json(
@@ -224,7 +226,7 @@ async fn serve_exec_with_pushed_events(
                 )
                 .await;
             }
-            Some("process/start")
+            Some("process/start" | "process/startOwned")
                 if request["params"]["processId"]
                     .as_str()
                     .is_some_and(|process_id| process_id.contains("-shell-snapshot-")) =>
@@ -260,7 +262,7 @@ async fn serve_exec_with_pushed_events(
                     send_exec_server_json(&mut websocket, message).await;
                 }
             }
-            Some("process/start") => break request,
+            Some("process/start" | "process/startOwned") => break request,
             Some("process/read")
                 if snapshot_process_id.as_deref() == request["params"]["processId"].as_str() =>
             {

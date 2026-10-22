@@ -671,7 +671,8 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_sandbox_retry_increments_dispatch_counter_once() {
-        use crate::tools::tool_dispatch_trace::{ToolDispatchTiming, scope_tool_dispatch_timing};
+        use crate::tools::tool_dispatch_trace::ToolDispatchTiming;
+        use crate::tools::tool_dispatch_trace::scope_tool_dispatch_timing;
         let (session, mut turn) = make_session_and_context().await;
         turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
         turn.approval_policy

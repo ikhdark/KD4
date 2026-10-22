@@ -44,17 +44,16 @@ fn exclusive_tls_roots_select_explicit_root_policy() {
             .tls_certs_only_pem(&ca_pem.repeat(count))
             .expect("valid CA certificate bundle");
         assert_eq!(builder.tls_certs_only.as_ref().unwrap().len(), count);
-        let client = builder
-            .build_inner_using(
-                /*direct*/ false,
-                reqwest::blocking::Client::builder(),
-                |builder, custom_ca_policy| {
-                    assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
-                    builder
-                        .build()
-                        .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
-                },
-            );
+        let client = builder.build_inner_using(
+            /*direct*/ false,
+            reqwest::blocking::Client::builder(),
+            |builder, custom_ca_policy| {
+                assert_eq!(custom_ca_policy, CustomCaPolicy::ExplicitRootSet);
+                builder
+                    .build()
+                    .map_err(BuildCustomCaTransportError::BuildClientWithExplicitRoots)
+            },
+        );
         assert!(client.is_ok());
     }
 
@@ -199,6 +198,7 @@ fn explicit_none_disables_blocking_transport_timeout() {
     });
     let result = BlockingHttpClientBuilder::new()
         .request_timeout(None)
+        .connect_timeout(std::time::Duration::from_millis(25))
         .build_inner_using(
             /*direct*/ true,
             reqwest::blocking::Client::builder().timeout(std::time::Duration::from_millis(50)),
@@ -217,4 +217,44 @@ fn explicit_none_disables_blocking_transport_timeout() {
             .status(),
         StatusCode::OK
     );
+}
+
+#[test]
+fn connection_timeout_bounds_a_stalled_tls_handshake_without_a_request_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS stall server");
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let server = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "connection must arrive"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept connection: {error}"),
+            }
+        };
+        // Never answer the TLS ClientHello. The bounded fallback closes the socket
+        // even if the facade accidentally stops applying its connection deadline.
+        let _ = wait.recv_timeout(std::time::Duration::from_secs(2));
+        drop(stream);
+    });
+    let result = BlockingHttpClientBuilder::new()
+        .request_timeout(None)
+        .connect_timeout(std::time::Duration::from_millis(50))
+        .build_direct()
+        .expect("build client")
+        .get(format!("https://{address}/"))
+        .send();
+    let _ = release.send(());
+    server.join().expect("join TLS stall server");
+    let error = result.err().expect("TLS handshake must time out");
+    assert!(error.is_timeout(), "{error}");
+    assert!(error.is_connect(), "{error}");
 }

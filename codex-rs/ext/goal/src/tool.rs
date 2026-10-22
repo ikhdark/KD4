@@ -63,6 +63,58 @@ struct UpdateGoalArgs {
     status: ThreadGoalStatus,
 }
 
+pub(crate) struct PendingGoalTerminalIntent {
+    executor: GoalToolExecutor,
+    invocation: ToolCall,
+    goal: codex_state::ThreadGoal,
+    args: UpdateGoalArgs,
+    acceptance: Arc<dyn codex_extension_api::TaskAcceptance>,
+}
+
+impl PendingGoalTerminalIntent {
+    pub(crate) fn turn_id(&self) -> &str {
+        &self.invocation.turn_id
+    }
+
+    pub(crate) async fn commit(self) -> Result<serde_json::Value, FunctionCallError> {
+        // Core's read-only reconciliation precedes the goal semaphore: no
+        // cross-owner callback is awaited with the goal state lock held.
+        if self.args.status == ThreadGoalStatus::Blocked {
+            self.acceptance.check_blocked().await?;
+        } else {
+            self.acceptance.check().await?;
+        }
+        let _permit = tokio::select! {
+            _ = self.invocation.cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("goal terminal intent cancelled".into())),
+            permit = self.executor.runtime.goal_state_permit() => permit.map_err(FunctionCallError::Fatal)?,
+        };
+        let current = self
+            .executor
+            .state_db
+            .thread_goals()
+            .get_thread_goal(self.executor.thread_id)
+            .await
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+        if self.invocation.cancellation_token.is_cancelled()
+            || !self.acceptance.is_current()
+            || !self.executor.runtime.admits_tool(&self.invocation.turn_id)
+            || current.as_ref().is_none_or(|goal| {
+                goal_reference(goal) != self.args.goal_ref || goal.status != self.goal.status
+            })
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "goal or turn changed before terminal intent settled".into(),
+            ));
+        }
+        let payload = self.invocation.payload.clone();
+        let output = self
+            .executor
+            .commit_terminal_update(self.invocation, self.goal, self.args)
+            .await?;
+        Ok(output.code_mode_result(&payload))
+    }
+}
+
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GoalToolResponse {
@@ -71,6 +123,7 @@ struct GoalToolResponse {
     goal: Option<ThreadGoal>,
     remaining_tokens: Option<i64>,
     completion_budget_report: Option<String>,
+    terminal_transition: Option<codex_state::GoalTerminalTransition>,
 }
 
 #[derive(Clone, Copy)]
@@ -145,6 +198,13 @@ impl GoalToolExecutor {
 }
 
 impl ToolExecutor<ToolCall> for GoalToolExecutor {
+    fn requires_task_acceptance(&self, payload: &ToolPayload) -> bool {
+        matches!(self.kind, GoalToolKind::Update)
+            && matches!(payload, ToolPayload::Function { arguments }
+                if serde_json::from_str::<UpdateGoalArgs>(arguments).is_ok_and(|args|
+                    matches!(args.status, ThreadGoalStatus::Complete | ThreadGoalStatus::Blocked)))
+    }
+
     fn tool_name(&self) -> ToolName {
         ToolName::plain(match self.kind {
             GoalToolKind::Get => GET_GOAL_TOOL_NAME,
@@ -176,6 +236,24 @@ impl ToolExecutor<ToolCall> for GoalToolExecutor {
     }
 
     fn handle(&self, invocation: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+        self.handle_call(invocation, None)
+    }
+
+    fn handle_with_task_acceptance(
+        &self,
+        invocation: ToolCall,
+        acceptance: Arc<dyn codex_extension_api::TaskAcceptance>,
+    ) -> codex_extension_api::ToolExecutorFuture<'_> {
+        self.handle_call(invocation, Some(acceptance))
+    }
+}
+
+impl GoalToolExecutor {
+    fn handle_call(
+        &self,
+        invocation: ToolCall,
+        acceptance: Option<Arc<dyn codex_extension_api::TaskAcceptance>>,
+    ) -> codex_extension_api::ToolExecutorFuture<'_> {
         Box::pin(async move {
             let _goal_state_permit = tokio::select! {
                 biased;
@@ -192,7 +270,7 @@ impl ToolExecutor<ToolCall> for GoalToolExecutor {
             match self.kind {
                 GoalToolKind::Get => self.handle_get(invocation).await,
                 GoalToolKind::Create => self.handle_create(invocation).await,
-                GoalToolKind::Update => self.handle_update(invocation).await,
+                GoalToolKind::Update => self.handle_update(invocation, acceptance).await,
             }
         })
     }
@@ -219,7 +297,25 @@ impl GoalToolExecutor {
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("failed to read goal: {err}"))
             })?;
-        goal_response(goal, CompletionBudgetReport::Omit, false)
+        let transition = match self.runtime.terminal_transition() {
+            Some(transition) => Some(transition),
+            None => self
+                .state_db
+                .thread_goals()
+                .get_terminal_transition(self.thread_id)
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to read goal stop state: {err}"
+                    ))
+                })?,
+        }
+        .filter(|transition| {
+            goal.as_ref().is_some_and(|goal| {
+                goal.goal_id == transition.goal_id && goal.objective == transition.objective
+            })
+        });
+        goal_response(goal, CompletionBudgetReport::Omit, false, transition)
     }
 
     async fn handle_create(
@@ -267,12 +363,13 @@ impl GoalToolExecutor {
             turn_id,
             protocol_goal_from_state(goal.clone()),
         );
-        goal_response(Some(goal), CompletionBudgetReport::Omit, false)
+        goal_response(Some(goal), CompletionBudgetReport::Omit, false, None)
     }
 
     async fn handle_update(
         &self,
         invocation: ToolCall,
+        acceptance: Option<Arc<dyn codex_extension_api::TaskAcceptance>>,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args: UpdateGoalArgs = parse_arguments(invocation.function_arguments()?)?;
         if !matches!(
@@ -304,7 +401,42 @@ impl GoalToolExecutor {
                 serde_json::json!({"goal_ref": goal_reference(&intended_goal), "objective": intended_goal.objective})
             )));
         }
-        self.runtime.suppress_goal(&intended_goal.goal_id);
+        let acceptance = acceptance.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "goal terminal updates require host settlement; the goal remains active".into(),
+            )
+        })?;
+        self.runtime
+            .stage_terminal_intent(PendingGoalTerminalIntent {
+                executor: self.clone(),
+                invocation,
+                goal: intended_goal,
+                args,
+                acceptance,
+            })
+            .map_err(FunctionCallError::RespondToModel)?;
+        Ok(Box::new(JsonToolOutput::new(serde_json::json!({
+            "terminal_update_pending":true,
+            "message":"Goal remains active until accepted sibling effects settle and host readiness is reconciled. This is not a completed or blocked goal receipt."
+        }))))
+    }
+
+    async fn commit_terminal_update(
+        &self,
+        invocation: ToolCall,
+        intended_goal: codex_state::ThreadGoal,
+        args: UpdateGoalArgs,
+    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+        self.runtime
+            .begin_terminal_transition(
+                &intended_goal,
+                args.status,
+                &invocation.turn_id,
+                &invocation.call_id,
+                "model-tool",
+            )
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
         let accounting_result = self
             .account_active_goal_progress(
                 &invocation.turn_id,
@@ -326,26 +458,10 @@ impl GoalToolExecutor {
         }
         let previous_status = Some(intended_goal.status);
         let goal = self
-            .state_db
-            .thread_goals()
-            .update_thread_goal(
-                self.thread_id,
-                codex_state::GoalUpdate {
-                    objective: None,
-                    status: Some(args.status),
-                    token_budget: None,
-                    expected_goal_id: Some(intended_goal.goal_id),
-                },
-            )
+            .runtime
+            .persist_terminal_status(&intended_goal, args.status)
             .await
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!("failed to update goal: {err}"))
-            })?
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "cannot update goal because this thread has no goal".to_string(),
-                )
-            })?;
+            .map_err(FunctionCallError::RespondToModel)?;
         self.metrics
             .record_terminal_if_status_changed(previous_status, &goal);
         self.analytics.status_changed(
@@ -371,6 +487,7 @@ impl GoalToolExecutor {
                 CompletionBudgetReport::Omit
             },
             accounting_pending,
+            self.runtime.terminal_transition(),
         )
     }
 
@@ -424,11 +541,13 @@ fn goal_response(
     goal: Option<codex_state::ThreadGoal>,
     completion_budget_report: CompletionBudgetReport,
     accounting_pending: bool,
+    terminal_transition: Option<codex_state::GoalTerminalTransition>,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let value = serde_json::to_value(GoalToolResponse::new(
         goal,
         completion_budget_report,
         accounting_pending,
+        terminal_transition,
     ))
     .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
     Ok(Box::new(JsonToolOutput::new(value)))
@@ -439,6 +558,7 @@ impl GoalToolResponse {
         goal: Option<codex_state::ThreadGoal>,
         report_mode: CompletionBudgetReport,
         accounting_pending: bool,
+        terminal_transition: Option<codex_state::GoalTerminalTransition>,
     ) -> Self {
         let goal_ref = goal.as_ref().map(goal_reference);
         let goal = goal.map(protocol_goal_from_state);
@@ -459,6 +579,7 @@ impl GoalToolResponse {
             goal,
             remaining_tokens,
             completion_budget_report,
+            terminal_transition,
         }
     }
 }

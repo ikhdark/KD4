@@ -181,6 +181,10 @@ pub(super) async fn spawn_review_thread(
         target: resolved.target,
         user_facing_hint: resolved.user_facing_hint,
     };
-    sess.spawn_task(tc, input, ReviewTask::new(entered_review_mode))
-        .await;
+    sess.spawn_task(
+        tc,
+        input,
+        ReviewTask::new(entered_review_mode).with_source_scope(resolved.source_scope),
+    )
+    .await;
 }

@@ -53,6 +53,19 @@ pub(crate) fn thread_settings_from_config_snapshot(
 ) -> ThreadSettings {
     ThreadSettings {
         cwd: config_snapshot.cwd().clone(),
+        environments: Some(
+            config_snapshot
+                .environments
+                .environments
+                .iter()
+                .map(
+                    |selection| codex_app_server_protocol::ThreadSelectedEnvironment {
+                        environment_id: selection.environment_id.clone(),
+                        cwd: selection.cwd.clone(),
+                    },
+                )
+                .collect(),
+        ),
         approval_policy: config_snapshot.approval_policy.into(),
         sandbox_policy: thread_response_sandbox_policy(
             &config_snapshot.permission_profile,
@@ -87,10 +100,23 @@ pub(crate) fn thread_settings_from_core_snapshot(
         reasoning_summary,
         personality,
         collaboration_mode,
+        environments,
         ..
     } = snapshot;
     let sandbox_policy = thread_response_sandbox_policy(&permission_profile, cwd.as_path());
     ThreadSettings {
+        environments: environments.map(|selection| {
+            selection
+                .environments
+                .into_iter()
+                .map(
+                    |selection| codex_app_server_protocol::ThreadSelectedEnvironment {
+                        environment_id: selection.environment_id,
+                        cwd: selection.cwd,
+                    },
+                )
+                .collect()
+        }),
         sandbox_policy,
         permission_profile: Some(permission_profile),
         cwd,

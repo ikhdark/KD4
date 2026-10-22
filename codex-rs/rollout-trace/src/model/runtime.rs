@@ -38,9 +38,19 @@ pub struct CodeCell {
     pub output_item_ids: Vec<ConversationItemId>,
     /// Raw code-mode runtime/session id, useful when matching runtime payloads.
     pub runtime_cell_id: Option<String>,
-    /// Full JS-cell runtime window; yielded cells can outlive the initial custom call.
+    /// JS-cell runtime window. Without an observed terminal receipt an interrupted
+    /// owner's boundary closes only the logical frame, not a proven runtime interval.
     pub execution: ExecutionWindow,
     pub runtime_status: CodeCellRuntimeStatus,
+    /// Owner closure is independent of the runtime result (including late receipts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_end: Option<ExecutionWindow>,
+    /// Absent in older bundles and when runtime finality was never observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_terminal: Option<CodeCellTerminalObservation>,
+    /// Contradictory explicit receipts, retained without overwriting the first fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_conflicts: Vec<CodeCellTerminalObservation>,
     pub initial_response_at_unix_ms: Option<i64>,
     pub initial_response_seq: Option<RawEventSeq>,
     pub yielded_at_unix_ms: Option<i64>,
@@ -54,6 +64,8 @@ pub struct CodeCell {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeCellRuntimeStatus {
+    /// Ownership ended without an explicit runtime terminal receipt.
+    Unknown,
     /// The `exec` request has been accepted but the runtime has not yet started user code.
     Starting,
     /// Runtime is executing JavaScript and has not yet yielded or terminated.
@@ -66,6 +78,13 @@ pub enum CodeCellRuntimeStatus {
     Failed,
     /// Runtime was explicitly terminated.
     Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeCellTerminalObservation {
+    pub status: CodeCellRuntimeStatus,
+    pub ended_at_unix_ms: i64,
+    pub ended_seq: RawEventSeq,
 }
 
 /// Installed conversation-history replacement boundary.
@@ -99,9 +118,14 @@ pub struct CompactionRequest {
     pub thread_id: AgentThreadId,
     pub codex_turn_id: CodexTurnId,
     pub execution: ExecutionWindow,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_terminal_status: Option<super::ExecutionStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_end: Option<ExecutionWindow>,
     pub model: String,
     pub provider_name: String,
-    pub raw_request_payload_id: RawPayloadId,
+    /// None means optional capture failed, not an empty request or no attempt.
+    pub raw_request_payload_id: Option<RawPayloadId>,
     /// Full compaction response payload. `None` while running, after pre-response
     /// failures, or when response capture was unavailable.
     pub raw_response_payload_id: Option<RawPayloadId>,
@@ -150,6 +174,9 @@ pub struct ToolCall {
     /// events. Reducers can use these to build richer runtime objects such as
     /// terminal operations without overwriting the canonical invocation/result.
     pub raw_runtime_payload_ids: Vec<RawPayloadId>,
+    /// Missing means unknown coverage (including older bundles), never zero starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_observations: Option<serde_json::Value>,
 }
 
 /// Requester of a runtime tool.

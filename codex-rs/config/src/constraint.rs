@@ -305,18 +305,31 @@ mod tests {
         );
         let mut constrained = Constrained::new(1, positive).unwrap();
         assert_eq!(constrained.can_set(&2), Ok(()));
-        assert_eq!(constrained.can_set(&-1), Err(invalid_value("-1", "positive values")));
+        assert_eq!(
+            constrained.can_set(&-1),
+            Err(invalid_value("-1", "positive values"))
+        );
         assert_eq!(constrained.value(), 1);
-        assert_eq!(constrained.set(-5), Err(invalid_value("-5", "positive values")));
+        assert_eq!(
+            constrained.set(-5),
+            Err(invalid_value("-5", "positive values"))
+        );
         assert_eq!(constrained.value(), 1);
         constrained.set(2).unwrap();
         assert_eq!(constrained.value(), 2);
 
         // A rejected validator must not replace the working constraint.
-        assert!(constrained.add_validator(|_| Err(ConstraintError::empty_field("blocked"))).is_err());
+        assert!(
+            constrained
+                .add_validator(|_| Err(ConstraintError::empty_field("blocked")))
+                .is_err()
+        );
         constrained.set(3).unwrap();
         assert_eq!(constrained.value(), 3);
-        assert_eq!(constrained.set(-1), Err(invalid_value("-1", "positive values")));
+        assert_eq!(
+            constrained.set(-1),
+            Err(invalid_value("-1", "positive values"))
+        );
         assert_eq!(constrained.value(), 3);
     }
 }

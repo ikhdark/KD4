@@ -14,7 +14,7 @@ totalMatchCount: number,
  */
 scannedFileCount: number,
 /**
- * True only after scanning finishes without omitting paths. A completed
- * notification with this still false indicates an incomplete traversal.
+ * True only after scanning and current-query matching finish without omissions.
+ * False during matching, or when limits, cancellation or errors interrupt search.
  */
 walkComplete: boolean, };

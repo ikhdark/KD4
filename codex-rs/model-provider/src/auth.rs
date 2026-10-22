@@ -109,6 +109,10 @@ impl ProviderAccountScope {
             None
         };
 
+        let credential_scope_digest = auth
+            .lifecycle_id()
+            .map(|lifecycle| crate::auth::credential_scope_digest(lifecycle.as_bytes()))
+            .or(credential_scope_digest);
         Self {
             auth_mode: Some(auth.auth_mode()),
             account_id,
@@ -280,6 +284,14 @@ struct AgentIdentityAuthProvider {
 }
 
 impl AuthProvider for AgentIdentityAuthProvider {
+    fn connection_identity(&self) -> Option<Vec<u8>> {
+        let record = serde_json::to_vec(self.auth.record()).ok()?;
+        let mut digest = Sha256::new();
+        digest.update(b"CODEX_AGENT_CONNECTION_IDENTITY_V1\0");
+        digest.update(record);
+        Some(digest.finalize().to_vec())
+    }
+
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
         let _ = self.try_add_auth_headers(headers);
     }
@@ -328,9 +340,37 @@ struct AuthManagerAuthProvider {
     // Startup auth is only the account-scoped identity anchor. Request
     // headers always come from the current AuthManager snapshot below.
     expected_scope: ProviderAccountScope,
+    expected_epoch: u64,
+    projection: Option<SharedAuthProvider>,
+}
+
+struct ManagedDispatchGuard {
+    manager: Arc<AuthManager>,
+    epoch: u64,
+}
+
+impl codex_http_client::RequestDispatchGuard for ManagedDispatchGuard {
+    fn admit(&self, dispatch: &mut dyn FnMut()) -> Result<(), String> {
+        self.manager
+            .with_policy_auth_epoch(self.epoch, dispatch)
+            .map_err(|error| error.to_string())
+    }
 }
 
 impl AuthProvider for AuthManagerAuthProvider {
+    fn dispatch_guard(&self) -> Option<Arc<dyn codex_http_client::RequestDispatchGuard>> {
+        Some(Arc::new(ManagedDispatchGuard {
+            manager: Arc::clone(&self.auth_manager),
+            epoch: self.expected_epoch,
+        }))
+    }
+
+    fn connection_identity(&self) -> Option<Vec<u8>> {
+        self.projection
+            .as_ref()
+            .and_then(|projection| projection.connection_identity())
+    }
+
     fn add_auth_headers(&self, headers: &mut HeaderMap) {
         if self.try_add_auth_headers(headers).is_err() {
             headers.remove(http::header::AUTHORIZATION);
@@ -340,20 +380,28 @@ impl AuthProvider for AuthManagerAuthProvider {
     }
 
     fn try_add_auth_headers(&self, headers: &mut HeaderMap) -> Result<(), AuthError> {
-        let auth = self
+        self.auth_manager
+            .check_auth_load()
+            .map_err(|err| AuthError::Build(err.to_string()))?;
+        let (epoch, auth) = self
             .auth_manager
-            .auth_cached()
-            .filter(CodexAuth::uses_codex_backend)
-            .ok_or_else(|| {
-                AuthError::Build("managed authentication is no longer available".into())
-            })?;
-        // Follow refreshes only within the identity that owns the caller's state.
-        if ProviderAccountScope::from_auth(Some(&auth)) != self.expected_scope {
-            return Err(AuthError::Build(
-                "managed authentication account scope changed; rebuild request state".into(),
-            ));
+            .policy_auth_snapshot()
+            .map_err(|err| AuthError::Build(err.to_string()))?;
+        let auth = auth.ok_or_else(|| {
+            AuthError::Build("managed authentication is no longer available".into())
+        })?;
+        if epoch != self.expected_epoch
+            || ProviderAccountScope::from_auth(Some(&auth)) != self.expected_scope
+        {
+            return Err(AuthError::Build("authentication account scope changed or lifecycle invalidated; rebuild request state".into()));
         }
-        auth_provider_from_auth(&auth).try_add_auth_headers(headers)
+        let projection = self
+            .projection
+            .clone()
+            .unwrap_or_else(|| auth_provider_from_auth(&auth));
+        self.auth_manager
+            .with_policy_auth_epoch(epoch, || projection.try_add_auth_headers(headers))
+            .map_err(|err| AuthError::Build(err.to_string()))?
     }
 }
 
@@ -427,6 +475,38 @@ pub(crate) fn resolve_provider_auth(
 }
 
 pub(crate) async fn resolve_provider_auth_for_scope(
+    auth_manager: Option<Arc<AuthManager>>,
+    auth: Option<&CodexAuth>,
+    provider: &ModelProviderInfo,
+    scope: ProviderAuthScope,
+) -> codex_protocol::error::Result<ResolvedProviderAuth> {
+    // Provider-owned overrides are independent of the local Codex account.
+    if let Some(manager) = &auth_manager {
+        manager.check_auth_load()?;
+    }
+    if let Some(override_auth) = bearer_auth_for_provider(provider)? {
+        return Ok(ResolvedProviderAuth::new(Arc::new(override_auth)));
+    }
+    let epoch = auth_manager
+        .as_ref()
+        .map(|manager| manager.policy_auth_snapshot().map(|(epoch, _)| epoch))
+        .transpose()?;
+    let mut resolved =
+        resolve_provider_auth_for_scope_inner(auth_manager.clone(), auth, provider, scope).await?;
+    if let (Some(manager), Some(expected), Some(expected_epoch)) = (auth_manager, auth, epoch) {
+        let projection = (resolved.agent_identity_telemetry.is_some()
+            || matches!(expected, CodexAuth::AgentIdentity(_)))
+        .then(|| resolved.auth.clone());
+        resolved.auth = Arc::new(AuthManagerAuthProvider {
+            auth_manager: manager,
+            expected_scope: ProviderAccountScope::from_auth(Some(expected)),
+            expected_epoch,
+            projection,
+        });
+    }
+    Ok(resolved)
+}
+async fn resolve_provider_auth_for_scope_inner(
     auth_manager: Option<Arc<AuthManager>>,
     auth: Option<&CodexAuth>,
     provider: &ModelProviderInfo,
@@ -534,9 +614,15 @@ pub fn auth_provider_from_auth_manager(
     auth_manager: Arc<AuthManager>,
     expected_auth: &CodexAuth,
 ) -> SharedAuthProvider {
+    let expected_epoch = auth_manager
+        .policy_auth_snapshot()
+        .map(|(epoch, _)| epoch)
+        .unwrap_or(u64::MAX);
     Arc::new(AuthManagerAuthProvider {
         auth_manager,
         expected_scope: ProviderAccountScope::from_auth(Some(expected_auth)),
+        expected_epoch,
+        projection: None,
     })
 }
 
@@ -1014,6 +1100,16 @@ mod tests {
             .await
             .expect("refreshed auth should dispatch");
         assert_eq!(request.headers[AUTHORIZATION], "Bearer header.e30.reloaded");
+        let dispatch_guard = provider.dispatch_guard();
+        assert!(dispatch_guard.is_some());
+        assert_eq!(
+            codex_http_client::with_dispatch_guard(
+                dispatch_guard.clone(),
+                codex_http_client::admit_dispatch(async { 1 })
+            )
+            .await,
+            Ok(1),
+        );
 
         login_with_chatgpt_auth_tokens(
             &codex_home,
@@ -1025,6 +1121,17 @@ mod tests {
         auth_manager.reload().await;
 
         assert!(provider.to_auth_headers().is_empty());
+        let mut dispatched = false;
+        let result = codex_http_client::with_dispatch_guard(
+            dispatch_guard,
+            codex_http_client::admit_dispatch(async { dispatched = true }),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "already-prepared headers must not survive account replacement"
+        );
+        assert!(!dispatched);
         let request =
             codex_http_client::Request::new(http::Method::GET, "https://example.com".into());
         assert!(
@@ -1038,6 +1145,24 @@ mod tests {
         );
         provider.add_auth_headers(&mut stale_headers);
         assert!(stale_headers.is_empty());
+
+        let current = auth_manager.auth_cached().expect("replacement account");
+        let active = auth_provider_from_auth_manager(Arc::clone(&auth_manager), &current);
+        let logout_guard = active.dispatch_guard();
+        auth_manager.logout().await.expect("logout");
+        let mut dispatched = false;
+        assert!(
+            codex_http_client::with_dispatch_guard(
+                logout_guard,
+                codex_http_client::admit_dispatch(async { dispatched = true })
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !dispatched,
+            "logout must fence work prepared before transport waits"
+        );
     }
 
     #[tokio::test]
@@ -1105,7 +1230,11 @@ mod tests {
         let non_fedramp = auth_provider_from_auth(&CodexAuth::AgentIdentity(
             agent_identity_auth(/*chatgpt_account_is_fedramp*/ false).await,
         ));
-        assert!(!non_fedramp.to_auth_headers().contains_key("X-OpenAI-Fedramp"));
+        assert!(
+            !non_fedramp
+                .to_auth_headers()
+                .contains_key("X-OpenAI-Fedramp")
+        );
     }
 
     #[tokio::test]
@@ -1132,7 +1261,10 @@ mod tests {
         .expect("fallback should resolve bearer auth");
 
         let headers = provider_auth.auth.to_auth_headers();
-        assert_eq!(headers[http::header::AUTHORIZATION], "Bearer test-access-token");
+        assert_eq!(
+            headers[http::header::AUTHORIZATION],
+            "Bearer test-access-token"
+        );
         assert_eq!(headers["ChatGPT-Account-ID"], "account-123");
         assert_eq!(provider_auth.agent_identity_telemetry, None);
         assert!(fallback.is_engaged());
@@ -1152,7 +1284,10 @@ mod tests {
                 Some(manager),
                 Some(&auth),
                 &provider,
-                provider_auth_scope(AgentIdentityAuthPolicy::ChatGptAuth, session_fallback.clone()),
+                provider_auth_scope(
+                    AgentIdentityAuthPolicy::ChatGptAuth,
+                    session_fallback.clone(),
+                ),
             )
             .await
             .expect("subsequent fallback should preserve bearer auth");

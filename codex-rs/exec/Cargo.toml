@@ -37,6 +37,7 @@ codex-model-provider-info = { workspace = true }
 codex-otel = { workspace = true }
 codex-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-build-info = { workspace = true }
 codex-utils-cli = { workspace = true }
 codex-utils-oss = { workspace = true }
 codex-utils-sandbox-summary = { workspace = true }
@@ -65,6 +66,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 codex-apply-patch = { workspace = true }
+codex-rollout = { workspace = true }
 codex-state = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }

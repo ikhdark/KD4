@@ -27,6 +27,7 @@ async fn failed_primary(turn: &mut crate::session::turn_context::TurnContext, ca
         .shared();
     assert!(resolution.clone().await.is_err());
     turn.environments.starting = vec![StartingTurnEnvironment {
+        environment: Arc::clone(&ready.environment),
         selection: TurnEnvironmentSelection {
             environment_id: "primary".into(),
             cwd: ready.cwd().clone(),

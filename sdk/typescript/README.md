@@ -27,6 +27,9 @@ console.log(turn.items);
 ```
 
 Call `run()` repeatedly on the same `Thread` instance to continue that conversation.
+Await each turn or close its event iterator before starting another on the same
+`Thread`; overlapping consumed runs are rejected. Separate `Thread` objects may
+run concurrently. Constructing an unconsumed stream does not reserve a turn.
 
 ```typescript
 const nextTurn = await thread.run("Implement the fix");
@@ -37,6 +40,14 @@ const nextTurn = await thread.run("Implement the fix");
 `run()` buffers events until the turn finishes. To react to intermediate progress—tool calls,
 streaming responses, and file change notifications—use `runStreamed()` instead, which returns an
 async generator of structured events.
+
+Final text prefers the latest completed agent message, falling back to a completed
+`plan` item. A Plan is planning content, not verified implementation. Usage is
+`null` when no accounting snapshot was received; counters remain cumulative for
+the primary thread. Web-search `id` is the exec item identity; `call_id` preserves
+the provider identity. Known malformed envelopes and lifecycle mutations after a
+terminal are rejected. A fatal finalization error may follow `turn.completed`:
+always drain the process and inspect its outcome.
 
 ```typescript
 const { events } = await thread.runStreamed("Diagnose the test failure and propose a fix");

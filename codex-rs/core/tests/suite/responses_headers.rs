@@ -93,7 +93,9 @@ async fn responses_stream_includes_subagent_identity_headers(
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");
@@ -231,7 +233,9 @@ async fn responses_includes_configured_reasoning_summary_for_supported_model() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     let codex_home = TempDir::new().expect("failed to create TempDir");

@@ -6,6 +6,7 @@ use crate::agent::task_capabilities::is_independent_review_source;
 use crate::client_common::ToolSchemaArtifact;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolDispatchState;
 use crate::tools::context::ToolInvocation;
@@ -76,6 +77,7 @@ pub struct ToolRouter {
     registry: ToolRegistry,
     planning_warnings: Vec<String>,
     exposure_identity: ToolExposureIdentity,
+    resolved_planning_identity: Option<ResolvedToolPlanningIdentity>,
     pub(crate) tool_suggest_candidates: Option<ToolSuggestCandidates>,
     pub(crate) tool_search_sources: String,
     schema_cache: Mutex<Option<(HashSet<ToolName>, Arc<ToolSchemaArtifact>)>>,
@@ -87,6 +89,16 @@ pub struct ToolRouter {
     manifest_snapshot_build_count: AtomicUsize,
     #[cfg(test)]
     deferred_tool_capability_revision_build_count: AtomicUsize,
+}
+
+/// Retain the resolved inputs used by the canonical planner, not just the
+/// requested model slug. Catalog refreshes can change either under equal config.
+struct ResolvedToolPlanningIdentity {
+    config: Arc<crate::config::Config>,
+    model_info: codex_protocol::openai_models::ModelInfo,
+    available_models: Arc<Vec<codex_protocol::openai_models::ModelPreset>>,
+    code_mode_available: bool,
+    multi_agent_version: codex_protocol::protocol::MultiAgentVersion,
 }
 
 #[derive(Default)]
@@ -131,7 +143,11 @@ struct ToolDispatchCompletionGuard(Arc<ToolDispatchState>);
 
 impl Drop for ToolDispatchCompletionGuard {
     fn drop(&mut self) {
-        let _ = self.0.try_complete();
+        // A panic is not a validation return. Leave the election to the
+        // dispatch owner that joins the panic and records its failed trace.
+        if !std::thread::panicking() {
+            let _ = self.0.try_complete();
+        }
     }
 }
 
@@ -164,6 +180,31 @@ impl ToolRouter {
         tool_search_handler_cache: &ToolSearchHandlerCache,
     ) -> Result<Self, String> {
         build_tool_router(step_context, params, tool_search_handler_cache)
+    }
+
+    pub(crate) fn with_planning_context(mut self, turn: &TurnContext) -> Self {
+        self.resolved_planning_identity = Some(ResolvedToolPlanningIdentity {
+            config: Arc::clone(&turn.config),
+            model_info: turn.model_info.clone(),
+            available_models: Arc::clone(&turn.available_models),
+            code_mode_available: turn.code_mode_available,
+            multi_agent_version: turn.multi_agent_version,
+        });
+        self
+    }
+
+    pub(crate) fn matches_planning_context(&self, turn: &TurnContext) -> bool {
+        self.resolved_planning_identity
+            .as_ref()
+            .is_some_and(|identity| {
+                (Arc::ptr_eq(&identity.config, &turn.config)
+                    || identity.config.as_ref() == turn.config.as_ref())
+                    && identity.model_info == turn.model_info
+                    && (Arc::ptr_eq(&identity.available_models, &turn.available_models)
+                        || identity.available_models.as_ref() == turn.available_models.as_ref())
+                    && identity.code_mode_available == turn.code_mode_available
+                    && identity.multi_agent_version == turn.multi_agent_version
+            })
     }
 
     #[cfg(test)]
@@ -230,6 +271,7 @@ impl ToolRouter {
             registry,
             planning_warnings,
             exposure_identity,
+            resolved_planning_identity: None,
             tool_suggest_candidates: None,
             tool_search_sources,
             schema_cache: Mutex::new(None),
@@ -964,22 +1006,34 @@ async fn authorize_bound_typed_tool_call(
     Ok(())
 }
 
-#[instrument(level = "trace", skip_all)]
+/// Test convenience for the executors in the current extension tool surface;
+/// production captures [`extension_tool_surface_snapshot`] to keep its revision.
+#[cfg(test)]
 pub(crate) fn extension_tool_executors(
     session: &Session,
 ) -> Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>> {
-    session
-        .services
-        .extensions
-        .tool_contributors()
-        .iter()
-        .flat_map(|contributor| {
-            contributor.tools(
-                &session.services.session_extension_data,
-                &session.services.thread_extension_data,
-            )
-        })
-        .collect()
+    extension_tool_surface_snapshot(session).tools
+}
+
+pub(crate) fn extension_tool_surface_snapshot(
+    session: &Session,
+) -> codex_extension_api::ToolSurfaceSnapshot {
+    let mut snapshot = codex_extension_api::ToolSurfaceSnapshot {
+        revision: 0,
+        tools: Vec::new(),
+    };
+    for contributor in session.services.extensions.tool_contributors() {
+        let contribution = contributor.surface_snapshot(
+            &session.services.session_extension_data,
+            &session.services.thread_extension_data,
+        );
+        snapshot.revision = snapshot
+            .revision
+            .rotate_left(7)
+            .wrapping_add(contribution.revision);
+        snapshot.tools.extend(contribution.tools);
+    }
+    snapshot
 }
 
 pub(crate) fn extension_tool_surface_revision(session: &Session) -> u64 {

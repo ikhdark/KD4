@@ -110,13 +110,11 @@ mod tests {
             (false, Some("xterm-256color"), true, true),
             (false, None, true, true),
         ] {
-            assert_eq!(should_show_progress(json, term, tty), expected, "{json} {term:?} {tty}");
+            assert_eq!(
+                should_show_progress(json, term, tty),
+                expected,
+                "{json} {term:?} {tty}"
+            );
         }
     }
-
-
-
-
-
-
 }

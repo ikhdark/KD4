@@ -117,7 +117,17 @@ fn environment_descriptor_rejects_resources_outside_package_root() {
     let cwd = std::env::current_dir().expect("cwd");
     let root = absolute(cwd.join("plugin-root"));
     let outside = absolute(cwd.join("plugin-root-other/.mcp.json"));
-    for field in ["manifest", "skills", "mcp", "apps", "hooks", "composer", "logo", "logo_dark", "screenshots"] {
+    for field in [
+        "manifest",
+        "skills",
+        "mcp",
+        "apps",
+        "hooks",
+        "composer",
+        "logo",
+        "logo_dark",
+        "screenshots",
+    ] {
         let mut manifest_path = path_uri(&root.join(".codex-plugin/plugin.json"));
         let mut manifest = PluginManifest {
             name: "demo".to_string(),

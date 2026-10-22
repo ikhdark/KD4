@@ -5,6 +5,7 @@ use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
 #[cfg(not(unix))]
@@ -97,6 +98,39 @@ impl ProcessGroupControl {
         }
     }
 
+    pub(crate) fn signal_terminal(
+        &self,
+        master: &std::fs::File,
+        signal: ProcessSignal,
+    ) -> io::Result<()> {
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*active {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let signo = match signal {
+                ProcessSignal::Interrupt => libc::SIGINT,
+            };
+            // SAFETY: master owns the PTY; TIOCSIG takes an integer signal and
+            // resolves the foreground group under the kernel's terminal lock.
+            if unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSIG as _, signo) } == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = master;
+            Err(unsupported_signal(signal))
+        }
+    }
+
     pub(crate) async fn disarm_after_exit(&self) {
         // Only the backend waiter owns/reaps the child. WNOWAIT protects its identity
         // until all in-flight signals finish and future signals have been disabled.
@@ -165,10 +199,8 @@ impl fmt::Debug for PtyHandles {
 /// the root process exits.
 pub(crate) type SharedPtyHandles = Arc<StdMutex<Option<PtyHandles>>>;
 
-/// Bounds how long a finished ConPTY reader may keep draining once its
-/// pseudoconsole has been released. Draining normally ends within
-/// milliseconds; the bound only applies when the output receiver stops reading.
-#[cfg(windows)]
+/// Bounds native PTY drain after root exit, including inherited slave handles
+/// and a consumer that stops reading. An aborted producer leaves capture incomplete.
 const PTY_OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Releases PTY handles without blocking the async executor.
@@ -189,10 +221,8 @@ pub(crate) fn release_pty_handles(pty_handles: &StdMutex<Option<PtyHandles>>) {
     drop(handles);
 }
 
-/// Lets a ConPTY reader deliver the final frame that the pseudoconsole flushes
-/// when it is released; releasing it always closes the reader's pipe. The
-/// reader is aborted only if its receiver stops reading.
-#[cfg(windows)]
+/// Keep the authoritative native reader through EOF or an explicit bounded
+/// cutoff. Its producer receipt, not channel closure, certifies complete capture.
 fn drain_released_pty_reader(reader: JoinHandle<()>) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         reader.abort();
@@ -213,8 +243,33 @@ fn drain_released_pty_reader(reader: JoinHandle<()>) {
 /// there is no local `PtyHandles` instance to resize directly.
 type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 
+pub(crate) type StdinCloseReceipt =
+    tokio::sync::watch::Receiver<Option<Result<(), (io::ErrorKind, String)>>>;
+
+/// Producer EOF receipts. Channel closure alone is not proof of capture: a
+/// failed or aborted reader leaves its receipt false. Only the producer sets it.
+#[derive(Clone, Debug, Default)]
+pub struct OutputCapture {
+    pub(crate) stdout: Arc<AtomicBool>,
+    pub(crate) stderr: Arc<AtomicBool>,
+}
+
+impl OutputCapture {
+    pub fn stdout_complete(&self) -> bool {
+        self.stdout.load(Ordering::Acquire)
+    }
+    pub fn stderr_complete(&self) -> bool {
+        self.stderr.load(Ordering::Acquire)
+    }
+    pub fn complete(&self) -> bool {
+        self.stdout_complete() && self.stderr_complete()
+    }
+}
+
 /// Handle for driving an interactive process (PTY or pipe).
 pub struct ProcessHandle {
+    stdin_close_receipt: Option<StdinCloseReceipt>,
+    output_capture: OutputCapture,
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
@@ -258,6 +313,8 @@ impl ProcessHandle {
         // identity must survive that release so finish still drains the final ConPTY frame.
         let has_pty = pty_handles.is_some();
         Self {
+            stdin_close_receipt: None,
+            output_capture: OutputCapture::default(),
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
             reader_handle: StdMutex::new(Some(reader_handle)),
@@ -270,6 +327,23 @@ impl ProcessHandle {
             has_pty,
             resizer: StdMutex::new(resizer),
         }
+    }
+
+    pub(crate) fn with_output_capture(mut self, capture: OutputCapture) -> Self {
+        self.output_capture = capture;
+        self
+    }
+
+    /// Only the Unix PTY writer can acknowledge terminal EOF (canonical VEOF);
+    /// pipe and ConPTY sessions keep sender-drop close semantics.
+    #[cfg(unix)]
+    pub(crate) fn with_stdin_close_receipt(mut self, receipt: StdinCloseReceipt) -> Self {
+        self.stdin_close_receipt = Some(receipt);
+        self
+    }
+
+    pub fn output_capture(&self) -> OutputCapture {
+        self.output_capture.clone()
     }
 
     /// Returns a channel sender for writing raw bytes to the child stdin.
@@ -343,12 +417,36 @@ impl ProcessHandle {
         }
     }
 
-    /// Drop this handle's stdin sender. EOF follows queued input only after all
-    /// sender clones returned by `writer_sender` have also been dropped.
+    /// Drop this handle's stdin sender. All sender clones must also be dropped.
+    /// This alone is not evidence of terminal EOF; use `close_stdin_ordered`
+    /// when the caller needs an acknowledged EOF operation.
     pub fn close_stdin(&self) {
         if let Ok(mut writer_tx) = self.writer_tx.lock() {
             writer_tx.take();
         }
+    }
+
+    /// Close pipe input, or request canonical Unix terminal EOF after queued
+    /// input. Terminal EOF uses the current VEOF twice (flush a partial line,
+    /// then an empty read); it is not a permanent pipe half-close. Raw mode or
+    /// disabled VEOF returns Unsupported, never a false EOF acknowledgement.
+    /// External writer clones must be dropped before this operation can finish.
+    pub async fn close_stdin_ordered(&self) -> io::Result<()> {
+        self.close_stdin();
+        if let Some(mut receipt) = self.stdin_close_receipt.clone() {
+            let result = receipt.wait_for(Option::is_some).await.map_err(|_| {
+                io::Error::other("stdin writer stopped before confirming terminal EOF")
+            })?;
+            return match result.as_ref() {
+                Some(Ok(())) => Ok(()),
+                Some(Err((kind, message))) => Err(io::Error::new(*kind, message.clone())),
+                // `wait_for(Option::is_some)` never yields an empty result.
+                None => Err(io::Error::other(
+                    "stdin writer stopped before confirming terminal EOF",
+                )),
+            };
+        }
+        Ok(())
     }
 
     /// Closes stdin, drops the terminator, and releases the pseudoconsole after
@@ -404,11 +502,8 @@ impl ProcessHandle {
     ///
     /// This is used after the root process has already exited. In particular,
     /// pipe descendants may intentionally outlive the root while retaining an
-    /// inherited output handle, so waiting for the reader tasks to observe EOF
-    /// would retain the otherwise-finished process indefinitely. A Windows
-    /// pseudoconsole is different: releasing it closes the reader's pipe after
-    /// its final frame, so that reader drains to EOF (bounded) instead of
-    /// discarding output the child wrote before it exited.
+    /// inherited output handle. Native PTY readers drain to EOF with a bounded
+    /// cutoff, rather than discarding kernel-buffered bytes at root exit.
     pub fn finish(&self) {
         self.close_stdin();
 
@@ -419,14 +514,11 @@ impl ProcessHandle {
         if let Ok(mut h) = self.reader_handle.lock()
             && let Some(handle) = h.take()
         {
-            #[cfg(windows)]
             if self.has_pty {
                 drain_released_pty_reader(handle);
             } else {
                 handle.abort();
             }
-            #[cfg(not(windows))]
-            handle.abort();
         }
         if let Ok(mut handles) = self.reader_abort_handles.lock() {
             for handle in handles.drain(..) {
@@ -565,7 +657,6 @@ mod tests {
         assert!(handle.writer_sender().is_closed());
     }
 
-    #[cfg(windows)]
     #[tokio::test(start_paused = true)]
     async fn released_pty_reader_is_aborted_only_after_the_drain_bound() {
         let (dropped_tx, mut dropped_rx) = oneshot::channel::<()>();
@@ -593,7 +684,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     async fn already_released_pty_keeps_its_final_output_reader() {
         let (writer_tx, _writer_rx) = mpsc::channel(1);
@@ -703,7 +793,10 @@ mod tests {
         })
         .await
         .expect("the consumer queue must fill before draining starts");
-        assert!(!producer.is_finished(), "full output must backpressure the producer");
+        assert!(
+            !producer.is_finished(),
+            "full output must backpressure the producer"
+        );
         let received = tokio::time::timeout(Duration::from_secs(5), async {
             let mut received = Vec::new();
             while let Some(chunk) = stdout_rx.recv().await {
@@ -1000,9 +1093,15 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
 
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(256);
+    let capture = OutputCapture::default();
+    if stderr_driver_rx.is_none() {
+        capture.stderr.store(true, Ordering::Release);
+    }
     let spawn_stream_reader = |mut output_rx: ProcessOutputReceiver,
-                               output_tx: mpsc::Sender<Vec<u8>>| {
+                               output_tx: mpsc::Sender<Vec<u8>>,
+                               complete: Arc<AtomicBool>| {
         tokio::spawn(async move {
+            let mut lossless = true;
             // Drivers must close their output senders after forwarding the final bytes,
             // which can arrive after their exit notification.
             loop {
@@ -1013,16 +1112,20 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
                             break;
                         }
                     }
-                    Err(ProcessOutputRecvError::Lagged) => continue,
-                    Err(ProcessOutputRecvError::Closed) => break,
+                    Err(ProcessOutputRecvError::Lagged) => lossless = false,
+                    Err(ProcessOutputRecvError::Closed) => {
+                        complete.store(lossless, Ordering::Release);
+                        break;
+                    }
                 }
             }
         })
     };
-    let reader_handle = spawn_stream_reader(stdout_driver_rx, stdout_tx);
+    let reader_handle =
+        spawn_stream_reader(stdout_driver_rx, stdout_tx, Arc::clone(&capture.stdout));
     let stderr_reader_handle = stderr_driver_rx
         .take()
-        .map(|rx| spawn_stream_reader(rx, stderr_tx));
+        .map(|rx| spawn_stream_reader(rx, stderr_tx, Arc::clone(&capture.stderr)));
 
     let writer_handle = writer_handle.unwrap_or_else(|| tokio::spawn(async {}));
 
@@ -1051,7 +1154,8 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         exit_code,
         None,
         resizer,
-    );
+    )
+    .with_output_capture(capture);
 
     SpawnedProcess {
         session: handle,

@@ -6,7 +6,6 @@ imports_granularity = "Item"
 ignore = [
     "aws-auth",
     "backend-client",
-    "cloud-tasks-mock-client",
     "codex-backend-openapi-models",
     "codex-experimental-api-macros",
     "codex-home",

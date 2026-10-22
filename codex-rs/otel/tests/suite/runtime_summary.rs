@@ -87,7 +87,13 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
         r#"{"type":"responsesapi.websocket_timing","timing_metrics":{"responses_duration_excl_engine_and_client_tool_time_ms":124,"engine_service_total_ms":457,"engine_iapi_ttft_total_ms":211,"engine_service_ttft_total_ms":233,"engine_iapi_tbt_across_engine_calls_ms":377,"engine_service_tbt_across_engine_calls_ms":399}}"#
             .into(),
     ))));
-    manager.record_websocket_event(&ws_timing_response, Duration::from_millis(20));
+    // Connection correlation must not change aggregate provider timings or add
+    // one series per request. The frame itself has no physical-attempt identity.
+    manager.record_websocket_event_with_transport(
+        &ws_timing_response,
+        Duration::from_millis(20),
+        Some("connection-1"),
+    );
     manager.record_duration(
         "codex.turn.ttft.duration_ms",
         Duration::from_millis(95),
@@ -131,6 +137,7 @@ fn runtime_metrics_summary_collects_tool_api_and_streaming_metrics() -> Result<(
         responses_api_engine_service_tbt_ms: 399,
         turn_ttft_ms: 95,
         turn_ttfm_ms: 180,
+        ..RuntimeMetricsSummary::default()
     };
     assert_eq!(summary, expected);
 

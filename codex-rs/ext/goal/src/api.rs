@@ -252,6 +252,25 @@ impl GoalService {
                 .map(|goal| (goal, Some(previous_goal)))?
         };
 
+        // An explicit successful Active set is the recovery operation. If this
+        // write fails, retain the durable stop and return an error, not success.
+        let objective_changed = previous_goal.as_ref().is_none_or(|previous| {
+            previous.goal_id != goal.goal_id || previous.objective != goal.objective
+        });
+        if goal.status == codex_state::ThreadGoalStatus::Active
+            && (status == Some(ThreadGoalStatus::Active) || objective_changed)
+        {
+            state_db
+                .thread_goals()
+                .clear_terminal_transition(thread_id, &goal.goal_id)
+                .await
+                .map_err(|err| {
+                    GoalServiceError::Internal(format!("failed to reactivate stopped goal: {err}"))
+                })?;
+            if let Some(runtime) = &runtime {
+                runtime.set_terminal_transition(None);
+            }
+        }
         if objective.is_some() {
             fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
         }

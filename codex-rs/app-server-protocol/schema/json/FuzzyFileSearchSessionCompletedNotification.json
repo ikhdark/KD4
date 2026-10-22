@@ -1,8 +1,105 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "FuzzyFileSearchMatchType": {
+      "enum": [
+        "file",
+        "directory"
+      ],
+      "type": "string"
+    },
+    "FuzzyFileSearchResponse": {
+      "properties": {
+        "files": {
+          "items": {
+            "$ref": "#/definitions/FuzzyFileSearchResult"
+          },
+          "type": "array"
+        },
+        "scannedFileCount": {
+          "default": 0,
+          "description": "Number of indexed files and directories, including entries that did not match.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "totalMatchCount": {
+          "default": 0,
+          "description": "Matches found among scanned entries, before the result limit is applied.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "walkComplete": {
+          "default": false,
+          "description": "False if scanning was skipped or paths were omitted due to limits, cancellation, or errors.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "files"
+      ],
+      "type": "object"
+    },
+    "FuzzyFileSearchResult": {
+      "description": "Superset of [`codex_file_search::FileMatch`]",
+      "properties": {
+        "file_name": {
+          "type": "string"
+        },
+        "indices": {
+          "items": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "match_type": {
+          "$ref": "#/definitions/FuzzyFileSearchMatchType"
+        },
+        "path": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "score": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "file_name",
+        "match_type",
+        "path",
+        "root",
+        "score"
+      ],
+      "type": "object"
+    }
+  },
   "properties": {
+    "cancelled": {
+      "type": "boolean"
+    },
     "query": {
       "type": "string"
+    },
+    "results": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/FuzzyFileSearchResponse"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Terminal results are delivered even if best-effort progress updates were lost. Absent only in legacy server payloads; absence does not prove completeness."
     },
     "sessionId": {
       "type": "string"

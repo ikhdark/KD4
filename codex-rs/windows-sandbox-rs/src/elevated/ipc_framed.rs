@@ -26,7 +26,13 @@ use std::path::PathBuf;
 const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 /// Protocol version shared by the parent process and elevated command runner.
-pub const IPC_PROTOCOL_VERSION: u8 = 4;
+pub const IPC_PROTOCOL_VERSION: u8 = 5;
+
+/// Each stream has at most 16 outstanding 8-KiB chunks (128 KiB).
+/// Credits are returned only after child writes / downstream output admission.
+/// Output credits keep stdin acknowledgements readable even with stalled stdout.
+pub const IO_CHUNK_BYTES: usize = 8192;
+pub const IO_WINDOW_CHUNKS: usize = 16;
 
 /// Length-prefixed, JSON-encoded frame.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -38,8 +44,9 @@ pub struct FramedMessage {
 
 /// IPC message variants exchanged between parent and runner.
 ///
-/// `SpawnRequest`, `Stdin`, `CloseStdin`, `Resize`, and `Terminate` are parent->runner commands.
-/// `SpawnReady`, `Output`, `Exit`, and `Error` are runner->parent events/results.
+/// `SpawnRequest`, `Stdin`, `CloseStdin`, `OutputAck`, `Resize`, and `Terminate`
+/// are parent->runner commands. `SpawnReady`, `Output`, `StdinAck`,
+/// `StdinClosed`, `Exit`, and `Error` are runner->parent events/results.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
@@ -47,6 +54,9 @@ pub enum Message {
     SpawnReady { payload: SpawnReady },
     Output { payload: OutputPayload },
     Stdin { payload: StdinPayload },
+    StdinAck { payload: EmptyPayload },
+    StdinClosed { payload: EmptyPayload },
+    OutputAck { payload: OutputCredit },
     CloseStdin { payload: EmptyPayload },
     Resize { payload: ResizePayload },
     Exit { payload: ExitPayload },
@@ -98,6 +108,12 @@ pub enum OutputStream {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StdinPayload {
     pub data_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OutputCredit {
+    pub stream: OutputStream,
+    pub chunks: usize,
 }
 
 /// PTY resize request sent from parent to runner.

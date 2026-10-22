@@ -196,8 +196,14 @@ async fn marketplace_upgrade_all_configured_git_marketplaces() -> Result<()> {
     );
     let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
     let config: toml::Table = config.parse()?;
-    assert_eq!(config["marketplaces"]["debug"]["last_revision"].as_str(), Some(debug_new_revision.as_str()));
-    assert_eq!(config["marketplaces"]["tools"]["last_revision"].as_str(), Some(tools_new_revision.as_str()));
+    assert_eq!(
+        config["marketplaces"]["debug"]["last_revision"].as_str(),
+        Some(debug_new_revision.as_str())
+    );
+    assert_eq!(
+        config["marketplaces"]["tools"]["last_revision"].as_str(),
+        Some(tools_new_revision.as_str())
+    );
     Ok(())
 }
 
@@ -263,7 +269,6 @@ async fn marketplace_upgrade_named_marketplace_only() -> Result<()> {
     );
     Ok(())
 }
-
 
 #[tokio::test]
 async fn marketplace_upgrade_rejects_unknown_or_non_git_marketplace() -> Result<()> {

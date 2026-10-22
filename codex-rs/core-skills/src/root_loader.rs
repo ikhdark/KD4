@@ -23,7 +23,9 @@ static NEXT_PLUGIN_SKILL_SNAPSHOT_IDENTITY: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct PluginSkillSnapshots {
     cache_identity: u64,
-    snapshots_by_root: Arc<Mutex<HashMap<PluginSkillRoot, SkillRootSnapshot>>>,
+    snapshots_by_root: Arc<
+        Mutex<HashMap<(PluginSkillRoot, crate::service::FileSystemIdentity), SkillRootSnapshot>>,
+    >,
 }
 
 impl PluginSkillSnapshots {
@@ -61,12 +63,15 @@ where
             root.plugin_namespace.clone(),
             root.plugin_root.clone(),
         ) {
-            (Some(plugin_id), Some(plugin_namespace), Some(plugin_root)) => Some(PluginSkillRoot {
-                path: root.path.clone(),
-                plugin_id,
-                plugin_namespace,
-                plugin_root,
-            }),
+            (Some(plugin_id), Some(plugin_namespace), Some(plugin_root)) => Some((
+                PluginSkillRoot {
+                    path: root.path.clone(),
+                    plugin_id,
+                    plugin_namespace,
+                    plugin_root,
+                },
+                crate::service::FileSystemIdentity(Arc::clone(&root.file_system)),
+            )),
             _ => None,
         };
         let cached_snapshot = cache_key.as_ref().and_then(|cache_key| {
@@ -128,7 +133,7 @@ fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOut
         if !skills.is_empty() && !skill_roots.contains(&root) {
             skill_roots.push(root.clone());
         }
-        for skill in &skills {
+        for skill in skills.iter().filter(|skill| skill.source.is_none()) {
             skill_root_by_path
                 .entry(skill.path_to_skills_md.clone())
                 .or_insert_with(|| root.clone());
@@ -143,7 +148,7 @@ fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOut
     let mut seen = HashSet::new();
     outcome
         .skills
-        .retain(|skill| seen.insert(skill.path_to_skills_md.clone()));
+        .retain(|skill| seen.insert((skill.path_to_skills_md.clone(), skill.source.clone())));
     let retained_skill_paths = outcome
         .skills
         .iter()

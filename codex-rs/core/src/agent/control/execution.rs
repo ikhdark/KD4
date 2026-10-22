@@ -10,20 +10,21 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 
 type ExecutionPermitKey = (ThreadId, String);
 
 #[derive(Default)]
 pub(super) struct AgentExecutionLimiter {
-    active: Arc<AtomicUsize>,
+    permits: OnceLock<Arc<Semaphore>>,
     max_threads: OnceLock<usize>,
     pending: Mutex<HashMap<ExecutionPermitKey, AgentExecutionGuard>>,
 }
 
 pub(crate) struct AgentExecutionGuard {
-    active: Arc<AtomicUsize>,
+    permit: Option<OwnedSemaphorePermit>,
+    registry: Arc<crate::agent::AgentRegistry>,
 }
 
 pub(crate) struct AgentExecutionPermitRegistration {
@@ -43,7 +44,8 @@ pub(crate) struct AgentExecutionPermitThreadCleanup {
 
 impl Drop for AgentExecutionGuard {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
+        drop(self.permit.take());
+        self.registry.notify_execution_capacity_released();
     }
 }
 
@@ -114,7 +116,7 @@ impl AgentControl {
             return Ok(None);
         }
         Arc::clone(&self.agent_execution_limiter)
-            .try_guard()
+            .try_guard(Arc::clone(&self.state))
             .map(Some)
     }
 
@@ -135,6 +137,32 @@ impl AgentControl {
             None => None,
         };
         Ok(AgentExecutionPermitRegistration { limiter, key })
+    }
+
+    /// Accepted work queues on the same FIFO admission owner as new arrivals.
+    /// Cancelling this future removes its waiter without consuming capacity.
+    pub(crate) async fn wait_for_execution_capacity(
+        &self,
+        multi_agent_version: MultiAgentVersion,
+        session_source: &SessionSource,
+    ) -> Option<AgentExecutionGuard> {
+        if !is_execution_limited(multi_agent_version, session_source) {
+            return None;
+        }
+        #[expect(
+            clippy::expect_used,
+            reason = "the limiter owns its semaphore privately and never closes it"
+        )]
+        let permit = self
+            .agent_execution_limiter
+            .permits()
+            .acquire_owned()
+            .await
+            .expect("execution semaphore is never closed");
+        Some(AgentExecutionGuard {
+            permit: Some(permit),
+            registry: Arc::clone(&self.state),
+        })
     }
 
     pub(crate) fn execution_permit_cleanup(
@@ -184,19 +212,26 @@ impl AgentExecutionLimiter {
         self.max_threads.get().copied().unwrap_or(usize::MAX)
     }
 
-    fn try_guard(self: Arc<Self>) -> CodexResult<AgentExecutionGuard> {
+    fn permits(&self) -> Arc<Semaphore> {
+        Arc::clone(self.permits.get_or_init(|| {
+            Arc::new(Semaphore::new(
+                self.max_threads().min(Semaphore::MAX_PERMITS),
+            ))
+        }))
+    }
+
+    fn try_guard(
+        self: Arc<Self>,
+        registry: Arc<crate::agent::AgentRegistry>,
+    ) -> CodexResult<AgentExecutionGuard> {
         let max_threads = self.max_threads();
-        self.active
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                if active < max_threads {
-                    Some(active + 1)
-                } else {
-                    None
-                }
-            })
+        let permit = self
+            .permits()
+            .try_acquire_owned()
             .map_err(|_| CodexErr::AgentLimitReached { max_threads })?;
         Ok(AgentExecutionGuard {
-            active: Arc::clone(&self.active),
+            permit: Some(permit),
+            registry,
         })
     }
 

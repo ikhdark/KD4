@@ -2,7 +2,11 @@ use super::*;
 
 #[test]
 fn turn_interrupt_requires_matching_live_target_or_running_startup_race() {
-    for status in [TurnStatus::Interrupted, TurnStatus::Completed, TurnStatus::Failed] {
+    for status in [
+        TurnStatus::Interrupted,
+        TurnStatus::Completed,
+        TurnStatus::Failed,
+    ] {
         let error = validate_turn_interrupt_target(Some(("turn-1", &status)), true, "turn-1")
             .expect_err("a terminal snapshot must not be treated as active");
         assert_eq!(error.code, -32600);
@@ -15,9 +19,13 @@ fn turn_interrupt_requires_matching_live_target_or_running_startup_race() {
         .expect("core may report running before TurnStarted is projected");
     validate_turn_interrupt_target(Some(("turn-1", &TurnStatus::InProgress)), false, "turn-1")
         .expect("a live snapshot can precede core running status");
-    let error = validate_turn_interrupt_target(Some(("turn-2", &TurnStatus::InProgress)), true, "turn-1")
-        .expect_err("an interrupt must not target the successor turn");
-    assert_eq!(error.message, "expected active turn id turn-1 but found turn-2");
+    let error =
+        validate_turn_interrupt_target(Some(("turn-2", &TurnStatus::InProgress)), true, "turn-1")
+            .expect_err("an interrupt must not target the successor turn");
+    assert_eq!(
+        error.message,
+        "expected active turn id turn-1 but found turn-2"
+    );
 }
 
 #[test]
@@ -483,10 +491,13 @@ fn interrupt_acknowledgements_are_targeted_and_claimed_once() {
 fn map_additional_context_preserves_client_order() {
     let additional_context = IndexMap::from([
         ("dependency".to_string(), additional_context_entry("first")),
-        ("consumer".to_string(), AdditionalContextEntry {
-            value: "second".to_string(),
-            kind: AdditionalContextKind::Application,
-        }),
+        (
+            "consumer".to_string(),
+            AdditionalContextEntry {
+                value: "second".to_string(),
+                kind: AdditionalContextKind::Application,
+            },
+        ),
     ]);
 
     let mapped = map_additional_context(Some(additional_context)).expect("context should map");
@@ -496,9 +507,15 @@ fn map_additional_context_preserves_client_order() {
         vec!["dependency", "consumer"]
     );
     assert_eq!(mapped["dependency"].value, "first");
-    assert!(matches!(mapped["dependency"].kind, CoreAdditionalContextKind::Untrusted));
+    assert!(matches!(
+        mapped["dependency"].kind,
+        CoreAdditionalContextKind::Untrusted
+    ));
     assert_eq!(mapped["consumer"].value, "second");
-    assert!(matches!(mapped["consumer"].kind, CoreAdditionalContextKind::Application));
+    assert!(matches!(
+        mapped["consumer"].kind,
+        CoreAdditionalContextKind::Application
+    ));
 }
 
 #[test]
@@ -571,10 +588,18 @@ async fn bug_classifier_stream_accepts_reasoning_and_rejects_extra_answers_or_to
         Ok(ResponseEvent::OutputItemDone(answer.clone())),
         Ok(completed()),
     ]);
-    let result = consume_bug_classification_stream(&mut stream, &shutdown, "Crash")
+    let mut receipt = BugAttemptReceipt::default();
+    let result = consume_bug_classification_stream(&mut stream, &shutdown, "Crash", &mut receipt)
         .await
         .expect("one assistant answer is valid even when reasoning is emitted");
     assert_eq!(result.summary, "A crash was reported.");
+    assert_eq!(receipt.response_id.as_deref(), Some("classification-1"));
+    assert_eq!(receipt.dispatched, Some(true));
+    assert!(receipt.terminal_observed);
+    assert_eq!(
+        receipt.token_usage, None,
+        "missing receipt is not zero spend"
+    );
 
     let tool: ResponseItem = serde_json::from_value(serde_json::json!({
         "type": "function_call", "call_id": "call-1", "name": "exec", "arguments": "{}"
@@ -587,7 +612,13 @@ async fn bug_classifier_stream_accepts_reasoning_and_rejects_extra_answers_or_to
             Ok(completed()),
         ]);
         assert!(matches!(
-            consume_bug_classification_stream(&mut stream, &shutdown, "Crash").await,
+            consume_bug_classification_stream(
+                &mut stream,
+                &shutdown,
+                "Crash",
+                &mut BugAttemptReceipt::default()
+            )
+            .await,
             Err(BugClassificationFailure::MalformedOutput)
         ));
     }
@@ -598,10 +629,57 @@ async fn bug_classifier_stream_accepts_reasoning_and_rejects_extra_answers_or_to
                 .map(|item| Ok(ResponseEvent::OutputItemDone(item))),
         );
         assert!(matches!(
-            consume_bug_classification_stream(&mut stream, &shutdown, "Crash").await,
+            consume_bug_classification_stream(
+                &mut stream,
+                &shutdown,
+                "Crash",
+                &mut BugAttemptReceipt::default()
+            )
+            .await,
             Err(BugClassificationFailure::MalformedOutput)
         ));
     }
+}
+
+#[tokio::test]
+async fn bug_classifier_retains_usage_when_charged_response_fails_schema_validation() {
+    let usage = codex_protocol::protocol::TokenUsage {
+        input_tokens: 100,
+        output_tokens: 20,
+        total_tokens: 120,
+        ..Default::default()
+    };
+    let mut stream = futures::stream::iter([
+        Ok(ResponseEvent::OutputItemDone(ResponseItem::Message {
+            id: None,
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText { text: "{}".into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })),
+        Ok(ResponseEvent::Completed {
+            response_id: "charged-invalid-classification".into(),
+            token_usage: Some(usage.clone()),
+            end_turn: Some(true),
+        }),
+    ]);
+    let mut receipt = BugAttemptReceipt::default();
+    assert!(matches!(
+        consume_bug_classification_stream(
+            &mut stream,
+            &CancellationToken::new(),
+            "Crash",
+            &mut receipt,
+        )
+        .await,
+        Err(BugClassificationFailure::Schema)
+    ));
+    assert_eq!(receipt.token_usage, Some(usage));
+    assert_eq!(
+        receipt.response_id.as_deref(),
+        Some("charged-invalid-classification")
+    );
+    assert!(receipt.terminal_observed);
 }
 
 #[test]

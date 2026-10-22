@@ -226,7 +226,10 @@ mod tests {
                     canonicalize(&tmp_dir).unwrap(),
                 ]);
             }
-            assert_eq!(paths.allow, expected_allow, "exclude={exclude_tmpdir_env_var}");
+            assert_eq!(
+                paths.allow, expected_allow,
+                "exclude={exclude_tmpdir_env_var}"
+            );
             assert!(paths.deny.is_empty(), "no deny paths expected");
         }
     }

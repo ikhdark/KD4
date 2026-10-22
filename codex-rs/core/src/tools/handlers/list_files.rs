@@ -7,6 +7,8 @@ use codex_tools::JsonToolOutput;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_utils_path_uri::LegacyAppPathString;
+use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -23,6 +25,23 @@ pub(crate) struct ListFilesHandler;
 
 const MAX_DEPTH: usize = 64;
 const MAX_ENTRIES: usize = 50_000;
+
+fn render_listing_path(cwd: &str, native: String, convention: Option<PathConvention>) -> String {
+    let Some(convention) = convention else {
+        return native;
+    };
+    let windows = convention == PathConvention::Windows;
+    let normalized_cwd = windows.then(|| cwd.replace('\\', "/"));
+    let cwd = normalized_cwd.as_deref().unwrap_or(cwd);
+    let normalized = windows.then(|| native.replace('\\', "/"));
+    let path = normalized.as_deref().unwrap_or(&native);
+    match path.strip_prefix(cwd) {
+        Some("") => ".".to_string(),
+        Some(rest) if cwd.ends_with('/') => rest.to_string(),
+        Some(rest) if rest.starts_with('/') => rest[1..].to_string(),
+        _ => native,
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,7 +76,7 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
         entries.minimum = Some(1.into());
         ToolSpec::Function(ResponsesApiTool {
             name: "list_files".into(),
-            description: "List files and directories through the selected environment's sandboxed filesystem without shell quoting. Start at a narrow path. File include/exclude filters do not prune directories; exclude_directories omits and prunes matching directories. Patterns match case-sensitive basenames at every depth: * is zero or more Unicode characters, ? is one; other characters are literal. At most 64 patterns total, each 1–256 UTF-8 bytes without path separators. Entry paths are relative to the environment cwd (absolute when outside it) and can be passed to read_file or list_files. Directory symlinks are omitted from entries and never followed; hidden directories are listed but not traversed unless include_hidden is true. For an unfiltered audit omit all filters and set include_hidden=true; gitignore is never applied. complete refers only to this requested scope. Check truncated, errors, unexplored cutoff reasons, and effective_walk_options before claiming coverage. Directories are mutable, not stable pages. Recover large output with read_tool_output; repeat list_files for current state.".into(),
+            description: "List files and directories through the selected environment's sandboxed filesystem without shell quoting. Start at a narrow path. File include/exclude filters do not prune directories; exclude_directories omits and prunes matching directories. Patterns match case-sensitive basenames at every depth: * is zero or more Unicode characters, ? is one; other characters are literal. At most 64 patterns total, each 1–256 UTF-8 bytes without path separators. Entry paths are relative to the environment cwd (absolute when outside it) and can be passed to read_file or list_files. Directory symlinks and dangling links are omitted from entries and never followed; hidden directories are listed but not traversed unless include_hidden is true. For an unfiltered audit omit all filters and set include_hidden=true; gitignore is never applied. complete refers only to this requested scope. Check truncated, errors, unexplored cutoff reasons, and effective_walk_options before claiming coverage. Directories are mutable, not stable pages. Recover large output with read_tool_output; repeat list_files for current state.".into(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -142,19 +161,38 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
             // read_file and list_files take native paths, not URIs. The
             // cwd-relative spelling also keeps every entry from repeating the root.
             let cwd = environment.cwd().inferred_native_path_string();
-            let display_path = |native: String| {
-                let relative = match native.strip_prefix(cwd.as_str()) {
-                    Some("") => return ".".to_string(),
-                    Some(rest) if cwd.ends_with(['/', '\\']) => rest,
-                    Some(rest) if rest.starts_with(['/', '\\']) => &rest[1..],
-                    _ => return native,
-                };
-                if cwd.contains('\\') {
-                    relative.replace('\\', "/")
-                } else {
-                    relative.to_string()
-                }
-            };
+            let convention = environment.cwd().infer_path_convention();
+            let display_path = |native| render_listing_path(&cwd, native, convention);
+            let mut errors = outcome.errors.iter().map(|error| json!({
+                "path": display_path(error.path.inferred_native_path_string()), "message": error.message,
+            })).collect::<Vec<_>>();
+            let entries = outcome
+                .entries
+                .iter()
+                .filter_map(|entry| {
+                    // The filesystem can preserve opaque native identities, but this
+                    // tool publishes strings accepted by read_file/list_files. A lossy
+                    // replacement label must never name a different healthy sibling.
+                    let native = entry.path.infer_path_convention().and_then(|convention| {
+                        LegacyAppPathString::from_path_uri(&entry.path, convention)
+                            .ok()
+                            .filter(|native| {
+                                native
+                                    .to_path_uri(convention)
+                                    .is_ok_and(|roundtrip| roundtrip == entry.path)
+                            })
+                    });
+                    let Some(native) = native else {
+                        errors.push(json!({
+                        "path": display_path(path.inferred_native_path_string()),
+                        "message": "unrepresentable native entry cannot be addressed losslessly",
+                    }));
+                        return None;
+                    };
+                    Some(json!({"path": display_path(native.into_string()), "kind": entry.kind}))
+                })
+                .collect::<Vec<_>>();
+            let complete = !outcome.truncated && errors.is_empty();
             let value = json!({
                 "path": path.inferred_native_path_string(),
                 "environment_id": environment.environment_id,
@@ -171,19 +209,15 @@ impl ToolExecutor<ToolInvocation> for ListFilesHandler {
                 "limits_clamped": args.max_depth.is_some_and(|value| value > MAX_DEPTH)
                     || args.max_entries.is_some_and(|value| value > MAX_ENTRIES)
                     || args.max_directories.is_some_and(|value| value > 10_000),
-                "entries": outcome.entries.iter().map(|entry| json!({
-                    "path": display_path(entry.path.inferred_native_path_string()), "kind": entry.kind,
-                })).collect::<Vec<_>>(),
-                "errors": outcome.errors.iter().map(|error| json!({
-                    "path": display_path(error.path.inferred_native_path_string()), "message": error.message,
-                })).collect::<Vec<_>>(),
+                "entries": entries,
+                "errors": errors,
                 "truncated": outcome.truncated,
                 "unexplored": outcome.unexplored.iter().map(|stop| json!({
                     "path": display_path(stop.path.inferred_native_path_string()), "reason": stop.reason,
                     "effectiveLimit": stop.effective_limit, "partiallyExamined": stop.partially_examined,
                 })).collect::<Vec<_>>(),
                 "continuation_policy": "Re-examine unexplored paths with adjusted limits; directories are mutable, not stable resumable pages.",
-                "complete": !outcome.truncated && outcome.errors.is_empty(),
+                "complete": complete,
             });
             let evidence = crate::tools::context::semantic_evidence_sampling_signal(json!({
                 "source": "list_files",

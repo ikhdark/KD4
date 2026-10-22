@@ -605,6 +605,18 @@ async fn execute_approved_mcp_tool_call(
         .and_then(|prepared| prepared.arguments.clone())
         .or_else(|| arguments_value.clone())
         .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
+    let span = mcp_tool_call_span(
+        sess,
+        turn_context,
+        McpToolCallSpanFields {
+            server_name: server,
+            tool_name,
+            call_id,
+            server_origin,
+            connector_id,
+            connector_name,
+        },
+    );
     let execution = async {
         async {
             let rewritten_arguments = rewrite?;
@@ -621,21 +633,10 @@ async fn execute_approved_mcp_tool_call(
         }
         .await
     }
-    .instrument(mcp_tool_call_span(
-        sess,
-        turn_context,
-        McpToolCallSpanFields {
-            server_name: server,
-            tool_name,
-            call_id,
-            server_origin,
-            connector_id,
-            connector_name,
-        },
-    ))
+    .instrument(span.clone())
     .await;
     let result = execution.map(|execution| execution.model_result);
-    record_mcp_result_span_telemetry(&Span::current(), &result);
+    record_mcp_result_span_telemetry(&span, &result);
     if let Err(error) = &result {
         tracing::warn!("MCP tool call error: {error:?}");
     }
@@ -1036,7 +1037,7 @@ fn truncate_mcp_tool_result_for_event(
             }
             let preview = serde_json::json!({
                 "content": content, "structuredContent": structured, "_meta": meta,
-                "notice": "event preview truncated; original tool result retained",
+                "notice": "event preview truncated; this event does not contain the original result or certify its retention",
             })
             .to_string();
             Ok(CallToolResult {

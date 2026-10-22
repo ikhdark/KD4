@@ -1901,16 +1901,31 @@ async fn thread_list_sort_recency_at_uses_state_db_order_with_provider_filter() 
         .await?;
 
     let mut mcp = init_mcp(codex_home.path()).await?;
-    let ThreadListResponse { data, .. } = list_threads_with_sort(
-        &mut mcp,
-        /*cursor*/ None,
-        Some(10),
-        Some(vec!["mock_provider".to_string()]),
-        /*source_kinds*/ None,
-        Some(ThreadSortKey::RecencyAt),
-        /*archived*/ None,
+    // Without a coverage proof, default listing binds scan-and-repair storage;
+    // state-DB recency order is served by the explicit SQLite view.
+    let request_id = mcp
+        .send_thread_list_request(codex_app_server_protocol::ThreadListParams {
+            project_id: None,
+            cursor: None,
+            limit: Some(10),
+            sort_key: Some(ThreadSortKey::RecencyAt),
+            sort_direction: None,
+            model_providers: Some(vec!["mock_provider".to_string()]),
+            source_kinds: None,
+            archived: None,
+            cwd: None,
+            use_state_db_only: Some(true),
+            search_term: None,
+            parent_thread_id: None,
+            ancestor_thread_id: None,
+        })
+        .await?;
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
     )
-    .await?;
+    .await??;
+    let ThreadListResponse { data, .. } = to_response::<ThreadListResponse>(resp)?;
 
     assert_eq!(
         data.iter()
@@ -2072,9 +2087,10 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
     let ids_page1: Vec<_> = page1.iter().map(|thread| thread.id.as_str()).collect();
     assert_eq!(ids_page1, vec![id_watermark.as_str()]);
     let backwards_cursor = backwards_cursor.expect("expected backwardsCursor on first page");
+    // Without a coverage proof, default listing binds scan-and-repair storage.
     assert_eq!(
         backwards_cursor,
-        "thread-list-v1:state-db:2025-02-02T23:59:59.999Z"
+        "thread-list-v1:scan-and-repair:2025-02-02T23:59:59.999Z"
     );
 
     let id_new = create_fake_rollout(
@@ -2087,8 +2103,8 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
     )?;
     let new_rollout_path = rollout_path(codex_home.path(), "2025-02-01T12-00-00", &id_new);
     set_rollout_mtime(new_rollout_path.as_path(), "2025-02-04T00:00:00Z")?;
-    // A state-db cursor is intentionally bound to that storage path. Simulate the
-    // supported production writer by reconciling the new rollout before delta sync.
+    // Simulate the supported production writer by reconciling the new rollout
+    // before delta sync; the scan-bound cursor must still observe the file.
     let state = codex_state::StateRuntime::init(
         codex_home.path().to_path_buf(),
         "mock_provider".to_string(),
@@ -2108,7 +2124,7 @@ async fn thread_list_backwards_cursor_can_seed_forward_delta_sync() -> Result<()
             .get_thread(ThreadId::from_string(&id_new)?)
             .await?
             .is_some(),
-        "new rollout should be visible through the state-db cursor"
+        "reconciliation should index the new rollout"
     );
 
     let ThreadListResponse {

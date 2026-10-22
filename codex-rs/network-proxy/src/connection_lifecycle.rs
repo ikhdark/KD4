@@ -1,6 +1,8 @@
 use rama_core::Service;
 use rama_core::error::BoxError;
-use rama_core::graceful::{Shutdown, ShutdownGuard, WeakShutdownGuard};
+use rama_core::graceful::Shutdown;
+use rama_core::graceful::ShutdownGuard;
+use rama_core::graceful::WeakShutdownGuard;
 
 /// The sole sender is owned by the runtime handle. Drop signals cancellation
 /// synchronously, including when a shutdown/wait future is abandoned.
@@ -12,14 +14,21 @@ pub(crate) struct ConnectionLifecycle {
 impl ConnectionLifecycle {
     pub(crate) fn new() -> Self {
         let (signal, receive) = tokio::sync::oneshot::channel();
-        Self { signal: Some(signal), shutdown: Shutdown::new(async move { let _ = receive.await; }) }
+        Self {
+            signal: Some(signal),
+            shutdown: Shutdown::new(async move {
+                let _ = receive.await;
+            }),
+        }
     }
 
     pub(crate) fn guard(&self) -> ShutdownGuard {
         self.shutdown.guard()
     }
 
-    pub(crate) fn cancel(&mut self) { self.signal.take(); }
+    pub(crate) fn cancel(&mut self) {
+        self.signal.take();
+    }
 
     pub(crate) async fn shutdown(mut self) {
         self.cancel();
@@ -35,12 +44,19 @@ pub(crate) struct CancelOnShutdown<S> {
 
 impl<S> CancelOnShutdown<S> {
     pub(crate) fn new(inner: S, guard: &ShutdownGuard) -> Self {
-        Self { inner, guard: guard.clone_weak() }
+        Self {
+            inner,
+            guard: guard.clone_weak(),
+        }
     }
 }
 
 impl<S, R> Service<R> for CancelOnShutdown<S>
-where S: Service<R>, S::Error: Into<BoxError>, R: Send + 'static {
+where
+    S: Service<R>,
+    S::Error: Into<BoxError>,
+    R: Send + 'static,
+{
     type Output = S::Output;
     type Error = BoxError;
 

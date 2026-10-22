@@ -64,7 +64,11 @@ impl ThreadRequestProcessor {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
 
-        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+        let (mut removal_guard, thread_ids) = self
+            .thread_manager
+            .begin_agent_subtree_removal(thread_id)
+            .await
+            .map_err(|err| internal_error(format!("failed to fence subtree deletion: {err}")))?;
 
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;
@@ -95,7 +99,7 @@ impl ThreadRequestProcessor {
                 .map_err(thread_store_delete_error)?;
             if let Some(state_db) = self.state_db.as_ref() {
                 state_db
-                    .delete_threads_strict(delete_order.as_slice())
+                    .delete_thread_subtree_strict(thread_id, delete_order.as_slice())
                     .await
                     .map_err(|err| {
                         internal_error(format!(
@@ -103,6 +107,9 @@ impl ThreadRequestProcessor {
                         ))
                     })?;
             }
+            // Primary commit is irreversible; preserve the in-process retirement
+            // fence even if the originating RPC disappears during live cleanup.
+            removal_guard.commit(delete_order.as_slice());
             staged_delete.commit().await;
             for thread_id_to_delete in delete_order {
                 self.prepare_thread_for_delete(thread_id_to_delete).await;
@@ -133,6 +140,7 @@ impl ThreadRequestProcessor {
                 }
             }
             self.prepare_thread_for_delete(thread_id_to_delete).await;
+            removal_guard.commit_thread(thread_id_to_delete);
             completed_thread_ids.push(thread_id_to_delete);
             deleted_thread_ids.push(thread_id_to_delete.to_string());
         }

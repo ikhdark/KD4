@@ -413,8 +413,14 @@ sandbox = "elevated"
         for is_windows in [false, true] {
             for complete in [false, true] {
                 for (level, expected) in [
-                    (WindowsSandboxLevel::Disabled, WindowsSandboxReadiness::NotConfigured),
-                    (WindowsSandboxLevel::RestrictedToken, WindowsSandboxReadiness::Ready),
+                    (
+                        WindowsSandboxLevel::Disabled,
+                        WindowsSandboxReadiness::NotConfigured,
+                    ),
+                    (
+                        WindowsSandboxLevel::RestrictedToken,
+                        WindowsSandboxReadiness::Ready,
+                    ),
                     (
                         WindowsSandboxLevel::Elevated,
                         if complete {
@@ -425,9 +431,15 @@ sandbox = "elevated"
                     ),
                 ] {
                     assert_eq!(
-                        determine_windows_sandbox_readiness_for_platform(is_windows, level, complete)
-                            .status,
-                        if is_windows { expected } else { WindowsSandboxReadiness::Unsupported },
+                        determine_windows_sandbox_readiness_for_platform(
+                            is_windows, level, complete
+                        )
+                        .status,
+                        if is_windows {
+                            expected
+                        } else {
+                            WindowsSandboxReadiness::Unsupported
+                        },
                         "is_windows={is_windows}, level={level:?}, complete={complete}"
                     );
                 }

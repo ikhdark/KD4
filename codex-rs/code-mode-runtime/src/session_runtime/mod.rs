@@ -59,6 +59,8 @@ const TERMINAL_REPLAY_MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_ACTIVE_CELLS: usize = 8;
 const CELL_INPUT_BYTES_PER_SLOT: usize = 2 * 1024 * 1024;
 const TERMINAL_SPILL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+const TERMINAL_SPILL_JOBS: usize = 2;
+const TERMINAL_SPILL_BYTES: usize = 128 * 1024 * 1024;
 const SNAPSHOT_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(test)]
@@ -115,7 +117,12 @@ impl CachedCellEvent {
                 Ok(file)
             })();
             match spilled {
-                Ok(file) => return (Arc::new(Self::Spilled(file, bytes, terminal_completion(&event))), 0),
+                Ok(file) => {
+                    return (
+                        Arc::new(Self::Spilled(file, bytes, terminal_completion(&event))),
+                        0,
+                    );
+                }
                 Err(error) => {
                     // Preserve the evidence on storage failure rather than
                     // silently turning a completed cell into an unknown one.
@@ -142,18 +149,22 @@ impl CachedCellEvent {
 
 impl TerminalCellCache {
     fn lookup(&self, cell_id: &CellId) -> Result<(Arc<CachedCellEvent>, usize), Error> {
-        self.events.get(cell_id).map(|(event, retained_bytes)| {
-            let bytes = match event.as_ref() {
-                CachedCellEvent::Inline(_) => *retained_bytes,
-                CachedCellEvent::Spilled(_, bytes, _) => *bytes,
-            };
-            (Arc::clone(event), bytes)
-        }).ok_or_else(|| {
-            match self.expired.iter().find(|(id, _)| id == cell_id) {
-                Some((_, completed)) => Error::ExpiredResult { cell_id: cell_id.clone(), completed: *completed },
+        self.events
+            .get(cell_id)
+            .map(|(event, retained_bytes)| {
+                let bytes = match event.as_ref() {
+                    CachedCellEvent::Inline(_) => *retained_bytes,
+                    CachedCellEvent::Spilled(_, bytes, _) => *bytes,
+                };
+                (Arc::clone(event), bytes)
+            })
+            .ok_or_else(|| match self.expired.iter().find(|(id, _)| id == cell_id) {
+                Some((_, completed)) => Error::ExpiredResult {
+                    cell_id: cell_id.clone(),
+                    completed: *completed,
+                },
                 None => Error::MissingCell(cell_id.clone()),
-            }
-        })
+            })
     }
 
     #[cfg(test)]
@@ -221,9 +232,17 @@ fn cell_event_bytes(event: &CellEvent) -> usize {
     // Reuse output admission's allocation-free JSON counter. Count escaping,
     // item envelopes, error/loss metadata, and in-memory item storage as well.
     let mut counter = crate::runtime::JsonByteCounter::default();
-    if serde_json::to_writer(&mut counter, event).is_err() { return usize::MAX; }
-    counter.bytes.saturating_add(std::mem::size_of::<CellEvent>())
-        .saturating_add(content_items.capacity().saturating_mul(std::mem::size_of::<OutputItem>()))
+    if serde_json::to_writer(&mut counter, event).is_err() {
+        return usize::MAX;
+    }
+    counter
+        .bytes
+        .saturating_add(std::mem::size_of::<CellEvent>())
+        .saturating_add(
+            content_items
+                .capacity()
+                .saturating_mul(std::mem::size_of::<OutputItem>()),
+        )
 }
 
 /// Owns all cells and shared state for one transport-neutral code-mode session.
@@ -246,10 +265,14 @@ struct Inner<D: SessionRuntimeDelegate> {
     cells: Mutex<HashMap<CellId, CellHandle>>,
     terminal_cells: StdMutex<TerminalCellCache>,
     replay_bytes: Arc<Semaphore>,
+    spill_jobs: Arc<Semaphore>,
+    spill_bytes: Arc<Semaphore>,
     catalog: StdMutex<Option<CachedToolCatalog>>,
     active_cell_permits: Arc<Semaphore>,
     active_cell_capacity: usize,
     cell_tasks: TaskTracker,
+    storage_tasks: TaskTracker,
+    storage_admission: StdMutex<bool>,
     shutdown_token: CancellationToken,
     delegate: Arc<D>,
     task_failure_handler: Option<TaskFailureHandler>,
@@ -294,10 +317,14 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 cells: Mutex::new(HashMap::new()),
                 terminal_cells: StdMutex::new(TerminalCellCache::default()),
                 replay_bytes: Arc::new(Semaphore::new(TERMINAL_REPLAY_MAX_BYTES)),
+                spill_jobs: Arc::new(Semaphore::new(TERMINAL_SPILL_JOBS)),
+                spill_bytes: Arc::new(Semaphore::new(TERMINAL_SPILL_BYTES)),
                 catalog: StdMutex::new(None),
                 active_cell_permits: Arc::new(Semaphore::new(active_cell_capacity)),
                 active_cell_capacity,
                 cell_tasks: TaskTracker::new(),
+                storage_tasks: TaskTracker::new(),
+                storage_admission: StdMutex::new(true),
                 shutdown_token: CancellationToken::new(),
                 delegate,
                 task_failure_handler,
@@ -315,7 +342,9 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         if self.inner.shutdown_token.is_cancelled() {
             return Err(Error::ShuttingDown);
         }
-        let persistence_notice = self.restore_durable_state(request.state_path.as_ref()).await?;
+        let persistence_notice = self
+            .restore_durable_state(request.state_path.as_ref())
+            .await?;
         if persistence_notice.is_some() {
             request.state_path = None;
         }
@@ -328,10 +357,15 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             let mut event = initial_event.await?;
             if let Some(notice) = persistence_notice {
                 let (CellEvent::Yielded { content_items }
-                    | CellEvent::ExplicitYield { content_items }
-                    | CellEvent::Completed { content_items, .. }
-                    | CellEvent::Terminated { content_items }) = &mut event;
-                content_items.insert(0, OutputItem::Text { text: notice.to_string() });
+                | CellEvent::ExplicitYield { content_items }
+                | CellEvent::Completed { content_items, .. }
+                | CellEvent::Terminated { content_items }) = &mut event;
+                content_items.insert(
+                    0,
+                    OutputItem::Text {
+                        text: notice.to_string(),
+                    },
+                );
             }
             Ok(event)
         });
@@ -374,26 +408,51 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         self.inner.cell_tasks.close();
         drop(cells);
         self.inner.cell_tasks.wait().await;
+        // Actors can create storage descendants during close. Fence those only
+        // after the actor producers have joined, and fence public replay/restore
+        // registration with the same lock before observing the storage drain.
+        {
+            let mut admission = self
+                .inner
+                .storage_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *admission = false;
+            self.inner.storage_tasks.close();
+        }
+        tokio::time::timeout(SNAPSHOT_COMMIT_TIMEOUT, self.inner.storage_tasks.wait())
+            .await.map_err(|_| Error::Runtime(
+                "session storage cleanup is still owned and pending; snapshot relinquishment is unconfirmed".into()
+            ))?;
         Ok(())
     }
 
     async fn cached_terminal_event(&self, cell_id: &CellId) -> Result<CellEvent, Error> {
-        self.cached_terminal_observation(cell_id).await?.event().await
+        self.cached_terminal_observation(cell_id)
+            .await?
+            .event()
+            .await
     }
 
-    pub(crate) async fn recovered_terminal_observation(&self, cell_id: &CellId) -> Result<PendingEvent, Error> {
+    pub(crate) async fn recovered_terminal_observation(
+        &self,
+        cell_id: &CellId,
+    ) -> Result<PendingEvent, Error> {
         // Only IDs restored from this snapshot may cross a host generation.
         // An absent snapshot must not alias a freshly executed, non-durable ID.
-        if !self.inner.durable_state.get().is_some_and(|state|
-            cell_id_sequence(cell_id.as_str()).is_some_and(|id| id < state.first_cell_id))
-        {
+        if !self.inner.durable_state.get().is_some_and(|state| {
+            cell_id_sequence(cell_id.as_str()).is_some_and(|id| id < state.first_cell_id)
+        }) {
             return Err(Error::MissingCell(cell_id.clone()));
         }
         self.cached_terminal_observation(cell_id).await
     }
 
     async fn cached_terminal_observation(&self, cell_id: &CellId) -> Result<PendingEvent, Error> {
-        let (event, bytes) = self.inner.terminal_cells.lock()
+        let (event, bytes) = self
+            .inner
+            .terminal_cells
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .lookup(cell_id)?;
         let permit = tokio::select! {
@@ -410,23 +469,32 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         {
             (event.read(), permit)
         } else {
-            tokio::task::spawn_blocking(move || (event.read(), permit)).await
-                .map_err(|error| Error::Runtime(format!(
-                    "terminal cell recovery failed: {error}; do not replay its effects"
-                )))?
+            self.inner
+                .spawn_observed_storage(move || (event.read(), permit))?
+                .await
+                .map_err(|error| {
+                    Error::Runtime(format!(
+                        "terminal cell recovery failed: {error}; do not replay its effects"
+                    ))
+                })?
         };
         let event = event?;
-        Ok(PendingEvent { event: Box::pin(async move {
-            let _permit = permit;
-            Ok(event)
-        }) })
+        Ok(PendingEvent {
+            event: Box::pin(async move {
+                let _permit = permit;
+                Ok(event)
+            }),
+        })
     }
 
     fn allocate_cell_id(&self) -> Result<CellId, Error> {
         self.inner
             .next_cell_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next_cell_id| {
-                if self.inner.durable_state.get()
+                if self
+                    .inner
+                    .durable_state
+                    .get()
                     .is_some_and(|state| next_cell_id >= state.cell_id_limit)
                 {
                     return None;
@@ -437,9 +505,14 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             .map_err(|_| Error::CellIdSpaceExhausted)
     }
 
-    pub(crate) async fn restore_existing_durable_state(&self, path: &std::path::PathBuf) -> Result<(), Error> {
+    pub(crate) async fn restore_existing_durable_state(
+        &self,
+        path: &std::path::PathBuf,
+    ) -> Result<(), Error> {
         if self.inner.durable_state.get().is_none()
-            && !tokio::fs::try_exists(path).await.map_err(|error| Error::Runtime(error.to_string()))?
+            && !tokio::fs::try_exists(path)
+                .await
+                .map_err(|error| Error::Runtime(error.to_string()))?
         {
             return Ok(());
         }
@@ -464,17 +537,22 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         // a durable snapshot. A new snapshot may promote quiescent memory;
         // an existing snapshot must never replace it.
         if self.inner.durable_state.get().is_none()
-            && (self.inner.active_cell_permits.available_permits() != self.inner.active_cell_capacity
+            && (self.inner.active_cell_permits.available_permits()
+                != self.inner.active_cell_capacity
                 || (!self.inner.stored_values.lock().await.is_empty()
-                    && tokio::fs::try_exists(path).await.map_err(|error| Error::Runtime(error.to_string()))?))
+                    && tokio::fs::try_exists(path)
+                        .await
+                        .map_err(|error| Error::Runtime(error.to_string()))?))
         {
-            return Ok(Some("Named-state persistence was not enabled: existing values or active cells must be preserved. This cell runs with in-memory state only; it is not durable across restart."));
+            return Ok(Some(
+                "Named-state persistence was not enabled: existing values or active cells must be preserved. This cell runs with in-memory state only; it is not durable across restart.",
+            ));
         }
         let state = self.inner.durable_state.get_or_try_init(|| async {
             let initial_values = self.inner.stored_values.lock().await.clone();
             let minimum_cell_id = self.inner.next_cell_id.load(Ordering::Acquire);
             let owned_admission = admission.take();
-            let (state, restored, completed, returned_admission) = tokio::task::spawn_blocking(move || {
+            let (state, restored, completed, returned_admission) = self.inner.spawn_observed_storage(move || {
                 // Keep admission through blocking publication even if the caller cancels.
                 let admission = owned_admission;
                 let (state, restored) = snapshot::DurableState::open_with_values(selected_path, initial_values, minimum_cell_id)?;
@@ -482,7 +560,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                     (id, CachedCellEvent::new(event))
                 }).collect::<Vec<_>>();
                 Ok::<_, String>((state, restored, completed, admission))
-            }).await.map_err(|error| Error::Runtime(error.to_string()))?
+            })?.await.map_err(|error| Error::Runtime(error.to_string()))?
                 .map_err(Error::Runtime)?;
             // Keep exclusion until OnceCell has published the installed state.
             admission = returned_admission;
@@ -506,7 +584,9 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             Ok(Arc::new(state))
         }).await?;
         if &state.path != path {
-            return Err(Error::Runtime("a runtime cannot switch named-state snapshot paths".into()));
+            return Err(Error::Runtime(
+                "a runtime cannot switch named-state snapshot paths".into(),
+            ));
         }
         Ok(None)
     }
@@ -526,20 +606,28 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         // prevent the caller from ever issuing the wait/terminate that frees one.
         let stored_values = self.inner.stored_values.lock().await.clone();
         let catalog = {
-            let mut cached = self.inner.catalog.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut cached = self
+                .inner
+                .catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((definitions, catalog)) = cached.as_ref()
                 && Arc::ptr_eq(definitions, &request.enabled_tools)
             {
                 Arc::clone(catalog)
             } else {
-                let catalog = Arc::new(crate::runtime::EnabledToolCatalog::from_definitions(&request.enabled_tools).map_err(Error::Runtime)?);
+                let catalog = Arc::new(
+                    crate::runtime::EnabledToolCatalog::from_definitions(&request.enabled_tools)
+                        .map_err(Error::Runtime)?,
+                );
                 *cached = Some((Arc::clone(&request.enabled_tools), Arc::clone(&catalog)));
                 catalog
             }
         };
-        let input_bytes = stored_values.values().fold(request.source.len().saturating_add(catalog.input_bytes()), |bytes, value| {
-            bytes.saturating_add(value.bytes)
-        });
+        let input_bytes = stored_values.values().fold(
+            request.source.len().saturating_add(catalog.input_bytes()),
+            |bytes, value| bytes.saturating_add(value.bytes),
+        );
         let slots = cell_admission_slots(input_bytes, self.inner.active_cell_capacity);
         let cell_permit = match Arc::clone(&self.inner.active_cell_permits)
             .try_acquire_many_owned(slots)
@@ -555,7 +643,8 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                     .keys()
                     .cloned()
                     .collect::<Vec<_>>();
-                active.sort_by_key(|cell_id| cell_id_sequence(cell_id.as_str()).unwrap_or(u64::MAX));
+                active
+                    .sort_by_key(|cell_id| cell_id_sequence(cell_id.as_str()).unwrap_or(u64::MAX));
                 return Err(Error::ActiveCellLimit(active));
             }
         };
@@ -579,7 +668,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
                 stored_values,
                 host,
                 initial_observe_mode,
-                cell_state,
+                Arc::clone(&cell_state),
                 self.inner.task_failure_handler.clone(),
             ) => prepared.map_err(Error::Runtime)?,
         };
@@ -595,13 +684,20 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         }
         cells.insert(cell_id.clone(), handle);
         let task = self.inner.cell_tasks.spawn(task);
-        if let Some(task_failure_handler) = self.inner.task_failure_handler.clone() {
+        {
+            let task_failure_handler = self.inner.task_failure_handler.clone();
             let failed_cell_id = cell_id.clone();
-            let _failure_watcher = self.inner.cell_tasks.spawn(async move {
+            let inner = Arc::clone(&self.inner);
+            self.inner.cell_tasks.spawn(async move {
                 if let Err(err) = task.await {
-                    task_failure_handler(format!(
-                        "code-mode cell {failed_cell_id} task failed: {err}"
-                    ));
+                    inner.cells.lock().await.remove(&failed_cell_id);
+                    cell_state.mark_close_failed();
+                    tracing::error!(cell_id = %failed_cell_id, %err, "code-mode cell task failed");
+                    if let Some(task_failure_handler) = task_failure_handler {
+                        task_failure_handler(format!(
+                            "code-mode cell {failed_cell_id} task failed: {err}"
+                        ));
+                    }
                 }
             });
         }
@@ -650,6 +746,22 @@ struct RuntimeCellHost<D: SessionRuntimeDelegate> {
     snapshot: HashMap<String, StoredValue>,
     inner: Arc<Inner<D>>,
     cell_permit: Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+impl<D: SessionRuntimeDelegate> Inner<D> {
+    fn spawn_observed_storage<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<tokio::task::JoinHandle<T>, Error> {
+        let admission = self
+            .storage_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*admission || self.shutdown_token.is_cancelled() {
+            return Err(Error::ShuttingDown);
+        }
+        Ok(self.storage_tasks.spawn_blocking(work))
+    }
 }
 
 impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
@@ -752,7 +864,11 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
                     }
                 }
                 None => {
-                    for key in stored_values.keys().chain(self.snapshot.keys()).filter(|key| changed(key)) {
+                    for key in stored_values
+                        .keys()
+                        .chain(self.snapshot.keys())
+                        .filter(|key| changed(key))
+                    {
                         conflicts.entry(key).or_default().0 = true;
                     }
                 }
@@ -762,14 +878,24 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         let conflicting_read = conflicts.values().any(|(read, _)| *read);
         let event = if conflicting_write || conflicting_read {
             let mut event = storage_failure_event(event, "code-mode store conflict: another cell changed a read or written key; no stored values from this cell were committed. Nested tool effects may already have occurred; do not replay the cell blindly.".into());
-            if let CellEvent::Completed { error_text: Some(error), .. } = &mut event
+            if let CellEvent::Completed {
+                error_text: Some(error),
+                ..
+            } = &mut event
                 && let Ok(mut receipt) = serde_json::from_str::<JsonValue>(error)
             {
-                receipt["conflicting_keys"] = serde_json::json!(conflicts.iter().take(16).map(|(key, (read, write))| {
-                    serde_json::json!({"key": key.chars().take(128).collect::<String>(),
+                receipt["conflicting_keys"] = serde_json::json!(
+                    conflicts
+                        .iter()
+                        .take(16)
+                        .map(|(key, (read, write))| {
+                            serde_json::json!({"key": key.chars().take(128).collect::<String>(),
                         "key_truncated": key.chars().count() > 128, "read": read, "write": write})
-                }).collect::<Vec<_>>());
-                receipt["omitted_conflicting_key_count"] = serde_json::json!(conflicts.len().saturating_sub(16));
+                        })
+                        .collect::<Vec<_>>()
+                );
+                receipt["omitted_conflicting_key_count"] =
+                    serde_json::json!(conflicts.len().saturating_sub(16));
                 *error = receipt.to_string();
             }
             event
@@ -792,63 +918,91 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             // with the terminal receipt in the same snapshot, without changing
             // the live actor's separate yield/completion delivery semantics.
             let completed = crate::cell_actor::prepend_initial_yield(
-                event.clone(), pending_initial_yield_items.clone(),
+                event.clone(),
+                pending_initial_yield_items.clone(),
             );
             drop(stored_values);
-            let staging = tokio::task::spawn_blocking(move || {
+            // Staging returns an owned temporary file and commit lease. Keep
+            // storage tracked through result handoff or rejected-file disposal,
+            // not merely until the blocking closure returns.
+            let storage_owner = self.inner.storage_tasks.token();
+            let staging = self.inner.storage_tasks.spawn_blocking(move || {
                 let staged = durable.stage(call_id, values, cell_id, completed);
-                (gate, staged)
+                (gate, staged, storage_owner)
             });
             let staged = tokio::select! {
                 biased;
                 _ = cancellation_token.cancelled() => return CompletionCommit::Rejected(event),
                 staged = tokio::time::timeout_at(deadline, staging) => staged,
             };
-            let (gate, staged) = match staged {
-                Ok(Ok((gate, Ok(staged)))) => (gate, staged),
+            let (gate, staged, storage_owner) = match staged {
+                Ok(Ok((gate, Ok(staged), owner))) => (gate, staged, owner),
                 result => {
                     let reason = match result {
-                        Ok(Ok((_, Err(error)))) => error,
+                        Ok(Ok((_, Err(error), _))) => error,
                         Ok(Err(error)) => error.to_string(),
-                        Err(_) => "deadline expired; staged files remain owned and cannot publish".into(),
-                        Ok(Ok((_, Ok(_)))) => unreachable!(),
+                        Err(_) => {
+                            "deadline expired; staged files remain owned and cannot publish".into()
+                        }
+                        Ok(Ok((_, Ok(_), _))) => unreachable!(),
                     };
-                    return cell_state.commit_completion_with_event(event, pending_initial_yield_items,
-                        |event| storage_failure_event(event, format!("snapshot staging failed: {reason}")));
+                    return cell_state.commit_completion_with_event(
+                        event,
+                        pending_initial_yield_items,
+                        |event| {
+                            storage_failure_event(
+                                event,
+                                format!("snapshot staging failed: {reason}"),
+                            )
+                        },
+                    );
                 }
             };
             stored_values = self.inner.stored_values.lock().await;
-            Some((gate, staged))
+            Some((gate, staged, storage_owner))
         } else {
             drop(gate);
             None
         };
         let completed = event.clone();
         let terminal_completed = crate::cell_actor::prepend_initial_yield(
-            completed.clone(), pending_initial_yield_items.clone(),
+            completed.clone(),
+            pending_initial_yield_items.clone(),
         );
-        let commit = cell_state.commit_completion_with_event(event, pending_initial_yield_items, |event| {
-            if writes_fit && !conflicting_write && !conflicting_read {
-                crate::runtime::apply_stored_value_writes(&mut stored_values, stored_value_writes);
-            }
-            if staged.is_some() {
-                storage_failure_event_with_status(event, "snapshot publication is owned and pending; durability is unconfirmed".into(), "unknown")
-            } else {
-                event
-            }
-        });
+        let commit =
+            cell_state.commit_completion_with_event(event, pending_initial_yield_items, |event| {
+                if writes_fit && !conflicting_write && !conflicting_read {
+                    crate::runtime::apply_stored_value_writes(
+                        &mut stored_values,
+                        stored_value_writes,
+                    );
+                }
+                if staged.is_some() {
+                    storage_failure_event_with_status(
+                        event,
+                        "snapshot publication is owned and pending; durability is unconfirmed"
+                            .into(),
+                        "unknown",
+                    )
+                } else {
+                    event
+                }
+            });
         drop(stored_values);
-        if let (Some(durable), Some((gate, staged))) = (durable, staged) {
+        if let (Some(durable), Some((gate, staged, storage_owner))) = (durable, staged) {
             if matches!(commit, CompletionCommit::Rejected(_)) {
                 // Temporary-file cleanup is I/O too, and never publishes.
-                tokio::task::spawn_blocking(move || drop((gate, staged)));
+                self.inner
+                    .storage_tasks
+                    .spawn_blocking(move || drop((gate, staged, storage_owner)));
                 return commit;
             }
             // The atomic decision has been made. Never label a later publication
             // cancelled: termination and timeout observe an uncertain receipt.
             let inner = Arc::clone(&self.inner);
             let cell_id = self.cell_id.clone();
-            let publication = tokio::task::spawn_blocking(move || {
+            let publication = self.inner.storage_tasks.spawn_blocking(move || {
+                let _storage_owner = storage_owner;
                 let _gate = gate;
                 let result = durable.publish(staged);
                 let event = match &result {
@@ -876,55 +1030,76 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         commit
     }
 
-    async fn closed(&self, mut event: Option<CellEvent>) {
+    async fn closed(&self, mut event: Option<CellEvent>) -> Option<CellEvent> {
         // Nested callbacks have settled before this hook. Retain cancellation
         // evidence, but snapshot only committed values, never this cell's writes.
         if let Some(terminal @ CellEvent::Terminated { .. }) = &event
             && let Some(durable) = self.inner.durable_state.get().cloned()
         {
-            let inner = Arc::clone(&self.inner);
-            let call_id = self.parent_tool_call_id.clone();
-            let cell_id = self.cell_id.to_string();
-            let terminal = terminal.clone();
-            let publication = tokio::spawn(async move {
-                let gate = Arc::clone(&inner.commit_gate).lock_owned().await;
-                let values = inner.stored_values.lock().await.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _gate = gate;
-                    durable.publish(durable.stage(call_id, values, cell_id, terminal)?)
-                }).await.map_err(|error| error.to_string())?
-            });
-            if let result = tokio::time::timeout(TERMINAL_SPILL_TIMEOUT, publication).await
-                && !matches!(&result, Ok(Ok(Ok(()))))
+            let deadline = tokio::time::Instant::now() + TERMINAL_SPILL_TIMEOUT;
+            // Queued publishers remain actor-owned and expire before spawning.
+            // Only a job holding the shared commit gate may outlive observation.
+            let result = match tokio::time::timeout_at(
+                deadline,
+                Arc::clone(&self.inner.commit_gate).lock_owned(),
+            )
+            .await
+            {
+                Ok(gate) => {
+                    let values = self.inner.stored_values.lock().await.clone();
+                    let call_id = self.parent_tool_call_id.clone();
+                    let cell_id = self.cell_id.to_string();
+                    let terminal = terminal.clone();
+                    let publication = self.inner.storage_tasks.spawn_blocking(move || {
+                        let _gate = gate;
+                        durable.publish(durable.stage(call_id, values, cell_id, terminal)?)
+                    });
+                    match tokio::time::timeout_at(deadline, publication).await {
+                        Ok(Ok(result)) => result,
+                        result => Err(format!("{result:?}")),
+                    }
+                }
+                Err(_) => Err(
+                    "snapshot publication admission expired; no publisher was started".to_string(),
+                ),
+            };
+            if let Err(reason) = result
                 && let Some(CellEvent::Terminated { content_items }) = &mut event
             {
                 content_items.push(OutputItem::Text { text: format!(
-                    "Termination receipt durability is unconfirmed ({result:?}); do not replay external effects."
+                    "Termination receipt durability is unconfirmed ({reason}); do not replay external effects."
                 ) });
             }
         }
         // Transfer receipt custody before releasing execution capacity. Spilling
         // is only an optimization of an already recoverable terminal receipt.
-        let mut cached = event.map(|event| {
-            let bytes = cell_event_bytes(&event);
-            (Arc::new(CachedCellEvent::Inline(event)), bytes)
+        let mut cached = event.as_ref().map(|event| {
+            let bytes = cell_event_bytes(event);
+            (Arc::new(CachedCellEvent::Inline(event.clone())), bytes)
         });
         {
             let mut cells = self.inner.cells.lock().await;
             let removed = cells.remove(&self.cell_id);
             if removed.is_none() {
-                return;
+                return event;
             }
             if let Some(cached) = cached.as_mut() {
-                let mut terminal = self.inner.terminal_cells.lock()
+                let mut terminal = self
+                    .inner
+                    .terminal_cells
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Publication can settle between actor delivery and this custody
                 // transfer. Under the cache lock, prefer its confirmed receipt;
                 // otherwise the publication owner will replace this entry later.
-                if let Some(completed) = self.inner.durable_state.get()
+                if let Some(completed) = self
+                    .inner
+                    .durable_state
+                    .get()
                     .and_then(|durable| durable.completed_cell(self.cell_id.as_str()))
                 {
                     let bytes = cell_event_bytes(&completed);
+                    event = Some(completed.clone());
                     *cached = (Arc::new(CachedCellEvent::Inline(completed)), bytes);
                 }
                 terminal.insert_cached(self.cell_id.clone(), cached.clone());
@@ -934,27 +1109,43 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         self.inner.delegate.cell_closed(&self.cell_id);
         if let Some((inline, bytes)) = cached
             && bytes > TERMINAL_CELL_CACHE_MAX_BYTES
+            && let Ok(job) = Arc::clone(&self.inner.spill_jobs).try_acquire_owned()
+            && let Ok(weight) = u32::try_from(bytes)
+            && let Ok(admitted_bytes) =
+                Arc::clone(&self.inner.spill_bytes).try_acquire_many_owned(weight)
         {
             let source = Arc::clone(&inline);
             #[cfg(test)]
             let gate = self.inner.spill_gate.lock().unwrap().clone();
-            let spill = tokio::task::spawn_blocking(move || {
+            let spill = self.inner.storage_tasks.spawn_blocking(move || {
+                let _admission = (job, admitted_bytes);
                 #[cfg(test)]
-                if let Some(gate) = gate { gate.wait(); }
-                let CachedCellEvent::Inline(event) = source.as_ref() else { unreachable!() };
+                if let Some(gate) = gate {
+                    gate.wait();
+                }
+                let CachedCellEvent::Inline(event) = source.as_ref() else {
+                    unreachable!()
+                };
                 CachedCellEvent::new(event.clone())
             });
             if let Ok(Ok(spilled)) = tokio::time::timeout(TERMINAL_SPILL_TIMEOUT, spill).await {
-                let mut cache = self.inner.terminal_cells.lock()
+                let mut cache = self
+                    .inner
+                    .terminal_cells
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Eviction or replacement while spilling must not resurrect an
                 // old receipt. Timeout leaves inline evidence and owns no write
                 // to the cache; the blocking task drops its temporary file.
-                if cache.entry(&self.cell_id).is_some_and(|entry| Arc::ptr_eq(&entry, &inline)) {
+                if cache
+                    .entry(&self.cell_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry, &inline))
+                {
                     cache.insert_cached(self.cell_id.clone(), spilled);
                 }
             }
         }
+        event
     }
 }
 
@@ -966,7 +1157,11 @@ fn storage_failure_event(event: CellEvent, limit_error: String) -> CellEvent {
     storage_failure_event_with_status(event, limit_error, "rejected")
 }
 
-fn storage_failure_event_with_status(event: CellEvent, limit_error: String, status: &str) -> CellEvent {
+fn storage_failure_event_with_status(
+    event: CellEvent,
+    limit_error: String,
+    status: &str,
+) -> CellEvent {
     match event {
         CellEvent::Completed {
             content_items,
@@ -1004,6 +1199,9 @@ fn actor_error(cell_id: &CellId, error: CellError) -> Error {
         CellError::Busy => Error::BusyObserver(cell_id.clone()),
         CellError::AlreadyTerminating => Error::AlreadyTerminating(cell_id.clone()),
         CellError::Closed => Error::ClosedCell(cell_id.clone()),
+        CellError::CleanupFailed => Error::Runtime(format!(
+            "code-mode cell {cell_id} cleanup failed; external effects must not be replayed"
+        )),
     }
 }
 

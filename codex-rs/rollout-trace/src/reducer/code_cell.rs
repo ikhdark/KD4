@@ -22,6 +22,7 @@ use super::TraceReducer;
 use crate::model::CodeCell;
 use crate::model::CodeCellId;
 use crate::model::CodeCellRuntimeStatus;
+use crate::model::CodeCellTerminalObservation;
 use crate::model::ConversationItemKind;
 use crate::model::ExecutionStatus;
 use crate::model::ExecutionWindow;
@@ -75,6 +76,9 @@ pub(super) enum PendingCodeCellLifecycleEventKind {
     },
     Ended {
         status: CodeCellRuntimeStatus,
+    },
+    OwnerEnded {
+        status: ExecutionStatus,
     },
 }
 
@@ -183,6 +187,9 @@ impl TraceReducer {
                     status: ExecutionStatus::Running,
                 },
                 runtime_status: CodeCellRuntimeStatus::Starting,
+                owner_end: None,
+                observed_terminal: None,
+                terminal_conflicts: Vec::new(),
                 initial_response_at_unix_ms: None,
                 initial_response_seq: None,
                 yielded_at_unix_ms: None,
@@ -202,6 +209,14 @@ impl TraceReducer {
             self.add_code_cell_output_item(&started.code_cell_id, &item_id)?;
         }
         self.flush_pending_code_cell_lifecycle_events(&started.code_cell_id)?;
+        // A delayed start can arrive after the turn's closure was reduced.
+        let cell = &self.rollout.code_cells[&started.code_cell_id];
+        let owner = self.rollout.codex_turns[&cell.codex_turn_id]
+            .execution
+            .clone();
+        if let Some((end_seq, end_time)) = owner.ended_seq.zip(owner.ended_at_unix_ms) {
+            self.close_code_cell_owner(end_seq, end_time, &started.code_cell_id, owner.status)?;
+        }
 
         Ok(())
     }
@@ -284,7 +299,12 @@ impl TraceReducer {
             cell.yielded_at_unix_ms = Some(wall_time_unix_ms);
             cell.yielded_seq = Some(seq);
         }
-        if cell.execution.status == ExecutionStatus::Running {
+        if cell.observed_terminal.is_none()
+            && cell
+                .owner_end
+                .as_ref()
+                .is_none_or(|end| end.status == ExecutionStatus::Completed)
+        {
             cell.runtime_status = status;
         }
         Ok(())
@@ -331,9 +351,32 @@ impl TraceReducer {
             bail!("code cell end referenced unknown cell {code_cell_id}");
         };
 
-        if cell.execution.status != ExecutionStatus::Running {
+        if matches!(
+            status,
+            CodeCellRuntimeStatus::Unknown
+                | CodeCellRuntimeStatus::Starting
+                | CodeCellRuntimeStatus::Running
+                | CodeCellRuntimeStatus::Yielded
+        ) {
+            bail!("code cell end for {code_cell_id} did not contain a terminal runtime status");
+        }
+        let observation = CodeCellTerminalObservation {
+            status: status.clone(),
+            ended_at_unix_ms: wall_time_unix_ms,
+            ended_seq: seq,
+        };
+        if let Some(terminal) = &cell.observed_terminal {
+            if terminal.status != status
+                && !cell
+                    .terminal_conflicts
+                    .iter()
+                    .any(|conflict| conflict.status == status)
+            {
+                cell.terminal_conflicts.push(observation);
+            }
             return Ok(());
         }
+        cell.observed_terminal = Some(observation);
         if cell.initial_response_at_unix_ms.is_none() {
             cell.initial_response_at_unix_ms = Some(wall_time_unix_ms);
             cell.initial_response_seq = Some(seq);
@@ -345,35 +388,23 @@ impl TraceReducer {
         Ok(())
     }
 
-    /// Closes unfinished code cells when their owning turn is interrupted.
-    ///
-    /// A yielded code cell can outlive a completed turn and be resumed by a
-    /// later `wait`, so normal turn completion must not imply cell completion.
-    /// Cancellation/failure is different: the model-visible JS frame has been
-    /// abandoned even if nested terminal work reports late runtime events. In
-    /// that case leaving the cell `running` makes a completed trace look live.
-    pub(super) fn terminate_running_code_cells_for_turn_end(
+    /// Records owner closure without inventing runtime termination. Completed
+    /// owners can leave yielded cells active; interrupted owners leave finality unknown.
+    pub(super) fn close_code_cell_owners_for_turn_end(
         &mut self,
         seq: RawEventSeq,
         wall_time_unix_ms: i64,
         codex_turn_id: &str,
         turn_status: &ExecutionStatus,
     ) -> Result<()> {
-        let runtime_status = match turn_status {
-            ExecutionStatus::Running | ExecutionStatus::Completed => return Ok(()),
-            ExecutionStatus::Failed => CodeCellRuntimeStatus::Failed,
-            ExecutionStatus::Cancelled | ExecutionStatus::Aborted => {
-                CodeCellRuntimeStatus::Terminated
-            }
-        };
+        if *turn_status == ExecutionStatus::Running {
+            return Ok(());
+        }
         let code_cell_ids: Vec<_> = self
             .rollout
             .code_cells
             .values()
-            .filter(|cell| {
-                cell.codex_turn_id == codex_turn_id
-                    && cell.execution.status == ExecutionStatus::Running
-            })
+            .filter(|cell| cell.codex_turn_id == codex_turn_id)
             .map(|cell| cell.code_cell_id.clone())
             .chain(
                 self.pending_code_cell_starts
@@ -384,12 +415,52 @@ impl TraceReducer {
             .collect();
 
         for code_cell_id in code_cell_ids {
-            self.end_or_queue_code_cell(
-                seq,
-                wall_time_unix_ms,
-                code_cell_id,
-                runtime_status.clone(),
-            )?;
+            if self.pending_code_cell_starts.contains_key(&code_cell_id) {
+                self.queue_code_cell_lifecycle_event(
+                    code_cell_id,
+                    PendingCodeCellLifecycleEvent {
+                        seq,
+                        wall_time_unix_ms,
+                        kind: PendingCodeCellLifecycleEventKind::OwnerEnded {
+                            status: turn_status.clone(),
+                        },
+                    },
+                );
+            } else {
+                self.close_code_cell_owner(
+                    seq,
+                    wall_time_unix_ms,
+                    &code_cell_id,
+                    turn_status.clone(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn close_code_cell_owner(
+        &mut self,
+        seq: RawEventSeq,
+        wall_time_unix_ms: i64,
+        code_cell_id: &str,
+        status: ExecutionStatus,
+    ) -> Result<()> {
+        let cell = self
+            .rollout
+            .code_cells
+            .get_mut(code_cell_id)
+            .context("missing code cell owner")?;
+        if cell.owner_end.is_some() {
+            return Ok(());
+        }
+        let mut owner = cell.execution.clone();
+        owner.ended_seq = Some(seq);
+        owner.ended_at_unix_ms = Some(wall_time_unix_ms);
+        owner.status = status.clone();
+        cell.owner_end = Some(owner.clone());
+        if status != ExecutionStatus::Completed && cell.observed_terminal.is_none() {
+            cell.execution = owner;
+            cell.runtime_status = CodeCellRuntimeStatus::Unknown;
         }
         Ok(())
     }
@@ -413,6 +484,13 @@ impl TraceReducer {
         };
         for event in events {
             match event.kind {
+                PendingCodeCellLifecycleEventKind::OwnerEnded { status } => self
+                    .close_code_cell_owner(
+                        event.seq,
+                        event.wall_time_unix_ms,
+                        code_cell_id,
+                        status,
+                    )?,
                 PendingCodeCellLifecycleEventKind::InitialResponse {
                     runtime_cell_id,
                     status,
@@ -712,7 +790,8 @@ impl TraceReducer {
 
 fn execution_status_for_code_cell(status: &CodeCellRuntimeStatus) -> ExecutionStatus {
     match status {
-        CodeCellRuntimeStatus::Starting
+        CodeCellRuntimeStatus::Unknown
+        | CodeCellRuntimeStatus::Starting
         | CodeCellRuntimeStatus::Running
         | CodeCellRuntimeStatus::Yielded => ExecutionStatus::Running,
         CodeCellRuntimeStatus::Completed => ExecutionStatus::Completed,

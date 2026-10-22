@@ -2,6 +2,7 @@ mod managed_process;
 pub mod pipe;
 mod process;
 pub mod process_group;
+pub mod process_observation;
 pub mod pty;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -31,6 +32,7 @@ pub use managed_process::run_windows_process_operation;
 pub use pipe::spawn_process as spawn_pipe_process;
 /// Spawn a non-interactive process using regular pipes, but close stdin immediately.
 pub use pipe::spawn_process_no_stdin as spawn_pipe_process_no_stdin;
+pub use process::OutputCapture;
 /// Driver-backed process adapter used by integrations with their own process transport.
 pub use process::ProcessDriver;
 /// Handle for interacting with a spawned process (PTY or pipe).

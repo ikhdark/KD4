@@ -15,6 +15,59 @@ fn control_with_limit(max_threads: usize) -> AgentControl {
     control
 }
 
+#[tokio::test]
+async fn accepted_execution_waiters_keep_fifo_capacity_across_release_and_cancellation() {
+    let control = control_with_limit(1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".into()));
+    let held = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    let mut first = Box::pin(control.wait_for_execution_capacity(MultiAgentVersion::V2, &source));
+    let mut second = Box::pin(control.wait_for_execution_capacity(MultiAgentVersion::V2, &source));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(held);
+    assert!(
+        control
+            .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+            .is_err(),
+        "new arrivals cannot steal capacity assigned to accepted work"
+    );
+    let first = first.await;
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    drop(second);
+    drop(first);
+    assert!(
+        control
+            .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+            .is_ok(),
+        "cancelled waiters must not leak a permit"
+    );
+}
+
+#[test]
+fn capacity_notifications_only_track_actual_execution_release() {
+    let control = control_with_limit(1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".into()));
+    let mut capacity = control.subscribe_capacity_changes();
+    let guard = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .unwrap();
+    assert!(!capacity.has_changed().unwrap());
+    assert!(matches!(
+        control.reserve_execution_capacity(MultiAgentVersion::V2, &source),
+        Err(CodexErr::AgentLimitReached { max_threads: 1 })
+    ));
+    assert!(
+        !capacity.has_changed().unwrap(),
+        "a failed acquisition must not wake itself"
+    );
+    drop(guard);
+    assert!(capacity.has_changed().unwrap());
+    capacity.borrow_and_update();
+    assert!(!capacity.has_changed().unwrap());
+}
+
 #[test]
 fn execution_guards_count_active_v2_subagent_turns() {
     let control = control_with_limit(/*max_threads*/ 1);

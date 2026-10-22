@@ -32,6 +32,8 @@ mod inference;
 pub(crate) mod test_support;
 mod thread;
 mod tool;
+#[cfg(test)]
+mod tool_order_tests;
 
 use self::code_cell::PendingCodeCellLifecycleEvent;
 use self::code_cell::PendingCodeCellStart;
@@ -50,7 +52,7 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
     )?))
     .with_context(|| format!("read {}", bundle_dir.join(MANIFEST_FILE_NAME).display()))?;
     anyhow::ensure!(
-        manifest.schema_version == TRACE_MANIFEST_SCHEMA_VERSION,
+        (1..=TRACE_MANIFEST_SCHEMA_VERSION).contains(&manifest.schema_version),
         "unsupported trace manifest schema version {}",
         manifest.schema_version
     );
@@ -97,9 +99,50 @@ pub fn replay_bundle(bundle_dir: impl AsRef<Path>) -> Result<RolloutTrace> {
             reducer.record_runtime_code_cell_id(thread_id, runtime_cell_id, &cell_id)?;
         }
     }
+    // Generic dispatch payloads are persisted independently of runtime events.
+    // Keep only references from this finite snapshot pending; do not invent a
+    // tool or block live execution on diagnostic payload I/O.
+    let mut pending_runtime: BTreeMap<String, Vec<RawTraceEvent>> = BTreeMap::new();
     for event in events {
+        let runtime_tool_id = match &event.payload {
+            RawTraceEventPayload::ToolCallRuntimeStarted { tool_call_id, .. }
+            | RawTraceEventPayload::ToolCallRuntimeEnded { tool_call_id, .. }
+            | RawTraceEventPayload::ProcessStartsObserved { tool_call_id, .. }
+            | RawTraceEventPayload::McpToolCallCorrelationAssigned { tool_call_id, .. } => {
+                Some(tool_call_id)
+            }
+            _ => None,
+        };
+        if let Some(tool_id) = runtime_tool_id
+            && !reducer.rollout.tool_calls.contains_key(tool_id)
+        {
+            pending_runtime
+                .entry(tool_id.clone())
+                .or_default()
+                .push(event);
+            continue;
+        }
+        let started_tool_id = match &event.payload {
+            RawTraceEventPayload::ToolCallStarted { tool_call_id, .. } => {
+                Some(tool_call_id.clone())
+            }
+            _ => None,
+        };
         reducer.apply_event(event)?;
+        if let Some(tool_id) = started_tool_id
+            && let Some(pending) = pending_runtime.remove(&tool_id)
+        {
+            // Retain each event's original sequence, occurrence and payload.
+            for event in pending {
+                reducer.apply_event(event)?;
+            }
+        }
     }
+    anyhow::ensure!(
+        pending_runtime.is_empty(),
+        "tool runtime evidence referenced unknown calls: {:?}",
+        pending_runtime.keys().collect::<Vec<_>>()
+    );
     // Spawn edges prefer the child task message as their target, but a child can
     // fail before that message is ever reduced. Only after replaying the whole
     // bundle do we know which spawn deliveries need the child-thread fallback.
@@ -135,7 +178,7 @@ fn read_raw_events(event_log_path: &Path, rollout_id: &str) -> Result<Vec<RawTra
         match serde_json::from_slice::<RawTraceEvent>(&line) {
             Ok(event) => {
                 anyhow::ensure!(
-                    event.schema_version == RAW_TRACE_EVENT_SCHEMA_VERSION,
+                    (1..=RAW_TRACE_EVENT_SCHEMA_VERSION).contains(&event.schema_version),
                     "unsupported trace event schema version {} at line {line_number}",
                     event.schema_version
                 );
@@ -230,6 +273,17 @@ impl TraceReducer {
     }
 
     fn apply_event(&mut self, event: RawTraceEvent) -> Result<()> {
+        if let Some(occurrence) = event.occurrence {
+            self.rollout.event_occurrences.insert(event.seq, occurrence);
+        }
+        if let Some(count) = event.payload_capture_gap_count {
+            self.rollout.payload_capture_gap_count = Some(
+                self.rollout
+                    .payload_capture_gap_count
+                    .unwrap_or(0)
+                    .max(count),
+            );
+        }
         // Raw payload refs are reducer-wide evidence, not owned by a single
         // semantic arm. Keep this bookkeeping separate so typed reduction can
         // stay strict without duplicating payload insertion in every case.
@@ -267,6 +321,21 @@ impl TraceReducer {
             }
             RawTraceEventPayload::ThreadEnded { thread_id, status } => {
                 self.end_thread(event.seq, event.wall_time_unix_ms, thread_id, status)?;
+            }
+            RawTraceEventPayload::ThreadResumed {
+                thread_id,
+                parent_thread_id,
+                agent_path,
+                metadata_payload,
+            } => {
+                self.resume_thread(
+                    event.seq,
+                    event.wall_time_unix_ms,
+                    thread_id,
+                    parent_thread_id,
+                    agent_path,
+                    metadata_payload,
+                )?;
             }
             RawTraceEventPayload::CodexTurnStarted {
                 codex_turn_id,
@@ -308,7 +377,27 @@ impl TraceReducer {
                         codex_turn_id,
                         model,
                         provider_name,
-                        request_payload,
+                        request_payload: Some(request_payload),
+                    },
+                )?;
+            }
+            RawTraceEventPayload::InferenceStartedWithoutPayload {
+                inference_call_id,
+                thread_id,
+                codex_turn_id,
+                model,
+                provider_name,
+            } => {
+                self.start_inference_call(
+                    event.seq,
+                    event.wall_time_unix_ms,
+                    StartedInferenceCall {
+                        inference_call_id,
+                        thread_id,
+                        codex_turn_id,
+                        model,
+                        provider_name,
+                        request_payload: None,
                     },
                 )?;
             }
@@ -389,6 +478,19 @@ impl TraceReducer {
                     status,
                     result_payload,
                 )?;
+            }
+            RawTraceEventPayload::ProcessStartsObserved {
+                tool_call_id,
+                observations,
+            } => {
+                let call = self
+                    .rollout
+                    .tool_calls
+                    .get_mut(&tool_call_id)
+                    .with_context(|| {
+                        format!("process observation referenced unknown tool {tool_call_id}")
+                    })?;
+                call.process_observations = Some(observations);
             }
             RawTraceEventPayload::CodeCellStarted {
                 runtime_cell_id,
@@ -487,7 +589,29 @@ impl TraceReducer {
                         codex_turn_id,
                         model,
                         provider_name,
-                        request_payload,
+                        request_payload: Some(request_payload),
+                    },
+                )?;
+            }
+            RawTraceEventPayload::CompactionRequestStartedWithoutPayload {
+                compaction_id,
+                compaction_request_id,
+                thread_id,
+                codex_turn_id,
+                model,
+                provider_name,
+            } => {
+                self.start_compaction_request(
+                    event.seq,
+                    event.wall_time_unix_ms,
+                    StartedCompactionRequest {
+                        compaction_id,
+                        compaction_request_id,
+                        thread_id,
+                        codex_turn_id,
+                        model,
+                        provider_name,
+                        request_payload: None,
                     },
                 )?;
             }
@@ -508,6 +632,7 @@ impl TraceReducer {
             RawTraceEventPayload::CompactionRequestFailed {
                 compaction_id,
                 compaction_request_id,
+                response_payload,
                 ..
             } => {
                 self.complete_compaction_request(
@@ -516,7 +641,21 @@ impl TraceReducer {
                     compaction_id,
                     compaction_request_id,
                     ExecutionStatus::Failed,
-                    /*response_payload*/ None,
+                    response_payload,
+                )?;
+            }
+            RawTraceEventPayload::CompactionRequestCancelled {
+                compaction_id,
+                compaction_request_id,
+                ..
+            } => {
+                self.complete_compaction_request(
+                    event.seq,
+                    event.wall_time_unix_ms,
+                    compaction_id,
+                    compaction_request_id,
+                    ExecutionStatus::Cancelled,
+                    None,
                 )?;
             }
             RawTraceEventPayload::CompactionInstalled {

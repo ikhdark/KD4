@@ -30,6 +30,8 @@ pub(crate) const SESSION_ID_KEY: &str = "session_id";
 pub(crate) const THREAD_ID_KEY: &str = "thread_id";
 pub(crate) const TURN_ID_KEY: &str = "turn_id";
 pub(crate) const WINDOW_ID_KEY: &str = "window_id";
+/// Core no longer sends this key; it stays reserved so client metadata cannot
+/// request server-side history ingestion.
 pub(crate) const HISTORY_INGEST_REQUESTED_KEY: &str = "history_ingest_requested";
 pub(crate) const REQUEST_KIND_KEY: &str = "request_kind";
 pub(crate) const COMPACTION_KEY: &str = "compaction";
@@ -119,6 +121,7 @@ impl CompactionTurnMetadata {
 pub(crate) enum CodexResponsesRequestKind {
     Turn,
     Prewarm,
+    Auxiliary,
     Compaction(CompactionTurnMetadata),
 }
 
@@ -127,6 +130,7 @@ impl CodexResponsesRequestKind {
         match self {
             CodexResponsesRequestKind::Turn => ("turn", None),
             CodexResponsesRequestKind::Prewarm => ("prewarm", None),
+            CodexResponsesRequestKind::Auxiliary => ("auxiliary", None),
             CodexResponsesRequestKind::Compaction(metadata) => ("compaction", Some(metadata)),
         }
     }
@@ -145,7 +149,6 @@ pub struct CodexResponsesMetadata {
     pub(crate) thread_id: String,
     pub(crate) turn_id: Option<String>,
     pub(crate) window_id: String,
-    pub(crate) history_ingest_requested: Option<bool>,
     pub(crate) request_kind: Option<CodexResponsesRequestKind>,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -172,7 +175,6 @@ impl CodexResponsesMetadata {
             thread_id,
             turn_id: None,
             window_id,
-            history_ingest_requested: None,
             request_kind: None,
             forked_from_thread_id: None,
             parent_thread_id: None,
@@ -185,6 +187,23 @@ impl CodexResponsesMetadata {
             extra: BTreeMap::new(),
             turn_metadata_json_cache: OnceLock::new(),
         }
+    }
+
+    /// Auxiliary work has one durable attempt identity, not a synthetic coding turn.
+    pub fn for_bug_classifier(attempt_id: &str, thread_id: &str, bug_id: i64) -> Self {
+        let mut metadata = Self::new(
+            String::new(),
+            attempt_id.to_string(),
+            attempt_id.to_string(),
+            String::new(),
+        );
+        metadata.request_kind = Some(CodexResponsesRequestKind::Auxiliary);
+        metadata.turn_id = Some(attempt_id.to_string());
+        metadata.extra.insert("bug_id".into(), bug_id.to_string());
+        metadata
+            .extra
+            .insert("originating_thread_id".into(), thread_id.to_string());
+        metadata
     }
 
     pub(crate) fn has_turn_metadata(&self) -> bool {
@@ -277,7 +296,6 @@ impl CodexResponsesMetadata {
             thread_id: Some(self.thread_id.as_str()),
             turn_id: self.turn_id.as_deref(),
             window_id: has_request_identity.then_some(self.window_id.as_str()),
-            history_ingest_requested: self.history_ingest_requested,
             request_kind: request_kind_value,
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
@@ -350,8 +368,6 @@ fn non_empty_workspaces(
 
 #[derive(Serialize)]
 struct CodexTurnMetadataPayload<'a> {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    history_ingest_requested: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installation_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

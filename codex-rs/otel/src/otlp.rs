@@ -519,10 +519,9 @@ mod tests {
             ("../http-client/tests/fixtures/test-ca.pem", true),
             ("Cargo.toml", false),
         ] {
-            let ca_certificate = AbsolutePathBuf::try_from(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path),
-            )
-            .expect("absolute CA certificate path");
+            let ca_certificate =
+                AbsolutePathBuf::try_from(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path))
+                    .expect("absolute CA certificate path");
             let tls = OtelTlsConfig {
                 ca_certificate: Some(ca_certificate),
                 ..OtelTlsConfig::default()
@@ -535,7 +534,10 @@ mod tests {
                     result.expect("configured CA should load");
                 } else {
                     let error = result.expect_err("configured CA must not be ignored");
-                    assert!(error.to_string().contains("failed to parse certificate"), "{error}");
+                    assert!(
+                        error.to_string().contains("failed to parse certificate"),
+                        "{error}"
+                    );
                 }
             }
         }

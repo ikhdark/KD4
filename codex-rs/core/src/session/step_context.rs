@@ -21,6 +21,8 @@ pub(crate) struct McpToolSnapshot {
     pub(crate) revision: u64,
     pub(crate) tools: Arc<Vec<ToolInfo>>,
     pub(crate) resources_available: bool,
+    pub(crate) pending_servers: Vec<String>,
+    pub(crate) failed_servers: Vec<String>,
 }
 
 const MCP_SNAPSHOT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -40,6 +42,8 @@ async fn bounded_mcp_snapshot(
                 revision: u64::MAX,
                 tools: Arc::new(Vec::new()),
                 resources_available: false,
+                pending_servers: Vec::new(),
+                failed_servers: Vec::new(),
             }
         }
     }
@@ -49,6 +53,8 @@ async fn bounded_mcp_snapshot(
 #[derive(Clone)]
 pub(crate) struct StepContext {
     pub(crate) turn: Arc<TurnContext>,
+    /// User input incorporated by the authoring request, never cell creation time.
+    pub(crate) user_intent_epoch: u64,
     /// Plan owner observed before sampling, shared by direct and nested calls.
     pub(crate) plan_sampling_revision: Option<crate::plan_store::PlanSamplingRevision>,
     pub(crate) environments: TurnEnvironmentSnapshot,
@@ -114,6 +120,7 @@ impl StepContext {
         let mcp_tool_snapshot = Arc::new(OnceCell::new());
         Self {
             turn,
+            user_intent_epoch: 0,
             plan_sampling_revision: None,
             environments,
             selected_capability_roots,
@@ -131,14 +138,14 @@ impl StepContext {
         self.mcp_tool_snapshot
             .get_or_init(|| async {
                 bounded_mcp_snapshot(async {
-                    // Startup is part of capture's budget too. A slow optional
-                    // server must not hold the turn behind its network timeout.
-                    self.mcp.manager().wait_for_startup().await;
+                    // Required startup is validated by construction. Optional
+                    // discovery must not hide another server's ready tools.
                     loop {
                         let revision = self.mcp.manager().tool_catalog_revision();
-                        let (tools, resources_available) = tokio::join!(
+                        let (tools, resources_available, (pending_servers, failed_servers)) = tokio::join!(
                             self.mcp.manager().list_all_tools_snapshot(),
                             self.mcp.manager().has_ready_server_with_resources(),
+                            self.mcp.manager().catalog_availability(),
                         );
                         if revision == self.mcp.manager().tool_catalog_revision() {
                             return McpToolSnapshot {
@@ -146,6 +153,8 @@ impl StepContext {
                                 revision,
                                 tools,
                                 resources_available,
+                                pending_servers,
+                                failed_servers,
                             };
                         }
                         tokio::task::yield_now().await;
@@ -191,6 +200,8 @@ impl StepContext {
                 revision,
                 tools: Arc::new(tools),
                 resources_available,
+                pending_servers: Vec::new(),
+                failed_servers: Vec::new(),
             })
             .expect("test MCP tool snapshot should be unset");
     }
@@ -213,7 +224,8 @@ mod snapshot_deadline_tests {
             .seed_mcp_tool_snapshot_for_test(17, Vec::new(), true)
             .await;
         let next = session.capture_step_context(turn).await.unwrap();
-        next.seed_mcp_tool_snapshot_for_test(18, Vec::new(), false).await;
+        next.seed_mcp_tool_snapshot_for_test(18, Vec::new(), false)
+            .await;
         let retry = first.for_retry_attempt();
         assert!(std::ptr::eq(
             first.mcp_tool_snapshot().await,
@@ -222,7 +234,10 @@ mod snapshot_deadline_tests {
         assert_eq!(next.mcp_tool_snapshot().await.revision, 18);
         assert_eq!(first.mcp_tool_snapshot().await.revision, 17);
         assert!(!next.mcp_tool_snapshot().await.resources_available);
-        assert!(!Arc::ptr_eq(&first.mcp_tool_snapshot, &next.mcp_tool_snapshot));
+        assert!(!Arc::ptr_eq(
+            &first.mcp_tool_snapshot,
+            &next.mcp_tool_snapshot
+        ));
         let (_, other_turn) = crate::session::tests::make_session_and_context().await;
         let other = session
             .capture_step_context(Arc::new(other_turn))
@@ -302,6 +317,8 @@ mod snapshot_deadline_tests {
                 revision: 17,
                 tools: Arc::new(Vec::new()),
                 resources_available: true,
+                pending_servers: Vec::new(),
+                failed_servers: Vec::new(),
             }
         })
         .await;

@@ -22,6 +22,7 @@ use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_tools::DiscoverablePluginInfo;
@@ -365,50 +366,6 @@ async fn removed_workspace_workers_are_not_exposed_or_registered() {
 }
 
 #[tokio::test]
-async fn token_budget_tools_require_feature_activation() {
-    for (enabled, notes, history) in [
-        (false, true, true),
-        (true, false, false),
-        (true, true, false),
-        (true, false, true),
-        (true, true, true),
-    ] {
-        let extension_tool_executors = crate::session::tests::token_budget_recovery_tool_stubs()
-            .into_iter()
-            .filter(|executor| {
-                let name = executor.tool_name();
-                (notes && name == ToolName::namespaced("notes", "write_file"))
-                    || (history && name == ToolName::namespaced("history", "read_item"))
-            })
-            .collect();
-        let plan = probe_with(
-            |turn| set_feature(turn, Feature::TokenBudget, enabled),
-            ToolPlanInputs {
-                extension_tool_executors,
-                ..ToolPlanInputs::default()
-            },
-        )
-        .await;
-        let names = &["get_context_remaining"];
-        if enabled {
-            plan.assert_visible_contains(names);
-            plan.assert_registered_contains(names);
-        } else {
-            plan.assert_visible_lacks(names);
-            plan.assert_registered_lacks(names);
-        }
-        // A fresh window discards history, so it needs the notes/history recovery tools.
-        if enabled && notes && history {
-            plan.assert_visible_contains(&["new_context"]);
-            plan.assert_registered_contains(&["new_context"]);
-        } else {
-            plan.assert_visible_lacks(&["new_context"]);
-            plan.assert_registered_lacks(&["new_context"]);
-        }
-    }
-}
-
-#[tokio::test]
 async fn read_file_is_visible_and_registered_for_text_models() {
     let plan = probe(|turn| turn.model_info.input_modalities = vec![InputModality::Text]).await;
     plan.assert_visible_contains(&["read_file", "list_files"]);
@@ -420,6 +377,67 @@ async fn read_file_is_available_without_an_execution_environment() {
     let plan = probe(|turn| turn.environments.turn_environments.clear()).await;
     plan.assert_visible_contains(&["read_file"]);
     plan.assert_registered_contains(&["read_file"]);
+    plan.assert_visible_lacks(&["read_status", "list_files", "save_turn_diff"]);
+    plan.assert_registered_lacks(&["read_status", "list_files", "save_turn_diff"]);
+}
+
+#[tokio::test]
+async fn environment_projection_matches_status_routes_and_nested_listing() {
+    for mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+        for profile in [
+            "empty",
+            "ready",
+            "starting",
+            "starting_with_ready_secondary",
+        ] {
+            let plan = probe(|turn| {
+                turn.model_info.tool_mode = Some(mode);
+                if profile == "empty" {
+                    turn.environments.turn_environments.clear();
+                } else if profile.starts_with("starting") {
+                    let primary = turn.environments.turn_environments.remove(0);
+                    if profile == "starting_with_ready_secondary" {
+                        let mut secondary = primary.clone();
+                        secondary.environment_id = "secondary".into();
+                        turn.environments.turn_environments.push(secondary);
+                    }
+                    turn.environments.starting.push(
+                        crate::environment_selection::StartingTurnEnvironment::for_test(
+                            primary,
+                            0,
+                            Arc::new(tokio::sync::Notify::new()),
+                        ),
+                    );
+                }
+            })
+            .await;
+            if profile == "empty" {
+                plan.assert_registered_lacks(&["read_status"]);
+            } else {
+                plan.assert_registered_contains(&["read_status"]);
+            }
+            plan.assert_registered_contains(&["read_file", "read_tool_output"]);
+            let has_listing = matches!(profile, "ready" | "starting_with_ready_secondary");
+            if has_listing {
+                plan.assert_registered_contains(&["list_files"]);
+            } else {
+                plan.assert_registered_lacks(&["list_files"]);
+            }
+            if mode != ToolMode::Direct {
+                let ToolSpec::Freeform(exec) = plan.visible_spec("exec") else {
+                    panic!("expected exec tool");
+                };
+                assert_eq!(
+                    exec.description.contains("await tools.list_files("),
+                    has_listing
+                );
+                assert_eq!(
+                    exec.description.contains("read_status"),
+                    profile != "empty" && mode == ToolMode::CodeModeOnly
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -928,18 +946,36 @@ async fn code_mode_eager_plan_contract_exposes_requirement_resolution() {
     // status update succeeds; the eager contract must explain that first call.
     assert!(exec.description.contains("resolve?:"));
     assert!(exec.description.contains("Original requirement IDs"));
-    assert!(exec.description.contains("completing renamed/split/merged descendants"));
-    assert!(exec.description.contains("every mapped descendant must be completed"));
-    assert!(!exec.description.contains("a rejected revision names the field"));
-    assert!(exec.description.contains("before retiring scope or linking"));
+    assert!(
+        exec.description
+            .contains("completing renamed/split/merged descendants")
+    );
+    assert!(
+        exec.description
+            .contains("every mapped descendant must be completed")
+    );
+    assert!(
+        !exec
+            .description
+            .contains("a rejected revision names the field")
+    );
+    assert!(
+        exec.description
+            .contains("before retiring scope or linking")
+    );
     // Keep unrelated administrative contracts lazy, not removed from the owner.
-    let ToolSpec::Function(full) =
-        crate::tools::handlers::plan_spec::create_update_plan_tool()
+    let ToolSpec::Function(full) = crate::tools::handlers::plan_spec::create_update_plan_tool()
     else {
         panic!("expected plan tool");
     };
     let properties = full.parameters.properties.as_ref().unwrap();
-    for field in ["resolve", "superseded", "scope_change_instructions", "scope_change_refs", "workflow"] {
+    for field in [
+        "resolve",
+        "superseded",
+        "scope_change_instructions",
+        "scope_change_refs",
+        "workflow",
+    ] {
         assert!(properties.contains_key(field));
         if field != "resolve" {
             assert!(!exec.description.contains(&format!("{field}?:")));
@@ -1053,7 +1089,10 @@ async fn code_mode_exposes_bootstrap_contracts_and_keeps_other_builtins_resolvab
     for exec in [mixed_exec, nested_exec] {
         assert_eq!(exec.description.matches("declare const tools").count(), 1);
         // Command results are declared once by name instead of `unknown`.
-        assert!(exec.description.contains("type CodeModeExecCommandResult = {"));
+        assert!(
+            exec.description
+                .contains("type CodeModeExecCommandResult = {")
+        );
         assert_eq!(
             exec.description
                 .matches("Promise<CodeModeExecCommandResult>")
@@ -1660,7 +1699,8 @@ async fn host_context_gates_agent_job_tools() {
             SessionSource::SubAgent(SubAgentSource::Other("agent_job:42".to_string()));
     })
     .await;
-    worker_agent_job.assert_visible_contains(&["spawn_agents_on_csv", "report_agent_job_result"]);
+    worker_agent_job.assert_visible_contains(&["report_agent_job_result"]);
+    worker_agent_job.assert_registered_lacks(&["spawn_agents_on_csv"]);
     assert_eq!(
         worker_agent_job.authorization_class("report_agent_job_result"),
         TypedToolClass::OwnTask
@@ -1682,7 +1722,7 @@ async fn host_context_gates_agent_job_tools() {
     })
     .await;
     v2_worker.assert_visible_contains(&["report_agent_job_result"]);
-    v2_worker.assert_registered_contains(&["spawn_agents_on_csv"]);
+    v2_worker.assert_registered_lacks(&["spawn_agents_on_csv"]);
 
     let remote_agent_job = probe(|turn| {
         set_feature(turn, Feature::SpawnCsv, /*enabled*/ true);
@@ -2122,6 +2162,117 @@ async fn dynamic_tool_name_collisions_use_the_shared_first_registration_policy()
                 .any(|warning| { warning.contains(name) && warning.contains("Rename or disable") }),
             "expected an actionable collision warning for `{name}`"
         );
+    }
+}
+
+#[tokio::test]
+async fn generated_search_wins_before_the_nested_catalog_is_captured() {
+    use crate::tools::context::ToolDispatchState;
+    use crate::tools::context::ToolPayload;
+    use crate::tools::router::ToolCall;
+    use crate::tools::router::ToolCallSource;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+    use tokio_util::sync::CancellationToken;
+
+    for mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+        for search in [false, true] {
+            for optional_name in ["tool_search", "lookup"] {
+                let (mut session, mut turn) = make_session_and_context().await;
+                session.services.code_mode_service = crate::tools::code_mode::CodeModeService::new(
+                    Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider),
+                );
+                turn.model_info.tool_mode = Some(mode);
+                turn.model_info.supports_search_tool = search;
+                let dynamic_tools = vec![dynamic_tool(None, optional_name, false)];
+                codex_tools::validate_dynamic_tools(&dynamic_tools).unwrap();
+                let step = StepContext::for_test(Arc::new(turn));
+                let session = Arc::new(session);
+                let cache = ToolSearchHandlerCache::default();
+                let router = ToolRouter::try_from_context(
+                    &step,
+                    ToolRouterParams {
+                        mcp_tools: Some(Vec::new()),
+                        deferred_mcp_tools: None,
+                        tool_suggest_candidates: None,
+                        extension_tool_executors: Vec::new(),
+                        dynamic_tools: &dynamic_tools,
+                        exposure_identity: ToolExposureIdentity {
+                            mcp_resources_available: true,
+                            ..Default::default()
+                        },
+                    },
+                    &cache,
+                )
+                .unwrap();
+                let router = Arc::new(router);
+                let step = step.with_tool_router_for_test(Arc::clone(&router));
+                let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+                // A live JS cell cannot dispatch nested tools until the normal
+                // turn worker owns the broker's dequeue loop.
+                let worker = session.services.code_mode_service.start_turn_worker(
+                    &session,
+                    Arc::clone(&step),
+                    Arc::clone(&tracker),
+                    Default::default(),
+                );
+                if search {
+                    assert_eq!(
+                        router.tool_authorization_class_for_test(&ToolName::plain("tool_search")),
+                        Some(TypedToolClass::ReadSearch)
+                    );
+                }
+                if mode != ToolMode::Direct {
+                    let state = Arc::new(ToolDispatchState::new());
+                    assert!(state.try_admit());
+                    let code = if search {
+                        "const found = await tools.tool_search({query:'read_mcp_resource',limit:1}); if (!JSON.stringify(found).includes('read_mcp_resource')) throw new Error('native search did not return the owned reader'); text('native-search-oracle'); text('catalog-oracle');"
+                    } else {
+                        "text('catalog-oracle');"
+                    };
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(10), router
+                        .dispatch_tool_call_with_terminal_outcome(
+                            Arc::clone(&session),
+                            Arc::clone(&step),
+                            CancellationToken::new(),
+                            Arc::clone(&tracker),
+                            ToolCall {
+                                tool_name: ToolName::plain("exec"),
+                                call_id: "catalog".into(),
+                                payload: ToolPayload::Custom { input: code.into() },
+                            },
+                            ToolCallSource::Direct,
+                            state,
+                        ))
+                        .await
+                        .unwrap_or_else(|_| panic!("catalog dispatch timed out: mode={mode:?}, search={search}, optional={optional_name}"))
+                        .unwrap();
+                    let output = result.result.log_preview();
+                    assert!(result.success_for_logging(), "{output}");
+                    assert!(output.contains("catalog-oracle"), "{output}");
+                    if search {
+                        assert!(output.contains("native-search-oracle"), "{output}");
+                    }
+                }
+                session.services.code_mode_service.shutdown().await.unwrap();
+                drop(worker);
+                assert_eq!(
+                    router
+                        .registered_tool_names_for_test()
+                        .iter()
+                        .filter(|name| **name == ToolName::plain("tool_search"))
+                        .count(),
+                    usize::from(search || optional_name == "tool_search")
+                );
+                assert_eq!(
+                    router
+                        .planning_warnings()
+                        .iter()
+                        .any(|warning| warning.contains("tool_search")
+                            && warning.contains("Rename or disable")),
+                    search && optional_name == "tool_search"
+                );
+            }
+        }
     }
 }
 
@@ -3480,4 +3631,88 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
     })
     .await;
     unsupported_provider.assert_visible_lacks(&["web_search"]);
+}
+#[tokio::test]
+async fn local_provider_rejects_required_dynamic_namespaces_before_sampling() {
+    let (_session, mut turn) = make_session_and_context().await;
+    turn.model_info.tool_mode = Some(ToolMode::Direct);
+    turn.provider = codex_model_provider::create_model_provider(
+        codex_model_provider_info::built_in_model_providers(None)
+            .remove("ollama")
+            .unwrap(),
+        None,
+    );
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(turn);
+    let cache = ToolSearchHandlerCache::default();
+    for (namespace, supported) in [(Some("audit_tools"), false), (None, true)] {
+        let tools = vec![dynamic_tool(namespace, "lookup", false)];
+        let result = ToolRouter::try_from_context(
+            step_context.as_ref(),
+            ToolRouterParams {
+                mcp_tools: None,
+                deferred_mcp_tools: None,
+                tool_suggest_candidates: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &tools,
+                exposure_identity: ToolExposureIdentity::default(),
+            },
+            &cache,
+        );
+        if supported {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                result
+                    .err()
+                    .expect("unsupported namespace")
+                    .contains("does not support namespaced dynamic tools")
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn v1_initial_nested_catalog_keeps_child_lifecycle() {
+    for mode in [ToolMode::Direct, ToolMode::CodeMode, ToolMode::CodeModeOnly] {
+        for search in [false, true] {
+            for policy in ["normal", "excluded", "direct_only"] {
+                let plan = probe_with(
+                    |turn| {
+                        set_feature(turn, Feature::MultiAgentV2, false);
+                        turn.multi_agent_version = MultiAgentVersion::V1;
+                        turn.model_info.tool_mode = Some(mode);
+                        turn.model_info.supports_search_tool = search;
+                        update_config(turn, |config| match policy {
+                            "excluded" => {
+                                config.code_mode.excluded_tool_namespaces =
+                                    vec![MULTI_AGENT_V1_NAMESPACE.into()]
+                            }
+                            "direct_only" => {
+                                config.code_mode.direct_only_tool_namespaces =
+                                    vec![MULTI_AGENT_V1_NAMESPACE.into()]
+                            }
+                            _ => {}
+                        });
+                    },
+                    ToolPlanInputs {
+                        exposure_identity: ToolExposureIdentity {
+                            agent_surface_stage: AgentSurfaceStage::SpawnOnly,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await;
+                let expected = mode != ToolMode::Direct && policy == "normal";
+                for tool in ["send_input", "resume_agent", "wait_agent", "close_agent"] {
+                    let name = ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, tool).to_string();
+                    if expected {
+                        plan.assert_registered_contains(&[&name]);
+                    } else {
+                        plan.assert_registered_lacks(&[&name]);
+                    }
+                }
+            }
+        }
+    }
 }

@@ -1,11 +1,9 @@
-use std::io::ErrorKind;
 use std::path::Path;
 
-use crate::rollout::SESSIONS_SUBDIR;
 use codex_protocol::error::CodexErr;
 use codex_thread_store::ThreadStoreError;
 
-pub(crate) fn map_session_init_error(err: &anyhow::Error, codex_home: &Path) -> CodexErr {
+pub(crate) fn map_session_init_error(err: &anyhow::Error, _codex_home: &Path) -> CodexErr {
     if let Some(ThreadStoreError::Unsupported { operation }) = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<ThreadStoreError>())
@@ -13,45 +11,33 @@ pub(crate) fn map_session_init_error(err: &anyhow::Error, codex_home: &Path) -> 
         return CodexErr::UnsupportedOperation(format!("{operation} is not supported yet"));
     }
 
-    if let Some(mapped) = err
-        .chain()
-        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-        .find_map(|io_err| map_rollout_io_error(io_err, codex_home))
-    {
-        return mapped;
-    }
-
+    // Session startup also performs network-policy and configuration I/O.
+    // An I/O kind alone cannot identify a storage path or justify data repair.
     CodexErr::Fatal(format!("Failed to initialize session: {err:#}"))
 }
 
-fn map_rollout_io_error(io_err: &std::io::Error, codex_home: &Path) -> Option<CodexErr> {
-    let sessions_dir = codex_home.join(SESSIONS_SUBDIR);
-    let hint = match io_err.kind() {
-        ErrorKind::PermissionDenied => format!(
-            "Codex cannot access session files at {} (permission denied). If sessions were created using sudo, fix ownership: sudo chown -R $(whoami) {}",
-            sessions_dir.display(),
-            codex_home.display()
-        ),
-        ErrorKind::NotFound => format!(
-            "Session storage missing at {}. Create the directory or choose a different Codex home.",
-            sessions_dir.display()
-        ),
-        ErrorKind::AlreadyExists => format!(
-            "Session storage path {} is blocked by an existing file. Remove or rename it so Codex can create sessions.",
-            sessions_dir.display()
-        ),
-        ErrorKind::InvalidData | ErrorKind::InvalidInput => format!(
-            "Session data under {} looks corrupt or unreadable. Clearing the sessions directory may help (this will remove saved threads).",
-            sessions_dir.display()
-        ),
-        ErrorKind::IsADirectory | ErrorKind::NotADirectory => format!(
-            "Session storage path {} has an unexpected type. Ensure it is a directory Codex can use for session files.",
-            sessions_dir.display()
-        ),
-        _ => return None,
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    Some(CodexErr::Fatal(format!(
-        "{hint} (underlying error: {io_err})"
-    )))
+    #[test]
+    fn io_kind_does_not_imply_session_storage_failure() {
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::AlreadyExists,
+        ] {
+            let err = anyhow::Error::new(std::io::Error::new(kind, "network policy rejected"))
+                .context("managed proxy initialization");
+            let CodexErr::Fatal(message) = map_session_init_error(&err, Path::new("home")) else {
+                panic!("expected fatal initialization error");
+            };
+            assert_eq!(
+                message,
+                "Failed to initialize session: managed proxy initialization: network policy rejected"
+            );
+        }
+    }
 }

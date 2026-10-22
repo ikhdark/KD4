@@ -179,6 +179,22 @@ pub(crate) fn build_agent_spawn_config(turn: &TurnContext) -> Result<Config, Fun
     Ok(config)
 }
 
+/// New work uses the admitting step's cwd before role/model configuration is resolved.
+/// Resume intentionally continues to use its separate stored-child configuration path.
+pub(crate) fn build_agent_spawn_config_for_step(
+    step: &crate::session::step_context::StepContext,
+) -> Result<Config, FunctionCallError> {
+    let mut config = build_agent_spawn_config(&step.turn)?;
+    if let Some(cwd) = step
+        .environments
+        .primary()
+        .and_then(|primary| primary.cwd().to_abs_path().ok())
+    {
+        config.cwd = cwd;
+    }
+    Ok(config)
+}
+
 pub(crate) fn build_agent_resume_config(turn: &TurnContext) -> Result<Config, FunctionCallError> {
     let mut config = build_agent_shared_config(turn)?;
     // For resume, keep base instructions sourced from rollout/session metadata.
@@ -225,6 +241,7 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     turn: &TurnContext,
     role_locks: AgentRoleLocks,
 ) -> Result<(), FunctionCallError> {
+    let role_permissions = config.permissions.clone();
     if !role_locks.permissions {
         config.permissions = turn.config.permissions.clone();
         config
@@ -233,6 +250,25 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
             })?;
+    }
+    config.permissions.allow_login_shell = if role_locks.allow_login_shell {
+        role_permissions.allow_login_shell
+    } else {
+        turn.config.permissions.allow_login_shell
+    };
+    config.permissions.shell_environment_policy = if role_locks.shell_environment_policy {
+        role_permissions.shell_environment_policy
+    } else {
+        turn.config.permissions.shell_environment_policy.clone()
+    };
+    config.permissions.windows_sandbox_private_desktop = if role_locks.windows_private_desktop {
+        role_permissions.windows_sandbox_private_desktop
+    } else {
+        turn.config.permissions.windows_sandbox_private_desktop
+    };
+    if role_locks.windows_sandbox {
+        config.permissions.windows_sandbox_mode = role_permissions.windows_sandbox_mode;
+    } else {
         config.permissions.windows_sandbox_mode = match turn.windows_sandbox_level {
             WindowsSandboxLevel::Elevated => Some(WindowsSandboxModeToml::Elevated),
             WindowsSandboxLevel::RestrictedToken => Some(WindowsSandboxModeToml::Unelevated),
@@ -336,11 +372,15 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     if let Some(reasoning_effort) = reasoning_effort.as_ref()
         && (!role_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata)
     {
-        validate_spawn_agent_reasoning_effort(
-            &selected_model_name,
-            &selected_model_info.supported_reasoning_levels,
-            reasoning_effort,
-        )?;
+        let wire_effort = crate::client::request_effort_for_model(
+            &selected_model_info,
+            Some(reasoning_effort.clone()),
+        );
+        crate::client::validate_request_effort_for_model(
+            &selected_model_info,
+            wire_effort.as_ref(),
+        )
+        .map_err(FunctionCallError::RespondToModel)?;
     }
     config.model_reasoning_effort = reasoning_effort;
 
@@ -509,26 +549,18 @@ fn default_spawn_reasoning_effort(
         .or_else(|| supported.first().map(|preset| preset.effort.clone()))
 }
 
+#[cfg(test)]
 fn validate_spawn_agent_reasoning_effort(
     model: &str,
     supported_reasoning_levels: &[ReasoningEffortPreset],
     requested_reasoning_effort: &ReasoningEffort,
 ) -> Result<(), FunctionCallError> {
-    if supported_reasoning_levels
-        .iter()
-        .any(|preset| &preset.effort == requested_reasoning_effort)
-    {
-        return Ok(());
-    }
-
-    let supported = supported_reasoning_levels
-        .iter()
-        .map(|preset| preset.effort.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(FunctionCallError::RespondToModel(format!(
-        "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
-    )))
+    crate::client::validate_reasoning_effort(
+        model,
+        supported_reasoning_levels,
+        requested_reasoning_effort,
+    )
+    .map_err(FunctionCallError::RespondToModel)
 }
 
 #[cfg(test)]
@@ -582,10 +614,73 @@ mod model_limit_provenance_tests {
             config.model_auto_compact_token_limit = limits.1;
             for model in ["custom-child-model", "custom-grandchild-model"] {
                 config.model = Some(model.into());
-                apply_spawn_agent_model_defaults_and_overrides(&session, &turn, &mut config,
-                    None, None, AgentRoleLocks { model: true, ..Default::default() }).await.unwrap();
-                assert_eq!((config.model_context_window, config.model_auto_compact_token_limit), limits);
+                apply_spawn_agent_model_defaults_and_overrides(
+                    &session,
+                    &turn,
+                    &mut config,
+                    None,
+                    None,
+                    AgentRoleLocks {
+                        model: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    (
+                        config.model_context_window,
+                        config.model_auto_compact_token_limit
+                    ),
+                    limits
+                );
             }
+        }
+    }
+}
+#[cfg(test)]
+mod role_permission_ownership_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn shell_only_role_fields_do_not_freeze_or_lose_the_live_permission_profile() {
+        for sandbox in ["", "sandbox_mode = 'read-only'\n"] {
+            let (_session, mut turn) = crate::session::tests::make_session_and_context().await;
+            turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+            let mut parent = (*turn.config).clone();
+            parent.permissions.allow_login_shell = true;
+            parent.permissions.shell_environment_policy = Default::default();
+            turn.config = Arc::new(parent);
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("shell.toml");
+            std::fs::write(&path, format!("{sandbox}allow_login_shell = false\n[shell_environment_policy]\ninherit = 'none'\n")).unwrap();
+            let mut child = build_agent_spawn_config(&turn).unwrap();
+            child.agent_roles.insert(
+                "shell".into(),
+                crate::config::AgentRoleConfig {
+                    config_file: Some(path),
+                    ..Default::default()
+                },
+            );
+            let locks = crate::agent::role::apply_role_to_config(&mut child, Some("shell"))
+                .await
+                .unwrap();
+            apply_spawn_agent_runtime_overrides(&mut child, &turn, locks).unwrap();
+            assert!(!child.permissions.allow_login_shell);
+            let expected = codex_protocol::config_types::ShellEnvironmentPolicy {
+                inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::None,
+                ..Default::default()
+            };
+            assert_eq!(child.permissions.shell_environment_policy, expected);
+            assert_eq!(
+                child.permissions.permission_profile(),
+                &if sandbox.is_empty() {
+                    turn.permission_profile()
+                } else {
+                    codex_protocol::models::PermissionProfile::read_only()
+                }
+            );
         }
     }
 }

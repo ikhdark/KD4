@@ -28,6 +28,184 @@ async fn wait_until_released(pause_state: &mut watch::Receiver<bool>) {
         .expect("elicitation service should remain available");
 }
 
+pub(crate) struct InteractionOwnerTask;
+
+// Registry-cleanup controls need a live owner but must not emit startup events
+// into their deliberately full one-slot event channel.
+pub(crate) fn registry_interaction_owner(
+    turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
+) -> ActiveTurn {
+    let worker = tokio::spawn(async {});
+    let cancellation = CancellationToken::new();
+    let terminal = TurnTerminalCoordinator::new(turn.sub_id.clone());
+    ActiveTurn {
+        task: Some(crate::state::RunningTask {
+            done: std::sync::Arc::new(tokio::sync::Notify::new()),
+            worker_done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            kind: crate::state::TaskKind::Regular,
+            task: std::sync::Arc::new(InteractionOwnerTask),
+            auxiliary_cancellation_token: cancellation.child_token(),
+            cancellation_token: cancellation,
+            auxiliary_tasks: tokio::task::JoinSet::new(),
+            worker_abort_handle: worker.abort_handle(),
+            task_span: tracing::Span::none(),
+            turn_context: turn,
+            _agent_execution_guard: None,
+        }),
+        terminal: Some(terminal),
+        ..Default::default()
+    }
+}
+
+impl crate::tasks::SessionTask for InteractionOwnerTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "session_task.interaction_owner_fixture"
+    }
+    fn run(
+        self: std::sync::Arc<Self>,
+        _session: std::sync::Arc<crate::session::session::Session>,
+        _turn: std::sync::Arc<crate::session::turn_context::TurnContext>,
+        _input: Vec<crate::session::TurnInput>,
+        cancellation: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, crate::tasks::SessionTaskResult> {
+        Box::pin(async move {
+            cancellation.cancelled().await;
+            Ok(crate::tasks::TurnTaskResult::default())
+        })
+    }
+}
+
+#[tokio::test]
+async fn mcp_elicitation_rejects_idle_taskless_claimed_and_wrong_owner() {
+    use codex_protocol::approvals::ElicitationRequest;
+    use rmcp::model::RequestId;
+    for owner in [None, Some("taskless"), Some("claimed"), Some("successor")] {
+        let mut terminal_permit = None;
+        let (session, turn, events) = make_session_and_context_with_rx().await;
+        session
+            .services
+            .latest_mcp_runtime()
+            .manager()
+            .set_elicitations_auto_deny(false);
+        if let Some(owner) = owner {
+            if owner == "successor" {
+                let successor = session
+                    .new_default_turn_with_sub_id("successor".into())
+                    .await;
+                session
+                    .spawn_task(successor, Vec::new(), InteractionOwnerTask)
+                    .await;
+            } else {
+                let terminal = TurnTerminalCoordinator::new(turn.sub_id.clone());
+                if owner == "claimed" {
+                    terminal_permit = terminal.try_claim();
+                }
+                *session.active_turn.lock().await = Some(ActiveTurn {
+                    terminal: Some(terminal),
+                    ..Default::default()
+                });
+            }
+        }
+        let result = session
+            .request_mcp_server_elicitation(
+                &turn,
+                "probe".into(),
+                RequestId::String("probe".into()),
+                ElicitationRequest::Form {
+                    meta: None,
+                    message: "old request".into(),
+                    requested_schema: serde_json::json!({"type":"object"}),
+                },
+            )
+            .await;
+        assert!(!result.sent);
+        assert!(result.response.is_none());
+        assert!(!*session.subscribe_elicitation_pause_state().borrow());
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event.msg,
+                codex_protocol::protocol::EventMsg::ElicitationRequest(_)
+            ));
+        }
+        let turn_state = session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| std::sync::Arc::clone(&active.turn_state));
+        if let Some(turn_state) = turn_state {
+            assert!(
+                !turn_state
+                    .lock()
+                    .await
+                    .has_pending_elicitation("probe", &RequestId::String("probe".into()))
+            );
+        }
+        drop(terminal_permit);
+        if owner == Some("successor") {
+            session
+                .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+                .await;
+        } else {
+            session.active_turn.lock().await.take();
+        }
+    }
+}
+
+#[tokio::test]
+async fn matching_live_mcp_owner_receives_one_question_and_answer() {
+    use codex_protocol::approvals::ElicitationRequest;
+    use rmcp::model::RequestId;
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    session
+        .services
+        .latest_mcp_runtime()
+        .manager()
+        .set_elicitations_auto_deny(false);
+    session
+        .spawn_task(turn.clone(), Vec::new(), InteractionOwnerTask)
+        .await;
+    let id = RequestId::String("live-question".into());
+    let mut request = Box::pin(session.request_mcp_server_elicitation(
+        &turn,
+        "probe".into(),
+        id.clone(),
+        ElicitationRequest::Form {
+            meta: None,
+            message: "current request".into(),
+            requested_schema: serde_json::json!({"type":"object"}),
+        },
+    ));
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    loop {
+        if let codex_protocol::protocol::EventMsg::ElicitationRequest(event) =
+            events.recv().await.unwrap().msg
+        {
+            assert_eq!(event.turn_id.as_deref(), Some(turn.sub_id.as_str()));
+            break;
+        }
+    }
+    let response = codex_rmcp_client::ElicitationResponse {
+        action: codex_rmcp_client::ElicitationAction::Accept,
+        content: Some(serde_json::json!({})),
+        meta: None,
+    };
+    session
+        .resolve_elicitation("probe".into(), id, response.clone())
+        .await
+        .unwrap();
+    let result = request.await;
+    assert!(result.sent);
+    assert_eq!(result.response, Some(response));
+    assert!(!*session.subscribe_elicitation_pause_state().borrow());
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+}
+
 #[tokio::test]
 async fn command_approval_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;

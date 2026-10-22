@@ -9,6 +9,51 @@ use pretty_assertions::assert_eq;
 
 use super::*;
 
+#[tokio::test]
+async fn incomplete_responses_preserve_status_for_both_helpers_without_retry() {
+    for (status, detailed) in [(200, false), (200, true), (401, true), (429, true)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let url = format!("http://{address}/body");
+        let client = Client::new(
+            format!("http://{address}"),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        );
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream.write_all(format!("HTTP/1.1 {status} synthetic\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort").as_bytes()).await.unwrap();
+        });
+        let request = client.http.post(&url);
+        let error = if detailed {
+            client
+                .exec_request_detailed(request, "POST", &url)
+                .await
+                .unwrap_err()
+        } else {
+            client
+                .exec_request(request, "POST", &url)
+                .await
+                .unwrap_err()
+                .downcast::<RequestError>()
+                .unwrap()
+        };
+        assert_eq!(error.status().unwrap().as_u16(), status);
+        assert_eq!(error.is_unauthorized(), status == 401);
+        assert!(matches!(error, RequestError::IncompleteResponse { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("request dispatched; response incomplete")
+        );
+        server.await.unwrap();
+    }
+}
+
 #[test]
 fn client_preserves_supplied_http_client_factory_policy() {
     let client = Client::new(

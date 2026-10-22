@@ -479,7 +479,9 @@ async fn collect_model_verification_and_warnings(
                     .params
                     .as_ref()
                     .and_then(|params| params["message"].as_str())
-                    .ok_or_else(|| anyhow::anyhow!("warning notifications must include a message"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("warning notifications must include a message")
+                    })?;
                 warnings.push(message.to_string());
             }
             "model/rerouted" => {

@@ -14,13 +14,13 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use clap::Parser;
-use reqwest::Url;
-use reqwest::blocking::Client;
-use reqwest::header::AUTHORIZATION;
-use reqwest::header::HOST;
-use reqwest::header::HeaderMap;
-use reqwest::header::HeaderName;
-use reqwest::header::HeaderValue;
+use codex_http_client::BlockingHttpClient;
+use codex_http_client::BlockingHttpClientBuilder;
+use http::header::AUTHORIZATION;
+use http::header::HOST;
+use http::HeaderMap;
+use http::HeaderName;
+use http::HeaderValue;
 use serde::Serialize;
 use tiny_http::Header;
 use tiny_http::Method;
@@ -28,6 +28,7 @@ use tiny_http::Request;
 use tiny_http::Response;
 use tiny_http::Server;
 use tiny_http::StatusCode;
+use url::Url;
 
 mod dump;
 mod read_api_key;
@@ -133,12 +134,12 @@ pub fn run_main(args: Args) -> Result<()> {
     let server = Server::from_listener(listener, None)
         .map_err(|err| anyhow!("creating HTTP server: {err}"))?;
     let client = Arc::new(
-        Client::builder()
-            // Disable reqwest's 30s default so long-lived response streams keep flowing.
-            .timeout(None::<Duration>)
+        BlockingHttpClientBuilder::new()
+            // Keep long-lived response streams independent of the connection deadline.
+            .request_timeout(None)
             .connect_timeout(Duration::from_secs(30))
-            .build()
-            .context("building reqwest client")?,
+            .build_with_transport_default_proxy()
+            .context("building HTTP client")?,
     );
 
     eprintln!("responses-api-proxy listening on {bound_addr}");
@@ -202,7 +203,7 @@ fn write_server_info(path: &Path, port: u16) -> Result<()> {
 }
 
 fn forward_request(
-    client: &Client,
+    client: &BlockingHttpClient,
     auth_header: &'static str,
     config: &ForwardConfig,
     dump_dir: Option<&ExchangeDumper>,
@@ -219,7 +220,10 @@ fn forward_request(
         return Ok(());
     }
 
-    if req.body_length().is_some_and(|length| length as u64 > config.max_request_bytes) {
+    if req
+        .body_length()
+        .is_some_and(|length| length as u64 > config.max_request_bytes)
+    {
         let _ = req.respond(Response::new_empty(StatusCode(413)));
         return Ok(());
     }
@@ -228,9 +232,26 @@ fn forward_request(
         return Ok(());
     };
 
+    let request_connection_fields = connection_fields(
+        req.headers()
+            .iter()
+            .filter(|header| header.field.equiv("connection"))
+            .map(|header| header.value.as_str()),
+    );
+    let incoming_headers = req
+        .headers()
+        .iter()
+        .filter(|header| {
+            !is_hop_header(
+                header.field.as_str().to_ascii_lowercase().as_str(),
+                &request_connection_fields,
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let exchange_dump = dump_dir.and_then(|dump_dir| {
         dump_dir
-            .dump_request(&method, &url_path, req.headers(), &body)
+            .dump_request(&method, &url_path, &incoming_headers, &body)
             .map_err(|err| {
                 eprintln!("responses-api-proxy failed to dump request: {err}");
                 err
@@ -238,10 +259,9 @@ fn forward_request(
             .ok()
     });
 
-    // Build headers for upstream, forwarding everything from the incoming
-    // request except Authorization (we replace it below).
+    // Forward only end-to-end fields, replacing origin authentication below.
     let mut headers = HeaderMap::new();
-    for header in req.headers() {
+    for header in &incoming_headers {
         let name_ascii = header.field.as_str();
         let lower = name_ascii.to_ascii_lowercase();
         if lower.as_str() == "authorization" || lower.as_str() == "host" {
@@ -266,24 +286,25 @@ fn forward_request(
     headers.insert(HOST, config.host_header.clone());
 
     let upstream_resp = client
-        .post(config.upstream_url.clone())
+        .post(config.upstream_url.as_str())
         .headers(headers)
         .body(body)
         .send()
         .context("forwarding request to upstream")?;
 
-    // We have to create an adapter between a `reqwest::blocking::Response`
-    // and a `tiny_http::Response`. Fortunately, `reqwest::blocking::Response`
-    // implements `Read`, so we can use it directly as the body of the
-    // `tiny_http::Response`.
+    // The HTTP facade response implements Read, so forwarding remains streaming.
     let status = upstream_resp.status();
+    let connection_fields = connection_fields(
+        upstream_resp
+            .headers()
+            .get_all("connection")
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    );
     let mut response_headers = Vec::new();
     for (name, value) in upstream_resp.headers().iter() {
         // Skip headers that tiny_http manages itself.
-        if matches!(
-            name.as_str(),
-            "content-length" | "transfer-encoding" | "connection" | "trailer" | "upgrade"
-        ) {
+        if is_hop_header(name.as_str(), &connection_fields) {
             continue;
         }
 
@@ -319,9 +340,100 @@ fn forward_request(
     Ok(())
 }
 
+fn connection_fields<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    values
+        .flat_map(|value| value.split(','))
+        .map(|field| field.trim().to_ascii_lowercase())
+        .collect()
+}
+
+fn is_hop_header(name: &str, connection_fields: &[String]) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "content-length"
+    ) || connection_fields
+        .iter()
+        .any(|field| field.eq_ignore_ascii_case(name))
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn forwarding_removes_credentials_and_all_connection_nominated_fields() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let proxy = Server::http("127.0.0.1:0").unwrap();
+        let proxy_address = proxy.server_addr().to_ip().unwrap();
+        let origin_task = std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+            assert!(!headers.contains("proxy-authorization:"));
+            assert!(!headers.contains("x-hop-private:"));
+            assert!(!headers.contains("x-second-hop:"));
+            assert!(headers.contains("authorization: bearer origin-secret\r\n"));
+            stream.read_exact(&mut [0; 2]).unwrap();
+            // tiny_http discards Connection on responses; write it on the wire so this
+            // fixture exercises response-nominated header sanitation too.
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: x-response-private, close\r\nx-response-private: hidden\r\n\r\nok").unwrap();
+        });
+        let proxy_task = std::thread::spawn(move || {
+            let client = BlockingHttpClientBuilder::new().build_direct().unwrap();
+            let request = proxy.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+            forward_request(
+                &client,
+                "Bearer origin-secret",
+                &ForwardConfig {
+                    upstream_url: Url::parse(&format!("http://{origin_address}/v1/responses"))
+                        .unwrap(),
+                    host_header: HeaderValue::from_str(&origin_address.to_string()).unwrap(),
+                    max_request_bytes: 1024,
+                },
+                None,
+                request,
+            )
+            .unwrap();
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "proxy-authorization",
+            HeaderValue::from_static("Basic caller-secret"),
+        );
+        headers.append("connection", HeaderValue::from_static("X-Hop-Private"));
+        headers.append("connection", HeaderValue::from_static(" x-second-hop"));
+        headers.insert("x-hop-private", HeaderValue::from_static("private"));
+        headers.insert("x-second-hop", HeaderValue::from_static("private"));
+        let response = BlockingHttpClientBuilder::new()
+            .build_direct()
+            .unwrap()
+            .post(format!("http://{proxy_address}/v1/responses"))
+            .headers(headers)
+            .body(b"{}".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(!response.headers().contains_key("x-response-private"));
+        assert_eq!(response.text().unwrap(), "ok");
+        proxy_task.join().unwrap();
+        origin_task.join().unwrap();
+    }
 
     #[test]
     fn blocked_worker_retains_one_slot_without_unbounded_admission() {

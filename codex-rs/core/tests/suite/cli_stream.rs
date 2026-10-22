@@ -277,13 +277,10 @@ async fn exec_cli_applies_model_instructions_file() {
     require_network!();
 
     // Start mock server which will capture the request and return a minimal
-    // SSE stream for a single turn.
+    // SSE stream for a single answered turn (an empty response would trigger
+    // the missing-answer repair request).
     let server = MockServer::start().await;
-    let sse = concat!(
-        "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n"
-    );
-    let resp_mock = core_test_support::responses::mount_sse_once(&server, sse.to_string()).await;
+    let resp_mock = responses::mount_sse_once(&server, cli_sse_response()).await;
 
     // Create a temporary instructions file with a unique marker we can assert
     // appears in the outbound request payload.
@@ -350,11 +347,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
     require_network!();
 
     let server = MockServer::start().await;
-    let sse = concat!(
-        "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n"
-    );
-    let resp_mock = core_test_support::responses::mount_sse_once(&server, sse.to_string()).await;
+    let resp_mock = responses::mount_sse_once(&server, cli_sse_response()).await;
 
     let custom = TempDir::new().unwrap();
     let marker = "cli-profile-model-instructions-file-marker";

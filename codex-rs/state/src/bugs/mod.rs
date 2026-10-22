@@ -36,8 +36,24 @@ pub struct BugCreateResult {
 pub struct BugClaim {
     pub id: i64,
     pub raw_text: String,
+    pub thread_id: String,
+    /// Immutable auxiliary identity, never the mutable writer lease token.
+    pub attempt_id: String,
     pub attempt_count: i64,
     pub claim_token: String,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BugAttemptReceipt {
+    pub requested_model: String,
+    pub resolved_model: String,
+    pub response_id: Option<String>,
+    pub token_usage: Option<codex_protocol::protocol::TokenUsage>,
+    /// None means dispatch could not be established, not that no work occurred.
+    pub dispatched: Option<bool>,
+    pub terminal_observed: bool,
+    pub duration_ms: u64,
+    pub outcome: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,7 +154,7 @@ impl BugStore {
              SET attempt_count = attempt_count + 1, claim_token = ?, claim_timestamp = ?, updated_at = ? \
              WHERE id = ? AND status = 'pending' AND attempt_count < ? \
                AND (claim_token IS NULL OR claim_timestamp < ?) \
-             RETURNING id, raw_text, attempt_count, claim_token",
+             RETURNING id, raw_text, thread_id, attempt_count, claim_token",
         )
         .bind(&token)
         .bind(now)
@@ -148,7 +164,7 @@ impl BugStore {
         .bind(now - STALE_CLAIM_SECONDS)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(row_to_claim))
+        self.register_attempt(row).await
     }
 
     /// Claim the oldest eligible report other than the excluded submission.
@@ -165,7 +181,7 @@ impl BugStore {
                  ORDER BY created_at, id LIMIT 1) \
              AND status = 'pending' AND attempt_count < ? \
              AND (claim_token IS NULL OR claim_timestamp < ?) \
-             RETURNING id, raw_text, attempt_count, claim_token",
+             RETURNING id, raw_text, thread_id, attempt_count, claim_token",
         )
         .bind(&token)
         .bind(now)
@@ -177,7 +193,49 @@ impl BugStore {
         .bind(now - STALE_CLAIM_SECONDS)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(row_to_claim))
+        self.register_attempt(row).await
+    }
+
+    async fn register_attempt(
+        &self,
+        row: Option<sqlx::sqlite::SqliteRow>,
+    ) -> anyhow::Result<Option<BugClaim>> {
+        let Some(row) = row else { return Ok(None) };
+        let claim = row_to_claim(row);
+        // Persist identity before any provider work. If this fails, keep the
+        // lease: no request has started and an immediate retry is not safe.
+        sqlx::query(
+            "INSERT INTO bug_classifier_attempts \
+             (attempt_id, bug_id, ordinal, thread_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&claim.attempt_id)
+        .bind(claim.id)
+        .bind(claim.attempt_count)
+        .bind(&claim.thread_id)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.pool)
+        .await?;
+        Ok(Some(claim))
+    }
+
+    /// A late lease may settle only its own immutable receipt, never a newer
+    /// classification. A repeated terminal cannot replace already saved usage.
+    pub async fn record_attempt_receipt(
+        &self,
+        claim: &BugClaim,
+        receipt: &BugAttemptReceipt,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE bug_classifier_attempts SET receipt_json = ? \
+             WHERE attempt_id = ? AND bug_id = ? AND ordinal = ? AND receipt_json IS NULL",
+        )
+        .bind(serde_json::to_string(receipt)?)
+        .bind(&claim.attempt_id)
+        .bind(claim.id)
+        .bind(claim.attempt_count)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn commit_classification(
@@ -244,6 +302,8 @@ fn row_to_claim(row: sqlx::sqlite::SqliteRow) -> BugClaim {
     BugClaim {
         id: row.get("id"),
         raw_text: row.get("raw_text"),
+        thread_id: row.get("thread_id"),
+        attempt_id: uuid::Uuid::now_v7().to_string(),
         attempt_count: row.get("attempt_count"),
         claim_token: row.get("claim_token"),
     }

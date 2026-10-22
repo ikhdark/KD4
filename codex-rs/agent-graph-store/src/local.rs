@@ -29,6 +29,19 @@ impl LocalAgentGraphStore {
 }
 
 impl AgentGraphStore for LocalAgentGraphStore {
+    fn list_reconciled_thread_spawn_edges(
+        &self,
+        root_thread_id: ThreadId,
+        live_edges: Vec<(ThreadId, ThreadId)>,
+    ) -> AgentGraphStoreFuture<'_, Vec<(ThreadId, ThreadId)>> {
+        Box::pin(async move {
+            self.state_db
+                .list_reconciled_thread_spawn_edges(root_thread_id, &live_edges)
+                .await
+                .map_err(|err| internal_error("reconcile thread-spawn edges", err))
+        })
+    }
+
     fn upsert_thread_spawn_edge(
         &self,
         parent_thread_id: ThreadId,

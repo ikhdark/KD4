@@ -9,7 +9,6 @@ use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::sqlite::SqliteJournalMode;
-use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -343,6 +342,122 @@ impl std::fmt::Debug for LocalAgentTaskStore {
 }
 
 impl LocalAgentTaskStore {
+    /// Bind new roots once, inherit children once, and never reset on resume.
+    pub async fn initialize_validation_task(
+        &self,
+        thread: &str,
+        parent: Option<&str>,
+        new_root: bool,
+    ) -> StoreResult<()> {
+        let inherited: Option<(String, String)> =
+            match parent {
+                Some(parent) => sqlx::query_as(
+                    "SELECT task_key, grant_id FROM validation_task_threads WHERE thread_id = ?",
+                )
+                .bind(parent)
+                .fetch_optional(&self.pool)
+                .await?,
+                None => None,
+            };
+        let (task, grant) = inherited
+            .clone()
+            .unwrap_or_else(|| (format!("legacy:{thread}"), "initial".into()));
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO validation_task_threads VALUES (?, ?, ?)")
+            .bind(thread)
+            .bind(&task)
+            .bind(&grant)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT OR IGNORE INTO validation_suite_grants (task_key, grant_id, state) VALUES (?, ?, ?)")
+            .bind(&task).bind(&grant).bind(if inherited.is_some() || new_root { "unused" } else { "uncertain" })
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn validation_task_scope(
+        &self,
+        thread: &str,
+    ) -> StoreResult<Option<(String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT task_key, grant_id FROM validation_task_threads WHERE thread_id = ?",
+        )
+        .bind(thread)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn inherit_validation_task_scope(
+        &self,
+        thread: &str,
+        task: &str,
+        grant: &str,
+    ) -> StoreResult<()> {
+        let inserted = sqlx::query("INSERT OR IGNORE INTO validation_task_threads SELECT ?, task_key, grant_id FROM validation_suite_grants WHERE task_key=? AND grant_id=?")
+            .bind(thread).bind(task).bind(grant).execute(&self.pool).await?.rows_affected();
+        if inserted == 0 && self.validation_task_scope(thread).await?.is_none() {
+            return Err(StoreError::CorruptData(
+                "captured validation task grant is missing".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Only accepted root-client metadata calls this; replaying an ID cannot reset it.
+    pub async fn accept_validation_task_grant(
+        &self,
+        thread: &str,
+        task: &str,
+        grant: &str,
+    ) -> StoreResult<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT OR IGNORE INTO validation_suite_grants (task_key, grant_id, state) VALUES (?, ?, 'unused')")
+            .bind(task).bind(grant).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO validation_task_threads VALUES (?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET task_key=excluded.task_key, grant_id=excluded.grant_id")
+            .bind(thread).bind(task).bind(grant).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn validation_suite_attempt(
+        &self,
+        task: &str,
+        grant: &str,
+    ) -> StoreResult<Option<(String, String)>> {
+        Ok(sqlx::query_as("SELECT attempt_id, acknowledgement_path FROM validation_suite_grants WHERE task_key=? AND grant_id=? AND attempt_id IS NOT NULL AND acknowledgement_path IS NOT NULL")
+            .bind(task).bind(grant).fetch_optional(&self.pool).await?)
+    }
+
+    pub async fn reserve_validation_suite(
+        &self,
+        task: &str,
+        grant: &str,
+        attempt: &str,
+        acknowledgement: &str,
+        refunded_attempt: Option<&str>,
+    ) -> StoreResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(previous) = refunded_attempt {
+            sqlx::query("UPDATE validation_suite_grants SET state='unused' WHERE task_key=? AND grant_id=? AND attempt_id=?")
+                .bind(task).bind(grant).bind(previous).execute(&mut *tx).await?;
+        }
+        let claimed = sqlx::query("UPDATE validation_suite_grants SET state='reserved', attempt_id=?, acknowledgement_path=? WHERE task_key=? AND grant_id=? AND state='unused'")
+            .bind(attempt).bind(acknowledgement).bind(task).bind(grant).execute(&mut *tx).await?.rows_affected() == 1;
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    pub async fn start_validation_suite(
+        &self,
+        task: &str,
+        grant: &str,
+        attempt: &str,
+    ) -> StoreResult<bool> {
+        Ok(sqlx::query("UPDATE validation_suite_grants SET state='started' WHERE task_key=? AND grant_id=? AND attempt_id=? AND state='reserved'")
+            .bind(task).bind(grant).bind(attempt).execute(&self.pool).await?.rows_affected() == 1)
+    }
+
     pub async fn initialize(state_runtime: &StateRuntime) -> StoreResult<Self> {
         let coordination_root = state_runtime.codex_home().join(COORDINATION_DIR);
         tokio::fs::create_dir_all(&coordination_root).await?;
@@ -354,11 +469,29 @@ impl LocalAgentTaskStore {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(DATABASE_BUSY_TIMEOUT);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(DATABASE_MAX_CONNECTIONS)
-            .connect_with(options)
-            .await?;
-        MIGRATOR.run(&pool).await?;
+        let pool = codex_state::connect_sqlite_pool_with_retry(
+            options,
+            DATABASE_MAX_CONNECTIONS,
+            Instant::now(),
+        )
+        .await
+        .map_err(|error| match error.downcast::<sqlx::Error>() {
+            Ok(error) => StoreError::Sql(error),
+            Err(error) => StoreError::CorruptData(format!("connect task database: {error:#}")),
+        })?;
+        let pool_ref = &pool;
+        if let Err(error) =
+            codex_state::migrate_tolerating_concurrent_initializers(pool_ref, || async move {
+                MIGRATOR.run(pool_ref).await.map_err(Into::into)
+            })
+            .await
+        {
+            pool.close().await;
+            return Err(match error.downcast::<sqlx::migrate::MigrateError>() {
+                Ok(error) => StoreError::Migration(error),
+                Err(error) => StoreError::CorruptData(format!("task migration: {error:#}")),
+            });
+        }
         upgrade_legacy_repository_bindings(&pool).await?;
         let wake_revision = Arc::new(watch::channel(0).0);
         let mut wake_connection = pool.acquire().await?;
@@ -416,6 +549,14 @@ impl LocalAgentTaskStore {
         }
     }
 
+    pub async fn task_state_revision(&self) -> StoreResult<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT revision FROM task_state_revision WHERE id = 1")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn wake_revision(&self) -> u64 {
         *self.wake_revision.borrow()
@@ -441,7 +582,7 @@ impl LocalAgentTaskStore {
         draft: AssignmentDraft,
     ) -> StoreResult<(Assignment, Attempt)> {
         let admitted = self
-            .create_assignment_with_admission_impl(repo_root, draft, false, false)
+            .create_assignment_with_admission_impl(repo_root, draft, false, false, None)
             .await?;
         Ok((admitted.assignment, admitted.attempt))
     }
@@ -452,6 +593,7 @@ impl LocalAgentTaskStore {
         draft: AssignmentDraft,
         selective: bool,
         isolated_integrator_available: bool,
+        launch: Option<(String, String, String)>,
     ) -> StoreResult<AdmittedAssignment> {
         let root = repo_root.to_path_buf();
         let (repository, mut assignment) = tokio::task::spawn_blocking(move || {
@@ -496,7 +638,7 @@ impl LocalAgentTaskStore {
                 .copied()
                 .map(|target| (target, gate))
         });
-        validate_dependencies_tx(
+        let dependency_admissions = validate_dependencies_tx(
             &mut transaction,
             assignment.assignment_id,
             Some(&assignment.repository_id),
@@ -511,12 +653,8 @@ impl LocalAgentTaskStore {
         )
         .await?;
         let (overlaps, integration_plan) = if selective {
-            selective_admission_tx(
-                &mut transaction,
-                &assignment,
-                isolated_integrator_available,
-            )
-            .await?
+            selective_admission_tx(&mut transaction, &assignment, isolated_integrator_available)
+                .await?
         } else {
             (
                 AdmissionOverlapSummary::default(),
@@ -546,6 +684,25 @@ impl LocalAgentTaskStore {
             .execute(&mut *transaction)
             .await?;
         insert_attempt(&mut transaction, &attempt).await?;
+        for dependency in &dependency_admissions {
+            sqlx::query("INSERT INTO dependency_admissions (assignment_id, dependency_id, body_json) VALUES (?, ?, ?)")
+                .bind(assignment.assignment_id.to_string()).bind(dependency.assignment_id.to_string())
+                .bind(encode(dependency)?).execute(&mut *transaction).await?;
+        }
+        if let Some((agent_path, task_name, owner)) = launch {
+            if agent_path.trim().is_empty() || task_name.trim().is_empty() {
+                return Err(StoreError::InvalidAssignment(
+                    "launch path and name cannot be empty".into(),
+                ));
+            }
+            // None is the unstarted phase; binding the actual thread precedes input.
+            sqlx::query("INSERT INTO agent_task_bindings (assignment_id, attempt_id, root_session_id, agent_path, task_name, thread_id, bound_at, updated_at, launch_owner) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)")
+                .bind(assignment.assignment_id.to_string()).bind(attempt.attempt_id.to_string())
+                .bind(&assignment.root_session_id).bind(agent_path).bind(task_name)
+                .bind(encode(&attempt.created_at)?).bind(encode(&attempt.created_at)?)
+                .bind(owner)
+                .execute(&mut *transaction).await?;
+        }
         sqlx::query(
             "INSERT INTO workspace_actors (
                 workspace_id, actor_id, root_session_id, kind, assignment_id, attempt_id,
@@ -635,30 +792,36 @@ impl LocalAgentTaskStore {
         }
         let staging_path = task_capsule_staging_path(&self.coordination_root, assignment_id);
         let staging_payload = canonical_payload.clone();
+        let durable_payload = canonical_payload.clone();
         #[cfg(test)]
         let publication_pause = TEST_SNAPSHOT_CAPTURE_PAUSE.try_with(Arc::clone).ok();
-        // The file is the durable capsule record. Keep the assignment lock through
-        // staging and publication even if the caller is cancelled.
-        let transaction = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        // Reuse Assignment's existing immutable capsule slot as an independent
+        // authoritative copy. The worker owns publication AND DB commit through
+        // observer cancellation; the sidecar alone is not an attachment receipt.
+        tokio::task::spawn_blocking(move || -> StoreResult<()> {
             if let Some(parent) = staging_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             if staging_path.try_exists()? {
-                std::fs::remove_file(&staging_path)?;
+                return Err(StoreError::CorruptData(format!(
+                    "unresolved capsule stage retained at {}", staging_path.display()
+                )));
             }
+            let writing_path = staging_path.with_extension(format!("{}.writing", AttemptId::new()));
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&staging_path)?;
+                .open(&writing_path)?;
             if let Err(error) = file
                 .write_all(staging_payload.as_bytes())
                 .and_then(|()| file.sync_all())
             {
                 drop(file);
-                let _ = std::fs::remove_file(&staging_path);
-                return Err(error);
+                let _ = std::fs::remove_file(&writing_path);
+                return Err(error.into());
             }
             drop(file);
+            std::fs::rename(&writing_path, &staging_path)?;
             #[cfg(test)]
             if let Some(pause) = publication_pause {
                 pause.started.add_permits(1);
@@ -672,14 +835,17 @@ impl LocalAgentTaskStore {
                 });
             }
             std::fs::rename(&staging_path, &capsule_path)?;
-            Ok(transaction)
+            tokio::runtime::Handle::current().block_on(async move {
+                sqlx::query("UPDATE assignments SET body_json = json_set(body_json, '$.task_capsule', ?) WHERE assignment_id = ?")
+                    .bind(durable_payload).bind(assignment_id.to_string())
+                    .execute(&mut *transaction).await?;
+                transaction.commit().await?;
+                Ok(())
+            })
         })
         .await
         .map_err(std::io::Error::other)??;
         assignment.task_capsule = Some(canonical_payload.clone());
-        // No database data was changed: release the serialization lock. Publication
-        // above remains durable even if cancellation rolls this transaction back.
-        transaction.rollback().await?;
         Ok(assignment)
     }
 
@@ -695,7 +861,7 @@ impl LocalAgentTaskStore {
         let mut transaction = self.pool.begin().await?;
         let mut assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         let current_attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
-        let receipt =
+        let receipt: Option<AgentReceipt> =
             sqlx::query_scalar::<_, String>("SELECT body_json FROM receipts WHERE attempt_id = ?")
                 .bind(current_attempt.attempt_id.to_string())
                 .fetch_optional(&mut *transaction)
@@ -711,7 +877,7 @@ impl LocalAgentTaskStore {
             .into_iter()
             .map(|row| decode(row.get::<String, _>("body_json").as_str()))
             .collect::<StoreResult<Vec<_>>>()?;
-        let validation_calls = sqlx::query(
+        let validation_calls: Vec<ValidationCall> = sqlx::query(
             "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY julianday(json_extract(recorded_at, '$')), call_id",
         )
         .bind(current_attempt.attempt_id.to_string())
@@ -720,7 +886,7 @@ impl LocalAgentTaskStore {
         .into_iter()
         .map(|row| decode(row.get::<String, _>("body_json").as_str()))
         .collect::<StoreResult<Vec<_>>>()?;
-        let mut observations = if limit == 0 {
+        let mut observations: Vec<RuntimeObservation> = if limit == 0 {
             Vec::new()
         } else {
             let rows = sqlx::query("SELECT body_json FROM observations WHERE assignment_id = ? ORDER BY sequence DESC LIMIT ?")
@@ -733,6 +899,65 @@ impl LocalAgentTaskStore {
                 .collect::<StoreResult<Vec<_>>>()?
         };
         observations.reverse();
+        // Terminal diagnostics are a status projection, not an optional general
+        // history tail. Read the latest origin and its delivery recovery in the
+        // same snapshot as the attempt/receipt, including when limit is zero.
+        let terminal = sqlx::query_scalar::<_, String>(
+            "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ?
+             AND json_extract(body_json, '$.call_id') NOT LIKE '%:parent-delivery'
+             ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(current_attempt.attempt_id.to_string())
+        .bind(encode(&ObservationKind::HostCompletion)?)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|body| decode::<RuntimeObservation>(&body))
+        .transpose()?;
+        if let Some(terminal) = terminal {
+            let delivery_origin = format!(
+                "{}:parent-delivery",
+                terminal.call_id.as_deref().unwrap_or_default()
+            );
+            let delivery = sqlx::query_scalar::<_, String>(
+                "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ?
+                 AND json_extract(body_json, '$.call_id') = ? ORDER BY sequence DESC LIMIT 1",
+            )
+            .bind(current_attempt.attempt_id.to_string())
+            .bind(encode(&ObservationKind::HostCompletion)?)
+            .bind(delivery_origin)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(|body| decode::<RuntimeObservation>(&body))
+            .transpose()?;
+            // Keep requested history retrievable, but put the current projection
+            // last and include it only once. Consumers select this origin, not
+            // arbitrary historical failures in the general tail.
+            observations.retain(|observation| {
+                observation.event_id != terminal.event_id
+                    && delivery
+                        .as_ref()
+                        .is_none_or(|delivery| observation.event_id != delivery.event_id)
+            });
+            observations.push(terminal);
+            observations.extend(delivery);
+        } else {
+            // Old clean turns had no terminal marker. Preserve a delivery-only
+            // recovery fact without inventing a matching completion assessment.
+            let delivery = sqlx::query_scalar::<_, String>(
+                "SELECT body_json FROM observations WHERE attempt_id = ? AND kind = ?
+                 ORDER BY sequence DESC LIMIT 1",
+            )
+            .bind(current_attempt.attempt_id.to_string())
+            .bind(encode(&ObservationKind::HostCompletion)?)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(|body| decode::<RuntimeObservation>(&body))
+            .transpose()?;
+            if let Some(delivery) = delivery {
+                observations.retain(|observation| observation.event_id != delivery.event_id);
+                observations.push(delivery);
+            }
+        }
         let epoch = 0; // Legacy field; workspace freshness is no longer tracked.
         let actor_row = sqlx::query(
             "SELECT state, last_progress_at, lease_expires_at, nudge_sent_at FROM workspace_actors
@@ -776,14 +1001,34 @@ impl LocalAgentTaskStore {
             == crate::AssignmentAdmissionOrigin::Typed
             && !pending_gates.is_empty())
         .then(|| "resolve pending gates before completion".to_string());
+        let dependency_admissions = sqlx::query_scalar::<_, String>(
+            "SELECT body_json FROM dependency_admissions WHERE assignment_id = ? ORDER BY dependency_id",
+        ).bind(assignment_id.to_string()).fetch_all(&mut *transaction).await?
+            .into_iter().map(|body| decode(&body)).collect::<StoreResult<Vec<crate::DependencyAdmission>>>()?;
+        let criterion_assessments = if let Some(receipt) = &receipt {
+            assess_criteria_tx(
+                &mut transaction,
+                &assignment,
+                current_attempt.amendment.as_ref(),
+                receipt.attempt_id,
+                &receipt.criterion_results,
+                &receipt.validation_call_ids,
+                &validation_calls,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
         transaction.commit().await?;
         hydrate_task_capsule(&self.coordination_root, &mut assignment).await?;
         Ok(AgentTask {
             assignment,
+            dependency_admissions,
             current_attempt,
             gates,
             receipt,
             validation_calls,
+            criterion_assessments,
             workspace_status: WorkspaceTaskStatus {
                 epoch,
                 last_progress_at,
@@ -829,6 +1074,7 @@ LIMIT 1
         let attempt_id = AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?;
 
         Ok(AgentTaskAuthorization {
+            root_session_id: assignment.root_session_id,
             admission_origin: assignment.admission_origin,
             current_attempt: attempt_from_row(attempt_id, &row)?,
         })
@@ -938,6 +1184,14 @@ LIMIT 1
             .bind(encode(&binding.updated_at)?)
             .execute(&mut *transaction)
             .await?;
+        if binding.thread_id.is_some() {
+            sqlx::query(
+                "UPDATE agent_task_bindings SET launch_owner = NULL WHERE assignment_id = ?",
+            )
+            .bind(binding.assignment_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(binding)
     }
@@ -950,6 +1204,8 @@ LIMIT 1
         actor.require_root()?;
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
+        let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        actor.require_root_for(&assignment.root_session_id)?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if !attempt.state.is_terminal() || attempt.sealed_at.is_none() {
             return Err(StoreError::InvalidAssignment(
@@ -1058,7 +1314,9 @@ LIMIT 1
         call_id: Option<String>,
     ) -> StoreResult<RuntimeObservation> {
         if kind == ObservationKind::HostCompletion {
-            return Err(StoreError::InvalidAssignment("host completion observations require the host terminal boundary".into()));
+            return Err(StoreError::InvalidAssignment(
+                "host completion observations require the host terminal boundary".into(),
+            ));
         }
         if summary.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
@@ -1361,7 +1619,6 @@ LIMIT 1
         Ok(updated.rows_affected() == 1)
     }
 
-
     async fn submit_agent_receipt_impl(
         &self,
         attempt_id: AttemptId,
@@ -1423,6 +1680,7 @@ LIMIT 1
         let mut seen_calls = HashSet::new();
         let mut validation_summaries = HashSet::new();
         let mut successful_calls = std::collections::HashMap::new();
+        let mut observed_calls = Vec::new();
         for call_id in &draft.validation_call_ids {
             if !seen_calls.insert(call_id.as_str()) {
                 invalid_calls.push(call_id.clone());
@@ -1459,9 +1717,11 @@ LIMIT 1
             if completion_proof {
                 validation_summaries.insert(call.command_summary.clone());
                 if let Some(end_epoch) = call.evidence.end_epoch {
-                    successful_calls.insert(call_id.as_str(), (end_epoch, call.verified_evidence_kind()));
+                    successful_calls
+                        .insert(call_id.as_str(), (end_epoch, call.verified_evidence_kind()));
                 }
             }
+            observed_calls.push(call);
         }
         if !invalid_calls.is_empty() {
             return Err(StoreError::ValidationCallOwnership {
@@ -1499,6 +1759,35 @@ LIMIT 1
             });
         }
         if draft.status == AgentStatusClaim::Completed && !host_legacy_outcome {
+            let assessments = assess_criteria_tx(
+                &mut transaction,
+                &assignment,
+                attempt.amendment.as_ref(),
+                attempt_id,
+                &draft.criterion_results,
+                &draft.validation_call_ids,
+                &observed_calls,
+            )
+            .await?;
+            for assessment in assessments
+                .iter()
+                .filter(|assessment| !assessment.satisfied)
+            {
+                // Legacy claims may finish their lifecycle but never become
+                // proved obligations or ordinary dependency authorization.
+                if effective_criteria(&assignment, attempt.amendment.as_ref())
+                    .iter()
+                    .any(|criterion| {
+                        criterion.id == assessment.criterion_id
+                            && criterion.evidence_policy.is_some()
+                    })
+                {
+                    return Err(StoreError::CriterionResultsInvalid(format!(
+                        "{}: {}",
+                        assessment.criterion_id, assessment.reason
+                    )));
+                }
+            }
             let missing_obligations =
                 missing_evidence_obligations(&assignment, &validation_summaries);
             if !missing_obligations.is_empty() {
@@ -1506,12 +1795,7 @@ LIMIT 1
                     obligations: missing_obligations,
                 });
             }
-            validate_declared_changes_tx(
-                &mut transaction,
-                &assignment,
-                &mut draft,
-            )
-            .await?;
+            validate_declared_changes_tx(&mut transaction, &assignment, &mut draft).await?;
         }
         if let Some(review_reason) = review_reason.as_deref() {
             if draft.status != AgentStatusClaim::Completed {
@@ -1593,19 +1877,19 @@ LIMIT 1
         Ok(receipt)
     }
 
-
     async fn amend_agent_task_impl(
         &self,
         actor: TaskActor,
         assignment_id: AssignmentId,
         amendment: AttemptAmendment,
         host_legacy_followup: bool,
-    ) -> StoreResult<Attempt> {
+    ) -> StoreResult<(Attempt, Option<AgentTaskBinding>)> {
         actor.require_root()?;
         amendment.validate()?;
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        actor.require_root_for(&assignment.root_session_id)?;
         if host_legacy_followup
             && (!matches!(
                 assignment.admission_origin,
@@ -1625,7 +1909,7 @@ LIMIT 1
         }
         if !current.state.is_terminal() {
             if host_legacy_followup {
-                return Ok(current);
+                return Ok((current, None));
             }
             return Err(StoreError::InvalidAssignment(
                 "the original attempt must be sealed before amendment".to_string(),
@@ -1743,8 +2027,16 @@ LIMIT 1
             None,
         )
         .await?;
+        // Read the committed binding inside the same transaction. No fallible
+        // database work may be required to publish a successful amendment.
+        let binding = sqlx::query("SELECT assignment_id, attempt_id, root_session_id, agent_path, task_name, thread_id, bound_at, updated_at FROM agent_task_bindings WHERE assignment_id = ?")
+            .bind(assignment_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?
+            .map(|row| binding_from_row(&row))
+            .transpose()?;
         transaction.commit().await?;
-        Ok(next)
+        Ok((next, binding))
     }
 
     async fn abandon_agent_task_impl(
@@ -1762,6 +2054,7 @@ LIMIT 1
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        actor.require_root_for(&assignment.root_session_id)?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if attempt.state.is_terminal() || attempt.sealed_at.is_some() {
             return Err(StoreError::AttemptSealed(attempt.attempt_id));
@@ -1850,11 +2143,23 @@ LIMIT 1
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
-        require_gate_actor_tx(&mut transaction, actor, &assignment, kind).await?;
+        require_gate_actor_tx(&mut transaction, actor.clone(), &assignment, kind).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if attempt.attempt_id != expected_attempt_id {
             return Err(StoreError::AttemptNotActive(expected_attempt_id));
         }
+        let verification_proof = if kind == GateKind::Verification && status == GateStatus::Passed {
+            if let TaskActor::Attempt(evaluator) = actor {
+                Some((
+                    evaluator,
+                    verification_proof_tx(&mut transaction, evaluator).await?,
+                ))
+            } else {
+                None // Explicit, reasoned root override.
+            }
+        } else {
+            None
+        };
         if let Some(existing_json) = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
         )
@@ -1893,6 +2198,14 @@ LIMIT 1
             .await?;
         if gate.status.is_sealed() {
             record_gate_verdict_tx(&mut transaction, attempt.attempt_id, &gate).await?;
+            if let Some((evaluator, calls)) = verification_proof {
+                sqlx::query("INSERT INTO verification_proofs (target_attempt_id, evaluator_attempt_id, validation_call_ids_json) VALUES (?, ?, ?)")
+                    .bind(attempt.attempt_id.to_string())
+                    .bind(evaluator.to_string())
+                    .bind(encode(&calls)?)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
         }
         let needs_main = gate_requires_main_intervention(&attempt, kind, status);
         if needs_main {
@@ -1949,6 +2262,7 @@ LIMIT 1
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        actor.require_root_for(&assignment.root_session_id)?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
         if let Some(existing_json) = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
@@ -2518,33 +2832,87 @@ LIMIT 1
         let mut entries = tokio::fs::read_dir(&capsule_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            let is_stage = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.') && name.ends_with(".staged.json"));
-            if is_stage {
-                let payload = tokio::fs::read_to_string(&path).await?;
-                let capsule: TaskCapsuleV1 = serde_json::from_str(&payload)
-                    .map_err(|error| StoreError::InvalidTaskCapsule(error.to_string()))?;
-                let exists = sqlx::query_scalar::<_, i64>(
-                    "SELECT EXISTS(SELECT 1 FROM assignments WHERE assignment_id = ?)",
-                )
-                .bind(capsule.assignment_id.to_string())
-                .fetch_one(&mut *transaction)
-                .await?
-                    != 0;
-                let expected_stage =
-                    task_capsule_staging_path(&self.coordination_root, capsule.assignment_id);
-                if !exists || path != expected_stage {
-                    tokio::fs::remove_file(path).await?;
-                    continue;
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let is_stage = name.starts_with('.') && name.ends_with(".staged.json");
+            if !is_stage && (name.starts_with('.') || !name.ends_with(".json")) {
+                continue;
+            }
+            // Each incomplete publication is isolated. Retain its bytes and
+            // make the affected assignment fail closed, not the entire store.
+            let mut invalid_payload = false;
+            let result: StoreResult<()> = async {
+                let payload = match tokio::fs::read_to_string(&path).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        invalid_payload = error.kind() == std::io::ErrorKind::InvalidData;
+                        return Err(error.into());
+                    }
+                };
+                let capsule: TaskCapsuleV1 = match serde_json::from_str(&payload) {
+                    Ok(capsule) => capsule,
+                    Err(error) => {
+                        invalid_payload = true;
+                        return Err(error.into());
+                    }
+                };
+                if capsule.schema_version != 1 || serde_json::to_string(&capsule)? != payload {
+                    invalid_payload = true;
+                    return Err(StoreError::CorruptData("invalid or noncanonical capsule".into()));
                 }
-                let final_path = task_capsule_path(&self.coordination_root, capsule.assignment_id);
-                if tokio::fs::try_exists(&final_path).await? {
-                    tokio::fs::remove_file(path).await?;
-                } else {
-                    tokio::fs::rename(path, final_path).await?;
+                let assignment = match load_assignment_tx(&mut transaction, capsule.assignment_id).await {
+                    Ok(assignment) => assignment,
+                    Err(error) => {
+                        invalid_payload = matches!(error, StoreError::AssignmentNotFound(_));
+                        return Err(error);
+                    }
+                };
+                let expected_path = if is_stage {
+                    task_capsule_staging_path(&self.coordination_root, capsule.assignment_id)
+                } else { task_capsule_path(&self.coordination_root, capsule.assignment_id) };
+                if path != expected_path || capsule.integration_plan != assignment.integration_plan {
+                    invalid_payload = true;
+                    return Err(StoreError::CorruptData("capsule scope or filename mismatch".into()));
                 }
+                if assignment.task_capsule.as_ref().is_some_and(|expected| expected != &payload) {
+                    invalid_payload = true;
+                    return Err(StoreError::CorruptData("capsule conflicts with authoritative assignment copy".into()));
+                }
+                if is_stage {
+                    let final_path = task_capsule_path(&self.coordination_root, capsule.assignment_id);
+                    if tokio::fs::try_exists(&final_path).await? {
+                        if tokio::fs::read(&final_path).await? != payload.as_bytes() {
+                            invalid_payload = true;
+                            return Err(StoreError::CorruptData("capsule stage conflicts with published bytes".into()));
+                        }
+                        tokio::fs::remove_file(&path).await?;
+                    } else {
+                        tokio::fs::rename(&path, final_path).await?;
+                    }
+                }
+                if assignment.task_capsule.is_none() {
+                    sqlx::query("UPDATE assignments SET body_json = json_set(body_json, '$.task_capsule', ?) WHERE assignment_id = ?")
+                        .bind(&payload).bind(capsule.assignment_id.to_string())
+                        .execute(&mut *transaction).await?;
+                }
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                // Only provisional payload damage is recoverable here. A failed
+                // database query, filesystem operation, or authoritative final
+                // capsule must not be presented as a successful initialization.
+                if !is_stage || !invalid_payload {
+                    return Err(error);
+                }
+                // Keep one diagnostic payload per staging name without making
+                // it a candidate on every subsequent startup. Never overwrite
+                // an earlier quarantined payload.
+                let quarantine = path.with_extension("invalid");
+                if !tokio::fs::try_exists(&quarantine).await? {
+                    tokio::fs::rename(&path, &quarantine).await?;
+                }
+                tracing::warn!(path = %path.display(), %error, "invalid unpublished task capsule retained; unrelated tasks remain available");
             }
         }
         transaction.commit().await?;
@@ -2741,12 +3109,7 @@ impl LocalAgentTaskStore {
                 None,
             )
             .await?;
-            let result = selective_admission_tx(
-                &mut transaction,
-                &assignment,
-                false,
-            )
-            .await;
+            let result = selective_admission_tx(&mut transaction, &assignment, false).await;
             transaction.rollback().await?;
             match result {
                 // Only an investigation still in flight can be shared. Sealed
@@ -2759,6 +3122,102 @@ impl LocalAgentTaskStore {
                 Err(error) => Err(error),
             }
         })
+    }
+
+    pub fn create_admitted_assignment_for_agent<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        draft: AssignmentDraft,
+        isolated_integrator_available: bool,
+        agent_path: String,
+        task_name: String,
+        owner: String,
+    ) -> TaskStoreFuture<'a, AdmittedAssignment> {
+        Box::pin(async move {
+            let result = self
+                .create_assignment_with_admission_impl(
+                    repo_root,
+                    draft,
+                    true,
+                    isolated_integrator_available,
+                    Some((agent_path, task_name, owner)),
+                )
+                .await;
+            if result.is_ok() {
+                self.notify_wake_waiters();
+            }
+            result
+        })
+    }
+
+    pub async fn retain_terminal_outcome(
+        &self,
+        binding: crate::AgentTaskBinding,
+        turn_id: String,
+        status_json: String,
+        event_json: String,
+    ) -> StoreResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = load_current_attempt_tx(&mut tx, binding.assignment_id).await?;
+        let assignment = load_assignment_tx(&mut tx, binding.assignment_id).await?;
+        if current.attempt_id != binding.attempt_id
+            || assignment.root_session_id != binding.root_session_id
+        {
+            return Ok(false);
+        }
+        let existing = sqlx::query_scalar::<_, String>(
+            "SELECT binding_json FROM pending_terminal_outcomes WHERE attempt_id = ?",
+        )
+        .bind(binding.attempt_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let encoded = encode(&binding)?;
+        if existing
+            .as_ref()
+            .is_some_and(|existing| existing != &encoded)
+        {
+            return Err(StoreError::CorruptData(
+                "terminal outcome binding changed".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO pending_terminal_outcomes (attempt_id, assignment_id, binding_json, turn_id, status_json, event_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(attempt_id) DO NOTHING")
+            .bind(binding.attempt_id.to_string()).bind(binding.assignment_id.to_string())
+            .bind(encoded).bind(turn_id).bind(status_json).bind(event_json).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn pending_terminal_outcomes(
+        &self,
+        root: &str,
+    ) -> StoreResult<Vec<(crate::AgentTaskBinding, String)>> {
+        sqlx::query("SELECT p.binding_json, p.status_json FROM pending_terminal_outcomes p JOIN assignments a USING (assignment_id) WHERE a.root_session_id = ? ORDER BY p.attempt_id")
+            .bind(root).fetch_all(&self.pool).await?.into_iter()
+            .map(|row| Ok((decode(row.get::<String, _>("binding_json").as_str())?, row.get("status_json")))).collect()
+    }
+
+    pub async fn acknowledge_terminal_outcome(&self, attempt: AttemptId) -> StoreResult<()> {
+        sqlx::query("DELETE FROM pending_terminal_outcomes WHERE attempt_id = ?")
+            .bind(attempt.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn unstarted_assignments(
+        &self,
+        root: &str,
+    ) -> StoreResult<Vec<(AssignmentId, Option<String>)>> {
+        let rows = sqlx::query("SELECT a.assignment_id, b.launch_owner FROM assignments a JOIN attempts t USING (assignment_id) LEFT JOIN agent_task_bindings b USING (assignment_id) WHERE a.root_session_id = ? AND t.state = ? AND t.ordinal = (SELECT MAX(current.ordinal) FROM attempts current WHERE current.assignment_id = a.assignment_id) AND b.thread_id IS NULL")
+            .bind(root).bind(encode(&AttemptState::Active)?).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
+                    row.get("launch_owner"),
+                ))
+            })
+            .collect()
     }
 
     pub fn create_admitted_assignment<'a>(
@@ -2774,6 +3233,7 @@ impl LocalAgentTaskStore {
                     draft,
                     true,
                     isolated_integrator_available,
+                    None,
                 )
                 .await;
             if result.is_ok() {
@@ -2798,6 +3258,36 @@ impl LocalAgentTaskStore {
             }
             result
         })
+    }
+
+    /// Resolve an existing evaluation workspace without exposing another task's history.
+    /// Root-session and repository-lineage authority are checked before returning its path.
+    pub async fn evaluation_target_workspace(
+        &self,
+        caller_repo_root: &Path,
+        root_session_id: &str,
+        target_id: AssignmentId,
+    ) -> StoreResult<PathBuf> {
+        let caller = repository_identity_async(caller_repo_root).await?;
+        let mut transaction = self.pool.begin().await?;
+        let target = load_assignment_tx(&mut transaction, target_id).await?;
+        if target.root_session_id != root_session_id || target.repository_id != caller.id {
+            return Err(StoreError::RepositoryMismatch(target_id));
+        }
+        let root = sqlx::query_scalar::<_, String>(
+            "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
+        )
+        .bind(target_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(StoreError::RepositoryBindingMissing(target_id))?;
+        transaction.commit().await?;
+        // Never hold a SQLite connection while waiting on the filesystem/Git.
+        let actual = repository_identity_async(Path::new(&root)).await?;
+        if actual.id != target.repository_id || actual.workspace_id != target.workspace_id {
+            return Err(StoreError::RepositoryMismatch(target_id));
+        }
+        Ok(actual.canonical_root)
     }
 
     pub fn get_agent_task(
@@ -2899,16 +3389,47 @@ impl LocalAgentTaskStore {
     /// Terminal diagnostics may follow an already-sealed authored receipt.
     /// The current-attempt fence and idempotency key are checked under the writer lock.
     pub fn record_host_completion_observation(
-        &self, attempt_id: AttemptId, origin: String, summary: String,
+        &self,
+        attempt_id: AttemptId,
+        origin: String,
+        summary: String,
+    ) -> TaskStoreFuture<'_, ()> {
+        self.record_host_completion_with_stop_cause(attempt_id, origin, summary, None)
+    }
+
+    pub fn record_host_completion_with_stop_cause(
+        &self,
+        attempt_id: AttemptId,
+        origin: String,
+        summary: String,
+        stop_cause: Option<String>,
     ) -> TaskStoreFuture<'_, ()> {
         Box::pin(async move {
-            if origin.is_empty() || origin.len() > 256 || summary.is_empty() || summary.len() > 64 * 1024 {
-                return Err(StoreError::InvalidAssignment("invalid bounded host completion observation".into()));
+            if stop_cause
+                .as_ref()
+                .is_some_and(|cause| cause.is_empty() || cause.len() > 128)
+            {
+                return Err(StoreError::InvalidAssignment(
+                    "invalid bounded execution stop cause".into(),
+                ));
+            }
+            if origin.is_empty()
+                || origin.len() > 256
+                || summary.is_empty()
+                || summary.len() > 64 * 1024
+            {
+                return Err(StoreError::InvalidAssignment(
+                    "invalid bounded host completion observation".into(),
+                ));
             }
             let mut transaction = self.pool.begin().await?;
             lock_attempt_tx(&mut transaction, attempt_id).await?;
             let attempt = load_attempt_tx(&mut transaction, attempt_id).await?;
-            if load_current_attempt_tx(&mut transaction, attempt.assignment_id).await?.attempt_id != attempt_id {
+            if load_current_attempt_tx(&mut transaction, attempt.assignment_id)
+                .await?
+                .attempt_id
+                != attempt_id
+            {
                 return Err(StoreError::AttemptNotActive(attempt_id));
             }
             let existing = sqlx::query_scalar::<_, String>(
@@ -2916,9 +3437,18 @@ impl LocalAgentTaskStore {
                 .bind(attempt_id.to_string()).bind(encode(&ObservationKind::HostCompletion)?).bind(&origin)
                 .fetch_optional(&mut *transaction).await?;
             if existing.is_none() {
-                let assignment = load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
-                append_observation_tx(&mut transaction, &assignment, attempt_id,
-                    ObservationKind::HostCompletion, summary, Some(origin)).await?;
+                let assignment =
+                    load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+                append_observation_with_stop_cause_tx(
+                    &mut transaction,
+                    &assignment,
+                    attempt_id,
+                    ObservationKind::HostCompletion,
+                    summary,
+                    Some(origin),
+                    stop_cause,
+                )
+                .await?;
             }
             transaction.commit().await?;
             self.notify_wake_waiters();
@@ -2945,10 +3475,18 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, Option<crate::SourceInspectionStart>> {
         Box::pin(async move {
             let context = validation_context(&self.pool, attempt_id).await?;
-            if !matches!(context.assignment.role, AgentRole::Worker | AgentRole::Verifier | AgentRole::Integrator) {
+            if !matches!(
+                context.assignment.role,
+                AgentRole::Worker | AgentRole::Verifier | AgentRole::Integrator
+            ) {
                 return Ok(None);
             }
-            if !context.assignment.required_evidence.iter().any(|item| item.starts_with("inspect:")) {
+            if !context
+                .assignment
+                .required_evidence
+                .iter()
+                .any(|item| item.starts_with("inspect:"))
+            {
                 return Ok(None);
             }
             let Ok(absolute_path) = tokio::fs::canonicalize(&absolute_path).await else {
@@ -2958,15 +3496,25 @@ impl LocalAgentTaskStore {
                 return Ok(None);
             };
             let Ok(path) = crate::scope::normalize_repo_path_async(
-                &context.repo_root, &relative_path.to_string_lossy(),
-            ).await else {
+                &context.repo_root,
+                &relative_path.to_string_lossy(),
+            )
+            .await
+            else {
                 return Ok(None);
             };
-            if !context.assignment.required_evidence.contains(&format!("inspect:{path}")) {
+            if !context
+                .assignment
+                .required_evidence
+                .contains(&format!("inspect:{path}"))
+            {
                 return Ok(None);
             }
             Ok(Some(crate::SourceInspectionStart {
-                attempt_id, path, workspace_id: context.assignment.workspace_id,
+                canonical_path: Some(absolute_path),
+                attempt_id,
+                path,
+                workspace_id: context.assignment.workspace_id,
                 epoch: 0,
             }))
         })
@@ -2986,15 +3534,22 @@ impl LocalAgentTaskStore {
             // evidence identity and retain the store's ownership checks.
             let call_id = format!("inspection:{}:{call_id}", start.attempt_id);
             let result = crate::SourceInspectionResult {
-                version: 1, kind: "source_inspection".into(), call_id: call_id.clone(),
-                path: start.path.clone(), source_sha256, bytes,
+                version: 1,
+                kind: "source_inspection".into(),
+                call_id: call_id.clone(),
+                path: start.path.clone(),
+                source_sha256,
+                bytes,
             };
             let mut call = ValidationCall {
-                call_id: call_id.clone(), attempt_id: start.attempt_id,
+                call_id: call_id.clone(),
+                attempt_id: start.attempt_id,
                 command_summary: format!("inspect:{}", start.path),
                 evidence: crate::ValidationEvidence {
-                    validation_result: Some(serde_json::to_value(result)
-                        .map_err(|error| StoreError::CorruptData(error.to_string()))?),
+                    validation_result: Some(
+                        serde_json::to_value(result)
+                            .map_err(|error| StoreError::CorruptData(error.to_string()))?,
+                    ),
                     ..Default::default()
                 },
                 status: ValidationCallStatus::Running,
@@ -3004,14 +3559,21 @@ impl LocalAgentTaskStore {
             call.status = ValidationCallStatus::Succeeded;
             call.recorded_at = Utc::now();
             self.record_validation_call(call).await?;
-            let recorded = self.get_validation_call(call_id.clone()).await?
+            let recorded = self
+                .get_validation_call(call_id.clone())
+                .await?
                 .ok_or_else(|| StoreError::CorruptData("inspection call disappeared".into()))?;
-            if recorded.verified_evidence_kind() != Some(crate::CriterionEvidenceKind::SourceInspection)
+            if recorded.verified_evidence_kind()
+                != Some(crate::CriterionEvidenceKind::SourceInspection)
             {
-                return Err(StoreError::ValidationCallStatusInvalid { call_ids: vec![call_id] });
+                return Err(StoreError::ValidationCallStatusInvalid {
+                    call_ids: vec![call_id],
+                });
             }
             Ok(crate::CriterionEvidenceRef {
-                call_id, workspace_id: start.workspace_id, evidence_epoch: start.epoch,
+                call_id,
+                workspace_id: start.workspace_id,
+                evidence_epoch: start.epoch,
                 kind: crate::CriterionEvidenceKind::SourceInspection,
             })
         })
@@ -3105,6 +3667,19 @@ impl LocalAgentTaskStore {
         amendment: AttemptAmendment,
     ) -> TaskStoreFuture<'_, Attempt> {
         Box::pin(async move {
+            self.amend_agent_task_with_binding(actor, assignment_id, amendment)
+                .await
+                .map(|(attempt, _)| attempt)
+        })
+    }
+
+    pub fn amend_agent_task_with_binding(
+        &self,
+        actor: TaskActor,
+        assignment_id: AssignmentId,
+        amendment: AttemptAmendment,
+    ) -> TaskStoreFuture<'_, (Attempt, Option<AgentTaskBinding>)> {
+        Box::pin(async move {
             let result = self
                 .amend_agent_task_impl(actor, assignment_id, amendment, false)
                 .await;
@@ -3138,7 +3713,7 @@ impl LocalAgentTaskStore {
             if result.is_ok() {
                 self.notify_wake_waiters();
             }
-            result
+            result.map(|(attempt, _)| attempt)
         })
     }
 
@@ -3170,7 +3745,14 @@ impl LocalAgentTaskStore {
     ) -> TaskStoreFuture<'_, AgentGate> {
         Box::pin(async move {
             let result = self
-                .set_agent_gate_impl(actor, assignment_id, expected_attempt_id, kind, status, reason)
+                .set_agent_gate_impl(
+                    actor,
+                    assignment_id,
+                    expected_attempt_id,
+                    kind,
+                    status,
+                    reason,
+                )
                 .await;
             if result.is_ok() {
                 self.notify_wake_waiters();
@@ -3311,18 +3893,12 @@ impl LocalAgentTaskStore {
     pub fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool> {
         Box::pin(async move { self.release_stalled_nudge_impl(assignment_id).await })
     }
-
 }
-
-
-
-
 
 struct ValidationContext {
     assignment: Assignment,
     repo_root: PathBuf,
 }
-
 
 async fn validation_context(
     pool: &SqlitePool,
@@ -3374,6 +3950,7 @@ struct StoredValidationResult {
 #[serde(rename_all = "snake_case")]
 enum StoredValidationTerminalStatus {
     Succeeded,
+    Unverified,
     Failed,
 }
 
@@ -3381,15 +3958,17 @@ fn validation_call_has_successful_result(call: &ValidationCall) -> bool {
     verified_evidence_kind(call).is_some()
 }
 
-pub(crate) fn verified_evidence_kind(call: &ValidationCall) -> Option<crate::CriterionEvidenceKind> {
+pub(crate) fn verified_evidence_kind(
+    call: &ValidationCall,
+) -> Option<crate::CriterionEvidenceKind> {
     if call.status != ValidationCallStatus::Succeeded
         || call.evidence.end_epoch != Some(call.evidence.start_epoch)
     {
         return None;
     }
-    if let Some(inspection) = call.evidence.validation_result.as_ref()
-        .and_then(|value| serde_json::from_value::<crate::SourceInspectionResult>(value.clone()).ok())
-    {
+    if let Some(inspection) = call.evidence.validation_result.as_ref().and_then(|value| {
+        serde_json::from_value::<crate::SourceInspectionResult>(value.clone()).ok()
+    }) {
         return (inspection.version == 1
             && inspection.kind == "source_inspection"
             && inspection.call_id == call.call_id
@@ -3397,22 +3976,27 @@ pub(crate) fn verified_evidence_kind(call: &ValidationCall) -> Option<crate::Cri
             && inspection.path != "."
             && call.command_summary == format!("inspect:{}", inspection.path)
             && inspection.source_sha256.len() == 64
-            && inspection.source_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .then_some(crate::CriterionEvidenceKind::SourceInspection);
+            && inspection
+                .source_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(crate::CriterionEvidenceKind::SourceInspection);
     }
-    let result =
-        call.evidence.validation_result.as_ref().and_then(|result| {
-            serde_json::from_value::<StoredValidationResult>(result.clone()).ok()
-        })?;
+    let result = call
+        .evidence
+        .validation_result
+        .as_ref()
+        .and_then(|result| serde_json::from_value::<StoredValidationResult>(result.clone()).ok())?;
     (call.status == ValidationCallStatus::Succeeded
         && call.evidence.end_epoch == Some(call.evidence.start_epoch)
         && result.call_id == call.call_id
         && result.status == StoredValidationTerminalStatus::Succeeded
-        && !result.argv.is_empty()
-        && result.argv.iter().all(|value| !value.trim().is_empty())
+        // Empty positional arguments are valid; only the executable must be
+        // nonempty, matching the public ValidationResult wire contract.
+        && result.argv.first().is_some_and(|value| !value.trim().is_empty())
         && !result.covered_paths.is_empty()
         && stored_covered_paths_are_normalized(&result.covered_paths))
-        .then_some(crate::CriterionEvidenceKind::ValidationExecution)
+    .then_some(crate::CriterionEvidenceKind::ValidationExecution)
 }
 
 fn stored_covered_paths_are_normalized(covered_paths: &[String]) -> bool {
@@ -3457,7 +4041,6 @@ async fn assignment_workspace_id_tx(
     .await?
     .ok_or(StoreError::RepositoryBindingMissing(assignment_id))
 }
-
 
 async fn lock_attempt_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -3591,7 +4174,6 @@ async fn ensure_task_workspace_tx(
     Ok(())
 }
 
-
 async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()> {
     let rows = sqlx::query(
         "SELECT assignment_id, repository_id, workspace_id, canonical_root
@@ -3612,6 +4194,11 @@ async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()
             Err(error) => return Err(error),
         };
         if repository.workspace_id != workspace_id {
+            if crate::scope::is_legacy_workspace_id(&repository.canonical_root, &workspace_id) {
+                // Folded identities may have merged case-sensitive checkouts.
+                // Preserve these historical bindings without authorizing reuse.
+                continue;
+            }
             return Err(StoreError::CorruptData(format!(
                 "legacy workspace identity does not match assignment {assignment_id}"
             )));
@@ -3738,14 +4325,112 @@ async fn dependency_reaches_tx(
     Ok(false)
 }
 
+async fn assess_criteria_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    amendment: Option<&AttemptAmendment>,
+    attempt_id: AttemptId,
+    results: &[crate::CriterionResult],
+    listed_calls: &[String],
+    calls: &[ValidationCall],
+) -> StoreResult<Vec<crate::CriterionAssessment>> {
+    let mut current_sources = std::collections::HashMap::new();
+    let paths = assignment
+        .effective_criteria(amendment)
+        .iter()
+        .filter_map(|criterion| {
+            let policy = criterion.evidence_policy.as_ref()?;
+            if policy.kind != crate::CriterionEvidenceRequirement::SourceInspection
+                || policy.freshness != crate::EvidenceFreshness::Current
+            {
+                return None;
+            }
+            policy
+                .required_evidence
+                .as_deref()?
+                .strip_prefix("inspect:")
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    if !paths.is_empty() {
+        let root = sqlx::query_scalar::<_, String>(
+            "SELECT canonical_root FROM assignment_repositories WHERE assignment_id = ?",
+        )
+        .bind(assignment.assignment_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(root) = root {
+            // Bounded local acquisition only. Slow/inaccessible storage yields
+            // unknown, never a pass, and cannot indefinitely hold the DB writer.
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut hashes = std::collections::HashMap::new();
+                let Ok(identity) = repository_identity_async(Path::new(&root)).await else {
+                    return hashes;
+                };
+                if identity.id != assignment.repository_id
+                    || identity.workspace_id != assignment.workspace_id
+                {
+                    return hashes;
+                }
+                for path in paths.iter().take(64) {
+                    if normalize_repo_path_async(Path::new(&root), path)
+                        .await
+                        .as_ref()
+                        .ok()
+                        != Some(path)
+                    {
+                        continue;
+                    }
+                    let Ok(file) = tokio::fs::File::open(Path::new(&root).join(path)).await else {
+                        continue;
+                    };
+                    if !file
+                        .metadata()
+                        .await
+                        .is_ok_and(|metadata| metadata.is_file())
+                    {
+                        continue;
+                    }
+                    use tokio::io::AsyncReadExt;
+                    let mut bytes = Vec::new();
+                    if file
+                        .take(8 * 1024 * 1024 + 1)
+                        .read_to_end(&mut bytes)
+                        .await
+                        .is_ok()
+                        && bytes.len() <= 8 * 1024 * 1024
+                    {
+                        hashes.insert(path.clone(), hex::encode(Sha256::digest(&bytes)));
+                    }
+                }
+                hashes
+            })
+            .await;
+            if let Ok(hashes) = observed {
+                current_sources = hashes;
+            }
+        }
+    }
+    Ok(crate::proof::assess_criteria(
+        assignment,
+        amendment,
+        attempt_id,
+        results,
+        listed_calls,
+        calls,
+        &current_sources,
+    ))
+}
+
 async fn validate_dependencies_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     candidate_id: AssignmentId,
     repository_id: Option<&str>,
     dependencies: &[AssignmentId],
     allowed_pending_gate: Option<(AssignmentId, GateKind)>,
-) -> StoreResult<()> {
+) -> StoreResult<Vec<crate::DependencyAdmission>> {
     let mut blockers = Vec::new();
+    let mut admitted = Vec::new();
     for dependency in dependencies {
         if *dependency == candidate_id {
             blockers.push(DependencyBlocker {
@@ -3822,12 +4507,48 @@ async fn validate_dependencies_tx(
             });
             continue;
         }
+        // A review/verification relation intentionally consumes a claim to
+        // evaluate it. Ordinary dependencies require satisfied obligations.
+        if allowed_pending_gate.is_none_or(|(target, _)| target != *dependency) {
+            let attempt = load_attempt_tx(transaction, receipt.attempt_id).await?;
+            let calls = sqlx::query_scalar::<_, String>(
+                "SELECT body_json FROM validation_calls WHERE attempt_id = ?",
+            )
+            .bind(receipt.attempt_id.to_string())
+            .fetch_all(&mut **transaction)
+            .await?
+            .into_iter()
+            .map(|body| decode(&body))
+            .collect::<StoreResult<Vec<ValidationCall>>>()?;
+            let assessments = assess_criteria_tx(
+                transaction,
+                &dependency_assignment,
+                attempt.amendment.as_ref(),
+                receipt.attempt_id,
+                &receipt.criterion_results,
+                &receipt.validation_call_ids,
+                &calls,
+            )
+            .await?;
+            if let Some(unverified) = assessments.iter().find(|assessment| !assessment.satisfied) {
+                blockers.push(DependencyBlocker {
+                    assignment_id: *dependency,
+                    state: DependencyState::Incomplete,
+                    detail: format!(
+                        "dependency criterion {} is unverified: {}",
+                        unverified.criterion_id, unverified.reason
+                    ),
+                });
+                continue;
+            }
+        }
         let gate_rows =
             sqlx::query("SELECT body_json FROM gates WHERE assignment_id = ? ORDER BY kind")
                 .bind(dependency.to_string())
                 .fetch_all(&mut **transaction)
                 .await?;
         let mut blocking_gates = Vec::new();
+        let mut accepted_gates = Vec::new();
         for row in gate_rows {
             let gate: AgentGate = decode(row.get::<String, _>("body_json").as_str())?;
             if gate.assignment_id != *dependency {
@@ -3842,7 +4563,14 @@ async fn validate_dependencies_tx(
             {
                 blocking_gates.push((gate.kind, gate.status));
             }
+            accepted_gates.push(gate);
         }
+        admitted.push(crate::DependencyAdmission {
+            assignment_id: *dependency,
+            attempt_id: receipt.attempt_id,
+            receipt_sha256: hex::encode(Sha256::digest(receipt_json.as_bytes())),
+            gates: accepted_gates,
+        });
         if !blocking_gates.is_empty() {
             let state = if blocking_gates
                 .iter()
@@ -3865,7 +4593,7 @@ async fn validate_dependencies_tx(
         }
     }
     if blockers.is_empty() {
-        Ok(())
+        Ok(admitted)
     } else {
         Err(StoreError::DependencyBlocked { blockers })
     }
@@ -3914,13 +4642,16 @@ async fn seal_architecture_contract_for_receipt_tx(
     }))
 }
 
-
-
 async fn validate_architecture_contract_reference_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     worker: &Assignment,
     repo_root: &Path,
 ) -> StoreResult<()> {
+    // Evaluation dependencies inspect the Architect's output; only Workers consume
+    // its exact implementation contract (the draft validator rejects refs on other roles).
+    if worker.role != AgentRole::Worker {
+        return Ok(());
+    }
     let mut architect_dependency_ids = Vec::new();
     for dependency_id in &worker.dependencies {
         let dependency = load_assignment_tx(transaction, *dependency_id).await?;
@@ -4123,12 +4854,16 @@ async fn require_gate_actor_tx(
 ) -> StoreResult<()> {
     let actor_attempt_id = match actor {
         TaskActor::Root => return Ok(()),
+        TaskActor::RootSession(_) => return actor.require_root_for(&target.root_session_id),
         TaskActor::Attempt(actor_attempt_id) => actor_attempt_id,
     };
     let actor_attempt = load_attempt_tx(transaction, actor_attempt_id).await?;
     let current_actor_attempt =
         load_current_attempt_tx(transaction, actor_attempt.assignment_id).await?;
-    if current_actor_attempt.attempt_id != actor_attempt_id {
+    if current_actor_attempt.attempt_id != actor_attempt_id
+        || current_actor_attempt.state != AttemptState::Active
+        || current_actor_attempt.sealed_at.is_some()
+    {
         return Err(StoreError::GateAuthorityRequired {
             gate: kind.to_string(),
         });
@@ -4159,6 +4894,43 @@ async fn require_gate_actor_tx(
         });
     }
     Ok(())
+}
+
+async fn verification_proof_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    evaluator: AttemptId,
+) -> StoreResult<Vec<String>> {
+    let attempt = require_active_current_attempt_tx(transaction, evaluator).await?;
+    let assignment = load_assignment_tx(transaction, attempt.assignment_id).await?;
+    let rows =
+        sqlx::query("SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY call_id")
+            .bind(evaluator.to_string())
+            .fetch_all(&mut **transaction)
+            .await?;
+    let mut summaries = HashSet::new();
+    let mut calls = Vec::new();
+    for row in rows {
+        let call: ValidationCall = decode(row.get::<String, _>("body_json").as_str())?;
+        if call.attempt_id != evaluator {
+            return Err(StoreError::ValidationCallOwnership {
+                call_ids: vec![call.call_id],
+            });
+        }
+        if !call.status.is_terminal() {
+            return Err(StoreError::ValidationCallStatusInvalid {
+                call_ids: vec![call.call_id],
+            });
+        }
+        if validation_call_has_successful_result(&call) {
+            summaries.insert(call.command_summary);
+            calls.push(call.call_id);
+        }
+    }
+    let obligations = missing_evidence_obligations(&assignment, &summaries);
+    if !obligations.is_empty() {
+        return Err(StoreError::RequiredEvidenceMissing { obligations });
+    }
+    Ok(calls)
 }
 
 async fn record_gate_verdict_tx(
@@ -4603,11 +5375,6 @@ async fn selective_admission_tx(
     Ok((overlaps, integration_plan))
 }
 
-
-
-
-
-
 async fn finish_successful_task_if_unblocked_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment_id: AssignmentId,
@@ -4672,7 +5439,6 @@ pub(crate) fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<Age
     })
 }
 
-
 fn task_capsule_path(coordination_root: &Path, assignment_id: AssignmentId) -> PathBuf {
     coordination_root
         .join("task_capsules")
@@ -4692,7 +5458,21 @@ async fn hydrate_task_capsule(
     let capsule_path = task_capsule_path(coordination_root, assignment.assignment_id);
     let canonical_payload = match tokio::fs::read_to_string(capsule_path).await {
         Ok(payload) => payload,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // The committed assignment copy is the attachment authority. A stage
+            // without it is an uncommitted publication: attach stages, publishes
+            // and only then commits that copy, while readers do not take the
+            // assignment lock, so a concurrent read can observe the stage before
+            // the published file. Startup reconciliation settles crash leftovers,
+            // and attach still refuses to publish over an unresolved stage.
+            if assignment.task_capsule.is_some() {
+                return Err(StoreError::CorruptData(format!(
+                    "attached task capsule is unavailable for {}",
+                    assignment.assignment_id
+                )));
+            }
+            return Ok(());
+        }
         Err(error) => return Err(error.into()),
     };
     let capsule: TaskCapsuleV1 = serde_json::from_str(&canonical_payload)?;
@@ -4704,6 +5484,15 @@ async fn hydrate_task_capsule(
     if serde_json::to_string(&capsule)?.as_bytes() != canonical_payload.as_bytes() {
         return Err(StoreError::CorruptData(
             "persisted TaskCapsuleV1 payload is not canonical".to_string(),
+        ));
+    }
+    if assignment
+        .task_capsule
+        .as_ref()
+        .is_some_and(|expected| expected != &canonical_payload)
+    {
+        return Err(StoreError::CorruptData(
+            "task capsule does not match its authoritative assignment copy".to_string(),
         ));
     }
     assignment.task_capsule = Some(canonical_payload);
@@ -4727,7 +5516,29 @@ async fn append_observation_tx(
     summary: String,
     call_id: Option<String>,
 ) -> StoreResult<RuntimeObservation> {
+    append_observation_with_stop_cause_tx(
+        transaction,
+        assignment,
+        attempt_id,
+        kind,
+        summary,
+        call_id,
+        None,
+    )
+    .await
+}
+
+async fn append_observation_with_stop_cause_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    attempt_id: AttemptId,
+    kind: ObservationKind,
+    summary: String,
+    call_id: Option<String>,
+    execution_stop_cause: Option<String>,
+) -> StoreResult<RuntimeObservation> {
     let observation = RuntimeObservation {
+        execution_stop_cause,
         event_id: MutationEventId::new(),
         wake_event_id: WakeEventId::new(),
         assignment_id: assignment.assignment_id,
@@ -4843,7 +5654,6 @@ async fn pending_gate_count(
     .await?)
 }
 
-
 async fn finish_task_actor(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment_id: AssignmentId,
@@ -4924,7 +5734,6 @@ fn receipt_observation_kind(status: AgentStatusClaim) -> ObservationKind {
     }
 }
 
-
 fn normalized_requirement_identity(requirement: &str) -> String {
     requirement.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -4962,7 +5771,6 @@ fn missing_evidence_obligations(
 fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
-
 
 fn encode<T: Serialize + ?Sized>(value: &T) -> StoreResult<String> {
     Ok(serde_json::to_string(value)?)

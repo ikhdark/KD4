@@ -1226,21 +1226,34 @@ mod tests {
         let marker_path = super::setup_marker_path(codex_home.path());
         let users_path = super::sandbox_users_path(codex_home.path());
         fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).expect("write marker");
-        assert!(verify_setup_completed(codex_home.path()).is_err(), "users still missing");
+        assert!(
+            verify_setup_completed(codex_home.path()).is_err(),
+            "users still missing"
+        );
         fs::write(&users_path, serde_json::to_vec(&users).unwrap()).expect("write users");
         verify_setup_completed(codex_home.path()).expect("matching artifacts are ready");
 
         users.version -= 1;
         fs::write(&users_path, serde_json::to_vec(&users).unwrap()).expect("write old users");
-        assert!(verify_setup_completed(codex_home.path()).is_err(), "old users rejected");
+        assert!(
+            verify_setup_completed(codex_home.path()).is_err(),
+            "old users rejected"
+        );
         users.version = super::SETUP_VERSION;
         fs::write(&users_path, serde_json::to_vec(&users).unwrap()).expect("restore users");
         let mut old_marker = marker;
         old_marker.version -= 1;
-        fs::write(&marker_path, serde_json::to_vec(&old_marker).unwrap()).expect("write old marker");
-        assert!(verify_setup_completed(codex_home.path()).is_err(), "old marker rejected");
+        fs::write(&marker_path, serde_json::to_vec(&old_marker).unwrap())
+            .expect("write old marker");
+        assert!(
+            verify_setup_completed(codex_home.path()).is_err(),
+            "old marker rejected"
+        );
         fs::write(&marker_path, b"{").expect("write malformed marker");
-        assert!(verify_setup_completed(codex_home.path()).is_err(), "malformed marker rejected");
+        assert!(
+            verify_setup_completed(codex_home.path()).is_err(),
+            "malformed marker rejected"
+        );
     }
 
     fn permissions_for(

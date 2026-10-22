@@ -102,24 +102,101 @@ pub(crate) struct TurnEnvironment {
     pub(crate) shell: Option<shell::Shell>,
     pub(crate) operating_system: Option<String>,
     pub(crate) shell_snapshot: ShellSnapshotTask,
+    pub(crate) shell_snapshot_origin: Option<crate::shell_snapshot::ShellSnapshotOrigin>,
     pub(crate) shell_snapshot_tasks: Option<tokio_util::task::TaskTracker>,
+    pub(crate) runtime: Option<codex_exec_server::EnvironmentRuntime>,
     lifecycle: Option<Arc<TurnEnvironmentLifecycle>>,
 }
 
 impl TurnEnvironment {
+    fn apply_runtime(
+        &mut self,
+        runtime: codex_exec_server::EnvironmentRuntime,
+    ) -> Result<(), codex_exec_server::ExecServerError> {
+        let changed = self
+            .runtime
+            .as_ref()
+            .is_none_or(|old| old.incarnation != runtime.incarnation);
+        self.shell = Some(
+            shell::Shell::from_environment_shell_info(runtime.info.shell.clone())
+                .map_err(|error| codex_exec_server::ExecServerError::Protocol(error.to_string()))?,
+        );
+        self.operating_system = runtime.info.operating_system.clone();
+        if changed {
+            // An old Cmd snapshot is not valid for a new initialized session.
+            self.shell_snapshot = futures::future::ready(None).boxed().shared();
+        }
+        self.runtime = Some(runtime);
+        if changed && let Some(runtime) = &self.runtime {
+            self.environment = Arc::new(self.environment.bound_to_runtime(runtime));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_cached_runtime(&mut self) -> bool {
+        if !self.environment.is_remote() {
+            return true;
+        }
+        self.environment.is_ready()
+            && self
+                .environment
+                .cached_runtime()
+                .is_some_and(|runtime| self.apply_runtime(runtime).is_ok())
+    }
+
+    pub(crate) async fn refresh_runtime(
+        &mut self,
+    ) -> Result<(), codex_exec_server::ExecServerError> {
+        if let Some(runtime) = self.environment.current_runtime().await? {
+            self.apply_runtime(runtime)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn exec_backend(&self) -> Arc<dyn codex_exec_server::ExecBackend> {
+        self.runtime.as_ref().map_or_else(
+            || self.environment.get_exec_backend(),
+            |runtime| Arc::clone(&runtime.exec_backend),
+        )
+    }
+
+    pub(crate) fn owner_id(&self) -> String {
+        format!(
+            "{}:{}",
+            self.environment.approval_scope_id(),
+            self.runtime
+                .as_ref()
+                .map_or("local", |runtime| runtime.incarnation.as_str())
+        )
+    }
+
+    pub(crate) fn provenance(&self) -> codex_protocol::items::EnvironmentProvenance {
+        codex_protocol::items::EnvironmentProvenance {
+            environment_id: self.environment_id.clone(),
+            owner_id: self.owner_id(),
+        }
+    }
+
     pub(crate) fn new(
         environment_id: String,
         environment: Arc<Environment>,
         cwd: PathUri,
         shell: Option<shell::Shell>,
     ) -> Self {
+        let runtime = environment.cached_runtime();
+        let environment = match &runtime {
+            Some(runtime) => Arc::new(environment.bound_to_runtime(runtime)),
+            None => environment,
+        };
         Self {
             environment_id,
+            runtime,
             operating_system: (!environment.is_remote()).then(|| std::env::consts::OS.to_string()),
             environment,
             cwd,
             shell,
             shell_snapshot: futures::future::ready(None).boxed().shared(),
+            shell_snapshot_origin: None,
             shell_snapshot_tasks: None,
             lifecycle: None,
         }
@@ -137,11 +214,31 @@ impl TurnEnvironment {
         self.lifecycle = None;
     }
 
-    pub(crate) async fn shell_snapshot(&self, cwd: &PathUri) -> Option<Arc<ShellSnapshotFile>> {
+    pub(crate) async fn shell_snapshot_for_config(
+        &self,
+        cwd: &PathUri,
+        config: &Config,
+    ) -> Option<Arc<ShellSnapshotFile>> {
+        let origin = self.shell_snapshot_origin.as_ref()?;
+        if !config.features.enabled(Feature::ShellSnapshot)
+            || origin.policy != config.permissions.shell_environment_policy
+            || self.shell.as_ref() != Some(&origin.shell)
+        {
+            return None;
+        }
+        self.ready_shell_snapshot(cwd)
+    }
+
+    fn ready_shell_snapshot(&self, cwd: &PathUri) -> Option<Arc<ShellSnapshotFile>> {
         if self.cwd != *cwd {
             return None;
         }
         self.shell_snapshot.clone().now_or_never().flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shell_snapshot(&self, cwd: &PathUri) -> Option<Arc<ShellSnapshotFile>> {
+        self.ready_shell_snapshot(cwd)
     }
 
     pub(crate) fn cwd(&self) -> &PathUri {
@@ -164,6 +261,45 @@ impl std::fmt::Debug for TurnEnvironment {
             .field("cwd", &self.cwd)
             .field("shell", &self.shell)
             .finish_non_exhaustive()
+    }
+}
+
+/// Locally compiled once at admission, shared by delivery and final acceptance.
+#[derive(Debug)]
+pub(crate) struct PreparedOutputSchema {
+    original: Value,
+    validator: jsonschema::Validator,
+}
+
+impl PartialEq for PreparedOutputSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.original == other.original
+    }
+}
+
+impl PreparedOutputSchema {
+    pub(crate) fn prepare(original: Value) -> Result<Arc<Self>, String> {
+        // Retrieval features are disabled: external refs cannot fetch data.
+        let validator = jsonschema::validator_for(&original)
+            .map_err(|error| format!("Invalid output schema: {error}"))?;
+        Ok(Arc::new(Self {
+            original,
+            validator,
+        }))
+    }
+
+    pub(crate) fn original(&self) -> &Value {
+        &self.original
+    }
+
+    pub(crate) fn validate_text(&self, text: Option<&str>) -> Result<(), Value> {
+        let text = text.ok_or_else(|| serde_json::json!({"category":"missing_output"}))?;
+        let value: Value = serde_json::from_str(text).map_err(|error|
+            serde_json::json!({"category":"invalid_json", "line":error.line(), "column":error.column()}))?;
+        self.validator.validate(&value).map_err(|error| {
+            serde_json::json!({"category":"schema_mismatch", "instance_pointer":
+                error.instance_path().as_str().chars().take(512).collect::<String>()})
+        })
     }
 }
 
@@ -209,7 +345,7 @@ pub struct TurnContext {
     pub(crate) network: Option<NetworkProxy>,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) available_models: Arc<Vec<ModelPreset>>,
-    pub(crate) final_output_json_schema: Option<Value>,
+    pub(crate) final_output_json_schema: Option<Arc<PreparedOutputSchema>>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
     /// Deferred tools selected during this root task, bound to exact capability revisions.
     pub(crate) workspace_execution_coordinator:
@@ -520,13 +656,7 @@ impl TurnContext {
     }
 
     pub(crate) fn effective_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
-        if self.model_info.supports_reasoning_summaries {
-            self.reasoning_effort
-                .clone()
-                .or_else(|| self.model_info.default_reasoning_level.clone())
-        } else {
-            None
-        }
+        self.request_reasoning_effort()
     }
 
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
@@ -594,7 +724,6 @@ impl TurnContext {
                 .or_else(|| model_info.default_reasoning_level.clone())
         };
         config.model_reasoning_effort = reasoning_effort.clone();
-        config.token_budget = super::token_budget::resolve_for_model(&config, &model_info);
 
         let collaboration_mode = self.collaboration_mode.with_updates(
             Some(model.clone()),
@@ -957,13 +1086,8 @@ impl Session {
             &model_info,
         );
         let mut per_turn_config = per_turn_config;
-        let resolved_token_budget =
-            super::token_budget::resolve_for_model(&per_turn_config, &model_info);
         // The config is usually shared with the cross-turn cache; an
         // unconditional write would clone it and defeat that reuse.
-        if per_turn_config.token_budget != resolved_token_budget {
-            Arc::make_mut(&mut per_turn_config).token_budget = resolved_token_budget;
-        }
         if per_turn_config.service_tier != resolved_service_tier {
             Arc::make_mut(&mut per_turn_config).service_tier = resolved_service_tier;
         }
@@ -1097,7 +1221,7 @@ impl Session {
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
-        final_output_json_schema: Option<Option<Value>>,
+        final_output_json_schema: Option<Option<Arc<PreparedOutputSchema>>>,
     ) -> Arc<TurnContext> {
         self.new_turn_context_from_configuration(
             sub_id,
@@ -1127,7 +1251,7 @@ impl Session {
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,
-        final_output_json_schema: Option<Option<Value>>,
+        final_output_json_schema: Option<Option<Arc<PreparedOutputSchema>>>,
         multi_agent_runtime: TurnMultiAgentRuntime,
     ) -> Arc<TurnContext> {
         let turn_environments = self.services.turn_environments.snapshot().await;
@@ -1145,14 +1269,6 @@ impl Session {
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
         let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
-        {
-            let mcp_runtime = self.services.latest_mcp_runtime();
-            let mcp_connection_manager = mcp_runtime.manager();
-            mcp_connection_manager.set_approval_policy(&session_configuration.approval_policy);
-            mcp_connection_manager
-                .set_permission_profile(session_configuration.permission_profile());
-        }
-
         let model_info = self
             .services
             .models_manager
@@ -1215,10 +1331,6 @@ impl Session {
         if per_turn_config.service_tier != resolved_service_tier {
             Arc::make_mut(&mut per_turn_config).service_tier = resolved_service_tier;
         }
-        // Resolve before consulting the cache so the cached allocation already
-        // carries this model's budget and make_turn_context has nothing to rewrite.
-        let resolved_token_budget =
-            super::token_budget::resolve_for_model(&per_turn_config, &model_info);
         let per_turn_config = {
             let mut cached = self
                 .turn_config_cache
@@ -1226,16 +1338,11 @@ impl Session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match cached.as_ref() {
                 Some(previous)
-                    if same_turn_config_projection(previous.as_ref(), per_turn_config.as_ref())
-                        && previous.token_budget == resolved_token_budget =>
+                    if same_turn_config_projection(previous.as_ref(), per_turn_config.as_ref()) =>
                 {
                     Arc::clone(previous)
                 }
                 _ => {
-                    let mut per_turn_config = per_turn_config;
-                    if per_turn_config.token_budget != resolved_token_budget {
-                        Arc::make_mut(&mut per_turn_config).token_budget = resolved_token_budget;
-                    }
                     *cached = Some(Arc::clone(&per_turn_config));
                     per_turn_config
                 }
@@ -1271,6 +1378,14 @@ impl Session {
             turn_context.final_output_json_schema = final_schema;
         }
         turn_context.code_mode_available = self.services.code_mode_service.is_available();
+        if turn_context.config.features.enabled(Feature::Kd4Runtime) {
+            turn_context.full_suite_budget = self
+                .services
+                .agent_control
+                .task_coordinator()
+                .validation_budget(self.thread_id())
+                .await;
+        }
         turn_context
             .turn_timing_state
             .bind_live_phase_events(turn_context.sub_id.clone(), self.tx_event.clone());
@@ -1348,5 +1463,69 @@ impl Session {
     async fn default_turn_configuration(&self) -> SessionConfiguration {
         let state = self.state.lock().await;
         state.session_configuration.clone()
+    }
+}
+#[cfg(test)]
+mod runtime_epoch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_session_metadata_replaces_shell_and_discards_old_snapshot() {
+        let environment = Arc::new(codex_exec_server::Environment::default_for_tests());
+        let backend = environment.get_exec_backend();
+        let mut selected = TurnEnvironment::new(
+            "remote".into(),
+            environment,
+            PathUri::parse("file:///C:/workspace").unwrap(),
+            None,
+        );
+        let runtime = |id: &str, name: &str, path: &str| {
+            codex_exec_server::EnvironmentRuntime::for_tests(
+                id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "operatingSystem":"windows", "shell":{"name":name,"path":path},
+                    "cwd":"file:///C:/workspace",
+                }))
+                .unwrap(),
+                Arc::clone(&backend),
+            )
+        };
+        selected
+            .apply_runtime(runtime("first", "powershell", "C:/first/powershell.exe"))
+            .unwrap();
+        let stable = Arc::clone(&selected.environment);
+        let owner = selected.owner_id();
+        selected
+            .apply_runtime(runtime("first", "powershell", "C:/first/powershell.exe"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&stable, &selected.environment));
+        assert_eq!(selected.owner_id(), owner);
+        selected.shell_snapshot = futures::future::pending().boxed().shared();
+        selected
+            .apply_runtime(runtime("second", "cmd", "C:/second/cmd.exe"))
+            .unwrap();
+        assert_eq!(
+            selected.shell.as_ref().unwrap().shell_type,
+            shell::ShellType::Cmd
+        );
+        assert!(
+            selected
+                .shell
+                .as_ref()
+                .unwrap()
+                .shell_path
+                .to_string_lossy()
+                .contains("second")
+        );
+        assert_eq!(selected.runtime.as_ref().unwrap().session_id, "second");
+        assert_ne!(selected.owner_id(), owner);
+        assert!(
+            selected
+                .shell_snapshot
+                .clone()
+                .now_or_never()
+                .unwrap()
+                .is_none()
+        );
     }
 }

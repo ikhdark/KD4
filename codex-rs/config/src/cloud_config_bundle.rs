@@ -179,7 +179,11 @@ impl CloudConfigBundleLoadError {
 pub struct CloudConfigBundleLoader {
     state: std::sync::Arc<std::sync::Mutex<BundleLoadState>>,
     retry_factory: Option<std::sync::Arc<dyn Fn() -> BundleLoadFuture + Send + Sync>>,
+    publication_guard: Option<std::sync::Arc<BundlePublicationGuard>>,
 }
+
+type BundlePublicationGuard =
+    dyn Fn(&mut dyn FnMut()) -> Result<(), CloudConfigBundleLoadError> + Send + Sync;
 
 type BundleLoadFuture =
     Shared<BoxFuture<'static, Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError>>>;
@@ -202,6 +206,7 @@ impl CloudConfigBundleLoader {
                 future: Some(fut.boxed().shared()),
             })),
             retry_factory: None,
+            publication_guard: None,
         }
     }
 
@@ -223,10 +228,83 @@ impl CloudConfigBundleLoader {
                 future: Some(factory()),
             })),
             retry_factory: Some(factory),
+            publication_guard: None,
+        }
+    }
+
+    /// The guard must call the publication exactly once while its identity is current.
+    pub fn with_publication_guard(
+        mut self,
+        guard: impl Fn(&mut dyn FnMut()) -> Result<(), CloudConfigBundleLoadError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.publication_guard = Some(std::sync::Arc::new(guard));
+        self
+    }
+
+    pub fn validate_current(&self) -> Result<(), CloudConfigBundleLoadError> {
+        self.publish_if_current(|| ())
+    }
+
+    /// Synchronous only: never perform I/O or re-enter the authority in `publish`.
+    pub fn publish_if_current<T>(
+        &self,
+        publish: impl FnOnce() -> T,
+    ) -> Result<T, CloudConfigBundleLoadError> {
+        match &self.publication_guard {
+            Some(guard) => {
+                let mut publish = Some(publish);
+                let mut result = None;
+                guard(&mut || {
+                    if let Some(publish) = publish.take() {
+                        result = Some(publish());
+                    }
+                })?;
+                result.ok_or_else(|| {
+                    CloudConfigBundleLoadError::new(
+                        CloudConfigBundleLoadErrorCode::Internal,
+                        None,
+                        "policy guard did not publish",
+                    )
+                })
+            }
+            None => Ok(publish()),
+        }
+    }
+
+    pub fn candidate_generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+    }
+
+    /// A download is only a candidate until the complete effective config validates.
+    /// Do not discard a newer attempt, an in-flight attempt, or a terminal request error.
+    pub fn reject_candidate(&self, generation: u64) {
+        if self.retry_factory.is_none() {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation == generation
+            && state
+                .future
+                .as_ref()
+                .and_then(|future| future.peek())
+                .is_some_and(Result::is_ok)
+        {
+            state.generation += 1;
+            state.future = None;
         }
     }
 
     pub async fn get(&self) -> Result<Option<CloudConfigBundle>, CloudConfigBundleLoadError> {
+        self.validate_current()?;
         let (generation, future) = {
             let mut state = self
                 .state
@@ -247,6 +325,7 @@ impl CloudConfigBundleLoader {
             (state.generation, future)
         };
         let result = future.await;
+        self.validate_current()?;
         let retryable = result
             .as_ref()
             .err()
@@ -269,7 +348,7 @@ impl CloudConfigBundleLoader {
                 state.future = None;
             }
         }
-        result
+        self.publish_if_current(|| result)?
     }
 }
 

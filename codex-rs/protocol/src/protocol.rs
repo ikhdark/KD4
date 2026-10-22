@@ -254,14 +254,15 @@ pub struct ThreadSettingsOverrides {
 }
 
 /// Source classification for client-supplied context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdditionalContextKind {
     Untrusted,
     Application,
 }
 
 /// Client-supplied context keyed by an opaque source identifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdditionalContextEntry {
     pub value: String,
     pub kind: AdditionalContextKind,
@@ -1047,6 +1048,10 @@ pub enum EventMsg {
     #[serde(rename = "task_complete", alias = "turn_complete")]
     TurnComplete(TurnCompleteEvent),
 
+    /// Closes imported historical context without asserting source completion.
+    /// Completion timestamps, errors, and native execution timings are absent.
+    ImportedTurnClosed(TurnCompleteEvent),
+
     /// Usage update for the current session, including totals and last turn.
     /// Optional means unknown — UIs should not display when `None`.
     TokenCount(TokenCountEvent),
@@ -1514,6 +1519,12 @@ pub enum AgentStatus {
         last_agent_message: Option<String>,
         surfaced_result: SurfacedToolResult,
     },
+    /// Execution stopped at a capacity boundary. Acceptance is independently
+    /// owned by task receipts; preserve the report even without acceptance.
+    Stopped {
+        last_agent_message: Option<String>,
+        stop_cause: TurnExecutionStopCause,
+    },
     /// Agent encountered an error.
     Errored(String),
     /// Agent has been shutdown.
@@ -1749,6 +1760,93 @@ pub struct SafetyBufferingEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextCompactedEvent;
 
+/// Accepted user-facing answer from one completion attempt. Kept separately
+/// from last-visible-message evidence, which may include commentary or errors.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnFinalAnswer {
+    pub message: Option<AcceptedFinalMessage>,
+    /// Absent in older records. Final-specific observations, not task acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tail: Option<TurnFinalTail>,
+}
+
+/// Version 1 counts Unicode scalar values, UTF-8 bytes and nonempty Unicode
+/// whitespace-separated words in the canonical final, once. No token estimate
+/// is inferred. Times are monotonic offsets from this core turn's start.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnFinalTail {
+    pub measurement_version: u16,
+    pub item_id: Option<String>,
+    pub canonical_sha256: Option<String>,
+    #[ts(type = "number | null")]
+    pub text_codepoints: Option<u64>,
+    #[ts(type = "number | null")]
+    pub text_utf8_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub whitespace_words: Option<u64>,
+    #[ts(type = "number | null")]
+    pub first_content_host_ms: Option<u64>,
+    #[ts(type = "number | null")]
+    pub full_content_host_ms: Option<u64>,
+    /// Host observation of the admitted final candidate, not proof that every
+    /// user obligation or external evidence source was reconciled.
+    #[ts(type = "number | null")]
+    pub reconciled_host_ms: Option<u64>,
+    /// Unknown unless an authoritative task oracle supplies required evidence;
+    /// never substitute the most recent tool, status call, or plan completion.
+    pub required_evidence: Option<TurnRequiredEvidenceFrontier>,
+    /// Requires a capable native client. Server writer receipts are NOT render
+    /// acknowledgments and cannot populate this field.
+    pub native_render_ack: Option<TurnFinalRenderAck>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnRequiredEvidenceFrontier {
+    pub provenance: String,
+    pub source_snapshot: String,
+    /// Oracle-owned references; not final-answer prose.
+    pub result_ids: Vec<String>,
+    #[ts(type = "number")]
+    pub available_host_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnFinalRenderAck {
+    pub client_id: String,
+    pub canonical_sha256: String,
+    pub clock_domain: String,
+    #[ts(type = "number")]
+    pub rendered_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct AcceptedFinalMessage {
+    pub item_id: String,
+    pub text: String,
+    pub origin: AcceptedFinalMessageOrigin,
+    pub completion_attempt_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum AcceptedFinalMessageOrigin {
+    AssistantFinal,
+    LegacyUnphased,
+    Plan,
+}
+
 /// Immutable wall-clock profile captured at the core terminal boundary.
 ///
 /// `exclusive` is the canonical elapsed-time partition. Values in `unions`
@@ -1757,6 +1855,21 @@ pub struct ContextCompactedEvent;
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTiming {
+    /// Scheduling cause, not an acceptance verdict. Absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stop_cause: Option<TurnExecutionStopCause>,
+    /// Bounded occurrence intervals in a named process clock domain. Missing
+    /// evidence must not be reconstructed from scalar totals or wall epochs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub activity_timeline: Option<crate::timing::TurnTimingTimeline>,
+    /// Accepted answer identity frozen after completion hooks and pending-input
+    /// admission. Some with no message explicitly means no accepted answer;
+    /// absence is legacy unknown. This is not the last visible/partial message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub final_answer: Option<TurnFinalAnswer>,
     /// Completion diagnostics captured at the terminal boundary. These are
     /// independent of execution status and timing validity; empty diagnostics
     /// are not proof that the user's entire task was verified.
@@ -1801,6 +1914,16 @@ pub struct TurnTiming {
     /// from turn start and are diagnostic only; they are not additive buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_requests: Vec<TurnTimingModelRequest>,
+    /// True qualifies all history-derived purpose, failure, wait-signature and
+    /// nonprogress aggregates as retained-tail lower bounds. None is legacy unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model_request_history_truncated: Option<bool>,
+    /// Frozen-core duration excludes subsequent detail export and event enqueue;
+    /// it is not a client-delivery or terminal-publication latency measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub terminal_publication_duration_excluded: Option<bool>,
     /// Bounded per-call relay timings captured at delivery. Offsets are from
     /// turn start; phase durations are diagnostics and are not additive with
     /// the canonical `exclusive` partition.
@@ -1817,14 +1940,16 @@ pub struct TurnTiming {
     /// Exact accepted-call closure ledger. A terminal event is publishable only
     /// when every accepted direct and nested execution has timing, a terminal
     /// outcome, and exactly one persisted projection.
-    #[serde(default)]
+    #[serde(default = "TurnTimingToolClosure::unmeasured")]
     pub tool_closure: TurnTimingToolClosure,
-    /// Provider usage observed on generations where neither relevant
-    /// structured state nor the next-correct-action changed. This is a
-    /// diagnostic and is never treated as measured avoidable savings.
+    /// Provider usage observed on generations with no recorded progress kinds
+    /// and unchanged relevant state. A changed next action alone is not progress
+    /// under this predicate; useful inference or diagnosis may still occur.
+    /// Final-answer publication is excluded. This observational diagnostic is
+    /// neither measured avoidable savings nor authority to stop a turn.
     #[serde(default)]
     pub observational_nonprogress_tokens: TurnTimingDiagnosticTokenAggregate,
-    /// Latency observed on the same unchanged-state, unchanged-next-action
+    /// Latency observed on the same no-recorded-progress, unchanged-state
     /// generations as `observational_nonprogress_tokens`. Model-stream wait
     /// remains a model-side wall-clock measurement; `decision_latency_ns`
     /// narrows that to dispatch-to-first-actionable-output where observable.
@@ -1841,6 +1966,13 @@ pub struct TurnTiming {
     pub pre_first_model_output: Option<TurnTimingPreFirstModelOutput>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/")]
+pub enum TurnExecutionStopCause {
+    SubagentContextBudget,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1852,6 +1984,23 @@ pub struct TurnCompletionAssessment {
     pub failed_checks: Vec<String>,
     pub verification_gaps: Vec<String>,
     pub advisories: Vec<String>,
+}
+
+impl TurnCompletionAssessment {
+    /// Material diagnostics only; advisories are not failed task requirements.
+    pub fn verification_warning(&self) -> Option<String> {
+        (!self.failed_checks.is_empty() || !self.verification_gaps.is_empty()).then(|| {
+            format!(
+                "{} This turn is not a verified completion of that scope.",
+                self.failed_checks
+                    .iter()
+                    .chain(&self.verification_gaps)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -1867,23 +2016,34 @@ pub struct TurnValidationUncertainty {
 impl TurnCompletionAssessment {
     /// Bounded host observations, never acceptance or execution authority.
     pub fn bounded_summary(&self, turn_id: &str) -> Option<String> {
-        if self.failed_checks.is_empty() && self.verification_gaps.is_empty() && self.advisories.is_empty() {
+        if self.failed_checks.is_empty()
+            && self.verification_gaps.is_empty()
+            && self.advisories.is_empty()
+        {
             return None;
         }
-        let mut result = format!("Host completion observations for turn {turn_id} (not acceptance):");
+        let mut result = format!(
+            "Host completion observations for turn {turn_id} (not acceptance or test authorization). Missing attribution does not require tests; follow applicable user instructions, including intentional omission. Input attribution is not proof that changed behavior was exercised. Saved process identities are not live or callable handles."
+        );
         for (label, entries) in [
             ("failed checks", &self.failed_checks),
             ("verification gaps", &self.verification_gaps),
             ("advisories", &self.advisories),
         ] {
-            if entries.is_empty() { continue; }
+            if entries.is_empty() {
+                continue;
+            }
             result.push_str(&format!("\n{label} ({}):", entries.len()));
             for entry in entries.iter().take(4) {
                 let text = entry.chars().take(192).collect::<String>();
                 result.push_str(&format!("\n- {text}"));
-                if text.len() < entry.len() { result.push_str(" [truncated]"); }
+                if text.len() < entry.len() {
+                    result.push_str(" [truncated]");
+                }
             }
-            if entries.len() > 4 { result.push_str("\n[additional observations omitted; see the turn timing record]"); }
+            if entries.len() > 4 {
+                result.push_str("\n[additional observations omitted; see the turn timing record]");
+            }
         }
         Some(result)
     }
@@ -1944,6 +2104,10 @@ pub struct TurnTimingToolCallIdentity {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingToolClosure {
+    /// False when a legacy record omitted the entire closure ledger. Its zero
+    /// counts and incomplete verdict are unavailable evidence, not observations.
+    #[serde(default = "closure_measurement_available")]
+    pub measurement_available: bool,
     #[serde(default)]
     pub accepted_count: u32,
     #[serde(default)]
@@ -1977,6 +2141,7 @@ pub struct TurnTimingToolClosure {
 impl Default for TurnTimingToolClosure {
     fn default() -> Self {
         Self {
+            measurement_available: true,
             accepted_count: 0,
             timing_paired_count: 0,
             terminal_count: 0,
@@ -1992,6 +2157,43 @@ impl Default for TurnTimingToolClosure {
             orphan_calls: Vec::new(),
             complete: true,
         }
+    }
+}
+
+fn closure_measurement_available() -> bool {
+    true
+}
+
+impl TurnTimingToolClosure {
+    fn unmeasured() -> Self {
+        Self {
+            measurement_available: false,
+            complete: false,
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit110_closure_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_legacy_closure_is_unmeasured_but_live_empty_is_complete() {
+        let mut legacy = serde_json::to_value(TurnTiming::default()).unwrap();
+        legacy["schemaVersion"] = serde_json::json!(9);
+        legacy.as_object_mut().unwrap().remove("toolClosure");
+        let decoded: TurnTiming = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.schema_version, 9);
+        assert!(!decoded.tool_closure.measurement_available);
+        assert!(!decoded.tool_closure.complete);
+        let serialized = serde_json::to_value(decoded).unwrap();
+        assert_eq!(serialized["toolClosure"]["measurementAvailable"], false);
+        assert!(TurnTiming::default().tool_closure.complete);
+        let explicit: TurnTimingToolClosure =
+            serde_json::from_value(serde_json::json!({"complete": true})).unwrap();
+        assert!(explicit.measurement_available);
+        assert!(explicit.complete);
     }
 }
 
@@ -2490,8 +2692,8 @@ pub struct TurnTimingModelRequest {
     #[serde(default)]
     #[ts(type = "number | null")]
     pub decision_latency_ns: Option<u64>,
-    /// Tool calls whose deferred executor future was polled for this generation.
-    /// Kept under its historical field name for rollout compatibility.
+    /// Unique tool calls accepted for this generation, including unpolled calls.
+    /// Timing schemas <=32 counted calls at executor polling instead.
     #[serde(default)]
     pub tool_call_count: u32,
     /// Tool calls parsed from completed model output before relay persistence
@@ -2845,8 +3047,17 @@ impl<'de> Deserialize<'de> for TurnTimingDeterministicContinuationReceipt {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingProviderTokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub coverage: Option<TokenUsageCoverage>,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Provider output minus explicitly reported reasoning, not visible text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_excluding_reported_reasoning_tokens: Option<u64>,
+    /// Deprecated compatibility remainder. Not a final-answer text count;
+    /// consult coverage and the canonical optional field before interpreting it.
     pub visible_output_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
@@ -2856,6 +3067,9 @@ pub struct TurnTimingProviderTokenUsage {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingDiagnosticTokenAggregate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub coverage: Option<TokenUsageCoverage>,
     /// Expected physical usage reports; absent in legacy aggregates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -2867,6 +3081,12 @@ pub struct TurnTimingDiagnosticTokenAggregate {
     pub logical_generations: u32,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Same provider remainder as the per-request canonical field. Retained
+    /// window only when TurnTiming.model_request_history_truncated is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_excluding_reported_reasoning_tokens: Option<u64>,
+    /// Deprecated compatibility remainder; never add it to the canonical field.
     pub visible_output_tokens: u64,
     pub reasoning_tokens: u64,
     pub total_tokens: u64,
@@ -2972,6 +3192,9 @@ pub struct TurnTimingGenerationPurposeCounts {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnTimingGenerationPurposeAggregate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub coverage: Option<TokenUsageCoverage>,
     /// Expected physical usage reports; absent in legacy aggregates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -3000,6 +3223,12 @@ pub struct TurnTimingGenerationPurposeAggregate {
     pub input_tokens: u64,
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Provider remainder, not visible/final text. Completeness also requires
+    /// TurnTiming.model_request_history_truncated == Some(false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output_excluding_reported_reasoning_tokens: Option<u64>,
+    /// Deprecated compatibility remainder; never add it to the canonical field.
     #[serde(default)]
     pub visible_output_tokens: u64,
     #[serde(default)]
@@ -3154,7 +3383,10 @@ pub struct TurnTimingMilestones {
 #[ts(export_to = "v2/")]
 pub struct TurnTimingCounters {
     /// Logical workflow generations. `model_request_count` remains the
-    /// authoritative physical provider-attempt aggregate.
+    /// authoritative physical transport-attempt aggregate in timing schema 34+:
+    /// each identity is counted once at transport entry, including internal auth
+    /// retries. This does not prove provider receipt. Older schemas may count
+    /// only the first dispatch/readiness in a sampling row.
     #[serde(default)]
     pub logical_generation_count: u32,
     #[serde(default)]
@@ -3225,6 +3457,12 @@ pub struct TurnTimingCounters {
     pub failure_diagnosis_count: u32,
     #[serde(default)]
     pub attempts_by_kind: TurnTimingAttemptKindCounts,
+    /// Bounded detail loss; diagnostics derived from request rows cover only
+    /// retained detail when either eviction counter is nonzero.
+    #[serde(default)]
+    pub model_request_detail_eviction_count: u32,
+    #[serde(default)]
+    pub physical_attempt_detail_eviction_count: u32,
     pub model_request_count: u32,
     pub model_retry_count: u32,
     pub model_fallback_count: u32,
@@ -3326,11 +3564,15 @@ pub struct TurnCompleteEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub completed_at: Option<i64>,
-    /// Duration between turn start and completion in milliseconds, if known.
+    /// Duration from turn start to the frozen core terminal boundary, if known.
+    /// Detail export/event enqueue after that boundary are excluded; not client delivery latency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub duration_ms: Option<i64>,
-    /// Duration between turn start and the first model token in milliseconds, if known.
+    /// Duration until the turn consumer observes nonempty model content (text,
+    /// exposed reasoning, or tool input), excluding internal compaction. This is
+    /// not provider-internal token timing. Timing schemas <=32 measured first
+    /// visible output instead; older records must retain that interpretation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub time_to_first_token_ms: Option<i64>,
@@ -3450,6 +3692,121 @@ pub struct TokenUsage {
     pub reasoning_output_tokens: i64,
     #[ts(type = "number")]
     pub total_tokens: i64,
+    /// Known receipt sums, not a claim that unobserved provider work was free.
+    /// Absent on old records: component availability is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub coverage: Option<TokenUsageCoverage>,
+}
+
+/// Constant-space receipt/component coverage. Counts add and subtract with the
+/// existing usage ledger, so an earlier missing receipt does not taint later turns.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct TokenUsageCoverage {
+    #[ts(type = "number")]
+    pub receipts: u64,
+    /// Whole usage objects received. None preserves legacy coverage uncertainty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub reported_receipts: Option<u64>,
+    /// Sum of the explicitly reported cache-write input class, not an estimate.
+    /// Interpret with cache_write_receipts; an absent class is never known zero.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub cache_write_input_tokens: i64,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub cache_write_receipts: u64,
+    #[ts(type = "number")]
+    pub input_tokens: u64,
+    #[ts(type = "number")]
+    pub cached_input_tokens: u64,
+    #[ts(type = "number")]
+    pub output_tokens: u64,
+    #[ts(type = "number")]
+    pub reasoning_output_tokens: u64,
+    #[ts(type = "number")]
+    pub total_tokens: u64,
+    #[ts(type = "number")]
+    pub invalid_receipts: u64,
+    pub saturated: bool,
+}
+
+impl TokenUsageCoverage {
+    pub fn fully_reported() -> Self {
+        Self {
+            receipts: 1,
+            reported_receipts: Some(1),
+            input_tokens: 1,
+            cached_input_tokens: 1,
+            output_tokens: 1,
+            reasoning_output_tokens: 1,
+            total_tokens: 1,
+            ..Default::default()
+        }
+    }
+
+    pub fn add_assign(&mut self, other: &Self) {
+        macro_rules! add { ($($field:ident),*) => { $(
+            if self.$field.checked_add(other.$field).is_none() { self.saturated = true; }
+            self.$field = self.$field.saturating_add(other.$field);
+        )* }; }
+        self.reported_receipts =
+            self.reported_receipts
+                .zip(other.reported_receipts)
+                .map(|(left, right)| {
+                    self.saturated |= left.checked_add(right).is_none();
+                    left.saturating_add(right)
+                });
+        self.saturated |= self
+            .cache_write_input_tokens
+            .checked_add(other.cache_write_input_tokens)
+            .is_none();
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(other.cache_write_input_tokens);
+        add!(
+            receipts,
+            cache_write_receipts,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+            invalid_receipts
+        );
+        self.saturated |= other.saturated;
+    }
+
+    fn difference(&self, before: &Self) -> Self {
+        Self {
+            receipts: self.receipts.saturating_sub(before.receipts),
+            reported_receipts: self
+                .reported_receipts
+                .zip(before.reported_receipts)
+                .map(|(after, before)| after.saturating_sub(before)),
+            cache_write_input_tokens: self
+                .cache_write_input_tokens
+                .saturating_sub(before.cache_write_input_tokens)
+                .max(0),
+            cache_write_receipts: self
+                .cache_write_receipts
+                .saturating_sub(before.cache_write_receipts),
+            input_tokens: self.input_tokens.saturating_sub(before.input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(before.cached_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(before.output_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_sub(before.reasoning_output_tokens),
+            total_tokens: self.total_tokens.saturating_sub(before.total_tokens),
+            invalid_receipts: self
+                .invalid_receipts
+                .saturating_sub(before.invalid_receipts),
+            saturated: self.saturated || before.saturated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -3478,7 +3835,7 @@ impl TokenUsageInfo {
         let mut info = match info {
             Some(info) => info.clone(),
             None => Self {
-                total_token_usage: TokenUsage::default(),
+                total_token_usage: TokenUsage::empty_ledger(),
                 last_token_usage: TokenUsage::default(),
                 estimated_context_tokens: None,
                 model_context_window,
@@ -3505,17 +3862,21 @@ impl TokenUsageInfo {
     }
 
     pub fn context_tokens(&self) -> i64 {
-        self.estimated_context_tokens.unwrap_or(self.last_token_usage.total_tokens)
+        self.estimated_context_tokens
+            .unwrap_or(self.last_token_usage.total_tokens)
     }
 
     /// Compatibility projection for context bars only, never a consumption ledger.
     pub fn context_usage(&self) -> TokenUsage {
-        TokenUsage { total_tokens: self.context_tokens(), ..TokenUsage::default() }
+        TokenUsage {
+            total_tokens: self.context_tokens(),
+            ..TokenUsage::default()
+        }
     }
 
     pub fn full_context_window(context_window: i64) -> Self {
         let mut info = Self {
-            total_token_usage: TokenUsage::default(),
+            total_token_usage: TokenUsage::empty_ledger(),
             last_token_usage: TokenUsage::default(),
             estimated_context_tokens: None,
             model_context_window: Some(context_window),
@@ -3527,7 +3888,7 @@ impl TokenUsageInfo {
     /// A fork inherits context, not the parent's already-consumed provider work.
     pub fn for_fork(&self) -> Self {
         Self {
-            total_token_usage: TokenUsage::default(),
+            total_token_usage: TokenUsage::empty_ledger(),
             last_token_usage: TokenUsage::default(),
             estimated_context_tokens: Some(self.context_tokens()),
             model_context_window: self.model_context_window,
@@ -3612,6 +3973,109 @@ pub struct SpendControlLimitSnapshot {
 const BASELINE_TOKENS: i64 = 12000;
 
 impl TokenUsage {
+    pub fn empty_ledger() -> Self {
+        Self {
+            coverage: Some(TokenUsageCoverage {
+                reported_receipts: Some(0),
+                ..Default::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub fn missing_receipt() -> Self {
+        Self {
+            coverage: Some(TokenUsageCoverage {
+                receipts: 1,
+                reported_receipts: Some(0),
+                ..Default::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub fn known_input(&self) -> Option<i64> {
+        self.known(self.input_tokens, |c| c.input_tokens)
+    }
+    pub fn known_cached_input(&self) -> Option<i64> {
+        self.known(self.cached_input_tokens, |c| c.cached_input_tokens)
+    }
+    pub fn known_output(&self) -> Option<i64> {
+        self.known(self.output_tokens, |c| c.output_tokens)
+    }
+    pub fn known_reasoning_output(&self) -> Option<i64> {
+        self.known(self.reasoning_output_tokens, |c| c.reasoning_output_tokens)
+    }
+    pub fn known_total(&self) -> Option<i64> {
+        self.known(self.total_tokens, |c| c.total_tokens)
+    }
+    pub fn known_visible_output(&self) -> Option<i64> {
+        self.known_output()?
+            .checked_sub(self.known_reasoning_output()?)
+            .filter(|tokens| *tokens >= 0)
+    }
+    pub fn known_non_cached_input(&self) -> Option<i64> {
+        self.known_input()?
+            .checked_sub(self.known_cached_input()?)
+            .filter(|tokens| *tokens >= 0)
+    }
+
+    pub fn known_cache_write_input(&self) -> Option<i64> {
+        let coverage = self.coverage.as_ref()?;
+        self.known(coverage.cache_write_input_tokens, |c| {
+            c.cache_write_receipts
+        })
+    }
+
+    /// Only valid for providers whose input classes are disjoint read/write/ordinary.
+    /// No provider convention is inferred from an absent cache-write field.
+    pub fn known_ordinary_input(&self) -> Option<i64> {
+        if self.coverage.as_ref()?.invalid_receipts != 0 {
+            return None;
+        }
+        self.known_non_cached_input()?
+            .checked_sub(self.known_cache_write_input()?)
+            .filter(|tokens| *tokens >= 0)
+    }
+
+    fn known(&self, value: i64, reported: impl FnOnce(&TokenUsageCoverage) -> u64) -> Option<i64> {
+        let coverage = self.coverage.as_ref()?;
+        (!coverage.saturated && reported(coverage) == coverage.receipts && value >= 0)
+            .then_some(value)
+    }
+
+    pub fn difference(&self, before: &Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(before.input_tokens).max(0),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(before.cached_input_tokens)
+                .max(0),
+            output_tokens: self
+                .output_tokens
+                .saturating_sub(before.output_tokens)
+                .max(0),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_sub(before.reasoning_output_tokens)
+                .max(0),
+            total_tokens: self.total_tokens.saturating_sub(before.total_tokens).max(0),
+            coverage: match (&self.coverage, &before.coverage) {
+                (Some(after), Some(before)) => Some(after.difference(before)),
+                (Some(after), None)
+                    if before.input_tokens == 0
+                        && before.cached_input_tokens == 0
+                        && before.output_tokens == 0
+                        && before.reasoning_output_tokens == 0
+                        && before.total_tokens == 0 =>
+                {
+                    Some(*after)
+                }
+                _ => None,
+            },
+        }
+    }
+
     pub fn is_zero(&self) -> bool {
         self.total_tokens == 0
     }
@@ -3621,12 +4085,13 @@ impl TokenUsage {
     }
 
     pub fn non_cached_input(&self) -> i64 {
-        (self.input_tokens - self.cached_input()).max(0)
+        self.input_tokens.saturating_sub(self.cached_input()).max(0)
     }
 
-    /// Primary count for display as a single absolute value: non-cached input + output.
+    /// Derived uncached input + output, not the provider's total token count.
     pub fn blended_total(&self) -> i64 {
-        (self.non_cached_input() + self.output_tokens.max(0)).max(0)
+        self.non_cached_input()
+            .saturating_add(self.output_tokens.max(0))
     }
 
     pub fn tokens_in_context_window(&self) -> i64 {
@@ -3656,13 +4121,44 @@ impl TokenUsage {
             .round() as i64
     }
 
-    /// In-place element-wise sum of token counts.
+    /// In-place nonnegative, saturating element-wise sum, including restored DTOs.
     pub fn add_assign(&mut self, other: &TokenUsage) {
-        self.input_tokens += other.input_tokens;
-        self.cached_input_tokens += other.cached_input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.reasoning_output_tokens += other.reasoning_output_tokens;
-        self.total_tokens += other.total_tokens;
+        if let Some(coverage) = self.coverage.as_mut() {
+            if let Some(other_coverage) = &other.coverage {
+                coverage.add_assign(other_coverage);
+                coverage.saturated |= [
+                    (self.input_tokens, other.input_tokens),
+                    (self.cached_input_tokens, other.cached_input_tokens),
+                    (self.output_tokens, other.output_tokens),
+                    (self.reasoning_output_tokens, other.reasoning_output_tokens),
+                    (self.total_tokens, other.total_tokens),
+                ]
+                .into_iter()
+                .any(|(left, right)| left.max(0).checked_add(right.max(0)).is_none());
+            } else {
+                self.coverage = None;
+            }
+        }
+        self.input_tokens = self
+            .input_tokens
+            .max(0)
+            .saturating_add(other.input_tokens.max(0));
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .max(0)
+            .saturating_add(other.cached_input_tokens.max(0));
+        self.output_tokens = self
+            .output_tokens
+            .max(0)
+            .saturating_add(other.output_tokens.max(0));
+        self.reasoning_output_tokens = self
+            .reasoning_output_tokens
+            .max(0)
+            .saturating_add(other.reasoning_output_tokens.max(0));
+        self.total_tokens = self
+            .total_tokens
+            .max(0)
+            .saturating_add(other.total_tokens.max(0));
     }
 }
 
@@ -3681,29 +4177,37 @@ impl fmt::Display for FinalOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let token_usage = &self.token_usage;
 
+        let optional = |value: Option<i64>| {
+            value
+                .map(format_with_separators)
+                .unwrap_or_else(|| "unknown".to_string())
+        };
         write!(
             f,
-            "Token usage: total={} input={}{} output={}{}",
-            format_with_separators(token_usage.blended_total()),
-            format_with_separators(token_usage.non_cached_input()),
-            if token_usage.cached_input() > 0 {
-                format!(
-                    " (+ {} cached)",
-                    format_with_separators(token_usage.cached_input())
-                )
-            } else {
-                String::new()
-            },
+            "Token usage (thread, observed subtotal): total={} input={} cached={} uncached={} output={} reasoning={}",
+            format_with_separators(token_usage.total_tokens),
+            format_with_separators(token_usage.input_tokens),
+            optional(token_usage.known_cached_input()),
+            optional(token_usage.known_non_cached_input()),
             format_with_separators(token_usage.output_tokens),
-            if token_usage.reasoning_output_tokens > 0 {
-                format!(
-                    " (reasoning {})",
-                    format_with_separators(token_usage.reasoning_output_tokens)
-                )
-            } else {
-                String::new()
-            }
-        )
+            optional(token_usage.known_reasoning_output()),
+        )?;
+        match token_usage.coverage.as_ref() {
+            Some(coverage) if !coverage.saturated => write!(
+                f,
+                "; receipts input={}/{} cached={}/{} output={}/{} total={}/{} invalid={}",
+                coverage.input_tokens,
+                coverage.receipts,
+                coverage.cached_input_tokens,
+                coverage.receipts,
+                coverage.output_tokens,
+                coverage.receipts,
+                coverage.total_tokens,
+                coverage.receipts,
+                coverage.invalid_receipts,
+            ),
+            _ => write!(f, "; metering unknown"),
+        }
     }
 }
 
@@ -4094,6 +4598,7 @@ impl InitialHistory {
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::AdditionalContextState { .. }
                 | RolloutItem::EventMsg(_) => None,
             })
             .and_then(|turn_context| turn_context.multi_agent_mode.clone())
@@ -4274,6 +4779,12 @@ impl fmt::Display for SessionSource {
 }
 
 impl SessionSource {
+    /// Shared continuation eligibility; V2 workers receive work from their parent.
+    pub fn accepts_direct_user_input(&self, version: Option<MultiAgentVersion>) -> bool {
+        !(version == Some(MultiAgentVersion::V2)
+            && matches!(self, Self::SubAgent(SubAgentSource::ThreadSpawn { .. })))
+    }
+
     pub fn from_startup_arg(value: &str) -> Result<Self, &'static str> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -4436,6 +4947,7 @@ fn multi_agent_version_from_items(
             | RolloutItem::InterAgentCommunicationMetadata { .. }
             | RolloutItem::Compacted(_)
             | RolloutItem::WorldState(_)
+            | RolloutItem::AdditionalContextState { .. }
             | RolloutItem::EventMsg(_) => None,
         })
     })
@@ -4604,6 +5116,16 @@ pub enum RolloutItem {
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     WorldState(WorldStateItem),
+    /// Versioned, model-invisible source ownership co-recorded with its input.
+    AdditionalContextState {
+        version: u8,
+        turn_id: String,
+        state: serde_json::Value,
+        /// Checkpoint-only companion owned by the AGENTS source manager, not
+        /// evidence that the provider accepted a world-state baseline.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_sources: Option<serde_json::Value>,
+    },
     EventMsg(EventMsg),
 }
 
@@ -4645,8 +5167,11 @@ pub struct SamplingTimingCheckpoint {
     pub harness_build: Option<SessionBuildInfo>,
     /// When true, `timing` keeps its cumulative scalar aggregates but carries
     /// only the model requests, tool calls, and continuation receipts that are
-    /// new or changed since the previous checkpoint of the same turn. Readers
-    /// rebuild those arrays by merging the turn's checkpoints in order. Older
+    /// new or changed since the previous checkpoint of the same turn. Its
+    /// activity timeline keeps its scalars but carries only the intervals from
+    /// the previous checkpoint's last interval on, which may have been extended.
+    /// Readers rebuild those arrays by merging the turn's checkpoints in order,
+    /// replacing intervals that start at or after the first one carried. Older
     /// rollouts hold full snapshots and omit this field.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub incremental: bool,
@@ -5039,14 +5564,12 @@ fn migrate_rollout_v0(fields: &mut serde_json::Map<String, Value>) -> Result<(),
         Some("event_msg")
             if payload.get("type").and_then(Value::as_str) == Some("collab_agent_spawn_end") =>
         {
-            // Extended rollouts predate spawn model metadata. Use the same
-            // unavailable-metadata defaults as the legacy item projection.
-            payload
-                .entry("model".to_string())
-                .or_insert_with(|| Value::String(String::new()));
+            // Missing historical evidence is unavailable, not a model/effort
+            // selection. Keep recorded values, including custom effort names.
+            payload.entry("model".to_string()).or_insert(Value::Null);
             payload
                 .entry("reasoning_effort".to_string())
-                .or_insert_with(|| Value::String(ReasoningEffortConfig::default().to_string()));
+                .or_insert(Value::Null);
         }
         _ => {}
     }
@@ -5058,6 +5581,19 @@ fn reject_v0_fields_in_current_rollout(
 ) -> Result<(), String> {
     let item_type = fields.get("type").and_then(Value::as_str);
     let payload = fields.get("payload").and_then(Value::as_object);
+    if item_type == Some("event_msg")
+        && let Some(payload) = payload
+        && matches!(
+            payload.get("type").and_then(Value::as_str),
+            Some("collab_agent_spawn_begin" | "collab_agent_spawn_end")
+        )
+    {
+        for field in ["model", "reasoning_effort"] {
+            if !payload.contains_key(field) {
+                return Err(format!("missing field `{field}`"));
+            }
+        }
+    }
     if item_type == Some("turn_context")
         && payload.is_some_and(|value| value.contains_key("summary"))
     {
@@ -5193,6 +5729,9 @@ pub enum ExecCommandStatus {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ExecCommandBeginEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<crate::items::EnvironmentProvenance>,
     /// Identifier so this can be paired with the ExecCommandEnd event.
     pub call_id: String,
     /// Identifier for the underlying PTY process (when available).
@@ -5219,6 +5758,9 @@ pub struct ExecCommandBeginEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ExecCommandEndEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<crate::items::EnvironmentProvenance>,
     /// Identifier for the ExecCommandBegin that finished.
     pub call_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5265,6 +5807,9 @@ pub struct ExecCommandEndEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ViewImageToolCallEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<crate::items::EnvironmentProvenance>,
     /// Identifier for the originating tool call.
     pub call_id: String,
     /// Filesystem path resolved for the selected environment.
@@ -5335,6 +5880,9 @@ pub struct StreamErrorEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct PatchApplyBeginEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<crate::items::EnvironmentProvenance>,
     /// Identifier so this can be paired with the PatchApplyEnd event.
     pub call_id: String,
     /// Turn ID that this patch belongs to.
@@ -5357,6 +5905,9 @@ pub struct PatchApplyUpdatedEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct PatchApplyEndEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<crate::items::EnvironmentProvenance>,
     /// Identifier for the PatchApplyBegin that finished.
     pub call_id: String,
     /// Turn ID that this patch belongs to.
@@ -5902,8 +6453,8 @@ pub struct CollabAgentSpawnBeginEvent {
     /// Initial prompt sent to the agent. Can be empty to prevent CoT leaking at the
     /// beginning.
     pub prompt: String,
-    pub model: String,
-    pub reasoning_effort: ReasoningEffortConfig,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -5952,9 +6503,9 @@ pub struct CollabAgentSpawnEndEvent {
     /// beginning.
     pub prompt: String,
     /// Effective model used by the spawned agent after inheritance and role overrides.
-    pub model: String,
+    pub model: Option<String>,
     /// Effective reasoning effort used by the spawned agent after inheritance and role overrides.
-    pub reasoning_effort: ReasoningEffortConfig,
+    pub reasoning_effort: Option<ReasoningEffortConfig>,
     /// Last known status of the new agent reported to the sender agent.
     pub status: AgentStatus,
 }
@@ -7081,6 +7632,7 @@ mod tests {
                 revised_prompt: None,
                 result: String::new(),
                 saved_path: None,
+                provider_usage: None,
             }),
             started_at_ms: 0,
         };
@@ -7100,6 +7652,7 @@ mod tests {
             turn_id: "turn-1".into(),
             started_at_ms: 0,
             item: TurnItem::FileChange(FileChangeItem {
+                environment: None,
                 id: "patch-1".into(),
                 changes: [(
                     PathBuf::from("new.txt"),
@@ -7188,6 +7741,7 @@ mod tests {
                 revised_prompt: Some("A tiny blue square".into()),
                 result: "Zm9v".into(),
                 saved_path: Some(test_path_buf("/tmp/ig-1.png").abs()),
+                provider_usage: None,
             }),
             completed_at_ms: 0,
         };
@@ -7216,6 +7770,7 @@ mod tests {
             turn_id: "turn-1".into(),
             completed_at_ms: 0,
             item: TurnItem::FileChange(FileChangeItem {
+                environment: None,
                 id: "patch-1".into(),
                 changes: [(
                     PathBuf::from("new.txt"),
@@ -7310,6 +7865,7 @@ mod tests {
             turn_id: "turn-1".into(),
             started_at_ms: 10,
             item: TurnItem::CommandExecution(CommandExecutionItem {
+                environment: None,
                 output_metadata: None,
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
@@ -7338,6 +7894,7 @@ mod tests {
             turn_id: "turn-1".into(),
             completed_at_ms: 20,
             item: TurnItem::CommandExecution(CommandExecutionItem {
+                environment: None,
                 output_metadata: None,
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
@@ -7827,8 +8384,8 @@ mod tests {
             );
             assert_eq!(event.prompt, "inspect the change");
             assert_eq!(event.status, AgentStatus::PendingInit);
-            assert_eq!(event.model, "");
-            assert_eq!(event.reasoning_effort, ReasoningEffortConfig::Medium);
+            assert_eq!(event.model, None);
+            assert_eq!(event.reasoning_effort, None);
         }
         Ok(())
     }
@@ -7851,8 +8408,8 @@ mod tests {
         let RolloutItem::EventMsg(EventMsg::CollabAgentSpawnEnd(event)) = line.item else {
             panic!("expected spawn end event");
         };
-        assert_eq!(event.model, "recorded-model");
-        assert_eq!(event.reasoning_effort, ReasoningEffortConfig::High);
+        assert_eq!(event.model.as_deref(), Some("recorded-model"));
+        assert_eq!(event.reasoning_effort, Some(ReasoningEffortConfig::High));
         Ok(())
     }
 
@@ -8323,12 +8880,54 @@ mod tests {
             output_tokens: 0,
             reasoning_output_tokens: 0,
             total_tokens: 10,
+            coverage: None,
         });
 
         let info = TokenUsageInfo::new_or_append(&initial, &last, Some(128_000))
             .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(128_000));
+    }
+
+    #[test]
+    fn audit_observability_usage_aggregate_never_decreases_or_wraps() {
+        let mut usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            ..TokenUsage::default()
+        };
+        let before = usage.clone();
+        usage.add_assign(&TokenUsage {
+            input_tokens: -50,
+            output_tokens: -10,
+            total_tokens: -60,
+            ..TokenUsage::default()
+        });
+        assert_eq!(usage, before);
+        usage.add_assign(&TokenUsage {
+            input_tokens: 7,
+            cached_input_tokens: -2,
+            output_tokens: 3,
+            reasoning_output_tokens: -1,
+            total_tokens: 10,
+            coverage: None,
+        });
+        assert_eq!(usage.input_tokens, 107);
+        assert_eq!(usage.output_tokens, 23);
+        assert_eq!(usage.total_tokens, 130);
+        assert_eq!(usage.cached_input_tokens, 0);
+        assert_eq!(usage.reasoning_output_tokens, 0);
+        usage.add_assign(&TokenUsage {
+            input_tokens: i64::MAX,
+            output_tokens: i64::MAX,
+            total_tokens: i64::MAX,
+            ..TokenUsage::default()
+        });
+        assert_eq!(usage.input_tokens, i64::MAX);
+        assert_eq!(usage.output_tokens, i64::MAX);
+        assert_eq!(usage.total_tokens, i64::MAX);
+        assert_eq!(usage.blended_total(), i64::MAX);
     }
 
     #[test]
@@ -8345,6 +8944,7 @@ mod tests {
             output_tokens: 0,
             reasoning_output_tokens: 0,
             total_tokens: 10,
+            coverage: None,
         });
 
         let info =
@@ -8979,5 +9579,112 @@ mod tests {
             serde_json::to_value(item).expect("serialize manifest"),
             value
         );
+    }
+}
+#[cfg(test)]
+mod receipt_coverage_regressions {
+    use super::*;
+
+    #[test]
+    fn cache_write_subtotals_preserve_missing_reports_legacy_and_fork_scope() {
+        let receipt = TokenUsage {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            total_tokens: 100,
+            coverage: Some(TokenUsageCoverage {
+                cache_write_input_tokens: 30,
+                cache_write_receipts: 1,
+                ..TokenUsageCoverage::fully_reported()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(receipt.known_cache_write_input(), Some(30));
+        assert_eq!(receipt.known_ordinary_input(), Some(30));
+        let mut total = TokenUsage::empty_ledger();
+        total.add_assign(&receipt);
+        let before = total.clone();
+        total.add_assign(&receipt);
+        assert_eq!(total.known_cache_write_input(), Some(60));
+        assert_eq!(total.difference(&before), receipt);
+        total.add_assign(&TokenUsage::missing_receipt());
+        assert_eq!(total.coverage.as_ref().unwrap().reported_receipts, Some(2));
+        assert_eq!(
+            total.coverage.as_ref().unwrap().cache_write_input_tokens,
+            60
+        );
+        assert_eq!(total.known_cache_write_input(), None);
+        let encoded = serde_json::to_value(&total).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TokenUsage>(encoded).unwrap(),
+            total
+        );
+        let info = TokenUsageInfo {
+            total_token_usage: total,
+            last_token_usage: receipt,
+            estimated_context_tokens: Some(500),
+            model_context_window: Some(200_000),
+        };
+        let fork = info.for_fork();
+        assert_eq!(
+            fork.total_token_usage.coverage.unwrap().reported_receipts,
+            Some(0)
+        );
+        assert_eq!(fork.total_token_usage.known_cache_write_input(), Some(0));
+        assert_eq!(fork.context_tokens(), 500);
+        let legacy: TokenUsageCoverage = serde_json::from_value(serde_json::json!({
+            "receipts":1,"input_tokens":1,"cached_input_tokens":1,"output_tokens":1,
+            "reasoning_output_tokens":1,"total_tokens":1,"invalid_receipts":0,"saturated":false
+        }))
+        .unwrap();
+        assert_eq!(legacy.reported_receipts, None);
+        let legacy_usage = TokenUsage {
+            coverage: Some(legacy),
+            ..Default::default()
+        };
+        assert_eq!(legacy_usage.known_cache_write_input(), None);
+    }
+
+    #[test]
+    fn missing_receipt_stays_unknown_and_does_not_taint_the_next_turn() {
+        let mut ledger = TokenUsage::empty_ledger();
+        ledger.add_assign(&TokenUsage::missing_receipt());
+        assert_eq!(ledger.known_total(), None);
+        let before = ledger.clone();
+        ledger.add_assign(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            coverage: Some(TokenUsageCoverage::fully_reported()),
+            ..Default::default()
+        });
+        assert_eq!(ledger.total_tokens, 120);
+        assert_eq!(ledger.known_total(), None);
+        let turn = ledger.difference(&before);
+        assert_eq!(turn.known_total(), Some(120));
+        assert_eq!(turn.known_cached_input(), Some(0));
+        assert_eq!(turn.coverage.unwrap().receipts, 1);
+    }
+
+    #[test]
+    fn saturation_is_visible_and_legacy_component_availability_is_unknown() {
+        let mut ledger = TokenUsage::empty_ledger();
+        let usage = TokenUsage {
+            input_tokens: i64::MAX,
+            total_tokens: i64::MAX,
+            coverage: Some(TokenUsageCoverage::fully_reported()),
+            ..Default::default()
+        };
+        ledger.add_assign(&usage);
+        ledger.add_assign(&TokenUsage {
+            input_tokens: 1,
+            total_tokens: 1,
+            coverage: Some(TokenUsageCoverage::fully_reported()),
+            ..Default::default()
+        });
+        assert_eq!(ledger.input_tokens, i64::MAX);
+        assert_eq!(ledger.total_tokens, i64::MAX);
+        assert!(ledger.coverage.unwrap().saturated);
+        assert_eq!(ledger.known_total(), None);
+        assert_eq!(TokenUsage::default().known_reasoning_output(), None);
     }
 }

@@ -106,6 +106,11 @@ config_version = 1
 [features]
 chronicle = true
 telepathy = true
+context_management = true
+
+[features.token_budget]
+enabled = true
+reminder_threshold_tokens = 6144
 
 [notice]
 hide_full_access_warning = true
@@ -115,6 +120,7 @@ home = true
 
 [profiles.work.features]
 chronicle = true
+token_budget = true
 
 [profiles.work.notice]
 hide_full_access_warning = true
@@ -129,6 +135,8 @@ project = true
     assert_eq!(migrated["config_version"].as_integer(), Some(1));
     assert!(migrated["features"].get("chronicle").is_none());
     assert!(migrated["features"].get("telepathy").is_none());
+    assert!(migrated["features"].get("context_management").is_none());
+    assert!(migrated["features"].get("token_budget").is_none());
     assert!(migrated["notice"].get("hide_full_access_warning").is_none());
     assert!(
         migrated["notice"]
@@ -138,6 +146,11 @@ project = true
     assert!(
         migrated["profiles"]["work"]["features"]
             .get("chronicle")
+            .is_none()
+    );
+    assert!(
+        migrated["profiles"]["work"]["features"]
+            .get("token_budget")
             .is_none()
     );
     assert!(
@@ -358,7 +371,6 @@ async fn profile_v2_rejects_matching_legacy_profile_tables_and_selectors() {
         assert!(message.contains("work.config.toml"));
     }
 }
-
 
 #[tokio::test]
 async fn profile_v2_allows_unrelated_legacy_profiles_in_base_user_config() {

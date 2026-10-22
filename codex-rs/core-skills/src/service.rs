@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -83,8 +85,14 @@ pub struct SkillsService {
     restriction_product: Option<Product>,
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     cache_generation: AtomicU64,
-    input_snapshot_cache: RwLock<HashMap<SkillsInputCacheKey, HostSkillsSnapshot>>,
+    input_snapshot_cache: RwLock<HashMap<SkillsInputCacheKey, InputSnapshot>>,
     snapshot_cache: RwLock<HashMap<SkillsCacheKey, HostSkillsSnapshot>>,
+    cache_reuse_disabled: AtomicBool,
+}
+
+struct InputSnapshot {
+    snapshot: HostSkillsSnapshot,
+    roots: Vec<AbsolutePathBuf>,
 }
 
 impl SkillsService {
@@ -104,6 +112,7 @@ impl SkillsService {
             cache_generation: AtomicU64::new(0),
             input_snapshot_cache: RwLock::new(HashMap::new()),
             snapshot_cache: RwLock::new(HashMap::new()),
+            cache_reuse_disabled: AtomicBool::new(false),
         };
         if !bundled_skills_enabled {
             // The loader caches bundled skills under `skills/.system`. Clearing that directory is
@@ -149,6 +158,7 @@ impl SkillsService {
             return snapshot;
         }
         let roots = self.skill_roots_for_config(input, fs).await;
+        let root_dependencies = roots.iter().map(|root| root.path.clone()).collect();
         let skill_config_rules = skill_config_rules_from_stack(&input.config_layer_stack);
         let snapshot = self
             .snapshot_for_roots(
@@ -163,7 +173,7 @@ impl SkillsService {
                 },
             )
             .await;
-        self.cache_input_snapshot(input_cache_key, snapshot.clone());
+        self.cache_input_snapshot(input_cache_key, snapshot.clone(), root_dependencies);
         snapshot
     }
 
@@ -192,6 +202,9 @@ impl SkillsService {
         force_reload: bool,
         fs: Option<Arc<dyn ExecutorFileSystem>>,
     ) -> HostSkillsSnapshot {
+        if force_reload {
+            self.clear_cache();
+        }
         let generation = self.cache_generation.load(Ordering::SeqCst);
         let cache_result = true;
         let mut roots = skill_roots(
@@ -300,7 +313,63 @@ impl SkillsService {
         info!("skills cache cleared ({cleared} entries)");
     }
 
+    /// Reconcile a genuine observation gap without cooling unrelated catalogs.
+    /// Rekey unaffected entries across the existing publication-generation fence;
+    /// old in-flight loads can only publish under the previous generation.
+    pub fn invalidate_roots(&self, roots: &[PathBuf]) {
+        if roots.is_empty() {
+            return;
+        }
+        let affected = |path: &AbsolutePathBuf| {
+            roots
+                .iter()
+                .any(|root| path.as_path().starts_with(root) || root.starts_with(path.as_path()))
+        };
+        let mut inputs = self
+            .input_snapshot_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut snapshots = self
+            .snapshot_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_generation = self.cache_generation.fetch_add(1, Ordering::SeqCst);
+        let generation = previous_generation + 1;
+        *inputs = inputs
+            .drain()
+            .filter_map(|(mut key, value)| {
+                if key.generation != previous_generation || value.roots.iter().any(&affected) {
+                    return None;
+                }
+                key.generation = generation;
+                Some((key, value))
+            })
+            .collect();
+        *snapshots = snapshots
+            .drain()
+            .filter_map(|(mut key, value)| {
+                if key.generation != previous_generation
+                    || key.roots.iter().any(|root| affected(&root.path))
+                {
+                    return None;
+                }
+                key.generation = generation;
+                Some((key, value))
+            })
+            .collect();
+    }
+
+    /// A terminal observer cannot certify retained cache entries. Continue to
+    /// serve fresh loads, but never reuse a snapshot across an unobserved edit.
+    pub fn disable_cache_reuse(&self) {
+        self.cache_reuse_disabled.store(true, Ordering::Release);
+        self.clear_cache();
+    }
+
     fn cached_snapshot(&self, cache_key: &SkillsCacheKey) -> Option<HostSkillsSnapshot> {
+        if self.cache_reuse_disabled.load(Ordering::Acquire) {
+            return None;
+        }
         match self.snapshot_cache.read() {
             Ok(cache) => cache.get(cache_key).cloned(),
             Err(err) => err.into_inner().get(cache_key).cloned(),
@@ -308,13 +377,24 @@ impl SkillsService {
     }
 
     fn cached_input_snapshot(&self, cache_key: &SkillsInputCacheKey) -> Option<HostSkillsSnapshot> {
+        if self.cache_reuse_disabled.load(Ordering::Acquire) {
+            return None;
+        }
         match self.input_snapshot_cache.read() {
-            Ok(cache) => cache.get(cache_key).cloned(),
-            Err(err) => err.into_inner().get(cache_key).cloned(),
+            Ok(cache) => cache.get(cache_key).map(|value| value.snapshot.clone()),
+            Err(err) => err
+                .into_inner()
+                .get(cache_key)
+                .map(|value| value.snapshot.clone()),
         }
     }
 
-    fn cache_input_snapshot(&self, cache_key: SkillsInputCacheKey, snapshot: HostSkillsSnapshot) {
+    fn cache_input_snapshot(
+        &self,
+        cache_key: SkillsInputCacheKey,
+        snapshot: HostSkillsSnapshot,
+        roots: Vec<AbsolutePathBuf>,
+    ) {
         let mut cache = self
             .input_snapshot_cache
             .write()
@@ -325,7 +405,7 @@ impl SkillsService {
         {
             cache.remove(&evicted_key);
         }
-        cache.insert(cache_key, snapshot);
+        cache.insert(cache_key, InputSnapshot { snapshot, roots });
     }
 
     fn extra_roots(&self) -> Vec<AbsolutePathBuf> {
@@ -356,7 +436,7 @@ impl Hash for ConfigLayerStackIdentity {
 // Keep the allocation alive while its address is used as a cache identity.
 // Otherwise a later executor can reuse the address and inherit stale skills.
 #[derive(Clone)]
-struct FileSystemIdentity(Arc<dyn ExecutorFileSystem>);
+pub(crate) struct FileSystemIdentity(pub(crate) Arc<dyn ExecutorFileSystem>);
 
 impl std::fmt::Debug for FileSystemIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -501,7 +581,7 @@ fn finalize_skill_outcome(
         outcome
             .skills
             .iter()
-            .filter(|skill| outcome.is_skill_enabled(skill))
+            .filter(|skill| skill.source.is_none() && outcome.is_skill_enabled(skill))
             .cloned()
             .collect(),
     );
@@ -518,6 +598,63 @@ mod tests;
 mod cache_invalidation_tests {
     use super::*;
     use codex_config::ConfigRequirementsToml;
+
+    #[test]
+    fn targeted_invalidation_keeps_unrelated_hits_without_promoting_late_loads() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = AbsolutePathBuf::try_from(directory.path()).unwrap();
+        let service = SkillsService::new(cwd.clone(), false);
+        let input = SkillsLoadInput::new(
+            cwd,
+            Vec::new(),
+            ConfigLayerStack::new(
+                Vec::new(),
+                Default::default(),
+                ConfigRequirementsToml::default(),
+            )
+            .unwrap(),
+            false,
+        );
+        let mut other = input.clone();
+        other.cwd = AbsolutePathBuf::try_from(directory.path().join("other")).unwrap();
+        let a = AbsolutePathBuf::try_from(directory.path().join("a")).unwrap();
+        let b = AbsolutePathBuf::try_from(directory.path().join("b")).unwrap();
+        let snapshot = HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome::default()));
+        service.cache_input_snapshot(
+            SkillsInputCacheKey::new(&input, None, 0),
+            snapshot.clone(),
+            vec![a.clone()],
+        );
+        service.cache_input_snapshot(
+            SkillsInputCacheKey::new(&other, None, 0),
+            snapshot.clone(),
+            vec![b],
+        );
+        service.invalidate_roots(&[a.to_path_buf()]);
+        assert!(
+            service
+                .cached_input_snapshot(&SkillsInputCacheKey::new(&input, None, 1))
+                .is_none()
+        );
+        let retained = service
+            .cached_input_snapshot(&SkillsInputCacheKey::new(&other, None, 1))
+            .unwrap();
+        assert!(std::ptr::eq(snapshot.outcome(), retained.outcome()));
+        // An old load can finish after invalidation. A later unrelated
+        // acquisition must not promote that stale key to the newest generation.
+        service.cache_input_snapshot(SkillsInputCacheKey::new(&input, None, 0), snapshot, vec![a]);
+        service.invalidate_roots(&[directory.path().join("unrelated")]);
+        assert!(
+            service
+                .cached_input_snapshot(&SkillsInputCacheKey::new(&input, None, 2))
+                .is_none()
+        );
+        assert!(
+            service
+                .cached_input_snapshot(&SkillsInputCacheKey::new(&other, None, 2))
+                .is_some()
+        );
+    }
 
     #[test]
     fn invalidation_isolates_late_publication_in_both_snapshot_caches() {
@@ -544,7 +681,7 @@ mod cache_invalidation_tests {
         service.clear_cache();
         // Deterministically replay completion of a load that began before the
         // clear. Neither public load path may reuse these late publications.
-        service.cache_input_snapshot(old_input_key, snapshot.clone());
+        service.cache_input_snapshot(old_input_key, snapshot.clone(), Vec::new());
         service
             .snapshot_cache
             .write()
@@ -556,7 +693,7 @@ mod cache_invalidation_tests {
         let roots_key = skills_cache_key(&[], &rules, None, None, generation);
         assert!(service.cached_input_snapshot(&input_key).is_none());
         assert!(service.cached_snapshot(&roots_key).is_none());
-        service.cache_input_snapshot(input_key.clone(), snapshot);
+        service.cache_input_snapshot(input_key.clone(), snapshot, Vec::new());
         assert!(service.cached_input_snapshot(&input_key).is_some());
     }
 }

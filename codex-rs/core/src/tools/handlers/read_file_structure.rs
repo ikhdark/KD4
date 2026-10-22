@@ -566,9 +566,9 @@ mod tests {
         let (_, failures, _) = resolve_batch(
             "gap.rs",
             &mut canonical,
-            Some(vec![FileSelector::Structure(StructureSelector::Enclosing {
-                line: 5,
-            })]),
+            Some(vec![FileSelector::Structure(
+                StructureSelector::Enclosing { line: 5 },
+            )]),
         );
         let failure = failures.first().expect("the enclosing lookup must fail");
         assert_eq!(failure["status"], "invalid_selector");
@@ -605,10 +605,14 @@ mod tests {
         ] {
             let mut canonical = CanonicalToolResult::text(source.to_owned());
             let exact = ToolOutputSelector::Lines { start: 1, end: 1 };
-            let (ranges, failures, _) = resolve_batch(path, &mut canonical, Some(vec![
-                FileSelector::Structure(StructureSelector::Symbol { name: name.into() }),
-                FileSelector::Exact(exact.clone()),
-            ]));
+            let (ranges, failures, _) = resolve_batch(
+                path,
+                &mut canonical,
+                Some(vec![
+                    FileSelector::Structure(StructureSelector::Symbol { name: name.into() }),
+                    FileSelector::Exact(exact.clone()),
+                ]),
+            );
             assert_eq!(ranges, Some(vec![exact]));
             assert_eq!(failures.len(), 1);
             let message = failures[0]["message"].as_str().unwrap();
@@ -993,7 +997,12 @@ mod tests {
     fn unique_paths_and_source_headers_resolve_to_their_item() {
         let source = "struct RootDatabase;\nimpl Clone for RootDatabase {\n    fn clone(&self) -> Self { RootDatabase }\n}\nstruct FactSet<T>(Vec<T>);\nimpl<T: Ord + Clone> FactSet<T>\nwhere\n    T: Copy,\n{\n    fn insert(&mut self) {}\n}\nfn collect() {}\nstruct Collector;\nimpl Collector {\n    fn collect(&self) {}\n}\n";
         for (name, start, end, qualified_name) in [
-            ("RootDatabase::clone", 3, 3, "<RootDatabase as Clone>::clone"),
+            (
+                "RootDatabase::clone",
+                3,
+                3,
+                "<RootDatabase as Clone>::clone",
+            ),
             ("impl<T: Ord + Clone> FactSet<T>", 6, 11, "impl FactSet<T>"),
             ("Collector::collect", 15, 15, "Collector::collect"),
         ] {

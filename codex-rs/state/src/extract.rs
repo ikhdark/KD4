@@ -103,7 +103,7 @@ fn apply_non_setting_rollout_item(metadata: &mut ThreadMetadata, item: &RolloutI
         RolloutItem::Compacted(_)
         | RolloutItem::ToolManifest(_)
         | RolloutItem::SamplingBoundary(_) => {}
-        RolloutItem::WorldState(_) => {}
+        RolloutItem::WorldState(_) | RolloutItem::AdditionalContextState { .. } => {}
     }
 }
 
@@ -130,7 +130,8 @@ pub fn rollout_item_affects_thread_metadata(item: &RolloutItem) -> bool {
         | RolloutItem::Compacted(_)
         | RolloutItem::ToolManifest(_)
         | RolloutItem::SamplingBoundary(_)
-        | RolloutItem::WorldState(_) => false,
+        | RolloutItem::WorldState(_)
+        | RolloutItem::AdditionalContextState { .. } => false,
     }
 }
 
@@ -141,6 +142,7 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
         return;
     }
     metadata.id = meta_line.meta.id;
+    metadata.session_id.get_or_insert(meta_line.meta.session_id);
     metadata.source = enum_to_string(&meta_line.meta.source);
     // Later SessionMeta lines do not redefine the canonical history_mode.
     metadata.thread_source = meta_line.meta.thread_source.clone();
@@ -772,6 +774,8 @@ mod tests {
         let created_at = DateTime::<Utc>::from_timestamp(1_735_689_600, 0).expect("timestamp");
         ThreadMetadata {
             project_id: None,
+            session_id: None,
+            current_parent_thread_id: None,
             id,
             rollout_path: PathBuf::from("/tmp/a.jsonl"),
             created_at,

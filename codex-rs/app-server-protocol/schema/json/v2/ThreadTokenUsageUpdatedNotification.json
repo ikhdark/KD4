@@ -37,6 +37,16 @@
           "format": "int64",
           "type": "integer"
         },
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TokenUsageCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "inputTokens": {
           "format": "int64",
           "type": "integer"
@@ -60,6 +70,81 @@
         "outputTokens",
         "reasoningOutputTokens",
         "totalTokens"
+      ],
+      "type": "object"
+    },
+    "TokenUsageCoverage": {
+      "description": "Constant-space receipt/component coverage. Counts add and subtract with the existing usage ledger, so an earlier missing receipt does not taint later turns.",
+      "properties": {
+        "cache_write_input_tokens": {
+          "default": 0,
+          "description": "Sum of the explicitly reported cache-write input class, not an estimate. Interpret with cache_write_receipts; an absent class is never known zero.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "cache_write_receipts": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cached_input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "invalid_receipts": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reasoning_output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receipts": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reported_receipts": {
+          "description": "Whole usage objects received. None preserves legacy coverage uncertainty.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "saturated": {
+          "type": "boolean"
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cached_input_tokens",
+        "input_tokens",
+        "invalid_receipts",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "receipts",
+        "saturated",
+        "total_tokens"
       ],
       "type": "object"
     }

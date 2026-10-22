@@ -186,6 +186,11 @@ async fn run_remote_compact_task_inner(
             .await;
         return Err(error);
     }
+    let context_compaction_item = ContextCompactionItem::new();
+    let compaction_id = context_compaction_item.id.clone();
+    let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
+    sess.emit_turn_item_started(turn_context, &compaction_item)
+        .await;
     let result = run_remote_compact_task_inner_impl(
         sess,
         step_context,
@@ -194,9 +199,12 @@ async fn run_remote_compact_task_inner(
         initial_context_injection,
         compaction_metadata,
         &mut analytics_details,
+        &compaction_id,
         cancellation_token,
     )
     .await;
+    sess.emit_turn_item_completed(turn_context, compaction_item)
+        .await;
     let status = compaction_status_from_result(&result);
     let codex_error = result.as_ref().err();
     if result.is_ok() && run_post_compact_hook_gate(sess, turn_context, trigger, None).await {
@@ -233,20 +241,16 @@ async fn run_remote_compact_task_inner_impl(
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
+    compaction_id: &str,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
-    let context_compaction_item = ContextCompactionItem::new();
-    let compaction_id = context_compaction_item.id.clone();
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
         turn_context.sub_id.as_str(),
-        compaction_id.as_str(),
+        compaction_id,
         turn_context.model_info.slug.as_str(),
         turn_context.provider.info().name.as_str(),
     );
-    let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
-    sess.emit_turn_item_started(turn_context, &compaction_item)
-        .await;
 
     let attempt = run_remote_compact_v2_attempt(
         sess,
@@ -279,7 +283,7 @@ async fn run_remote_compact_task_inner_impl(
             let fallback_compaction_trace =
                 sess.services.rollout_thread_trace.compaction_trace_context(
                     fallback_turn_context.sub_id.as_str(),
-                    compaction_id.as_str(),
+                    compaction_id,
                     fallback_turn_context.model_info.slug.as_str(),
                     fallback_turn_context.provider.info().name.as_str(),
                 );
@@ -379,8 +383,6 @@ async fn run_remote_compact_task_inner_impl(
     }
     sess.recompute_token_usage(compaction_turn_context).await;
 
-    sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
-        .await;
     Ok(())
 }
 
@@ -397,6 +399,21 @@ struct RemoteCompactionV2TraceRequest<'a> {
     parallel_tool_calls: bool,
 }
 
+/// Only this non-cloneable owner closes an abandoned trace. Enrichment clones
+/// share the terminal flag but dropping them cannot cancel the live request.
+struct RemoteCompactionTraceOwner(Option<codex_rollout_trace::CompactionTraceAttempt>);
+
+impl Drop for RemoteCompactionTraceOwner {
+    fn drop(&mut self) {
+        if let Some(attempt) = self.0.take().filter(|attempt| !attempt.is_terminal())
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let attempt = attempt.at_occurrence(codex_rollout_trace::TraceOccurrence::now());
+            runtime.spawn_blocking(move || attempt.record_cancelled("compaction owner dropped"));
+        }
+    }
+}
+
 async fn run_remote_compaction_request_v2(
     sess: &Session,
     turn_context: &TurnContext,
@@ -406,6 +423,8 @@ async fn run_remote_compaction_request_v2(
     compaction_trace: &CompactionTraceContext,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactionV2Output> {
+    client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
+    client_session.set_startup_timing(Arc::clone(&sess.startup_timing));
     let max_retries = turn_context
         .provider
         .info()
@@ -417,6 +436,7 @@ async fn run_remote_compaction_request_v2(
     loop {
         let attempt_started = tokio::time::Instant::now();
         let trace_attempt = if compaction_trace.is_enabled() {
+            let occurrence = codex_rollout_trace::TraceOccurrence::now();
             let compaction_trace = compaction_trace.clone();
             let model = turn_context.model_info.slug.clone();
             let instructions = prompt.base_instructions.text.clone();
@@ -425,24 +445,28 @@ async fn run_remote_compaction_request_v2(
             crate::tools::tool_dispatch_trace::run_trace_recording(
                 &sess.terminal_tasks,
                 move || {
-                    compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
-                        model: &model,
-                        instructions: &instructions,
-                        input: &input,
-                        parallel_tool_calls,
-                    })
+                    compaction_trace.start_attempt_at(
+                        &RemoteCompactionV2TraceRequest {
+                            model: &model,
+                            instructions: &instructions,
+                            input: &input,
+                            parallel_tool_calls,
+                        },
+                        occurrence,
+                    )
                 },
             )
             .await
         } else {
             None
         };
+        let mut trace_owner = RemoteCompactionTraceOwner(trace_attempt);
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         let inference_trace_context = InferenceTraceContext::disabled();
         let service_tier =
             crate::session::turn::service_tier_for_sampling(sess, turn_context).await;
         let stream_result = tokio::select! {
-            _ = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+            _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
             result = client_session.stream(
                 prompt,
                 &turn_context.model_info,
@@ -455,19 +479,27 @@ async fn run_remote_compaction_request_v2(
             ) => result,
         };
         drop(model_request_timing_guard);
+        let mut terminal_receipt = None;
         let result = match stream_result {
             Ok(stream) => {
-                collect_compaction_output(
+                collect_compaction_output_with_receipt(
                     stream,
                     Some(&turn_context.turn_timing_state),
                     Some((sess, turn_context)),
                     cancellation_token,
+                    &mut terminal_receipt,
                 )
                 .await
             }
             Err(err) => Err(err),
         };
-        if let Some(trace_attempt) = trace_attempt {
+        // Transfer terminal ownership before optional persistence. A forced
+        // drop while the terminal write is queued must not race it with a
+        // fabricated physical cancellation.
+        if let Some(trace_attempt) = trace_owner.0.take() {
+            let trace_attempt =
+                trace_attempt.at_occurrence(codex_rollout_trace::TraceOccurrence::now());
+            let cancelled = matches!(&result, Err(CodexErr::TurnAborted));
             let trace_result = result
                 .as_ref()
                 .map(|output| vec![output.compaction_output.clone()])
@@ -475,7 +507,14 @@ async fn run_remote_compaction_request_v2(
             crate::tools::tool_dispatch_trace::run_trace_recording(
                 &sess.terminal_tasks,
                 move || {
-                    trace_attempt.record_result(trace_result.as_deref());
+                    if cancelled {
+                        trace_attempt.record_cancelled("compaction cancelled");
+                    } else {
+                        trace_attempt.record_result_with_receipt(
+                            trace_result.as_deref(),
+                            terminal_receipt.as_ref(),
+                        );
+                    }
                 },
             )
             .await;
@@ -514,12 +553,32 @@ async fn run_remote_compaction_request_v2(
     }
 }
 
+/// Test convenience; production retains the terminal receipt for its trace.
+#[cfg(test)]
 async fn collect_compaction_output(
-    mut stream: ResponseStream,
+    stream: ResponseStream,
     timing_state: Option<&Arc<TurnTimingState>>,
     accounting_context: Option<(&Session, &TurnContext)>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<RemoteCompactionV2Output> {
+    collect_compaction_output_with_receipt(
+        stream,
+        timing_state,
+        accounting_context,
+        cancellation_token,
+        &mut None,
+    )
+    .await
+}
+
+async fn collect_compaction_output_with_receipt(
+    mut stream: ResponseStream,
+    timing_state: Option<&Arc<TurnTimingState>>,
+    accounting_context: Option<(&Session, &TurnContext)>,
+    cancellation_token: &CancellationToken,
+    terminal_receipt: &mut Option<codex_rollout_trace::CompactionResponseReceipt>,
+) -> CodexResult<RemoteCompactionV2Output> {
+    let identity = stream.attempt_identity().cloned();
     let mut output_item_count = 0usize;
     let mut compaction_count = 0usize;
     let mut compaction_output = None;
@@ -539,6 +598,19 @@ async fn collect_compaction_output(
         let event = match event {
             Ok(event) => event,
             Err(error) => {
+                if error.terminal_usage().is_some() || error.terminal_response_id().is_some() {
+                    *terminal_receipt = Some(codex_rollout_trace::CompactionResponseReceipt {
+                        response_id: error.terminal_response_id().map(str::to_owned),
+                        sampling_request_id: identity
+                            .as_ref()
+                            .map(|id| id.sampling_request_id.clone()),
+                        physical_attempt_id: identity
+                            .as_ref()
+                            .map(|id| id.physical_attempt_id.clone()),
+                        token_usage: error.terminal_usage().and_then(Clone::clone),
+                        provider_completed: false,
+                    });
+                }
                 if let Some(token_usage) = error.terminal_usage() {
                     if let Some(timing) = timing_state {
                         timing.record_generation_token_usage(token_usage.as_ref());
@@ -546,7 +618,8 @@ async fn collect_compaction_output(
                     if let (Some((sess, turn)), Some(usage)) =
                         (accounting_context, token_usage.as_ref())
                     {
-                        sess.update_token_usage_info(turn, Some(usage)).await?;
+                        sess.record_compaction_token_usage(turn, Some(usage))
+                            .await?;
                     }
                 }
                 return Err(error.into_response_error());
@@ -577,11 +650,24 @@ async fn collect_compaction_output(
                     }
                 }
             }
-            ResponseEvent::Completed { token_usage, .. } => {
+            ResponseEvent::Completed {
+                response_id,
+                token_usage,
+                ..
+            } => {
+                // Capture before accounting or checkpoint validation can fail.
+                *terminal_receipt = Some(codex_rollout_trace::CompactionResponseReceipt {
+                    response_id: Some(response_id),
+                    sampling_request_id: identity.as_ref().map(|id| id.sampling_request_id.clone()),
+                    physical_attempt_id: identity.as_ref().map(|id| id.physical_attempt_id.clone()),
+                    token_usage: token_usage.clone(),
+                    provider_completed: true,
+                });
                 // Consumption belongs to the physical response, even when its
                 // checkpoint is invalid and must never be installed.
                 if let Some((sess, turn)) = accounting_context {
-                    sess.update_token_usage_info(turn, token_usage.as_ref()).await?;
+                    sess.record_compaction_token_usage(turn, token_usage.as_ref())
+                        .await?;
                 }
                 saw_completed = true;
                 completed_token_usage = token_usage;
@@ -626,11 +712,17 @@ async fn prepare_v2_retained_input(
 ) -> CodexResult<(Vec<ResponseItem>, usize)> {
     let (mut retained_input, retained_images, omitted_text) =
         crate::compact::build_task_input_checkpoint(prompt_input);
+    let omission_receipt_ids =
+        crate::compact::new_omission_receipt_ids(&retained_input, prompt_input);
     if let Some(text) =
         crate::compact::persist_task_compaction_text_recovery(sess, prompt_input, omitted_text)
             .await?
     {
-        crate::compact::bind_omission_receipts_to_recovery(&mut retained_input, &text);
+        crate::compact::bind_omission_receipts_to_recovery(
+            &mut retained_input,
+            &text,
+            &omission_receipt_ids,
+        );
         retained_input.push(crate::compact::compaction_context_message(text));
     }
     if let Some(plan) = crate::compact::retained_plan_context(sess).await? {
@@ -683,7 +775,6 @@ mod tests {
     use codex_utils_output_truncation::approx_token_count;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
     fn message(role: &str, text: &str, phase: Option<MessagePhase>) -> ResponseItem {
@@ -699,7 +790,8 @@ mod tests {
     }
 
     fn response_stream(events: Vec<CodexResult<ResponseEvent>>) -> ResponseStream {
-        let (tx_event, rx_event) = mpsc::channel(events.len().max(1));
+        let (tx_event, rx_event) =
+            codex_api::response_event_channel::response_event_channel(events.len().max(1));
         for event in events {
             tx_event
                 .try_send(event)
@@ -734,15 +826,22 @@ mod tests {
         Arc::make_mut(&mut turn.config).service_tier = Some("priority".into());
         // Compatibility compaction may retain a UI preset that is not the
         // configured intent. Wire effort must use the latter and target limits.
-        use codex_protocol::openai_models::{ReasoningEffort, ReasoningEffortPreset};
+        use codex_protocol::openai_models::ReasoningEffort;
+        use codex_protocol::openai_models::ReasoningEffortPreset;
         turn.reasoning_effort = Some(ReasoningEffort::Medium);
         turn.configured_reasoning_effort = Some(ReasoningEffort::Ultra);
         turn.model_info.supports_reasoning_summaries = true;
-        turn.model_info.supported_reasoning_levels =
-            [ReasoningEffort::XHigh, ReasoningEffort::Low, ReasoningEffort::High]
-                .into_iter()
-                .map(|effort| ReasoningEffortPreset { effort, description: String::new() })
-                .collect();
+        turn.model_info.supported_reasoning_levels = [
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+        ]
+        .into_iter()
+        .map(|effort| ReasoningEffortPreset {
+            effort,
+            description: String::new(),
+        })
+        .collect();
         let metadata = turn.turn_metadata_state.to_responses_metadata(
             session.installation_id.clone(),
             session.current_window_id().await,
@@ -814,7 +913,10 @@ mod tests {
                     .and_then(serde_json::Value::as_str),
                 expected
             );
-            assert_eq!(log.single_request().body_json()["reasoning"]["effort"], "xhigh");
+            assert_eq!(
+                log.single_request().body_json()["reasoning"]["effort"],
+                "xhigh"
+            );
         }
         Ok(())
     }
@@ -1678,7 +1780,8 @@ mod tests {
     #[tokio::test]
     async fn collect_compaction_output_stops_when_owner_is_cancelled() {
         for cancel_before_poll in [false, true] {
-            let (_tx_event, rx_event) = mpsc::channel(1);
+            let (_tx_event, rx_event) =
+                codex_api::response_event_channel::response_event_channel(1);
             let stream = ResponseStream {
                 rx_event,
                 attempt_identity: None,
@@ -1688,8 +1791,12 @@ mod tests {
             if cancel_before_poll {
                 cancellation_token.cancel();
             }
-            let mut pending =
-                Box::pin(collect_compaction_output(stream, None, None, &cancellation_token));
+            let mut pending = Box::pin(collect_compaction_output(
+                stream,
+                None,
+                None,
+                &cancellation_token,
+            ));
             if !cancel_before_poll {
                 assert!(futures::poll!(pending.as_mut()).is_pending());
                 cancellation_token.cancel();
@@ -1735,13 +1842,26 @@ mod tests {
                     },
                 )))],
             };
-            let result = collect_compaction_output(
+            let mut receipt = None;
+            let result = collect_compaction_output_with_receipt(
                 response_stream(events),
                 Some(&turn.turn_timing_state),
                 Some((&session, &turn)),
                 &CancellationToken::new(),
+                &mut receipt,
             )
             .await;
+            let receipt = receipt.expect("capture the terminal before checkpoint validation");
+            assert_eq!(receipt.token_usage.as_ref(), Some(&usage));
+            assert_eq!(receipt.provider_completed, checkpoint.is_some());
+            assert_eq!(
+                receipt.response_id.as_deref(),
+                Some(if checkpoint.is_some() {
+                    "compacted"
+                } else {
+                    "incomplete"
+                })
+            );
             match checkpoint {
                 Some("") => assert!(matches!(result, Err(CodexErr::Fatal(message))
                     if message.contains("empty checkpoint"))),
@@ -1751,7 +1871,10 @@ mod tests {
             }
             assert_eq!(session.total_token_usage().await, Some(usage));
             assert_eq!(session.current_window_id().await, window);
-            assert_eq!(session.clone_history().await.raw_items(), history.raw_items());
+            assert_eq!(
+                session.clone_history().await.raw_items(),
+                history.raw_items()
+            );
         }
     }
 
@@ -1760,14 +1883,30 @@ mod tests {
         let (session, turn) = crate::session::tests::make_session_and_context().await;
         let history = session.clone_history().await;
         let window = session.current_window_id().await;
-        let usage = TokenUsage { input_tokens: 100, output_tokens: 20, total_tokens: 120, ..Default::default() };
-        let result = collect_compaction_output(response_stream(vec![Err(CodexErr::TerminalResponse {
-            source: Box::new(CodexErr::QuotaExceeded), response_id: Some("failed".into()), token_usage: Some(usage.clone()),
-        })]), Some(&turn.turn_timing_state), Some((&session, &turn)), &CancellationToken::new()).await;
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            ..Default::default()
+        };
+        let result = collect_compaction_output(
+            response_stream(vec![Err(CodexErr::TerminalResponse {
+                source: Box::new(CodexErr::QuotaExceeded),
+                response_id: Some("failed".into()),
+                token_usage: Some(usage.clone()),
+            })]),
+            Some(&turn.turn_timing_state),
+            Some((&session, &turn)),
+            &CancellationToken::new(),
+        )
+        .await;
         assert!(matches!(result, Err(CodexErr::QuotaExceeded)));
         assert_eq!(session.total_token_usage().await, Some(usage));
         assert_eq!(session.current_window_id().await, window);
-        assert_eq!(session.clone_history().await.raw_items(), history.raw_items());
+        assert_eq!(
+            session.clone_history().await.raw_items(),
+            history.raw_items()
+        );
     }
 
     #[tokio::test]
@@ -1836,6 +1975,7 @@ mod tests {
                     output_tokens: 42,
                     reasoning_output_tokens: 5,
                     total_tokens: 123_498,
+                    coverage: None,
                 }),
                 end_turn: Some(true),
             }),
@@ -1845,9 +1985,10 @@ mod tests {
         timing.mark_turn_started();
         timing.begin_compaction_generation();
         drop(timing.begin_model_request_wait());
-        let output = collect_compaction_output(stream, Some(&timing), None, &CancellationToken::new())
-            .await
-            .expect("compaction should be collected");
+        let output =
+            collect_compaction_output(stream, Some(&timing), None, &CancellationToken::new())
+                .await
+                .expect("compaction should be collected");
 
         assert_eq!(output.compaction_output, compaction);
         assert_eq!(
@@ -1858,6 +1999,7 @@ mod tests {
                 output_tokens: 42,
                 reasoning_output_tokens: 5,
                 total_tokens: 123_498,
+                coverage: None,
             })
         );
         let profile = timing.complete_snapshot().protocol_timing();
@@ -1887,11 +2029,86 @@ mod tests {
                 token_usage: None,
                 end_turn: Some(true),
             }));
-            let result =
-                collect_compaction_output(response_stream(events), None, None, &CancellationToken::new())
-                    .await;
+            let result = collect_compaction_output(
+                response_stream(events),
+                None,
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
             assert!(matches!(result, Err(CodexErr::Fatal(message))
                 if message.contains(&format!("got {count} from {count} output items"))));
+        }
+    }
+}
+#[cfg(test)]
+mod ctxaudit_usage_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ctxaudit_rejected_completed_compaction_counts_usage_without_changing_context() {
+        for count in [0, 1, 2] {
+            let (session, turn) = crate::session::tests::make_session_and_context().await;
+            let prior = TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                total_tokens: 110,
+                ..Default::default()
+            };
+            session
+                .update_token_usage_info(&turn, Some(&prior))
+                .await
+                .unwrap();
+            let before = session.token_usage_info().await.unwrap();
+            let usage = TokenUsage {
+                input_tokens: 25,
+                cached_input_tokens: 5,
+                output_tokens: 7,
+                reasoning_output_tokens: 2,
+                total_tokens: 32,
+                coverage: None,
+            };
+            let mut events = (0..count)
+                .map(|_| {
+                    Ok(ResponseEvent::OutputItemDone(ResponseItem::Compaction {
+                        id: None,
+                        encrypted_content: "checkpoint".into(),
+                        internal_chat_message_metadata_passthrough: None,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            events.push(Ok(ResponseEvent::Completed {
+                response_id: "audit".into(),
+                token_usage: Some(usage.clone()),
+                end_turn: Some(true),
+            }));
+            let (tx, rx) = codex_api::response_event_channel::response_event_channel(events.len());
+            for event in events {
+                tx.send(event).await.unwrap();
+            }
+            drop(tx);
+            let stream = ResponseStream {
+                rx_event: rx,
+                attempt_identity: None,
+                consumer_dropped: CancellationToken::new(),
+            };
+            let result = collect_compaction_output(
+                stream,
+                None,
+                Some((&session, &turn)),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(result.is_ok(), count == 1);
+            let after = session.token_usage_info().await.unwrap();
+            let mut total = before.total_token_usage.clone();
+            total.add_assign(&usage);
+            assert_eq!(after.total_token_usage, total);
+            assert_eq!(after.last_token_usage, before.last_token_usage);
+            assert_eq!(
+                after.estimated_context_tokens,
+                before.estimated_context_tokens
+            );
         }
     }
 }

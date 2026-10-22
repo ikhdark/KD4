@@ -60,8 +60,7 @@ const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 #[tokio::test]
 async fn thread_shell_command_history_responses_keep_the_user_shell_execution_exactly_once()
--> Result<()>
-{
+-> Result<()> {
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().join("codex_home");
     std::fs::create_dir(&codex_home)?;
@@ -162,7 +161,12 @@ async fn thread_shell_command_history_responses_keep_the_user_shell_execution_ex
     .await??;
     let ThreadReadResponse { thread, .. } = to_response::<ThreadReadResponse>(read_resp)?;
     assert_eq!(thread.turns.len(), 1);
-    assert_user_shell_command(&thread.turns[0].items, "thread/read", &command_id, &expected_output);
+    assert_user_shell_command(
+        &thread.turns[0].items,
+        "thread/read",
+        &command_id,
+        &expected_output,
+    );
 
     let turns_list_id = mcp
         .send_thread_turns_list_request(ThreadTurnsListParams {
@@ -181,7 +185,12 @@ async fn thread_shell_command_history_responses_keep_the_user_shell_execution_ex
     let ThreadTurnsListResponse { data, .. } =
         to_response::<ThreadTurnsListResponse>(turns_list_resp)?;
     assert_eq!(data.len(), 1);
-    assert_user_shell_command(&data[0].items, "thread/turns/list", &command_id, &expected_output);
+    assert_user_shell_command(
+        &data[0].items,
+        "thread/turns/list",
+        &command_id,
+        &expected_output,
+    );
 
     let fork_id = mcp
         .send_thread_fork_request(ThreadForkParams {
@@ -196,7 +205,12 @@ async fn thread_shell_command_history_responses_keep_the_user_shell_execution_ex
     .await??;
     let ThreadForkResponse { thread, .. } = to_response::<ThreadForkResponse>(fork_resp)?;
     assert_eq!(thread.turns.len(), 1);
-    assert_user_shell_command(&thread.turns[0].items, "thread/fork", &command_id, &expected_output);
+    assert_user_shell_command(
+        &thread.turns[0].items,
+        "thread/fork",
+        &command_id,
+        &expected_output,
+    );
 
     Ok(())
 }
@@ -368,7 +382,9 @@ async fn serve_remote_user_shell(listener: TcpListener) -> Result<()> {
     loop {
         let request = read_exec_server_json(&mut websocket).await?;
         match request["method"].as_str() {
-            Some("process/start") => {
+            // Current clients send `process/startOwned`; its params flatten the
+            // legacy start fields and its result is the same `ExecResponse`.
+            Some("process/start" | "process/startOwned") => {
                 let process_id = request["params"]["processId"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("process/start missing processId"))?
@@ -499,16 +515,19 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     let workspace = tmp.path().join("workspace");
     std::fs::create_dir(&workspace)?;
 
-    let responses = vec![create_shell_command_sse_response(
-        vec![
-            "python3".to_string(),
-            "-c".to_string(),
-            "print(42)".to_string(),
-        ],
-        /*workdir*/ None,
-        Some(5000),
-        "call-approve",
-    )?, create_final_assistant_message_sse_response("command declined")?];
+    let responses = vec![
+        create_shell_command_sse_response(
+            vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print(42)".to_string(),
+            ],
+            /*workdir*/ None,
+            Some(5000),
+            "call-approve",
+        )?,
+        create_final_assistant_message_sse_response("command declined")?,
+    ];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(
         codex_home.as_path(),
@@ -641,12 +660,22 @@ async fn thread_shell_command_uses_existing_active_turn() -> Result<()> {
     .await??;
     let ThreadReadResponse { thread, .. } = to_response::<ThreadReadResponse>(read_resp)?;
     assert_eq!(thread.turns.len(), 1);
-    assert_user_shell_command(&thread.turns[0].items, "thread/read", &command_id, &expected_output);
+    assert_user_shell_command(
+        &thread.turns[0].items,
+        "thread/read",
+        &command_id,
+        &expected_output,
+    );
 
     Ok(())
 }
 
-fn assert_user_shell_command(items: &[ThreadItem], context: &str, command_id: &str, expected_output: &str) {
+fn assert_user_shell_command(
+    items: &[ThreadItem],
+    context: &str,
+    command_id: &str,
+    expected_output: &str,
+) {
     // Count every user-shell execution and every item with this id, so a second
     // copy in another state or under another id is a duplicate too.
     let commands = items

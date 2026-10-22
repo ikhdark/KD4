@@ -150,3 +150,120 @@ async fn command_progress_resets_stall_deadline() {
         .await
         .expect("stall detector exits at the reset deadline");
 }
+
+/// Like `build_exec_request` and unified exec, a launch under managed network whose policy
+/// requested a sandbox this host cannot provide is refused before any setup. This runtime always
+/// launches on this host, so a remote-labelled environment is refused too. A held validation
+/// owner stops every other launch at admission, so the controls show the refusal applies to no
+/// other case without starting a process.
+#[tokio::test]
+async fn managed_network_launch_without_available_sandbox_is_refused_before_setup() {
+    let temp = tempfile::tempdir().expect("create workspace");
+    let root = AbsolutePathBuf::try_from(temp.path().to_path_buf()).expect("absolute workspace");
+    let cwd = PathUri::from_abs_path(&root);
+    let holder = crate::workspace_operation_gate::ValidationOwner::for_command(
+        codex_protocol::ThreadId::new(),
+        &["cargo".to_string(), "test".to_string()],
+    );
+    let _owner = crate::workspace_operation_gate::acquire_workspace_validation(
+        root.as_path(),
+        "cargo test -p held-validation",
+        holder,
+    )
+    .await
+    .expect("hold the workspace validation gate");
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let ctx = ToolCtx {
+        session: Arc::new(session),
+        turn: Arc::new(turn),
+        call_id: "managed-network-sandbox".to_string(),
+        tool_name: codex_tools::ToolName::plain("shell_command"),
+    };
+    let local = ShellRequest {
+        command: vec!["must-not-launch-sandbox-fixture".to_string()],
+        command_for_approval: vec!["cargo".to_string(), "test".to_string()],
+        turn_environment: TurnEnvironment::new(
+            "local".to_string(),
+            Arc::new(Environment::default_for_tests()),
+            cwd.clone(),
+            /*shell*/ None,
+        ),
+        hook_command: "cargo test".to_string(),
+        cwd: root.clone(),
+        workspace_operation_root: Some(root.to_path_buf()),
+        ..shell_request("local")
+    };
+    let remote = ShellRequest {
+        turn_environment: TurnEnvironment::new(
+            "remote".to_string(),
+            Arc::new(
+                Environment::create_for_tests(Some("ws://127.0.0.1:1".to_string()))
+                    .expect("remote-labelled environment"),
+            ),
+            cwd.clone(),
+            /*shell*/ None,
+        ),
+        ..local.clone()
+    };
+    assert!(remote.turn_environment.environment.is_remote());
+    let permissions = codex_protocol::models::PermissionProfile::read_only();
+    let mut runtime = ShellRuntime::for_shell_command();
+    for (request, enforce_managed_network, sandbox_requested, refused) in [
+        (&local, true, true, true),
+        // The launch is local even when the environment is labelled remote.
+        (&remote, true, true, true),
+        // Restrictions still require enforcement without a managed proxy.
+        (&local, false, true, true),
+        (&remote, false, true, true),
+        // A launch whose policy requested no sandbox (an explicit bypass) is unchanged.
+        (&local, true, false, false),
+        (&local, false, false, false),
+    ] {
+        let case = (
+            request.turn_environment.environment_id.as_str(),
+            enforce_managed_network,
+            sandbox_requested,
+        );
+        let attempt = SandboxAttempt {
+            codex_home: &root,
+            sandbox: codex_sandboxing::SandboxType::None,
+            sandbox_requested,
+            permissions: &permissions,
+            exec_server_permissions: &permissions,
+            enforce_managed_network,
+            sandbox_cwd: &cwd,
+            workspace_roots: std::slice::from_ref(&root),
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+            windows_sandbox_private_desktop: false,
+            network_denial_cancellation_token: None,
+            network_proxy: None,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime.run(request, &attempt, &ctx),
+        )
+        .await
+        .expect("no case may wait for the held validation owner");
+        if refused {
+            let Err(ToolError::Codex(CodexErr::Io(error))) = &result else {
+                panic!("{case:?}: expected the unavailable-sandbox refusal, got {result:?}");
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{case:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed",
+                "{case:?}"
+            );
+        } else {
+            assert!(
+                matches!(&result, Err(ToolError::Rejected(message))
+                    if message.contains("No process was started or queued")),
+                "{case:?}: the launch must reach validation admission, got {result:?}"
+            );
+        }
+    }
+}

@@ -13,6 +13,13 @@ pub struct WebSearchItem {
     pub id: String,
     pub query: String,
     pub action: Option<WebSearchAction>,
+    /// Absent on historical/hosted items whose terminal outcome was not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
 }
 
 // App-server-facing description of the action performed by standalone web search.

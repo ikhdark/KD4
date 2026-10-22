@@ -30,6 +30,12 @@ pub(crate) trait EventProcessor {
     /// Handle an unrecoverable failure in exec's local app-server event stream.
     fn process_event_stream_error(&mut self, message: String);
 
+    /// Invocation failure after core completion; never invent a second terminal
+    /// or revoke an already accepted final artifact.
+    fn process_invocation_error(&mut self, message: String) {
+        eprintln!("Session finalization failed: {message}");
+    }
+
     /// Return a delivery failure so the runtime can shut down before returning it.
     fn take_output_error(&mut self) -> Option<std::io::Error> {
         None
@@ -98,20 +104,63 @@ fn write_last_message(output_file: &Path, message: &str) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Bounded streaming counterpart of the recovered-item selector. Keep only the
+/// best eligible message; commentary remains in the transcript, not this cache.
+#[derive(Default)]
+pub(crate) struct FinalMessageSelection {
+    message: Option<String>,
+    rank: u8,
+}
+
+impl FinalMessageSelection {
+    pub(crate) fn observe(&mut self, item: &ThreadItem) {
+        let Some((text, rank)) = final_message_candidate(item) else {
+            return;
+        };
+        if rank >= self.rank {
+            self.message = Some(text.to_string());
+            self.rank = rank;
+        }
+    }
+
+    pub(crate) fn message(&self) -> Option<String> {
+        self.message.clone()
+    }
+}
+
 pub(crate) fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
     items
         .iter()
-        .rev()
-        .find_map(|item| match item {
-            ThreadItem::AgentMessage { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            items.iter().rev().find_map(|item| match item {
-                ThreadItem::Plan { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-        })
+        .filter_map(final_message_candidate)
+        .max_by_key(|(_, rank)| *rank)
+        .map(|(text, _)| text.to_string())
+}
+
+fn final_message_candidate(item: &ThreadItem) -> Option<(&str, u8)> {
+    use codex_protocol::models::MessagePhase;
+    match item {
+        ThreadItem::AgentMessage {
+            text,
+            phase: Some(MessagePhase::FinalAnswer),
+            ..
+        } => Some((text, 3)),
+        ThreadItem::AgentMessage {
+            text, phase: None, ..
+        } => Some((text, 2)),
+        ThreadItem::Plan { text, .. } => Some((text, 1)),
+        _ => None,
+    }
+}
+
+pub(crate) fn final_message_from_turn(
+    items: &[ThreadItem],
+    timing: Option<&codex_protocol::protocol::TurnTiming>,
+) -> Option<String> {
+    if let Some(answer) = timing.and_then(|timing| timing.final_answer.as_ref()) {
+        return answer.message.as_ref().map(|message| message.text.clone());
+    }
+    // Legacy producers carry no acceptance receipt. Never promote commentary.
+    final_message_from_turn_items(items)
 }
 
 #[cfg(test)]
@@ -179,8 +228,57 @@ mod tests {
             id: "newer-plan".to_string(),
             text: "newer plan".to_string(),
         });
-        assert_eq!(final_message_from_turn_items(&items), Some("latest answer".to_string()));
-        assert_eq!(final_message_from_turn_items(&[items[0].clone(), items[3].clone()]), Some("newer plan".to_string()));
+        assert_eq!(
+            final_message_from_turn_items(&items),
+            Some("latest answer".to_string())
+        );
+        assert_eq!(
+            final_message_from_turn_items(&[items[0].clone(), items[3].clone()]),
+            Some("newer plan".to_string())
+        );
         assert_eq!(final_message_from_turn_items(&[]), None);
+    }
+}
+#[cfg(test)]
+mod phase_selection_tests {
+    use super::*;
+    use codex_protocol::models::MessagePhase;
+
+    #[test]
+    fn streamed_and_recovered_selectors_exclude_commentary_and_keep_empty_final() {
+        for answer in ["accepted answer", ""] {
+            let mut items = vec![
+                ThreadItem::AgentMessage {
+                    id: "final".into(),
+                    text: answer.into(),
+                    phase: Some(MessagePhase::FinalAnswer),
+                },
+                ThreadItem::AgentMessage {
+                    id: "progress".into(),
+                    text: "I will check next".into(),
+                    phase: Some(MessagePhase::Commentary),
+                },
+                ThreadItem::AgentMessage {
+                    id: "legacy".into(),
+                    text: "legacy tail".into(),
+                    phase: None,
+                },
+            ];
+            let mut selection = FinalMessageSelection::default();
+            for item in &items {
+                selection.observe(item);
+            }
+            assert_eq!(selection.message().as_deref(), Some(answer));
+            assert_eq!(
+                final_message_from_turn_items(&items).as_deref(),
+                Some(answer)
+            );
+            items.remove(0);
+            assert_eq!(
+                final_message_from_turn_items(&items).as_deref(),
+                Some("legacy tail")
+            );
+            assert_eq!(final_message_from_turn_items(&items[..1]), None);
+        }
     }
 }

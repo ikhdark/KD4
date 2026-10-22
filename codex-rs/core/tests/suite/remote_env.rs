@@ -143,9 +143,13 @@ async fn send_environment_info(websocket: &mut WebSocketStream<TcpStream>) {
         .expect("environment info response");
 }
 
-async fn serve_environment_info(listener: TcpListener) {
+/// Callers retain the returned peer for the rest of the test. Readiness and
+/// tool dispatch use the live initialized session, so dropping the peer would
+/// model a disconnected executor instead of a ready one.
+async fn serve_environment_info(listener: TcpListener) -> WebSocketStream<TcpStream> {
     let mut websocket = accept_initialized_exec_server(listener).await;
     send_environment_info(&mut websocket).await;
+    websocket
 }
 
 async fn serve_environment_with_agents_md(
@@ -351,7 +355,7 @@ async fn deferred_executor_startup_case(explicit_environment: bool) -> Result<()
         .await?;
     wait_for_response_request_count(&response_mock, /*expected_count*/ 1).await;
     assert_eq!(response_mock.requests().len(), 1);
-    serve_environment_info(listener).await;
+    let _exec_server = serve_environment_info(listener).await;
     let event = wait_for_event(&test.codex, |event| {
         matches!(
             event,
@@ -627,9 +631,13 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
         .context("wait_for_environment output should be present")?;
     let wait_output = wait_output.context("wait_for_environment output should be text")?;
     // The startup cause follows the fixed prefix; its socket text varies by platform and port.
+    // The handler wraps every shared-waiter failure (startup, cancellation, runtime refresh)
+    // as unavailable; the waiter names a startup failure as such.
     let cause = wait_output
-        .strip_prefix("Environment `remote` failed to start and is unavailable: ")
-        .context("wait_for_environment output should name the failed environment")?;
+        .strip_prefix("Environment `remote` is unavailable: environment `remote` failed to start: ")
+        .with_context(|| {
+            format!("wait_for_environment output should name the failed environment: {wait_output}")
+        })?;
     assert!(
         cause.contains("exec-server"),
         "startup cause must reach the model: {wait_output}"
@@ -728,7 +736,7 @@ async fn deferred_executor_compaction_replaces_stale_environment_context() -> Re
     })
     .await;
 
-    serve_environment_info(listener).await;
+    let _exec_server = serve_environment_info(listener).await;
     test.codex
         .submit(Op::UserInputAnswer {
             id: request.turn_id,

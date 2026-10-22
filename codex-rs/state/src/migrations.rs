@@ -34,6 +34,35 @@ pub(crate) fn runtime_state_migrator() -> Migrator {
     runtime_migrator(&STATE_MIGRATOR)
 }
 
+/// Keep the deployed DROP and the compatibility restoration invisible until
+/// both have committed. SQLx's inner migration transactions become savepoints.
+pub(crate) async fn run_state_migrations(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> anyhow::Result<()> {
+    let latest = migrator
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(0);
+    let current = migrations_table_exists(pool).await?
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM _sqlx_migrations WHERE version = ?)",
+        )
+        .bind(latest)
+        .fetch_one(pool)
+        .await?;
+    if current {
+        // Still validate known checksums; no writer reservation on warm opens.
+        migrator.run(pool).await?;
+    } else {
+        let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+        migrator.run_direct(None, &mut *transaction, false).await?;
+        transaction.commit().await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn runtime_logs_migrator() -> Migrator {
     runtime_migrator(&LOGS_MIGRATOR)
 }
@@ -49,7 +78,7 @@ pub(crate) fn runtime_bugs_migrator() -> Migrator {
 /// SQLx takes no migration lock on SQLite, so concurrent initializers can both try to apply the
 /// same pending migration and the later one fails replaying it. Retry while the ledger shows that
 /// a writer made progress; a failure without ledger progress is returned unchanged.
-pub(crate) async fn migrate_tolerating_concurrent_initializers<F, Fut>(
+pub async fn migrate_tolerating_concurrent_initializers<F, Fut>(
     pool: &SqlitePool,
     mut migrate: F,
 ) -> anyhow::Result<()>

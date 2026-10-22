@@ -77,6 +77,71 @@
       ],
       "type": "object"
     },
+    "ThreadQueueAcceptedSubmission": {
+      "properties": {
+        "queuedSubmissionId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "queuedSubmissionId",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "ThreadQueuePendingStart": {
+      "properties": {
+        "queuedSubmissionId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "queuedSubmissionId",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "ThreadQueueSnapshot": {
+      "properties": {
+        "acceptedSubmissions": {
+          "description": "Bounded recent receipts. An absent ID is unknown/expired, never proof of rejection or permission to resubmit potentially accepted input.",
+          "items": {
+            "$ref": "#/definitions/ThreadQueueAcceptedSubmission"
+          },
+          "type": "array"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "pendingStart": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadQueuePendingStart"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "acceptedSubmissions",
+        "paused",
+        "revision"
+      ],
+      "type": "object"
+    },
     "UserInput": {
       "oneOf": [
         {
@@ -256,6 +321,17 @@
         "string",
         "null"
       ]
+    },
+    "snapshot": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadQueueSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Absent on older peers, not proof that no submission was accepted."
     }
   },
   "required": [

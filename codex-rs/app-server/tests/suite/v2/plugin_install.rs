@@ -5,6 +5,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use super::plugin_test_support::write_plugin_source;
+use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 use anyhow::Result;
 use anyhow::bail;
 use app_test_support::ChatGptAuthFixture;
@@ -61,8 +63,6 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 use wiremock::matchers::query_param;
-use super::plugin_test_support::write_plugin_source;
-use super::plugin_test_support::write_plugins_enabled_config_with_base_url;
 
 // Plugin install tests wait on connector discovery after the install response path
 // starts, which is noticeably slower on Windows CI.
@@ -90,6 +90,8 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let exactly_one_source = "requires exactly one of marketplacePath or remoteMarketplaceName";
+    // A relative path fails parameter decoding (-32602); decoded requests that
+    // violate install rules are invalid requests (-32600).
     let cases = [
         (
             "relative marketplace path",
@@ -97,7 +99,8 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
                 "marketplacePath": "relative-marketplace.json",
                 "pluginName": "missing-plugin",
             }),
-            vec!["Invalid request"],
+            -32602,
+            vec!["Invalid parameters for plugin/install"],
         ),
         (
             "missing install source",
@@ -106,6 +109,7 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
                 remote_marketplace_name: None,
                 plugin_name: "sample-plugin".to_string(),
             })?,
+            -32600,
             vec![exactly_one_source],
         ),
         (
@@ -117,6 +121,7 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
                 remote_marketplace_name: Some("openai-curated-remote".to_string()),
                 plugin_name: "sample-plugin".to_string(),
             })?,
+            -32600,
             vec![exactly_one_source],
         ),
         (
@@ -128,6 +133,7 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
                 remote_marketplace_name: None,
                 plugin_name: "missing-plugin".to_string(),
             })?,
+            -32600,
             vec!["marketplace file", "does not exist"],
         ),
         (
@@ -137,11 +143,12 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
                 remote_marketplace_name: Some("openai-curated-remote".to_string()),
                 plugin_name: "linear/../../oops".to_string(),
             })?,
+            -32600,
             vec!["invalid remote plugin id"],
         ),
     ];
 
-    for (case, params, expected_fragments) in cases {
+    for (case, params, expected_code, expected_fragments) in cases {
         let request_id = mcp.send_raw_request("plugin/install", Some(params)).await?;
         let err = timeout(
             DEFAULT_TIMEOUT,
@@ -149,7 +156,7 @@ async fn plugin_install_rejects_invalid_requests_before_side_effects() -> Result
         )
         .await??;
 
-        assert_eq!(err.error.code, -32600, "{case}");
+        assert_eq!(err.error.code, expected_code, "{case}");
         for fragment in expected_fragments {
             assert!(
                 err.error.message.contains(fragment),
@@ -2007,7 +2014,10 @@ async fn oauth_discovery_request_count_rejects_disabled_recording() {
 }
 
 fn configure_remote_plugin_test(codex_home: &std::path::Path, server: &MockServer) -> Result<()> {
-    write_plugins_enabled_config_with_base_url(codex_home, &format!("{}/backend-api/", server.uri()))?;
+    write_plugins_enabled_config_with_base_url(
+        codex_home,
+        &format!("{}/backend-api/", server.uri()),
+    )?;
     write_chatgpt_auth(
         codex_home,
         ChatGptAuthFixture::new("chatgpt-token")

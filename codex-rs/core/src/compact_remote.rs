@@ -223,30 +223,19 @@ enum ToolReceiptSide {
     Output,
 }
 
-type ToolReceiptIndex<'a> = HashMap<(ToolReceiptKind, ToolReceiptSide, &'a str), usize>;
+type ToolReceiptIndex = Vec<Option<usize>>;
 
-fn tool_receipt_index(items: &[ResponseItem]) -> ToolReceiptIndex<'_> {
-    let mut index = HashMap::new();
-    for (position, item) in items.iter().enumerate() {
-        if let Some(identity) = tool_receipt_identity(item) {
-            // Retain the first occurrence, matching the previous counterpart lookup.
-            index.entry(identity).or_insert(position);
-        }
-    }
-    index
+fn tool_receipt_index(items: &[ResponseItem]) -> ToolReceiptIndex {
+    crate::tool_occurrence::pairs(items)
 }
 
 fn complete_tool_receipt_indices(
     items: &[ResponseItem],
-    receipt_index: &ToolReceiptIndex<'_>,
+    receipt_index: &ToolReceiptIndex,
     index: usize,
 ) -> Option<Vec<usize>> {
-    let (kind, side, call_id) = tool_receipt_identity(&items[index])?;
-    let counterpart_side = match side {
-        ToolReceiptSide::Call => ToolReceiptSide::Output,
-        ToolReceiptSide::Output => ToolReceiptSide::Call,
-    };
-    let counterpart = *receipt_index.get(&(kind, counterpart_side, call_id))?;
+    tool_receipt_identity(&items[index])?;
+    let counterpart = receipt_index.get(index).copied().flatten()?;
     let mut group = vec![index, counterpart];
     group.sort_unstable();
     group.dedup();
@@ -312,9 +301,13 @@ fn remote_tool_search_receipt_group(
     };
     let ordered_tool_identities = match &prior_receipt {
         Some(receipt) => receipt.ordered_tool_identities.clone(),
-        None => tools.iter()
+        None => tools
+            .iter()
             .map(codex_tools::LoadableToolSpec::callable_names_from_value)
-            .collect::<Option<Vec<_>>>()?.into_iter().flatten().collect::<Vec<_>>(),
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
     };
     let total_identity_count =
         prior_receipt
@@ -329,8 +322,9 @@ fn remote_tool_search_receipt_group(
         .as_ref()
         .map_or(tools.len(), |receipt| receipt.result_count);
     // Old receipts may contain container names: never upgrade that lost knowledge.
-    let callable_count = prior_receipt.as_ref().map_or(
-        Some(total_identity_count), |receipt| receipt.callable_count);
+    let callable_count = prior_receipt
+        .as_ref()
+        .map_or(Some(total_identity_count), |receipt| receipt.callable_count);
     let receipt_arguments = prior_receipt.as_ref().map_or_else(
         || compact_tool_search_arguments(arguments),
         |receipt| receipt.arguments.clone(),
@@ -369,7 +363,9 @@ fn remote_tool_search_receipt_group(
         );
         let receipt = RemoteToolSearchReceiptV1 {
             version: prior_receipt.as_ref().map_or(
-                crate::tool_history::TOOL_SEARCH_RECEIPT_VERSION, |receipt| receipt.version),
+                crate::tool_history::TOOL_SEARCH_RECEIPT_VERSION,
+                |receipt| receipt.version,
+            ),
             receipt_id,
             call_id: call_id.clone(),
             status: status.clone(),
@@ -519,6 +515,7 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
         return (0, 0);
     }
     let receipt_index = tool_receipt_index(history.raw_items());
+    let reused = crate::tool_occurrence::reused_call_ids(history.raw_items());
     let prepared_outputs = prepared_items.map(|items| {
         items
             .iter()
@@ -535,6 +532,10 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
             break;
         }
         let raw_item = &history.raw_items()[index];
+        if crate::tool_occurrence::identity(raw_item).is_some_and(|(_, _, id)| reused.contains(id))
+        {
+            continue;
+        }
         let current_model_item = if let Some(prepared_outputs) = prepared_outputs.as_ref() {
             let Some((kind, side, call_id)) = tool_receipt_identity(raw_item) else {
                 continue;
@@ -600,20 +601,15 @@ pub(crate) fn trim_function_call_history_to_fit_context_window_for_prompt(
 
 fn rewritten_output_for_context_window(
     items: &[ResponseItem],
-    receipt_index: &ToolReceiptIndex<'_>,
+    receipt_index: &ToolReceiptIndex,
     index: usize,
 ) -> Option<ResponseItem> {
     let item = items.get(index)?;
     Some(match item {
         ResponseItem::ToolSearchOutput {
-            call_id: Some(call_id),
-            ..
+            call_id: Some(_), ..
         } => {
-            let call_index = *receipt_index.get(&(
-                ToolReceiptKind::Search,
-                ToolReceiptSide::Call,
-                call_id.as_str(),
-            ))?;
+            let call_index = receipt_index.get(index).copied().flatten()?;
             let (_, _, output) =
                 remote_tool_search_receipt_group(items, &[call_index, index], false)?;
             output

@@ -375,6 +375,9 @@ pub struct FeedbackSnapshot {
 
 pub struct FeedbackAttachmentPath {
     pub path: PathBuf,
+    /// A selected rollout, rather than an arbitrary user-supplied log. Hydrate
+    /// validated sidecars within the upload budget instead of exporting stubs.
+    pub hydrate_rollout: bool,
     /// Optional filename to use for the uploaded attachment instead of `path`'s basename.
     pub attachment_filename_override: Option<String>,
 }
@@ -665,12 +668,25 @@ impl FeedbackSnapshot {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "extra-log.log".to_string())
                 });
+            let filename = if attachment_path.hydrate_rollout {
+                filename
+                    .strip_suffix(".zst")
+                    .unwrap_or(&filename)
+                    .to_string()
+            } else {
+                filename
+            };
             let limit = remaining.min(MAX_ATTACHMENT_BYTES);
-            let data = match fs::File::open(&attachment_path.path).and_then(|file| {
-                let mut data = Vec::new();
-                file.take(limit as u64 + 1).read_to_end(&mut data)?;
-                Ok(data)
-            }) {
+            let read = if attachment_path.hydrate_rollout {
+                codex_rollout::read_rollout_for_feedback(&attachment_path.path, limit)
+            } else {
+                fs::File::open(&attachment_path.path).and_then(|file| {
+                    let mut data = Vec::new();
+                    file.take(limit as u64 + 1).read_to_end(&mut data)?;
+                    Ok(data)
+                })
+            };
+            let data = match read {
                 Ok(data) => data,
                 Err(err) => {
                     tracing::warn!(
@@ -979,6 +995,7 @@ mod tests {
     fn upload_succeeds_only_when_sentry_accepts_the_envelope() {
         let missing_filename = format!("codex-feedback-missing-{}.log", ThreadId::new());
         let missing = FeedbackAttachmentPath {
+            hydrate_rollout: false,
             path: std::env::temp_dir().join(&missing_filename),
             attachment_filename_override: None,
         };
@@ -1105,6 +1122,7 @@ mod tests {
         let small = dir.path().join("small.zip");
         fs::write(&small, b"complete archive").unwrap();
         let paths = [oversized, small].map(|path| FeedbackAttachmentPath {
+            hydrate_rollout: false,
             path,
             attachment_filename_override: None,
         });
@@ -1362,6 +1380,7 @@ mod tests {
         let extra_filename = format!("codex-feedback-extra-{}.jsonl", ThreadId::new());
         let extra_path = std::env::temp_dir().join(&extra_filename);
         let extra_attachment_path = FeedbackAttachmentPath {
+            hydrate_rollout: false,
             path: extra_path.clone(),
             attachment_filename_override: None,
         };
@@ -1467,14 +1486,17 @@ mod tests {
                 &[
                     FeedbackAttachmentPath {
                         path: gzip_path.clone(),
+                        hydrate_rollout: false,
                         attachment_filename_override: None,
                     },
                     FeedbackAttachmentPath {
                         path: unknown_path.clone(),
+                        hydrate_rollout: false,
                         attachment_filename_override: None,
                     },
                     FeedbackAttachmentPath {
                         path: unknown_path.clone(),
+                        hydrate_rollout: false,
                         attachment_filename_override: Some("session.JSONL".to_string()),
                     },
                 ],
@@ -1596,5 +1618,60 @@ mod tests {
             assert!(!without_optional_fields.contains_key("reason"));
             assert!(!without_optional_fields.contains_key("session_source"));
         }
+    }
+
+    #[tokio::test]
+    async fn selected_rollout_envelope_contains_hydrated_terminal_evidence() {
+        use codex_protocol::protocol::EventMsg;
+        use codex_protocol::protocol::RolloutItem;
+        use codex_protocol::protocol::TurnCompleteEvent;
+        use codex_protocol::protocol::TurnTiming;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        fs::write(&path, b"").unwrap();
+        let message = "preserved terminal evidence ".repeat(1000);
+        let item = RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "feedback-turn".to_string(),
+            last_agent_message: Some(message.clone()),
+            surfaced_result: None,
+            error: None,
+            completed_at: None,
+            duration_ms: Some(1234),
+            time_to_first_token_ms: None,
+            timing: Some(TurnTiming {
+                inclusive_duration_ms: 1234,
+                ..Default::default()
+            }),
+        }));
+        codex_rollout::append_rollout_item_to_path(&path, &item)
+            .await
+            .unwrap();
+        let source = fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&source).contains("rollout_payload_artifact"));
+        let paths = [FeedbackAttachmentPath {
+            path: path.clone(),
+            hydrate_rollout: true,
+            attachment_filename_override: None,
+        }];
+        let snapshot = CodexFeedback::new().snapshot(None);
+        let envelope = snapshot
+            .encode_envelope(FeedbackUploadOptions {
+                classification: "bug",
+                reason: None,
+                tags: None,
+                include_logs: true,
+                extra_attachments: &[],
+                extra_attachment_paths: &paths,
+                session_source: None,
+                logs_override: None,
+            })
+            .unwrap();
+        let envelope = String::from_utf8(envelope).unwrap();
+        assert!(envelope.contains(&message));
+        assert!(envelope.contains("feedback-turn"));
+        assert!(envelope.contains("1234"));
+        assert!(!envelope.contains("rollout_payload_artifact"));
+        assert_eq!(fs::read(path).unwrap(), source);
     }
 }

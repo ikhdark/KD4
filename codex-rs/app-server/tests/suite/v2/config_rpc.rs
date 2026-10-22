@@ -88,7 +88,8 @@ service_tier = "priority"
 
     let requirements = response.requirements.expect("managed requirements");
     assert_eq!(requirements.allow_remote_control, Some(false));
-    let defaults = requirements.models
+    let defaults = requirements
+        .models
         .and_then(|models| models.new_thread)
         .expect("managed new-thread defaults");
     assert_eq!(defaults.model.as_deref(), Some("gpt-managed"));
@@ -952,9 +953,9 @@ model = "gpt-old"
         .and_then(|d| d.get("config_write_error_code"))
         .and_then(|v| v.as_str());
     assert_eq!(code, Some("configVersionConflict"));
-    let persisted: toml::Value = toml::from_str(
-        &std::fs::read_to_string(codex_home.path().join("config.toml"))?,
-    )?;
+    let persisted: toml::Value = toml::from_str(&std::fs::read_to_string(
+        codex_home.path().join("config.toml"),
+    )?)?;
     assert_eq!(persisted["model"].as_str(), Some("gpt-old"));
 
     Ok(())
@@ -1029,8 +1030,6 @@ async fn config_batch_write_applies_multiple_edits() -> Result<()> {
 
     Ok(())
 }
-
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_batch_write_rejects_legacy_profile_tables() -> Result<()> {

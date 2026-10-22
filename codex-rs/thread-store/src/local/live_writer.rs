@@ -21,6 +21,94 @@ use crate::types::canonical_history_mode_from_rollout_items;
 
 const ROLLOUT_SIZE_BYTES_METRIC: &str = "codex.rollout.size_bytes";
 
+/// Keep startup custody until the observer actually receives the initialized
+/// writer. Dropping an unreceived result cleans up only this append owner.
+struct InitializationGuard {
+    store: LocalThreadStore,
+    thread_id: ThreadId,
+    recorder: Option<RolloutRecorder>,
+}
+
+impl Drop for InitializationGuard {
+    fn drop(&mut self) {
+        let Some(recorder) = self.recorder.take() else {
+            return;
+        };
+        let store = self.store.clone();
+        let thread_id = self.thread_id;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            warn!(%thread_id, "cannot discard unclaimed recorder without a Tokio runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) = recorder.discard_owned().await {
+                warn!(%thread_id, %error, "failed to discard unclaimed recorder initialization");
+                return;
+            }
+            remove_current_recorder(&store, thread_id, &recorder).await;
+        });
+    }
+}
+
+pub(super) async fn initialize<F, Fut>(
+    store: LocalThreadStore,
+    thread_id: ThreadId,
+    start: F,
+) -> ThreadStoreResult<()>
+where
+    F: FnOnce(LocalThreadStore) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ThreadStoreResult<Option<Arc<Vec<RolloutItem>>>>>
+        + Send
+        + 'static,
+{
+    let (send, receive) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = async {
+            let history = start(store.clone()).await?;
+            let guard = InitializationGuard {
+                recorder: Some(store.live_recorder(thread_id).await?),
+                store: store.clone(),
+                thread_id,
+            };
+            if let Some(history) = history {
+                super::projection::initialize_from_items(&store, thread_id, &history).await?;
+            } else {
+                super::projection::initialize_empty(&store, thread_id).await?;
+            }
+            Ok::<_, ThreadStoreError>(guard)
+        }
+        .await;
+        // Failed send drops the guard too; a detached successful worker cannot
+        // leave a registered writer without an initialization owner.
+        let _ = send.send(result);
+    });
+    let mut guard = receive.await.map_err(|error| ThreadStoreError::Internal {
+        message: format!("recorder initialization failed: {error}"),
+    })??;
+    guard.recorder.take();
+    Ok(())
+}
+
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Writer and projection maps settle together in live-recorders -> projections order; eviction only try-locks the writer map"
+)]
+async fn remove_current_recorder(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    recorder: &RolloutRecorder,
+) {
+    let mut entries = store.live_recorders.lock().await;
+    if entries
+        .get(&thread_id)
+        .is_some_and(|entry| entry.recorder.same_writer(recorder))
+    {
+        // No replacement can register in this store until both maps settle.
+        super::projection::remove(store, thread_id).await;
+        entries.remove(&thread_id);
+    }
+}
+
 pub(super) async fn create_thread(
     store: &LocalThreadStore,
     params: CreateThreadParams,
@@ -54,10 +142,7 @@ pub(super) async fn resume_thread(
     store: &LocalThreadStore,
     params: ResumeThreadParams,
 ) -> ThreadStoreResult<Arc<Vec<RolloutItem>>> {
-    let store = store.clone();
-    // Loading/materialization may own blocking file work after caller cancellation.
-    tokio::spawn(async move { resume_thread_owned(&store, params).await })
-        .await.map_err(|error| ThreadStoreError::Internal { message: error.to_string() })?
+    resume_thread_owned(store, params).await
 }
 
 async fn resume_thread_owned(
@@ -99,9 +184,11 @@ async fn resume_thread_owned(
     }
     let history_mode = thread.history_mode;
     reject_paginated_history_mode(history_mode)?;
-    let rollout_path = thread.rollout_path.ok_or_else(|| ThreadStoreError::Internal {
-        message: format!("thread {} does not have a rollout path", params.thread_id),
-    })?;
+    let rollout_path = thread
+        .rollout_path
+        .ok_or_else(|| ThreadStoreError::Internal {
+            message: format!("thread {} does not have a rollout path", params.thread_id),
+        })?;
     let config = RolloutConfig {
         codex_home: store.config.codex_home.clone(),
         sqlite_home: store.config.sqlite_home.clone(),
@@ -136,16 +223,112 @@ async fn resume_thread_owned(
             (recorder, history)
         }
         None => {
-            let (recorder, history) = RolloutRecorder::resume_and_load_with_writer_lease(&config, rollout_path, params.thread_id, Some(lease))
-                .await.map_err(thread_store_io_error)?;
+            let (recorder, history) = RolloutRecorder::resume_and_load_with_writer_lease(
+                &config,
+                rollout_path,
+                params.thread_id,
+                Some(lease),
+            )
+            .await
+            .map_err(thread_store_io_error)?;
             validate_history(&history)?;
             (recorder, Arc::new(history))
         }
     };
+    repair_resume_discovery_metadata(store, params.thread_id, recorder.rollout_path()).await;
     store
         .insert_live_recorder(params.thread_id, recorder, history_mode)
         .await?;
     Ok(history)
+}
+
+/// Canonical history is the restart receipt for deferred index facts. Repair
+/// only missing discovery facts on resume; never overwrite current settings,
+/// assignments or an explicitly cleared/custom title with an old observation.
+async fn repair_resume_discovery_metadata(
+    store: &LocalThreadStore,
+    id: ThreadId,
+    path: &std::path::Path,
+) {
+    let Some(db) = store.state_db.as_deref() else {
+        return;
+    };
+    let result = async {
+        let current = db
+            .get_thread(id)
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: error.to_string(),
+            })?;
+        let Some(current) = current else {
+            // Resuming does not unarchive: a missing row for an archived
+            // rollout is rebuilt archived, as a metadata update rebuilds it.
+            let archived =
+                super::helpers::rollout_path_is_archived(store.config.codex_home.as_path(), path);
+            if !codex_rollout::state_integration::reconcile_rollout(
+                Some(db),
+                path,
+                &store.config.default_model_provider_id,
+                None,
+                &[],
+                archived.then_some(true),
+            )
+            .await
+            {
+                return Err(thread_store_io_error(std::io::Error::other(
+                    "resume metadata reconciliation remains deferred",
+                )));
+            }
+            return Ok::<_, ThreadStoreError>(());
+        };
+        if current.first_user_message.is_some()
+            && current
+                .preview
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+        {
+            return Ok(());
+        }
+        // A caller's cached history is not authority for a missing fact.
+        let (history, actual, _) = RolloutRecorder::load_rollout_items(path)
+            .await
+            .map_err(thread_store_io_error)?;
+        if actual != Some(id) {
+            return Err(thread_store_io_error(std::io::Error::other(
+                "resume metadata identity mismatch",
+            )));
+        }
+        let Some(builder) = codex_rollout::builder_from_items(&history, path) else {
+            return Ok(());
+        };
+        let mut facts = builder.build(&store.config.default_model_provider_id);
+        codex_state::apply_rollout_items(
+            &mut facts,
+            &history,
+            &store.config.default_model_provider_id,
+        );
+        db.patch_existing_thread_metadata(id, |row| {
+            if row.first_user_message.is_none() {
+                row.first_user_message = facts.first_user_message;
+            }
+            if row
+                .preview
+                .as_ref()
+                .is_none_or(std::string::String::is_empty)
+            {
+                row.preview = facts.preview;
+            }
+        })
+        .await
+        .map_err(|error| ThreadStoreError::Internal {
+            message: error.to_string(),
+        })?;
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        warn!(%id, %error, "resume discovery repair deferred");
+    }
 }
 
 pub(super) async fn append_persisted_items_ordered(
@@ -195,6 +378,18 @@ pub(super) async fn shutdown_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
+    let store = store.clone();
+    tokio::spawn(async move { shutdown_thread_owned(&store, thread_id).await })
+        .await
+        .map_err(|error| ThreadStoreError::Internal {
+            message: error.to_string(),
+        })?
+}
+
+async fn shutdown_thread_owned(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<()> {
     let recorder = store.live_recorder(thread_id).await?;
     let rollout_path = recorder.rollout_path().to_path_buf();
     recorder.shutdown().await.map_err(thread_store_io_error)?;
@@ -205,7 +400,7 @@ pub(super) async fn shutdown_thread(
         let size_bytes = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
         let _ = metrics.histogram(ROLLOUT_SIZE_BYTES_METRIC, size_bytes, &[]);
     }
-    store.live_recorders.lock().await.remove(&thread_id);
+    remove_current_recorder(store, thread_id, &recorder).await;
     Ok(())
 }
 
@@ -213,10 +408,25 @@ pub(super) async fn discard_thread(
     store: &LocalThreadStore,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<()> {
-    let recorder = store.live_recorder(thread_id).await?;
-    recorder.discard().await.map_err(thread_store_io_error)?;
-    store.live_recorders.lock().await.remove(&thread_id);
-    Ok(())
+    let store = store.clone();
+    let completion = tokio::spawn(async move {
+        let recorder = store.live_recorder(thread_id).await?;
+        recorder
+            .discard_owned()
+            .await
+            .map_err(thread_store_io_error)?;
+        remove_current_recorder(&store, thread_id, &recorder).await;
+        Ok(())
+    });
+    // Timing out only the observer keeps eventual terminal/map settlement owned.
+    tokio::time::timeout(std::time::Duration::from_secs(30), completion)
+        .await
+        .map_err(|_| ThreadStoreError::Internal {
+            message: "timed out waiting for rollout discard settlement".into(),
+        })?
+        .map_err(|error| ThreadStoreError::Internal {
+            message: error.to_string(),
+        })?
 }
 
 pub(super) async fn rollout_path(
@@ -249,25 +459,17 @@ async fn sync_materialized_rollout_path(
         return Ok(());
     };
     let result: ThreadStoreResult<()> = async {
-        let Some(mut metadata) =
-            state_db
-                .get_thread(thread_id)
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to read thread metadata for {thread_id}: {err}"),
-                })?
-        else {
-            return Ok(());
-        };
-        if metadata.rollout_path != rollout_path {
-            metadata.rollout_path = rollout_path;
-            state_db
-                .upsert_thread(&metadata)
-                .await
-                .map_err(|err| ThreadStoreError::Internal {
-                    message: format!("failed to update thread metadata for {thread_id}: {err}"),
-                })?;
-        }
+        state_db
+            .patch_existing_thread_metadata(thread_id, |current| {
+                if !rollout_path.exists() && !rollout_path.with_extension("jsonl.zst").exists() {
+                    return;
+                }
+                current.rollout_path = rollout_path;
+            })
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to update thread metadata for {thread_id}: {err}"),
+            })?;
         Ok(())
     }
     .await;

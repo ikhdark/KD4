@@ -82,15 +82,17 @@ async fn windows_sandbox_requests_reject_invalid_paths() -> Result<()> {
     let missing_path =
         codex_utils_absolute_path::AbsolutePathBuf::try_from(codex_home.path().join("missing"))?;
 
-    // Neither rejection starts setup or grants a root.
-    for (method, params, expected_fragment) in [
+    // Neither rejection starts setup or grants a root. A relative cwd fails
+    // parameter decoding; a missing absolute path is an invalid request.
+    for (method, params, expected_code, expected_fragment) in [
         (
             "windowsSandbox/setupStart",
             serde_json::json!({
                 "mode": "unelevated",
                 "cwd": "relative-root",
             }),
-            "Invalid request",
+            -32602,
+            "Invalid parameters for windowsSandbox/setupStart",
         ),
         (
             "windowsSandbox/grantReadRoot",
@@ -98,6 +100,7 @@ async fn windows_sandbox_requests_reject_invalid_paths() -> Result<()> {
                 "path": missing_path,
                 "cwd": codex_home.path(),
             }),
+            -32600,
             "path does not exist",
         ),
     ] {
@@ -108,7 +111,7 @@ async fn windows_sandbox_requests_reject_invalid_paths() -> Result<()> {
         )
         .await??;
 
-        assert_eq!(err.error.code, -32600, "{method}");
+        assert_eq!(err.error.code, expected_code, "{method}");
         assert!(
             err.error.message.contains(expected_fragment),
             "{method}: {}",

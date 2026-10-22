@@ -39,7 +39,11 @@ mod tests {
             (Some(&empty_map), &[][..], "-"),
             (Some(&env), &[][..], "A=*****, B=*****"),
             (None, &vars[..], "TOKEN=*****, PATH=*****"),
-            (Some(&env), &vars[..], "A=*****, B=*****, TOKEN=*****, PATH=*****"),
+            (
+                Some(&env),
+                &vars[..],
+                "A=*****, B=*****, TOKEN=*****, PATH=*****",
+            ),
         ] {
             assert_eq!(format_env_display(map, variables), expected);
         }

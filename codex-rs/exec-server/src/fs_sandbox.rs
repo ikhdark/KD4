@@ -20,9 +20,6 @@ use codex_sandboxing::transform_for_direct_spawn_with_codex_home;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
-use codex_utils_pty::configure_windows_command_args;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use crate::ExecServerRuntimePaths;
 use crate::FileSystemSandboxContext;
@@ -163,11 +160,12 @@ impl FileSystemSandboxRunner {
         // Keep wrapper ACL ownership and the helper's trusted runtime environment
         // on the same home. Per-instance overrides must not use the parent home.
         let transformed = match self.helper_env.get("CODEX_HOME") {
-            Some(home) => transform_for_direct_spawn_with_codex_home(request, std::path::Path::new(home)),
+            Some(home) => {
+                transform_for_direct_spawn_with_codex_home(request, std::path::Path::new(home))
+            }
             None => transform_for_direct_spawn(request),
         };
-        transformed
-        .map_err(|err| invalid_request(format!("failed to prepare fs sandbox: {err}")))
+        transformed.map_err(|err| invalid_request(format!("failed to prepare fs sandbox: {err}")))
     }
 }
 
@@ -304,32 +302,59 @@ async fn run_command(
     command: SandboxExecRequest,
     request_json: Vec<u8>,
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
-    let mut child = spawn_command(command)?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| internal_error("failed to open fs sandbox helper stdin".to_string()))?;
-    stdin.write_all(&request_json).await.map_err(io_error)?;
-    drop(request_json);
-    stdin.shutdown().await.map_err(io_error)?;
-    drop(stdin);
-
-    let output = child.wait_with_output().await.map_err(io_error)?;
-    if !output.status.success() {
+    let codex_utils_pty::SpawnedProcess {
+        session,
+        stdout_rx,
+        stderr_rx,
+        exit_rx,
+    } = spawn_command(command).await?;
+    session
+        .writer_sender()
+        .send(request_json)
+        .await
+        .map_err(|_| internal_error("failed to write fs sandbox helper input".into()))?;
+    session.close_stdin();
+    let collect = |mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>, limit: usize| async move {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            if chunk.len() > limit.saturating_sub(bytes.len()) {
+                return Err(internal_error(
+                    "fs sandbox helper output exceeds response limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    };
+    let (stdout, stderr, status) = tokio::try_join!(
+        collect(stdout_rx, crate::connection::MAX_JSONRPC_MESSAGE_LEN),
+        collect(stderr_rx, 64 * 1024),
+        async {
+            exit_rx
+                .await
+                .map_err(|_| internal_error("fs sandbox helper exit was not confirmed".into()))
+        },
+    )?;
+    if !session.output_capture().complete() {
+        return Err(internal_error(
+            "fs sandbox helper output capture is incomplete; result unavailable".into(),
+        ));
+    }
+    session.finish();
+    if status != 0 {
         return Err(internal_error(format!(
             "fs sandbox helper failed with status {status}: {stderr}",
-            status = output.status,
-            stderr = String::from_utf8_lossy(&output.stderr).trim()
+            stderr = String::from_utf8_lossy(&stderr).trim()
         )));
     }
-    let response: FsHelperResponse = serde_json::from_slice(&output.stdout).map_err(json_error)?;
+    let response: FsHelperResponse = serde_json::from_slice(&stdout).map_err(json_error)?;
     match response {
         FsHelperResponse::Ok(payload) => Ok(payload),
         FsHelperResponse::Error(error) => Err(error),
     }
 }
 
-fn spawn_command(
+async fn spawn_command(
     SandboxExecRequest {
         command: argv,
         cwd,
@@ -337,24 +362,16 @@ fn spawn_command(
         arg0,
         ..
     }: SandboxExecRequest,
-) -> Result<tokio::process::Child, JSONRPCErrorError> {
+) -> Result<codex_utils_pty::SpawnedProcess, JSONRPCErrorError> {
     let Some((program, args)) = argv.split_first() else {
         return Err(invalid_request("fs sandbox command was empty".to_string()));
     };
-    let mut command = Command::new(program);
-
-    let _ = arg0;
-    configure_windows_command_args(command.as_std_mut(), std::ffi::OsStr::new(program), args);
     // TODO(anp): Keep PathUri through the filesystem helper launch boundary.
     let cwd = cwd.to_abs_path().map_err(io_error)?;
-    command.current_dir(cwd.as_path());
-    command.env_clear();
-    command.envs(env);
-    command.stdin(std::process::Stdio::piped());
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    command.kill_on_drop(true);
-    command.spawn().map_err(io_error)
+    // Reuse the admitted, cancellation-safe pipe owner and its confirmed reaper.
+    codex_utils_pty::spawn_pipe_process(program, args, cwd.as_path(), &env, &arg0)
+        .await
+        .map_err(|error| internal_error(error.to_string()))
 }
 
 fn io_error(err: std::io::Error) -> JSONRPCErrorError {
@@ -408,10 +425,17 @@ mod tests {
                 } else {
                     Vec::new()
                 });
-                let helper_roots = if include_helper { roots.as_slice() } else { &[] };
+                let helper_roots = if include_helper {
+                    roots.as_slice()
+                } else {
+                    &[]
+                };
                 add_helper_runtime_permissions(&mut policy, helper_roots, cwd.as_path());
                 assert!(policy.include_platform_defaults());
-                assert_eq!(policy.can_write_path_with_cwd(writable.as_path(), cwd.as_path()), writes);
+                assert_eq!(
+                    policy.can_write_path_with_cwd(writable.as_path(), cwd.as_path()),
+                    writes
+                );
                 if include_helper {
                     assert!(policy.can_read_path_with_cwd(roots[0].as_path(), cwd.as_path()));
                     assert!(!policy.can_write_path_with_cwd(roots[0].as_path(), cwd.as_path()));

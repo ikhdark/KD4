@@ -60,7 +60,10 @@ fn model_context_budget_rejects_whole_items_without_spending_remaining_bytes() {
 fn model_context_budget_truncates_at_utf8_boundary() {
     let mut budget = ModelContextBudget::new(9);
     let text = format!("a{}z", "😀".repeat(20));
-    assert_eq!(budget.take(&text), Some("a\n[... context truncated ...]\nz".into()));
+    assert_eq!(
+        budget.take(&text),
+        Some("a\n[... context truncated ...]\nz".into())
+    );
     assert_eq!(budget.remaining_bytes(), 5);
 }
 
@@ -305,10 +308,12 @@ fn additional_context_caps_entity_heavy_values_after_escaping() {
         .split_once('…')
         .expect("truncation marker should have a closing delimiter");
 
+    // 41-byte marker leaves 3_959 bytes: 395 + 396 whole entities, and
+    // (20_000 - 3_955) bytes omitted round up to 4_012 tokens.
     assert!(body.len() <= 4_000);
-    assert_eq!(marker, "4008 tokens truncated");
-    assert_eq!(prefix, "&amp;".repeat(397));
-    assert_eq!(suffix, "&amp;".repeat(397));
+    assert_eq!(marker, "approximately 4012 tokens truncated");
+    assert_eq!(prefix, "&amp;".repeat(395));
+    assert_eq!(suffix, "&amp;".repeat(396));
 }
 
 #[test]

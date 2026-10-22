@@ -54,6 +54,9 @@ pub fn json_response<T: Serialize>(value: &T) -> Response {
 
 pub fn blocked_header_value(reason: &str) -> &'static str {
     match reason {
+        "dns_failed" => "dns-failed",
+        "dns_timeout" => "dns-timeout",
+        "dns_empty" => "dns-empty",
         REASON_NOT_ALLOWED | REASON_NOT_ALLOWED_LOCAL => "blocked-by-allowlist",
         REASON_DENIED => "blocked-by-denylist",
         REASON_METHOD_NOT_ALLOWED => "blocked-by-method-policy",
@@ -65,6 +68,9 @@ pub fn blocked_header_value(reason: &str) -> &'static str {
 
 pub fn blocked_message(reason: &str) -> &'static str {
     match reason {
+        "dns_failed" => "DNS resolution failed; destination address is unknown.",
+        "dns_timeout" => "DNS resolution timed out; destination address is unknown.",
+        "dns_empty" => "DNS resolution returned no destination addresses.",
         REASON_NOT_ALLOWED => "Domain not in allowlist.",
         REASON_NOT_ALLOWED_LOCAL => "Sandbox policy blocks local/private network addresses.",
         REASON_DENIED => "Domain denied by the sandbox policy.",
@@ -78,7 +84,7 @@ pub fn blocked_message(reason: &str) -> &'static str {
 
 pub fn blocked_text_response(reason: &str) -> Response {
     Response::builder()
-        .status(StatusCode::FORBIDDEN)
+        .status(blocked_status(reason))
         .header("content-type", "text/plain")
         .header("x-proxy-error", blocked_header_value(reason))
         .body(Body::from(blocked_message(reason)))
@@ -94,11 +100,19 @@ pub fn blocked_text_response_with_policy(
     details: &PolicyDecisionDetails<'_>,
 ) -> Response {
     Response::builder()
-        .status(StatusCode::FORBIDDEN)
+        .status(blocked_status(reason))
         .header("content-type", "text/plain")
         .header("x-proxy-error", blocked_header_value(reason))
         .body(Body::from(blocked_message_with_policy(reason, details)))
         .unwrap_or_else(|_| Response::new(Body::from("blocked")))
+}
+
+pub(crate) fn blocked_status(reason: &str) -> StatusCode {
+    match reason {
+        "dns_timeout" => StatusCode::GATEWAY_TIMEOUT,
+        "dns_failed" | "dns_empty" => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::FORBIDDEN,
+    }
 }
 
 #[cfg(test)]

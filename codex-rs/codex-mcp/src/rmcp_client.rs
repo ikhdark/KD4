@@ -130,8 +130,9 @@ fn make_progress_sender(tx_event: Sender<Event>) -> SendProgress {
                 Some(total) => format!("MCP tool progress: {}/{total}", params.progress),
                 None => format!("MCP tool progress: {}", params.progress),
             });
-            if let Err(err) = tx_event
-                .send(Event {
+            if let Err(err) = crate::event_queue::send_event(
+                &tx_event,
+                Event {
                     id: turn_id,
                     msg: EventMsg::McpToolCallProgress(McpToolCallProgressEvent {
                         call_id: item_id,
@@ -139,8 +140,9 @@ fn make_progress_sender(tx_event: Sender<Event>) -> SendProgress {
                         progress: Some(params.progress),
                         total: params.total,
                     }),
-                })
-                .await
+                },
+            )
+            .await
             {
                 warn!("failed to forward MCP tool progress event: {err}");
             }
@@ -301,16 +303,17 @@ impl CodexAppsStartupReconnect {
             };
 
             if recovered && let Some(context) = startup_status_context {
-                let _ = context
-                    .tx_event
-                    .send(Event {
+                let _ = crate::event_queue::send_event(
+                    &context.tx_event,
+                    Event {
                         id: context.submit_id,
                         msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
                             server: context.server_name,
                             status: McpStartupStatus::Ready,
                         }),
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
         });
     }
@@ -1094,10 +1097,8 @@ fn spawn_tool_catalog_refresh_worker(
     notifications: Receiver<()>,
 ) {
     tokio::spawn(async move {
-        while notifications.recv().await.is_ok() {
-            let Some(client) = client.upgrade() else {
-                break;
-            };
+        run_tool_catalog_refresh_worker(&server_name, notifications, || async {
+            let client = client.upgrade()?;
             let list_start = Instant::now();
             let fetch_ticket = codex_apps_tools_cache_context
                 .as_ref()
@@ -1139,14 +1140,56 @@ fn spawn_tool_catalog_refresh_worker(
             } else {
                 commit_tool_catalog_refresh(&tools, &tool_catalog_revision, refresh)
             };
-            if let Err(error) = commit {
+            Some(commit)
+        })
+        .await;
+    });
+}
+
+/// One consumed notification remains pending until a complete refresh succeeds.
+/// Notifications during a fill stay queued; during backoff they coalesce into
+/// the pending retry without defeating its deadline. No client is held asleep.
+async fn run_tool_catalog_refresh_worker<F, Fut>(
+    server_name: &str,
+    notifications: Receiver<()>,
+    mut refresh: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<Result<()>>>,
+{
+    let mut retry = None;
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if let Some(delay) = retry {
+            let deadline = tokio::time::sleep(delay);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    _ = &mut deadline => break,
+                    event = notifications.recv() => if event.is_err() { return; },
+                }
+            }
+        } else if notifications.recv().await.is_err() {
+            return;
+        }
+        if notifications.is_closed() {
+            return;
+        }
+        match refresh().await {
+            None => return,
+            Some(Ok(())) => {
+                retry = None;
+                backoff = Duration::from_secs(1);
+            }
+            Some(Err(error)) => {
                 warn!(
-                    "failed to refresh tools after list-changed notification for MCP server \
-                     '{server_name}': {error:#}"
+                    "failed to refresh tools after list-changed notification for MCP server '{server_name}': {error:#}"
                 );
+                retry = Some(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
-    });
+    }
 }
 
 pub(crate) fn commit_tool_catalog_refresh(
@@ -1489,17 +1532,17 @@ mod tests {
             params.total = total;
             send_progress(params).await;
 
-        let event = rx_event.recv().await.expect("forwarded progress event");
-        assert_eq!(event.id, "turn-1");
-        match event.msg {
-            EventMsg::McpToolCallProgress(event) => {
-                assert_eq!(event.call_id, "item-1");
-                assert_eq!(event.message, "working");
-                assert_eq!(event.progress, Some(progress));
-                assert_eq!(event.total, total);
+            let event = rx_event.recv().await.expect("forwarded progress event");
+            assert_eq!(event.id, "turn-1");
+            match event.msg {
+                EventMsg::McpToolCallProgress(event) => {
+                    assert_eq!(event.call_id, "item-1");
+                    assert_eq!(event.message, "working");
+                    assert_eq!(event.progress, Some(progress));
+                    assert_eq!(event.total, total);
+                }
+                other => panic!("expected MCP tool progress event, got {other:?}"),
             }
-            other => panic!("expected MCP tool progress event, got {other:?}"),
-        }
         }
         assert!(rx_event.try_recv().is_err());
     }
@@ -1524,6 +1567,114 @@ mod tests {
             /*server_instructions*/ None,
             listed_test_tool(name, None),
         )
+    }
+
+    #[tokio::test]
+    async fn notification_refresh_retries_after_error_without_another_event() {
+        let original = vec![test_tool_info("old")];
+        let mut changed = test_tool_info("new");
+        changed.tool.input_schema = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "type": "object", "properties": {"required_new_argument": {"type": "integer"}}
+            }))
+            .unwrap(),
+        );
+        let tools = Arc::new(ArcSwap::from_pointee(original));
+        let revision = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = async_channel::bounded(1);
+        let (attempt_tx, attempt_rx) = async_channel::unbounded();
+        let worker_tools = Arc::clone(&tools);
+        let worker_revision = Arc::clone(&revision);
+        let worker = tokio::spawn(async move {
+            let mut count = 0;
+            run_tool_catalog_refresh_worker("test", rx, || {
+                count += 1;
+                let count = count;
+                let tools = Arc::clone(&worker_tools);
+                let revision = Arc::clone(&worker_revision);
+                let attempt_tx = attempt_tx.clone();
+                let changed = changed.clone();
+                async move {
+                    let result = if count == 1 {
+                        Err(anyhow!("transient list failure"))
+                    } else {
+                        Ok(vec![changed])
+                    };
+                    let commit = commit_tool_catalog_refresh(&tools, &revision, result);
+                    attempt_tx.send((count, TokioInstant::now())).await.unwrap();
+                    Some(commit)
+                }
+            })
+            .await;
+        });
+        tx.send(()).await.unwrap();
+        let first = attempt_rx.recv().await.unwrap();
+        assert_eq!(first.0, 1);
+        assert_eq!(tools.load_full()[0].tool.name, "old");
+        assert_eq!(revision.load(Ordering::Acquire), 0);
+        let second = tokio::time::timeout(Duration::from_secs(5), attempt_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.0, 2);
+        assert!(
+            second.1.duration_since(first.1) >= Duration::from_secs(1),
+            "failure retry must not spin"
+        );
+        assert_eq!(tools.load_full()[0].tool.name, "new");
+        assert!(
+            tools.load_full()[0].tool.input_schema["properties"]
+                .get("required_new_argument")
+                .is_some()
+        );
+        assert_eq!(revision.load(Ordering::Acquire), 1);
+        let snapshot = tools.load_full();
+        tx.send(()).await.unwrap();
+        assert_eq!(attempt_rx.recv().await.unwrap().0, 3);
+        assert!(Arc::ptr_eq(&snapshot, &tools.load_full()));
+        assert_eq!(revision.load(Ordering::Acquire), 1);
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn notification_during_fill_is_retained_and_backoff_shutdown_is_prompt() {
+        let (tx, rx) = async_channel::bounded(1);
+        let (started_tx, started_rx) = async_channel::unbounded();
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let worker = tokio::spawn(async move {
+            run_tool_catalog_refresh_worker("test", rx, || {
+                let started = started_tx.clone();
+                let release = release_rx.clone();
+                async move {
+                    started.send(()).await.unwrap();
+                    let fail = release.recv().await.unwrap();
+                    Some(if fail {
+                        Err(anyhow!("persistent failure"))
+                    } else {
+                        Ok(())
+                    })
+                }
+            })
+            .await;
+        });
+        tx.send(()).await.unwrap();
+        started_rx.recv().await.unwrap();
+        tx.send(()).await.unwrap(); // arrives while the first fill is blocked
+        release_tx.send(false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release_tx.send(true).await.unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_millis(500), worker)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1808,8 +1959,8 @@ mod tests {
                 /*supports_openai_form_elicitation*/ false,
             );
             assert_eq!(params.capabilities.elicitation, Some(capability));
-            let wire = serde_json::to_value(&params.capabilities)
-                .expect("serialize client capabilities");
+            let wire =
+                serde_json::to_value(&params.capabilities).expect("serialize client capabilities");
             assert_eq!(wire["elicitation"], expected_wire);
         }
     }

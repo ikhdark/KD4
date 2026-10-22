@@ -26,8 +26,14 @@ use crate::protocol::InitializeResponse;
 #[test]
 fn parse_listen_url_accepts_supported_transports() {
     for (url, expected) in [
-        (DEFAULT_LISTEN_URL, ExecServerListenTransport::WebSocket("127.0.0.1:0".parse::<SocketAddr>().unwrap())),
-        ("ws://127.0.0.1:1234", ExecServerListenTransport::WebSocket("127.0.0.1:1234".parse::<SocketAddr>().unwrap())),
+        (
+            DEFAULT_LISTEN_URL,
+            ExecServerListenTransport::WebSocket("127.0.0.1:0".parse::<SocketAddr>().unwrap()),
+        ),
+        (
+            "ws://127.0.0.1:1234",
+            ExecServerListenTransport::WebSocket("127.0.0.1:1234".parse::<SocketAddr>().unwrap()),
+        ),
         ("stdio", ExecServerListenTransport::Stdio),
         ("stdio://", ExecServerListenTransport::Stdio),
     ] {
@@ -100,8 +106,14 @@ async fn stdio_listen_transport_serves_initialize() {
 #[test]
 fn parse_listen_url_rejects_invalid_and_unsupported_urls() {
     for (url, message) in [
-        ("ws://localhost:1234", "invalid websocket --listen URL `ws://localhost:1234`; expected `ws://IP:PORT`"),
-        ("http://127.0.0.1:1234", "unsupported --listen URL `http://127.0.0.1:1234`; expected `ws://IP:PORT` or `stdio`"),
+        (
+            "ws://localhost:1234",
+            "invalid websocket --listen URL `ws://localhost:1234`; expected `ws://IP:PORT`",
+        ),
+        (
+            "http://127.0.0.1:1234",
+            "unsupported --listen URL `http://127.0.0.1:1234`; expected `ws://IP:PORT` or `stdio`",
+        ),
     ] {
         assert_eq!(parse_listen_url(url).unwrap_err().to_string(), message);
     }
@@ -125,12 +137,34 @@ fn test_runtime_paths() -> ExecServerRuntimePaths {
 }
 
 #[tokio::test]
+async fn shutdown_stops_stdio_while_peer_keeps_input_open() {
+    let (_peer_writer, server_reader) = duplex(1024);
+    let (server_writer, _peer_reader) = duplex(1024);
+    let stop = crate::ExecServerShutdown::new();
+    let server = tokio::spawn(super::run_stdio_connection_with_io_and_shutdown(
+        server_reader,
+        server_writer,
+        test_runtime_paths(),
+        crate::ExecServerTelemetry::default(),
+        stop.clone(),
+    ));
+    tokio::task::yield_now().await;
+    stop.cancel();
+    timeout(Duration::from_secs(1), server)
+        .await
+        .expect("stop must not depend on peer EOF")
+        .expect("server task joins")
+        .expect("ordered service cleanup succeeds");
+}
+
+#[tokio::test]
 async fn plain_websocket_rejects_non_loopback_before_listening() {
     for address in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0"] {
         let error = super::run_websocket_listener(
             address.parse().unwrap(),
             test_runtime_paths(),
             crate::ExecServerTelemetry::default(),
+            crate::ExecServerShutdown::new(),
         )
         .await
         .expect_err("unauthenticated remote listener must fail closed");

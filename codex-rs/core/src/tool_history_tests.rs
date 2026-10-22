@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "tool_history_verification_tests.rs"]
+mod verification;
+
 async fn git_freshness_test_output(cwd: &Path, args: &[&str]) -> String {
     let output = tokio::process::Command::new("git")
         .args(args)
@@ -42,8 +45,14 @@ async fn git_read_evidence_invalidates_after_external_head_or_config_change() {
         let source = root.join("source.txt");
         std::fs::write(&source, "unchanged source").unwrap();
         let before = git_freshness_test_output(root, &read_args).await;
-        let arguments =
-            serde_json::json!({"cmd": format!("git {}", read_args.join(" ")), "shell": "bash"});
+        // Status is a certified read only with optional locks and fsmonitor off.
+        let arguments = serde_json::json!({
+            "cmd": format!(
+                "git --no-optional-locks -c core.fsmonitor=false {}",
+                read_args.join(" ")
+            ),
+            "shell": "bash"
+        });
         let (classification, _) = classify_workspace_tool_call_at_admission(
             "exec_command".into(),
             ToolPayload::Function {
@@ -138,7 +147,11 @@ async fn git_read_from_subdirectory_tracks_sibling_changes_but_exact_reads_do_no
     let sibling = root.join("sibling.txt");
     std::fs::write(&source, "unchanged source").unwrap();
     let before = git_freshness_test_output(&cwd, &["status", "--short"]).await;
-    let arguments = serde_json::json!({"cmd": "git status --short", "shell": "bash"});
+    // Status is a certified read only with optional locks and fsmonitor off.
+    let arguments = serde_json::json!({
+        "cmd": "git --no-optional-locks -c core.fsmonitor=false status --short",
+        "shell": "bash"
+    });
     let (classification, _) = classify_workspace_tool_call_at_admission(
         "exec_command".into(),
         ToolPayload::Function {
@@ -457,7 +470,7 @@ async fn root_only_sampling_requires_complete_watcher_coverage() {
         assert_eq!(notice["historical_authenticity"], "authenticated");
         assert_eq!(notice["valid_for_current_workspace"], false);
         if include_nested {
-            let current = notice["current_nested_results"].as_array().unwrap();
+            let current = notice["retained_nested_results"].as_array().unwrap();
             assert_eq!(current.len(), 1);
             assert_eq!(current[0]["call_id"], "watched-nested");
             let stale = notice["stale_nested_results"].as_array().unwrap();
@@ -827,6 +840,33 @@ fn verified10_compaction_preserves_recency_across_sidecars() {
 }
 
 #[test]
+#[cfg(windows)]
+fn read_status_matches_windows_path_case_aliases() {
+    let mut state = ToolHistoryState::default();
+    let mut entry = candidate(
+        "case-alias-read",
+        serde_json::json!({
+            "path":"C:\\Workspace\\Source.py", "environment_id":"local",
+            "canonical_uri":"file:///C:/Workspace/Source.py", "source_sha256":"same-source",
+            "canonical_bytes":4,
+            "results":[{"status":"ok", "complete":true, "text":"data",
+                "canonical_range":{"start":0,"end":4}}]
+        })
+        .to_string(),
+    );
+    entry.tool_identity = "read_file".into();
+    state.register(entry);
+    let report = state.read_status_page(
+        &[PathBuf::from("c:\\workspace\\SOURCE.PY")],
+        Some("local"),
+        &[],
+        &ReadStatusQuery::default(),
+    );
+    assert_eq!(report["paths"][0]["status"], "observed");
+    assert_eq!(report["paths"][0]["snapshots"][0]["obtained_bytes"], 4);
+}
+
+#[test]
 fn verified10_read_status_recovers_all_snapshots_and_disjoint_ranges() {
     let path = PathBuf::from("never-open-this-source");
     let mut state = ToolHistoryState::default();
@@ -980,7 +1020,11 @@ async fn dependency_notices_distinguish_changed_current_and_unverified_paths() {
         SourceDependencyV1::new(&a, false).path
     );
     assert_eq!(scope["dependencies"][0]["freshness"], "changed");
-    assert_eq!(scope["dependencies"][1]["freshness"], "current");
+    assert_eq!(scope["dependencies"][1]["freshness"], "unknown");
+    assert_eq!(
+        scope["dependencies"][1]["watcher_knowledge"],
+        "no_observed_change"
+    );
     assert_eq!(scope["dependencies"][0]["environment_id"], "local");
     let unknown = observation.dependency_notice(&output, Some(&identity), None);
     assert!(
@@ -998,6 +1042,120 @@ async fn dependency_notices_distinguish_changed_current_and_unverified_paths() {
         bounded.dependency_notice("{}", None, None)["omitted_dependencies"],
         4
     );
+}
+
+#[tokio::test]
+async fn pending_external_edit_cannot_project_retained_bytes_as_checked_current() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.txt");
+    std::fs::write(&source, "A").unwrap();
+    // Deliberately withhold all external notifications through the real journal owner.
+    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+    let identity = workspace_identity_at(root.path(), "before");
+    let observation = watched(
+        &cache,
+        root.path(),
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(identity.clone()),
+            &text_output("read", "A".into()),
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        )
+        .unwrap(),
+    )
+    .await;
+    std::fs::write(&source, "B").unwrap();
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "B");
+    let scope = observation.dependency_notice("A", Some(&identity), Some(&cache));
+    assert_eq!(scope["dependencies"][0]["freshness"], "unknown");
+    assert_eq!(
+        scope["dependencies"][0]["watcher_knowledge"],
+        "no_observed_change"
+    );
+    assert_eq!(observation.revision.as_ref(), Some(&identity));
+}
+
+#[tokio::test]
+async fn audit107_captured_changes_override_quiet_watches_in_history() {
+    for recursive in [false, true] {
+        for change in ["unchanged", "source", "sibling", "outside", "delete"] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("src");
+            std::fs::create_dir(&directory).unwrap();
+            let source = directory.join("source.txt");
+            std::fs::write(&source, "A").unwrap();
+            // No event delivery: the independently captured content must win.
+            let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+            let mut captured = workspace_identity_at(root.path(), "captured");
+            captured.path_fingerprints =
+                Some(BTreeMap::from([("src/source.txt".into(), sha256(b"A"))]));
+            let dependency = if recursive { &directory } else { &source };
+            let output = text_output("read", "A".into());
+            let observation = watched(
+                &cache,
+                root.path(),
+                WorkspaceEvidenceObservation::from_response_item(
+                    Some(captured.clone()),
+                    &output,
+                    BTreeSet::from([SourceDependencyV1::new(dependency, recursive)]),
+                )
+                .unwrap(),
+            )
+            .await;
+            match change {
+                "source" => std::fs::write(&source, "B").unwrap(),
+                "sibling" => std::fs::write(directory.join("sibling.txt"), "B").unwrap(),
+                "outside" => std::fs::write(root.path().join("notes.txt"), "B").unwrap(),
+                "delete" => std::fs::remove_file(&source).unwrap(),
+                _ => {}
+            }
+            let mut current = captured.clone();
+            current.worktree_identity = Some(format!("after-{change}"));
+            current.path_fingerprints = Some(
+                ["src/source.txt", "src/sibling.txt", "notes.txt"]
+                    .into_iter()
+                    .filter_map(|path| {
+                        std::fs::read(root.path().join(path))
+                            .ok()
+                            .map(|bytes| (path.to_string(), sha256(&bytes)))
+                    })
+                    .collect(),
+            );
+            let relevant =
+                matches!(change, "source" | "delete") || recursive && change == "sibling";
+            assert_eq!(
+                observation.is_current(Some(&current), Some(&cache)),
+                !relevant,
+                "recursive={recursive}, change={change}"
+            );
+            let scope = observation.dependency_notice("A", Some(&current), Some(&cache));
+            assert_eq!(
+                scope["dependencies"][0]["watcher_knowledge"],
+                "no_observed_change"
+            );
+            assert_eq!(
+                scope["dependencies"][0]["freshness"],
+                if relevant { "changed" } else { "unknown" }
+            );
+
+            let mut state = ToolHistoryState::default();
+            state.register_workspace_evidence(observation);
+            let items: Arc<[ResponseItem]> = Arc::from([function_call("read"), output]);
+            let notices = freshness_notices(&state, &items, Some(&current), &cache);
+            assert_eq!(notices.len(), usize::from(relevant));
+            if relevant {
+                assert_eq!(notices[0]["workspace_evidence_freshness"], "changed");
+                assert_eq!(
+                    notices[0]["source_scope"]["dependencies"][0]["freshness"],
+                    "changed"
+                );
+                assert_eq!(notices[0]["historical_authenticity"], "authenticated");
+            }
+            assert_eq!(
+                state.workspace_evidence["read"].revision.as_ref(),
+                Some(&captured)
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1250,7 +1408,8 @@ async fn stale_validation_pin_survives_compaction_and_restart_without_rerun() {
 
 #[test]
 fn stale_carrier_observation_marks_dependency_free_exec_pin_not_current() {
-    let source = PathBuf::from("/repo/input.rs");
+    // Only a host-absolute path has a source locator that can stay current.
+    let source = codex_utils_absolute_path::test_support::test_path_buf("/repo/input.rs");
     let text = bounded_output();
     let output = text_output("carrier", text.clone());
     let mut record = candidate("carrier", text);
@@ -1368,6 +1527,60 @@ fn receipt_digest_preserves_decisive_diagnostic_at_any_position() {
             .unwrap()
             .contains("decisive selection error")
     );
+}
+
+#[test]
+fn projected_direct_reads_union_only_matching_source_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.rs");
+    let uri = format!(
+        "file:///{}",
+        path.to_string_lossy()
+            .replace('\\', "/")
+            .trim_start_matches('/')
+    );
+    for projected in [false, true] {
+        let mut state = ToolHistoryState::default();
+        for (call, environment, hash, start, end) in [
+            ("one", "local", "same", 0, 5),
+            ("two", "local", "same", 5, 10),
+            ("changed", "local", "different", 0, 5),
+            ("remote", "remote", "same", 0, 5),
+        ] {
+            let raw = serde_json::json!({"path":path,"canonical_uri":uri,
+                "environment_id":environment,"source_sha256":hash,"canonical_bytes":10,
+                "complete":true,"results":[{"status":"ok","complete":true,
+                    "canonical_range":{"start":start,"end":end},"text":"x".repeat(end-start)}]});
+            let value = if projected {
+                codex_code_mode::model_visible_tool_result(
+                    &codex_protocol::ToolName::plain("read_file"),
+                    &raw,
+                )
+                .unwrap()
+            } else {
+                raw
+            };
+            let mut entry = candidate(call, value.to_string());
+            entry.tool_identity = "read_file".into();
+            state.register(entry);
+        }
+        let report = state.read_status(std::slice::from_ref(&path), None, &[]);
+        let snapshots = report["paths"][0]["snapshots"].as_array().unwrap();
+        assert_eq!(snapshots.len(), 3);
+        let combined = snapshots
+            .iter()
+            .find(|row| row["environment_id"] == "local" && row["source_sha256"] == "same")
+            .unwrap();
+        assert_eq!(combined["obtained_bytes"], 10);
+        assert_eq!(combined["coverage"], "full");
+        assert_eq!(
+            snapshots
+                .iter()
+                .filter(|row| row["coverage"] == "partial")
+                .count(),
+            2
+        );
+    }
 }
 
 #[test]
@@ -2081,10 +2294,12 @@ async fn proactive_retirement_pins_are_recoverable_and_do_not_repeat() {
             home.path(),
             "thread",
             recovered_id,
-            vec![crate::tools::command_output_artifact::ToolOutputSelector::Bytes {
-                start: 0,
-                end: bytes,
-            }],
+            vec![
+                crate::tools::command_output_artifact::ToolOutputSelector::Bytes {
+                    start: 0,
+                    end: bytes,
+                },
+            ],
         )
         .await
         .unwrap();
@@ -2319,7 +2534,19 @@ async fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating
         Some(&captured),
         &cache,
     );
-    assert_eq!(initial.items, canonical);
+    // Watcher-backed evidence is qualified once, after the unchanged history,
+    // even when no change was delivered.
+    assert!(initial.items.starts_with(&canonical));
+    assert_eq!(initial.items.len(), canonical.len() + 1);
+    let ResponseItem::Message { role, content, .. } = initial.items.last().unwrap() else {
+        panic!("verification qualifier")
+    };
+    assert_eq!(role, "developer");
+    assert!(
+        serde_json::to_string(content)
+            .unwrap()
+            .contains("<workspace_source_verification>")
+    );
     let anchor = SamplingProjectionAnchor {
         prepared_items: Arc::clone(&canonical),
         projection: initial.clone(),
@@ -2401,7 +2628,8 @@ async fn sampling_freshness_appends_invalidations_without_rewriting_or_repeating
         &cache,
     );
     assert!(without_budget.items.starts_with(&canonical));
-    assert_eq!(without_budget.items.len(), canonical.len() + 1);
+    // One verification qualifier plus one invalidation notice.
+    assert_eq!(without_budget.items.len(), canonical.len() + 2);
 }
 
 #[test]
@@ -2493,8 +2721,7 @@ fn child_message_continuation_preserves_the_previous_freshness_layout() {
     // A user turn whose notices are a small share of the prompt keeps the
     // layout the provider cached and appends the request after it.
     let earlier_work = message("assistant", &"earlier analysis ".repeat(2_000));
-    let padded: Arc<[ResponseItem]> =
-        Arc::from([earlier_work, function_call("read-old"), output]);
+    let padded: Arc<[ResponseItem]> = Arc::from([earlier_work, function_call("read-old"), output]);
     let padded_previous =
         state.project_sampling_with_workspace_cache(Arc::clone(&padded), Some(&changed), &cache);
     assert_eq!(
@@ -2610,14 +2837,14 @@ fn invalidation_reason_changes_do_not_repeat_the_same_evidence_but_nested_change
         "call_id": "read",
         "stale_workspace_evidence": true, "valid_for_current_workspace": false,
         "reason": "repository changed", "reason_code": "workspace_identity_changed",
-        "current_nested_results": [{"call_id": "still-current"}],
+        "retained_nested_results": [{"call_id": "still-current"}],
     });
     let mut next = previous.clone();
     next["reason"] = "source dependency changed".into();
     next["reason_code"] = "source_dependencies_invalidated".into();
     assert!(same_workspace_invalidation(&previous, &next));
     assert!(same_workspace_invalidation(&next, &previous));
-    next["current_nested_results"] = serde_json::json!([]);
+    next["retained_nested_results"] = serde_json::json!([]);
     assert!(!same_workspace_invalidation(&previous, &next));
     next = previous.clone();
     next["call_id"] = "other".into();
@@ -2788,15 +3015,44 @@ fn source_dependency_normalization_preserves_case_on_case_sensitive_filesystems(
 }
 
 #[test]
-fn source_dependency_normalization_uses_the_target_platform_case_policy() {
+fn source_dependency_normalization_never_folds_an_operational_locator() {
     let upper = normalized_source_path(Path::new("src/Owner.rs"));
     let lower = normalized_source_path(Path::new("src/owner.rs"));
 
-    if cfg!(windows) {
-        assert_eq!(upper, lower);
-    } else {
-        assert_ne!(upper, lower);
-    }
+    assert_ne!(upper, lower);
+}
+
+#[test]
+fn source_dependency_persists_the_exact_native_locator() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("UPPER.rs");
+    std::fs::write(&source, "original").unwrap();
+    let dependency = SourceDependencyV1::new(&source, false);
+    let restored: SourceDependencyV1 =
+        serde_json::from_str(&serde_json::to_string(&dependency).unwrap()).unwrap();
+    let uri =
+        codex_utils_path_uri::PathUri::parse(restored.locator_uri.as_deref().unwrap()).unwrap();
+    assert_eq!(uri.to_abs_path().unwrap().as_path(), source);
+    assert_eq!(
+        std::fs::read(uri.to_abs_path().unwrap()).unwrap(),
+        b"original"
+    );
+    assert!(restored.path.ends_with("/UPPER.rs"));
+    let legacy: SourceDependencyV1 = serde_json::from_value(
+        serde_json::json!({"path":dependency.path.to_lowercase(),"recursive":false}),
+    )
+    .unwrap();
+    assert!(legacy.locator_uri.is_none());
+    assert_ne!(restored, legacy);
+    let output = text_output("legacy-locator", "historical source bytes".to_string());
+    let observation = WorkspaceEvidenceObservation::from_response_item_with_freshness(
+        Some(workspace_identity("legacy")),
+        &output,
+        BTreeSet::from([legacy]),
+        true,
+    )
+    .unwrap();
+    assert!(!observation.source_dependencies_current);
 }
 
 #[test]
@@ -2942,7 +3198,8 @@ fn workspace_identity(label: &str) -> WorkspaceEvidenceIdentity {
 }
 
 /// `label`'s digests in the repository at `root`. A live cache compares
-/// repository roots and dependency watches, never the digests.
+/// repository roots and dependency watches; capture-local path fingerprints
+/// can additionally prove changes when supplied by a fixture.
 fn workspace_identity_at(root: &Path, label: &str) -> WorkspaceEvidenceIdentity {
     WorkspaceEvidenceIdentity {
         repository_root: Some(root.to_string_lossy().into_owned()),
@@ -3112,7 +3369,11 @@ fn unwatched_evidence_notice_reports_how_to_treat_it() {
         WorkspaceEvidenceObservation::from_response_item(
             Some(captured.clone()),
             &output,
-            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured"), true)]),
+            // Host-absolute, so the dependency has a locator that can stay current.
+            BTreeSet::from([SourceDependencyV1::new(
+                &codex_utils_absolute_path::test_support::test_path_buf("/repo-captured"),
+                true,
+            )]),
         )
         .expect("text evidence observation"),
     );
@@ -3167,7 +3428,11 @@ fn workspace_projection_memoizes_verdicts_without_crossing_mutations_or_snapshot
         WorkspaceEvidenceObservation::from_response_item(
             Some(captured.clone()),
             &output,
-            BTreeSet::from([SourceDependencyV1::new(Path::new("/repo-captured"), true)]),
+            // Host-absolute, so the dependency has a locator that can stay current.
+            BTreeSet::from([SourceDependencyV1::new(
+                &codex_utils_absolute_path::test_support::test_path_buf("/repo-captured"),
+                true,
+            )]),
         )
         .unwrap(),
     );
@@ -3278,12 +3543,16 @@ fn sampling_freshness_notice_never_copies_tool_output() {
         let canonical: Arc<[ResponseItem]> =
             Arc::from([named_function_call("parent", name), output.clone()]);
         let mut state = ToolHistoryState::default();
+        // Host-absolute dependencies have locators, so only the missing
+        // watches (not unlocatable paths) make these results unverified.
         state.register_workspace_evidence(
             WorkspaceEvidenceObservation::from_response_item(
                 Some(before.clone()),
                 &output,
                 BTreeSet::from([SourceDependencyV1::new(
-                    Path::new("/repo-before/source.rs"),
+                    &codex_utils_absolute_path::test_support::test_path_buf(
+                        "/repo-before/source.rs",
+                    ),
                     false,
                 )]),
             )
@@ -3294,7 +3563,9 @@ fn sampling_freshness_notice_never_copies_tool_output() {
                 Some(after.clone()),
                 &text_output("nested", nested_text.into()),
                 BTreeSet::from([SourceDependencyV1::new(
-                    Path::new("/repo-after/current.rs"),
+                    &codex_utils_absolute_path::test_support::test_path_buf(
+                        "/repo-after/current.rs",
+                    ),
                     false,
                 )]),
             )
@@ -3343,7 +3614,16 @@ fn sampling_freshness_notice_never_copies_tool_output() {
             assert_eq!(notices.len(), 1);
             let notice = &notices[0];
             assert_eq!(notice["valid_for_current_workspace"], false);
-            assert_eq!(notice["historical_authenticity"], "authenticated");
+            // Recovered bytes authenticate only through their own producer-time
+            // digest; a successful plain-text recovery carries none.
+            assert_eq!(
+                notice["historical_authenticity"],
+                if name == "read_tool_output" {
+                    "unverified"
+                } else {
+                    "authenticated"
+                }
+            );
             // Matching digests without a dependency watch are unknown, not current.
             assert_eq!(notice["stale_nested_results"][0]["call_id"], "nested");
             assert_eq!(
@@ -3483,25 +3763,55 @@ async fn non_git_watched_evidence_keeps_mutation_and_watcher_guards() {
     let path = root.path().join("source.txt");
     std::fs::write(&path, "unchanged").unwrap();
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    assert!(cache.workspace_evidence_identity(root.path()).await.is_none());
+    assert!(
+        cache
+            .workspace_evidence_identity(root.path())
+            .await
+            .is_none()
+    );
     let output = text_output("non-git-read", "unchanged".into());
     let items: Arc<[ResponseItem]> = Arc::from([function_call("non-git-read"), output.clone()]);
-    let observation = watched(&cache, root.path(),
-        WorkspaceEvidenceObservation::from_response_item(None, &output,
-            BTreeSet::from([SourceDependencyV1::new(&path, false)])).unwrap()
-            .with_source_scope_complete(true),
-    ).await;
-    assert_eq!(observation.dependency_notice("unchanged", None, Some(&cache))["dependencies"][0]["freshness"], "current");
+    let observation = watched(
+        &cache,
+        root.path(),
+        WorkspaceEvidenceObservation::from_response_item(
+            None,
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&path, false)]),
+        )
+        .unwrap()
+        .with_source_scope_complete(true),
+    )
+    .await;
+    assert_eq!(
+        observation.dependency_notice("unchanged", None, Some(&cache))["dependencies"][0]["freshness"],
+        "unknown"
+    );
     let mut state = ToolHistoryState::default();
     state.register_workspace_evidence(observation);
     assert!(freshness_notices(&state, &items, None, &cache).is_empty());
-    cache.note_host_workspace_mutation_paths(root.path(), &["unrelated.txt".into()]).await;
+    cache
+        .note_host_workspace_mutation_paths(root.path(), &["unrelated.txt".into()])
+        .await;
     assert!(freshness_notices(&state, &items, None, &cache).is_empty());
-    let restored: ToolHistoryState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    let restored: ToolHistoryState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
     assert!(freshness_notices(&restored, &items, None, &cache).is_empty());
     let restarted_cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    assert_eq!(freshness_notices(&restored, &items, None, &restarted_cache).len(), 1);
-    assert_eq!(freshness_notices(&state, &items, Some(&workspace_identity_at(root.path(), "now-git")), &cache).len(), 1);
+    assert_eq!(
+        freshness_notices(&restored, &items, None, &restarted_cache).len(),
+        1
+    );
+    assert_eq!(
+        freshness_notices(
+            &state,
+            &items,
+            Some(&workspace_identity_at(root.path(), "now-git")),
+            &cache
+        )
+        .len(),
+        1
+    );
     let mut mutated = state.clone();
     assert!(mutated.invalidate_source_dependencies(Some(&BTreeSet::from([path])), None));
     assert_eq!(freshness_notices(&mutated, &items, None, &cache).len(), 1);
@@ -3593,7 +3903,13 @@ fn recovered_workspace_evidence_inherits_origin_revision() {
             call_id: recovery_call_id.to_string(),
             internal_chat_message_metadata_passthrough: None,
         },
-        text_output(recovery_call_id, "old file contents".to_string()),
+        text_output(
+            recovery_call_id,
+            serde_json::json!({
+                "historical_authenticity":"authenticated", "results":[{"text":"old file contents"}]
+            })
+            .to_string(),
+        ),
     ]);
 
     let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
@@ -3662,43 +3978,82 @@ async fn workspace_evidence_invalidates_only_overlapping_source_dependencies() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn workspace_evidence_invalidation_matches_case_variant_paths_on_windows() {
+    // Dependencies persist the exact locator, but a case-variant Windows path
+    // names the same source and must still invalidate the observation.
+    let call_id = "case-variant-read";
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("Owner.rs");
+    let output = text_output(call_id, "owner source".to_string());
+    let mut state = ToolHistoryState::default();
+    state.register_workspace_evidence(
+        WorkspaceEvidenceObservation::from_response_item(
+            Some(workspace_identity_at(root.path(), "captured")),
+            &output,
+            BTreeSet::from([SourceDependencyV1::new(&source, false)]),
+        )
+        .expect("workspace observation"),
+    );
+    assert!(state.workspace_evidence[call_id].source_dependencies_current);
+
+    let variant = PathBuf::from(source.to_string_lossy().to_ascii_uppercase());
+    assert!(state.invalidate_source_dependencies(Some(&BTreeSet::from([variant])), None));
+    assert!(!state.workspace_evidence[call_id].source_dependencies_current);
+}
+
 #[test]
 fn recovered_bytes_survive_missing_producer_provenance() {
-    let output = "exact historical source recovered successfully";
-    let canonical: Arc<[ResponseItem]> = Arc::from([
-        named_function_call_with_arguments(
-            "recovery",
-            "read_tool_output",
-            serde_json::json!({"artifact_id":"unknown-producer"}),
-        ),
-        text_output("recovery", output.to_string()),
-    ]);
-    let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
-    // The recovered bytes stay in their tool message; the notice only
-    // qualifies them.
-    let notices = freshness_notices(
-        &ToolHistoryState::default(),
-        &canonical,
-        Some(&workspace_identity("current")),
-        &cache,
-    );
-    assert_eq!(notices.len(), 1);
-    let notice = &notices[0];
-    assert_eq!(notice["reason_code"], "missing_observation");
-    assert_eq!(notice["historical_authenticity"], "authenticated");
-    assert!(
-        notice["reason"]
-            .as_str()
-            .unwrap()
-            .contains("recovered historical bytes remain authenticated")
-    );
-    assert_eq!(notice["valid_for_current_workspace"], false);
+    for authenticity in [Some("authenticated"), Some("unverified"), None] {
+        let mut output = serde_json::json!({"results":[{"text":"exact historical source recovered successfully"}]});
+        if let Some(authenticity) = authenticity {
+            output["historical_authenticity"] = authenticity.into();
+        }
+        let canonical: Arc<[ResponseItem]> = Arc::from([
+            named_function_call_with_arguments(
+                "recovery",
+                "read_tool_output",
+                serde_json::json!({"artifact_id":"unknown-producer"}),
+            ),
+            text_output("recovery", output.to_string()),
+        ]);
+        let cache = GitWorkspaceCache::with_noop_watcher_for_tests();
+        // The recovered bytes stay in their tool message; the notice only
+        // qualifies them. Missing or legacy integrity never authenticates itself.
+        let notices = freshness_notices(
+            &ToolHistoryState::default(),
+            &canonical,
+            Some(&workspace_identity("current")),
+            &cache,
+        );
+        assert_eq!(notices.len(), 1);
+        let notice = &notices[0];
+        assert_eq!(notice["reason_code"], "missing_observation");
+        assert_eq!(
+            notice["historical_authenticity"],
+            if authenticity == Some("authenticated") {
+                "authenticated"
+            } else {
+                "unverified"
+            }
+        );
+        assert_eq!(
+            notice["reason"]
+                .as_str()
+                .unwrap()
+                .contains("recovered historical bytes remain authenticated"),
+            authenticity == Some("authenticated")
+        );
+        assert_eq!(notice["valid_for_current_workspace"], false);
+    }
 }
 
 #[test]
 fn workspace_error_outputs_preserve_diagnostics_with_historical_applicability() {
     let call_id = "failed-workspace-read";
-    let dependency = PathBuf::from("/repo/src/foo.rs");
+    // Host-absolute, so the dependency has a locator that can stay current.
+    let dependency = codex_utils_absolute_path::test_support::test_path_buf("/repo/src/foo.rs");
     let mut payload = FunctionCallOutputPayload::from_text("permission denied".to_string());
     payload.success = Some(false);
     let output = ResponseItem::FunctionCallOutput {
@@ -3821,6 +4176,10 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
         .await
         .expect("initial search runs");
     ledger.record_exit(&attempt_key, 1).await;
+    // An exit status alone cannot prove a miss; the executor verifies it.
+    ledger
+        .record_verified_search_result(&attempt_key, true)
+        .await;
     ledger
         .begin_attempt_with_freshness(&attempt_key, false, false)
         .await
@@ -3864,7 +4223,8 @@ async fn intersecting_workspace_transition_marks_stale_and_permits_suppressed_re
 fn generation_batch_invalidation_excludes_its_own_completed_calls() {
     let current_call_id = "current-generation-call";
     let older_call_id = "older-call";
-    let dependency = PathBuf::from("/repo/src/foo.rs");
+    // Host-absolute, so the dependency has a locator that can stay current.
+    let dependency = codex_utils_absolute_path::test_support::test_path_buf("/repo/src/foo.rs");
     let captured = workspace_identity("captured");
     let current_output = text_output(current_call_id, "current result".to_string());
     let older_output = text_output(older_call_id, "older result".to_string());
@@ -4081,10 +4441,11 @@ async fn nested_workspace_evidence_retains_only_current_results_after_resume() {
     let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
     assert_eq!(notices.len(), 1);
     let notice = &notices[0];
-    let current = notice["current_nested_results"].as_array().unwrap();
+    let current = notice["retained_nested_results"].as_array().unwrap();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0]["call_id"], "b");
-    assert_eq!(current[0]["workspace_evidence_freshness"], "current");
+    assert_eq!(current[0]["workspace_evidence_freshness"], "unknown");
+    assert_eq!(current[0]["watcher_knowledge"], "no_observed_change");
     assert_eq!(
         current[0]["source_scope"]["dependencies"][0]["path"],
         SourceDependencyV1::new(&path_b, false).path
@@ -4103,14 +4464,14 @@ async fn nested_workspace_evidence_retains_only_current_results_after_resume() {
     let mut mutated = state.clone();
     mutated.invalidate_source_dependencies(Some(&BTreeSet::from([path_b.clone()])), Some(&after));
     let notices = freshness_notices(&mutated, &canonical, Some(&after), &cache);
-    assert!(notices[0].get("current_nested_results").is_none());
+    assert!(notices[0].get("retained_nested_results").is_none());
     let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
-    assert_eq!(notices[0]["current_nested_results"][0]["call_id"], "b");
+    assert_eq!(notices[0]["retained_nested_results"][0]["call_id"], "b");
 
     // A mutation the journal cannot attribute leaves no proof that B stayed unchanged.
     cache.note_host_workspace_mutation();
     let notices = freshness_notices(&state, &canonical, Some(&after), &cache);
-    assert!(notices[0].get("current_nested_results").is_none());
+    assert!(notices[0].get("retained_nested_results").is_none());
     state.retain_for_history(&[]);
     assert!(state.is_persisted_empty());
 }
@@ -4325,6 +4686,290 @@ fn rg_dependencies_reuse_search_scope_parsing_for_options_and_compound_commands(
     );
 }
 
+#[test]
+fn grep_explicit_patterns_keep_all_source_and_pattern_file_inputs() {
+    let root = tempfile::tempdir().unwrap();
+    let cwd = root.path();
+    let external = tempfile::tempdir().unwrap();
+    let source = external
+        .path()
+        .join("external.txt")
+        .to_string_lossy()
+        .into_owned();
+    let patterns = external
+        .path()
+        .join("patterns.txt")
+        .to_string_lossy()
+        .into_owned();
+    let classify = |args: Vec<String>| {
+        classify_workspace_tool_call(
+            "exec_command",
+            &ToolPayload::Function {
+                arguments: serde_json::json!({"program":"grep", "args":args}).to_string(),
+            },
+            cwd,
+        )
+    };
+    let exact = |paths: Vec<String>| {
+        paths
+            .into_iter()
+            .map(|path| SourceDependencyV1::new(&cwd.join(path), false))
+            .collect::<BTreeSet<_>>()
+    };
+    for (args, inputs) in [
+        (
+            vec!["-e".into(), "TOKEN".into(), source.clone()],
+            vec![source.clone()],
+        ),
+        (
+            vec!["-e".into(), "TOKEN".into(), "a.txt".into(), "b.txt".into()],
+            vec!["a.txt".into(), "b.txt".into()],
+        ),
+        (vec!["-eTOKEN".into(), "a.txt".into()], vec!["a.txt".into()]),
+        (
+            vec!["--regexp=TOKEN".into(), "a.txt".into()],
+            vec!["a.txt".into()],
+        ),
+        (
+            vec!["a.txt".into(), "-eTOKEN".into(), "-eOTHER".into()],
+            vec!["a.txt".into()],
+        ),
+        (
+            vec!["-f".into(), patterns.clone(), "a.txt".into()],
+            vec![patterns.clone(), "a.txt".into()],
+        ),
+        (
+            vec![format!("-f{patterns}"), "a.txt".into()],
+            vec![patterns.clone(), "a.txt".into()],
+        ),
+        (
+            vec![format!("--file={patterns}"), "file with spaces.txt".into()],
+            vec![patterns, "file with spaces.txt".into()],
+        ),
+        (
+            vec!["--".into(), "-TOKEN".into(), "-file.txt".into()],
+            vec!["-file.txt".into()],
+        ),
+        (vec!["TOKEN".into(), source.clone()], vec![source]),
+    ] {
+        let result = classify(args.clone());
+        assert!(result.source_scope_complete, "{args:?}");
+        assert_eq!(result.source_dependencies, exact(inputs), "{args:?}");
+    }
+    for args in [
+        vec!["TOKEN", "-"],
+        vec!["-f", "-", "a.txt"],
+        vec!["--unknown-input", "other", "TOKEN", "a.txt"],
+        vec!["TOKEN"],
+    ] {
+        assert!(!classify(args.into_iter().map(str::to_string).collect()).source_scope_complete);
+    }
+}
+#[test]
+fn legacy_dependency_parser_scope_is_not_upgraded_on_reload() {
+    let output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "old-grep".into(),
+        output: codex_protocol::models::FunctionCallOutputPayload::from_text("old evidence".into()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let observation = WorkspaceEvidenceObservation::from_response_item(
+        None,
+        &output,
+        BTreeSet::from([SourceDependencyV1::new(Path::new("source.txt"), false)]),
+    )
+    .unwrap();
+    assert!(observation.has_complete_source_scope());
+    let mut value = serde_json::to_value(&observation).unwrap();
+    value["source_scope_version"] = 1.into();
+    let legacy: WorkspaceEvidenceObservation = serde_json::from_value(value.clone()).unwrap();
+    assert!(
+        !legacy.has_complete_source_scope(),
+        "old search closure was not proved"
+    );
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("source_scope_version");
+    let restored: WorkspaceEvidenceObservation = serde_json::from_value(value).unwrap();
+    assert!(!restored.has_complete_source_scope());
+    assert_eq!(restored.output_sha256, observation.output_sha256);
+}
+
+#[test]
+fn rg_history_keeps_known_paths_without_claiming_external_input_closure() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("input.txt"), "needle").unwrap();
+    std::fs::write(root.path().join("patterns.txt"), "needle").unwrap();
+    for (args, complete) in [
+        (vec!["needle", "input.txt"], false),
+        (
+            vec![
+                "--no-ignore-global",
+                "--no-ignore-parent",
+                "needle",
+                "input.txt",
+            ],
+            false,
+        ),
+        (vec!["--no-config", "needle", "input.txt"], false),
+        (
+            vec![
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
+                "--pre",
+                "helper",
+                "needle",
+                "input.txt",
+            ],
+            false,
+        ),
+        (
+            vec![
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
+                "-L",
+                "needle",
+                "input.txt",
+            ],
+            false,
+        ),
+        (
+            vec![
+                "--no-ignore-global",
+                "--no-ignore-parent",
+                "needle",
+                "--",
+                "--no-config",
+                "input.txt",
+            ],
+            false,
+        ),
+        (
+            vec![
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
+                "-f",
+                "patterns.txt",
+                "input.txt",
+            ],
+            true,
+        ),
+    ] {
+        let classification = classify_workspace_tool_call(
+            "exec_command",
+            &ToolPayload::Function {
+                arguments: serde_json::json!({"program": "rg", "args": args}).to_string(),
+            },
+            root.path(),
+        );
+        assert_eq!(classification.source_scope_complete, complete, "{args:?}");
+        assert!(
+            classification
+                .source_dependencies
+                .contains(&SourceDependencyV1::new(
+                    &root.path().join("input.txt"),
+                    false
+                )),
+            "{args:?}"
+        );
+        if complete {
+            assert!(
+                classification
+                    .source_dependencies
+                    .contains(&SourceDependencyV1::new(
+                        &root.path().join("patterns.txt"),
+                        false
+                    ))
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn resume_excludes_expired_and_mismatched_references_without_blocking_healthy_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    let (healthy, _) = stored_candidate(home.path(), "thread", "healthy", bounded_output()).await;
+    let healthy_id = healthy.artifact_id.clone();
+    let (mut mismatched, _) =
+        stored_candidate(home.path(), "thread", "mismatched", bounded_output()).await;
+    let mismatched_path = home
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{}.log", mismatched.artifact_id));
+    mismatched.artifact_sha256 = "0".repeat(64);
+    let mut expired = candidate("expired", bounded_output());
+    expired.artifact_id = uuid::Uuid::now_v7().to_string();
+    let mut state = ToolHistoryState::default();
+    state.register(healthy);
+    state.register(mismatched);
+    state.register(expired);
+    persist_tool_history_state(home.path(), "thread", &state)
+        .await
+        .unwrap();
+    let ledger = std::fs::read(ledger_path(home.path(), "thread")).unwrap();
+
+    let prepared = prepare_tool_history_state(home.path(), "thread", state.clone())
+        .await
+        .expect("definitive rejections must not block healthy evidence");
+    assert_eq!(
+        prepared.artifact_references(),
+        BTreeMap::from([(
+            healthy_id.clone(),
+            state.artifact_references()[&healthy_id].clone()
+        )])
+    );
+    // Preparation neither commits the contracted ledger nor prunes old pins.
+    assert_eq!(
+        std::fs::read(ledger_path(home.path(), "thread")).unwrap(),
+        ledger
+    );
+    assert!(
+        mismatched_path
+            .with_extension("active-tool-history")
+            .exists()
+    );
+    assert!(mismatched_path.exists());
+}
+
+#[tokio::test]
+async fn temporarily_locked_resume_artifact_keeps_provenance_and_pin_for_retry() {
+    let home = tempfile::tempdir().unwrap();
+    let (candidate, _) = stored_candidate(home.path(), "thread", "call", bounded_output()).await;
+    let path = home
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{}.log", candidate.artifact_id));
+    let mut state = ToolHistoryState::default();
+    state.register(candidate);
+    persist_tool_history_state(home.path(), "thread", &state)
+        .await
+        .unwrap();
+    let ledger = std::fs::read(ledger_path(home.path(), "thread")).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.lock().unwrap();
+    assert!(
+        prepare_tool_history_state(home.path(), "thread", state.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(home.path(), "thread")).unwrap(),
+        ledger
+    );
+    assert!(path.with_extension("active-tool-history").exists());
+    drop(file);
+    let recovered = prepare_tool_history_state(home.path(), "thread", state.clone())
+        .await
+        .unwrap();
+    assert_eq!(recovered.artifact_references(), state.artifact_references());
+}
 /// Regression for the recorded sessions where `Get-Content x | Select-Object
 /// ...` batches carried no dependencies, so every workspace change marked them
 /// stale and the model re-read unchanged files dozens of times.
@@ -4398,10 +5043,11 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
     let checkout = SourceDependencyV1::new(cwd, true);
     let metadata = SourceDependencyV1::new(&cwd.join(".git"), true);
     let src_tree = SourceDependencyV1::new(&cwd.join("src"), true);
+    // Git reads are scoped only in the helper-suppressed spellings approval admits.
     let mut cases = vec![
         (
             "bash",
-            "git status --short; cat src/work.rs",
+            "git --no-optional-locks -c core.fsmonitor=false status --short; cat src/work.rs",
             BTreeSet::from([checkout.clone(), metadata.clone(), work.clone()]),
         ),
         (
@@ -4437,7 +5083,7 @@ fn listings_git_reads_and_path_cmdlets_scope_without_making_batches_opaque() {
         ));
         cases.push((
             "powershell",
-            "git diff --stat; Get-Content src/work.rs",
+            "git -c core.fsmonitor=false diff --stat --no-ext-diff --no-textconv; Get-Content src/work.rs",
             BTreeSet::from([checkout, metadata, work]),
         ));
     }
@@ -5369,6 +6015,42 @@ async fn stored_candidate(
     candidate.artifact_bytes = canonical.exact_bytes;
     candidate.artifact_sha256 = canonical.sha256;
     (candidate, canonical_bytes)
+}
+
+#[tokio::test]
+async fn durable_audit_10_failed_verification_retains_the_committed_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    let (candidate, bytes) =
+        stored_candidate(home.path(), "thread", "call", bounded_output()).await;
+    let path = home
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{}.log", candidate.artifact_id));
+    let mut state = ToolHistoryState::default();
+    state.register(candidate);
+    persist_tool_history_state(home.path(), "thread", &state)
+        .await
+        .unwrap();
+    let ledger = std::fs::read(ledger_path(home.path(), "thread")).unwrap();
+    std::fs::write(&path, b"unreadable evidence").unwrap();
+    assert!(
+        prepare_tool_history_state(home.path(), "thread", state.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(home.path(), "thread")).unwrap(),
+        ledger
+    );
+    assert!(path.with_extension("active-tool-history").exists());
+    std::fs::write(path, bytes).unwrap();
+    assert_eq!(
+        prepare_tool_history_state(home.path(), "thread", state.clone())
+            .await
+            .unwrap()
+            .artifact_references(),
+        state.artifact_references()
+    );
 }
 
 #[test]
@@ -6378,9 +7060,19 @@ async fn unsupported_history_files_fence_cold_and_cached_writers() {
             );
             assert_eq!(std::fs::read(&ledger).unwrap(), ledger_before);
             assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+            // Fenced writers add no entries. The ledger's persistent transaction
+            // lock sidecar was created by the successful writes above.
+            let entries = std::fs::read_dir(ledger.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<BTreeSet<_>>();
             assert_eq!(
-                std::fs::read_dir(ledger.parent().unwrap()).unwrap().count(),
-                2
+                entries,
+                BTreeSet::from([
+                    ledger.clone(),
+                    journal.clone(),
+                    codex_file_system::atomic_write_lock_path(&ledger).unwrap(),
+                ])
             );
         }
     }
@@ -6685,6 +7377,7 @@ fn affected_path_index_preserves_source_dependency_overlap_semantics() {
             SourceDependencyV1 {
                 path: "src/exact.rs".to_string(),
                 recursive: false,
+                locator_uri: None,
             },
             true,
         ),
@@ -6692,6 +7385,7 @@ fn affected_path_index_preserves_source_dependency_overlap_semantics() {
             SourceDependencyV1 {
                 path: "src/tree".to_string(),
                 recursive: true,
+                locator_uri: None,
             },
             true,
         ),
@@ -6699,6 +7393,7 @@ fn affected_path_index_preserves_source_dependency_overlap_semantics() {
             SourceDependencyV1 {
                 path: "src/tree/leaf.rs".to_string(),
                 recursive: false,
+                locator_uri: None,
             },
             false,
         ),
@@ -6725,6 +7420,7 @@ fn affected_path_index_preserves_source_dependency_overlap_semantics() {
         &SourceDependencyV1 {
             path: "src/nested/file.rs".to_string(),
             recursive: false,
+            locator_uri: None,
         }
     ));
 }
@@ -6745,6 +7441,7 @@ fn root_source_dependencies_overlap_descendants_without_matching_relative_paths(
         let dependency = SourceDependencyV1 {
             path: path.into(),
             recursive,
+            locator_uri: None,
         };
         assert_eq!(source_dependency_overlaps(&dependency, changed), expected);
         assert_eq!(
@@ -6763,6 +7460,7 @@ fn root_source_dependencies_overlap_descendants_without_matching_relative_paths(
     record.source_dependencies = BTreeSet::from([SourceDependencyV1 {
         path: "/".into(),
         recursive: true,
+        locator_uri: None,
     }]);
     let mut state = ToolHistoryState::default();
     state.register(record);
@@ -7417,7 +8115,7 @@ fn factored_workspace_metadata_round_trips_every_per_call_exception() {
         .map(|index| {
             let mut notice = base.clone();
             notice["call_id"] = format!("call-{index}").into();
-            notice["current_nested_results"] =
+            notice["retained_nested_results"] =
                 serde_json::json!([{"call_id":format!("nested-{index}")}]);
             if index == 4 {
                 notice["reason_code"] = "source_dependencies_invalidated".into();
@@ -7907,13 +8605,16 @@ async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carr
     for index in 0..9 {
         let extra = root.path().join(format!("extra-{index}.txt"));
         std::fs::write(&extra, "unchanged").unwrap();
-        classification.source_dependencies.extend(classify_workspace_tool_call(
-            "read_file",
-            &ToolPayload::Function {
-                arguments: serde_json::json!({"path": extra}).to_string(),
-            },
-            root.path(),
-        ).source_dependencies);
+        classification.source_dependencies.extend(
+            classify_workspace_tool_call(
+                "read_file",
+                &ToolPayload::Function {
+                    arguments: serde_json::json!({"path": extra}).to_string(),
+                },
+                root.path(),
+            )
+            .source_dependencies,
+        );
     }
     assert!(
         classification.source_scope_complete,
@@ -8015,12 +8716,12 @@ async fn incomplete_source_scope_survives_ledger_restore_and_cannot_hide_in_carr
     assert_eq!(notices[0]["valid_for_current_workspace"], false);
     assert!(notices[0]["source_scope"].get("dependencies").is_none());
     assert!(
-        notices[0]["current_nested_results"][0]
+        notices[0]["retained_nested_results"][0]
             .get("source_scope")
             .is_none()
     );
     assert_eq!(
-        notices[0]["current_nested_results"][0]["call_id"],
+        notices[0]["retained_nested_results"][0]["call_id"],
         "native-child"
     );
 

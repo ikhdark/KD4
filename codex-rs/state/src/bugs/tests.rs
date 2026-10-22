@@ -38,25 +38,41 @@ async fn reopen_accepts_equivalent_checkout_line_endings_and_preserves_reports()
     for crlf in [false, true] {
         let home = tempfile::tempdir().expect("temporary SQLite home");
         let store = BugStore::open(home.path()).await.expect("initial store");
-        let created = store.create(params("preserved report 🐛", "thread-a"))
-            .await.expect("persist report");
-        let migration = &crate::migrations::BUGS_MIGRATOR.migrations[0];
-        let sql = migration.sql.as_str().replace("\r\n", "\n");
-        let sql = if crlf { sql.replace('\n', "\r\n") } else { sql };
-        let checksum = <sha2::Sha384 as sha2::Digest>::digest(sql.as_bytes()).to_vec();
-        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
-            .bind(&checksum).execute(&store.pool).await.expect("checkout-equivalent ledger");
+        let created = store
+            .create(params("preserved report 🐛", "thread-a"))
+            .await
+            .expect("persist report");
+        let mut checksums = Vec::new();
+        for migration in crate::migrations::BUGS_MIGRATOR.migrations.iter() {
+            let sql = migration.sql.as_str().replace("\r\n", "\n");
+            let sql = if crlf { sql.replace('\n', "\r\n") } else { sql };
+            let checksum = <sha2::Sha384 as sha2::Digest>::digest(sql.as_bytes()).to_vec();
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(&checksum)
+                .bind(migration.version)
+                .execute(&store.pool)
+                .await
+                .expect("checkout-equivalent ledger");
+            checksums.push((migration.version, checksum));
+        }
         store.pool.close().await;
 
-        let reopened = BugStore::open(home.path()).await
+        let reopened = BugStore::open(home.path())
+            .await
             .expect("equivalent checkout must not make existing reports inaccessible");
-        let claim = reopened.claim_by_id(created.id).await.expect("claim").expect("report");
+        let claim = reopened
+            .claim_by_id(created.id)
+            .await
+            .expect("claim")
+            .expect("report");
         assert_eq!(claim.raw_text, "preserved report 🐛");
         assert_eq!(claim.attempt_count, 1);
-        let persisted_checksum: Vec<u8> = sqlx::query_scalar(
-            "SELECT checksum FROM _sqlx_migrations WHERE version = 1",
-        ).fetch_one(&reopened.pool).await.expect("original ledger checksum");
-        assert_eq!(persisted_checksum, checksum);
+        let persisted_checksums: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&reopened.pool)
+                .await
+                .expect("original ledger checksums");
+        assert_eq!(persisted_checksums, checksums);
         reopened.pool.close().await;
     }
 }
@@ -117,7 +133,7 @@ async fn concurrent_fresh_initializers_share_one_migration_and_reports() {
         .fetch_one(&second.pool)
         .await
         .expect("migration ledger");
-    assert_eq!(migration_count, 1);
+    assert_eq!(migration_count, 2);
     let created = first
         .create(params("shared report", "thread-a"))
         .await
@@ -170,12 +186,18 @@ async fn persistent_writer_lock_is_bounded_and_open_recovers_after_release() {
         error.downcast_ref::<sqlx::Error>(),
         Some(sqlx::Error::Database(error)) if error.code().as_deref() == Some("5")
     ));
-    let store = BugStore::open(home.path()).await.expect("open after release");
+    let store = BugStore::open(home.path())
+        .await
+        .expect("open after release");
     let created = store
         .create(params("report after lock release", "thread-a"))
         .await
         .expect("persist after release");
-    let claim = store.claim_by_id(created.id).await.expect("claim").expect("report");
+    let claim = store
+        .claim_by_id(created.id)
+        .await
+        .expect("claim")
+        .expect("report");
     assert_eq!(claim.raw_text, "report after lock release");
     store.pool.close().await;
 }
@@ -410,4 +432,80 @@ async fn older_claim_excludes_new_id_and_orders_by_creation_then_id() {
             .expect("older claim")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn classifier_receipts_are_once_only_and_stale_claims_cannot_change_newer_results() {
+    let home = tempfile::tempdir().unwrap();
+    let store = BugStore::open(home.path()).await.unwrap();
+    let bug = store
+        .create(params("immutable original", "original-thread"))
+        .await
+        .unwrap();
+    let first = store.claim_by_id(bug.id).await.unwrap().unwrap();
+    sqlx::query("UPDATE bugs SET claim_timestamp = 0 WHERE id = ?")
+        .bind(bug.id)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let second = store.claim_by_id(bug.id).await.unwrap().unwrap();
+    assert_ne!(first.attempt_id, first.claim_token);
+    assert_ne!(first.attempt_id, second.attempt_id);
+    assert_eq!(second.thread_id, "original-thread");
+    let receipt = BugAttemptReceipt {
+        response_id: Some("response-120".into()),
+        token_usage: Some(codex_protocol::protocol::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            ..Default::default()
+        }),
+        dispatched: Some(true),
+        terminal_observed: true,
+        outcome: "schema_error".into(),
+        ..Default::default()
+    };
+    assert!(
+        store
+            .record_attempt_receipt(&first, &receipt)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .record_attempt_receipt(&first, &BugAttemptReceipt::default())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .commit_classification(bug.id, &first.claim_token, classification())
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .commit_classification(bug.id, &second.claim_token, classification())
+            .await
+            .unwrap()
+    );
+    let saved: String =
+        sqlx::query_scalar("SELECT receipt_json FROM bug_classifier_attempts WHERE attempt_id = ?")
+            .bind(&first.attempt_id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        serde_json::from_str::<BugAttemptReceipt>(&saved).unwrap(),
+        receipt
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM bug_classifier_attempts WHERE bug_id = ?")
+            .bind(bug.id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 2);
+    assert!(!saved.contains(&first.claim_token));
+    assert!(!saved.contains("immutable original"));
 }

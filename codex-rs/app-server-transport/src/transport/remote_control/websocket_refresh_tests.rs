@@ -52,6 +52,7 @@ async fn connect_test_websocket(
             desired_state_tx: &desired_state_tx,
             desired_state_persistence_lock: &desired_state_persistence_lock,
             http_clients: &test_http_clients(),
+            policy: None,
         },
         &status_publisher,
     )

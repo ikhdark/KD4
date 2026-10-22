@@ -55,6 +55,10 @@ pub(crate) struct PendingPluginInstall {
     backup_root: Option<PathBuf>,
     transaction_dir: Option<tempfile::TempDir>,
     committed: bool,
+    published: bool,
+    publication_id: String,
+    // Drop after staging cleanup, including rollback after configuration failure.
+    _entry_lock: fs::File,
 }
 
 impl PendingPluginInstall {
@@ -63,12 +67,28 @@ impl PendingPluginInstall {
     }
 
     pub(crate) fn commit(mut self) -> PluginInstallResult {
+        if let Err(error) = fs::remove_file(self.target_root.join(".codex-install-owner")) {
+            warn!("failed to remove committed plugin publication marker: {error}");
+        }
         self.committed = true;
         self.result.clone()
     }
 
     fn rollback(&mut self) -> io::Result<()> {
-        if self.target_root.exists() {
+        if self.published
+            && fs::read_to_string(self.target_root.join(".codex-install-owner"))?
+                != self.publication_id
+        {
+            return Err(io::Error::other(
+                "plugin publication was replaced; conflicting files retained",
+            ));
+        }
+        if self.target_root.exists() && !self.published {
+            return Err(io::Error::other(
+                "unexpected plugin publication; conflicting files retained",
+            ));
+        }
+        if self.published {
             fs::rename(&self.target_root, &self.staged_root)?;
         }
         if let Some(backup_root) = self.backup_root.as_ref()
@@ -109,6 +129,7 @@ pub(crate) struct PendingPluginUninstall {
     backup_root: Option<PathBuf>,
     transaction_dir: Option<tempfile::TempDir>,
     committed: bool,
+    _entry_lock: fs::File,
 }
 
 impl PendingPluginUninstall {
@@ -697,6 +718,30 @@ fn plugin_name_for_source(
         .map(|_| plugin_name)
 }
 
+/// Stable per-entry ownership. Never unlink the lock file: another process may
+/// still have its inode open. Nonblocking acquisition also avoids config/cache
+/// lock-order waits and leaves unrelated plugin keys independent.
+pub(crate) fn try_lock_plugin_cache_entry(target_root: &Path) -> io::Result<fs::File> {
+    let parent = target_root
+        .parent()
+        .ok_or_else(|| io::Error::other("plugin cache entry has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let parent = fs::canonicalize(parent)?;
+    let name = target_root
+        .file_name()
+        .ok_or_else(|| io::Error::other("plugin cache entry has no name"))?;
+    let mut lock_name = std::ffi::OsString::from(".plugin-lock-");
+    lock_name.push(name);
+    let file = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(parent.join(lock_name))?;
+    file.try_lock().map_err(io::Error::from)?;
+    Ok(file)
+}
+
 fn replace_plugin_root_atomically(
     source: &Path,
     target_root: &Path,
@@ -713,6 +758,8 @@ fn replace_plugin_root_atomically(
 
     fs::create_dir_all(parent)
         .map_err(|err| PluginStoreError::io("failed to create plugin cache directory", err))?;
+    let entry_lock = try_lock_plugin_cache_entry(target_root)
+        .map_err(|err| PluginStoreError::io("plugin cache entry is busy or unavailable", err))?;
 
     let staged_dir = tempfile::Builder::new()
         .prefix(INSTALL_TRANSACTION_PREFIX)
@@ -748,6 +795,14 @@ fn replace_plugin_root_atomically(
             .map_err(|err| PluginStoreError::io("failed to write fallback plugin manifest", err))?;
     }
 
+    let Some(publication_id) = staged_dir.path().file_name() else {
+        return Err(PluginStoreError::Invalid(
+            "plugin staging directory has no name".to_string(),
+        ));
+    };
+    let publication_id = publication_id.to_string_lossy().into_owned();
+    fs::write(staged_root.join(".codex-install-owner"), &publication_id)
+        .map_err(|err| PluginStoreError::io("failed to identify staged plugin publication", err))?;
     let backup_root = target_root
         .exists()
         .then(|| staged_dir.path().join("previous-plugin-root"));
@@ -756,13 +811,16 @@ fn replace_plugin_root_atomically(
             .map_err(|err| PluginStoreError::io("failed to back up plugin cache entry", err))?;
     }
 
-    let transaction = PendingPluginInstall {
+    let mut transaction = PendingPluginInstall {
         result,
         target_root: target_root.to_path_buf(),
         staged_root,
         backup_root,
         transaction_dir: Some(staged_dir),
         committed: false,
+        published: false,
+        publication_id,
+        _entry_lock: entry_lock,
     };
     if let Err(err) = fs::rename(&transaction.staged_root, target_root) {
         return Err(PluginStoreError::io(
@@ -770,10 +828,13 @@ fn replace_plugin_root_atomically(
             err,
         ));
     }
+    transaction.published = true;
     Ok(transaction)
 }
 
 fn stage_plugin_uninstall(path: &Path) -> Result<PendingPluginUninstall, PluginStoreError> {
+    let entry_lock = try_lock_plugin_cache_entry(path)
+        .map_err(|err| PluginStoreError::io("plugin cache entry is busy or unavailable", err))?;
     match fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -782,6 +843,7 @@ fn stage_plugin_uninstall(path: &Path) -> Result<PendingPluginUninstall, PluginS
                 backup_root: None,
                 transaction_dir: None,
                 committed: false,
+                _entry_lock: entry_lock,
             });
         }
         Err(err) => {
@@ -811,6 +873,7 @@ fn stage_plugin_uninstall(path: &Path) -> Result<PendingPluginUninstall, PluginS
         backup_root: Some(backup_root),
         transaction_dir: Some(transaction_dir),
         committed: false,
+        _entry_lock: entry_lock,
     })
 }
 

@@ -27,4 +27,5 @@ pub struct TurnInputContext {
     pub environments: Vec<TurnInputEnvironment>,
     /// Selected capability roots that are ready in this step.
     pub ready_selected_capability_roots: Vec<SelectedCapabilityRoot>,
+    pub bound_selected_capability_roots: Vec<codex_exec_server::ResolvedSelectedCapabilityRoot>,
 }

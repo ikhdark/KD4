@@ -503,4 +503,3 @@ network_rule(host="api.github.com", protocol="https", decision="allow", justific
         );
     }
 }
-

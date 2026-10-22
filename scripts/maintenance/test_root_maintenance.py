@@ -25,7 +25,11 @@ class RootMaintenanceTest(unittest.TestCase):
             scripts = root / "scripts"
             scripts.mkdir()
             (scripts / "maintenance").mkdir()
-            for name in ("maintenance/readme_toc.py", "maintenance/test_readme_toc.py", "unmapped_helper.py"):
+            for name in (
+                "maintenance/readme_toc.py",
+                "maintenance/test_readme_toc.py",
+                "unmapped_helper.py",
+            ):
                 (scripts / name).write_text("", encoding="utf-8")
             with (
                 mock.patch.object(maintenance, "REPO_ROOT", root),
@@ -70,7 +74,9 @@ class RootMaintenanceTest(unittest.TestCase):
             ["scripts.build.test_build_tooling_policy"],
         )
         self.assertEqual(
-            root_maintenance.python_test_targets([], ["scripts/maintenance/root_maintenance.py"]),
+            root_maintenance.python_test_targets(
+                [], ["scripts/maintenance/root_maintenance.py"]
+            ),
             [
                 "scripts.maintenance.test_report_script_regressions.ScriptReportRegressions.test_changed_tests_and_adjacent_production_across_owned_roots",
                 "scripts.maintenance.test_report_script_regressions.ScriptReportRegressions.test_report_regressions_follow_their_changed_owners_once",
@@ -155,31 +161,56 @@ class RootMaintenanceTest(unittest.TestCase):
     def test_script_test_entrypoints_have_explicit_validation_declarations(self):
         maintenance = load_root_maintenance_module()
         config = json.loads((REPO_ROOT / ".codex/test-runners.json").read_text())
-        declarations = [row for row in config["runners"]
-                        if any("scripts/maintenance/root_maintenance.py" in prefix
-                               for prefix in row["prefixes"])]
+        declarations = [
+            row
+            for row in config["runners"]
+            if any(
+                "scripts/maintenance/root_maintenance.py" in prefix
+                for prefix in row["prefixes"]
+            )
+        ]
         # Classify only the public test subcommand, not audit-scripts (whose
         # --quick mode omits tests) or arbitrary scripts through run-python.js.
-        self.assertEqual(declarations, [
-            {
-                "programs": ["python", "python3", "py"],
-                "prefixes": [["scripts/maintenance/root_maintenance.py", "test-python"]],
-                "options": {"-B": 0, "-u": 0},
-                "allow_extra_args": True, "operations": ["test"],
-            },
-            {
-                "programs": ["node"],
-                "prefixes": [["scripts/maintenance/run-python.js", "scripts/maintenance/root_maintenance.py", "test-python"]],
-                "allow_extra_args": True, "operations": ["test"],
-            },
-        ])
-        for option, code in (("--help", 0), ("--dry-run", 2), ("--list", 2),
-                             ("--no-run", 2), ("--quick", 2)):
-            with (self.subTest(option=option),
-                  mock.patch.object(maintenance, "run") as run,
-                  contextlib.redirect_stdout(io.StringIO()),
-                  contextlib.redirect_stderr(io.StringIO()),
-                  self.assertRaises(SystemExit) as exit_status):
+        self.assertEqual(
+            declarations,
+            [
+                {
+                    "programs": ["python", "python3", "py"],
+                    "prefixes": [
+                        ["scripts/maintenance/root_maintenance.py", "test-python"]
+                    ],
+                    "options": {"-B": 0, "-u": 0},
+                    "allow_extra_args": True,
+                    "operations": ["test"],
+                },
+                {
+                    "programs": ["node"],
+                    "prefixes": [
+                        [
+                            "scripts/maintenance/run-python.js",
+                            "scripts/maintenance/root_maintenance.py",
+                            "test-python",
+                        ]
+                    ],
+                    "allow_extra_args": True,
+                    "operations": ["test"],
+                },
+            ],
+        )
+        for option, code in (
+            ("--help", 0),
+            ("--dry-run", 2),
+            ("--list", 2),
+            ("--no-run", 2),
+            ("--quick", 2),
+        ):
+            with (
+                self.subTest(option=option),
+                mock.patch.object(maintenance, "run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as exit_status,
+            ):
                 maintenance.main(["test-python", option])
             self.assertEqual(exit_status.exception.code, code)
             run.assert_not_called()
@@ -200,11 +231,20 @@ class RootMaintenanceTest(unittest.TestCase):
             "scripts.build.test_validation_scheduling",
         }
         with mock.patch.object(maintenance, "run_python_tests", return_value=0) as run:
-            self.assertEqual(maintenance.main([
-                "test-python", "--changed", "scripts/build/rust_test_runner.py",
-                "--changed", "scripts/build/rust_build_status.py",
-                "--changed", "scripts/build/test_validation_scheduling.py",
-            ]), 0)
+            self.assertEqual(
+                maintenance.main(
+                    [
+                        "test-python",
+                        "--changed",
+                        "scripts/build/rust_test_runner.py",
+                        "--changed",
+                        "scripts/build/rust_build_status.py",
+                        "--changed",
+                        "scripts/build/test_validation_scheduling.py",
+                    ]
+                ),
+                0,
+            )
         command = run.call_args.args[0]
         for module in expected:
             self.assertEqual(command.count(module), 1, module)
@@ -235,7 +275,9 @@ class RootMaintenanceTest(unittest.TestCase):
         for path, module in focused_tests.items():
             with (
                 self.subTest(path=path),
-                mock.patch.object(root_maintenance, "run_python_tests", return_value=0) as run,
+                mock.patch.object(
+                    root_maintenance, "run_python_tests", return_value=0
+                ) as run,
             ):
                 self.assertEqual(
                     root_maintenance.main(["test-python", "--changed", path]), 0
@@ -299,10 +341,15 @@ class RootMaintenanceTest(unittest.TestCase):
         )
         self.assertTrue(javascript_targets, "fixture must exercise Node syntax checks")
         self.assertEqual(
-            [(label, command) for label, command in commands
-             if label.startswith("JavaScript syntax:")],
-            [(f"JavaScript syntax: {target}", ("node", "--check", target))
-             for target in javascript_targets],
+            [
+                (label, command)
+                for label, command in commands
+                if label.startswith("JavaScript syntax:")
+            ],
+            [
+                (f"JavaScript syntax: {target}", ("node", "--check", target))
+                for target in javascript_targets
+            ],
         )
         self.assertIn("script unit tests", labels)
         unit_command = dict(commands)["script unit tests"]
@@ -519,21 +566,31 @@ class RootMaintenanceTest(unittest.TestCase):
             mock.patch.object(root_maintenance, "run") as run,
             mock.patch.object(root_maintenance, "_run_json_worker") as worker,
             mock.patch.object(
-                root_maintenance, "script_inventory",
+                root_maintenance,
+                "script_inventory",
                 side_effect=AssertionError("broad discovery"),
             ),
         ):
             self.assertEqual(
-                root_maintenance.test_modules_for_changed_path("scripts/maintenance/readme_toc.py"),
+                root_maintenance.test_modules_for_changed_path(
+                    "scripts/maintenance/readme_toc.py"
+                ),
                 ("scripts.maintenance.test_readme_toc",),
             )
             for extra in ([], ["--changed", "scripts/maintenance/readme_toc.py"]):
-                with (self.subTest(extra=extra),
-                      contextlib.redirect_stderr(io.StringIO()) as stderr):
+                with (
+                    self.subTest(extra=extra),
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
                     self.assertEqual(
-                        root_maintenance.main([
-                            "test-python", "--changed", "scripts/unmapped_helper.py", *extra,
-                        ]),
+                        root_maintenance.main(
+                            [
+                                "test-python",
+                                "--changed",
+                                "scripts/unmapped_helper.py",
+                                *extra,
+                            ]
+                        ),
                         2,
                     )
                 self.assertEqual(
@@ -587,24 +644,42 @@ class RootMaintenanceTest(unittest.TestCase):
         for expected in (0, 1, 2):
             with (
                 self.subTest(expected=expected),
-                mock.patch.object(maintenance, "_run_python_tests_json", return_value=expected) as run,
+                mock.patch.object(
+                    maintenance, "_run_python_tests_json", return_value=expected
+                ) as run,
             ):
                 self.assertEqual(
-                    maintenance.main(["test-python", "--module", ordinary, "--module", harbor]),
+                    maintenance.main(
+                        ["test-python", "--module", ordinary, "--module", harbor]
+                    ),
                     expected,
                 )
                 run.assert_called_once_with([ordinary], [harbor], json_output=False)
 
     def test_script_audit_uses_shared_test_environment_routing(self):
         maintenance = load_root_maintenance_module()
-        targets = ["scripts.maintenance.test_asciicheck", "scripts.benchmark_scripts.test_harbor_windows_codex"]
+        targets = [
+            "scripts.maintenance.test_asciicheck",
+            "scripts.benchmark_scripts.test_harbor_windows_codex",
+        ]
         commands, _missing = maintenance.script_audit_commands(
-            include_tests=True, test_targets=targets, resolve_tool=lambda name: name,
+            include_tests=True,
+            test_targets=targets,
+            resolve_tool=lambda name: name,
         )
-        self.assertEqual(dict(commands)["script unit tests"], (
-            *maintenance.UV_RUN_SCRIPTS, "python", "scripts/maintenance/root_maintenance.py",
-            "test-python", "--module", targets[0], "--module", targets[1],
-        ))
+        self.assertEqual(
+            dict(commands)["script unit tests"],
+            (
+                *maintenance.UV_RUN_SCRIPTS,
+                "python",
+                "scripts/maintenance/root_maintenance.py",
+                "test-python",
+                "--module",
+                targets[0],
+                "--module",
+                targets[1],
+            ),
+        )
 
     def test_root_maintenance_uv_commands_use_frozen_lock(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -620,18 +695,28 @@ class RootMaintenanceTest(unittest.TestCase):
 
         with (
             mock.patch.object(root_maintenance, "run", side_effect=fake_run),
-            mock.patch.object(root_maintenance, "_run_json_worker", side_effect=missing_report),
+            mock.patch.object(
+                root_maintenance, "_run_json_worker", side_effect=missing_report
+            ),
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(
                 root_maintenance.main(
-                    ["lint-python", "--changed", "scripts/maintenance/root_maintenance.py"]
+                    [
+                        "lint-python",
+                        "--changed",
+                        "scripts/maintenance/root_maintenance.py",
+                    ]
                 ),
                 0,
             )
             self.assertEqual(
                 root_maintenance.main(
-                    ["test-python", "--module", "scripts.build.test_build_tooling_policy"]
+                    [
+                        "test-python",
+                        "--module",
+                        "scripts.build.test_build_tooling_policy",
+                    ]
                 ),
                 2,
             )
@@ -657,8 +742,13 @@ class RootMaintenanceTest(unittest.TestCase):
                     "scripts",
                     "python",
                     "-B",
-                    str(root_maintenance.SCRIPTS_ROOT / "maintenance" / "unittest_json.py"),
+                    str(
+                        root_maintenance.SCRIPTS_ROOT
+                        / "maintenance"
+                        / "unittest_json.py"
+                    ),
                     "--execution-only",
+                    "--coalesce-selectors",
                     "scripts.build.test_build_tooling_policy",
                     "-v",
                 ),
@@ -667,6 +757,70 @@ class RootMaintenanceTest(unittest.TestCase):
 
 
 class StructuredMaintenanceTest(unittest.TestCase):
+    def test_parent_selection_never_suppresses_an_explicit_required_child(self):
+        target = self.write_test("test_overlap")
+        path = self.root / "scripts" / "test_overlap.py"
+        path.write_text(
+            "import unittest\nclass Example(unittest.TestCase):\n"
+            " def test_default(self): self.assertEqual(2+2, 4)\n"
+            " def test_required(self): self.fail('explicit child ran')\n"
+            "def load_tests(loader, tests, pattern):\n"
+            " return unittest.TestSuite([Example('test_default')])\n"
+        )
+        for child in ("test_required", "missing"):
+            with self.subTest(child=child):
+                self.output.seek(0)
+                self.output.truncate()
+                code, report, commands = self.run_json(
+                    [target, target + ".Example." + child]
+                )
+                self.assertNotEqual(code, 0)
+                self.assertFalse(report["successful"])
+                self.assertEqual(
+                    len(commands), 1, "selection must not add a preflight process"
+                )
+                if child == "test_required":
+                    self.assertEqual(report["tests_run"], 2)
+
+    def test_retained_oracle_report_is_complete_with_bounded_presentation(self):
+        source = "VALUE = 1\n"
+        path = self.root / "fixture.py"
+        path.write_bytes(source.encode("utf-8"))
+        report = {
+            "schema_version": 1,
+            "language": "python",
+            "advisory_only": True,
+            "parse_complete": True,
+            "analysis_complete": False,
+            "diagnostics": [{"path": "fixture.py", "reason": "constant_only"}] * 208,
+            "unknown": [{"path": "fixture.py", "reason": "unresolved"}] * 26863,
+            "limitations": ["not coverage"],
+        }
+        destination = self.root / "oracle.json"
+        with mock.patch.object(
+            self.owner, "_run_json_worker", return_value=(0, report)
+        ) as worker:
+            self.assertTrue(
+                self.owner._print_oracle_advisories(
+                    {"fixture.py": source}, {"fixture.py"}, report_path=destination
+                )
+            )
+        worker.assert_called_once()
+        self.assertEqual(json.loads(destination.read_text()), report)
+        self.assertLess(len(self.output.getvalue().encode()), 65536)
+        self.assertIn("26863 unresolved", self.output.getvalue())
+        with (
+            mock.patch.object(self.owner, "_run_json_worker", return_value=(0, report)),
+            mock.patch.object(
+                self.owner, "write_json_atomic", side_effect=OSError("disk full")
+            ),
+        ):
+            self.assertFalse(
+                self.owner._print_oracle_advisories(
+                    {"fixture.py": source}, {"fixture.py"}, report_path=destination
+                )
+            )
+
     def setUp(self):
         self.owner = load_root_maintenance_module()
         self.output = self.enterContext(contextlib.redirect_stdout(io.StringIO()))
@@ -677,8 +831,13 @@ class StructuredMaintenanceTest(unittest.TestCase):
 
     def test_json_worker_uses_file_backed_transport_and_rejects_invalid_output(self):
         code, report = self.owner._run_json_worker(
-            [sys.executable, "-c", "import json,sys; print(json.dumps(json.load(sys.stdin)))"],
-            request={"text": "λ😀"}, timeout=5,
+            [
+                sys.executable,
+                "-c",
+                "import json,sys; print(json.dumps(json.load(sys.stdin.buffer)))",
+            ],
+            request={"text": "λ😀"},
+            timeout=5,
         )
         self.assertEqual((code, report), (0, {"text": "λ😀"}))
         with self.assertRaises(ValueError):
@@ -691,9 +850,13 @@ class StructuredMaintenanceTest(unittest.TestCase):
 
     def test_json_worker_timeout_reaps_a_stalled_child(self):
         ready = self.root / "ready"
-        command = [sys.executable, "-c", (
-            f"import pathlib,time; pathlib.Path({str(ready)!r}).write_text('ready'); time.sleep(60)"
-        )]
+        command = [
+            sys.executable,
+            "-c",
+            (
+                f"import pathlib,time; pathlib.Path({str(ready)!r}).write_text('ready'); time.sleep(60)"
+            ),
+        ]
         with self.assertRaises(subprocess.TimeoutExpired):
             self.owner._run_json_worker(command, timeout=2)
         self.assertTrue(ready.exists(), "the fixture must start before timeout")
@@ -709,7 +872,8 @@ class StructuredMaintenanceTest(unittest.TestCase):
             module = f"scripts.benchmark_scripts.{name}"
         (scripts / f"{name}.py").write_text(
             "import unittest\nclass Example(unittest.TestCase):\n"
-            f"    def test_example(self):\n        {body}\n", encoding="utf-8",
+            f"    def test_example(self):\n        {body}\n",
+            encoding="utf-8",
         )
         return module
 
@@ -728,12 +892,20 @@ class StructuredMaintenanceTest(unittest.TestCase):
         with (
             mock.patch.object(self.owner, "UV_RUN_SCRIPTS", ["fixture-uv"]),
             mock.patch.object(self.owner, "_run_json_worker", side_effect=execute),
-            mock.patch.object(self.owner, "harbor_python", return_value=Path(sys.executable),
-                              side_effect=ValueError("missing Harbor") if missing_harbor else None),
+            mock.patch.object(
+                self.owner,
+                "harbor_python",
+                return_value=Path(sys.executable),
+                side_effect=ValueError("missing Harbor") if missing_harbor else None,
+            ),
         ):
-            code = self.owner.main(["test-python", "--json", *(
-                arg for target in targets for arg in ("--module", target)
-            )])
+            code = self.owner.main(
+                [
+                    "test-python",
+                    "--json",
+                    *(arg for target in targets for arg in ("--module", target)),
+                ]
+            )
         return code, json.loads(self.output.getvalue()), commands
 
     def test_json_mode_aggregates_real_workers_and_preserves_failure_details(self):
@@ -745,14 +917,19 @@ class StructuredMaintenanceTest(unittest.TestCase):
         self.assertFalse(report["successful"])
         self.assertEqual(report["tests_run"], 2)
         self.assertFalse(report["reusable_validation_receipt"])
-        self.assertEqual([item["environment"] for item in report["environments"]], ["scripts", "harbor"])
+        self.assertEqual(
+            [item["environment"] for item in report["environments"]],
+            ["scripts", "harbor"],
+        )
         self.assertEqual(commands[0][:2], ["fixture-uv", "python"])
         self.assertEqual(commands[1][0], sys.executable)
         failed = report["environments"][0]["report"]["tests"][0]
         self.assertEqual(failed["outcome"], "failure")
         self.assertIn("assertion λ detail", json.dumps(failed, ensure_ascii=False))
         self.assertIn("Traceback", json.dumps(failed))
-        self.assertEqual(report["environments"][1]["report"]["tests"][0]["outcome"], "success")
+        self.assertEqual(
+            report["environments"][1]["report"]["tests"][0]["outcome"], "success"
+        )
 
     def test_json_mode_missing_harbor_preserves_ordinary_result(self):
         ordinary = self.write_test("test_ordinary")
@@ -774,7 +951,9 @@ class StructuredMaintenanceTest(unittest.TestCase):
         self.output.seek(0)
         self.output.truncate()
         with mock.patch.object(self.owner, "_run_json_worker", return_value=(0, {})):
-            self.assertEqual(self.owner.main(["test-python", "--json", "--module", "missing"]), 2)
+            self.assertEqual(
+                self.owner.main(["test-python", "--json", "--module", "missing"]), 2
+            )
         self.assertFalse(json.loads(self.output.getvalue())["complete"])
 
     def test_docs_only_changed_selection_fails_closed_in_both_presentations(self):
@@ -785,12 +964,18 @@ class StructuredMaintenanceTest(unittest.TestCase):
                 self.errors.seek(0)
                 self.errors.truncate()
                 with mock.patch.object(self.owner, "_run_json_worker") as worker:
-                    code = self.owner.main([
-                        "test-python", "--changed", "README.md",
-                        *(["--json"] if json_output else []),
-                    ])
+                    code = self.owner.main(
+                        [
+                            "test-python",
+                            "--changed",
+                            "README.md",
+                            *(["--json"] if json_output else []),
+                        ]
+                    )
                 worker.assert_not_called()
-                self.assertEqual(code, 2, "zero selected tests cannot certify validation")
+                self.assertEqual(
+                    code, 2, "zero selected tests cannot certify validation"
+                )
                 if json_output:
                     report = json.loads(self.output.getvalue())
                     self.assertEqual(report["tests_run"], 0)
@@ -809,16 +994,29 @@ class StructuredMaintenanceTest(unittest.TestCase):
         with mock.patch.object(self.owner, "UV_RUN_SCRIPTS", []):
             for source, expected in (
                 ("", 2),
-                ("import unittest\nclass Case(unittest.TestCase):\n"
-                 "    def test_effect(self): self.assertEqual(2 + 2, 4)\n", 0),
-                ("import unittest\nclass Case(unittest.TestCase):\n"
-                 "    def test_effect(self): self.fail('required effect missing')\n", 1),
+                (
+                    "import unittest\nclass Case(unittest.TestCase):\n"
+                    "    def test_effect(self): self.assertEqual(2 + 2, 4)\n",
+                    0,
+                ),
+                (
+                    "import unittest\nclass Case(unittest.TestCase):\n"
+                    "    def test_effect(self): self.fail('required effect missing')\n",
+                    1,
+                ),
             ):
                 with self.subTest(expected=expected):
                     path.write_text(source, encoding="utf-8")
-                    self.assertEqual(self.owner.main([
-                        "test-python", "--module", target,
-                    ]), expected)
+                    self.assertEqual(
+                        self.owner.main(
+                            [
+                                "test-python",
+                                "--module",
+                                target,
+                            ]
+                        ),
+                        expected,
+                    )
 
     def test_text_mode_rejects_successful_exit_before_a_completion_report(self):
         target = self.write_test("test_abrupt", "__import__('os')._exit(0)")
@@ -831,11 +1029,22 @@ class StructuredMaintenanceTest(unittest.TestCase):
         harbor = self.write_test("test_harbor_windows_codex")
         with (
             mock.patch.object(self.owner, "UV_RUN_SCRIPTS", []),
-            mock.patch.object(self.owner, "harbor_python", side_effect=ValueError("missing Harbor")),
+            mock.patch.object(
+                self.owner, "harbor_python", side_effect=ValueError("missing Harbor")
+            ),
         ):
-            self.assertEqual(self.owner.main([
-                "test-python", "--module", ordinary, "--module", harbor,
-            ]), 2)
+            self.assertEqual(
+                self.owner.main(
+                    [
+                        "test-python",
+                        "--module",
+                        ordinary,
+                        "--module",
+                        harbor,
+                    ]
+                ),
+                2,
+            )
         self.assertIn("started=1", self.errors.getvalue())
         self.assertIn("missing Harbor", self.errors.getvalue())
 
@@ -843,22 +1052,43 @@ class StructuredMaintenanceTest(unittest.TestCase):
         target = self.write_test("test_skips")
         path = self.root / "scripts" / "test_skips.py"
         for source, expected, evidence in (
-            ("import unittest\nclass Case(unittest.TestCase):\n"
-             "    @classmethod\n    def setUpClass(cls): raise unittest.SkipTest('missing dependency')\n"
-             "    def test_required(self): self.fail('must not execute')\n", 1, "unrun=1"),
-            ("import unittest\nclass Case(unittest.TestCase):\n"
-             "    @unittest.skip('declared platform skip')\n    def test_skip(self): pass\n"
-             "    @unittest.expectedFailure\n    def test_expected(self): self.fail('known defect')\n",
-             0, "unrun=0"),
+            (
+                "import unittest\nclass Case(unittest.TestCase):\n"
+                "    @classmethod\n    def setUpClass(cls): raise unittest.SkipTest('missing dependency')\n"
+                "    def test_required(self): self.fail('must not execute')\n",
+                1,
+                "unrun=1",
+            ),
+            (
+                "import unittest\nclass Case(unittest.TestCase):\n"
+                "    def setUp(self): raise unittest.SkipTest('missing dependency')\n"
+                "    def test_required(self): self.fail('must not execute')\n",
+                1,
+                "successful=False",
+            ),
+            (
+                "import unittest\nclass Case(unittest.TestCase):\n"
+                "    @unittest.skip('declared platform skip')\n    def test_skip(self): pass\n"
+                "    @unittest.expectedFailure\n    def test_expected(self): self.fail('known defect')\n",
+                0,
+                "unrun=0",
+            ),
         ):
             with self.subTest(expected=expected):
                 path.write_text(source, encoding="utf-8")
                 self.errors.seek(0)
                 self.errors.truncate()
                 with mock.patch.object(self.owner, "UV_RUN_SCRIPTS", []):
-                    self.assertEqual(self.owner.main([
-                        "test-python", "--module", target,
-                    ]), expected)
+                    self.assertEqual(
+                        self.owner.main(
+                            [
+                                "test-python",
+                                "--module",
+                                target,
+                            ]
+                        ),
+                        expected,
+                    )
                 self.assertIn(evidence, self.errors.getvalue())
 
     def oracle_audit(self, sources, *, strict=True):
@@ -867,21 +1097,42 @@ class StructuredMaintenanceTest(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(text, encoding="utf-8", newline="")
         with (
-            mock.patch.object(self.owner, "script_source_targets", return_value=list(sources)),
-            mock.patch.object(self.owner, "script_kind_map", return_value=dict.fromkeys(sources, "python")),
+            mock.patch.object(
+                self.owner, "script_source_targets", return_value=list(sources)
+            ),
+            mock.patch.object(
+                self.owner,
+                "script_kind_map",
+                return_value=dict.fromkeys(sources, "python"),
+            ),
             mock.patch.object(self.owner, "git_context_label", return_value="fixture"),
-            mock.patch.object(self.owner, "script_audit_context_issues", return_value=[]),
-            mock.patch.object(self.owner, "test_modules_for_changed_path", return_value=("fixture",)),
-            mock.patch.object(self.owner, "script_audit_commands", return_value=([], [])),
+            mock.patch.object(
+                self.owner, "script_audit_context_issues", return_value=[]
+            ),
+            mock.patch.object(
+                self.owner, "test_modules_for_changed_path", return_value=("fixture",)
+            ),
+            mock.patch.object(
+                self.owner, "script_audit_commands", return_value=([], [])
+            ),
         ):
-            return self.owner.main(["audit-scripts", "--quick", "--oracles", *(["--strict"] if strict else [])])
+            return self.owner.main(
+                [
+                    "audit-scripts",
+                    "--quick",
+                    "--oracles",
+                    *(["--strict"] if strict else []),
+                ]
+            )
 
     def test_oracles_use_source_only_and_remain_advisory_under_strict(self):
         marker = self.root / "must-not-execute"
-        source = (f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
-                  "import unittest\ndef report(): return {'executed': False}\n"
-                  "class Case(unittest.TestCase):\n"
-                  "    def test_literal(self): self.assertEqual(report()['executed'], False)\n")
+        source = (
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
+            "import unittest\ndef report(): return {'executed': False}\n"
+            "class Case(unittest.TestCase):\n"
+            "    def test_literal(self): self.assertEqual(report()['executed'], False)\n"
+        )
         self.assertEqual(self.oracle_audit({"scripts/test_fixture.py": source}), 0)
         self.assertFalse(marker.exists())
         self.assertIn("[ORACLE ADVISORY]", self.output.getvalue())
@@ -890,12 +1141,18 @@ class StructuredMaintenanceTest(unittest.TestCase):
 
     def test_oracle_worker_isolated_from_source_import_shadowing(self):
         marker = self.root / "imported-source"
-        shadow = (f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
-                  "raise RuntimeError('analyzed source was imported')\n")
-        source = ("import unittest\nVALUE = 7\nclass Case(unittest.TestCase):\n"
-                  "    def test_literal(self): self.assertEqual(VALUE, 7)\n")
+        shadow = (
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('bad')\n"
+            "raise RuntimeError('analyzed source was imported')\n"
+        )
+        source = (
+            "import unittest\nVALUE = 7\nclass Case(unittest.TestCase):\n"
+            "    def test_literal(self): self.assertEqual(VALUE, 7)\n"
+        )
         with mock.patch.dict(os.environ, {"PYTHONPATH": str(self.root)}):
-            self.assertEqual(self.oracle_audit({"ast.py": shadow, "test_fixture.py": source}), 0)
+            self.assertEqual(
+                self.oracle_audit({"ast.py": shadow, "test_fixture.py": source}), 0
+            )
         self.assertFalse(marker.exists())
         self.assertIn("parse_complete=True", self.output.getvalue())
         self.assertIn("constant_only_oracle", self.output.getvalue())
@@ -906,14 +1163,27 @@ class StructuredMaintenanceTest(unittest.TestCase):
         worker.assert_not_called()
         self.assertIn("incomplete Python input snapshot", self.output.getvalue())
         source = "VALUE = 7\n"
-        for change in ({"analysis_complete": True}, {"diagnostics": ["not a diagnostic"]}):
+        for change in (
+            {"analysis_complete": True},
+            {"diagnostics": ["not a diagnostic"]},
+        ):
             with self.subTest(change=change):
                 self.output.seek(0)
                 self.output.truncate()
-                report = {"schema_version": 1, "language": "python", "advisory_only": True,
-                          "parse_complete": True, "analysis_complete": False,
-                          "diagnostics": [], "unknown": [], "limitations": [], **change}
-                with mock.patch.object(self.owner, "_run_json_worker", return_value=(0, report)):
+                report = {
+                    "schema_version": 1,
+                    "language": "python",
+                    "advisory_only": True,
+                    "parse_complete": True,
+                    "analysis_complete": False,
+                    "diagnostics": [],
+                    "unknown": [],
+                    "limitations": [],
+                    **change,
+                }
+                with mock.patch.object(
+                    self.owner, "_run_json_worker", return_value=(0, report)
+                ):
                     self.assertEqual(self.oracle_audit({"fixture.py": source}), 0)
                 self.assertIn("Analysis unverified", self.output.getvalue())
 
@@ -923,15 +1193,23 @@ class StructuredMaintenanceTest(unittest.TestCase):
 
         def change_source(*args, **kwargs):
             result = original(*args, **kwargs)
-            (self.root / "scripts/test_fixture.py").write_text(source + "# changed\n", encoding="utf-8")
+            (self.root / "scripts/test_fixture.py").write_text(
+                source + "# changed\n", encoding="utf-8"
+            )
             return result
 
-        with mock.patch.object(self.owner, "_run_json_worker", side_effect=change_source):
+        with mock.patch.object(
+            self.owner, "_run_json_worker", side_effect=change_source
+        ):
             self.assertEqual(self.oracle_audit({"scripts/test_fixture.py": source}), 0)
         self.assertIn("source changed during oracle analysis", self.output.getvalue())
         self.output.seek(0)
         self.output.truncate()
-        with mock.patch.object(self.owner, "_run_json_worker", side_effect=subprocess.TimeoutExpired("oracle", 30)):
+        with mock.patch.object(
+            self.owner,
+            "_run_json_worker",
+            side_effect=subprocess.TimeoutExpired("oracle", 30),
+        ):
             self.assertEqual(self.oracle_audit({"scripts/test_fixture.py": source}), 0)
         self.assertIn("Analysis unverified", self.output.getvalue())
         self.assertIn("SCRIPT AUDIT PASSED", self.output.getvalue())
@@ -975,18 +1253,28 @@ class SyntaxSchedulingTest(unittest.TestCase):
                 self.assertEqual(sorted(completed), list(range(7)))
             return 0
 
-        commands = [("unknown", ("before",)), *self.commands(7),
-                    ("script unit tests", ("after",))]
-        with (mock.patch.object(self.owner, "run_owned", side_effect=parser),
-              mock.patch.object(self.owner, "run", side_effect=exclusive)):
+        commands = [
+            ("unknown", ("before",)),
+            *self.commands(7),
+            ("script unit tests", ("after",)),
+        ]
+        with (
+            mock.patch.object(self.owner, "run_owned", side_effect=parser),
+            mock.patch.object(self.owner, "run", side_effect=exclusive),
+        ):
             results = list(self.owner._audit_command_results(commands))
         self.assertEqual(peak, 4)
         self.assertEqual(active, 0)
         self.assertEqual(serial, ["before", "after"])
-        self.assertEqual([label for label, _ in results], [label for label, _ in commands])
+        self.assertEqual(
+            [label for label, _ in results], [label for label, _ in commands]
+        )
         self.assertEqual([code for _, code in results], [0, 0, 0, 1, 0, 0, 0, 0, 0])
-        diagnostics = [line for line in self.output.getvalue().splitlines()
-                       if line.startswith("diagnostic-")]
+        diagnostics = [
+            line
+            for line in self.output.getvalue().splitlines()
+            if line.startswith("diagnostic-")
+        ]
         self.assertEqual(diagnostics, [f"diagnostic-{i}" for i in range(7)])
 
     def test_interrupt_cancels_and_joins_started_sibling(self):
@@ -1007,8 +1295,10 @@ class SyntaxSchedulingTest(unittest.TestCase):
                 finally:
                     stopped.set()
 
-        with (mock.patch.object(self.owner, "run_owned", side_effect=parser),
-              self.assertRaises(KeyboardInterrupt)):
+        with (
+            mock.patch.object(self.owner, "run_owned", side_effect=parser),
+            self.assertRaises(KeyboardInterrupt),
+        ):
             list(self.owner._audit_command_results(self.commands(2)))
         self.assertTrue(stopped.is_set())
 
@@ -1017,8 +1307,12 @@ class SyntaxSchedulingTest(unittest.TestCase):
         rendezvous = threading.Barrier(4, timeout=5)
         format_finished = threading.Event()
         completed = []
-        commands = [("Python format", ("format",)), ("Python lint", ("lint",)),
-                    *self.commands(3), ("script unit tests", ("tests",))]
+        commands = [
+            ("Python format", ("format",)),
+            ("Python lint", ("lint",)),
+            *self.commands(3),
+            ("script unit tests", ("tests",)),
+        ]
 
         def execute(command, **kwargs):
             name = command[0]
@@ -1036,13 +1330,23 @@ class SyntaxSchedulingTest(unittest.TestCase):
             self.assertCountEqual(completed, ["format", "lint", "0", "1", "2"])
             return 0
 
-        with (mock.patch.object(self.owner, "run_owned", side_effect=execute),
-              mock.patch.object(self.owner, "run", side_effect=tests)):
+        with (
+            mock.patch.object(self.owner, "run_owned", side_effect=execute),
+            mock.patch.object(self.owner, "run", side_effect=tests),
+        ):
             results = list(self.owner._audit_command_results(commands))
-        self.assertEqual(results, [(label, int(label == "Python format")) for label, _ in commands])
-        diagnostics = [line for line in self.output.getvalue().splitlines()
-                       if line.startswith("diagnostic-")]
-        self.assertEqual(diagnostics, [f"diagnostic-{name}" for name in ["format", "lint", "0", "1", "2"]])
+        self.assertEqual(
+            results, [(label, int(label == "Python format")) for label, _ in commands]
+        )
+        diagnostics = [
+            line
+            for line in self.output.getvalue().splitlines()
+            if line.startswith("diagnostic-")
+        ]
+        self.assertEqual(
+            diagnostics,
+            [f"diagnostic-{name}" for name in ["format", "lint", "0", "1", "2"]],
+        )
 
     def test_parser_interrupt_cancels_python_chain_without_starting_lint(self):
         from scripts.common import process_owner
@@ -1068,10 +1372,15 @@ class SyntaxSchedulingTest(unittest.TestCase):
                     kwargs["stdout"].write(b"format-cleaned-up\n")
                     stopped.set()
 
-        commands = [("Python format", ("format",)), ("Python lint", ("lint",)),
-                    ("PowerShell syntax", ("parser",))]
-        with (mock.patch.object(self.owner, "run_owned", side_effect=execute),
-              self.assertRaises(KeyboardInterrupt)):
+        commands = [
+            ("Python format", ("format",)),
+            ("Python lint", ("lint",)),
+            ("PowerShell syntax", ("parser",)),
+        ]
+        with (
+            mock.patch.object(self.owner, "run_owned", side_effect=execute),
+            self.assertRaises(KeyboardInterrupt),
+        ):
             list(self.owner._audit_command_results(commands))
         self.assertTrue(stopped.is_set())
         self.assertCountEqual(calls, ["format", "parser"])
@@ -1100,10 +1409,15 @@ class SyntaxSchedulingTest(unittest.TestCase):
                     kwargs["stdout"].write(b"held-cleaned-up\n")
                     stopped.set()
 
-        commands = [("Python format", ("first",)), ("PowerShell syntax", ("held",)),
-                    ("script unit tests", ("not-started",))]
-        with (mock.patch.object(self.owner, "run_owned", side_effect=execute),
-              mock.patch.object(self.owner, "run") as serial):
+        commands = [
+            ("Python format", ("first",)),
+            ("PowerShell syntax", ("held",)),
+            ("script unit tests", ("not-started",)),
+        ]
+        with (
+            mock.patch.object(self.owner, "run_owned", side_effect=execute),
+            mock.patch.object(self.owner, "run") as serial,
+        ):
             results = self.owner._audit_command_results(commands)
             self.assertEqual(next(results), ("Python format", 0))
             results.close()
@@ -1121,7 +1435,9 @@ class SyntaxSchedulingTest(unittest.TestCase):
         def write(text):
             if text == "python-diagnostic\n":
                 delivering.set()
-                self.assertTrue(parser_finished.wait(5), "output delivery blocked the parser")
+                self.assertTrue(
+                    parser_finished.wait(5), "output delivery blocked the parser"
+                )
             return original_write(text)
 
         def execute(command, **kwargs):
@@ -1134,11 +1450,17 @@ class SyntaxSchedulingTest(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0)
 
         commands = [("Python format", ("python",)), ("PowerShell syntax", ("parser",))]
-        with (mock.patch.object(self.output, "write", side_effect=write),
-              mock.patch.object(self.owner, "run_owned", side_effect=execute)):
-            self.assertEqual(list(self.owner._audit_command_results(commands)),
-                             [(label, 0) for label, _ in commands])
-        self.assertTrue(self.output.getvalue().endswith("python-diagnostic\nparser-diagnostic\n"))
+        with (
+            mock.patch.object(self.output, "write", side_effect=write),
+            mock.patch.object(self.owner, "run_owned", side_effect=execute),
+        ):
+            self.assertEqual(
+                list(self.owner._audit_command_results(commands)),
+                [(label, 0) for label, _ in commands],
+            )
+        self.assertTrue(
+            self.output.getvalue().endswith("python-diagnostic\nparser-diagnostic\n")
+        )
 
     def test_missing_parser_preserves_sibling_and_unicode_diagnostics(self):
         body = "x" * 65535 + "λ😀\n"
@@ -1156,25 +1478,50 @@ class SyntaxSchedulingTest(unittest.TestCase):
         self.assertIn(body, self.output.getvalue())
 
     def test_unknown_commands_and_uv_checks_remain_serial(self):
-        commands = [(label, (label,)) for label in
-                    ("Python format", "Python lint", "unknown", "script unit tests")]
-        with (mock.patch.object(self.owner, "run", side_effect=[0, OSError("no tool"), 0, 0]) as run,
-              mock.patch.object(self.owner, "run_owned") as parallel):
+        commands = [
+            (label, (label,))
+            for label in (
+                "Python format",
+                "Python lint",
+                "unknown",
+                "script unit tests",
+            )
+        ]
+        with (
+            mock.patch.object(
+                self.owner, "run", side_effect=[0, OSError("no tool"), 0, 0]
+            ) as run,
+            mock.patch.object(self.owner, "run_owned") as parallel,
+        ):
             results = list(self.owner._audit_command_results(commands))
         self.assertEqual(run.call_count, 4)
         parallel.assert_not_called()
         self.assertEqual([code for _, code in results], [0, 127, 0, 0])
 
     def test_real_parser_exit_codes_and_audit_cli_failure_summary(self):
-        commands = [(f"JavaScript syntax: {i}",
-                     (sys.executable, "-c", f"print('child-{i}'); raise SystemExit({i})"))
-                    for i in (0, 1)]
+        commands = [
+            (
+                f"JavaScript syntax: {i}",
+                (sys.executable, "-c", f"print('child-{i}'); raise SystemExit({i})"),
+            )
+            for i in (0, 1)
+        ]
         with (
-            mock.patch.object(self.owner, "script_source_targets", return_value=["fixture.js"]),
-            mock.patch.object(self.owner, "script_kind_map", return_value={"fixture.js": "javascript"}),
-            mock.patch.object(self.owner, "script_audit_context_issues", return_value=[]),
-            mock.patch.object(self.owner, "script_audit_findings", return_value=([], [])),
-            mock.patch.object(self.owner, "script_audit_commands", return_value=(commands, [])),
+            mock.patch.object(
+                self.owner, "script_source_targets", return_value=["fixture.js"]
+            ),
+            mock.patch.object(
+                self.owner, "script_kind_map", return_value={"fixture.js": "javascript"}
+            ),
+            mock.patch.object(
+                self.owner, "script_audit_context_issues", return_value=[]
+            ),
+            mock.patch.object(
+                self.owner, "script_audit_findings", return_value=([], [])
+            ),
+            mock.patch.object(
+                self.owner, "script_audit_commands", return_value=(commands, [])
+            ),
             mock.patch.object(self.owner, "git_context_label", return_value="fixture"),
         ):
             self.assertEqual(self.owner.main(["audit-scripts", "--quick"]), 1)

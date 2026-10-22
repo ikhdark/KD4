@@ -8,6 +8,7 @@ pub(crate) mod images;
 pub(crate) mod provider;
 pub(crate) mod rate_limits;
 pub(crate) mod requests;
+pub mod response_event_channel;
 pub(crate) mod responses_stream;
 pub(crate) mod safety_buffering;
 pub(crate) mod search;
@@ -22,6 +23,7 @@ pub const X_OPENAI_AUTHORIZATION_ERROR_HEADER: &str = "x-openai-authorization-er
 /// Base64-encoded JSON error details returned by the API identity layer.
 pub const X_ERROR_JSON_HEADER: &str = "x-error-json";
 
+pub use crate::requests::headers::X_CODEX_INSTALLATION_ID_HEADER;
 pub use crate::requests::headers::build_session_headers;
 pub use crate::responses_stream::X_CODEX_TURN_STATE_HEADER;
 pub use codex_client::RequestTelemetry;

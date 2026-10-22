@@ -414,8 +414,75 @@ pub struct ToolOutputProjectionJsonPointer {
     pub pointer: String,
 }
 
+fn json_trace_size_bound(value: &JsonValue, limit: usize, depth: usize) -> Option<usize> {
+    if depth > 64 {
+        return None;
+    }
+    let string_size = |value: &str| value.len().checked_mul(6)?.checked_add(2);
+    let size = match value {
+        JsonValue::Null => 4,
+        JsonValue::Bool(_) => 5,
+        JsonValue::Number(number) => {
+            struct Counter {
+                used: usize,
+                limit: usize,
+            }
+            impl std::fmt::Write for Counter {
+                fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                    self.used = self
+                        .used
+                        .checked_add(value.len())
+                        .filter(|used| *used <= self.limit)
+                        .ok_or(std::fmt::Error)?;
+                    Ok(())
+                }
+            }
+            let mut counter = Counter { used: 0, limit };
+            std::fmt::write(&mut counter, format_args!("{number}")).ok()?;
+            counter.used
+        }
+        JsonValue::String(value) => string_size(value)?,
+        JsonValue::Array(values) => {
+            let mut size = 2_usize;
+            for value in values {
+                size = size.checked_add(1)?.checked_add(json_trace_size_bound(
+                    value,
+                    limit.checked_sub(size)?,
+                    depth + 1,
+                )?)?;
+                if size > limit {
+                    return None;
+                }
+            }
+            size
+        }
+        JsonValue::Object(values) => {
+            let mut size = 2_usize;
+            for (key, value) in values {
+                size = size.checked_add(string_size(key)?)?.checked_add(2)?;
+                size = size.checked_add(json_trace_size_bound(
+                    value,
+                    limit.checked_sub(size)?,
+                    depth + 1,
+                )?)?;
+                if size > limit {
+                    return None;
+                }
+            }
+            size
+        }
+    };
+    (size <= limit).then_some(size)
+}
+
 /// Model-facing output contract returned by executable tool runtimes.
 pub trait ToolOutput: Send {
+    /// Allocation-free upper bound for optional trace result materialization.
+    /// Unknown producers opt out; this never changes model-facing output.
+    fn trace_detail_size_bound(&self, _limit: usize) -> Option<usize> {
+        None
+    }
+
     fn log_preview(&self) -> String;
 
     fn success_for_logging(&self) -> bool;
@@ -471,6 +538,14 @@ pub trait ToolOutput: Send {
     /// projection of a larger authoritative result.
     fn requires_canonical_artifact(&self) -> bool {
         false
+    }
+
+    /// Whether generic recovery storage may retain this producer's evidence.
+    /// Model-only/private outputs must opt out until typed recovery enforces
+    /// their access boundary. Fitting outputs stay native; oversized delivery
+    /// is explicitly unavailable rather than spilling into ordinary artifacts.
+    fn allows_generic_artifact_retention(&self) -> bool {
+        true
     }
 
     /// Host delivery status, distinct from execution success and output text.
@@ -554,6 +629,10 @@ impl<T> ToolOutput for Box<T>
 where
     T: ToolOutput + ?Sized,
 {
+    fn trace_detail_size_bound(&self, limit: usize) -> Option<usize> {
+        (**self).trace_detail_size_bound(limit)
+    }
+
     fn log_preview(&self) -> String {
         (**self).log_preview()
     }
@@ -594,6 +673,10 @@ where
 
     fn requires_canonical_artifact(&self) -> bool {
         (**self).requires_canonical_artifact()
+    }
+
+    fn allows_generic_artifact_retention(&self) -> bool {
+        (**self).allows_generic_artifact_retention()
     }
 
     fn model_delivery_unavailable(&self) -> bool {
@@ -660,7 +743,10 @@ impl std::fmt::Debug for JsonToolOutput {
             .debug_struct("JsonToolOutput")
             .field("value", &self.value)
             .field("model_value", &self.model_value)
-            .field("canonical_artifact_required", &self.canonical_artifact_required)
+            .field(
+                "canonical_artifact_required",
+                &self.canonical_artifact_required,
+            )
             .field("sampling_signal", &self.sampling_signal)
             .field("success", &self.success)
             .field("outcome", &self.outcome)
@@ -834,35 +920,55 @@ pub fn essential_projection_fields(value: &JsonValue) -> JsonValue {
 }
 
 fn small_control_value(value: &JsonValue, depth: usize, remaining: &mut usize) -> bool {
-    if depth > 4 || *remaining < 2 { return false; }
+    if depth > 4 || *remaining < 2 {
+        return false;
+    }
     *remaining -= 2;
     match value {
         JsonValue::String(text) => {
             let bytes = text.len().saturating_mul(6);
-            if bytes > *remaining { return false; }
+            if bytes > *remaining {
+                return false;
+            }
             *remaining -= bytes;
             true
         }
-        JsonValue::Array(values) => values.len() <= 16
-            && values.iter().all(|value| small_control_value(value, depth + 1, remaining)),
-        JsonValue::Object(fields) => fields.len() <= 16
-            && fields.iter().all(|(key, value)| {
-                let bytes = key.len().saturating_mul(6).saturating_add(4);
-                if bytes > *remaining { return false; }
-                *remaining -= bytes;
-                small_control_value(value, depth + 1, remaining)
-            }),
+        JsonValue::Array(values) => {
+            values.len() <= 16
+                && values
+                    .iter()
+                    .all(|value| small_control_value(value, depth + 1, remaining))
+        }
+        JsonValue::Object(fields) => {
+            fields.len() <= 16
+                && fields.iter().all(|(key, value)| {
+                    let bytes = key.len().saturating_mul(6).saturating_add(4);
+                    if bytes > *remaining {
+                        return false;
+                    }
+                    *remaining -= bytes;
+                    small_control_value(value, depth + 1, remaining)
+                })
+        }
         _ => {
             let bytes = value.to_string().len();
-            if bytes > *remaining { return false; }
+            if bytes > *remaining {
+                return false;
+            }
             *remaining -= bytes;
             true
         }
     }
 }
 
-fn essential_projection_fields_bounded(value: &JsonValue, depth: usize, remaining: &mut usize) -> JsonValue {
-    if depth > 16 || *remaining < 2 { return JsonValue::Null; }
+fn essential_projection_fields_bounded(
+    value: &JsonValue,
+    depth: usize,
+    remaining: &mut usize,
+) -> JsonValue {
+    if depth > 16 || *remaining < 2 {
+        return JsonValue::Null;
+    }
     *remaining -= 2;
     match value {
         JsonValue::Object(object) => JsonValue::Object(
@@ -874,12 +980,19 @@ fn essential_projection_fields_bounded(value: &JsonValue, depth: usize, remainin
                 // metadata. Keep the same depth/byte bounds; no payload is
                 // promoted merely because its traversal has higher priority.
                 .filter(|(key, _)| is_essential_key(key))
-                .chain(object.iter().filter(|(key, _)| key.as_str() == "structuredContent"))
-                .chain(object.iter().filter(|(key, _)|
-                    !is_essential_key(key) && key.as_str() != "structuredContent"))
+                .chain(
+                    object
+                        .iter()
+                        .filter(|(key, _)| key.as_str() == "structuredContent"),
+                )
+                .chain(object.iter().filter(|(key, _)| {
+                    !is_essential_key(key) && key.as_str() != "structuredContent"
+                }))
                 .filter_map(|(key, value)| {
                     let key_bytes = key.len().saturating_mul(6).saturating_add(4);
-                    if key_bytes > *remaining { return None; }
+                    if key_bytes > *remaining {
+                        return None;
+                    }
                     if is_essential_key(key) {
                         if small_control_value(value, 0, &mut 2048) {
                             let bytes = value.to_string().len();
@@ -900,12 +1013,20 @@ fn essential_projection_fields_bounded(value: &JsonValue, depth: usize, remainin
             // Null placeholders retain source indexes. If even placeholders
             // cannot fit, leave the entire array in the canonical artifact.
             let placeholders = values.len().saturating_mul(5);
-            if placeholders > *remaining { return JsonValue::Null; }
+            if placeholders > *remaining {
+                return JsonValue::Null;
+            }
             *remaining -= placeholders;
             let projected = values
                 .iter()
                 .map(|value| essential_projection_fields_bounded(value, depth + 1, remaining))
-                .map(|value| if is_empty_projection(&value) { JsonValue::Null } else { value })
+                .map(|value| {
+                    if is_empty_projection(&value) {
+                        JsonValue::Null
+                    } else {
+                        value
+                    }
+                })
                 .collect::<Vec<_>>();
             if projected.iter().all(is_empty_projection) {
                 JsonValue::Null
@@ -1014,6 +1135,16 @@ fn is_essential_key(key: &str) -> bool {
 }
 
 impl ToolOutput for JsonToolOutput {
+    fn trace_detail_size_bound(&self, limit: usize) -> Option<usize> {
+        Some(
+            json_trace_size_bound(&self.value, limit, 0)?.max(json_trace_size_bound(
+                self.model_value.as_ref().unwrap_or(&self.value),
+                limit,
+                0,
+            )?),
+        )
+    }
+
     fn code_mode_failure_is_error(&self) -> bool {
         !self.code_mode_failure_as_data
     }
@@ -1383,8 +1514,6 @@ mod canonical_tests {
         assert_eq!(JsonToolOutput::new(value), cloned);
     }
 
-
-
     #[test]
     fn model_projection_keeps_execution_hooks_and_canonical_result_raw() {
         let raw = serde_json::json!({"complete":true,"alias":true});
@@ -1393,19 +1522,34 @@ mod canonical_tests {
         // Populate the shared cache before overriding a clone's presentation.
         assert_eq!(original.log_preview(), raw.to_string());
         let output = original.clone().with_model_value(projected.clone());
-        let payload = ToolPayload::Function { arguments: "{}".to_string() };
+        let payload = ToolPayload::Function {
+            arguments: "{}".to_string(),
+        };
         assert_eq!(output.code_mode_result(&payload), raw);
-        assert_eq!(output.post_tool_use_response("call", &payload), Some(raw.clone()));
-        assert_eq!(output.canonical_result(&payload), original.canonical_result(&payload));
-        assert_eq!(output.projection_metadata().unwrap().spillable_text, vec![projected.to_string()]);
-        let ResponseInputItem::FunctionCallOutput { output: response, .. } = output.to_response_item("call", &payload) else {
+        assert_eq!(
+            output.post_tool_use_response("call", &payload),
+            Some(raw.clone())
+        );
+        assert_eq!(
+            output.canonical_result(&payload),
+            original.canonical_result(&payload)
+        );
+        assert_eq!(
+            output.projection_metadata().unwrap().spillable_text,
+            vec![projected.to_string()]
+        );
+        let ResponseInputItem::FunctionCallOutput {
+            output: response, ..
+        } = output.to_response_item("call", &payload)
+        else {
             panic!("function output expected");
         };
-        assert_eq!(response.body, FunctionCallOutputBody::Text(projected.to_string()));
+        assert_eq!(
+            response.body,
+            FunctionCallOutputBody::Text(projected.to_string())
+        );
         assert_eq!(original.log_preview(), raw.to_string());
     }
-
-
 
     #[test]
     fn canonical_json_sorts_recursively_and_records_lexical_ranges() {
@@ -1576,12 +1720,15 @@ mod canonical_tests {
         ]});
         let output = JsonToolOutput::new(value.clone());
         let metadata = output.projection_metadata().expect("JSON projection");
-        assert_eq!(metadata.essential_inline, serde_json::json!({"results": [
-            null,
-            {"status": "failed"},
-            null,
-            {"nested": [null, {"nextCursor": "page-2"}]}
-        ]}));
+        assert_eq!(
+            metadata.essential_inline,
+            serde_json::json!({"results": [
+                null,
+                {"status": "failed"},
+                null,
+                {"nested": [null, {"nextCursor": "page-2"}]}
+            ]})
+        );
         assert_eq!(metadata.spillable_text, vec![value.to_string()]);
         assert_eq!(output.value(), &value);
     }
@@ -1628,7 +1775,8 @@ mod canonical_tests {
 
     #[test]
     fn semantic_controls_survive_payload_budget_pressure() {
-        let payload = (0..1000).map(|i| (format!("field_{i:04}"), JsonValue::from("payload")))
+        let payload = (0..1000)
+            .map(|i| (format!("field_{i:04}"), JsonValue::from("payload")))
             .collect::<serde_json::Map<_, _>>();
         let value = serde_json::json!({
             "a_payload": payload, "complete": false, "truncated": true,
@@ -1636,17 +1784,21 @@ mod canonical_tests {
         });
         let output = JsonToolOutput::new(value.clone());
         let metadata = output.projection_metadata().unwrap();
-        assert_eq!(metadata.essential_inline, serde_json::json!({
-            "complete": false, "truncated": true,
-            "status": "partial", "nextCursor": "remaining-page"
-        }));
+        assert_eq!(
+            metadata.essential_inline,
+            serde_json::json!({
+                "complete": false, "truncated": true,
+                "status": "partial", "nextCursor": "remaining-page"
+            })
+        );
         assert_eq!(output.value(), &value);
         assert_eq!(metadata.spillable_text, vec![value.to_string()]);
     }
 
     #[test]
     fn semantic_controls_survive_mcp_metadata_budget_pressure() {
-        let payload = (0..1000).map(|i| (format!("field_{i:04}"), JsonValue::from("payload")))
+        let payload = (0..1000)
+            .map(|i| (format!("field_{i:04}"), JsonValue::from("payload")))
             .collect::<serde_json::Map<_, _>>();
         let result = codex_protocol::mcp::CallToolResult {
             content: vec![serde_json::json!({"type":"text", "text":"partial page"})],
@@ -1657,13 +1809,23 @@ mod canonical_tests {
             meta: Some(payload.into()),
         };
         let metadata = result.projection_metadata().unwrap();
-        assert_eq!(metadata.essential_inline["structuredContent"], serde_json::json!({
-            "complete": false, "truncated": true, "nextCursor": "remaining-page"
-        }));
+        assert_eq!(
+            metadata.essential_inline["structuredContent"],
+            serde_json::json!({
+                "complete": false, "truncated": true, "nextCursor": "remaining-page"
+            })
+        );
         assert!(metadata.essential_inline.to_string().len() < 8192);
         assert!(metadata.essential_inline.get("_meta").is_none());
-        let canonical = result.canonical_result(&ToolPayload::Function { arguments: "{}".into() }).unwrap();
-        assert_eq!(canonical.value.unwrap()["_meta"].as_object().unwrap().len(), 1000);
+        let canonical = result
+            .canonical_result(&ToolPayload::Function {
+                arguments: "{}".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            canonical.value.unwrap()["_meta"].as_object().unwrap().len(),
+            1000
+        );
     }
 
     #[test]
@@ -1740,6 +1902,31 @@ mod canonical_tests {
                 "tools": [{"name": "lookup"}],
                 "omitted_result_count": 4,
             })
+        );
+    }
+}
+#[cfg(test)]
+mod trace_byte_budget_regressions {
+    use super::*;
+
+    #[test]
+    fn trace_preflight_does_not_serialize_or_clone_an_oversized_result() {
+        let output = JsonToolOutput::new(serde_json::json!({"text": "x".repeat(2 * 1024 * 1024)}));
+        assert!(output.serialized.get().is_none());
+        assert_eq!(output.trace_detail_size_bound(1024), None);
+        assert!(
+            output.serialized.get().is_none(),
+            "admission must precede serialization"
+        );
+        let value = serde_json::json!({"text":"\"\\\n", "count": 0});
+        let output = JsonToolOutput::new(value.clone());
+        let bound = output.trace_detail_size_bound(1024).unwrap();
+        assert!(bound >= serde_json::to_vec(&value).unwrap().len());
+        assert_eq!(
+            output.code_mode_result(&ToolPayload::Function {
+                arguments: "{}".into()
+            }),
+            value
         );
     }
 }

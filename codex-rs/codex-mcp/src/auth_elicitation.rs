@@ -349,8 +349,8 @@ mod tests {
             "https://chatgpt.com/apps/google-calendar/connector_calendar"
         );
         assert_eq!(
-            plan.elicitation.meta[MCP_TOOL_CODEX_APPS_META_KEY]
-                [CONNECTOR_AUTH_FAILURE_META_KEY][CONNECTOR_AUTH_FAILURE_ERROR_HTTP_STATUS_CODE_KEY],
+            plan.elicitation.meta[MCP_TOOL_CODEX_APPS_META_KEY][CONNECTOR_AUTH_FAILURE_META_KEY]
+                [CONNECTOR_AUTH_FAILURE_ERROR_HTTP_STATUS_CODE_KEY],
             serde_json::json!(401)
         );
 

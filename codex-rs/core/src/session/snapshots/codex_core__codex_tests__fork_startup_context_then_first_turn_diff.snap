@@ -9,9 +9,12 @@ Scenario: First request after fork when startup preserves the parent baseline, t
     [01] <personality_spec>Use the following communication style for future messages:\nBe concise, direct...
     [02] <skills_usage_instructions>\n## How to use skills\n- Use the smallest skill set named by the use...
 01:message/developer:<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instruct...
-02:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
+02:message/user[2]:
+    [01] <SKILLS_INSTRUCTIONS>
+    [02] <ENVIRONMENT_CONTEXT:cwd=<CWD>>
 03:message/user:fork seed
-04:message/developer[2]:
+04:message/assistant:seed answer
+05:message/developer[2]:
     [01] <PERMISSIONS_INSTRUCTIONS>
     [02] <collaboration_mode>Fork turn collaboration instructions.</collaboration_mode>
-05:message/user:after fork
+06:message/user:after fork

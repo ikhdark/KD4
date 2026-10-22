@@ -132,7 +132,11 @@ mod tests {
             &external_agent_home,
             &project_root,
             "missing-root.jsonl",
-            &[record("user", "root is gone", &root.path().join("missing-repo"))],
+            &[record(
+                "user",
+                "root is gone",
+                &root.path().join("missing-repo"),
+            )],
         );
 
         let sessions = detect_recent_sessions(&external_agent_home, root.path()).expect("detect");

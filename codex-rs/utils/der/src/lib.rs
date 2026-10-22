@@ -7,6 +7,21 @@ pub fn first_der_item(der: &[u8]) -> Option<&[u8]> {
     der_item_length(der).map(|length| &der[..length])
 }
 
+/// Extracts an OpenSSL trusted certificate without broadening AUX trust policy.
+/// Rustls cannot enforce X509_AUX purposes. Only absent or empty AUX is supported;
+/// nonempty (including unknown) metadata is rejected before trust insertion/export.
+pub fn trusted_certificate_for_server_auth(der: &[u8]) -> Result<&[u8], &'static str> {
+    let certificate = first_der_item(der)
+        .filter(|item| item.first() == Some(&0x30))
+        .ok_or("invalid trusted certificate DER length or tag")?;
+    match &der[certificate.len()..] {
+        [] | [0x30, 0x00] => Ok(certificate),
+        _ => Err(
+            "unsupported OpenSSL trusted certificate AUX policy; use an explicitly unrestricted CERTIFICATE root or remove this root from the bundle",
+        ),
+    }
+}
+
 fn der_item_length(der: &[u8]) -> Option<usize> {
     let &length_octet = der.get(1)?;
     if length_octet & 0x80 == 0 {
@@ -36,6 +51,31 @@ fn der_item_length(der: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::first_der_item;
+    use super::trusted_certificate_for_server_auth;
+
+    #[test]
+    fn trusted_roots_cannot_discard_nonempty_or_malformed_aux() {
+        let certificate = [0x30, 0x01, 0xaa];
+        assert_eq!(
+            trusted_certificate_for_server_auth(&certificate),
+            Ok(&certificate[..])
+        );
+        let mut empty_aux = certificate.to_vec();
+        empty_aux.extend_from_slice(&[0x30, 0]);
+        assert_eq!(
+            trusted_certificate_for_server_auth(&empty_aux),
+            Ok(&certificate[..])
+        );
+        for aux in [
+            &[0x30, 3, 0x06, 1, 0x2a][..],
+            &[0x30, 2, 0x06][..],
+            &[0x05, 0][..],
+        ] {
+            let mut restricted = certificate.to_vec();
+            restricted.extend_from_slice(aux);
+            assert!(trusted_certificate_for_server_auth(&restricted).is_err());
+        }
+    }
 
     #[test]
     fn rejects_invalid_lengths_and_trims_trailing_x509_aux() {

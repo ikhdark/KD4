@@ -109,6 +109,33 @@ pub(crate) struct OutboundConnectionState {
     pub(crate) writer: mpsc::Sender<QueuedOutgoingMessage>,
     disconnect_sender: Option<CancellationToken>,
     transport_shutdown: CancellationToken,
+    stdio_delivery: Option<StdioDelivery>,
+}
+
+struct StdioDelivery {
+    sender: mpsc::Sender<(QueuedOutgoingMessage, tokio::sync::OwnedSemaphorePermit)>,
+    bytes: Arc<tokio::sync::Semaphore>,
+}
+
+const STDIO_DELIVERY_BYTES: usize = 16 * 1024 * 1024;
+
+fn stdio_message_bytes(message: &OutgoingMessage) -> Option<u32> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            if self.0 > STDIO_DELIVERY_BYTES {
+                return Err(std::io::Error::other("stdio delivery byte budget exceeded"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, message).ok()?;
+    Some(counter.0.max(1) as u32)
 }
 
 impl OutboundConnectionState {
@@ -127,6 +154,7 @@ impl OutboundConnectionState {
             writer,
             disconnect_sender,
             transport_shutdown,
+            stdio_delivery: None,
         }
     }
 
@@ -199,7 +227,7 @@ async fn send_message_to_connection(
     message: OutgoingMessage,
     write_complete_tx: Option<tokio::sync::oneshot::Sender<std::time::Instant>>,
 ) -> bool {
-    let Some(connection_state) = connections.get(&connection_id) else {
+    let Some(connection_state) = connections.get_mut(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
         return false;
     };
@@ -227,20 +255,50 @@ async fn send_message_to_connection(
             }
         }
     } else {
-        // Stdio applies backpressure even though its failure shuts down the runtime.
-        // A shutdown must still release a router waiting for an unread pipe.
-        let shutdown = connection_state.transport_shutdown.clone();
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => disconnect_connection(connections, connection_id),
-            result = writer.send(queued_message) => {
-                if result.is_err() {
-                    disconnect_connection(connections, connection_id)
-                } else {
-                    false
-                }
-            }
+        // The per-stdio owner may wait on its physical writer; the global
+        // router never does. Count and bytes both bound this additional stage.
+        if connection_state.transport_shutdown.is_cancelled() {
+            return disconnect_connection(connections, connection_id);
         }
+        let delivery = connection_state.stdio_delivery.get_or_insert_with(|| {
+            let (sender, mut receiver) =
+                mpsc::channel::<(QueuedOutgoingMessage, tokio::sync::OwnedSemaphorePermit)>(128);
+            let shutdown = connection_state.transport_shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        next = receiver.recv() => next,
+                    };
+                    let Some((message, credit)) = next else {
+                        break;
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.cancelled() => break,
+                        result = writer.send(message) => {
+                            if result.is_err() { shutdown.cancel(); break; }
+                        }
+                    }
+                    drop(credit);
+                }
+            });
+            StdioDelivery {
+                sender,
+                bytes: Arc::new(tokio::sync::Semaphore::new(STDIO_DELIVERY_BYTES)),
+            }
+        });
+        let credit = stdio_message_bytes(&queued_message.message)
+            .and_then(|bytes| delivery.bytes.clone().try_acquire_many_owned(bytes).ok());
+        if let Some(credit) = credit
+            && delivery.sender.try_send((queued_message, credit)).is_ok()
+        {
+            return false;
+        }
+        // Required output cannot be silently dropped. Stdio retains its
+        // existing process-lifetime failure policy when its owned budget ends.
+        disconnect_connection(connections, connection_id)
     }
 }
 

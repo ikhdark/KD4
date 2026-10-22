@@ -167,7 +167,11 @@ fn finish_driver_spawn_honors_stdin_open_without_process_exit() {
                 },
                 stdin_open,
             );
-            let sent = spawned.session.writer_sender().send(b"input".to_vec()).await;
+            let sent = spawned
+                .session
+                .writer_sender()
+                .send(b"input".to_vec())
+                .await;
             assert_eq!(sent.is_ok(), stdin_open);
             if stdin_open {
                 assert_eq!(writer_rx.recv().await, Some(b"input".to_vec()));
@@ -178,8 +182,6 @@ fn finish_driver_spawn_honors_stdin_open_without_process_exit() {
         }
     });
 }
-
-
 
 #[test]
 fn runner_stdin_writer_sends_close_stdin_after_input_eof() {

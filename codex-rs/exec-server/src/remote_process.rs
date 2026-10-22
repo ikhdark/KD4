@@ -18,7 +18,13 @@ use crate::protocol::WriteResponse;
 
 #[derive(Clone)]
 pub(crate) struct RemoteProcess {
-    client: LazyRemoteExecServerClient,
+    client: RemoteProcessClient,
+}
+
+#[derive(Clone)]
+enum RemoteProcessClient {
+    Lazy(LazyRemoteExecServerClient),
+    Bound(crate::client::ExecServerClient),
 }
 
 struct RemoteExecProcess {
@@ -28,7 +34,15 @@ struct RemoteExecProcess {
 impl RemoteProcess {
     pub(crate) fn new(client: LazyRemoteExecServerClient) -> Self {
         trace!("remote process new");
-        Self { client }
+        Self {
+            client: RemoteProcessClient::Lazy(client),
+        }
+    }
+
+    pub(crate) fn bound(client: crate::client::ExecServerClient) -> Self {
+        Self {
+            client: RemoteProcessClient::Bound(client),
+        }
     }
 
     async fn start(
@@ -36,9 +50,12 @@ impl RemoteProcess {
         params: ExecParams,
     ) -> Result<StartedExecProcess, crate::ExecServerError> {
         let deadline = tokio::time::Instant::now() + crate::client::PROCESS_START_TIMEOUT;
-        let client = tokio::time::timeout_at(deadline, self.client.get())
-            .await
-            .map_err(|_| crate::ExecServerError::ProcessStartTimedOut)??;
+        let client = match &self.client {
+            RemoteProcessClient::Lazy(client) => tokio::time::timeout_at(deadline, client.get())
+                .await
+                .map_err(|_| crate::ExecServerError::ProcessStartTimedOut)??,
+            RemoteProcessClient::Bound(client) => client.clone(),
+        };
         let session = client.start_process_before(params, deadline).await?;
 
         Ok(StartedExecProcess {
@@ -80,6 +97,13 @@ impl RemoteExecProcess {
 }
 
 impl ExecProcess for RemoteExecProcess {
+    fn termination_is_unreachable(&self) -> bool {
+        self.session.termination_is_unreachable()
+    }
+
+    fn record_unresolved_termination(&self, reason: &str) {
+        self.session.record_unresolved_termination(reason);
+    }
     fn process_id(&self) -> &crate::ProcessId {
         self.session.process_id()
     }

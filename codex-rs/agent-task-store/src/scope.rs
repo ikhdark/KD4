@@ -166,7 +166,6 @@ impl RepoScope {
             || self.recursive && is_descendant(&self.path, &other.path)
             || other.recursive && is_descendant(&other.path, &self.path)
     }
-
 }
 
 pub fn normalize_repo_scopes(
@@ -311,32 +310,34 @@ fn paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn comparison_key(path: &str) -> String {
-    if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_owned()
-    }
+    // Normalization resolves existing aliases to canonical filesystem spelling.
+    // Windows alone is not proof that a directory is case-insensitive.
+    path.to_owned()
 }
-
 
 pub(crate) fn filesystem_paths_equal(left: &str, right: &str) -> bool {
     paths_equal(left, right)
 }
 
-
-
-
 fn filesystem_identity_bytes(path: &Path) -> Vec<u8> {
-    let bytes = native_os_bytes(path.as_os_str());
-    // Canonical Windows paths normally preserve the filesystem's spelling. Lowercase
-    // valid Unicode paths for compatibility with the legacy identity while retaining a
-    // lossless wide-character fallback for paths that cannot be represented as UTF-8.
-    if let Some(path) = path.to_str() {
-        return path.to_lowercase().into_bytes();
-    }
-    let mut identity = b"windows\0".to_vec();
-    identity.extend(bytes);
+    // A new domain keeps legacy folded identities from being treated as proof
+    // of equality. The old store rows remain intact, not silently merged.
+    let mut identity = b"windows-exact-v2\0".to_vec();
+    identity.extend(native_os_bytes(path.as_os_str()));
     identity
+}
+
+/// Recognize old folded bindings only to leave them historical during upgrade.
+/// This must not be used as current filesystem identity or scope authorization.
+pub(crate) fn is_legacy_workspace_id(path: &Path, id: &str) -> bool {
+    let bytes = if let Some(path) = path.to_str() {
+        path.to_lowercase().into_bytes()
+    } else {
+        let mut bytes = b"windows\0".to_vec();
+        bytes.extend(native_os_bytes(path.as_os_str()));
+        bytes
+    };
+    hex::encode(Sha256::digest(bytes)) == id
 }
 
 fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
@@ -347,22 +348,27 @@ fn native_os_bytes(value: &std::ffi::OsStr) -> Vec<u8> {
         .collect::<Vec<_>>()
 }
 
-
-
-
 #[cfg(test)]
 mod audit_tests {
     use super::*;
 
     #[test]
     #[cfg(windows)]
-    fn audit_workspace_case_identity_is_windows_case_insensitive() {
-        assert_eq!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
+    fn scope_identity_does_not_assume_windows_is_case_insensitive() {
+        assert_ne!(comparison_key("Src/Lib.rs"), comparison_key("src/lib.rs"));
         let scope = RepoScope {
             path: "Src".to_string(),
             recursive: true,
         };
-        assert!(scope.covers_path("src/lib.rs"));
+        assert!(scope.covers_path("Src/lib.rs"));
+        assert!(!scope.covers_path("src/lib.rs"));
+        assert_ne!(
+            filesystem_identity_bytes(Path::new(r"C:\Repo")),
+            filesystem_identity_bytes(Path::new(r"C:\repo"))
+        );
+        let legacy = hex::encode(Sha256::digest(b"c:\\repo"));
+        assert!(is_legacy_workspace_id(Path::new(r"C:\Repo"), &legacy));
+        assert!(!is_legacy_workspace_id(Path::new(r"C:\Repo"), "corrupt"));
         // Case folding must not merge distinct names.
         assert!(!scope.covers_path("srcs/lib.rs"));
     }
@@ -383,4 +389,17 @@ mod audit_tests {
         assert_ne!(left_identity, right_identity);
     }
 
+    #[test]
+    fn existing_scope_aliases_follow_canonical_filesystem_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let upper = temp.path().join("Owner.rs");
+        let lower = temp.path().join("owner.rs");
+        std::fs::write(&upper, "upper").unwrap();
+        std::fs::write(&lower, "lower").unwrap();
+        let aliases =
+            std::fs::canonicalize(&upper).unwrap() == std::fs::canonicalize(&lower).unwrap();
+        let upper = normalize_repo_path(temp.path(), "Owner.rs").unwrap();
+        let lower = normalize_repo_path(temp.path(), "owner.rs").unwrap();
+        assert_eq!(upper == lower, aliases);
+    }
 }

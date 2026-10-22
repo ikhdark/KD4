@@ -63,18 +63,33 @@ fn terminal_output_loss_survives_wire_conversion_and_legacy_omission() {
         cell_id: crate::CellId::new("loss".to_string()),
         content_items: Vec::new(),
         error_text: None,
-        output_loss: Some(crate::OutputLoss { discarded_items: 3, discarded_bytes_lower_bound: 8192 }),
+        output_loss: Some(crate::OutputLoss {
+            discarded_items: 3,
+            discarded_bytes_lower_bound: 8192,
+        }),
     };
     let wire = WireRuntimeResponse::from(expected.clone());
     let mut encoded = serde_json::to_value(wire).unwrap();
-    assert_eq!(encoded["Result"]["output_loss"], json!({ "discarded_items": 3, "discarded_bytes_lower_bound": 8192 }));
+    assert_eq!(
+        encoded["Result"]["output_loss"],
+        json!({ "discarded_items": 3, "discarded_bytes_lower_bound": 8192 })
+    );
     let decoded: WireRuntimeResponse = serde_json::from_value(encoded.clone()).unwrap();
     assert_eq!(crate::RuntimeResponse::from(decoded), expected);
-    encoded["Result"].as_object_mut().unwrap().remove("output_loss");
+    encoded["Result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("output_loss");
     let legacy: WireRuntimeResponse = serde_json::from_value(encoded).unwrap();
-    assert_eq!(crate::RuntimeResponse::from(legacy), crate::RuntimeResponse::Result {
-        cell_id: crate::CellId::new("loss".to_string()), content_items: Vec::new(), error_text: None, output_loss: None,
-    });
+    assert_eq!(
+        crate::RuntimeResponse::from(legacy),
+        crate::RuntimeResponse::Result {
+            cell_id: crate::CellId::new("loss".to_string()),
+            content_items: Vec::new(),
+            error_text: None,
+            output_loss: None,
+        }
+    );
 }
 
 fn supported_versions() -> SupportedProtocolVersions {

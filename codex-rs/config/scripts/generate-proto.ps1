@@ -161,9 +161,17 @@ function Normalize-GeneratedProto {
     }
     Write-LfFile -Path $Path -Lines $withAllow.ToArray()
 
-    & rustfmt --edition 2024 $Path
-    if ($LASTEXITCODE -ne 0) {
-        throw "rustfmt failed with exit code $LASTEXITCODE"
+    # rustup selects the tracked toolchain from cwd, not the input filename.
+    # Resolve protoc in the caller's directory before entering this scope.
+    Push-Location -LiteralPath (Join-Path $repoRoot 'codex-rs')
+    try {
+        & rustfmt --edition 2024 $Path
+        if ($LASTEXITCODE -ne 0) {
+            throw "rustfmt failed with exit code $LASTEXITCODE"
+        }
+    }
+    finally {
+        Pop-Location
     }
 
     $lines = [System.IO.File]::ReadAllLines($Path)

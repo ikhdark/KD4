@@ -238,8 +238,7 @@ fn normalize_additional_permissions_rejects_glob_read_and_write_grants() {
                 .expect_err("URI glob grants are unsupported"),
         ] {
             assert_eq!(
-                err,
-                "glob file system permissions only support deny-read entries",
+                err, "glob file system permissions only support deny-read entries",
                 "access: {access:?}"
             );
         }

@@ -46,6 +46,28 @@ def _client_for_script(script: str) -> CodexClient:
     )
 
 
+@pytest.mark.parametrize(
+    "name,required",
+    [
+        ("ThreadStartParams", {}),
+        ("ThreadResumeParams", {"threadId": "thread"}),
+        ("ThreadForkParams", {"threadId": "thread"}),
+        ("TurnStartParams", {"threadId": "thread", "input": []}),
+    ],
+)
+@pytest.mark.parametrize("extra", [{}, {"serviceTier": None}, {"serviceTier": "priority"}])
+def test_typed_service_tier_preserves_wire_presence(name, required, extra) -> None:
+    import openai_codex.generated.v2_all as models
+    from openai_codex.client import _params_dict
+
+    params = getattr(models, name).model_validate({**required, **extra})
+    wire = _params_dict(params)
+    assert ("serviceTier" in wire) == ("serviceTier" in extra)
+    if "serviceTier" in extra:
+        assert wire["serviceTier"] == extra["serviceTier"]
+    assert _params_dict({**required, **extra}) == {**required, **extra}
+
+
 def test_over_cap_newline_free_stderr_is_drained_on_success() -> None:
     client = _client_for_script(
         _WRITE_NEWLINE_FREE_STDERR

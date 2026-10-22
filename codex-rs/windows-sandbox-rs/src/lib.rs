@@ -89,17 +89,36 @@ mod wait_timeout_tests {
     #[test]
     fn retained_capture_marks_truncation_only_after_observing_excess_bytes() {
         for (cap, chunks, expected, truncated) in [
-            (None, vec![b"abc".as_slice(), b"def", b""], b"abcdef".as_slice(), false),
+            (
+                None,
+                vec![b"abc".as_slice(), b"def", b""],
+                b"abcdef".as_slice(),
+                false,
+            ),
             (Some(0), vec![b"".as_slice()], b"".as_slice(), false),
             (Some(0), vec![b"a".as_slice(), b""], b"".as_slice(), true),
-            (Some(4), vec![b"ab".as_slice(), b"cd", b""], b"abcd".as_slice(), false),
-            (Some(4), vec![b"abc".as_slice(), b"def", b""], b"abcd".as_slice(), true),
+            (
+                Some(4),
+                vec![b"ab".as_slice(), b"cd", b""],
+                b"abcd".as_slice(),
+                false,
+            ),
+            (
+                Some(4),
+                vec![b"abc".as_slice(), b"def", b""],
+                b"abcd".as_slice(),
+                true,
+            ),
         ] {
             let mut capture = RetainedCapture::new(cap);
             for chunk in chunks {
                 capture.append(chunk);
             }
-            assert_eq!(capture.into_parts(), (expected.to_vec(), truncated), "cap={cap:?}");
+            assert_eq!(
+                capture.into_parts(),
+                (expected.to_vec(), truncated),
+                "cap={cap:?}"
+            );
         }
     }
 }
@@ -252,6 +271,8 @@ pub use acl::ensure_allow_mask_aces_with_inheritance;
 
 pub use acl::ensure_allow_write_aces;
 
+pub use acl::ensure_directory_traversal_aces;
+
 pub use acl::fetch_dacl_handle;
 
 pub use acl::path_mask_allows;
@@ -319,7 +340,11 @@ pub use ipc_framed::ExitPayload;
 
 pub use ipc_framed::FramedMessage;
 
+pub use ipc_framed::EmptyPayload;
+pub use ipc_framed::IO_CHUNK_BYTES;
+pub use ipc_framed::IO_WINDOW_CHUNKS;
 pub use ipc_framed::IPC_PROTOCOL_VERSION;
+pub use ipc_framed::OutputCredit;
 
 pub use ipc_framed::Message;
 
@@ -419,6 +444,7 @@ pub use setup_error::setup_error_path;
 
 pub use setup_error::write_setup_error_report;
 
+pub use stdio_bridge::StdioBridgeOutcome;
 pub use stdio_bridge::forward_sandbox_session_stdio;
 
 #[doc(hidden)]
@@ -1191,10 +1217,6 @@ mod windows_impl {
             }
         }
 
-
-
-
-
         fn capture_pipe_with_open_writer() -> (super::CapturePipeReader, HANDLE) {
             let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) =
                 // SAFETY: The helper returns successful pipe allocations to the test, which
@@ -1309,7 +1331,9 @@ mod windows_impl {
                     CloseHandle(out_w);
                 }
             });
-            started_rx.recv_timeout(Duration::from_secs(5)).expect("writer produced output");
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("writer produced output");
 
             let started_at = Instant::now();
             let output = reader.stop_and_collect();

@@ -38,6 +38,117 @@ fn status_arguments(step: &str, status: StepStatus) -> String {
 }
 
 #[tokio::test]
+async fn audit32_plan_tool_refreshes_next_prompt_without_deferred_executor() {
+    for deferred in [false, true] {
+        for source in [
+            ToolCallSource::Direct,
+            ToolCallSource::CodeMode {
+                cell_id: "audit32".into(),
+                parent_call_id: None,
+                runtime_tool_call_id: "audit32-refresh".into(),
+                nested_deadline: None,
+                cancellation_cause: None,
+            },
+        ] {
+            let (session, mut turn, _events) = make_session_and_context_with_rx().await;
+            let config = Arc::make_mut(
+                &mut Arc::get_mut(&mut turn)
+                    .expect("fixture turn is uniquely owned")
+                    .config,
+            );
+            if deferred {
+                config
+                    .features
+                    .enable(codex_features::Feature::DeferredExecutor)
+                    .unwrap();
+            } else {
+                config
+                    .features
+                    .disable(codex_features::Feature::DeferredExecutor)
+                    .unwrap();
+            }
+            let first = StepContext::for_test(Arc::clone(&turn));
+            let mut world = session
+                .record_context_updates_and_set_reference_context_item(&first)
+                .await
+                .unwrap();
+            session
+                .bind_context_baseline_candidate("initial-plan", "accepted")
+                .await;
+            assert!(
+                session
+                    .commit_context_baseline_candidate("initial-plan", "accepted")
+                    .await
+                    .unwrap()
+            );
+            for status in [StepStatus::Completed, StepStatus::Pending] {
+                let next = StepContext::for_test(Arc::clone(&turn));
+                PlanHandler
+                    .handle(ToolInvocation {
+                        session: Arc::clone(&session),
+                        step_context: Arc::clone(&next),
+                        cancellation_token: CancellationToken::new(),
+                        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                        call_id: "audit32-refresh".into(),
+                        tool_name: ToolName::plain("update_plan"),
+                        source: source.clone(),
+                        payload: ToolPayload::Function {
+                            arguments: if status == StepStatus::Completed {
+                                plan_arguments("required current task", status)
+                            } else {
+                                status_arguments("required current task", status)
+                            },
+                        },
+                    })
+                    .await
+                    .unwrap();
+                let updated = session
+                    .record_step_world_state_if_changed(&world, &next)
+                    .await
+                    .unwrap();
+                let expected = session.build_world_state_for_step(&next).await;
+                assert_eq!(
+                    updated.snapshot().section("task_state"),
+                    expected.snapshot().section("task_state")
+                );
+                let prompt = session
+                    .clone_history()
+                    .await
+                    .for_prompt(&turn.model_info.input_modalities);
+                let revision = session
+                    .services
+                    .plan_store
+                    .execution_snapshot()
+                    .await
+                    .unwrap()
+                    .revision;
+                let prompt = serde_json::to_string(&prompt).unwrap();
+                assert!(prompt.contains(&revision), "deferred={deferred}: {prompt}");
+                assert!(prompt.contains("required current task"));
+                // Desired state is not a delivered baseline until an exact
+                // physical request accepts the prepared update.
+                session
+                    .bind_context_baseline_candidate("updated-plan", "accepted")
+                    .await;
+                assert!(
+                    session
+                        .commit_context_baseline_candidate("updated-plan", "accepted")
+                        .await
+                        .unwrap()
+                );
+                let count = session.clone_history().await.raw_items().len();
+                session
+                    .record_step_world_state_if_changed(&updated, &next)
+                    .await
+                    .unwrap();
+                assert_eq!(session.clone_history().await.raw_items().len(), count);
+                world = updated;
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn plan_replacement_uses_the_captured_sampling_fence() {
     let (session, turn, _events) = make_session_and_context_with_rx().await;
     session
@@ -202,7 +313,8 @@ async fn plan_publication_is_ordered_and_cancelled_waiter_cannot_publish() {
 #[tokio::test]
 async fn plan_scope_change_uses_accepted_user_input_not_context_text() {
     use crate::session::TurnInput;
-    use codex_protocol::models::{ContentItem, ResponseItem};
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     let (session, turn, _events) = make_session_and_context_with_rx().await;
     let original = plan_update_args("Deploy", StepStatus::Pending);
     session.services.plan_store.update(original.clone()).await;
@@ -755,6 +867,8 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
     assert_eq!(
         properties.keys().map(String::as_str).collect::<Vec<_>>(),
         vec![
+            "acceptance",
+            "acceptance_reviewed_revision",
             "expected_revision",
             "expected_step_revisions",
             "explanation",
@@ -762,6 +876,7 @@ fn update_plan_schema_is_the_simple_checklist_contract() {
             "resolve",
             "scope_change_instructions",
             "scope_change_refs",
+            "scope_change_reviewed_revision",
             "set",
             "superseded",
             "workflow"

@@ -194,13 +194,44 @@ if (-not (Ensure-Command 'cargo')) {
 
 Write-Host "==> Configuring Rust toolchain per rust-toolchain.toml" -ForegroundColor Cyan
 
-# Pin to the workspace toolchain and install components
-$toolchain = '1.99.1'
+function Read-WorkspaceRustToolchain([string]$ManifestPath) {
+  # Bootstrap has no project Python dependency. Accept the manifest's simple
+  # string/array TOML schema explicitly and fail rather than guessing on drift.
+  $section = ''
+  $values = @{}
+  foreach ($line in [IO.File]::ReadAllLines($ManifestPath)) {
+    $line = $line.Trim()
+    if (-not $line -or $line.StartsWith('#')) { continue }
+    if ($line -match '^\[([A-Za-z_-]+)\]$') { $section = $Matches[1]; continue }
+    if ($section -ne 'toolchain' -or $line -notmatch '^(channel|components)\s*=\s*(.+)$') {
+      throw "Unsupported Rust toolchain declaration: $line"
+    }
+    $key, $value = $Matches[1], $Matches[2]
+    if ($values.ContainsKey($key)) { throw "Duplicate toolchain key: $key" }
+    if ($key -eq 'components') {
+      if (-not $value.StartsWith('[')) { throw 'toolchain.components must be an array' }
+      $components = ConvertFrom-Json -InputObject $value -ErrorAction Stop
+      $values[$key] = @($components)
+    }
+    else { $values[$key] = ConvertFrom-Json -InputObject $value -ErrorAction Stop }
+  }
+  if ($values['channel'] -isnot [string] -or $values['channel'] -notmatch '^[A-Za-z0-9_.-]+$' -or
+      $values['components'] -isnot [array] -or $values['components'].Count -eq 0) {
+    throw "Invalid workspace Rust toolchain manifest: $ManifestPath"
+  }
+  foreach ($component in $values['components']) {
+    if ($component -isnot [string] -or $component -notmatch '^[A-Za-z0-9_-]+$') { throw "Invalid Rust component" }
+  }
+  return $values
+}
+$workspaceToolchain = Read-WorkspaceRustToolchain (Join-Path $PSScriptRoot '..\rust-toolchain.toml')
+$toolchain = $workspaceToolchain['channel']
+$toolchainComponents = $workspaceToolchain['components']
 & rustup toolchain install $toolchain --profile minimal | Out-Host
 Assert-LastExitCode "rustup toolchain install $toolchain"
 & rustup default $toolchain | Out-Host
 Assert-LastExitCode "rustup default $toolchain"
-& rustup component add clippy rustfmt rust-src --toolchain $toolchain | Out-Host
+& rustup component add @toolchainComponents --toolchain $toolchain | Out-Host
 Assert-LastExitCode "rustup component add"
 
 # 6.5) LLVM/Clang (some crates/bindgen require clang/libclang)

@@ -39,6 +39,70 @@ impl WebSocketPongWatchdog {
     }
 }
 
+/// Shared read/write ownership for ordinary, potentially 64 MiB WebSocket
+/// messages. A Pong racing the Ping flush acknowledges that Ping as well.
+pub(crate) struct WebSocketLiveness {
+    state: std::sync::Mutex<(WebSocketPongWatchdog, u64)>,
+    changed: tokio::sync::Notify,
+}
+
+impl WebSocketLiveness {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            state: std::sync::Mutex::new((WebSocketPongWatchdog::new(timeout), 0)),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn pong_generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
+    }
+
+    pub(crate) fn ping_flushed(&self, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.1 == generation {
+            state.0.ping_sent(Instant::now());
+        }
+        self.changed.notify_one();
+    }
+
+    pub(crate) fn received_pong(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1 = state.1.wrapping_add(1);
+        state.0.received_pong();
+        self.changed.notify_one();
+    }
+
+    pub(crate) async fn expired(&self) {
+        loop {
+            let changed = self.changed.notified();
+            let deadline = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0
+                .deadline();
+            tokio::select! {
+                biased;
+                _ = changed => {},
+                _ = async { match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }} => return,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "websocket_pong_watchdog_tests.rs"]
 mod tests;

@@ -127,6 +127,11 @@ async fn run_local_image_turn(detail: Option<ImageDetail>) -> Result<Vec<Value>>
         "never",
         &BTreeMap::default(),
     )?;
+    // Original detail reaches only models that advertise it; fallback metadata
+    // for an unknown slug downgrades it to high.
+    let mut model = codex_models_manager::model_info::model_info_from_slug("mock-model");
+    model.supports_image_detail_original = true;
+    app_test_support::write_models_cache_with_models(codex_home.path(), vec![model])?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1103,7 +1108,8 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
     )
     .await??;
 
-    let event = wait_for_analytics_event(&capture, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
+    let event =
+        wait_for_analytics_event(&capture, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
     assert_eq!(event["event_params"]["thread_id"], thread.id);
     assert_eq!(event["event_params"]["session_id"], thread.session_id);
     assert_eq!(event["event_params"]["turn_id"], turn.id);
@@ -1254,7 +1260,8 @@ async fn turn_profile_tracks_blocking_tool_and_follow_up_sampling() -> Result<()
     )
     .await??;
 
-    let event = wait_for_analytics_event(&capture, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
+    let event =
+        wait_for_analytics_event(&capture, DEFAULT_READ_TIMEOUT, "codex_turn_event").await?;
     let params = &event["event_params"];
     assert_eq!(
         json!({
@@ -2357,7 +2364,9 @@ async fn turn_start_exec_approval_toggle_v2() -> Result<()> {
         loop {
             match mcp.read_next_message().await? {
                 JSONRPCMessage::Request(request) => {
-                    anyhow::bail!("unexpected approval request with approval_policy=never: {request:?}");
+                    anyhow::bail!(
+                        "unexpected approval request with approval_policy=never: {request:?}"
+                    );
                 }
                 JSONRPCMessage::Notification(notification)
                     if notification.method == "turn/completed" =>
@@ -2384,16 +2393,19 @@ async fn turn_start_exec_approval_decline_v2() -> Result<()> {
     let tmp = TempDir::new()?;
     let codex_home = tmp.path().to_path_buf();
 
-    let responses = vec![create_shell_command_sse_response(
-        vec![
-            "python3".to_string(),
-            "-c".to_string(),
-            "print(42)".to_string(),
-        ],
-        /*workdir*/ None,
-        Some(5000),
-        "call-decline",
-    )?, create_final_assistant_message_sse_response("command declined")?];
+    let responses = vec![
+        create_shell_command_sse_response(
+            vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print(42)".to_string(),
+            ],
+            /*workdir*/ None,
+            Some(5000),
+            "call-decline",
+        )?,
+        create_final_assistant_message_sse_response("command declined")?,
+    ];
     let server = create_mock_responses_server_sequence(responses).await;
     create_config_toml(
         codex_home.as_path(),
@@ -2776,32 +2788,51 @@ url = "ws://127.0.0.1:1"
     for case in [
         EnvironmentSelectionCase {
             name: "sticky_unset_turn_unset",
+            legacy_turn_cwd: false,
             sticky: None,
             turn: None,
             model_visible_cwd: Some("workspace"),
         },
         EnvironmentSelectionCase {
             name: "sticky_empty_turn_unset",
+            legacy_turn_cwd: false,
             sticky: Some(&[]),
             turn: None,
             model_visible_cwd: None,
         },
         EnvironmentSelectionCase {
             name: "sticky_local_turn_unset",
+            legacy_turn_cwd: false,
             sticky: Some(&["local"]),
             turn: None,
             model_visible_cwd: Some("sticky"),
         },
         EnvironmentSelectionCase {
             name: "sticky_local_turn_empty",
+            legacy_turn_cwd: false,
             sticky: Some(&["local"]),
             turn: Some(&[]),
             model_visible_cwd: None,
         },
         EnvironmentSelectionCase {
             name: "sticky_empty_turn_local",
+            legacy_turn_cwd: false,
             sticky: Some(&[]),
             turn: Some(&["local"]),
+            model_visible_cwd: Some("turn"),
+        },
+        EnvironmentSelectionCase {
+            name: "sticky_empty_cwd_only_stays_disabled",
+            legacy_turn_cwd: true,
+            sticky: Some(&[]),
+            turn: None,
+            model_visible_cwd: None,
+        },
+        EnvironmentSelectionCase {
+            name: "sticky_local_cwd_only_retargets_local",
+            legacy_turn_cwd: true,
+            sticky: Some(&["local"]),
+            turn: None,
             model_visible_cwd: Some("turn"),
         },
     ] {
@@ -2823,6 +2854,7 @@ url = "ws://127.0.0.1:1"
 
 struct EnvironmentSelectionCase {
     name: &'static str,
+    legacy_turn_cwd: bool,
     sticky: Option<&'static [&'static str]>,
     turn: Option<&'static [&'static str]>,
     /// Directory name of the local environment cwd the model is told about, if any.
@@ -2865,7 +2897,7 @@ async fn run_environment_selection_case(
                 text: format!("run {}", case.name),
                 text_elements: Vec::new(),
             }],
-            // No turn cwd: it would replace the sticky selection with the manager defaults.
+            cwd: case.legacy_turn_cwd.then(|| dirs.turn.to_path_buf()),
             environments: environment_params(case.turn, dirs.turn),
             model: Some("mock-model".to_string()),
             ..Default::default()
@@ -2953,7 +2985,6 @@ fn model_visible_environment_cwds(
         .map(|name| name.to_string_lossy().into_owned())
         .collect())
 }
-
 
 fn environment_params(ids: Option<&[&str]>, cwd: &Path) -> Option<Vec<TurnEnvironmentParams>> {
     ids.map(|ids| {
@@ -3051,6 +3082,7 @@ async fn turn_start_file_change_approval_v2() -> Result<()> {
         ref id,
         status,
         ref changes,
+        ..
     } = started_file_change
     else {
         unreachable!("loop ensures we break on file change items");
@@ -4171,8 +4203,9 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
                 JSONRPCMessage::Notification(notification)
                     if notification.method == "item/completed" =>
                 {
-                    let completed: ItemCompletedNotification =
-                        serde_json::from_value(notification.params.context("item/completed params")?)?;
+                    let completed: ItemCompletedNotification = serde_json::from_value(
+                        notification.params.context("item/completed params")?,
+                    )?;
                     if let ThreadItem::FileChange { id, status, .. } = completed.item
                         && id == "patch-call-2"
                     {
@@ -4187,7 +4220,10 @@ async fn turn_start_file_change_approval_accept_for_session_persists_v2() -> Res
                         serde_json::from_value(notification.params.context("completion params")?)?;
                     assert_eq!(completed.thread_id, thread.id);
                     assert_eq!(completed.turn.status, TurnStatus::Completed);
-                    assert!(patch_completed, "patch completion must precede turn completion");
+                    assert!(
+                        patch_completed,
+                        "patch completion must precede turn completion"
+                    );
                     return Ok::<(), anyhow::Error>(());
                 }
                 _ => {}
@@ -4287,6 +4323,7 @@ async fn turn_start_file_change_approval_decline_v2() -> Result<()> {
         ref id,
         status,
         ref changes,
+        ..
     } = started_file_change
     else {
         unreachable!("loop ensures we break on file change items");
@@ -4591,44 +4628,51 @@ fn write_apply_patch_models_cache(codex_home: &Path) -> Result<String> {
 async fn thread_queue_releases_accepted_input_while_turn_is_running() -> Result<()> {
     use codex_app_server_protocol::ThreadHistoryMode;
 
-    async fn queue_request(
-        mcp: &mut TestAppServer,
-        method: &str,
-        params: Value,
-    ) -> Result<Value> {
+    async fn queue_request(mcp: &mut TestAppServer, method: &str, params: Value) -> Result<Value> {
         let id = mcp.send_raw_request(method, Some(params)).await?;
         let response = timeout(
             DEFAULT_READ_TIMEOUT,
             mcp.read_stream_until_response_message(RequestId::Integer(id)),
-        ).await??;
+        )
+        .await??;
         Ok(response.result)
     }
 
     // The local store supports Legacy; paginated record recognition is unit-tested.
     let server = responses::start_mock_server().await;
-    let captured = responses::mount_sse_sequence(&server, vec![
-        create_request_user_input_sse_response("queued-question")?,
-        create_final_assistant_message_sse_response("First done")?,
-        create_final_assistant_message_sse_response("Follow-up done")?,
-    ]).await;
+    let captured = responses::mount_sse_sequence(
+        &server,
+        vec![
+            create_request_user_input_sse_response("queued-question")?,
+            create_final_assistant_message_sse_response("First done")?,
+            create_final_assistant_message_sse_response("Follow-up done")?,
+        ],
+    )
+    .await;
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml_with_chatgpt_base_url(
-        codex_home.path(), &server.uri(), &server.uri(),
+        codex_home.path(),
+        &server.uri(),
+        &server.uri(),
     )?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_managed_config()
-        .build().await?;
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
-    let id = mcp.send_thread_start_request_with_auto_env(ThreadStartParams {
-        model: Some("mock-model".into()),
-        history_mode: Some(ThreadHistoryMode::Legacy),
-        ..Default::default()
-    }).await?;
+    let id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".into()),
+            history_mode: Some(ThreadHistoryMode::Legacy),
+            ..Default::default()
+        })
+        .await?;
     let response = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_response_message(RequestId::Integer(id)),
-    ).await??;
+    )
+    .await??;
     let thread_id = to_response::<ThreadStartResponse>(response)?.thread.id;
     let params = json!({
         "threadId": thread_id,
@@ -4636,10 +4680,16 @@ async fn thread_queue_releases_accepted_input_while_turn_is_running() -> Result<
         "input": [{"type": "text", "text": "first queued prompt", "text_elements": []}],
     });
     let first = queue_request(&mut mcp, "thread/queue/add", params.clone()).await?;
-    let first_id = first["queuedSubmission"]["id"].as_str().context("queued id")?;
+    let first_id = first["queuedSubmission"]["id"]
+        .as_str()
+        .context("queued id")?;
     // The unanswered question keeps the turn running indefinitely. Queue
     // ownership must transfer without waiting for model/turn completion.
-    let question = timeout(DEFAULT_READ_TIMEOUT, mcp.read_stream_until_request_message()).await??;
+    let question = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_request_message(),
+    )
+    .await??;
     let ServerRequest::ToolRequestUserInput { request_id, .. } = question else {
         anyhow::bail!("expected pending question, got {question:?}");
     };
@@ -4649,49 +4699,109 @@ async fn thread_queue_releases_accepted_input_while_turn_is_running() -> Result<
         timeout(
             DEFAULT_READ_TIMEOUT,
             mcp.read_stream_until_notification_message("thread/queue/changed"),
-        ).await??;
+        )
+        .await??;
     }
     assert_eq!(captured.requests().len(), 1);
-    let listed = queue_request(&mut mcp, "thread/queue/list", json!({"threadId": thread_id})).await?;
-    assert_eq!(listed["data"], json!([]), "accepted input must leave the queue while running");
-    let deleted = queue_request(&mut mcp, "thread/queue/delete", json!({
-        "threadId": thread_id, "queuedSubmissionId": first_id,
-    })).await?;
-    assert_eq!(deleted["deleted"], false, "accepted input is already consumed, not still starting");
-    assert_eq!(queue_request(&mut mcp, "thread/queue/add", params).await?, first);
+    let listed = queue_request(
+        &mut mcp,
+        "thread/queue/list",
+        json!({"threadId": thread_id}),
+    )
+    .await?;
+    assert_eq!(
+        listed["data"],
+        json!([]),
+        "accepted input must leave the queue while running"
+    );
+    let deleted = queue_request(
+        &mut mcp,
+        "thread/queue/delete",
+        json!({
+            "threadId": thread_id, "queuedSubmissionId": first_id,
+        }),
+    )
+    .await?;
+    assert_eq!(
+        deleted["deleted"], false,
+        "accepted input is already consumed, not still starting"
+    );
+    assert_eq!(
+        queue_request(&mut mcp, "thread/queue/add", params).await?,
+        first
+    );
 
-    let second = queue_request(&mut mcp, "thread/queue/add", json!({
-        "threadId": thread_id,
-        "clientUserMessageId": "queued-second",
-        "input": [{"type": "text", "text": "next prompt", "text_elements": []}],
-    })).await?;
-    let second_id = second["queuedSubmission"]["id"].as_str().context("second queued id")?;
+    let second = queue_request(
+        &mut mcp,
+        "thread/queue/add",
+        json!({
+            "threadId": thread_id,
+            "clientUserMessageId": "queued-second",
+            "input": [{"type": "text", "text": "next prompt", "text_elements": []}],
+        }),
+    )
+    .await?;
+    let second_id = second["queuedSubmission"]["id"]
+        .as_str()
+        .context("second queued id")?;
     let updated_input = json!([{"type": "text", "text": "edited follow-up", "text_elements": []}]);
-    let updated = queue_request(&mut mcp, "thread/queue/update", json!({
-        "threadId": thread_id, "queuedSubmissionId": second_id, "input": updated_input,
-    })).await?;
+    let updated = queue_request(
+        &mut mcp,
+        "thread/queue/update",
+        json!({
+            "threadId": thread_id, "queuedSubmissionId": second_id, "input": updated_input,
+        }),
+    )
+    .await?;
     assert_eq!(updated["queuedSubmission"]["input"], updated_input);
-    let listed = queue_request(&mut mcp, "thread/queue/list", json!({"threadId": thread_id})).await?;
+    let listed = queue_request(
+        &mut mcp,
+        "thread/queue/list",
+        json!({"threadId": thread_id}),
+    )
+    .await?;
     assert_eq!(listed["data"], json!([updated["queuedSubmission"]]));
-    assert_eq!(captured.requests().len(), 1, "a waiting follow-up must not overlap the active turn");
+    assert_eq!(
+        captured.requests().len(),
+        1,
+        "a waiting follow-up must not overlap the active turn"
+    );
 
-    mcp.send_response(request_id, json!({"answers": {"confirm_path": {"answers": ["yes"]}}})).await?;
+    mcp.send_response(
+        request_id,
+        json!({"answers": {"confirm_path": {"answers": ["yes"]}}}),
+    )
+    .await?;
     for _ in 0..2 {
         let notification = timeout(
             DEFAULT_READ_TIMEOUT,
             mcp.read_stream_until_notification_message("turn/completed"),
-        ).await??;
-        let completed: TurnCompletedNotification = serde_json::from_value(
-            notification.params.context("completion params")?,
-        )?;
+        )
+        .await??;
+        let completed: TurnCompletedNotification =
+            serde_json::from_value(notification.params.context("completion params")?)?;
         assert_eq!(completed.thread_id, thread_id);
         assert_eq!(completed.turn.status, TurnStatus::Completed);
     }
-    let listed = queue_request(&mut mcp, "thread/queue/list", json!({"threadId": thread_id})).await?;
+    let listed = queue_request(
+        &mut mcp,
+        "thread/queue/list",
+        json!({"threadId": thread_id}),
+    )
+    .await?;
     assert_eq!(listed["data"], json!([]));
     let requests = captured.requests();
-    assert_eq!(requests.len(), 3, "accepted client retries must not replay the first prompt");
-    assert!(requests[2].message_input_texts("user").join("\n").contains("edited follow-up"));
+    assert_eq!(
+        requests.len(),
+        3,
+        "accepted client retries must not replay the first prompt"
+    );
+    assert!(
+        requests[2]
+            .message_input_texts("user")
+            .join("\n")
+            .contains("edited follow-up")
+    );
     Ok(())
 }
 

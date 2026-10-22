@@ -186,6 +186,7 @@ pub(crate) async fn execute_user_shell_command(
         .emit_turn_item_started(
             turn_context.as_ref(),
             &TurnItem::CommandExecution(CommandExecutionItem {
+                environment: Some(turn_environment.provenance()),
                 output_metadata: None,
                 id: call_id.clone(),
                 process_id: None,
@@ -252,6 +253,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        environment: Some(turn_environment.provenance()),
                         output_metadata: None,
                         id: call_id,
                         process_id: None,
@@ -282,6 +284,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        environment: Some(turn_environment.provenance()),
                         output_metadata: None,
                         id: call_id.clone(),
                         process_id: None,
@@ -339,6 +342,7 @@ pub(crate) async fn execute_user_shell_command(
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
                     TurnItem::CommandExecution(CommandExecutionItem {
+                        environment: Some(turn_environment.provenance()),
                         output_metadata: None,
                         id: call_id,
                         process_id: None,
@@ -396,7 +400,7 @@ async fn execute_local_user_shell_command(
         )
     })?;
     let shell_snapshot_location = turn_environment
-        .shell_snapshot(turn_environment.cwd())
+        .shell_snapshot_for_config(turn_environment.cwd(), &turn_context.config)
         .await;
     let mut exec_env_map = create_env(
         &turn_context.config.permissions.shell_environment_policy,
@@ -452,6 +456,7 @@ async fn execute_local_user_shell_command(
         call_id: call_id.to_string(),
         tx_event: session.get_tx_event(),
         progress: None,
+        delivery_recovery: None,
     });
 
     match execute_exec_request(exec_env, stdout_stream, /*after_spawn*/ None)
@@ -494,7 +499,7 @@ async fn execute_remote_user_shell_command(
             .collect(),
     };
     let shell_snapshot = turn_environment
-        .shell_snapshot(turn_environment.cwd())
+        .shell_snapshot_for_config(turn_environment.cwd(), &turn_context.config)
         .await;
     let mut env = policy.r#set.clone();
     env.insert(
@@ -509,7 +514,7 @@ async fn execute_remote_user_shell_command(
         &mut env,
     );
     let process_id = call_id.into();
-    let exec_backend = turn_environment.environment.get_exec_backend();
+    let exec_backend = turn_environment.exec_backend();
     let params = ExecParams {
         process_id,
         argv: display_command,
@@ -609,7 +614,14 @@ async fn terminate_remote_process_after_error(
 }
 
 async fn retry_remote_user_shell_termination(process: Arc<dyn ExecProcess>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
+        if process.termination_is_unreachable() || tokio::time::Instant::now() >= deadline {
+            let reason = "remote user shell termination remains unconfirmed; pinned session is unreachable or cleanup budget expired";
+            process.record_unresolved_termination(reason);
+            warn!(process_id = %process.process_id(), "{reason}");
+            return;
+        }
         match tokio::time::timeout(Duration::from_secs(1), process.terminate()).await {
             Ok(Ok(())) => return,
             result => {

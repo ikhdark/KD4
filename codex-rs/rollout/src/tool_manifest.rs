@@ -334,12 +334,20 @@ fn apply_delta(
             .collect::<Vec<_>>();
         let unique_names = names.iter().collect::<HashSet<_>>();
         if unique_names.len() != names.len() {
-            return Err(format!("ambiguous tool manifest identities in {collection}"));
+            return Err(format!(
+                "ambiguous tool manifest identities in {collection}"
+            ));
         }
         let mut removal_ids = HashSet::new();
-        for entry in removed.iter().filter(|entry| entry.collection == collection) {
+        for entry in removed
+            .iter()
+            .filter(|entry| entry.collection == collection)
+        {
             if !removal_ids.insert(&entry.name) || !unique_names.contains(&entry.name) {
-                return Err(format!("invalid tool manifest removal {collection}/{}", entry.name));
+                return Err(format!(
+                    "invalid tool manifest removal {collection}/{}",
+                    entry.name
+                ));
             }
         }
         let removed_names = removed
@@ -376,10 +384,16 @@ fn apply_delta(
         }
         let reconstructed = named_entries(&values);
         let mut final_names = HashSet::new();
-        if reconstructed.iter().any(|entry| !final_names.insert(&entry.name))
-            || additions.iter().any(|entry| reconstructed[entry.index].name != entry.name)
+        if reconstructed
+            .iter()
+            .any(|entry| !final_names.insert(&entry.name))
+            || additions
+                .iter()
+                .any(|entry| reconstructed[entry.index].name != entry.name)
         {
-            return Err(format!("invalid tool manifest addition identity in {collection}"));
+            return Err(format!(
+                "invalid tool manifest addition identity in {collection}"
+            ));
         }
         manifest.insert(collection.to_string(), Value::Array(values));
     }

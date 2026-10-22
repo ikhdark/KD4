@@ -21,6 +21,24 @@ from scripts.codex_package.test_layout import write_pe
 
 
 class CliEntrypointTest(unittest.TestCase):
+    def test_checkout_notices_reach_canonical_preflight_and_npm_staging(self):
+        from scripts.codex_package import stage_npm_packages
+
+        repo = Path(__file__).resolve().parents[2]
+        builder = stage_npm_packages.load_build_module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli.validate_cli_request(
+                request_args(),
+                cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
+                root / "package",
+            )
+            npm = root / "npm"
+            npm.mkdir()
+            builder.stage_sources(npm, "1.2.3", "codex")
+            for name in ("LICENSE", "NOTICE"):
+                self.assertEqual((npm / name).read_bytes(), (repo / name).read_bytes())
+
     def test_help_from_any_cwd_with_or_without_safe_path(self) -> None:
         repo = Path(__file__).resolve().parents[2]
         script = repo / "scripts" / "codex_package" / "build_codex_package.py"
@@ -378,6 +396,62 @@ class CliPerformanceFlagsTest(unittest.TestCase):
 
 
 class CliPreflightTest(unittest.TestCase):
+    def test_restart_recovers_each_publication_boundary_without_reencoding(self):
+        for boundary in (1, 2, "committed"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                outputs = [root / "one.zip", root / "two.zip"]
+                for path in outputs:
+                    path.write_bytes(b"old")
+                code = (
+                    "import os\nfrom pathlib import Path\nfrom scripts.codex_package import cli\n"
+                    f"root=Path({str(root)!r})\n"
+                    "paths=[root/'one.zip',root/'two.zip']\n"
+                    "with cli.publication_transaction(paths) as publication:\n"
+                    " for index,path in enumerate(paths,1):\n"
+                    "  staged=root/('staged-'+str(index))\n"
+                    "  staged.write_bytes(b'new')\n"
+                    "  publication.activate(staged,path,force=True)\n"
+                    f"  if index == {boundary!r}: os._exit(93)\n"
+                    " publication.state['phase']='committed'\n"
+                    " cli.write_json_atomic(publication.journal,publication.state)\n"
+                    " os._exit(93)\n"
+                )
+                result = subprocess.run(
+                    [sys.executable, "-B", "-c", code],
+                    cwd=Path(__file__).resolve().parents[2],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self.assertEqual(result.returncode, 93, result.stderr)
+                with cli.publication_transaction(outputs):
+                    self.assertEqual(
+                        [path.read_bytes() for path in outputs],
+                        [b"new" if boundary == "committed" else b"old"] * 2,
+                    )
+                self.assertFalse(list(root.glob(".*.backup-*")))
+                self.assertFalse(list(root.glob(".*.publish*.json")))
+
+    def test_publication_recovery_refuses_external_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, staged = root / "output.zip", root / "staged"
+            output.write_bytes(b"old")
+            staged.write_bytes(b"new")
+            publication = cli.Publication([output])
+            publication.activate(staged, output, force=True)
+            output.write_bytes(b"external edit")
+            with self.assertRaisesRegex(RuntimeError, "external edits"):
+                with cli.publication_transaction([output]):
+                    self.fail("unverified generation entered a new transaction")
+            self.assertEqual(output.read_bytes(), b"external edit")
+            self.assertEqual(next(root.glob(".*.backup-*")).read_bytes(), b"old")
+
     def setUp(self) -> None:
         use_package_notice_fixture(self, cli)
 
@@ -392,14 +466,19 @@ class CliPreflightTest(unittest.TestCase):
                 for path in (rg, alias):
                     with self.subTest(role=name, path=path):
                         args = request_args(
-                            target="x86_64-pc-windows-msvc", variant="codex",
-                            package_dir=root / "package", rg_bin=rg, **{name: path},
+                            target="x86_64-pc-windows-msvc",
+                            variant="codex",
+                            package_dir=root / "package",
+                            rg_bin=rg,
+                            **{name: path},
                         )
                         with (
                             mock.patch.object(cli, "parse_args", return_value=args),
                             mock.patch.object(cli, "package_build_lease") as lease,
                             mock.patch.object(cli, "resolve_package_inputs") as inputs,
-                            self.assertRaisesRegex(RuntimeError, "distinct executables"),
+                            self.assertRaisesRegex(
+                                RuntimeError, "distinct executables"
+                            ),
                         ):
                             cli.main()
                         lease.assert_not_called()
@@ -698,7 +777,10 @@ class CliPreflightTest(unittest.TestCase):
 
     def test_publication_rollback_removes_owned_output_after_interrupt(self) -> None:
         for directory in (False, True):
-            with self.subTest(directory=directory), tempfile.TemporaryDirectory() as temp:
+            with (
+                self.subTest(directory=directory),
+                tempfile.TemporaryDirectory() as temp,
+            ):
                 root = Path(temp)
                 staged, output = root / "staged", root / "output"
                 if directory:

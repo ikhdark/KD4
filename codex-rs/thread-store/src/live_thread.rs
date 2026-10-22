@@ -319,46 +319,79 @@ impl LiveThread {
             return Ok(());
         }
         let (items, measurement) = if self.persistence_telemetry.is_enabled() {
-            let (items, measurement) =
-                measure_and_filter_rollout_items_with_activity(raw_items, self.history_mode, capture_activity);
+            let (items, measurement) = measure_and_filter_rollout_items_with_activity(
+                raw_items,
+                self.history_mode,
+                capture_activity,
+            );
             (items, Some(measurement))
         } else {
             (
-                persisted_rollout_items_with_activity(raw_items, self.history_mode, capture_activity),
+                persisted_rollout_items_with_activity(
+                    raw_items,
+                    self.history_mode,
+                    capture_activity,
+                ),
                 None,
             )
         };
-        if let Some(measurement) = measurement.as_ref() {
-            self.persistence_telemetry
-                .record_batch(raw_items, measurement);
-        }
         if items.is_empty() {
             return Ok(());
         }
         // Keep canonical submission, observation and metadata acknowledgement in one
         // per-thread critical section, shared with explicit updates and barriers.
         let mut metadata_sync = self.metadata_sync.lock().await;
+        let observation_was_uncertain = metadata_sync.history_observation_uncertain;
+        if observation_was_uncertain {
+            // Settle any previously admitted write before submitting a successor,
+            // even when rebuilding its metadata projection is unavailable.
+            self.thread_store.persist_thread(self.thread_id).await?;
+        }
         let terminal_append =
             TerminalAppendGuard::new(Arc::clone(&self.terminal_events), items.as_slice());
+        // A failed projection recovery must not prevent a distinct canonical
+        // append. The store still owns stream ordering; do not replay the
+        // uncertain batch or acknowledge metadata derived from a partial prefix.
+        metadata_sync.history_observation_uncertain = true;
         self.thread_store
             .append_persisted_items_ordered(self.thread_id, items.as_slice())
             .await?;
+        // Commit measurements in canonical acceptance order, not arrival order.
+        // A later durability failure does not undo an accepted append.
+        if let Some(measurement) = measurement.as_ref() {
+            self.persistence_telemetry
+                .record_batch(raw_items, measurement);
+        }
         terminal_append.commit(items.as_slice());
-        let update = metadata_sync.observe_appended_items(items.as_slice());
+        let update = if observation_was_uncertain {
+            if !durable {
+                // Ordered appends defer projection repair to the next barrier.
+                return Ok(());
+            }
+            self.recover_uncertain_metadata(&mut metadata_sync).await?;
+            metadata_sync.take_pending_update_for_existing_history()
+        } else {
+            let update = metadata_sync.observe_appended_items(items.as_slice());
+            metadata_sync.history_observation_uncertain = false;
+            update
+        };
         // Acceptance and durability are separate: a failed barrier must retain the
         // observed metadata for flush recovery, without resubmitting the history.
         if durable {
             self.thread_store.flush_thread(self.thread_id).await?;
         }
         if durable && let Some(update) = update {
-            self.thread_store
-                .update_thread_metadata_ack(UpdateThreadMetadataParams {
+            let applied = self
+                .thread_store
+                .update_thread_metadata_applied(UpdateThreadMetadataParams {
                     thread_id: self.thread_id,
                     patch: update.patch.clone(),
                     include_archived: true,
                 })
                 .await?;
-            metadata_sync.mark_pending_update_applied(&update);
+            if applied {
+                metadata_sync.mark_pending_update_applied(&update);
+            }
         }
         Ok(())
     }
@@ -370,6 +403,7 @@ impl LiveThread {
     pub async fn persist(&self) -> ThreadStoreResult<()> {
         let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.persist_thread(self.thread_id).await?;
+        self.recover_uncertain_metadata(&mut metadata_sync).await?;
         let update = metadata_sync.take_pending_update();
         self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await
@@ -382,6 +416,7 @@ impl LiveThread {
     pub async fn flush(&self) -> ThreadStoreResult<()> {
         let mut metadata_sync = self.metadata_sync.lock().await;
         self.thread_store.flush_thread(self.thread_id).await?;
+        self.recover_uncertain_metadata(&mut metadata_sync).await?;
         let update = metadata_sync.take_pending_update_for_existing_history();
         self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await
@@ -397,6 +432,7 @@ impl LiveThread {
         self.thread_store
             .flush_thread_durable(self.thread_id)
             .await?;
+        self.recover_uncertain_metadata(&mut metadata_sync).await?;
         let update = metadata_sync.take_pending_update_for_existing_history();
         self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await
@@ -408,6 +444,7 @@ impl LiveThread {
     )]
     pub async fn shutdown(&self) -> ThreadStoreResult<()> {
         let mut metadata_sync = self.metadata_sync.lock().await;
+        self.recover_uncertain_metadata(&mut metadata_sync).await?;
         self.thread_store.shutdown_thread(self.thread_id).await?;
         let update = metadata_sync.take_pending_update_for_existing_history();
         self.apply_pending_metadata_update(&mut metadata_sync, update)
@@ -515,16 +552,21 @@ impl LiveThread {
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
         let mut metadata_sync = self.metadata_sync.lock().await;
+        self.recover_uncertain_metadata(&mut metadata_sync).await?;
         let update = metadata_sync.take_pending_update();
         self.apply_pending_metadata_update(&mut metadata_sync, update)
             .await?;
-        self.thread_store
+        let explicit_patch = patch.clone();
+        let thread = self
+            .thread_store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
                 patch,
                 include_archived,
             })
-            .await
+            .await?;
+        metadata_sync.record_explicit_update(explicit_patch);
+        Ok(thread)
     }
 
     /// Returns the live local rollout path for legacy local-only callers.
@@ -544,6 +586,36 @@ impl LiveThread {
             .map(Some)
     }
 
+    async fn recover_uncertain_metadata(
+        &self,
+        sync: &mut ThreadMetadataSync,
+    ) -> ThreadStoreResult<()> {
+        if sync.history_observation_uncertain {
+            self.thread_store.flush_thread(self.thread_id).await?;
+            // Never replay an uncertain write. The store's authoritative history
+            // barrier waits for its admitted projection worker as well.
+            let history = self
+                .thread_store
+                .load_history(LoadThreadHistoryParams {
+                    thread_id: self.thread_id,
+                    include_archived: true,
+                })
+                .await;
+            match history {
+                Ok(history) => {
+                    sync.observe_appended_items(&history.items);
+                }
+                // A barrier with no accepted items leaves a genuinely lazy local
+                // thread pathless; do not invent observed facts for that case.
+                Err(crate::ThreadStoreError::RolloutNotMaterialized { path, .. })
+                    if matches!(tokio::fs::try_exists(&path).await, Ok(false)) => {}
+                Err(error) => return Err(error),
+            }
+            sync.history_observation_uncertain = false;
+        }
+        Ok(())
+    }
+
     async fn apply_pending_metadata_update(
         &self,
         metadata_sync: &mut ThreadMetadataSync,
@@ -552,14 +624,17 @@ impl LiveThread {
         let Some(update) = update else {
             return Ok(());
         };
-        self.thread_store
-            .update_thread_metadata_ack(UpdateThreadMetadataParams {
+        let applied = self
+            .thread_store
+            .update_thread_metadata_applied(UpdateThreadMetadataParams {
                 thread_id: self.thread_id,
                 patch: update.patch.clone(),
                 include_archived: true,
             })
             .await?;
-        metadata_sync.mark_pending_update_applied(&update);
+        if applied {
+            metadata_sync.mark_pending_update_applied(&update);
+        }
         Ok(())
     }
 }
@@ -623,8 +698,11 @@ mod tests {
         ));
         let thread_id = ThreadId::new();
         let live = LiveThread::create(
-            store.clone(), create_params(thread_id, home.path().to_path_buf()),
-        ).await.unwrap();
+            store.clone(),
+            create_params(thread_id, home.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
         let path = store.live_rollout_path(thread_id).await.unwrap();
         let event =
             EventMsg::McpToolCallProgress(codex_protocol::protocol::McpToolCallProgressEvent {

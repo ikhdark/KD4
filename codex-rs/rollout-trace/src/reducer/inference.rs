@@ -25,7 +25,7 @@ pub(super) struct StartedInferenceCall {
     pub(super) codex_turn_id: String,
     pub(super) model: String,
     pub(super) provider_name: String,
-    pub(super) request_payload: RawPayloadRef,
+    pub(super) request_payload: Option<RawPayloadRef>,
 }
 
 impl TraceReducer {
@@ -67,13 +67,18 @@ impl TraceReducer {
             );
         }
 
-        let request_item_ids = self.reduce_inference_request(
-            wall_time_unix_ms,
-            &inference_call_id,
-            &thread_id,
-            &codex_turn_id,
-            &request_payload,
-        )?;
+        let owner = turn.execution.clone();
+        let request_item_ids = if let Some(request_payload) = &request_payload {
+            self.reduce_inference_request(
+                wall_time_unix_ms,
+                &inference_call_id,
+                &thread_id,
+                &codex_turn_id,
+                request_payload,
+            )?
+        } else {
+            Vec::new()
+        };
 
         self.thread_mut(&thread_id)?;
 
@@ -82,7 +87,7 @@ impl TraceReducer {
             InferenceCall {
                 inference_call_id,
                 thread_id,
-                codex_turn_id,
+                codex_turn_id: codex_turn_id.clone(),
                 execution: ExecutionWindow {
                     started_at_unix_ms: wall_time_unix_ms,
                     started_seq: seq,
@@ -91,6 +96,9 @@ impl TraceReducer {
                     status: ExecutionStatus::Running,
                 },
                 model: started.model,
+                observed_terminal_status: None,
+                observed_terminal: None,
+                owner_end: None,
                 provider_name: started.provider_name,
                 response_id: None,
                 upstream_request_id: None,
@@ -98,10 +106,21 @@ impl TraceReducer {
                 response_item_ids: Vec::new(),
                 tool_call_ids_started_by_response: Vec::new(),
                 usage: None,
-                raw_request_payload_id: started.request_payload.raw_payload_id,
+                raw_request_payload_id: started
+                    .request_payload
+                    .map(|payload| payload.raw_payload_id),
                 raw_response_payload_id: None,
             },
         );
+        // A delayed start may persist after owner-end cleanup already ran.
+        if let Some((end_seq, end_time)) = owner.ended_seq.zip(owner.ended_at_unix_ms) {
+            self.close_running_inference_calls_for_turn_end(
+                end_seq,
+                end_time,
+                &codex_turn_id,
+                &owner.status,
+            );
+        }
         Ok(())
     }
 
@@ -130,6 +149,7 @@ impl TraceReducer {
                 inference.execution.ended_at_unix_ms = Some(wall_time_unix_ms);
                 inference.execution.ended_seq = Some(seq);
                 inference.execution.status = inference_status.clone();
+                inference.owner_end = Some(inference.execution.clone());
             }
         }
     }
@@ -157,13 +177,14 @@ impl TraceReducer {
                 ),
                 RawTraceEventPayload::InferenceFailed {
                     inference_call_id,
+                    response_id,
                     upstream_request_id,
                     partial_response_payload,
                     ..
                 } => (
                     inference_call_id,
                     ExecutionStatus::Failed,
-                    None,
+                    response_id,
                     upstream_request_id,
                     partial_response_payload,
                 ),
@@ -189,6 +210,15 @@ impl TraceReducer {
         {
             bail!("inference completion referenced unknown call {inference_call_id}");
         }
+        // First explicit terminal wins. Owner-end inference is weaker and may
+        // be refined, but duplicate/conflicting physical terminals cannot win
+        // by arriving later or rewrite the conversation snapshot.
+        if self.rollout.inference_calls[&inference_call_id]
+            .observed_terminal_status
+            .is_some()
+        {
+            return Ok(());
+        }
 
         let response_item_ids = response_payload
             .as_ref()
@@ -200,15 +230,27 @@ impl TraceReducer {
             let Some(inference) = self.rollout.inference_calls.get_mut(&inference_call_id) else {
                 bail!("inference call {inference_call_id} disappeared during response reduction");
             };
-            inference.response_id = response_id;
+            if let Some(response_id) = response_id {
+                inference.response_id = Some(response_id);
+            }
             // Turn-end cleanup can close a stream before the async mapper observes
             // cancellation. Preserve that terminal status while still retaining any
             // late partial response evidence from the mapper.
-            if inference.execution.status == ExecutionStatus::Running {
+            if inference.execution.status == ExecutionStatus::Running
+                || status != ExecutionStatus::Cancelled
+            {
                 inference.execution.ended_at_unix_ms = Some(wall_time_unix_ms);
                 inference.execution.ended_seq = Some(seq);
-                inference.execution.status = status;
+                inference.execution.status = status.clone();
             }
+            inference.observed_terminal = Some(ExecutionWindow {
+                started_at_unix_ms: inference.execution.started_at_unix_ms,
+                started_seq: inference.execution.started_seq,
+                ended_at_unix_ms: Some(wall_time_unix_ms),
+                ended_seq: Some(seq),
+                status: status.clone(),
+            });
+            inference.observed_terminal_status = Some(status);
             // Turn-end cleanup can mark an inference terminal before the stream
             // mapper records its late partial payload. Keep the server request
             // id from that late payload even when the status is already closed.

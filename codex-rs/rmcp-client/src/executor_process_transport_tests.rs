@@ -102,6 +102,7 @@ struct ReplayProcess {
     id: codex_exec_server::ProcessId,
     wake: tokio::sync::watch::Sender<u64>,
     chunks: Vec<codex_exec_server::ProcessOutputChunk>,
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 impl ReplayProcess {
@@ -110,6 +111,7 @@ impl ReplayProcess {
         Self {
             id: "replay".into(),
             wake,
+            reads: std::sync::atomic::AtomicUsize::new(0),
             chunks: stdout
                 .into_iter()
                 .zip(1..)
@@ -140,6 +142,7 @@ impl codex_exec_server::ExecProcess for ReplayProcess {
         _: Option<u64>,
     ) -> codex_exec_server::ExecProcessFuture<'_, codex_exec_server::ReadResponse> {
         Box::pin(async move {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(codex_exec_server::ReadResponse {
                 chunks: self.chunks.clone(),
                 next_seq: self.chunks.len() as u64 + 1,
@@ -167,6 +170,61 @@ impl codex_exec_server::ExecProcess for ReplayProcess {
     fn terminate(&self) -> codex_exec_server::ExecProcessFuture<'_, ()> {
         panic!("unexpected terminate")
     }
+}
+
+#[tokio::test]
+async fn initial_forward_gap_recovers_all_synthetic_protocol_records_once() {
+    // Synthetic adapter frames, not unsolicited responses from a conforming
+    // MCP server. Each literal id is an independent ordering/count oracle.
+    let records = (1..=300)
+        .map(|id| format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{}}}}\n").into_bytes())
+        .collect();
+    let process = std::sync::Arc::new(ReplayProcess::new(records));
+    let mut transport = super::ExecutorProcessTransport::new(process.clone(), "initial-gap".into());
+    let trigger = codex_exec_server::ExecProcessEvent::Output(process.chunks[44].clone());
+    assert!(
+        transport
+            .recover_forward_gap(trigger)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(process.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    for id in 1..=300 {
+        let message = transport
+            .take_stdout_message(false)
+            .expect("every record must be recovered");
+        assert_eq!(serde_json::to_value(message).unwrap()["id"], id);
+    }
+    assert!(transport.take_stdout_message(false).is_none());
+    let duplicate = transport
+        .recover_forward_gap(codex_exec_server::ExecProcessEvent::Output(
+            process.chunks[44].clone(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    if let codex_exec_server::ExecProcessEvent::Output(chunk) = duplicate {
+        transport.push_process_output_if_new(chunk);
+    }
+    assert!(transport.take_stdout_message(false).is_none());
+    assert_eq!(process.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn contiguous_initial_event_needs_no_recovery_read() {
+    let process = std::sync::Arc::new(ReplayProcess::new(vec![b"diagnostic".to_vec()]));
+    let mut transport = super::ExecutorProcessTransport::new(process.clone(), "contiguous".into());
+    assert!(
+        transport
+            .recover_forward_gap(codex_exec_server::ExecProcessEvent::Output(
+                process.chunks[0].clone()
+            ))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(process.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

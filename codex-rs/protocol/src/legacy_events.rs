@@ -155,6 +155,7 @@ impl ReasoningItem {
 impl CommandExecutionItem {
     pub(crate) fn as_legacy_begin_event(&self, turn_id: String, started_at_ms: i64) -> EventMsg {
         EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
+            environment: self.environment.clone(),
             call_id: self.id.clone(),
             process_id: self.process_id.clone(),
             turn_id,
@@ -179,6 +180,7 @@ impl CommandExecutionItem {
             CommandExecutionStatus::Declined => ExecCommandStatus::Declined,
         };
         Some(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
+            environment: self.environment.clone(),
             call_id: self.id.clone(),
             output_metadata: self.output_metadata.clone(),
             process_id: self.process_id.clone(),
@@ -247,8 +249,8 @@ impl CollabAgentToolCallItem {
                     started_at_ms,
                     sender_thread_id: self.sender_thread_id,
                     prompt: self.prompt.clone().unwrap_or_default(),
-                    model: self.model.clone().unwrap_or_default(),
-                    reasoning_effort: self.reasoning_effort.clone().unwrap_or_default(),
+                    model: self.model.clone(),
+                    reasoning_effort: self.reasoning_effort.clone(),
                 },
             )),
             CollabAgentTool::SendInput => receiver_thread_id.map(|receiver_thread_id| {
@@ -308,8 +310,8 @@ impl CollabAgentToolCallItem {
                     new_agent_nickname,
                     new_agent_role,
                     prompt: self.prompt.clone().unwrap_or_default(),
-                    model: self.model.clone().unwrap_or_default(),
-                    reasoning_effort: self.reasoning_effort.clone().unwrap_or_default(),
+                    model: self.model.clone(),
+                    reasoning_effort: self.reasoning_effort.clone(),
                     status: receiver_thread_id
                         .map(|thread_id| self.agent_status(thread_id))
                         .unwrap_or(AgentStatus::NotFound),
@@ -430,6 +432,7 @@ impl ImageGenerationItem {
 impl FileChangeItem {
     pub fn as_legacy_begin_event(&self, turn_id: String) -> EventMsg {
         EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
+            environment: self.environment.clone(),
             call_id: self.id.clone(),
             turn_id,
             auto_approved: self.auto_approved.unwrap_or(false),
@@ -440,6 +443,7 @@ impl FileChangeItem {
     pub fn as_legacy_end_event(&self, turn_id: String) -> Option<EventMsg> {
         let status = self.status.clone()?;
         Some(EventMsg::PatchApplyEnd(PatchApplyEndEvent {
+            environment: self.environment.clone(),
             call_id: self.id.clone(),
             turn_id,
             stdout: self.stdout.clone().unwrap_or_default(),
@@ -512,6 +516,7 @@ impl TurnItem {
             TurnItem::WebSearch(item) => vec![item.as_legacy_event()],
             TurnItem::ImageView(item) => {
                 vec![EventMsg::ViewImageToolCall(ViewImageToolCallEvent {
+                    environment: item.environment.clone(),
                     call_id: item.id.clone(),
                     path: item.path.clone(),
                 })]

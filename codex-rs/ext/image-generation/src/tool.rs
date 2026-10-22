@@ -26,6 +26,7 @@ use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
 use codex_extension_items::ExtensionItem;
 use codex_extension_items::image_generation::ImageGenerationItem;
+use codex_extension_items::image_generation::ImageGenerationUsage;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -46,8 +47,6 @@ use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_image::PromptImageMode;
 use codex_utils_image::load_for_prompt_bytes;
 use codex_utils_path_uri::PathUri;
-use schemars::JsonSchema;
-use schemars::r#gen::SchemaSettings;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
@@ -83,13 +82,11 @@ impl ImageGenerationTool {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImagegenArgs {
     prompt: String,
-    #[schemars(length(max = 5))]
-    referenced_image_paths: Option<Vec<AbsolutePathBuf>>,
-    #[schemars(range(min = 1, max = 5))]
+    referenced_image_paths: Option<Vec<String>>,
     num_last_images_to_include: Option<usize>,
 }
 
@@ -167,6 +164,7 @@ impl ImageGenerationTool {
                     revised_prompt: None,
                     result: String::new(),
                     saved_path: None,
+                    provider_usage: None,
                 },
                 EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent {
                     call_id: call.call_id.clone(),
@@ -178,19 +176,11 @@ impl ImageGenerationTool {
                 ImageRequest::Generate(request) => self.backend.generate(request).await,
                 ImageRequest::Edit(request) => self.backend.edit(request).await,
             }
-            .map_err(|err| format!("image generation failed: {err}"))
-            .and_then(|response| {
-                response
-                    .data
-                    .into_iter()
-                    .next()
-                    .map(|data| data.b64_json)
-                    .ok_or_else(|| "image generation returned no image data".to_string())
-            })?;
+            .map_err(|err| format!("image generation failed: {err}"))?;
             Ok::<_, String>(result)
         };
         let operation_result = call.cancellation_token.run_until_cancelled(operation).await;
-        let result = match operation_result {
+        let response = match operation_result {
             None => {
                 emit_failed_item(&call, &args.prompt).await;
                 return Err(cancelled_error());
@@ -201,13 +191,28 @@ impl ImageGenerationTool {
             }
             Some(Ok(result)) => result,
         };
+        let mut usage = response.usage.unwrap_or_default();
+        usage.model = Some(IMAGE_MODEL.to_string());
+        let Some(data) = response.data.into_iter().next() else {
+            emit_failed_result(
+                &call.call_id,
+                call.turn_item_emitter.as_ref(),
+                &args.prompt,
+                Some(usage),
+            )
+            .await;
+            return Err(FunctionCallError::RespondToModel(
+                "image generation returned no image data".into(),
+            ));
+        };
         complete_image_generation(
             &call.call_id,
             call.turn_item_emitter.as_ref(),
             args.prompt,
-            result,
+            data.b64_json,
             self.save_root.as_ref(),
             &self.thread_id,
+            Some(usage),
         )
         .await
     }
@@ -220,6 +225,7 @@ async fn complete_image_generation(
     result: String,
     save_root: Option<&AbsolutePathBuf>,
     thread_id: &str,
+    provider_usage: Option<ImageGenerationUsage>,
 ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     let validation = tokio::task::spawn_blocking(move || validate_generated_image(result))
         .await
@@ -228,7 +234,7 @@ async fn complete_image_generation(
     let (result, bytes) = match validation {
         Ok(image) => image,
         Err(message) => {
-            emit_failed_result(call_id, emitter, &prompt).await;
+            emit_failed_result(call_id, emitter, &prompt, provider_usage).await;
             return Err(FunctionCallError::RespondToModel(message));
         }
     };
@@ -242,6 +248,7 @@ async fn complete_image_generation(
         revised_prompt: Some(prompt),
         result: result.clone(),
         saved_path: saved_path.clone(),
+        provider_usage,
     };
     let legacy_event = legacy_end_event(&item);
     emitter
@@ -311,13 +318,14 @@ fn image_history_requirement(payload: &ToolPayload) -> ConversationHistoryRequir
 }
 
 async fn emit_failed_item(call: &ToolCall, prompt: &str) {
-    emit_failed_result(&call.call_id, call.turn_item_emitter.as_ref(), prompt).await;
+    emit_failed_result(&call.call_id, call.turn_item_emitter.as_ref(), prompt, None).await;
 }
 
 async fn emit_failed_result(
     call_id: &str,
     emitter: &dyn codex_extension_api::TurnItemEmitter,
     prompt: &str,
+    provider_usage: Option<ImageGenerationUsage>,
 ) {
     let item = ImageGenerationItem {
         id: call_id.to_string(),
@@ -325,6 +333,7 @@ async fn emit_failed_result(
         revised_prompt: Some(prompt.to_string()),
         result: String::new(),
         saved_path: None,
+        provider_usage,
     };
     let legacy_event = legacy_end_event(&item);
     emitter
@@ -445,8 +454,9 @@ async fn request_for_call_args(
                     "`num_last_images_to_include` must be between 1 and {MAX_EDIT_IMAGES}"
                 )));
             }
-            // Pathless images have no stable reference, so this bounded window may include newer
-            // unrelated images. This remains best-effort until the harness provides stable refs.
+            // An ordinal must never fall back to an older surviving image when
+            // compaction may have evicted a newer one. Only the post-checkpoint
+            // suffix has known chronology; unavailable references require reattachment.
             let images = recent_images(history, count);
             if images.len() != count {
                 return Err(FunctionCallError::RespondToModel(format!(
@@ -477,6 +487,14 @@ async fn request_for_call_args(
 }
 
 fn recent_images(history: &[ResponseItem], count: usize) -> Vec<ImageUrl> {
+    let boundary = history.iter().rposition(|item| match item {
+        ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::Message { content, .. } => content.iter().any(|item| {
+            matches!(item, ContentItem::InputText { text } if text.starts_with(codex_core::compact::SUMMARY_PREFIX))
+        }),
+        _ => false,
+    });
+    let history = boundary.map_or(history, |index| &history[index + 1..]);
     let mut function_call_ids = HashSet::new();
     let mut custom_tool_call_ids = HashSet::new();
     for item in history {
@@ -579,10 +597,14 @@ fn output_image_urls(output: &FunctionCallOutputPayload) -> impl Iterator<Item =
 }
 
 async fn image_url(
-    path: &AbsolutePathBuf,
+    path: &str,
     environment: &ToolEnvironment,
 ) -> Result<ImageUrl, FunctionCallError> {
-    let path_uri = PathUri::from_abs_path(path);
+    let path_uri = environment.cwd.join(path).map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "invalid referenced image path `{path}`: {error}"
+        ))
+    })?;
     let sandbox = environment.file_system_sandbox_context.clone();
     let bytes = environment
         .file_system
@@ -590,15 +612,15 @@ async fn image_url(
         .await
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(
-                "unable to read referenced image at `{}`: {error}",
-                path.display()
+                "unable to read referenced image at `{path}`: {error}"
             ))
         })?
         .ok_or_else(|| FunctionCallError::RespondToModel(format!(
-            "referenced image at `{}` changed while being read or exceeds the {MAX_PROMPT_IMAGE_SOURCE_BYTES} byte limit",
-            path.display()
+            "referenced image at `{path}` changed while being read or exceeds the {MAX_PROMPT_IMAGE_SOURCE_BYTES} byte limit"
         )))?;
-    let image_path = path.clone();
+    // Decoder diagnostics may use a presentation path; filesystem admission must
+    // use the selected environment's URI, never a host-native absolute path.
+    let image_path = path_uri.to_path_buf();
     let image = tokio::task::spawn_blocking(move || {
         load_for_prompt_bytes(image_path.as_path(), bytes, PromptImageMode::Original)
     })
@@ -608,8 +630,7 @@ async fn image_url(
     })?
     .map_err(|error| {
         FunctionCallError::RespondToModel(format!(
-            "unable to process referenced image at `{}`: {error}",
-            path.display()
+            "unable to process referenced image at `{path}`: {error}"
         ))
     })?;
     Ok(ImageUrl {
@@ -625,22 +646,22 @@ fn parse_args(call: &ToolCall) -> Result<ImagegenArgs, FunctionCallError> {
 
 /// Builds the namespace function schema exposed to the model.
 fn imagegen_tool_spec() -> ToolSpec {
-    let mut schema_value = serde_json::to_value(
-        SchemaSettings::draft2019_09()
-            .with(|settings| settings.inline_subschemas = true)
-            .into_generator()
-            .into_root_schema_for::<ImagegenArgs>(),
-    )
-    .unwrap_or_else(|err| panic!("imagegen schema should serialize: {err}"));
-    let Value::Object(ref mut schema) = schema_value else {
-        unreachable!("imagegen root schema must be an object");
-    };
-    let mut input_schema = Map::new();
-    for key in ["properties", "required", "type", "additionalProperties"] {
-        if let Some(value) = schema.remove(key) {
-            input_schema.insert(key.to_string(), value);
-        }
-    }
+    // The backend reserves this name and requires its original wire schema.
+    // Deriving it from ImagegenArgs leaked bounds once the generic schema
+    // parser learned to preserve them. Keep runtime limits in request_for_call_args.
+    let input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "prompt": { "type": "string" },
+            "referenced_image_paths": {
+                "type": ["array", "null"],
+                "items": { "type": "string" }
+            },
+            "num_last_images_to_include": { "type": ["integer", "null"] }
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+    });
     ToolSpec::Namespace(ResponsesApiNamespace {
         name: IMAGE_GEN_NAMESPACE.to_string(),
         description: default_namespace_description(IMAGE_GEN_NAMESPACE),
@@ -648,7 +669,7 @@ fn imagegen_tool_spec() -> ToolSpec {
             name: IMAGEGEN_TOOL_NAME.to_string(),
             description: IMAGEGEN_DESCRIPTION.to_string(),
             strict: false,
-            parameters: parse_tool_input_schema(&Value::Object(input_schema))
+            parameters: parse_tool_input_schema(&input_schema)
                 .unwrap_or_else(|err| panic!("imagegen input schema should parse: {err}")),
             output_schema: None,
             defer_loading: None,

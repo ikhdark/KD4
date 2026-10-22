@@ -24,6 +24,60 @@ fn unexpected_status(status: StatusCode) -> CodexErr {
     })
 }
 
+#[tokio::test]
+async fn unknown_dispatch_and_invalid_output_never_authorize_outer_retry_or_fallback() {
+    for request in [
+        ResponsesStreamRequest::Sampling,
+        ResponsesStreamRequest::LocalCompaction,
+        ResponsesStreamRequest::RemoteCompactionV2,
+    ] {
+        for cancelled in [false, true] {
+            for error in [
+                codex_api::ApiError::ProviderFailure {
+                    code: Some("dispatch_outcome_unknown".into()),
+                    message: "accepted request, acknowledgement lost".into(),
+                },
+                codex_api::ApiError::invalid_response("output fragment without an active item"),
+            ] {
+                let home = tempfile::tempdir().unwrap();
+                let (session, turn, events) =
+                    crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                        codex_login::CodexAuth::from_api_key("test key"),
+                        Vec::new(),
+                        home.path(),
+                        |config| config.model_provider.supports_websockets = true,
+                    )
+                    .await;
+                let mut client = session.services.model_client.new_session();
+                let mut state = ResponsesStreamRetryState::default();
+                let cancellation = CancellationToken::new();
+                if cancelled {
+                    cancellation.cancel();
+                }
+                let result = handle_retryable_response_stream_error(
+                    &mut state,
+                    5,
+                    codex_api::map_api_error(error),
+                    &mut client,
+                    &session,
+                    &turn,
+                    request,
+                    &cancellation,
+                )
+                .await;
+                assert!(result.is_err());
+                assert_eq!(matches!(result, Err(CodexErr::TurnAborted)), cancelled);
+                assert_eq!(state.retries, 0);
+                assert!(session.services.model_client.responses_websocket_enabled());
+                assert!(
+                    events.try_recv().is_err(),
+                    "no retry/fallback may be announced"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn response_stream_retries_transport_timeouts() {
     assert!(should_retry_response_stream(&CodexErr::RequestTimeout));
@@ -566,7 +620,10 @@ async fn repeated_http_idle_timeouts_exhaust_the_generation_budget() {
         let (session, mut turn, _events) =
             crate::session::tests::make_session_and_context_with_rx().await;
         std::sync::Arc::get_mut(&mut turn).unwrap().session_source = SessionSource::VSCode;
-        session.services.model_client.force_http_fallback(&turn.session_telemetry);
+        session
+            .services
+            .model_client
+            .force_http_fallback(&turn.session_telemetry);
         let mut client = session.services.model_client.new_session();
         let mut state = ResponsesStreamRetryState::default();
         tokio::time::pause();
@@ -575,9 +632,16 @@ async fn repeated_http_idle_timeouts_exhaust_the_generation_budget() {
                 "idle timeout waiting for SSE after 100ms".into(),
             ));
             let result = handle_retryable_response_stream_error(
-                &mut state, max_retries, error, &mut client, &session, &turn,
-                ResponsesStreamRequest::Sampling, &CancellationToken::new(),
-            ).await;
+                &mut state,
+                max_retries,
+                error,
+                &mut client,
+                &session,
+                &turn,
+                ResponsesStreamRequest::Sampling,
+                &CancellationToken::new(),
+            )
+            .await;
             assert_eq!(result.is_ok(), attempt < max_retries);
         }
         assert_eq!(state.retries, max_retries);
@@ -849,21 +913,36 @@ async fn owner_cancellation_interrupts_each_active_retry_wait() {
         let advice = RetryAfter::from_delay(Duration::from_secs(60));
         let error = match kind {
             "network" => connection_failed(),
-            "fallback" => unexpected_status(StatusCode::SERVICE_UNAVAILABLE).with_retry_after(advice),
+            "fallback" => {
+                unexpected_status(StatusCode::SERVICE_UNAVAILABLE).with_retry_after(advice)
+            }
             _ => CodexErr::Stream("retry later".into(), advice),
         };
         let retry = handle_retryable_response_stream_error(
-            &mut state, if kind == "fallback" { 0 } else { 5 }, error,
-            &mut client, &session, &turn, ResponsesStreamRequest::Sampling, &cancellation,
+            &mut state,
+            if kind == "fallback" { 0 } else { 5 },
+            error,
+            &mut client,
+            &session,
+            &turn,
+            ResponsesStreamRequest::Sampling,
+            &cancellation,
         );
         tokio::pin!(retry);
         assert!(futures::poll!(retry.as_mut()).is_pending(), "{kind}");
-        assert!(events.try_recv().is_ok(), "{kind} must enter the announced wait");
+        assert!(
+            events.try_recv().is_ok(),
+            "{kind} must enter the announced wait"
+        );
         cancellation.cancel();
         let result = tokio::time::timeout(Duration::from_millis(1), retry.as_mut())
-            .await.expect("cancellation must not wait for the retry deadline");
+            .await
+            .expect("cancellation must not wait for the retry deadline");
         assert!(matches!(result, Err(CodexErr::TurnAborted)), "{kind}");
-        assert!(events.try_recv().is_err(), "cancellation must not announce another retry");
+        assert!(
+            events.try_recv().is_err(),
+            "cancellation must not announce another retry"
+        );
         tokio::time::resume();
     }
 }
@@ -1188,7 +1267,10 @@ async fn missing_credentials_wait_rechecks_a_login_that_already_completed() {
         if cancelled {
             assert!(matches!(result, Err(CodexErr::TurnAborted)));
         } else {
-            assert!(result.unwrap(), "the authenticated request can now be retried");
+            assert!(
+                result.unwrap(),
+                "the authenticated request can now be retried"
+            );
         }
         assert!(deadline.is_none(), "no account wait was needed");
         assert!(events.try_recv().is_err(), "do not announce a stale wait");
@@ -1201,29 +1283,55 @@ async fn usage_limit_rechecks_the_failed_attempt_account_before_waiting() {
     let home = tempfile::tempdir().unwrap();
     let (session, mut turn, _) =
         crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-            codex_login::CodexAuth::from_api_key("test key"), Vec::new(), home.path(), |_| {},
-        ).await;
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |_| {},
+        )
+        .await;
     let credentials = tempfile::tempdir().unwrap();
     let manager = interactive_turn_with_account(&mut turn, credentials.path());
     let failed_account = AccountChangeIdentity::from_auth(&manager.auth_cached().unwrap()).unwrap();
     store_test_login(credentials.path(), "replacement-account");
     manager.reload().await;
-    assert_eq!(manager.auth_cached().unwrap().api_key(), Some("replacement-account"));
+    assert_eq!(
+        manager.auth_cached().unwrap().api_key(),
+        Some("replacement-account")
+    );
     let error = usage_limit(None);
     let mut deadline = None;
     let cancellation = CancellationToken::new();
-    assert!(tokio::time::timeout(Duration::from_millis(100), wait_for_account_change(
-        AccountChangeWait::UsageLimit(&error, Some(&failed_account)), &mut deadline,
-        &session, &turn, &cancellation,
-    )).await.expect("already completed switch must not wait").unwrap());
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_account_change(
+                AccountChangeWait::UsageLimit(&error, Some(&failed_account)),
+                &mut deadline,
+                &session,
+                &turn,
+                &cancellation,
+            )
+        )
+        .await
+        .expect("already completed switch must not wait")
+        .unwrap()
+    );
     // Repeated errors under the replacement cannot reuse the old switch.
     let replacement = AccountChangeIdentity::from_auth(&manager.auth_cached().unwrap()).unwrap();
-    let wait = wait_for_account_change(AccountChangeWait::UsageLimit(&error, Some(&replacement)),
-        &mut deadline, &session, &turn, &cancellation);
+    let wait = wait_for_account_change(
+        AccountChangeWait::UsageLimit(&error, Some(&replacement)),
+        &mut deadline,
+        &session,
+        &turn,
+        &cancellation,
+    );
     tokio::pin!(wait);
     assert!(futures::poll!(wait.as_mut()).is_pending());
     manager.reload().await;
-    assert!(futures::poll!(wait.as_mut()).is_pending(), "unchanged credentials must not replay");
+    assert!(
+        futures::poll!(wait.as_mut()).is_pending(),
+        "unchanged credentials must not replay"
+    );
     cancellation.cancel();
     assert!(matches!(wait.await, Err(CodexErr::TurnAborted)));
 }
@@ -1233,8 +1341,12 @@ async fn due_usage_reset_retries_once_then_backs_off_with_the_same_deadline() {
     let home = tempfile::tempdir().unwrap();
     let (session, mut turn, _) =
         crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-            codex_login::CodexAuth::from_api_key("test key"), Vec::new(), home.path(), |_| {},
-        ).await;
+            codex_login::CodexAuth::from_api_key("test key"),
+            Vec::new(),
+            home.path(),
+            |_| {},
+        )
+        .await;
     let credentials = tempfile::tempdir().unwrap();
     let _manager = interactive_turn_with_account(&mut turn, credentials.path());
     let error = usage_limit(Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
@@ -1242,16 +1354,43 @@ async fn due_usage_reset_retries_once_then_backs_off_with_the_same_deadline() {
     tokio::time::pause();
     let started = tokio::time::Instant::now();
     let cancellation = CancellationToken::new();
-    assert!(wait_for_account_change(AccountChangeWait::UsageLimit(&error, None),
-        &mut deadline, &session, &turn, &cancellation).await.unwrap());
+    assert!(
+        wait_for_account_change(
+            AccountChangeWait::UsageLimit(&error, None),
+            &mut deadline,
+            &session,
+            &turn,
+            &cancellation
+        )
+        .await
+        .unwrap()
+    );
     assert!(started.elapsed() < Duration::from_secs(1));
     let original_deadline = deadline;
-    assert!(wait_for_account_change(AccountChangeWait::UsageLimit(&error, None),
-        &mut deadline, &session, &turn, &cancellation).await.unwrap());
+    assert!(
+        wait_for_account_change(
+            AccountChangeWait::UsageLimit(&error, None),
+            &mut deadline,
+            &session,
+            &turn,
+            &cancellation
+        )
+        .await
+        .unwrap()
+    );
     assert!(started.elapsed() >= ACCOUNT_CHANGE_RELOAD_INTERVAL);
     assert_eq!(deadline, original_deadline);
     cancellation.cancel();
-    assert!(matches!(wait_for_account_change(AccountChangeWait::UsageLimit(&error, None),
-        &mut deadline, &session, &turn, &cancellation).await, Err(CodexErr::TurnAborted)));
+    assert!(matches!(
+        wait_for_account_change(
+            AccountChangeWait::UsageLimit(&error, None),
+            &mut deadline,
+            &session,
+            &turn,
+            &cancellation
+        )
+        .await,
+        Err(CodexErr::TurnAborted)
+    ));
     tokio::time::resume();
 }

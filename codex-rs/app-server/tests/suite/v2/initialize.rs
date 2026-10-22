@@ -269,7 +269,6 @@ async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn initialize_rejects_invalid_client_name() -> Result<()> {
     let responses = Vec::new();

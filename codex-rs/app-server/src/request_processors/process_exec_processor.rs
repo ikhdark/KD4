@@ -99,6 +99,7 @@ pub(crate) struct ProcessExecRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     environment_manager: Arc<EnvironmentManager>,
     sessions: Arc<Mutex<HashMap<ConnectionProcessHandle, ProcessSession>>>,
+    run_tasks: tokio_util::task::TaskTracker,
 }
 
 impl ProcessExecRequestProcessor {
@@ -110,6 +111,7 @@ impl ProcessExecRequestProcessor {
             outgoing,
             environment_manager,
             sessions: Arc::default(),
+            run_tasks: tokio_util::task::TaskTracker::new(),
         }
     }
 
@@ -143,6 +145,8 @@ impl ProcessExecRequestProcessor {
         }
         let mut env = std::env::vars().collect::<HashMap<_, _>>();
         if let Some(env_overrides) = env_overrides {
+            #[cfg(windows)]
+            validate_environment_override_keys(&env_overrides)?;
             for (key, value) in env_overrides {
                 // Windows treats environment names as case-insensitive. Remove
                 // the inherited spelling before applying either an unset or a
@@ -233,6 +237,11 @@ impl ProcessExecRequestProcessor {
         self.close_connection_processes(connection_id).await;
     }
 
+    pub(crate) async fn drain_run_tasks(&self) {
+        self.run_tasks.close();
+        self.run_tasks.wait().await;
+    }
+
     fn require_local_environment(&self) -> Result<(), JSONRPCErrorError> {
         self.environment_manager
             .try_local_environment()
@@ -316,6 +325,9 @@ struct SpawnProcessOutputParams {
 struct ProcessOutputCapture {
     text: String,
     cap_reached: bool,
+    base64: Option<String>,
+    drain_timed_out: bool,
+    reached_eof: bool,
 }
 
 impl ProcessExecRequestProcessor {
@@ -339,6 +351,9 @@ impl ProcessExecRequestProcessor {
             size,
         } = params;
         let connection_cancellation = rpc_gate.cancellation_token().child_token();
+        let run_owner = rpc_gate
+            .try_commit(|| self.run_tasks.token())
+            .ok_or_else(|| invalid_request("connection is closed"))?;
 
         let Some((program, args)) = command.split_first() else {
             return Err(internal_error(
@@ -406,6 +421,7 @@ impl ProcessExecRequestProcessor {
         let response_request_id = request_id.clone();
         let (response_enqueued_tx, response_enqueued_rx) = oneshot::channel();
         tokio::spawn(async move {
+            let _run_owner = run_owner;
             let _ = response_enqueued_rx.await;
             run_process(RunProcessParams {
                 outgoing,
@@ -728,6 +744,18 @@ async fn run_process(params: RunProcessParams) {
             ServerNotification::ProcessExited(ProcessExitedNotification {
                 process_handle,
                 exit_code,
+                stdout_base64: stdout.base64,
+                stderr_base64: stderr.base64,
+                stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                    reached_eof: stdout.reached_eof && session.output_capture().stdout_complete(),
+                    cap_reached: stdout.cap_reached,
+                    drain_timed_out: stdout.drain_timed_out,
+                }),
+                stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                    reached_eof: stderr.reached_eof && session.output_capture().stderr_complete(),
+                    cap_reached: stderr.cap_reached,
+                    drain_timed_out: stderr.drain_timed_out,
+                }),
                 stdout: stdout.text,
                 stdout_cap_reached: stdout.cap_reached,
                 stderr: stderr.text,
@@ -737,7 +765,9 @@ async fn run_process(params: RunProcessParams) {
         )
         .await;
     if !delivered {
-        outgoing.fail_connection_delivery(request_id.connection_id).await;
+        outgoing
+            .fail_connection_delivery(request_id.connection_id)
+            .await;
     }
     if let Some(cleanup) = terminal_cleanup {
         cleanup.sessions.lock().await.remove(&cleanup.process_key);
@@ -761,13 +791,26 @@ fn collect_spawn_process_output(
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
         let mut cap = OutputByteCap::new(output_bytes_cap);
+        let streaming_requested = stream_output;
+        let mut drain_timed_out = false;
+        // Every loop exit decides whether the pipe reached EOF.
+        let reached_eof;
         loop {
+            if *stdio_timeout_rx.borrow() {
+                reached_eof = output_rx.is_closed() && output_rx.is_empty();
+                drain_timed_out = !reached_eof;
+                break;
+            }
             let mut chunk = tokio::select! {
                 chunk = output_rx.recv() => match chunk {
                     Some(chunk) => chunk,
-                    None => break,
+                    None => { reached_eof = true; break; },
                 },
-                _ = stdio_timeout_rx.wait_for(|&v| v) => break,
+                _ = stdio_timeout_rx.wait_for(|&v| v) => {
+                    reached_eof = output_rx.is_closed() && output_rx.is_empty();
+                    drain_timed_out = !reached_eof;
+                    break;
+                },
             };
             while chunk.len() < OUTPUT_CHUNK_SIZE_HINT
                 && let Ok(next_chunk) = output_rx.try_recv()
@@ -800,6 +843,9 @@ fn collect_spawn_process_output(
             }
         }
         ProcessOutputCapture {
+            reached_eof,
+            base64: (streaming_requested && !buffer.is_empty()).then(|| STANDARD.encode(&buffer)),
+            drain_timed_out,
             text: bytes_to_string_smart(&buffer),
             cap_reached: cap.truncated(),
         }
@@ -813,6 +859,21 @@ fn handle_process_resize(
     session
         .resize(size)
         .map_err(|err| invalid_request(format!("failed to resize PTY: {err}")))
+}
+
+#[cfg(windows)]
+fn validate_environment_override_keys(
+    overrides: &HashMap<String, Option<String>>,
+) -> Result<(), JSONRPCErrorError> {
+    let mut names = std::collections::HashSet::new();
+    for key in overrides.keys() {
+        if !names.insert(key.to_ascii_lowercase()) {
+            return Err(invalid_params(format!(
+                "process/spawn env contains conflicting case-insensitive key {key:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn no_active_process_error(process_handle: &str) -> JSONRPCErrorError {
@@ -838,18 +899,52 @@ mod tests {
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
 
+    #[cfg(windows)]
+    #[test]
+    fn conflicting_environment_aliases_are_rejected_before_spawn() {
+        for first in [None, Some(String::new()), Some("requested".into())] {
+            for second in [None, Some(String::new()), Some("other".into())] {
+                for keys in [["PATH", "Path"], ["Path", "PATH"]] {
+                    let overrides = HashMap::from([
+                        (keys[0].to_string(), first.clone()),
+                        (keys[1].to_string(), second.clone()),
+                    ]);
+                    assert!(validate_environment_override_keys(&overrides).is_err());
+                }
+            }
+        }
+        assert!(
+            validate_environment_override_keys(&HashMap::from([
+                ("PATH".into(), None),
+                ("OTHER".into(), Some(String::new())),
+            ]))
+            .is_ok()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn terminal_backpressure_explicitly_fails_the_connection() {
         let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
         let outgoing = Arc::new(OutgoingMessageSender::new(
-            outgoing_tx, codex_analytics::AnalyticsEventsClient::disabled(),
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
         ));
         let failed = CancellationToken::new();
         let initialized = Arc::new(AtomicBool::new(true));
-        outgoing.connection_opened_with_runtime(ConnectionId(42), Arc::clone(&initialized), failed.clone()).await;
-        assert!(outgoing.try_send_server_notification(ServerNotification::ThreadClosed(
-            codex_app_server_protocol::ThreadClosedNotification { thread_id: "full".into() },
-        )));
+        outgoing
+            .connection_opened_with_runtime(
+                ConnectionId(42),
+                Arc::clone(&initialized),
+                failed.clone(),
+            )
+            .await;
+        assert!(
+            outgoing.try_send_server_notification(ServerNotification::ThreadClosed(
+                codex_app_server_protocol::ThreadClosedNotification {
+                    thread_id: "full".into()
+                },
+            ))
+        );
         let (writer_tx, _writer_rx) = mpsc::channel(1);
         let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
         let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
@@ -858,22 +953,39 @@ mod tests {
         drop(stderr_tx);
         let (exit_tx, exit_rx) = oneshot::channel();
         let spawned = spawn_from_driver(ProcessDriver {
-            writer_tx, stdout_rx: stdout_rx.into(), stderr_rx: Some(stderr_rx.into()),
-            exit_rx, terminator: None, writer_handle: None, resizer: None,
+            writer_tx,
+            stdout_rx: stdout_rx.into(),
+            stderr_rx: Some(stderr_rx.into()),
+            exit_rx,
+            terminator: None,
+            writer_handle: None,
+            resizer: None,
         });
         let (_control_tx, control_rx) = mpsc::channel(1);
         let (_write_tx, write_rx) = mpsc::channel(1);
         exit_tx.send(7).unwrap();
         run_process(RunProcessParams {
-            outgoing, request_id: ConnectionRequestId {
-                connection_id: ConnectionId(42), request_id: codex_app_server_protocol::RequestId::Integer(42),
-            }, process_handle: "terminal".into(), spawned, control_rx, write_rx,
-            stream_stdin: false, stream_stdout_stderr: true,
+            outgoing,
+            request_id: ConnectionRequestId {
+                connection_id: ConnectionId(42),
+                request_id: codex_app_server_protocol::RequestId::Integer(42),
+            },
+            process_handle: "terminal".into(),
+            spawned,
+            control_rx,
+            write_rx,
+            stream_stdin: false,
+            stream_stdout_stderr: true,
             expiration: ExecExpiration::Cancellation(CancellationToken::new()),
-            output_bytes_cap: Some(1024), connection_cancellation: CancellationToken::new(),
+            output_bytes_cap: Some(1024),
+            connection_cancellation: CancellationToken::new(),
             terminal_cleanup: None,
-        }).await;
-        assert!(failed.is_cancelled(), "a forgotten terminal must not leave a live connection");
+        })
+        .await;
+        assert!(
+            failed.is_cancelled(),
+            "a forgotten terminal must not leave a live connection"
+        );
         assert!(!initialized.load(Ordering::Acquire));
     }
 
@@ -970,6 +1082,103 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn delivered_prefix_and_raw_fallback_reconstruct_every_utf8_split() {
+        let bytes = "é€🙂".as_bytes();
+        for stream in [ProcessOutputStream::Stdout, ProcessOutputStream::Stderr] {
+            for split in 1..bytes.len() {
+                let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
+                let outgoing = Arc::new(OutgoingMessageSender::new(
+                    outgoing_tx,
+                    codex_analytics::AnalyticsEventsClient::disabled(),
+                ));
+                let (output_tx, output_rx) = mpsc::channel(1);
+                let (_drain_tx, stdio_timeout_rx) = watch::channel(false);
+                let collector = collect_spawn_process_output(SpawnProcessOutputParams {
+                    connection_id: ConnectionId(42),
+                    process_handle: "split".into(),
+                    output_rx,
+                    stdio_timeout_rx,
+                    outgoing: Arc::clone(&outgoing),
+                    stream,
+                    stream_output: true,
+                    output_bytes_cap: None,
+                    connection_cancellation: CancellationToken::new(),
+                });
+                output_tx.send(bytes[..split].to_vec()).await.unwrap();
+                let OutgoingEnvelope::ToConnection {
+                    message:
+                        OutgoingMessage::AppServerNotification(ServerNotification::ProcessOutputDelta(
+                            delta,
+                        )),
+                    ..
+                } = timeout(Duration::from_secs(1), outgoing_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                else {
+                    panic!("delivered prefix");
+                };
+                assert_eq!(delta.stream, stream);
+                let mut received = STANDARD.decode(delta.delta_base64).unwrap();
+                // Fail admission only after the prefix was delivered.
+                assert!(
+                    outgoing.try_send_server_notification(ServerNotification::ThreadClosed(
+                        codex_app_server_protocol::ThreadClosedNotification {
+                            thread_id: "full".into()
+                        }
+                    ))
+                );
+                output_tx.send(bytes[split..].to_vec()).await.unwrap();
+                drop(output_tx);
+                let capture = collector.await.unwrap();
+                received.extend(STANDARD.decode(capture.base64.unwrap()).unwrap());
+                assert_eq!(received, bytes, "split {split} on {stream:?}");
+                assert!(!capture.cap_reached);
+                assert!(!capture.drain_timed_out);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn post_exit_drain_expiry_is_not_eof_or_a_byte_cap() {
+        for keep_open in [false, true] {
+            let (outgoing_tx, _outgoing_rx) = mpsc::channel(1);
+            let outgoing = Arc::new(OutgoingMessageSender::new(
+                outgoing_tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            ));
+            let (output_tx, output_rx) = mpsc::channel(1);
+            output_tx.send(b"prefix".to_vec()).await.unwrap();
+            let (drain_tx, stdio_timeout_rx) = watch::channel(false);
+            let collector = collect_spawn_process_output(SpawnProcessOutputParams {
+                connection_id: ConnectionId(42),
+                process_handle: "drain".into(),
+                output_rx,
+                stdio_timeout_rx,
+                outgoing,
+                stream: ProcessOutputStream::Stdout,
+                stream_output: false,
+                output_bytes_cap: None,
+                connection_cancellation: CancellationToken::new(),
+            });
+            let slot = output_tx.reserve().await.unwrap();
+            drop(slot); // The prefix was collected before expiry/EOF.
+            if keep_open {
+                drain_tx.send_replace(true);
+            } else {
+                drop(output_tx);
+            }
+            let capture = timeout(Duration::from_secs(1), collector)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(capture.text, "prefix");
+            assert_eq!(capture.drain_timed_out, keep_open);
+            assert!(!capture.cap_reached);
+        }
+    }
+
     #[test]
     fn logging_contract_process_spawn_metadata_omits_argv_and_env_values() {
         let params = ProcessSpawnParams {
@@ -995,16 +1204,19 @@ mod tests {
 
         let metadata = process_spawn_log_metadata(&params);
 
-        assert_eq!(metadata, ProcessSpawnLogMetadata {
-            argv_count: 3,
-            env_key_count: 1,
-            tty: true,
-            stream_stdin: true,
-            stream_stdout_stderr: true,
-            output_cap_present: true,
-            timeout_present: true,
-            size_present: false,
-        });
+        assert_eq!(
+            metadata,
+            ProcessSpawnLogMetadata {
+                argv_count: 3,
+                env_key_count: 1,
+                tty: true,
+                stream_stdin: true,
+                stream_stdout_stderr: true,
+                output_cap_present: true,
+                timeout_present: true,
+                size_present: false,
+            }
+        );
         let rendered = format!("{metadata:?}");
         assert!(!rendered.contains("command secret"));
         assert!(!rendered.contains("secret value"));
@@ -1121,7 +1333,9 @@ mod tests {
             panic!("process exit should use a targeted notification");
         };
         assert_eq!(connection_id, ConnectionId(22));
-        let OutgoingMessage::AppServerNotification(ServerNotification::ProcessExited(exited)) = message else {
+        let OutgoingMessage::AppServerNotification(ServerNotification::ProcessExited(exited)) =
+            message
+        else {
             panic!("expected process exit notification");
         };
         assert_eq!(exited.process_handle, "backpressured");

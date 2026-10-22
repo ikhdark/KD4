@@ -30,6 +30,7 @@ codex-utils-path-uri = { workspace = true }
 dirs = { workspace = true }
 dunce = { workspace = true }
 futures = { workspace = true }
+pulldown-cmark = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 noyalib = { workspace = true }
 sha2 = { workspace = true }

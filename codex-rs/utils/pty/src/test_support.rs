@@ -43,12 +43,10 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> io::Result<()> {
     // SAFETY: the handle remains live for the bounded wait.
     match unsafe { WaitForSingleObject(handle.as_raw_handle().cast(), millis) } {
         WAIT_OBJECT_0 => Ok(()),
-        winapi::shared::winerror::WAIT_TIMEOUT => {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("test child {pid} survived cleanup"),
-            ))
-        }
+        winapi::shared::winerror::WAIT_TIMEOUT => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("test child {pid} survived cleanup"),
+        )),
         _ => Err(io::Error::last_os_error()),
     }
 }
@@ -122,7 +120,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(child.try_wait()?.is_none(), "observation must not kill the child");
+        assert!(
+            child.try_wait()?.is_none(),
+            "observation must not kill the child"
+        );
         child.kill()?;
         assert!(!child.wait()?.success());
         wait_for_process_exit(child.id(), Duration::from_secs(1)).await?;

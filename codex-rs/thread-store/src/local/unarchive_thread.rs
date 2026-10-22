@@ -26,6 +26,22 @@ async fn unarchive_thread_with_touch<F>(
 where
     F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
 {
+    let store = store.clone();
+    tokio::spawn(async move { unarchive_thread_owned(&store, params, touch).await })
+        .await
+        .map_err(|error| ThreadStoreError::Internal {
+            message: error.to_string(),
+        })?
+}
+
+async fn unarchive_thread_owned<F>(
+    store: &LocalThreadStore,
+    params: ArchiveThreadParams,
+    touch: F,
+) -> ThreadStoreResult<StoredThread>
+where
+    F: FnOnce(&std::path::Path) -> std::io::Result<()> + Send + 'static,
+{
     let thread_id = params.thread_id;
     let _lease = store.acquire_writer_lease(thread_id, false).await?;
     let state_db_ctx = store.state_db().await;
@@ -39,9 +55,13 @@ where
     .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
 
     let canonical_archived_path = resolve_archived_representation(
-        store.config.codex_home.join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
+        store
+            .config
+            .codex_home
+            .join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
         archived_path.clone(),
-    ).await?;
+    )
+    .await?;
     let file_name = matching_rollout_file_name(
         canonical_archived_path.as_path(),
         thread_id,
@@ -129,7 +149,9 @@ async fn resolve_archived_representation(
             let Some(current) = codex_rollout::existing_rollout_path(&discovered).await else {
                 return Err(error);
             };
-            if current == discovered { return Err(error); }
+            if current == discovered {
+                return Err(error);
+            }
             scoped_rollout_path_async(root, current, "archived").await
         }
     }
@@ -155,15 +177,20 @@ mod tests {
     #[tokio::test]
     async fn unarchive_validates_compressed_sibling_of_stale_discovery() {
         let home = TempDir::new().unwrap();
-        let path = write_archived_session_file(home.path(), "2025-01-03T13-00-00", Uuid::from_u128(9989)).unwrap();
+        let path =
+            write_archived_session_file(home.path(), "2025-01-03T13-00-00", Uuid::from_u128(9989))
+                .unwrap();
         let compressed = path.with_extension("jsonl.zst");
         // Validation only resolves identity; decoding is exercised by the
         // existing compression-aware movement tests.
         std::fs::write(&compressed, b"replacement representation").unwrap();
         std::fs::remove_file(&path).unwrap();
         let resolved = resolve_archived_representation(
-            home.path().join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR), path,
-        ).await.unwrap();
+            home.path().join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
+            path,
+        )
+        .await
+        .unwrap();
         assert_eq!(resolved, std::fs::canonicalize(compressed).unwrap());
     }
 
@@ -173,18 +200,28 @@ mod tests {
         let store = LocalThreadStore::new(test_config(home.path()), None);
         let uuid = Uuid::from_u128(9993);
         let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
-        let archived = write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid).unwrap();
-        let destination = home.path().join("sessions/2025/01/03").join(archived.file_name().unwrap());
+        let archived =
+            write_archived_session_file(home.path(), "2025-01-03T13-00-00", uuid).unwrap();
+        let destination = home
+            .path()
+            .join("sessions/2025/01/03")
+            .join(archived.file_name().unwrap());
         std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
         std::fs::write(&destination, "must survive").unwrap();
         let original = std::fs::read(&archived).unwrap();
-        let error = store.unarchive_thread(ArchiveThreadParams { thread_id }).await.unwrap_err();
+        let error = store
+            .unarchive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .unwrap_err();
         assert!(
             matches!(&error, ThreadStoreError::Internal { message } if message.contains("conflicting rollout destination")),
             "{error:?}"
         );
         assert_eq!(std::fs::read(&archived).unwrap(), original);
-        assert_eq!(std::fs::read_to_string(destination).unwrap(), "must survive");
+        assert_eq!(
+            std::fs::read_to_string(destination).unwrap(),
+            "must survive"
+        );
     }
 
     #[tokio::test]
@@ -203,7 +240,9 @@ mod tests {
             .unarchive_thread(ArchiveThreadParams { thread_id })
             .await
             .expect_err("mismatch");
-        assert!(matches!(error, ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id));
+        assert!(
+            matches!(error, ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id)
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("retained bytes"),
             bytes

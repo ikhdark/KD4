@@ -53,8 +53,14 @@ impl PromptFragment {
     /// The producer could not obtain an authoritative snapshot. This is not an
     /// empty successful contribution and must not revoke its previous values.
     pub fn unavailable() -> Self {
-        Self { slot: PromptSlot::SeparateDeveloper, text: String::new(), unavailable: true }
+        Self {
+            slot: PromptSlot::SeparateDeveloper,
+            text: String::new(),
+            unavailable: true,
+        }
     }
 
-    pub fn is_unavailable(&self) -> bool { self.unavailable }
+    pub fn is_unavailable(&self) -> bool {
+        self.unavailable
+    }
 }

@@ -429,6 +429,7 @@ fn legacy_shell_projection_metadata_keeps_exact_bytes_status_and_context() {
         validation: None,
         inner: FunctionToolOutput::from_text("bounded shell output".to_string(), Some(false)),
         canonical_output: Some(raw.clone()),
+        canonical_complete: true,
         exit_code: Some(7),
         call_id: "shell-call".to_string(),
         validation_failure: false,
@@ -1196,7 +1197,8 @@ async fn shell_command_active_path_applies_read_only_repair_and_retains_output()
         })
         .to_string(),
     };
-    let (session, turn) = make_session_and_context().await;
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     let turn = Arc::new(turn);
     let handler = ShellCommandHandler::default();
     let output = handler
@@ -1352,6 +1354,7 @@ async fn shell_command_reduced_output_advertises_exact_retained_artifact() {
 
 async fn shell_command_output_budget_case(policy_bytes: i64, budget: Option<usize>) {
     let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
     turn.model_info.truncation_policy =
         codex_protocol::openai_models::TruncationPolicyConfig::bytes(policy_bytes);
     let input_home = tempfile::tempdir().expect("search input directory");
@@ -1373,9 +1376,11 @@ async fn shell_command_output_budget_case(policy_bytes: i64, budget: Option<usiz
     let home = turn.config.codex_home.clone();
     let thread_id = session.thread_id.to_string();
     let turn = Arc::new(turn);
+    // The fixture session owns the temporary home holding the artifact.
+    let session = Arc::new(session);
     let output = ShellCommandHandler::default()
         .handle(ToolInvocation {
-            session: session.into(),
+            session: Arc::clone(&session),
             step_context: StepContext::for_test(turn),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
             tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
@@ -1676,6 +1681,7 @@ fn oversized_validation_diagnostic_projection_is_bounded_and_recoverable() {
         validation: None,
         inner: FunctionToolOutput::from_text("command failed".to_string(), Some(false)),
         canonical_output: Some(canonical.clone()),
+        canonical_complete: true,
         exit_code: Some(1),
         call_id: "failure".to_string(),
         validation_failure: true,
@@ -1697,4 +1703,89 @@ fn oversized_validation_diagnostic_projection_is_bounded_and_recoverable() {
         "partial lines are not exact ranges"
     );
     assert_eq!(output.canonical_output, Some(canonical));
+}
+
+/// Runs a known-safe version probe through the production `shell_command` handler on a host
+/// without a sandbox backend. Exec policy allows the probe under a read-only profile there, so the
+/// orchestrator requests a sandbox it cannot provide, with or without managed network.
+async fn run_version_probe_without_sandbox_backend(
+    managed_network: bool,
+) -> Result<String, crate::FunctionCallError> {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::read_only();
+    turn.windows_sandbox_level = codex_protocol::config_types::WindowsSandboxLevel::Disabled;
+    turn.approval_policy =
+        crate::config::Constrained::allow_any(codex_protocol::protocol::AskForApproval::Never);
+    let started_proxy = if managed_network {
+        let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+            codex_network_proxy::NetworkProxyConfig::default(),
+            /*requirements*/ None,
+            &turn.permission_profile(),
+        )
+        .expect("managed network spec");
+        let started_proxy = spec
+            .start_proxy(
+                turn.config.codex_home.as_path(),
+                &turn.permission_profile(),
+                /*policy_decider*/ None,
+                /*blocked_request_observer*/ None,
+                /*enable_network_approval_flow*/ true,
+                crate::config::NetworkProxyAuditMetadata::default(),
+            )
+            .await
+            .expect("start managed network proxy");
+        turn.network = Some(started_proxy.proxy());
+        Some(started_proxy)
+    } else {
+        None
+    };
+    assert_eq!(turn.network.is_some(), managed_network);
+    let payload = ToolPayload::Function {
+        arguments: json!({"kind": "argv", "program": "rg", "args": ["--version"]}).to_string(),
+    };
+    let result = ShellCommandHandler::default()
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::new(turn)),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "managed-network-without-sandbox".to_string(),
+            tool_name: codex_tools::ToolName::plain("shell_command"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await
+        .map(|output| output.code_mode_result(&payload).to_string());
+    drop(started_proxy);
+    result
+}
+
+/// Under managed network, `shell_command` must not run a command unsandboxed when this host has no
+/// sandbox backend. Like `build_exec_request` and unified exec, it refuses the launch, and the
+/// model sees the refusal as an execution error.
+#[tokio::test]
+async fn shell_command_refuses_managed_network_launch_when_no_sandbox_is_available() {
+    let error = match run_version_probe_without_sandbox_backend(/*managed_network*/ true).await {
+        Err(crate::FunctionCallError::RespondToModel(error)) => error,
+        Err(error) => panic!("unexpected handler error: {error}"),
+        Ok(output) => panic!("managed network must not run a command without a sandbox: {output}"),
+    };
+    assert_eq!(
+        error,
+        "execution error: requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed"
+    );
+}
+
+/// Read-only restrictions still require a sandbox even without a managed proxy.
+#[tokio::test]
+async fn shell_command_without_managed_network_refuses_when_no_sandbox_is_available() {
+    let error = match run_version_probe_without_sandbox_backend(/*managed_network*/ false).await {
+        Err(crate::FunctionCallError::RespondToModel(error)) => error,
+        Err(error) => panic!("unexpected handler error: {error}"),
+        Ok(output) => panic!("restricted command must not run without a sandbox: {output}"),
+    };
+    assert_eq!(
+        error,
+        "execution error: requested restrictions require a sandbox, but no sandbox backend is available; refusing to run unsandboxed"
+    );
 }

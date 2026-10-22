@@ -10,6 +10,40 @@ const INVALID_IMAGE_URL_ERROR: &str =
     "Tool call failed: invalid image output. Pass a base64 data URI instead";
 const CODEX_IMAGE_DETAIL_META_KEY: &str = "codex/imageDetail";
 
+enum ImageOutputError {
+    Discarded,
+    Invalid(String),
+}
+impl From<String> for ImageOutputError {
+    fn from(error: String) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+// Data URIs have no JSON escapes. Include the largest detail spelling and the
+// content-array separator, independently of the unrelated 8 MiB text limit.
+const IMAGE_ENCODING_OVERHEAD: usize =
+    br#"{"type":"input_image","image_url":"","detail":"original"},"#.len();
+
+fn copy_image_url(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::String>,
+    extra_bytes: usize,
+) -> Result<String, ImageOutputError> {
+    let bytes = value.utf8_length(scope).saturating_add(extra_bytes);
+    if let Some(state) = scope.get_slot::<super::RuntimeState>()
+        && let Some(event) = state
+            .output_admission
+            .reject_before_conversion_with_overhead(bytes, IMAGE_ENCODING_OVERHEAD)
+    {
+        if let Some(event) = event {
+            let _ = state.event_tx.send(event);
+        }
+        return Err(ImageOutputError::Discarded);
+    }
+    Ok(copy_string(scope, value))
+}
+
 // These bound Rust conversion copies, not V8 allocations or buffered output.
 pub(super) const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const MAX_NOTIFICATION_BYTES: usize = 1024 * 1024;
@@ -55,7 +89,9 @@ pub(super) fn serialize_output_text_with_limit(
         || value.is_big_int()
         || value.is_string()
     {
-        let value = value.to_string(scope).ok_or_else(|| "failed to format text".to_string())?;
+        let value = value
+            .to_string(scope)
+            .ok_or_else(|| "failed to format text".to_string())?;
         return bounded_string(scope, value, max_bytes);
     }
 
@@ -70,7 +106,9 @@ pub(super) fn serialize_output_text_with_limit(
             .map(|exception| value_to_error_text(&mut tc, exception))
             .unwrap_or_else(|| "unknown code mode exception".to_string()));
     }
-    let value = value.to_string(&tc).ok_or_else(|| "failed to format text".to_string())?;
+    let value = value
+        .to_string(&tc)
+        .ok_or_else(|| "failed to format text".to_string())?;
     bounded_string(&mut tc, value, max_bytes)
 }
 
@@ -107,9 +145,9 @@ pub(super) fn normalize_output_image(
     value: v8::Local<'_, v8::Value>,
     detail_override: Option<String>,
 ) -> Result<FunctionCallOutputContentItem, ()> {
-    let result = (|| -> Result<FunctionCallOutputContentItem, String> {
-        let (image_url, detail) = if value.is_string() {
-            (value.to_rust_string_lossy(scope), None)
+    let result = (|| -> Result<FunctionCallOutputContentItem, ImageOutputError> {
+        let (image_url, detail) = if let Ok(image_url) = v8::Local::<v8::String>::try_from(value) {
+            (copy_image_url(scope, image_url, 0)?, None)
         } else if value.is_object() && !value.is_array() {
             let object = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
@@ -119,20 +157,20 @@ pub(super) fn normalize_output_image(
                 parse_mcp_output_image(scope, value)?
             }
         } else {
-            return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
+            return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string().into());
         };
 
         if image_url.is_empty() {
-            return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
+            return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string().into());
         }
         let Some((scheme, _)) = image_url.split_once(':') else {
-            return Err(INVALID_IMAGE_URL_ERROR.to_string());
+            return Err(INVALID_IMAGE_URL_ERROR.to_string().into());
         };
         if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-            return Err(REMOTE_IMAGE_URL_ERROR.to_string());
+            return Err(REMOTE_IMAGE_URL_ERROR.to_string().into());
         }
         if !scheme.eq_ignore_ascii_case("data") || !valid_image_data_uri(&image_url) {
-            return Err(INVALID_IMAGE_URL_ERROR.to_string());
+            return Err(INVALID_IMAGE_URL_ERROR.to_string().into());
         }
 
         let detail = detail_override.or(detail);
@@ -145,9 +183,9 @@ pub(super) fn normalize_output_image(
                     "high" => ImageDetail::High,
                     "original" => ImageDetail::Original,
                     _ => {
-                        return Err(
-                            "image detail must be one of: auto, low, high, original".to_string()
-                        );
+                        return Err("image detail must be one of: auto, low, high, original"
+                            .to_string()
+                            .into());
                     }
                 })
             }
@@ -159,7 +197,8 @@ pub(super) fn normalize_output_image(
 
     match result {
         Ok(item) => Ok(item),
-        Err(error_text) => {
+        Err(ImageOutputError::Discarded) => Err(()),
+        Err(ImageOutputError::Invalid(error_text)) => {
             throw_type_error(scope, &error_text);
             Err(())
         }
@@ -169,7 +208,7 @@ pub(super) fn normalize_output_image(
 fn parse_non_mcp_output_image(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
-) -> Result<Option<(String, Option<String>)>, String> {
+) -> Result<Option<(String, Option<String>)>, ImageOutputError> {
     let image_url_key = v8::String::new(scope, "image_url")
         .ok_or_else(|| "failed to allocate image helper keys".to_string())?;
     let Some(image_url) = object.get(scope, image_url_key.into()) else {
@@ -178,59 +217,86 @@ fn parse_non_mcp_output_image(
     if image_url.is_undefined() {
         return Ok(None);
     }
-    if !image_url.is_string() {
-        return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
-    }
+    let image_url = v8::Local::<v8::String>::try_from(image_url)
+        .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
+    let image_url = copy_image_url(scope, image_url, 0)?;
     let detail_key = v8::String::new(scope, "detail")
         .ok_or_else(|| "failed to allocate image helper keys".to_string())?;
     let detail = parse_image_detail_value(scope, object.get(scope, detail_key.into()))?;
-    Ok(Some((image_url.to_rust_string_lossy(scope), detail)))
+    Ok(Some((image_url, detail)))
+}
+
+fn image_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'_, v8::Object>,
+    key: &str,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let key = v8::String::new(scope, key)
+        .ok_or_else(|| "failed to allocate image helper key".to_string())?;
+    object
+        .get(scope, key.into())
+        .ok_or_else(|| "failed to read image helper property".to_string())
 }
 
 fn parse_mcp_output_image(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
-) -> Result<(String, Option<String>), String> {
-    let Some(result) = v8_value_to_json(scope, value)? else {
-        return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
-    };
-    let JsonValue::Object(result) = result else {
-        return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
-    };
-    let Some(item_type) = result.get("type").and_then(JsonValue::as_str) else {
-        return Err(IMAGE_HELPER_EXPECTS_MESSAGE.to_string());
-    };
-    if item_type != "image" {
-        return Err(format!(
-            "image only accepts MCP image blocks, got \"{item_type}\""
-        ));
+) -> Result<(String, Option<String>), ImageOutputError> {
+    let object = v8::Local::<v8::Object>::try_from(value)
+        .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
+    let kind = image_property(scope, object, "type")?;
+    let kind = v8::Local::<v8::String>::try_from(kind)
+        .map_err(|_| IMAGE_HELPER_EXPECTS_MESSAGE.to_string())?;
+    let kind = bounded_string(scope, kind, 32)?;
+    if kind != "image" {
+        return Err(format!("image only accepts MCP image blocks, got \"{kind}\"").into());
     }
-    let data = result
-        .get("data")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| "image expected MCP image data".to_string())?;
+    let data = image_property(scope, object, "data")?;
+    let data = v8::Local::<v8::String>::try_from(data)
+        .map_err(|_| "image expected MCP image data".to_string())?;
+    // Reject before Rust conversion even when the raw MCP payload is huge.
+    let data = copy_image_url(scope, data, 160)?;
     if data.is_empty() {
-        return Err("image expected MCP image data".to_string());
+        return Err("image expected MCP image data".to_string().into());
     }
-
-    let image_url = if data.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:")) {
-        data.to_string()
+    let mime = image_property(scope, object, "mimeType")?;
+    let mime = if mime.is_undefined() {
+        image_property(scope, object, "mime_type")?
     } else {
-        let mime_type = result
-            .get("mimeType")
-            .or_else(|| result.get("mime_type"))
-            .and_then(JsonValue::as_str)
-            .filter(|mime_type| !mime_type.is_empty())
-            .unwrap_or("application/octet-stream");
-        format!("data:{mime_type};base64,{data}")
+        mime
     };
-    let detail = result
-        .get("_meta")
-        .and_then(JsonValue::as_object)
-        .and_then(|meta| meta.get(CODEX_IMAGE_DETAIL_META_KEY))
-        .and_then(JsonValue::as_str)
-        .filter(|detail| matches!(*detail, "auto" | "low" | "high" | "original"))
-        .map(str::to_string);
+    let mime = if let Ok(mime) = v8::Local::<v8::String>::try_from(mime) {
+        bounded_string(scope, mime, 128)?
+    } else {
+        String::new()
+    };
+    let mime = if mime.is_empty() {
+        "application/octet-stream"
+    } else {
+        &mime
+    };
+    let image_url = if data
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        data
+    } else {
+        format!("data:{mime};base64,{data}")
+    };
+    let meta = image_property(scope, object, "_meta")?;
+    let detail = if let Ok(meta) = v8::Local::<v8::Object>::try_from(meta) {
+        let key = v8::String::new(scope, CODEX_IMAGE_DETAIL_META_KEY)
+            .ok_or_else(|| "failed to allocate image helper key".to_string())?;
+        let detail = meta.get(scope, key.into());
+        match detail.and_then(|d| v8::Local::<v8::String>::try_from(d).ok()) {
+            Some(detail) => bounded_string(scope, detail, 8)
+                .ok()
+                .filter(|d| matches!(d.as_str(), "auto" | "low" | "high" | "original")),
+            None => None,
+        }
+    } else {
+        None
+    };
     Ok((image_url, detail))
 }
 
@@ -239,9 +305,11 @@ fn parse_image_detail_value<'s>(
     value: Option<v8::Local<'s, v8::Value>>,
 ) -> Result<Option<String>, String> {
     match value {
-        Some(value) if value.is_string() => Ok(Some(value.to_rust_string_lossy(scope))),
         Some(value) if value.is_null() || value.is_undefined() => Ok(None),
-        Some(_) => Err("image detail must be a string when provided".to_string()),
+        Some(value) => match v8::Local::<v8::String>::try_from(value) {
+            Ok(value) => bounded_string(scope, value, 8).map(Some),
+            Err(_) => Err("image detail must be a string when provided".to_string()),
+        },
         None => Ok(None),
     }
 }
@@ -251,7 +319,9 @@ pub(super) fn v8_value_to_json(
     value: v8::Local<'_, v8::Value>,
 ) -> Result<Option<JsonValue>, String> {
     v8_value_to_json_with_limit(scope, value, MAX_PAYLOAD_BYTES).map_err(|error| match error {
-        JsonConversionError::TooLarge => format!("payload exceeds its limit of {MAX_PAYLOAD_BYTES} bytes"),
+        JsonConversionError::TooLarge => {
+            format!("payload exceeds its limit of {MAX_PAYLOAD_BYTES} bytes")
+        }
         JsonConversionError::Invalid(message) => message,
     })
 }
@@ -268,13 +338,15 @@ pub(super) fn v8_value_to_json_with_limit(
 ) -> Result<Option<JsonValue>, JsonConversionError> {
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let mut tc = tc.init();
-    let Some(stringified) = super::output_projection::json_codec(&mut tc, value, "stringify")
-        .and_then(|value| v8::Local::<v8::String>::try_from(value).ok()) else {
+    let Some(stringified) = super::output_projection::json_codec(&mut tc, value, "canonical")
+        .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+    else {
         if tc.has_caught() {
-            return Err(JsonConversionError::Invalid(tc
-                .exception()
-                .map(|exception| value_to_error_text(&mut tc, exception))
-                .unwrap_or_else(|| "unknown code mode exception".to_string())));
+            return Err(JsonConversionError::Invalid(
+                tc.exception()
+                    .map(|exception| value_to_error_text(&mut tc, exception))
+                    .unwrap_or_else(|| "unknown code mode exception".to_string()),
+            ));
         }
         return Ok(None);
     };
@@ -283,7 +355,9 @@ pub(super) fn v8_value_to_json_with_limit(
     }
     serde_json::from_str(&copy_string(&mut tc, stringified))
         .map(Some)
-        .map_err(|err| JsonConversionError::Invalid(format!("failed to serialize JavaScript value: {err}")))
+        .map_err(|err| {
+            JsonConversionError::Invalid(format!("failed to serialize JavaScript value: {err}"))
+        })
 }
 
 pub(super) fn json_to_v8<'s>(
@@ -302,6 +376,19 @@ pub(super) fn serialized_json_to_v8<'s>(
     super::output_projection::json_codec(scope, json.into(), "parse")
 }
 
+fn diagnostic_string(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::String>) -> String {
+    let limit = super::MAX_ERROR_TEXT_BYTES;
+    if value.utf8_length(scope) <= limit {
+        return copy_string(scope, value);
+    }
+    let mut bytes = vec![0; limit - super::ERROR_TRUNCATION_SUFFIX.len()];
+    let written = value.write_utf8_v2(scope, &mut bytes, v8::WriteFlags::kReplaceInvalidUtf8, None);
+    bytes.truncate(written);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    text.push_str(super::ERROR_TRUNCATION_SUFFIX);
+    text
+}
+
 pub(super) fn value_to_error_text(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
@@ -314,10 +401,11 @@ pub(super) fn value_to_error_text(
         v8::Local::<v8::String>::try_from(object.get(&tc, key.into())?).ok()
     });
     tc.reset();
-    let mut text = stack
-        .map(|stack| bounded_string(&mut tc, stack, MAX_NOTIFICATION_BYTES)
-            .unwrap_or_else(|_| "[error stack exceeds 1 MiB]".to_string()))
-        .unwrap_or_else(|| value.to_rust_string_lossy(&tc));
+    let string = stack.or_else(|| value.to_string(&tc));
+    tc.reset();
+    let mut text = string
+        .map(|string| diagnostic_string(&mut tc, string))
+        .unwrap_or_else(|| "[unprintable exception]".to_string());
     if text.lines().next().is_some_and(|line| {
         line.starts_with("TypeError: ") && line.ends_with(".index is not a function")
     }) {
@@ -328,23 +416,29 @@ pub(super) fn value_to_error_text(
     // fallback. Do not run this on successful results or emit extra tool calls.
     if let Some(object) = object {
         for field in ["results", "evidence"] {
-            let Some(key) = v8::String::new(&tc, field) else { continue; };
+            let Some(key) = v8::String::new(&tc, field) else {
+                continue;
+            };
             let attached = object.get(&tc, key.into());
             tc.reset();
-            let Some(attached) = attached.filter(|value| !value.is_undefined()) else { continue; };
+            let Some(attached) = attached.filter(|value| !value.is_undefined()) else {
+                continue;
+            };
             let remaining = MAX_PAYLOAD_BYTES.saturating_sub(text.len() + field.len() + 32);
             let mut serialized = super::output_projection::stringify(&mut tc, attached)
                 .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
             tc.reset();
             if serialized.is_none() {
-                serialized = super::output_projection::json_codec(&mut tc, attached, "helper_evidence")
-                    .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
-                    .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
+                serialized =
+                    super::output_projection::json_codec(&mut tc, attached, "helper_evidence")
+                        .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+                        .and_then(|json| bounded_string(&mut tc, json, remaining).ok());
                 tc.reset();
             }
             text.push_str(&format!("\nHelper {field}:\n"));
             text.push_str(serialized.as_deref().unwrap_or(
-                "[evidence unavailable: unserializable or exceeds remaining 8 MiB error budget]"));
+                "[evidence unavailable: unserializable or exceeds remaining 8 MiB error budget]",
+            ));
         }
     }
     text
@@ -357,7 +451,10 @@ pub(super) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
     }
 }
 
-pub(super) fn error_value<'s>(scope: &mut v8::PinScope<'s, '_>, message: &str) -> v8::Local<'s, v8::Value> {
+pub(super) fn error_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    message: &str,
+) -> v8::Local<'s, v8::Value> {
     match v8::String::new(scope, message) {
         Some(message) => v8::Exception::error(scope, message),
         None => v8::undefined(scope).into(),
@@ -365,18 +462,37 @@ pub(super) fn error_value<'s>(scope: &mut v8::PinScope<'s, '_>, message: &str) -
 }
 
 fn valid_image_data_uri(uri: &str) -> bool {
-    let Some((header, payload)) = uri.split_once(',') else { return false; };
-    let Some((mime, encoding)) = header.get(5..).and_then(|header| header.split_once(';')) else { return false; };
+    let Some((header, payload)) = uri.split_once(',') else {
+        return false;
+    };
+    let Some((mime, encoding)) = header.get(5..).and_then(|header| header.split_once(';')) else {
+        return false;
+    };
     // view_image and MCP blocks without a MIME type return opaque source bytes.
     // The history insertion path decodes and validates those bytes as an image.
-    if !["image/png", "image/jpeg", "image/webp", "image/gif", "application/octet-stream"].iter().any(|supported| mime.eq_ignore_ascii_case(supported))
-        || !encoding.eq_ignore_ascii_case("base64") || payload.is_empty() || payload.len() % 4 != 0 {
+    if ![
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+        "application/octet-stream",
+    ]
+    .iter()
+    .any(|supported| mime.eq_ignore_ascii_case(supported))
+        || !encoding.eq_ignore_ascii_case("base64")
+        || payload.is_empty()
+        || payload.len() % 4 != 0
+    {
         return false;
     }
     // Validate canonical base64 in place; decoding would allocate another image.
     let unpadded = payload.trim_end_matches('=');
     let padding = payload.len() - unpadded.len();
-    if padding > 2 || !unpadded.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/') {
+    if padding > 2
+        || !unpadded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    {
         return false;
     }
     let last = match unpadded.as_bytes().last().copied() {
@@ -387,5 +503,9 @@ fn valid_image_data_uri(uri: &str) -> bool {
         Some(b'/') => 63,
         _ => return false,
     };
-    match padding { 1 => last & 3 == 0, 2 => last & 15 == 0, _ => true }
+    match padding {
+        1 => last & 3 == 0,
+        2 => last & 15 == 0,
+        _ => true,
+    }
 }

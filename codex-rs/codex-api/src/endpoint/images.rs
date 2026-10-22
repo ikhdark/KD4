@@ -50,8 +50,14 @@ impl<T: HttpTransport> ImagesClient<T> {
         request: &ImageEditRequest,
         extra_headers: HeaderMap,
     ) -> Result<ImageResponse, ApiError> {
-        self.post_image_request("images/edits", request, extra_headers, "image edit", request.n.unwrap_or(1))
-            .await
+        self.post_image_request(
+            "images/edits",
+            request,
+            extra_headers,
+            "image edit",
+            request.n.unwrap_or(1),
+        )
+        .await
     }
 
     async fn post_image_request<R: Serialize>(
@@ -67,13 +73,22 @@ impl<T: HttpTransport> ImagesClient<T> {
         // Each supported image may contain 64 MiB of decoded data. Allow base64
         // plus worst-case JSON Unicode escapes and one MiB of envelope metadata.
         let per_image = (64_usize * 1024 * 1024).div_ceil(3) * 4 * 6;
-        let max_response_bytes = usize::try_from(image_count.max(1)).ok()
+        let max_response_bytes = usize::try_from(image_count.max(1))
+            .ok()
             .and_then(|count| per_image.checked_mul(count))
             .and_then(|bytes| bytes.checked_add(1024 * 1024))
-            .ok_or_else(|| ApiError::InvalidRequest { message: "image response budget overflow".into() })?;
+            .ok_or_else(|| ApiError::InvalidRequest {
+                message: "image response budget overflow".into(),
+            })?;
         let resp = self
             .session
-            .execute_non_idempotent(Method::POST, path, extra_headers, Some(body), max_response_bytes)
+            .execute_non_idempotent(
+                Method::POST,
+                path,
+                extra_headers,
+                Some(body),
+                max_response_bytes,
+            )
             .await?;
         serde_json::from_slice(&resp.body)
             .map_err(|e| ApiError::Stream(format!("failed to decode {operation} response: {e}")))
@@ -247,6 +262,21 @@ mod tests {
             }],
             quality: Some(ImageQuality::Medium),
             size: Some("1024x1536".to_string()),
+            usage: Some(codex_protocol::items::ImageGenerationUsage {
+                model: None,
+                reported: true,
+                input_tokens: Some(1474),
+                output_tokens: Some(1372),
+                total_tokens: Some(2846),
+                input_tokens_details: Some(codex_protocol::items::ImageTokenDetails {
+                    image_tokens: Some(1457),
+                    text_tokens: Some(17),
+                }),
+                output_tokens_details: Some(codex_protocol::items::ImageTokenDetails {
+                    image_tokens: Some(1372),
+                    text_tokens: Some(0),
+                }),
+            }),
         }
     }
 

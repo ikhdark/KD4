@@ -214,6 +214,12 @@ impl TraceReducer {
             inference.usage = Some(usage);
         }
 
+        if let Some(response_id) = payload.get("response_id").and_then(Value::as_str)
+            && let Some(inference) = self.rollout.inference_calls.get_mut(inference_call_id)
+        {
+            inference.response_id = Some(response_id.to_owned());
+        }
+
         Ok(response_item_ids)
     }
 

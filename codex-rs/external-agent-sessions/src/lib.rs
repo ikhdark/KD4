@@ -206,7 +206,10 @@ mod tests {
         assert_eq!(pending.source_path, source_path.canonicalize().unwrap());
         assert_eq!(pending.session.cwd, root.path());
         assert_eq!(pending.session.title.as_deref(), Some("first request"));
-        assert_eq!(pending.session.first_user_message.as_deref(), Some("first request"));
+        assert_eq!(
+            pending.session.first_user_message.as_deref(),
+            Some("first request")
+        );
 
         // Validation uses the cwd recorded in the session, not the discovery cwd.
         let missing_cwd_source = root.path().join("missing-cwd-session.jsonl");

@@ -8,15 +8,28 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn instruction_spills_never_splice_policy_even_when_storage_fails() -> Result<()> {
     let dir = tempdir()?;
-    let text = format!("Perform the action. {} Except when unapproved, do not perform it. {} Proceed.", "x".repeat(15_000), "y".repeat(45_000));
+    let text = format!(
+        "Perform the action. {} Except when unapproved, do not perform it. {} Proceed.",
+        "x".repeat(15_000),
+        "y".repeat(45_000)
+    );
     for storage_fails in [false, true] {
-        let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?
-            .join(if storage_fails { "blocked" } else { "available" });
+        let output_dir = AbsolutePathBuf::from_absolute_path(dir.path())?.join(if storage_fails {
+            "blocked"
+        } else {
+            "available"
+        });
         if storage_fails {
             fs::write(output_dir.as_ref(), "not a directory").await?;
         }
-        let spiller = HookOutputSpiller { output_dir, last_prune: Arc::default() };
-        let output = spiller.maybe_spill_texts(ThreadId::new(), vec![text.clone()]).await.remove(0);
+        let spiller = HookOutputSpiller {
+            output_dir,
+            last_prune: Arc::default(),
+        };
+        let output = spiller
+            .maybe_spill_texts(ThreadId::new(), vec![text.clone()])
+            .await
+            .remove(0);
         assert!(output.starts_with(OMITTED_HOOK_INSTRUCTIONS));
         assert!(!output.contains("Perform the action."));
         assert!(!output.contains("Proceed."));
@@ -25,7 +38,10 @@ async fn instruction_spills_never_splice_policy_even_when_storage_fails() -> Res
             assert!(output.contains("Recovery unavailable:"));
             assert!(!output.contains("Full hook output saved to:"));
         } else {
-            let path = output.lines().find_map(|line| line.strip_prefix("Full hook output saved to: ")).context("recovery path")?;
+            let path = output
+                .lines()
+                .find_map(|line| line.strip_prefix("Full hook output saved to: "))
+                .context("recovery path")?;
             assert_eq!(fs::read_to_string(path).await?, text);
         }
     }

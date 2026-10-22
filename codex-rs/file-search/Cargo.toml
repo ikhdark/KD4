@@ -25,6 +25,7 @@ nucleo = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 unicode-segmentation = { workspace = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

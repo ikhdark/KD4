@@ -452,9 +452,12 @@ fn git_subcommand(tokens: &[String]) -> Option<&str> {
             index = index.saturating_add(2);
             continue;
         }
+        // Approval requires `--no-optional-locks` before `status`, so the
+        // only certifiable status spelling must still resolve its subcommand.
         if matches!(
             token,
             "--no-pager"
+                | "--no-optional-locks"
                 | "--paginate"
                 | "-p"
                 | "--literal-pathspecs"
@@ -511,7 +514,7 @@ fn git_argv_is_read_only(command: &[String], subcommand: &str, allow_cwd_change:
         stripped.drain(1..=removable);
         return git_argv_is_read_only(&stripped, subcommand, allow_cwd_change);
     }
-    if matches!(subcommand, "diff" | "log" | "show") {
+    if matches!(subcommand, "diff" | "log" | "show" | "status") {
         // These commands can write with --output or invoke external programs.
         // Do not override the safety owner's rejection with a subcommand label.
         codex_shell_command::is_safe_command::is_known_safe_direct_argv(command)
@@ -698,4 +701,47 @@ fn tokens_contain_redirect(tokens: &[String]) -> bool {
         // the spaced (`> out.txt`) and attached (`>out.txt`) forms.
         rest.starts_with('>')
     })
+}
+#[cfg(test)]
+mod configured_git_helper_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_classification_requires_the_same_helper_suppression_as_approval() {
+        let argv = |args: &[&str]| {
+            args.iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>()
+        };
+        for args in [
+            vec!["git", "status"],
+            vec!["git", "--no-optional-locks", "status"],
+            vec!["git", "diff"],
+            vec!["git", "show", "HEAD"],
+        ] {
+            assert!(looks_like_mutating_command(&argv(&args)), "{args:?}");
+            assert!(!command_is_read_only_git(&argv(&args)), "{args:?}");
+        }
+        for args in [
+            vec![
+                "git",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+            ],
+            vec![
+                "git",
+                "-c",
+                "core.fsmonitor=false",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+            ],
+        ] {
+            assert!(!looks_like_mutating_command(&argv(&args)), "{args:?}");
+            // Dependency scoping must accept every spelling approval admits.
+            assert!(command_is_read_only_git(&argv(&args)), "{args:?}");
+        }
+    }
 }

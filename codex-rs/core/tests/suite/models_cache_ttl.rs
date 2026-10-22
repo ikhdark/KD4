@@ -44,7 +44,7 @@ const VERSIONED_MODEL: &str = "codex-test-versioned";
 const DIFFERENT_VERSION_MODEL: &str = "codex-test-different-version";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
+async fn matching_models_etag_does_not_renew_cache_ttl() -> Result<()> {
     let server = MockServer::start().await;
 
     let remote_model = test_remote_model(REMOTE_MODEL, /*priority*/ 1);
@@ -83,7 +83,9 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     let stale_time = Utc.timestamp_opt(0, 0).single().expect("valid epoch");
     rewrite_cache_timestamp(&cache_path, stale_time).await?;
 
-    // Trigger responses with matching ETag, which should renew the cache TTL without another /models.
+    // A response ETag is an inference hint without request-scoped authority. Even when it
+    // equals the cached validator, it must neither refetch /models nor renew the cache TTL;
+    // only scoped /models responses renew it.
     let response_body = sse(vec![
         ev_response_created("resp-1"),
         ev_assistant_message("msg-1", "done"),
@@ -96,7 +98,6 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
     .await;
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, test.cwd_path());
-    let refresh_started_at = Utc::now();
 
     codex
         .submit(Op::UserInput {
@@ -126,34 +127,23 @@ async fn renews_cache_ttl_on_matching_models_etag() -> Result<()> {
         .await?;
 
     let _ = wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-    let refresh_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let refreshed_cache = tokio::time::timeout_at(refresh_deadline, async {
-        loop {
-            let cache = read_cache(&cache_path).await?;
-            if cache.fetched_at >= refresh_started_at {
-                break Ok::<_, anyhow::Error>(cache);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("matching response ETag did not renew the cache TTL before the deadline")?;
-    let refresh_finished_at = Utc::now();
-    assert!(
-        refreshed_cache.fetched_at >= refresh_started_at
-            && refreshed_cache.fetched_at <= refresh_finished_at,
-        "cache TTL should be renewed to the response-processing interval; got {} outside {}..={}",
-        refreshed_cache.fetched_at,
-        refresh_started_at,
-        refresh_finished_at,
-    );
-    assert_eq!(refreshed_cache.etag.as_deref(), Some(ETAG));
+    // The turn submits its ETag notice asynchronously. An equal notice coalesces with a
+    // pending one, and this future resolves only once the refresh worker is idle.
+    Arc::clone(&models_manager)
+        .notify_etag(
+            ETAG.to_string(),
+            codex_core::test_support::default_http_client_factory(),
+        )
+        .await;
+    let cache = read_cache(&cache_path).await?;
     assert_eq!(
-        refreshed_cache.client_version,
-        Some(client_version_to_whole())
+        cache.fetched_at, stale_time,
+        "a matching response ETag must not renew the cache TTL"
     );
-    assert!(refreshed_cache.provider_cache_identity.is_some());
-    assert_eq!(refreshed_cache.models, vec![remote_model]);
+    assert_eq!(cache.etag.as_deref(), Some(ETAG));
+    assert_eq!(cache.client_version, Some(client_version_to_whole()));
+    assert!(cache.provider_cache_identity.is_some());
+    assert_eq!(cache.models, vec![remote_model]);
     assert_eq!(
         models_mock.requests().len(),
         1,
@@ -458,7 +448,6 @@ fn test_remote_model(slug: &str, priority: i32) -> ModelInfo {
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
-        supports_experimental_context: false,
         context_window: Some(272_000),
         max_context_window: None,
         auto_compact_token_limit: None,

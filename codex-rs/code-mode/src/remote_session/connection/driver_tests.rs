@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::NestedCancellation;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
@@ -13,11 +14,11 @@ use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::ClientToHost;
+use codex_code_mode_protocol::host::DelegateRequest;
+use codex_code_mode_protocol::host::DelegateRequestId;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 use codex_code_mode_protocol::host::HostRequest;
-use codex_code_mode_protocol::host::DelegateRequest;
-use codex_code_mode_protocol::host::DelegateRequestId;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
@@ -30,7 +31,6 @@ use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use crate::NestedCancellation;
 use tokio_util::sync::CancellationToken;
 
 use super::ConnectionDriver;
@@ -210,22 +210,48 @@ struct PanickingDelegate;
 async fn continuous_events_do_not_starve_termination_commands() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
-    harness.open(session.clone(), Arc::new(RecordingDelegate::default())).await;
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
     let _cell = harness.start_cell(session.clone(), 2, "1").await;
     // Fill the event queue before the driver runs again and end it with a
     // failure. An event-first driver reaches the failure before it reads the
     // command and never frames it; the fair selector reads the command first
     // except with probability (1/3)^16.
     for _ in 0..15 {
-        harness.event_tx.try_send(DriverEvent::RequestCancelled(RequestId::new(999_999))).unwrap();
+        harness
+            .event_tx
+            .try_send(DriverEvent::RequestCancelled(RequestId::new(999_999)))
+            .unwrap();
     }
-    harness.event_tx.try_send(DriverEvent::Failed("probe".to_string())).unwrap();
+    harness
+        .event_tx
+        .try_send(DriverEvent::Failed("probe".to_string()))
+        .unwrap();
     let (response_tx, _response_rx) = oneshot::channel();
-    harness.command_tx.try_send(DriverCommand::Terminate { session, cell_id: CellId::new("1".to_string()), response_tx }).unwrap();
-    let frame = harness.outgoing_rx.recv().await.expect("terminate frame before the queued failure");
+    harness
+        .command_tx
+        .try_send(DriverCommand::Terminate {
+            session,
+            cell_id: CellId::new("1".to_string()),
+            response_tx,
+        })
+        .unwrap();
+    let frame = harness
+        .outgoing_rx
+        .recv()
+        .await
+        .expect("terminate frame before the queued failure");
     let mut bytes = Vec::new();
-    FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
-    let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
+    FramedWriter::new(&mut bytes)
+        .write_frame(&frame)
+        .await
+        .unwrap();
+    let message = FramedReader::new(bytes.as_slice())
+        .read::<ClientToHost>()
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(message, ClientToHost::Request {
         id, request: HostRequest::Terminate { cell_id, .. },
     } if id == RequestId::new(3) && cell_id.as_str() == "1"));
@@ -364,18 +390,27 @@ async fn legacy_host_rejects_stale_receipt_lookup_without_sending_extensions() {
     let mut harness = DriverHarness::start();
     let mut session = remote_session();
     session.generation = 2;
-    harness.open(session.clone(), Arc::new(RecordingDelegate::default())).await;
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
     let (response_tx, response_rx) = oneshot::channel();
-    harness.command_tx.send(DriverCommand::Wait {
-        session,
-        request: WaitRequest {
-            cell_id: CellId::new("1".into()), yield_time_ms: 1,
-            recovery: Some(codex_code_mode_protocol::ReceiptRecovery {
-                path: std::env::temp_dir().join("receipt.json"), terminal_only: false,
-            }),
-        },
-        caller_cancellation: CancellationToken::new(), response_tx,
-    }).await.unwrap();
+    harness
+        .command_tx
+        .send(DriverCommand::Wait {
+            session,
+            request: WaitRequest {
+                cell_id: CellId::new("1".into()),
+                yield_time_ms: 1,
+                recovery: Some(codex_code_mode_protocol::ReceiptRecovery {
+                    path: std::env::temp_dir().join("receipt.json"),
+                    terminal_only: false,
+                }),
+            },
+            caller_cancellation: CancellationToken::new(),
+            response_tx,
+        })
+        .await
+        .unwrap();
     assert!(response_rx.await.unwrap().unwrap_err().contains("stale"));
     assert!(harness.outgoing_rx.try_recv().is_err());
     assert!(harness.alive.load(Ordering::Acquire));
@@ -393,23 +428,39 @@ async fn stale_generation_wait_recovers_only_terminal_receipts_without_execute()
         harness.open(session.clone(), delegate.clone()).await;
         let (response_tx, response_rx) = oneshot::channel();
         let old_id = CellId::new("g2:7".to_string());
-        harness.command_tx.send(DriverCommand::Wait {
-            session,
-            request: WaitRequest {
-                cell_id: old_id.clone(), yield_time_ms: 1,
-                recovery: Some(codex_code_mode_protocol::ReceiptRecovery {
-                    path: std::env::temp_dir().join("receipt-recovery-test.json"),
-                    terminal_only: false,
-                }),
-            },
-            caller_cancellation: CancellationToken::new(),
-            response_tx,
-        }).await.unwrap();
+        harness
+            .command_tx
+            .send(DriverCommand::Wait {
+                session,
+                request: WaitRequest {
+                    cell_id: old_id.clone(),
+                    yield_time_ms: 1,
+                    recovery: Some(codex_code_mode_protocol::ReceiptRecovery {
+                        path: std::env::temp_dir().join("receipt-recovery-test.json"),
+                        terminal_only: false,
+                    }),
+                },
+                caller_cancellation: CancellationToken::new(),
+                response_tx,
+            })
+            .await
+            .unwrap();
         let frame = harness.outgoing_rx.recv().await.unwrap();
         let mut bytes = Vec::new();
-        FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
-        let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
-        let ClientToHost::Request { id, request: HostRequest::Wait { request, .. } } = message else {
+        FramedWriter::new(&mut bytes)
+            .write_frame(&frame)
+            .await
+            .unwrap();
+        let message = FramedReader::new(bytes.as_slice())
+            .read::<ClientToHost>()
+            .await
+            .unwrap()
+            .unwrap();
+        let ClientToHost::Request {
+            id,
+            request: HostRequest::Wait { request, .. },
+        } = message
+        else {
             panic!("receipt recovery must send a wait, never execute");
         };
         assert_eq!(id, RequestId::new(2));
@@ -417,30 +468,53 @@ async fn stale_generation_wait_recovers_only_terminal_receipts_without_execute()
         assert_eq!(request.yield_time_ms, 1);
         let recovery = request.recovery.unwrap();
         assert!(recovery.terminal_only);
-        assert_eq!(recovery.path, std::env::temp_dir().join("receipt-recovery-test.json"));
+        assert_eq!(
+            recovery.path,
+            std::env::temp_dir().join("receipt-recovery-test.json")
+        );
         let response = if live_response {
-            WireRuntimeResponse::Yielded { cell_id: old_id.clone().into(), content_items: Vec::new() }
+            WireRuntimeResponse::Yielded {
+                cell_id: old_id.clone().into(),
+                content_items: Vec::new(),
+            }
         } else {
-            WireRuntimeResponse::Terminated { cell_id: old_id.clone().into(), content_items: Vec::new() }
+            WireRuntimeResponse::Terminated {
+                cell_id: old_id.clone().into(),
+                content_items: Vec::new(),
+            }
         };
-        harness.event_tx.send(DriverEvent::HostMessage(HostToClient::Response {
-            id: RequestId::new(2),
-            result: WireResult::Ok { value: HostResponse::WaitCompleted {
-                outcome: WireWaitOutcome::LiveCell(response),
-            }},
-        })).await.unwrap();
+        harness
+            .event_tx
+            .send(DriverEvent::HostMessage(HostToClient::Response {
+                id: RequestId::new(2),
+                result: WireResult::Ok {
+                    value: HostResponse::WaitCompleted {
+                        outcome: WireWaitOutcome::LiveCell(response),
+                    },
+                },
+            }))
+            .await
+            .unwrap();
         let result = response_rx.await.unwrap();
         if live_response {
             assert!(result.unwrap_err().contains("generation fence"));
             assert!(!harness.alive.load(Ordering::Acquire));
         } else {
-            assert_eq!(result.unwrap(), codex_code_mode_protocol::WaitOutcome::LiveCell(
-                codex_code_mode_protocol::RuntimeResponse::Terminated {
-                    cell_id: old_id, content_items: Vec::new(),
-                }));
+            assert_eq!(
+                result.unwrap(),
+                codex_code_mode_protocol::WaitOutcome::LiveCell(
+                    codex_code_mode_protocol::RuntimeResponse::Terminated {
+                        cell_id: old_id,
+                        content_items: Vec::new(),
+                    }
+                )
+            );
         }
         assert_eq!(delegate.invocations.load(Ordering::Relaxed), 0);
-        assert!(harness.outgoing_rx.try_recv().is_err(), "no execution or termination may be sent");
+        assert!(
+            harness.outgoing_rx.try_recv().is_err(),
+            "no execution or termination may be sent"
+        );
         harness.cancellation.cancel();
         (&mut harness.driver_task).await.unwrap();
     }
@@ -507,35 +581,39 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
     // The fair driver may reject an execute while shutdown is still queued.
     // It must converge to unknown-session without admitting any execution.
     tokio::time::timeout(Duration::from_secs(1), async {
-    loop {
-    let (execute_tx, execute_rx) = oneshot::channel();
-    harness
-        .command_tx
-        .send(DriverCommand::Execute {
-            session: session.clone(),
-            request: ExecuteRequest {
-                state_path: None,
-                tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new().into(),
-                source: "text('ok')".to_string(),
-                yield_time_ms: None,
-                max_output_tokens: None,
-                default_tool_timeout_ms: None,
-            },
-            caller_cancellation: CancellationToken::new(),
-            response_tx: execute_tx,
-        })
-        .await
-        .expect("execute command");
-    let error = execute_rx
-            .await
-            .expect("execute reply")
-            .err()
-            .expect("closed session should reject execute");
-    if error == "unknown code-mode session session-1" { break; }
-    assert_eq!(error, "code-mode session is shutting down");
-    }
-    }).await.unwrap();
+        loop {
+            let (execute_tx, execute_rx) = oneshot::channel();
+            harness
+                .command_tx
+                .send(DriverCommand::Execute {
+                    session: session.clone(),
+                    request: ExecuteRequest {
+                        state_path: None,
+                        tool_call_id: "call-1".to_string(),
+                        enabled_tools: Vec::new().into(),
+                        source: "text('ok')".to_string(),
+                        yield_time_ms: None,
+                        max_output_tokens: None,
+                        default_tool_timeout_ms: None,
+                    },
+                    caller_cancellation: CancellationToken::new(),
+                    response_tx: execute_tx,
+                })
+                .await
+                .expect("execute command");
+            let error = execute_rx
+                .await
+                .expect("execute reply")
+                .err()
+                .expect("closed session should reject execute");
+            if error == "unknown code-mode session session-1" {
+                break;
+            }
+            assert_eq!(error, "code-mode session is shutting down");
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -556,7 +634,10 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest { id: request_id, cause: None },
+            HostToClient::CancelDelegateRequest {
+                id: request_id,
+                cause: None,
+            },
         ))
         .await
         .expect("delegate cancel");
@@ -574,7 +655,10 @@ async fn delegate_cancel_is_best_effort_and_sends_no_late_response() {
     );
     // Reuse the ID for another tool call: an admitted duplicate would report Started.
     harness.start_tool_delegate(&session, request_id).await;
-    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert!(
@@ -616,7 +700,10 @@ async fn terminate_closes_cell_without_waiting_for_delegate_cleanup() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest { id: delegate_id, cause: None },
+            HostToClient::CancelDelegateRequest {
+                id: delegate_id,
+                cause: None,
+            },
         ))
         .await
         .expect("delegate cancel");
@@ -709,7 +796,10 @@ async fn shutdown_closes_cell_without_waiting_for_delegate_cleanup() {
     harness
         .event_tx
         .send(DriverEvent::HostMessage(
-            HostToClient::CancelDelegateRequest { id: delegate_id, cause: None },
+            HostToClient::CancelDelegateRequest {
+                id: delegate_id,
+                cause: None,
+            },
         ))
         .await
         .expect("delegate cancel");
@@ -850,7 +940,10 @@ async fn completed_delegate_request_id_cannot_be_reused() {
         }))
         .await
         .expect("reused delegate request");
-    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.notifications.load(Ordering::Relaxed), 1);
@@ -892,8 +985,15 @@ async fn delegate_task_panic_becomes_tool_error_without_killing_connection() {
         .expect("delegate response timeout")
         .expect("delegate response frame");
     let mut bytes = Vec::new();
-    FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
-    let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
+    FramedWriter::new(&mut bytes)
+        .write_frame(&frame)
+        .await
+        .unwrap();
+    let message = FramedReader::new(bytes.as_slice())
+        .read::<ClientToHost>()
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(message, ClientToHost::DelegateResponse {
         id, result: WireResult::Err { message },
     } if id == DelegateRequestId::new(7) && message == "code-mode delegate task failed: task panicked"));
@@ -937,7 +1037,10 @@ async fn delegate_for_unknown_cell_fails_connection_without_invocation() {
         }))
         .await
         .expect("delegate request");
-    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.invocations.load(Ordering::Relaxed), 0);
@@ -973,12 +1076,18 @@ async fn delegate_after_cell_close_fails_connection_without_invocation() {
         }))
         .await
         .expect("delegate request");
-    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task)
+        .await
+        .unwrap()
+        .unwrap();
 
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(delegate.invocations.load(Ordering::Relaxed), 0);
     assert_eq!(delegate.notifications.load(Ordering::Relaxed), 0);
-    assert_eq!(*delegate.closed_cells.lock().unwrap(), vec![CellId::new("1".to_string())]);
+    assert_eq!(
+        *delegate.closed_cells.lock().unwrap(),
+        vec![CellId::new("1".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -1133,14 +1242,28 @@ async fn remote_wait_accepts_durations_longer_than_five_minutes() {
         .expect("wait frame timeout")
         .expect("wait frame");
     let mut bytes = Vec::new();
-    FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
-    let message = FramedReader::new(bytes.as_slice()).read::<ClientToHost>().await.unwrap().unwrap();
-    let ClientToHost::Request { id, request: HostRequest::Wait { request, .. } } = message else {
+    FramedWriter::new(&mut bytes)
+        .write_frame(&frame)
+        .await
+        .unwrap();
+    let message = FramedReader::new(bytes.as_slice())
+        .read::<ClientToHost>()
+        .await
+        .unwrap()
+        .unwrap();
+    let ClientToHost::Request {
+        id,
+        request: HostRequest::Wait { request, .. },
+    } = message
+    else {
         panic!("expected a wait frame");
     };
     assert_eq!(id, RequestId::new(3));
     assert_eq!(request.cell_id.as_str(), "1");
-    assert_eq!(request.yield_time_ms, 300_001, "duration must not be clamped in transport");
+    assert_eq!(
+        request.yield_time_ms, 300_001,
+        "duration must not be clamped in transport"
+    );
     assert!(request.recovery.is_none());
     harness
         .event_tx
@@ -1174,8 +1297,15 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
     async fn next_message(harness: &mut DriverHarness) -> ClientToHost {
         let frame = harness.outgoing_rx.recv().await.expect("outgoing frame");
         let mut bytes = Vec::new();
-        FramedWriter::new(&mut bytes).write_frame(&frame).await.unwrap();
-        FramedReader::new(bytes.as_slice()).read().await.unwrap().unwrap()
+        FramedWriter::new(&mut bytes)
+            .write_frame(&frame)
+            .await
+            .unwrap();
+        FramedReader::new(bytes.as_slice())
+            .read()
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     let mut harness = DriverHarness::start();
@@ -1202,17 +1332,21 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         })
         .await
         .expect("first wait command");
-    assert_eq!(next_message(&mut harness).await, ClientToHost::Request {
-        id: RequestId::new(3),
-        request: HostRequest::Wait {
-            session_id: session.id.clone(),
-            request: WaitRequest {
-                recovery: None,
-                cell_id: CellId::new("1".to_string()),
-                yield_time_ms: 60_000,
-            }.into(),
-        },
-    });
+    assert_eq!(
+        next_message(&mut harness).await,
+        ClientToHost::Request {
+            id: RequestId::new(3),
+            request: HostRequest::Wait {
+                session_id: session.id.clone(),
+                request: WaitRequest {
+                    recovery: None,
+                    cell_id: CellId::new("1".to_string()),
+                    yield_time_ms: 60_000,
+                }
+                .into(),
+            },
+        }
+    );
     first_cancellation.cancel();
     drop(first_rx);
 
@@ -1231,22 +1365,32 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         })
         .await
         .expect("second wait command");
-    assert_eq!(next_message(&mut harness).await, ClientToHost::CancelRequest {
-        id: RequestId::new(3),
-    });
+    assert_eq!(
+        next_message(&mut harness).await,
+        ClientToHost::CancelRequest {
+            id: RequestId::new(3),
+        }
+    );
     // A cancellation watcher can win before the replacement command is read.
     // This local rejection is queued after that command on the same FIFO, so
     // an empty outgoing queue now proves deferral rather than a scheduling gap.
     let (barrier_tx, barrier_rx) = oneshot::channel();
-    harness.command_tx.send(DriverCommand::OpenSession {
-        session: session.clone(),
-        delegate: Arc::new(RecordingDelegate::default()),
-        cleanup: SessionCleanup::new(),
-        caller_cancellation: CancellationToken::new(),
-        response_tx: barrier_tx,
-    }).await.unwrap();
+    harness
+        .command_tx
+        .send(DriverCommand::OpenSession {
+            session: session.clone(),
+            delegate: Arc::new(RecordingDelegate::default()),
+            cleanup: SessionCleanup::new(),
+            caller_cancellation: CancellationToken::new(),
+            response_tx: barrier_tx,
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), barrier_rx).await.unwrap().unwrap(),
+        tokio::time::timeout(Duration::from_secs(1), barrier_rx)
+            .await
+            .unwrap()
+            .unwrap(),
         Err("code-mode session session-1 is already open".to_string()),
     );
     assert!(matches!(
@@ -1264,17 +1408,21 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
         }))
         .await
         .expect("cancelled wait response");
-    assert_eq!(next_message(&mut harness).await, ClientToHost::Request {
-        id: RequestId::new(4),
-        request: HostRequest::Wait {
-            session_id: session.id.clone(),
-            request: WaitRequest {
-                recovery: None,
-                cell_id: CellId::new("1".to_string()),
-                yield_time_ms: 1,
-            }.into(),
-        },
-    });
+    assert_eq!(
+        next_message(&mut harness).await,
+        ClientToHost::Request {
+            id: RequestId::new(4),
+            request: HostRequest::Wait {
+                session_id: session.id.clone(),
+                request: WaitRequest {
+                    recovery: None,
+                    cell_id: CellId::new("1".to_string()),
+                    yield_time_ms: 1,
+                }
+                .into(),
+            },
+        }
+    );
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::Response {
@@ -1609,11 +1757,17 @@ async fn connection_failure_closes_every_live_cell_once() {
     tokio::time::timeout(Duration::from_secs(1), cleanup.wait())
         .await
         .expect("session cleanup timeout");
-    assert_eq!(_started.started.initial_response().await, Err("host crashed".into()));
+    assert_eq!(
+        _started.started.initial_response().await,
+        Err("host crashed".into())
+    );
     assert_eq!(second.initial_response().await, Err("host crashed".into()));
     let mut closed = delegate.closed_cells.lock().unwrap().clone();
     closed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    assert_eq!(closed, vec![CellId::new("1".to_string()), CellId::new("2".to_string())]);
+    assert_eq!(
+        closed,
+        vec![CellId::new("1".to_string()), CellId::new("2".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -1691,7 +1845,9 @@ async fn aborting_driver_marks_connection_dead_and_closes_cells() {
 
     harness.driver_task.abort();
     let error = tokio::time::timeout(Duration::from_secs(1), &mut harness.driver_task)
-        .await.expect("aborted driver must finish").unwrap_err();
+        .await
+        .expect("aborted driver must finish")
+        .unwrap_err();
     assert!(error.is_cancelled());
 
     assert!(!harness.alive.load(Ordering::Acquire));
@@ -1737,37 +1893,212 @@ async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
     // Host events and commands are scheduled fairly. Shutdown must converge
     // even after its observer drops, without admitting any new execution.
     tokio::time::timeout(Duration::from_secs(1), async {
-    loop {
-    let (execute_tx, execute_rx) = oneshot::channel();
-    harness
-        .command_tx
-        .send(DriverCommand::Execute {
-            session: session.clone(),
-            request: ExecuteRequest {
-                state_path: None,
-                tool_call_id: "call-2".to_string(),
-                enabled_tools: Vec::new().into(),
-                source: "text('unreachable')".to_string(),
-                yield_time_ms: None,
-                max_output_tokens: None,
-                default_tool_timeout_ms: None,
-            },
-            caller_cancellation: CancellationToken::new(),
-            response_tx: execute_tx,
-        })
-        .await
-        .expect("execute command");
-    let error = execute_rx
-            .await
-            .expect("execute reply")
-            .err()
-            .expect("closed session should reject execute");
-    if error == "unknown code-mode session session-1" { break; }
-    assert_eq!(error, "code-mode session is shutting down");
-    }
-    }).await.expect("remote shutdown acknowledgement must be processed");
+        loop {
+            let (execute_tx, execute_rx) = oneshot::channel();
+            harness
+                .command_tx
+                .send(DriverCommand::Execute {
+                    session: session.clone(),
+                    request: ExecuteRequest {
+                        state_path: None,
+                        tool_call_id: "call-2".to_string(),
+                        enabled_tools: Vec::new().into(),
+                        source: "text('unreachable')".to_string(),
+                        yield_time_ms: None,
+                        max_output_tokens: None,
+                        default_tool_timeout_ms: None,
+                    },
+                    caller_cancellation: CancellationToken::new(),
+                    response_tx: execute_tx,
+                })
+                .await
+                .expect("execute command");
+            let error = execute_rx
+                .await
+                .expect("execute reply")
+                .err()
+                .expect("closed session should reject execute");
+            if error == "unknown code-mode session session-1" {
+                break;
+            }
+            assert_eq!(error, "code-mode session is shutting down");
+        }
+    })
+    .await
+    .expect("remote shutdown acknowledgement must be processed");
     assert!(matches!(
         harness.outgoing_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
+}
+
+#[tokio::test]
+async fn pending_shutdown_retains_the_connection_and_fences_execution_until_settlement() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    let cleanup = harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
+    for request in 2..=4 {
+        let (response_tx, response_rx) = oneshot::channel();
+        harness
+            .command_tx
+            .send(DriverCommand::ShutdownSession {
+                session: session.clone(),
+                response_tx,
+            })
+            .await
+            .unwrap();
+        harness
+            .outgoing_rx
+            .recv()
+            .await
+            .expect("same-generation close observation");
+        let result = if request < 4 {
+            WireResult::Err {
+                message: codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.into(),
+            }
+        } else {
+            WireResult::Ok {
+                value: HostResponse::SessionClosed {
+                    session_id: session.id.clone(),
+                },
+            }
+        };
+        harness
+            .event_tx
+            .send(DriverEvent::HostMessage(HostToClient::Response {
+                id: RequestId::new(request),
+                result,
+            }))
+            .await
+            .unwrap();
+        let result = response_rx.await.unwrap();
+        assert!(harness.alive.load(Ordering::Acquire));
+        if request < 4 {
+            assert_eq!(
+                result,
+                Err(codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING.into())
+            );
+            assert!(
+                !cleanup.is_complete(),
+                "pending storage still owns the session"
+            );
+            let (response_tx, response_rx) = oneshot::channel();
+            harness
+                .command_tx
+                .send(DriverCommand::Execute {
+                    session: session.clone(),
+                    request: ExecuteRequest {
+                        state_path: None,
+                        tool_call_id: "must-not-run".into(),
+                        enabled_tools: Vec::new().into(),
+                        source: "throw new Error('must not execute');".into(),
+                        yield_time_ms: None,
+                        max_output_tokens: None,
+                        default_tool_timeout_ms: None,
+                    },
+                    caller_cancellation: CancellationToken::new(),
+                    response_tx,
+                })
+                .await
+                .unwrap();
+            assert!(
+                response_rx.await.unwrap().is_err(),
+                "pending close must not reopen execution"
+            );
+            assert!(
+                harness.outgoing_rx.try_recv().is_err(),
+                "no execution request may escape the fence"
+            );
+        } else {
+            assert_eq!(result, Ok(()));
+            assert!(cleanup.is_complete());
+        }
+    }
+    harness.cancellation.cancel();
+    (&mut harness.driver_task).await.unwrap();
+}
+#[tokio::test(start_paused = true)]
+async fn abandoned_cleanup_deadline_retires_only_unacknowledged_control() {
+    for acknowledge in [false, true] {
+        let mut harness = DriverHarness::start();
+        let session = remote_session();
+        let _cleanup = harness
+            .open(session.clone(), Arc::new(RecordingDelegate::default()))
+            .await;
+        let cancellation = CancellationToken::new();
+        let (response_tx, response_rx) = oneshot::channel();
+        harness
+            .command_tx
+            .send(DriverCommand::Execute {
+                session: session.clone(),
+                request: ExecuteRequest {
+                    state_path: None,
+                    tool_call_id: "abandoned".into(),
+                    enabled_tools: Vec::new().into(),
+                    source: "await new Promise(()=>{})".into(),
+                    yield_time_ms: Some(1),
+                    max_output_tokens: None,
+                    default_tool_timeout_ms: None,
+                },
+                caller_cancellation: cancellation.clone(),
+                response_tx,
+            })
+            .await
+            .unwrap();
+        harness.outgoing_rx.recv().await.unwrap();
+        cancellation.cancel();
+        drop(response_rx);
+        harness
+            .event_tx
+            .send(DriverEvent::HostMessage(HostToClient::Response {
+                id: RequestId::new(2),
+                result: WireResult::Ok {
+                    value: HostResponse::ExecutionStarted {
+                        cell_id: CellId::new("1".into()).into(),
+                    },
+                },
+            }))
+            .await
+            .unwrap();
+        harness.outgoing_rx.recv().await.unwrap(); // cancel the abandoned request
+        harness.outgoing_rx.recv().await.unwrap(); // owned automatic termination
+        harness
+            .event_tx
+            .send(DriverEvent::HostMessage(HostToClient::InitialResponse {
+                id: RequestId::new(2),
+                result: WireResult::Ok {
+                    value: WireRuntimeResponse::Terminated {
+                        cell_id: CellId::new("1".into()).into(),
+                        content_items: Vec::new(),
+                    },
+                },
+            }))
+            .await
+            .unwrap();
+        if acknowledge {
+            harness
+                .event_tx
+                .send(DriverEvent::HostMessage(HostToClient::Response {
+                    id: RequestId::new(3),
+                    result: WireResult::Ok {
+                        value: HostResponse::WaitCompleted {
+                            outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
+                                cell_id: CellId::new("1".into()).into(),
+                                content_items: Vec::new(),
+                            }),
+                        },
+                    },
+                }))
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(super::super::TERMINATE_TIMEOUT * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(harness.alive.load(Ordering::Acquire), acknowledge);
+        harness.cancellation.cancel();
+        (&mut harness.driver_task).await.unwrap();
+    }
 }

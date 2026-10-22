@@ -6,12 +6,14 @@ use codex_protocol::protocol::AdditionalContextKind;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
 use core_test_support::require_network;
 use core_test_support::responses;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -21,6 +23,28 @@ use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_match;
 use indexmap::IndexMap;
 use pretty_assertions::assert_eq;
+
+/// User-role texts other than the skills catalog. The catalog is a stable
+/// contextual user fragment that precedes turn input; it is unrelated to the
+/// additional-context placement these tests check.
+fn turn_user_texts(request: &responses::ResponsesRequest) -> Vec<String> {
+    request
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| !text.starts_with(SKILLS_INSTRUCTIONS_OPEN_TAG))
+        .collect()
+}
+
+/// A completed turn that delivers a final answer. A response without one now
+/// triggers the turn's single missing-answer repair request, which would
+/// consume the next turn's scripted response.
+fn answered_turn_sse(id: &str) -> String {
+    sse(vec![
+        ev_response_created(id),
+        ev_assistant_message(&format!("msg-{id}"), "done"),
+        ev_completed(id),
+    ])
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Result<()> {
@@ -112,7 +136,7 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
         vec![application_context("automation_info", "run one")]
     );
     assert_eq!(
-        request.message_input_texts("user"),
+        turn_user_texts(&request),
         vec![
             external_context("browser_info", "tab one"),
             "inspect the active tab".to_string(),
@@ -166,7 +190,7 @@ async fn external_context_like_user_text_remains_a_user_message_item() -> Result
     .await;
 
     let request = request.single_request();
-    assert_eq!(request.message_input_texts("user"), vec!["<external_api>"]);
+    assert_eq!(turn_user_texts(&request), vec!["<external_api>"]);
 
     Ok(())
 }
@@ -176,16 +200,8 @@ async fn additional_context_is_deduplicated_between_turns_while_retained() -> Re
     require_network!();
 
     let server = start_mock_server().await;
-    let first_request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let second_request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
+    let first_request = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let second_request = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
     let test = test_codex()
         .with_config(|config| config.include_environment_context = false)
         .build(&server)
@@ -233,14 +249,14 @@ async fn additional_context_is_deduplicated_between_turns_while_retained() -> Re
     .await;
 
     assert_eq!(
-        first_request.single_request().message_input_texts("user"),
+        turn_user_texts(&first_request.single_request()),
         vec![
             external_context("browser_info", "same tab"),
             "first turn".to_string(),
         ]
     );
     assert_eq!(
-        second_request.single_request().message_input_texts("user"),
+        turn_user_texts(&second_request.single_request()),
         vec![
             external_context("browser_info", "same tab"),
             "first turn".to_string(),
@@ -256,21 +272,9 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
     require_network!();
 
     let server = start_mock_server().await;
-    let first_request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let second_request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
-    let third_request = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
-    )
-    .await;
+    let first_request = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let second_request = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
+    let third_request = mount_sse_once(&server, answered_turn_sse("resp-3")).await;
     let test = test_codex()
         .with_config(|config| config.include_environment_context = false)
         .build(&server)
@@ -384,7 +388,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         "This source's previous additional-context value is obsolete (previous_value_obsolete=\"true\"). It is no longer available; do not treat earlier values from this source as current. Any replacement follows separately.",
     );
     assert_eq!(
-        first_request.single_request().message_input_texts("user"),
+        turn_user_texts(&first_request.single_request()),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -392,7 +396,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         ]
     );
     assert_eq!(
-        second_request.single_request().message_input_texts("user"),
+        turn_user_texts(&second_request.single_request()),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -403,7 +407,7 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
         ]
     );
     assert_eq!(
-        third_request.single_request().message_input_texts("user"),
+        turn_user_texts(&third_request.single_request()),
         vec![
             external_context("automation_info", "run one"),
             external_context("browser_info", "tab one"),
@@ -490,7 +494,7 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
     // Application policy is admitted whole; only untrusted context is truncated.
     assert_eq!(automation_text, &untruncated_automation_fragment);
 
-    let user_texts = request.message_input_texts("user");
+    let user_texts = turn_user_texts(&request);
     let [external_text, user_text] = user_texts.as_slice() else {
         panic!("expected external context plus user input, got {user_texts:?}");
     };
@@ -625,7 +629,7 @@ async fn production_capture_matches_effective_settings() -> Result<()> {
             submit_plain_user_text(&test, &user_text).await?;
             user_texts.push(user_text);
             let request = request.single_request();
-            assert_eq!(request.message_input_texts("user"), user_texts);
+            assert_eq!(turn_user_texts(&request), user_texts);
             let wire = request.body_json();
             assert!(wire.get("_codex").is_none());
             assert_eq!(wire["instructions"], instructions);
@@ -695,21 +699,9 @@ async fn additional_context_overflow_resets_stale_values_in_the_model_request() 
     require_network!();
 
     let server = start_mock_server().await;
-    let first = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let second = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
-    )
-    .await;
-    let third = mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
-    )
-    .await;
+    let first = mount_sse_once(&server, answered_turn_sse("resp-1")).await;
+    let second = mount_sse_once(&server, answered_turn_sse("resp-2")).await;
+    let third = mount_sse_once(&server, answered_turn_sse("resp-3")).await;
     let test = test_codex()
         .with_config(|config| config.include_environment_context = false)
         .build(&server)

@@ -667,7 +667,10 @@ fn system_proxy_resolution_recovers_after_resolver_panics() {
         .is_err()
     );
     assert!(resolution_lock.is_poisoned());
-    assert!(!cache.is_poisoned(), "platform I/O must not hold the cache lock");
+    assert!(
+        !cache.is_poisoned(),
+        "platform I/O must not hold the cache lock"
+    );
     assert_eq!(
         resolve_system_proxy_with(&cache, &resolution_lock, request_url, &origin, |_, _| {
             SystemProxyDecision::Direct
@@ -788,7 +791,11 @@ fn system_proxy_cache_key_preserves_url_specific_pac_decisions() {
     );
     assert_eq!(cache_key.len(), 32);
     assert_eq!(cache_key, system_proxy_cache_key(request_url));
-    assert!(!cache_key.windows(b"secret".len()).any(|bytes| bytes == b"secret"));
+    assert!(
+        !cache_key
+            .windows(b"secret".len())
+            .any(|bytes| bytes == b"secret")
+    );
 }
 
 #[test]

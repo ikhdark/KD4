@@ -100,25 +100,11 @@ fn direct_delivery_text(
 pub(super) fn schema_validated_delivery(
     response: &codex_code_mode::RuntimeResponse,
     limit: usize,
-    schema: Option<&serde_json::Value>,
+    schema: Option<&crate::session::turn_context::PreparedOutputSchema>,
 ) -> Result<String, serde_json::Value> {
     let text = direct_delivery_text(response, limit)?;
     if let Some(schema) = schema {
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error|
-            serde_json::json!({"category":"invalid_json", "line":error.line(), "column":error.column()}))?;
-        let validator = jsonschema::validator_for(schema)
-            .map_err(|_| serde_json::json!({"category":"invalid_schema"}))?;
-        if let Err(error) = validator.validate(&value) {
-            let pointer = error
-                .instance_path()
-                .as_str()
-                .chars()
-                .take(512)
-                .collect::<String>();
-            return Err(
-                serde_json::json!({"category":"schema_mismatch", "instance_pointer":pointer}),
-            );
-        }
+        schema.validate_text(Some(&text))?;
     }
     Ok(text)
 }
@@ -409,6 +395,10 @@ impl CodeModeExecuteHandler {
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();
+        exec.session
+            .services
+            .code_mode_service
+            .bind_cell_environments(&cell_id, &step_context);
         let runtime_cell_id = cell_id.to_string();
         exec.session
             .services
@@ -417,7 +407,7 @@ impl CodeModeExecuteHandler {
         exec.session
             .services
             .code_mode_service
-            .record_cell_turn(&cell_id, &exec.turn.sub_id);
+            .bind_cell_delivery_turn(&cell_id, &exec.turn);
         exec.session
             .services
             .code_mode_service
@@ -517,6 +507,11 @@ impl CodeModeExecuteHandler {
                 super::wait_handler::queued_input_activity(
                     &exec,
                     turn_state.as_deref(),
+                    activity_rx.clone(),
+                ),
+                super::wait_handler::queued_steering_activity(
+                    &exec,
+                    turn_state.as_deref(),
                     activity_rx,
                 ),
                 "exec cancelled",
@@ -595,10 +590,18 @@ impl CodeModeExecuteHandler {
             _ = exec.session.services.elicitations.wait_until_clear() => {}
         }
         emit_failed_code_mode_cell_item(&exec, &call_id, &response, started_at).await;
-        exec.session
+        let retention_settled = exec
+            .session
             .services
             .code_mode_service
-            .flush_packet_retention(&cell_id)
+            .observe_packet_retention(
+                &cell_id,
+                matches!(
+                    &response,
+                    codex_code_mode::RuntimeResponse::Terminated { .. }
+                ),
+                &cancellation_token,
+            )
             .await;
         let delivery = exec
             .session
@@ -612,6 +615,9 @@ impl CodeModeExecuteHandler {
             .services
             .code_mode_service
             .elide_bodies_already_in_context(&mut output);
+        if !retention_settled {
+            super::attach_pending_retention(&mut output, &cell_id, &call_id);
+        }
         attach_delivery_decision(&mut output, delivery);
         if keep_dispatch_open {
             dispatch_lease.keep_open();
@@ -831,7 +837,8 @@ mod tests {
             error_text: None,
             output_loss: None,
         };
-        let schema = serde_json::json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false});
+        let schema = crate::session::turn_context::PreparedOutputSchema::prepare(
+            serde_json::json!({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false})).unwrap();
         let json = response(vec![FunctionCallOutputContentItem::InputText {
             text: r#"{"count":2}"#.into(),
         }]);
@@ -840,8 +847,17 @@ mod tests {
             Ok(r#"{"count":2}"#)
         );
         assert_eq!(
-            schema_validated_delivery(&json, 100, Some(&serde_json::json!({"type":"array"})))
-                .unwrap_err()["category"],
+            schema_validated_delivery(
+                &json,
+                100,
+                Some(
+                    &crate::session::turn_context::PreparedOutputSchema::prepare(
+                        serde_json::json!({"type":"array"})
+                    )
+                    .unwrap()
+                )
+            )
+            .unwrap_err()["category"],
             "schema_mismatch"
         );
         let image = response(vec![FunctionCallOutputContentItem::InputImage {

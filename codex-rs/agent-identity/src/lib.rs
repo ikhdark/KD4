@@ -192,10 +192,7 @@ pub struct AgentIdentityRegistrationHttpError {
 
 impl AgentIdentityRegistrationHttpError {
     fn new(operation: &'static str, status: StatusCode) -> Self {
-        Self {
-            operation,
-            status,
-        }
+        Self { operation, status }
     }
 
     /// HTTP status returned by the registration endpoint.
@@ -787,7 +784,10 @@ mod tests {
         .expect("JWT should encode");
 
         let error = verify_agent_identity_jwt(&jwt, &jwks).expect_err("JWT should not verify");
-        assert_eq!(error.to_string(), "agent identity JWT kid test-key is not trusted");
+        assert_eq!(
+            error.to_string(),
+            "agent identity JWT kid test-key is not trusted"
+        );
     }
 
     #[test]
@@ -880,7 +880,9 @@ mod tests {
         use std::io::Read;
         use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener binds");
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let address = listener.local_addr().expect("listener address");
         let (release, receiver) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
@@ -1201,9 +1203,8 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
         let private_key_base64 = BASE64_STANDARD.encode(private_key.as_bytes());
         // Encrypt with the public-key conversion, independently of the private
         // conversion under test. Both must identify the same recipient.
-        let recipient = crypto_box::PublicKey::from(
-            signing_key.verifying_key().to_montgomery().to_bytes(),
-        );
+        let recipient =
+            crypto_box::PublicKey::from(signing_key.verifying_key().to_montgomery().to_bytes());
         let task_id = "registered-task-雪";
         let ciphertext = recipient
             .seal(&mut crypto_box::aead::OsRng, task_id.as_bytes())
@@ -1270,9 +1271,8 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
             agent_runtime_id: "runtime",
             private_key_pkcs8_base64: &private_key_base64,
         };
-        let recipient = crypto_box::PublicKey::from(
-            signing_key.verifying_key().to_montgomery().to_bytes(),
-        );
+        let recipient =
+            crypto_box::PublicKey::from(signing_key.verifying_key().to_montgomery().to_bytes());
         let invalid_utf8 = recipient
             .seal(&mut crypto_box::aead::OsRng, &[0xff])
             .expect("seal invalid UTF-8");
@@ -1281,7 +1281,10 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
             .expect("seal task ID");
         *corrupted.last_mut().expect("ciphertext authentication tag") ^= 1;
         for (ciphertext, expected) in [
-            ("not base64!".to_string(), "encrypted task id is not valid base64"),
+            (
+                "not base64!".to_string(),
+                "encrypted task id is not valid base64",
+            ),
             (
                 BASE64_STANDARD.encode(corrupted),
                 "failed to decrypt encrypted task id",
@@ -1313,7 +1316,11 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
                 "agent registration",
                 status,
             ));
-            assert_eq!(is_retryable_registration_error(&error), retryable, "{status}");
+            assert_eq!(
+                is_retryable_registration_error(&error),
+                retryable,
+                "{status}"
+            );
             assert_eq!(
                 is_retryable_registration_error(&error.context("outer registration context")),
                 retryable,
@@ -1337,7 +1344,10 @@ J1bwkqKZTB5dHolX9A58e/xXnfZ5P8f3Z83+Izap3FwqQulk7b1WO1MQcHuVg2NN
             ),
         ] {
             for suffix in ["", "/"] {
-                assert_eq!(agent_identity_jwks_url(&format!("{base}{suffix}")), expected);
+                assert_eq!(
+                    agent_identity_jwks_url(&format!("{base}{suffix}")),
+                    expected
+                );
             }
         }
     }

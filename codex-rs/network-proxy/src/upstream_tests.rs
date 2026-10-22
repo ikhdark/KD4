@@ -121,6 +121,136 @@ fn generate_ca(common_name: &str) -> (String, KeyPair) {
     (cert.pem(), key_pair)
 }
 
+fn server_identity(host: &str) -> (Arc<rustls::ServerConfig>, CertificateDer<'static>) {
+    let (ca, ca_key) = generate_ca("proxy matrix CA");
+    let issuer = Issuer::from_ca_cert_pem(&ca, ca_key).unwrap();
+    let mut params = CertificateParams::new(vec![host.to_string()]).unwrap();
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.signed_by(&key, &issuer).unwrap();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(cert.pem().as_bytes()).unwrap()],
+            PrivateKeyDer::from_pem_slice(key.serialize_pem().as_bytes()).unwrap(),
+        )
+        .unwrap();
+    (
+        Arc::new(config),
+        CertificateDer::from_pem_slice(ca.as_bytes()).unwrap(),
+    )
+}
+
+async fn captured_headers(stream: &mut (dyn rama_core::stream::Stream + Unpin)) -> String {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        bytes.push(stream.read_u8().await.unwrap());
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+#[tokio::test]
+async fn proxy_tls_auth_and_request_form_match_each_origin_and_proxy_scheme() {
+    ensure_rustls_crypto_provider();
+    timeout(Duration::from_secs(10), async {
+        for (secure_proxy, secure_origin, bare) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let (proxy_config, proxy_ca) = server_identity("localhost");
+            let (origin_config, origin_ca) = server_identity("origin.test");
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(proxy_ca).unwrap();
+            roots.add(origin_ca).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let value = if bare {
+                format!("user:pass@localhost:{port}")
+            } else {
+                format!(
+                    "{}://user:pass@localhost:{port}",
+                    if secure_proxy { "https" } else { "http" }
+                )
+            };
+            let proxy = read_proxy_env_with(&["HTTP_PROXY"], |_| Ok(value.clone())).unwrap();
+            let client = UpstreamClient::new(
+                ProxyConfig {
+                    http: Some(proxy.clone()),
+                    https: Some(proxy),
+                    all: None,
+                },
+                TargetCheckedTcpConnector::from_allow_local_binding(true),
+                Arc::new(roots),
+            );
+            let server = async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut stream: Box<dyn rama_core::stream::Stream + Unpin> = if secure_proxy {
+                    let mut first = [0];
+                    socket.peek(&mut first).await.unwrap();
+                    assert_eq!(
+                        first[0], 0x16,
+                        "proxy must see TLS before any authenticated HTTP bytes"
+                    );
+                    Box::new(
+                        TlsAcceptor::from(proxy_config)
+                            .accept(socket)
+                            .await
+                            .unwrap(),
+                    )
+                } else {
+                    Box::new(socket)
+                };
+                let headers = captured_headers(stream.as_mut()).await;
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("proxy-authorization: basic dxnlcjpwyxnz")
+                );
+                if secure_origin {
+                    assert!(headers.starts_with("CONNECT origin.test:443 HTTP/1.1\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    stream = Box::new(
+                        TlsAcceptor::from(origin_config)
+                            .accept(stream)
+                            .await
+                            .unwrap(),
+                    );
+                    let origin_headers = captured_headers(stream.as_mut()).await;
+                    assert!(origin_headers.starts_with("GET /resource HTTP/1.1\r\n"));
+                    assert!(
+                        !origin_headers
+                            .to_ascii_lowercase()
+                            .contains("proxy-authorization")
+                    );
+                } else {
+                    assert!(headers.starts_with("GET http://origin.test/resource HTTP/1.1\r\n"));
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            };
+            let request = Request::builder()
+                .uri(format!(
+                    "{}://origin.test/resource",
+                    if secure_origin { "https" } else { "http" }
+                ))
+                .body(Body::empty())
+                .unwrap();
+            let (response, ()) = tokio::join!(client.serve(request), server);
+            assert_eq!(response.unwrap().status(), StatusCode::OK);
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn mitm_upstream_client_trusts_startup_custom_ca() {
     ensure_rustls_crypto_provider();

@@ -467,7 +467,8 @@ async fn fuzzy_file_search_session_streams_case_insensitive_queries_and_clears()
     mcp.start_fuzzy_file_search_session(session_id, vec![root_path.clone()])
         .await?;
     for query in ["alp", "ALP"] {
-        mcp.update_fuzzy_file_search_session(session_id, query).await?;
+        mcp.update_fuzzy_file_search_session(session_id, query)
+            .await?;
         let payload =
             wait_for_session_updated(&mut mcp, session_id, query, FileExpectation::NonEmpty)
                 .await?;
@@ -480,8 +481,7 @@ async fn fuzzy_file_search_session_streams_case_insensitive_queries_and_clears()
     }
 
     mcp.update_fuzzy_file_search_session(session_id, "").await?;
-    let blank =
-        wait_for_session_updated(&mut mcp, session_id, "", FileExpectation::Empty).await?;
+    let blank = wait_for_session_updated(&mut mcp, session_id, "", FileExpectation::Empty).await?;
     assert!(blank.files.is_empty());
     assert_eq!(blank.total_match_count, 0);
 
@@ -516,7 +516,6 @@ async fn test_fuzzy_file_search_session_no_updates_after_complete_until_query_ed
 
     Ok(())
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_fuzzy_file_search_session_update_works_without_waiting_for_start_response()
@@ -649,5 +648,3 @@ async fn test_fuzzy_file_search_two_sessions_are_independent() -> Result<()> {
 
     Ok(())
 }
-
-

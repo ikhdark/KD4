@@ -1,4 +1,5 @@
 """Cross-process runner admission proof using Python children, never Cargo."""
+
 from __future__ import annotations
 
 import argparse
@@ -30,7 +31,7 @@ class TargetAdmissionTest(unittest.TestCase):
 
     def child(self, name, target, cargo_profile=None):
         # Attempt/ready/release files are explicit barriers, not timing guesses.
-        program = r'''
+        program = r"""
 import pathlib, sys, time
 from scripts.build import rust_build_status as lanes
 root, target, name = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
@@ -57,16 +58,28 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
     while not (root / (name + '.release')).exists():
         if time.monotonic() >= deadline: raise RuntimeError('fixture not released')
         time.sleep(.01)
-'''
+"""
         process = subprocess.Popen(
-            [sys.executable, "-c", program, str(self.root), str(target), name, cargo_profile or ""],
-            cwd=lanes.REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [
+                sys.executable,
+                "-c",
+                program,
+                str(self.root),
+                str(target),
+                name,
+                cargo_profile or "",
+            ],
+            cwd=lanes.REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
         def cleanup():
             if process.poll() is None:
                 process.kill()
             process.communicate(timeout=5)
+
         self.addCleanup(cleanup)
         return process
 
@@ -77,7 +90,7 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                 self.fail(repr(process.communicate(timeout=1)))
             if time.monotonic() >= deadline:
                 self.fail(f"missing barrier {name}")
-            time.sleep(.01)
+            time.sleep(0.01)
 
     def release(self, name, process):
         (self.root / (name + ".release")).touch()
@@ -111,7 +124,11 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
     def test_runner_waits_for_lane_and_cargo_owners_without_dispatching(self):
         # Hold real locks in this process; the child must wait before any work
         # starts. A different target must remain usable while it waits.
-        for relative in [".lane-active.lock", "debug/.cargo-lock", "triple/debug/.cargo-lock"]:
+        for relative in [
+            ".lane-active.lock",
+            "debug/.cargo-lock",
+            "triple/debug/.cargo-lock",
+        ]:
             with self.subTest(lock=relative):
                 target = self.root / relative.replace("/", "-")
                 path = target / relative
@@ -138,22 +155,33 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
         handle = lanes._try_acquire_binary_file_lock(self.target / ".lane-active.lock")
         self.assertIsNotNone(handle)
         try:
-            with mock.patch.dict(os.environ, {"CODEX_CARGO_LANE_TARGET_DIR": str(self.root / "other")}):
+            with mock.patch.dict(
+                os.environ, {"CODEX_CARGO_LANE_TARGET_DIR": str(self.root / "other")}
+            ):
                 with self.assertRaises(TimeoutError):
-                    with lanes.reserve_rust_test_target(self.target, timeout_seconds=.02):
+                    with lanes.reserve_rust_test_target(
+                        self.target, timeout_seconds=0.02
+                    ):
                         self.fail("different inherited lane admitted")
-            with mock.patch.dict(os.environ, {"CODEX_CARGO_LANE_TARGET_DIR": str(self.target / ".." / "target")}):
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_CARGO_LANE_TARGET_DIR": str(self.target / ".." / "target")},
+            ):
                 with lanes.reserve_rust_test_target(self.target) as receipt:
                     self.assertTrue(receipt["inherited_lane_reservation"])
                     with self.assertRaises(TimeoutError):
-                        with lanes.reserve_rust_test_target(self.target, timeout_seconds=.02):
+                        with lanes.reserve_rust_test_target(
+                            self.target, timeout_seconds=0.02
+                        ):
                             self.fail("parent context bypassed another runner")
                 profile = self.target / "debug"
                 profile.mkdir()
                 cargo = lanes._try_acquire_binary_file_lock(profile / ".cargo-lock")
                 try:
                     with self.assertRaises(TimeoutError):
-                        with lanes.reserve_rust_test_target(self.target, timeout_seconds=.02):
+                        with lanes.reserve_rust_test_target(
+                            self.target, timeout_seconds=0.02
+                        ):
                             self.fail("parent context bypassed Cargo")
                 finally:
                     lanes._release_binary_file_lock(cargo)
@@ -166,10 +194,13 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
         for profile in (None, "test", "dev-small"):
             with self.subTest(profile=profile):
                 with mock.patch.object(
-                    lanes, "_try_acquire_binary_file_lock",
+                    lanes,
+                    "_try_acquire_binary_file_lock",
                     wraps=lanes._try_acquire_binary_file_lock,
                 ) as acquire:
-                    with lanes.reserve_rust_test_target(self.target, cargo_profile=profile):
+                    with lanes.reserve_rust_test_target(
+                        self.target, cargo_profile=profile
+                    ):
                         pass
                 self.assertEqual(
                     [call.args[0] for call in acquire.call_args_list],
@@ -177,7 +208,9 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                 )
 
     def test_failed_cargo_probe_releases_the_newly_acquired_runner_lease(self):
-        with mock.patch.object(lanes, "_cargo_profile_locks_are_busy", side_effect=OSError("fixture")):
+        with mock.patch.object(
+            lanes, "_cargo_profile_locks_are_busy", side_effect=OSError("fixture")
+        ):
             with self.assertRaises(OSError):
                 with lanes.reserve_rust_test_target(self.target, cargo_profile="test"):
                     self.fail("failed probe admitted")
@@ -207,8 +240,10 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
 
     def test_profile_aliases_still_wait_for_their_host_and_target_locks(self):
         for cargo_profile, directory in [
-            ("dev", "debug"), ("test", "debug"),
-            ("release", "release"), ("bench", "release"),
+            ("dev", "debug"),
+            ("test", "debug"),
+            ("release", "release"),
+            ("bench", "release"),
             ("dev-small", "dev-small"),
         ]:
             for prefix in ("", "triple"):
@@ -216,16 +251,22 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                     target = self.root / f"{cargo_profile}-{prefix}"
                     profile = target / prefix / directory
                     profile.mkdir(parents=True)
-                    handle = lanes._try_acquire_binary_file_lock(profile / ".cargo-lock")
+                    handle = lanes._try_acquire_binary_file_lock(
+                        profile / ".cargo-lock"
+                    )
                     self.assertIsNotNone(handle)
                     try:
                         with self.assertRaises(TimeoutError):
                             with lanes.reserve_rust_test_target(
-                                target, cargo_profile=cargo_profile, timeout_seconds=.02,
+                                target,
+                                cargo_profile=cargo_profile,
+                                timeout_seconds=0.02,
                             ):
                                 self.fail("active build profile admitted")
                         other = "release" if directory == "debug" else "test"
-                        with lanes.reserve_rust_test_target(target, cargo_profile=other) as receipt:
+                        with lanes.reserve_rust_test_target(
+                            target, cargo_profile=other
+                        ) as receipt:
                             self.assertEqual(
                                 receipt["cargo_profile_directory"],
                                 "release" if other == "release" else "debug",
@@ -239,7 +280,9 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
             for profile in (None, "test", "release", "dev-small"):
                 with self.subTest(profile=profile), self.assertRaises(TimeoutError):
                     with lanes.reserve_rust_test_target(
-                        self.target, cargo_profile=profile, timeout_seconds=.02,
+                        self.target,
+                        cargo_profile=profile,
+                        timeout_seconds=0.02,
                     ):
                         self.fail("another runner bypassed the whole-invocation lease")
 
@@ -259,11 +302,16 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
             with self.subTest(command=command):
                 env = {"CODEX_CARGO_LANE_TARGET_DIR": "obsolete"}
                 result = lanes._direct_reserved_lane_command(
-                    command, env, repo_root=self.root, target_dir=self.target,
+                    command,
+                    env,
+                    repo_root=self.root,
+                    target_dir=self.target,
                 )
                 self.assertIsNotNone(result)
                 self.assertEqual(env["CODEX_CARGO_LANE_TARGET_DIR"], str(self.target))
-                self.assertEqual(result[result.index("--target-dir") + 1], str(self.target))
+                self.assertEqual(
+                    result[result.index("--target-dir") + 1], str(self.target)
+                )
                 parsed = runner.build_parser().parse_args(result[2:])
                 self.assertEqual(parsed.profile, "fast")
                 if command[1] == "_core-gate-reserved":
@@ -305,29 +353,54 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                 ("_core-gate-reserved", ["fixture"]),
             ]:
                 with self.subTest(recipe=recipe):
-                    index = next(i for i, line in enumerate(lines) if line.startswith(recipe + " "))
+                    index = next(
+                        i
+                        for i, line in enumerate(lines)
+                        if line.startswith(recipe + " ")
+                    )
                     body = lines[index + 1].strip()
                     body = body.replace(
                         'python "{{ justfile_directory() }}\\scripts\\build\\rust_test_runner.py"',
                         f"& '{sys.executable.replace(chr(39), chr(39) * 2)}' '{str(probe).replace(chr(39), chr(39) * 2)}'",
                     )
-                    for key, value in {"target": "core_lib", "profile": "fast", "rust_min_stack": lanes.RUST_MIN_STACK_BYTES}.items():
+                    for key, value in {
+                        "target": "core_lib",
+                        "profile": "fast",
+                        "rust_min_stack": lanes.RUST_MIN_STACK_BYTES,
+                    }.items():
                         body = body.replace("{{ " + key + " }}", value)
                     self.assertNotIn("{{", body)
                     wrapper = self.root / "wrapper.ps1"
-                    wrapper.write_text(body + "\nexit $LASTEXITCODE\n", encoding="utf-8")
+                    wrapper.write_text(
+                        body + "\nexit $LASTEXITCODE\n", encoding="utf-8"
+                    )
                     result = subprocess.run(
-                        ["pwsh", "-NoProfile", "-File", str(wrapper), recipe, *arguments],
-                        env=dict(os.environ, CODEX_CARGO_LANE_TARGET_DIR=str(self.target)),
-                        capture_output=True, text=True, timeout=15,
+                        [
+                            "pwsh",
+                            "-NoProfile",
+                            "-File",
+                            str(wrapper),
+                            recipe,
+                            *arguments,
+                        ],
+                        env=dict(
+                            os.environ, CODEX_CARGO_LANE_TARGET_DIR=str(self.target)
+                        ),
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
                     receipt = json.loads(result.stdout)
                     self.assertTrue(receipt["inherited_lane_reservation"])
                     self.assertEqual(
                         receipt["cargo_profile_directory"],
-                        "dev-small" if recipe == "_core-test-small-reserved" else "debug",
+                        "dev-small"
+                        if recipe == "_core-test-small-reserved"
+                        else "debug",
                     )
         finally:
             lanes._release_binary_file_lock(handle)
@@ -336,7 +409,7 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
     def test_timeout_and_cancel_waiter_do_not_release_owner(self):
         with lanes.reserve_rust_test_target(self.target):
             with self.assertRaises(TimeoutError):
-                with lanes.reserve_rust_test_target(self.target, timeout_seconds=.02):
+                with lanes.reserve_rust_test_target(self.target, timeout_seconds=0.02):
                     self.fail("timed out waiter dispatched")
             with mock.patch.object(lanes.time, "sleep", side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt):
@@ -369,7 +442,9 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
     def test_busy_default_does_not_wait_dispatch_or_release_owner(self):
         with lanes.reserve_rust_test_target(self.target):
             with mock.patch.object(lanes.time, "sleep") as sleep:
-                with self.assertRaisesRegex(RuntimeError, "busy.*No validation was run"):
+                with self.assertRaisesRegex(
+                    RuntimeError, "busy.*No validation was run"
+                ):
                     with lanes.reserve_rust_test_target(self.target):
                         self.fail("busy target dispatched")
                 sleep.assert_not_called()
@@ -384,12 +459,15 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
         target = root / "example"
         with lanes.reserve_rust_test_target(target):
             # The short root lock is not held through execution.
-            with lanes.cargo_lane_coordination_lock(root, timeout_seconds=.05):
+            with lanes.cargo_lane_coordination_lock(root, timeout_seconds=0.05):
                 self.assertIn("example", lanes.locked_lane_names([target]))
             with self.assertRaisesRegex(RuntimeError, "busy"):
                 with lanes.reserve_cargo_lane(
-                    repo_root=self.root, lane_root=root, requested_lane="example",
-                    command=["cargo", "check"], warm_wait_seconds=0,
+                    repo_root=self.root,
+                    lane_root=root,
+                    requested_lane="example",
+                    command=["cargo", "check"],
+                    warm_wait_seconds=0,
                 ):
                     self.fail("busy lane reused")
 
@@ -406,31 +484,48 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
                     with lanes.reserve_rust_test_target(target):
                         self.fail("occupied runner lease admitted")
             with lanes.reserve_cargo_lane(
-                repo_root=self.root, lane_root=root, requested_lane="example", command=[],
+                repo_root=self.root,
+                lane_root=root,
+                requested_lane="example",
+                command=[],
             ):
                 with self.assertRaises(lanes.RustAdmissionBusy):
                     with lanes.reserve_rust_test_target(target):
                         self.fail("occupied lane admitted without inheritance")
-                with mock.patch.dict(os.environ, {"CODEX_CARGO_LANE_TARGET_DIR": str(target)}):
+                with mock.patch.dict(
+                    os.environ, {"CODEX_CARGO_LANE_TARGET_DIR": str(target)}
+                ):
                     with lanes.reserve_rust_test_target(target) as receipt:
                         self.assertTrue(receipt["inherited_lane_reservation"])
             sleep.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Windows lane owner")
-    def test_reserved_and_unreserved_children_survive_coordination_at_zero_build_wait(self):
+    def test_reserved_and_unreserved_children_survive_coordination_at_zero_build_wait(
+        self,
+    ):
         root = self.root / "codex-rs" / "target" / "lanes"
-        with lanes.reserve_cargo_lane(
-            repo_root=self.root, lane_root=root, requested_lane="example", command=[],
-        ) as (_, target), contextlib.ExitStack() as prober:
+        with (
+            lanes.reserve_cargo_lane(
+                repo_root=self.root,
+                lane_root=root,
+                requested_lane="example",
+                command=[],
+            ) as (_, target),
+            contextlib.ExitStack() as prober,
+        ):
             # Another launch is mid-probe when the reserved child asks for admission.
-            with mock.patch.object(lanes.time, "sleep", side_effect=lambda _: prober.close()) as sleep:
+            with mock.patch.object(
+                lanes.time, "sleep", side_effect=lambda _: prober.close()
+            ) as sleep:
                 prober.enter_context(lanes.cargo_lane_coordination_lock(root))
                 with lanes.reserve_rust_test_target(root / "other") as receipt:
                     self.assertFalse(receipt["inherited_lane_reservation"])
                 sleep.assert_called_once()
                 sleep.reset_mock()
                 prober.enter_context(lanes.cargo_lane_coordination_lock(root))
-                with mock.patch.dict(os.environ, {"CODEX_CARGO_LANE_TARGET_DIR": str(target)}):
+                with mock.patch.dict(
+                    os.environ, {"CODEX_CARGO_LANE_TARGET_DIR": str(target)}
+                ):
                     with lanes.reserve_rust_test_target(target) as receipt:
                         self.assertTrue(receipt["inherited_lane_reservation"])
                 sleep.assert_called_once()
@@ -440,8 +535,10 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
         root = self.root / "codex-rs" / "target" / "lanes"
         lanes.initialize_cargo_lanes_root(self.root, root)
         now = [0.0]
+
         def sleep(delay):
             now[0] += delay
+
         with lanes.cargo_lane_coordination_lock(root):
             with (
                 mock.patch.object(lanes.time, "monotonic", side_effect=lambda: now[0]),
@@ -460,35 +557,80 @@ with lanes.reserve_rust_test_target(target, timeout_seconds=10, cargo_profile=sy
             pass
 
     def test_busy_report_names_only_a_live_admitted_runner(self):
+        from scripts.build.validation_metrics import ValidationMetrics
+
         logs = self.target / "test-runner-logs"
         logs.mkdir(parents=True)
+
         def ledger(name, age, **fields):
             path = logs / f"validation-{name}.json"
-            path.write_text(json.dumps({
-                "outcome": "running", "phases": {"admission": 0.0},
-                "argv": ["run-target", name], "working_directory": "cwd",
-                "started_at": name, **fields,
-            }), encoding="utf-8")
+            path.write_text(
+                json.dumps(
+                    {
+                        "outcome": "running",
+                        "phases": {"admission": 0.0},
+                        "argv": ["run-target", name],
+                        "working_directory": "cwd",
+                        "started_at": name,
+                        **fields,
+                    }
+                ),
+                encoding="utf-8",
+            )
             stamp = time.time() - age
             os.utime(path, (stamp, stamp))
             return path
+
         ledger("crashed", 300)
-        live = ledger("live", 200)
+        ledger("old-finalizer", 200)
         ledger("finished", 100, outcome="passed")
         ledger("waiting", 50, phases={"admission": None})
         # Unfinished records alone name no one: a crashed runner leaves them too.
         self.assertIsNone(lanes.lane_runner_holder(self.target))
         with lanes.reserve_rust_test_target(self.target):
-            busy = lanes.RustAdmissionBusy("fixture", resource=self.target, wait_option="--wait")
-            self.assertEqual(busy.report()["holder"], {
-                "argv": ["run-target", "live"], "working_directory": "cwd",
-                "started_at": "live", "ledger": str(live.resolve()),
-            })
+            self.assertIsNone(
+                lanes.lane_runner_holder(self.target), "an unbound owner is unknown"
+            )
+        metrics = ValidationMetrics(["run-target", "live"])
+        metrics.bind(self.target)
+        live = metrics.path
+        self.assertIsNotNone(live)
+        try:
+            with lanes.reserve_rust_test_target(
+                self.target,
+                holder={
+                    "run_id": metrics.record["run_id"],
+                    "ledger": str(live.resolve()),
+                },
+            ):
+                for index in range(256):
+                    ledger(f"busy-{index}", 0, outcome="busy")
+                busy = lanes.RustAdmissionBusy(
+                    "fixture", resource=self.target, wait_option="--wait"
+                )
+                self.assertEqual(busy.report()["holder"]["ledger"], str(live.resolve()))
+            # A still-live metrics finalizer no longer owns the target.
+            with lanes.reserve_rust_test_target(self.target):
+                self.assertIsNone(lanes.lane_runner_holder(self.target))
+        finally:
+            metrics._release_owner()
+        # A crashed record with a stale descriptor cannot name a live owner.
+        with lanes.reserve_rust_test_target(
+            self.target,
+            holder={
+                "run_id": metrics.record["run_id"],
+                "ledger": str(live.resolve()),
+            },
+        ):
+            busy = lanes.RustAdmissionBusy(
+                "fixture", resource=self.target, wait_option="--wait"
+            )
+            self.assertIsNone(busy.report()["holder"])
 
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell lease probe")
     def test_powershell_lane_probe_recognizes_runner_lease(self):
         script = lanes.REPO_ROOT / "scripts" / "build" / "cargo-lane.ps1"
-        command = r'''
+        command = r"""
 $tokens=$null; $errors=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($args[0], [ref]$tokens, [ref]$errors)
 if($errors.Count){throw $errors[0]}
@@ -498,17 +640,29 @@ foreach($name in @('Test-IsCargoLaneLockContention','Test-ExclusiveLaneFileBusy'
     . ([scriptblock]::Create($fn.Extent.Text))
 }
 if((Test-CargoLockBusy -TargetDir $args[1]) -ne ($args[2] -eq 'busy')){throw 'incorrect runner lease state'}
-'''
+"""
         probe = self.root / "probe.ps1"
         probe.write_text(command)
+
         def assert_probe(state):
             result = subprocess.run(
-                ["pwsh", "-NoProfile", "-File", str(probe), str(script), str(self.target), state],
-                capture_output=True, text=True, timeout=15,
+                [
+                    "pwsh",
+                    "-NoProfile",
+                    "-File",
+                    str(probe),
+                    str(script),
+                    str(self.target),
+                    state,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "")
+
         self.target.mkdir()
         assert_probe("idle")
         with lanes.reserve_rust_test_target(self.target):
@@ -517,16 +671,30 @@ if((Test-CargoLockBusy -TargetDir $args[1]) -ne ($args[2] -eq 'busy')){throw 'in
 
 
 class AdmissionDispatchTest(RunnerTestCase):
-    def dispatch(self, command="run-gate", *, current_manifest=None, fingerprint=None, dependencies=None, cargo_profile=None):
+    def dispatch(
+        self,
+        command="run-gate",
+        *,
+        current_manifest=None,
+        fingerprint=None,
+        dependencies=None,
+        cargo_profile=None,
+    ):
         instance, _ = self.runner()
         instance.cargo_profile = cargo_profile
-        args = argparse.Namespace(command=command, manifest=self.temp_dir / "manifest.toml",
-                                  admission_timeout_seconds=.02, names=["demo-gate"], name="core_lib")
+        args = argparse.Namespace(
+            command=command,
+            manifest=self.temp_dir / "manifest.toml",
+            admission_timeout_seconds=0.02,
+            names=["demo-gate"],
+            name="core_lib",
+        )
         args.manifest.write_text("fixture")
         output = io.StringIO()
         ledger = {"fixture": ["b", "a"]}
         observations = []
         original_retain = instance._retain_text
+
         def retain(text, *, prefix):
             path = original_retain(text, prefix=prefix)
             if path is not None:
@@ -534,33 +702,59 @@ class AdmissionDispatchTest(RunnerTestCase):
                 self.assertEqual(path.read_text(encoding="utf-8"), text)
                 observations.append("retain")
             return path
+
         def evidence(*_args):
             self.assertTrue(lanes.cargo_lock_is_busy(self.target_dir))
             observations.append("evidence")
-            return dependencies if dependencies is not None else {"automatic_replay_allowed": False}
+            return (
+                dependencies
+                if dependencies is not None
+                else {"automatic_replay_allowed": False}
+            )
+
         def execute(*_args, **_kwargs):
             self.assertTrue(lanes.cargo_lock_is_busy(self.target_dir))
             observations.append("execute")
             return ledger
+
         with (
-            mock.patch.object(runner.Manifest, "load", return_value=current_manifest or instance.manifest),
-            mock.patch.object(runner, "execution_dependency_manifest", side_effect=evidence),
+            mock.patch.object(
+                runner.Manifest,
+                "load",
+                return_value=current_manifest or instance.manifest,
+            ),
+            mock.patch.object(
+                runner, "execution_dependency_manifest", side_effect=evidence
+            ),
             mock.patch.object(instance, "_retain_text", side_effect=retain),
             mock.patch.object(instance, "run_gates", side_effect=execute) as run_gates,
-            mock.patch.object(instance, "run_target", side_effect=execute) as run_target,
-            mock.patch.object(instance, "check_gates", side_effect=execute) as check_gates,
-            contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()),
+            mock.patch.object(
+                instance, "run_target", side_effect=execute
+            ) as run_target,
+            mock.patch.object(
+                instance, "check_gates", side_effect=execute
+            ) as check_gates,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(io.StringIO()),
         ):
-            runner._dispatch_with_admission(args, instance, instance.metadata, fingerprint, [], False)
+            runner._dispatch_with_admission(
+                args, instance, instance.metadata, fingerprint, [], False
+            )
             expected_calls = {
                 "run-gate": [mock.call(["demo-gate"])],
                 "run-target": [mock.call("core_lib", [], allow_all=False)],
                 "check-gates": [mock.call(["demo-gate"])],
             }
-            for name, method in (("run-gate", run_gates), ("run-target", run_target),
-                                 ("check-gates", check_gates)):
-                self.assertEqual(method.call_args_list,
-                                 expected_calls[name] if name == command else [], name)
+            for name, method in (
+                ("run-gate", run_gates),
+                ("run-target", run_target),
+                ("check-gates", check_gates),
+            ):
+                self.assertEqual(
+                    method.call_args_list,
+                    expected_calls[name] if name == command else [],
+                    name,
+                )
         return output.getvalue(), observations, ledger
 
     def test_admission_covers_fresh_evidence_execution_and_receipt_in_order(self):
@@ -570,26 +764,42 @@ class AdmissionDispatchTest(RunnerTestCase):
                 receipt = json.loads(text)
                 self.assertEqual(order, ["evidence", "execute"])
                 self.assertEqual(receipt["completed_tests"], ledger)
-                self.assertEqual(receipt["admission"]["target_dir"], str(self.target_dir.resolve()))
+                self.assertEqual(
+                    receipt["admission"]["target_dir"], str(self.target_dir.resolve())
+                )
                 self.assertGreaterEqual(receipt["admission"]["wait_seconds"], 0)
-                self.assertFalse(receipt["dependency_manifest"]["automatic_replay_allowed"])
+                self.assertFalse(
+                    receipt["dependency_manifest"]["automatic_replay_allowed"]
+                )
                 self.assertFalse(lanes.cargo_lock_is_busy(self.target_dir))
 
     def test_admitted_runner_is_named_as_holder_while_it_executes(self):
         instance, _ = self.runner()
         instance.metrics = runner.ValidationMetrics(["run-gate", "demo-gate"])
         instance.metrics.bind(self.target_dir)
-        args = argparse.Namespace(command="check-gates", manifest=self.temp_dir / "manifest.toml",
-                                  admission_timeout_seconds=0, names=["demo-gate"], name="core_lib")
+        args = argparse.Namespace(
+            command="check-gates",
+            manifest=self.temp_dir / "manifest.toml",
+            admission_timeout_seconds=0,
+            names=["demo-gate"],
+            name="core_lib",
+        )
         args.manifest.write_text("fixture")
         seen = []
         with (
             mock.patch.object(runner.Manifest, "load", return_value=instance.manifest),
-            mock.patch.object(instance, "check_gates",
-                              side_effect=lambda _: seen.append(lanes.lane_runner_holder(self.target_dir))),
+            mock.patch.object(
+                instance,
+                "check_gates",
+                side_effect=lambda _: seen.append(
+                    lanes.lane_runner_holder(self.target_dir)
+                ),
+            ),
             contextlib.redirect_stderr(io.StringIO()),
         ):
-            runner._dispatch_with_admission(args, instance, instance.metadata, None, [], False)
+            runner._dispatch_with_admission(
+                args, instance, instance.metadata, None, [], False
+            )
         self.assertEqual(seen[0]["argv"], ["run-gate", "demo-gate"])
         self.assertEqual(seen[0]["ledger"], str(instance.metrics.path))
         self.assertIsNone(lanes.lane_runner_holder(self.target_dir))
@@ -609,26 +819,61 @@ class AdmissionDispatchTest(RunnerTestCase):
                     text, order, _ = self.dispatch(command)
                     self.assertIn("execute", order)
                     if text:
-                        self.assertEqual(json.loads(text)["admission"]["cargo_profile_directory"], "debug")
+                        self.assertEqual(
+                            json.loads(text)["admission"]["cargo_profile_directory"],
+                            "debug",
+                        )
                     with self.assertRaises(runner.RunnerError) as error:
                         self.dispatch(command, cargo_profile="release")
                     self.assertEqual(error.exception.outcome, "busy")
-                    self.assertEqual(error.exception.admission_status["validation_status"], "pending")
+                    self.assertEqual(
+                        error.exception.admission_status["validation_status"], "pending"
+                    )
         finally:
             lanes._release_binary_file_lock(handle)
             handle.close()
 
-    def test_bulk_provenance_is_retained_before_execution_without_bloating_receipts(self):
-        manifest = {
-            "version": 1, "producer": "rust_test_runner", "captured": "before_execution",
-            "file_inputs": [{"path": f"source/日本語/{i}/Cargo.toml", "sha256": "a" * 64}
-                            for i in range(128)],
-            "source_roots": [f"source/日本語/{i}" for i in range(128)],
-            "omitted_file_inputs": 3, "omitted_source_roots": 2,
-            "execution_context_sha256": "b" * 64,
-            "coverage": "declared_not_exhaustive", "automatic_replay_allowed": False,
-            "unresolved_dependencies": ["transitive_and_generated_inputs"],
-        }
+    def test_bulk_provenance_is_retained_before_execution_without_bloating_receipts(
+        self,
+    ):
+        def provenance(count):
+            return {
+                "version": 1,
+                "producer": "rust_test_runner",
+                "captured": "before_execution",
+                "file_inputs": [
+                    {"path": f"source/日本語/{i}/Cargo.toml", "sha256": "a" * 64}
+                    for i in range(count)
+                ],
+                "source_roots": [f"source/日本語/{i}" for i in range(count)],
+                "omitted_file_inputs": 3,
+                "omitted_source_roots": 2,
+                "execution_context_sha256": "b" * 64,
+                "coverage": "declared_not_exhaustive",
+                "automatic_replay_allowed": False,
+                "unresolved_dependencies": ["transitive_and_generated_inputs"],
+            }
+
+        def bulk_independent_bytes(text):
+            # Launches whose provenance differs only in bulk may differ only in
+            # bulk counters, retention identity and the admission clock.
+            receipt = json.loads(text)
+            summary = receipt["dependency_manifest"]
+            return json.dumps(
+                {
+                    **receipt,
+                    "admission": {**receipt["admission"], "wait_seconds": 0},
+                    "dependency_manifest": {
+                        **summary,
+                        "omitted_file_inputs": 0,
+                        "omitted_source_roots": 0,
+                        "retained_manifest": sorted(summary["retained_manifest"]),
+                    },
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+
+        manifest = provenance(128)
         for command in ["run-target", "run-gate"]:
             with self.subTest(command=command):
                 text, order, ledger = self.dispatch(command, dependencies=manifest)
@@ -642,7 +887,13 @@ class AdmissionDispatchTest(RunnerTestCase):
                 self.assertEqual(len(raw), retained["bytes"])
                 self.assertEqual(hashlib.sha256(raw).hexdigest(), retained["sha256"])
                 self.assertEqual(json.loads(raw), manifest)
-                self.assertLess(len(text.encode("utf-8")), len(raw) // 10)
+                # No receipt byte may scale with retained bulk: doubling it
+                # changes only the normalized fields. A ratio to one fixture
+                # size would weigh the fixed envelope and local paths instead.
+                doubled, _, _ = self.dispatch(command, dependencies=provenance(2 * 128))
+                self.assertEqual(
+                    bulk_independent_bytes(doubled), bulk_independent_bytes(text)
+                )
                 self.assertEqual(summary["file_inputs"], [])
                 self.assertEqual(summary["source_roots"], [])
                 self.assertEqual(summary["omitted_file_inputs"], 131)
@@ -652,7 +903,9 @@ class AdmissionDispatchTest(RunnerTestCase):
                 self.assertEqual(receipt["completed_tests"], ledger)
                 self.assertEqual(receipt["executed_tests"], 2)
                 self.assertEqual(order, ["evidence", "retain", "execute"])
-        with mock.patch.object(runner.RustTestRunner, "_retain_text", return_value=None):
+        with mock.patch.object(
+            runner.RustTestRunner, "_retain_text", return_value=None
+        ):
             text, _, _ = self.dispatch(dependencies=manifest)
             self.assertEqual(json.loads(text)["dependency_manifest"], manifest)
 
@@ -665,9 +918,13 @@ class AdmissionDispatchTest(RunnerTestCase):
         # Runner edits and unrelated entries no longer discard a completed wait;
         # the receipt keeps naming the launch-time runner inputs.
         manifest = self.manifest()
-        unrelated = replace(manifest, targets={
-            **manifest.targets, "extra": replace(manifest.targets["core_shard"], name="extra"),
-        })
+        unrelated = replace(
+            manifest,
+            targets={
+                **manifest.targets,
+                "extra": replace(manifest.targets["core_shard"], name="extra"),
+            },
+        )
         for command in ["run-gate", "run-target"]:
             with self.subTest(command=command):
                 text, order, _ = self.dispatch(
@@ -692,8 +949,76 @@ class AdmissionDispatchTest(RunnerTestCase):
         with mock.patch.object(runner, "load_metadata") as metadata:
             for value in ["-1", "nan", "inf"]:
                 with contextlib.redirect_stderr(io.StringIO()):
-                    self.assertEqual(runner.main(["--admission-timeout-seconds", value, "check-manifest"]), 2)
+                    self.assertEqual(
+                        runner.main(
+                            ["--admission-timeout-seconds", value, "check-manifest"]
+                        ),
+                        2,
+                    )
             metadata.assert_not_called()
+
+    def test_post_import_disk_edit_is_not_executed_implementation_identity(self):
+        source = Path(runner.__file__).read_text(encoding="utf-8")
+        changed = source.replace(
+            '"runner": "rust_test_runner",',
+            '"runner": "rust_test_runner", "edited_emitter": True,',
+        )
+        self.assertNotEqual(source, changed)
+        copied_source = self.temp_dir / "copied_runner.py"
+        copied_source.write_text(source, encoding="utf-8")
+        manifest_path = self.temp_dir / "manifest.toml"
+        manifest_path.write_bytes(b"fixture manifest")
+
+        # The real module is already loaded. Synchronize a disk edit after its
+        # definitions are selected but before _main observes its disk inputs.
+        def selected_manifest(_path):
+            copied_source.write_text(changed, encoding="utf-8")
+            return self.manifest()
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(runner, "__file__", str(copied_source)),
+            mock.patch.object(runner.Manifest, "load", side_effect=selected_manifest),
+            mock.patch.object(runner, "load_metadata", return_value=self.metadata()),
+            mock.patch.object(
+                runner, "execution_dependency_manifest", return_value=None
+            ),
+            mock.patch.object(
+                runner.RustTestRunner, "run_target", return_value={"fixture": ["a"]}
+            ),
+            mock.patch.object(
+                lanes,
+                "reserve_rust_test_target",
+                return_value=contextlib.nullcontext({"wait_seconds": 0}),
+            ),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            args = runner.build_parser().parse_args(
+                [
+                    "--manifest",
+                    str(manifest_path),
+                    "--target-dir",
+                    str(self.target_dir),
+                    "run-target",
+                    "core_all",
+                ]
+            )
+            self.assertEqual(runner._main(args), 0)
+        receipt = json.loads(output.getvalue())
+        self.assertNotIn(
+            "edited_emitter", receipt, "the loaded old emitter actually executed"
+        )
+        self.assertEqual(
+            receipt["runner_input_fingerprint"],
+            hashlib.sha256(
+                copied_source.read_bytes() + manifest_path.read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            receipt["runner_input_fingerprint_scope"], "observed_disk_inputs"
+        )
+        self.assertIsNone(receipt["executed_implementation_identity"])
 
 
 if __name__ == "__main__":

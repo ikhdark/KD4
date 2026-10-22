@@ -304,6 +304,11 @@ pub struct ThreadSettingsUpdateResponse {}
 #[ts(export_to = "v2/")]
 pub struct ThreadSettings {
     pub cwd: AbsolutePathBuf,
+    /// Ordered applied selection; first is primary, empty disables environment access.
+    /// Absent only when restoring legacy settings without selection information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environments: Option<Vec<ThreadSelectedEnvironment>>,
     pub approval_policy: AskForApproval,
     pub sandbox_policy: SandboxPolicy,
     /// Exact permission profile enforced for this thread.
@@ -1468,6 +1473,9 @@ impl From<ThreadTokenUsage> for CoreTokenUsageInfo {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TokenUsageBreakdown {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub coverage: Option<codex_protocol::protocol::TokenUsageCoverage>,
     #[ts(type = "number")]
     pub total_tokens: i64,
     #[ts(type = "number")]
@@ -1483,6 +1491,7 @@ pub struct TokenUsageBreakdown {
 impl From<CoreTokenUsage> for TokenUsageBreakdown {
     fn from(value: CoreTokenUsage) -> Self {
         Self {
+            coverage: value.coverage,
             total_tokens: value.total_tokens,
             input_tokens: value.input_tokens,
             cached_input_tokens: value.cached_input_tokens,
@@ -1495,6 +1504,7 @@ impl From<CoreTokenUsage> for TokenUsageBreakdown {
 impl From<TokenUsageBreakdown> for CoreTokenUsage {
     fn from(value: TokenUsageBreakdown) -> Self {
         Self {
+            coverage: value.coverage,
             total_tokens: value.total_tokens,
             input_tokens: value.input_tokens,
             cached_input_tokens: value.cached_input_tokens,
@@ -1518,6 +1528,7 @@ mod token_usage_conversion_tests {
                 output_tokens: 20,
                 reasoning_output_tokens: 5,
                 total_tokens: 120,
+                coverage: None,
             },
             last_token_usage: CoreTokenUsage {
                 input_tokens: 60,
@@ -1525,6 +1536,7 @@ mod token_usage_conversion_tests {
                 output_tokens: 15,
                 reasoning_output_tokens: 3,
                 total_tokens: 75,
+                coverage: None,
             },
             model_context_window: Some(200_000),
         };
@@ -1540,6 +1552,7 @@ mod token_usage_conversion_tests {
                     output_tokens: 20,
                     reasoning_output_tokens: 5,
                     total_tokens: 120,
+                    coverage: None,
                 },
                 last: TokenUsageBreakdown {
                     input_tokens: 60,
@@ -1547,6 +1560,7 @@ mod token_usage_conversion_tests {
                     output_tokens: 15,
                     reasoning_output_tokens: 3,
                     total_tokens: 75,
+                    coverage: None,
                 },
                 model_context_window: Some(200_000),
             }

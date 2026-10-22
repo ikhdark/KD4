@@ -235,14 +235,16 @@ auth_elicitation = false
             })
             .await?;
 
-        let actual =
-            read_response::<ExperimentalFeatureListResponse>(&mut mcp, request_id).await?;
+        let actual = read_response::<ExperimentalFeatureListResponse>(&mut mcp, request_id).await?;
         let auth_elicitation = actual
             .data
             .iter()
             .find(|feature| feature.name == "auth_elicitation")
             .expect("auth_elicitation feature should be present");
-        assert_eq!(auth_elicitation.enabled, expected, "thread_id={thread_id:?}");
+        assert_eq!(
+            auth_elicitation.enabled, expected,
+            "thread_id={thread_id:?}"
+        );
     }
 
     Ok(())
@@ -422,8 +424,12 @@ async fn experimental_feature_enablement_set_only_updates_named_features() -> Re
     let actual = set_experimental_feature_enablement(
         &mut mcp,
         BTreeMap::from([("remote_plugin".to_string(), false)]),
-    ).await?;
-    assert_eq!(actual.enablement, BTreeMap::from([("remote_plugin".to_string(), false)]));
+    )
+    .await?;
+    assert_eq!(
+        actual.enablement,
+        BTreeMap::from([("remote_plugin".to_string(), false)])
+    );
     let ConfigReadResponse { config, .. } = read_config(&mut mcp, None).await?;
     let features = config.additional.get("features").expect("feature map");
     assert_eq!(features.get("auth_elicitation"), Some(&json!(true)));

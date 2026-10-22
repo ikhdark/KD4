@@ -5,6 +5,37 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
+    "AcceptedFinalMessage": {
+      "properties": {
+        "completionAttemptId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/definitions/AcceptedFinalMessageOrigin"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "completionAttemptId",
+        "itemId",
+        "origin",
+        "text"
+      ],
+      "type": "object"
+    },
+    "AcceptedFinalMessageOrigin": {
+      "enum": [
+        "assistant_final",
+        "legacy_unphased",
+        "plan"
+      ],
+      "type": "string"
+    },
     "ActivePermissionProfile": {
       "properties": {
         "extends": {
@@ -249,6 +280,17 @@
         },
         "status": {
           "$ref": "#/definitions/CollabAgentStatus"
+        },
+        "stopCause": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnExecutionStopCause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Execution scheduling cause, independent of lifecycle and task acceptance."
         },
         "surfacedResult": {
           "anyOf": [
@@ -542,6 +584,22 @@
       ],
       "type": "string"
     },
+    "EnvironmentProvenance": {
+      "properties": {
+        "environmentId": {
+          "type": "string"
+        },
+        "ownerId": {
+          "description": "Opaque registration/logical-session identity captured before dispatch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environmentId",
+        "ownerId"
+      ],
+      "type": "object"
+    },
     "FileSystemAccessMode": {
       "description": "Access mode for a filesystem entry.\n\nWhen two equally specific entries target the same path, we compare these by conflict precedence rather than by capability breadth: `deny` beats `write`, and `write` beats `read`.",
       "oneOf": [
@@ -816,6 +874,89 @@
         "original"
       ],
       "type": "string"
+    },
+    "ImageGenerationUsage": {
+      "properties": {
+        "inputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "inputTokensDetails": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ImageTokenDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outputTokensDetails": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ImageTokenDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reported": {
+          "description": "False means a response was observed but supplied no usable usage object.",
+          "type": "boolean"
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "reported"
+      ],
+      "type": "object"
+    },
+    "ImageTokenDetails": {
+      "properties": {
+        "imageTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "textTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "LegacyAppPathString": {
       "type": "string"
@@ -1791,6 +1932,16 @@
                 "null"
               ]
             },
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EnvironmentProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "executionId": {
               "description": "Unique dispatch execution id used by timing and lifecycle records.",
               "type": [
@@ -1896,6 +2047,16 @@
                 "$ref": "#/definitions/FileUpdateChange"
               },
               "type": "array"
+            },
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EnvironmentProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "id": {
               "type": "string"
@@ -2199,11 +2360,24 @@
                 }
               ]
             },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": "string"
             },
             "query": {
               "type": "string"
+            },
+            "status": {
+              "description": "Absent on historical/hosted items whose terminal outcome was not recorded.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
@@ -2223,6 +2397,16 @@
         },
         {
           "properties": {
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EnvironmentProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "id": {
               "type": "string"
             },
@@ -2275,6 +2459,17 @@
           "properties": {
             "id": {
               "type": "string"
+            },
+            "providerUsage": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageGenerationUsage"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Separate image-model receipt; never add these tokens to text inference."
             },
             "result": {
               "type": "string"
@@ -2540,6 +2735,81 @@
           "type": "object"
         }
       ]
+    },
+    "TokenUsageCoverage": {
+      "description": "Constant-space receipt/component coverage. Counts add and subtract with the existing usage ledger, so an earlier missing receipt does not taint later turns.",
+      "properties": {
+        "cache_write_input_tokens": {
+          "default": 0,
+          "description": "Sum of the explicitly reported cache-write input class, not an estimate. Interpret with cache_write_receipts; an absent class is never known zero.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "cache_write_receipts": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cached_input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "invalid_receipts": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reasoning_output_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receipts": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reported_receipts": {
+          "description": "Whole usage objects received. None preserves legacy coverage uncertainty.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "saturated": {
+          "type": "boolean"
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cached_input_tokens",
+        "input_tokens",
+        "invalid_receipts",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "receipts",
+        "saturated",
+        "total_tokens"
+      ],
+      "type": "object"
     },
     "ToolLifecycleBoundary": {
       "enum": [
@@ -2818,6 +3088,161 @@
       ],
       "type": "object"
     },
+    "TurnExecutionStopCause": {
+      "enum": [
+        "subagent_context_budget"
+      ],
+      "type": "string"
+    },
+    "TurnFinalAnswer": {
+      "description": "Accepted user-facing answer from one completion attempt. Kept separately from last-visible-message evidence, which may include commentary or errors.",
+      "properties": {
+        "message": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AcceptedFinalMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tail": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnFinalTail"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent in older records. Final-specific observations, not task acceptance."
+        }
+      },
+      "type": "object"
+    },
+    "TurnFinalRenderAck": {
+      "properties": {
+        "canonicalSha256": {
+          "type": "string"
+        },
+        "clientId": {
+          "type": "string"
+        },
+        "clockDomain": {
+          "type": "string"
+        },
+        "renderedAtMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "canonicalSha256",
+        "clientId",
+        "clockDomain",
+        "renderedAtMs"
+      ],
+      "type": "object"
+    },
+    "TurnFinalTail": {
+      "description": "Version 1 counts Unicode scalar values, UTF-8 bytes and nonempty Unicode whitespace-separated words in the canonical final, once. No token estimate is inferred. Times are monotonic offsets from this core turn's start.",
+      "properties": {
+        "canonicalSha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firstContentHostMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "fullContentHostMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "itemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "measurementVersion": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "nativeRenderAck": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnFinalRenderAck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Requires a capable native client. Server writer receipts are NOT render acknowledgments and cannot populate this field."
+        },
+        "reconciledHostMs": {
+          "description": "Host observation of the admitted final candidate, not proof that every user obligation or external evidence source was reconciled.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "requiredEvidence": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnRequiredEvidenceFrontier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Unknown unless an authoritative task oracle supplies required evidence; never substitute the most recent tool, status call, or plan completion."
+        },
+        "textCodepoints": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "textUtf8Bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "whitespaceWords": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "measurementVersion"
+      ],
+      "type": "object"
+    },
     "TurnItemsView": {
       "oneOf": [
         {
@@ -2843,6 +3268,35 @@
         }
       ]
     },
+    "TurnRequiredEvidenceFrontier": {
+      "properties": {
+        "availableHostMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "provenance": {
+          "type": "string"
+        },
+        "resultIds": {
+          "description": "Oracle-owned references; not final-answer prose.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sourceSnapshot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "availableHostMs",
+        "provenance",
+        "resultIds",
+        "sourceSnapshot"
+      ],
+      "type": "object"
+    },
     "TurnStatus": {
       "enum": [
         "completed",
@@ -2855,6 +3309,17 @@
     "TurnTiming": {
       "description": "Immutable wall-clock profile captured at the core terminal boundary.\n\n`exclusive` is the canonical elapsed-time partition. Values in `unions` and `local` may overlap and must not be added to that partition.",
       "properties": {
+        "activityTimeline": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnTimingTimeline"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bounded occurrence intervals in a named process clock domain. Missing evidence must not be reconstructed from scalar totals or wall epochs."
+        },
         "checkoutSnapshotSha256": {
           "description": "Content identity of tracked and non-ignored untracked files captured before this turn's tools ran. Absent means capture was unavailable.",
           "type": [
@@ -2910,6 +3375,17 @@
         "exclusive": {
           "$ref": "#/definitions/TurnTimingExclusive"
         },
+        "finalAnswer": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnFinalAnswer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Accepted answer identity frozen after completion hooks and pending-input admission. Some with no message explicitly means no accepted answer; absence is legacy unknown. This is not the last visible/partial message."
+        },
         "inclusiveDurationMs": {
           "format": "uint64",
           "minimum": 0.0,
@@ -2937,6 +3413,13 @@
         "milestones": {
           "$ref": "#/definitions/TurnTimingMilestones"
         },
+        "modelRequestHistoryTruncated": {
+          "description": "True qualifies all history-derived purpose, failure, wait-signature and nonprogress aggregates as retained-tail lower bounds. None is legacy unknown.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "modelRequests": {
           "description": "Per-sampling-request milestones, ordered by request. Times are offsets from turn start and are diagnostic only; they are not additive buckets.",
           "items": {
@@ -2959,7 +3442,7 @@
             "toolActiveUnionNs": 0,
             "toolCalls": 0
           },
-          "description": "Latency observed on the same unchanged-state, unchanged-next-action generations as `observational_nonprogress_tokens`. Model-stream wait remains a model-side wall-clock measurement; `decision_latency_ns` narrows that to dispatch-to-first-actionable-output where observable."
+          "description": "Latency observed on the same no-recorded-progress, unchanged-state generations as `observational_nonprogress_tokens`. Model-stream wait remains a model-side wall-clock measurement; `decision_latency_ns` narrows that to dispatch-to-first-actionable-output where observable."
         },
         "observationalNonprogressTokens": {
           "allOf": [
@@ -2975,7 +3458,7 @@
             "totalTokens": 0,
             "visibleOutputTokens": 0
           },
-          "description": "Provider usage observed on generations where neither relevant structured state nor the next-correct-action changed. This is a diagnostic and is never treated as measured avoidable savings."
+          "description": "Provider usage observed on generations with no recorded progress kinds and unchanged relevant state. A changed next action alone is not progress under this predicate; useful inference or diagnosis may still occur. Final-answer publication is excluded. This observational diagnostic is neither measured avoidable savings nor authority to stop a turn."
         },
         "preFirstModelOutput": {
           "anyOf": [
@@ -3000,6 +3483,24 @@
           "format": "int64",
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "stopCause": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnExecutionStopCause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Scheduling cause, not an acceptance verdict. Absent on older records."
+        },
+        "terminalPublicationDurationExcluded": {
+          "description": "Frozen-core duration excludes subsequent detail export and event enqueue; it is not a client-delivery or terminal-publication latency measurement.",
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -3042,11 +3543,12 @@
           ],
           "default": {
             "acceptedCount": 0,
-            "complete": true,
+            "complete": false,
             "duplicateAcceptanceCount": 0,
             "duplicateCallIdCount": 0,
             "duplicatePersistenceCount": 0,
             "duplicateTimingCount": 0,
+            "measurementAvailable": false,
             "orphanPersistenceCount": 0,
             "orphanTimingCount": 0,
             "overflowCount": 0,
@@ -3073,6 +3575,55 @@
         "profileValid",
         "schemaVersion",
         "unions"
+      ],
+      "type": "object"
+    },
+    "TurnTimingActivityInterval": {
+      "properties": {
+        "compaction": {
+          "type": "boolean"
+        },
+        "endNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "interactiveWait": {
+          "type": "boolean"
+        },
+        "modelActive": {
+          "type": "boolean"
+        },
+        "phase": {
+          "description": "One of the ten canonical exclusive bucket names (without the Ns suffix).",
+          "type": "string"
+        },
+        "planning": {
+          "type": "boolean"
+        },
+        "processInFlight": {
+          "description": "Observed process flight, NOT guarded tool runtime or CPU execution.",
+          "type": "boolean"
+        },
+        "startNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "toolActive": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "compaction",
+        "endNs",
+        "interactiveWait",
+        "modelActive",
+        "phase",
+        "planning",
+        "processInFlight",
+        "startNs",
+        "toolActive"
       ],
       "type": "object"
     },
@@ -3224,7 +3775,7 @@
         },
         "logicalGenerationCount": {
           "default": 0,
-          "description": "Logical workflow generations. `model_request_count` remains the authoritative physical provider-attempt aggregate.",
+          "description": "Logical workflow generations. `model_request_count` remains the authoritative physical transport-attempt aggregate in timing schema 34+: each identity is counted once at transport entry, including internal auth retries. This does not prove provider receipt. Older schemas may count only the first dispatch/readiness in a sampling row.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -3240,6 +3791,13 @@
           "type": "integer"
         },
         "modelRequestCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "modelRequestDetailEvictionCount": {
+          "default": 0,
+          "description": "Bounded detail loss; diagnostics derived from request rows cover only retained detail when either eviction counter is nonzero.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -3263,6 +3821,12 @@
           "type": "integer"
         },
         "permissionWaitCount": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "physicalAttemptDetailEvictionCount": {
+          "default": 0,
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -3622,6 +4186,16 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TokenUsageCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "expectedUsageCount": {
           "description": "Expected physical usage reports; absent in legacy aggregates.",
           "format": "uint64",
@@ -3650,6 +4224,15 @@
             "null"
           ]
         },
+        "outputExcludingReportedReasoningTokens": {
+          "description": "Same provider remainder as the per-request canonical field. Retained window only when TurnTiming.model_request_history_truncated is true.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "reasoningTokens": {
           "format": "uint64",
           "minimum": 0.0,
@@ -3661,6 +4244,7 @@
           "type": "integer"
         },
         "visibleOutputTokens": {
+          "description": "Deprecated compatibility remainder; never add it to the canonical field.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -3797,6 +4381,16 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TokenUsageCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "decisionLatencyNs": {
           "default": 0,
           "description": "Sum of dispatch-to-first-actionable-output latency for requests where an actionable output was observed.",
@@ -3844,6 +4438,15 @@
             "null"
           ]
         },
+        "outputExcludingReportedReasoningTokens": {
+          "description": "Provider remainder, not visible/final text. Completeness also requires TurnTiming.model_request_history_truncated == Some(false).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "outputTokens": {
           "format": "uint64",
           "minimum": 0.0,
@@ -3877,6 +4480,7 @@
         },
         "visibleOutputTokens": {
           "default": 0,
+          "description": "Deprecated compatibility remainder; never add it to the canonical field.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -4490,7 +5094,7 @@
         },
         "toolCallCount": {
           "default": 0,
-          "description": "Tool calls whose deferred executor future was polled for this generation. Kept under its historical field name for rollout compatibility.",
+          "description": "Unique tool calls accepted for this generation, including unpolled calls. Timing schemas <=32 counted calls at executor polling instead.",
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
@@ -4594,10 +5198,29 @@
           "minimum": 0.0,
           "type": "integer"
         },
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TokenUsageCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "inputTokens": {
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "outputExcludingReportedReasoningTokens": {
+          "description": "Provider output minus explicitly reported reasoning, not visible text.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "reasoningTokens": {
           "format": "uint64",
@@ -4610,6 +5233,7 @@
           "type": "integer"
         },
         "visibleOutputTokens": {
+          "description": "Deprecated compatibility remainder. Not a final-answer text count; consult coverage and the canonical optional field before interpreting it.",
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
@@ -4900,6 +5524,68 @@
       },
       "required": [
         "validationProcessNs"
+      ],
+      "type": "object"
+    },
+    "TurnTimingTimeline": {
+      "properties": {
+        "clockDomainId": {
+          "description": "Absent for clocks without proven alignment (including legacy records).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coverageComplete": {
+          "type": "boolean"
+        },
+        "droppedIntervals": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "durationNs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "intervals": {
+          "items": {
+            "$ref": "#/definitions/TurnTimingActivityInterval"
+          },
+          "type": "array"
+        },
+        "openProcessCount": {
+          "description": "Processes still observed in flight at the frozen window end are censored.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "startedAtNs": {
+          "description": "Turn start in the named process domain; intervals below are turn-relative.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tailUnknown": {
+          "description": "Checkpoints do not assert a terminal endpoint.",
+          "type": "boolean"
+        },
+        "version": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "coverageComplete",
+        "droppedIntervals",
+        "durationNs",
+        "intervals",
+        "openProcessCount",
+        "startedAtNs",
+        "tailUnknown",
+        "version"
       ],
       "type": "object"
     },
@@ -5351,6 +6037,11 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "measurementAvailable": {
+          "default": true,
+          "description": "False when a legacy record omitted the entire closure ledger. Its zero counts and incomplete verdict are unavailable evidence, not observations.",
+          "type": "boolean"
         },
         "orphanCalls": {
           "items": {

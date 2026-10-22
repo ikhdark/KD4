@@ -42,6 +42,7 @@ use crate::process::ExecProcessEventReceiver;
 use crate::protocol::ENVIRONMENT_INFO_METHOD;
 use crate::protocol::EXEC_CLOSED_METHOD;
 use crate::protocol::EXEC_EXITED_METHOD;
+use crate::protocol::EXEC_FAILED_METHOD;
 use crate::protocol::EXEC_METHOD;
 use crate::protocol::EXEC_OUTPUT_DELTA_METHOD;
 use crate::protocol::EXEC_READ_METHOD;
@@ -51,6 +52,7 @@ use crate::protocol::EXEC_WRITE_METHOD;
 use crate::protocol::EnvironmentInfo;
 use crate::protocol::ExecClosedNotification;
 use crate::protocol::ExecExitedNotification;
+use crate::protocol::ExecFailedNotification;
 use crate::protocol::ExecOutputDeltaNotification;
 use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
@@ -114,14 +116,18 @@ use crate::rpc::RpcClient;
 
 pub(crate) mod http_client;
 #[path = "client_recovery.rs"]
-mod recovery;
+pub(crate) mod recovery;
+use crate::ProcessCleanupRecord;
+use crate::ProcessCleanupStatus;
+use crate::ProcessCleanupTicket;
+use crate::ProcessExecutionKnowledge;
 pub(crate) use recovery::is_retryable_registry_error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 const ENVIRONMENT_INFO_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(30);
-const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const PROCESS_TERMINATION_TIMEOUT: Duration = Duration::from_secs(30);
 const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_RETAINED_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_PROCESS_EVENTS: usize = 256;
@@ -170,6 +176,7 @@ impl RemoteExecServerConnectArgs {
 }
 
 pub(crate) struct SessionState {
+    incarnation: String,
     wake_tx: watch::Sender<u64>,
     events: ExecProcessEventLog,
     ordered_events: StdMutex<OrderedSessionEvents>,
@@ -181,12 +188,15 @@ pub(crate) struct SessionState {
 struct OrderedSessionEvents {
     last_published_seq: u64,
     exit_published: bool,
+    last_exit_code: Option<i32>,
     closed_published: bool,
     // Server-side output, exit, and closed notifications are emitted by
     // different tasks and can reach the client out of order. Keep future events
     // here until all lower sequence numbers have been published.
     pending: BTreeMap<u64, ExecProcessEvent>,
     pending_bytes: usize,
+    // A private retained-read validator already owns the bounded response.
+    pending_byte_limit: Option<usize>,
     failure: Option<String>,
 }
 
@@ -206,6 +216,9 @@ struct HttpBodyStreams {
 }
 
 struct Inner {
+    instance_id: String,
+    cleanup_records: StdMutex<std::collections::VecDeque<ProcessCleanupTicket>>,
+    cleanup_records_evicted: AtomicU64,
     file_read_slots: Arc<tokio::sync::Semaphore>,
     // Key negative capability evidence to the transport, not the recoverable client.
     unsupported_bounded_read: StdMutex<Option<(Weak<RpcClient>, String)>>,
@@ -269,6 +282,7 @@ type ConnectionAttempt = OnceCell<ConnectionResult>;
 
 #[derive(Clone)]
 pub(crate) struct LazyRemoteExecServerClient {
+    bound_client: Option<ExecServerClient>,
     transport_params: ExecServerTransportParams,
     recovery_policy: RecoveryPolicy,
     // Saves the first startup result so callers share it. Retryable failures reconnect.
@@ -281,6 +295,7 @@ pub(crate) struct LazyRemoteExecServerClient {
 impl LazyRemoteExecServerClient {
     pub(crate) fn new(transport_params: ExecServerTransportParams) -> Self {
         Self {
+            bound_client: None,
             transport_params,
             recovery_policy: RecoveryPolicy::Wait,
             startup: Arc::new(ConnectionAttempt::new()),
@@ -326,11 +341,26 @@ impl LazyRemoteExecServerClient {
         }
     }
 
+    /// A captured capability can recover its logical session, never replace it.
+    pub(crate) fn bound(&self, client: ExecServerClient) -> Self {
+        Self {
+            bound_client: Some(client),
+            ..self.clone()
+        }
+    }
+
     pub(crate) async fn wait_until_ready(&self) -> Result<(), ExecServerError> {
         self.initial_client().await.map(drop)
     }
 
     pub(crate) async fn get(&self) -> Result<ExecServerClient, ExecServerError> {
+        if let Some(client) = &self.bound_client {
+            if matches!(self.recovery_policy, RecoveryPolicy::FailFast) {
+                return client.fail_fast();
+            }
+            client.rpc_client().await?;
+            return Ok(client.clone());
+        }
         if matches!(self.recovery_policy, RecoveryPolicy::FailFast) {
             let client = match self.cached_client() {
                 Some(client) => client,
@@ -441,7 +471,10 @@ impl LazyRemoteExecServerClient {
             .filter(|client| !client.is_disconnected())
     }
 
-    fn cached_client(&self) -> Option<ExecServerClient> {
+    pub(crate) fn cached_client(&self) -> Option<ExecServerClient> {
+        if let Some(client) = &self.bound_client {
+            return Some(client.clone());
+        }
         self.current_client
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -551,6 +584,12 @@ impl LazyRemoteExecServerClient {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecServerError {
+    #[error("remote process start was not acknowledged: {source}; {ticket}")]
+    ProcessStart {
+        #[source]
+        source: Box<ExecServerError>,
+        ticket: ProcessCleanupTicket,
+    },
     #[error("failed to spawn exec-server: {0}")]
     Spawn(#[source] std::io::Error),
     #[error("timed out connecting to exec-server websocket `{url}` after {timeout:?}")]
@@ -578,7 +617,11 @@ pub enum ExecServerError {
     #[error("exec-server protocol error: {0}")]
     Protocol(String),
     #[error("exec-server rejected request ({code}): {message}")]
-    Server { code: i64, message: String },
+    Server {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
     #[error("environment registry request failed ({status}{code_suffix}): {message}", code_suffix = .code.as_ref().map(|code| format!(", {code}")).unwrap_or_default())]
     EnvironmentRegistryHttp {
         status: http::StatusCode,
@@ -596,6 +639,18 @@ pub enum ExecServerError {
 }
 
 impl ExecServerClient {
+    /// Last 128 cleanup records, plus the number evicted. Records do not own tasks.
+    pub fn process_cleanup_records(&self) -> (Vec<ProcessCleanupRecord>, u64) {
+        let records = self
+            .inner
+            .cleanup_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            records.iter().map(ProcessCleanupTicket::snapshot).collect(),
+            self.inner.cleanup_records_evicted.load(Ordering::Relaxed),
+        )
+    }
     fn fail_fast(&self) -> Result<Self, ExecServerError> {
         self.rpc_client_without_recovery()?;
         Ok(Self {
@@ -623,7 +678,7 @@ impl ExecServerClient {
         }
     }
 
-    async fn rpc_client(&self) -> Result<Arc<RpcClient>, ExecServerError> {
+    pub(crate) async fn rpc_client(&self) -> Result<Arc<RpcClient>, ExecServerError> {
         match self.recovery_policy {
             RecoveryPolicy::Wait => self.inner.rpc_client().await,
             RecoveryPolicy::FailFast => self.rpc_client_without_recovery(),
@@ -655,10 +710,20 @@ impl ExecServerClient {
                     INITIALIZE_METHOD,
                     &InitializeParams {
                         client_name,
-                        resume_session_id,
+                        resume_session_id: resume_session_id.clone(),
                     },
                 )
                 .await?;
+            if resume_session_id
+                .as_ref()
+                .is_some_and(|requested| requested != &response.session_id)
+            {
+                return Err(ExecServerError::Protocol(format!(
+                    "exec-server did not resume requested session {} (received {})",
+                    resume_session_id.as_deref().unwrap_or_default(),
+                    response.session_id
+                )));
+            }
             let session_id = self
                 .inner
                 .session_id
@@ -699,6 +764,10 @@ impl ExecServerClient {
             result => map_rpc_call_result(result)?,
         };
         Ok(self.inner.environment_info.get_or_init(|| info).clone())
+    }
+
+    pub(crate) fn cached_environment_info(&self) -> Option<EnvironmentInfo> {
+        self.inner.environment_info.get().cloned()
     }
 
     pub async fn read(&self, params: ReadParams) -> Result<ReadResponse, ExecServerError> {
@@ -752,10 +821,23 @@ impl ExecServerClient {
         process_id: &ProcessId,
         deadline: Instant,
     ) -> Result<TerminateResponse, ExecServerError> {
+        self.terminate_with_incarnation_before(process_id, None, deadline)
+            .await
+    }
+
+    async fn terminate_with_incarnation_before(
+        &self,
+        process_id: &ProcessId,
+        incarnation: Option<String>,
+        deadline: Instant,
+    ) -> Result<TerminateResponse, ExecServerError> {
         self.call_for_cleanup_before(
             EXEC_TERMINATE_METHOD,
-            &TerminateParams {
-                process_id: process_id.clone(),
+            &crate::protocol::OwnedProcessParams {
+                incarnation,
+                params: TerminateParams {
+                    process_id: process_id.clone(),
+                },
             },
             deadline,
         )
@@ -787,13 +869,14 @@ impl ExecServerClient {
                 return Err(ExecServerError::Server {
                     code: METHOD_NOT_FOUND,
                     message: message.clone(),
+                    data: None,
                 });
             }
         }
         let result = self
             .call_rpc(&rpc_client, FS_READ_FILE_BOUNDED_METHOD, &params)
             .await;
-        if let Err(ExecServerError::Server { code, message }) = &result
+        if let Err(ExecServerError::Server { code, message, .. }) = &result
             && *code == METHOD_NOT_FOUND
         {
             *self
@@ -838,6 +921,14 @@ impl ExecServerClient {
         params: FsWriteFileParams,
     ) -> Result<FsWriteFileResponse, ExecServerError> {
         self.call(FS_WRITE_FILE_METHOD, &params).await
+    }
+
+    pub async fn fs_mutate_file_if_matches(
+        &self,
+        params: crate::protocol::FsMutateFileIfMatchesParams,
+    ) -> Result<crate::protocol::FsMutateFileIfMatchesResponse, ExecServerError> {
+        self.call(crate::protocol::FS_MUTATE_FILE_IF_MATCHES_METHOD, &params)
+            .await
     }
 
     pub async fn fs_create_directory(
@@ -897,15 +988,40 @@ impl ExecServerClient {
         params: ExecParams,
         deadline: Instant,
     ) -> Result<Session, ExecServerError> {
-        tokio::time::timeout_at(deadline, self.start_process_inner(params, deadline))
-            .await
-            .map_err(|_| ExecServerError::ProcessStartTimedOut)?
+        let ticket = ProcessCleanupTicket::new(
+            params.process_id.clone(),
+            self.inner.session_id.get().cloned(),
+        );
+        let submitted = Arc::new(AtomicBool::new(false));
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.start_process_inner(params, deadline, ticket.clone(), Arc::clone(&submitted)),
+        )
+        .await
+        .unwrap_or(Err(ExecServerError::ProcessStartTimedOut));
+        result.map_err(|source| {
+            if submitted.load(Ordering::Acquire)
+                && matches!(ticket.snapshot().cleanup, ProcessCleanupStatus::NotRequired)
+            {
+                ticket.update(
+                    ProcessExecutionKnowledge::PossiblyExecuted,
+                    ProcessCleanupStatus::Pending,
+                );
+            }
+            self.inner.retain_cleanup(ticket.clone());
+            ExecServerError::ProcessStart {
+                source: Box::new(source),
+                ticket,
+            }
+        })
     }
 
     async fn start_process_inner(
         &self,
         params: ExecParams,
         deadline: Instant,
+        ticket: ProcessCleanupTicket,
+        submitted: Arc<AtomicBool>,
     ) -> Result<Session, ExecServerError> {
         loop {
             let rpc_client = self.rpc_client().await?;
@@ -928,20 +1044,25 @@ impl ExecServerClient {
             let client = self.clone();
             let (mut result_tx, result_rx) = tokio::sync::oneshot::channel();
             let process_start_task = async move {
+                let owned_params = crate::protocol::OwnedProcessParams {
+                    incarnation: Some(state.incarnation.clone()),
+                    params,
+                };
                 let start_result = tokio::select! {
                     biased;
-                    result = client.call_rpc_with_timeout::<_, ExecResponse>(
-                        &rpc_client,
-                        EXEC_METHOD,
-                        &params,
+                    result = rpc_client.call_tracked::<_, ExecResponse>(
+                        crate::protocol::EXEC_OWNED_METHOD,
+                        &owned_params,
                         deadline.saturating_duration_since(Instant::now()),
-                    ) => Some(result),
+                        &submitted,
+                    ) => Some(map_rpc_call_result(result)),
                     _ = result_tx.closed() => None,
                 };
                 match start_result {
                     None => {
                         drop(active_start);
-                        cleanup_process_start(&client, &process_id, &state).await;
+                        cleanup_process_start(&client, &process_id, &state, &ticket, &submitted)
+                            .await;
                     }
                     Some(Ok(_)) => {
                         state.recoverable.store(true, Ordering::Release);
@@ -953,15 +1074,51 @@ impl ExecServerClient {
                         if result_tx.send(Ok(session)).is_err() {
                             state.recoverable.store(false, Ordering::Release);
                             drop(active_start);
-                            cleanup_process_start(&client, &process_id, &state).await;
+                            cleanup_process_start(
+                                &client,
+                                &process_id,
+                                &state,
+                                &ticket,
+                                &submitted,
+                            )
+                            .await;
                         }
                     }
                     Some(Err(error)) => {
+                        // These refusals precede dispatch/native launch. In
+                        // particular, never terminate somebody else's duplicate ID.
+                        if matches!(
+                            &error,
+                            ExecServerError::Server {
+                                code: -32601
+                                    | -32602
+                                    | crate::rpc::PROCESS_START_REFUSED_ERROR_CODE,
+                                ..
+                            }
+                        ) {
+                            submitted.store(false, Ordering::Release);
+                        }
+                        if matches!(&error, ExecServerError::Server { code: -32600, .. }) {
+                            // Old peers use this for both duplicate IDs and a
+                            // cancellation racing native launch. Neither "never
+                            // executed" nor terminating that ID is justified.
+                            ticket.update(state.execution_knowledge(), ProcessCleanupStatus::Unconfirmed("ambiguous server refusal; cleanup must not terminate a potentially pre-existing process".into()));
+                            client.inner.retain_cleanup(ticket.clone());
+                            let _ = result_tx.send(Err(error));
+                            drop(active_start);
+                            client.inner.remove_session_if(&process_id, &state);
+                            return;
+                        }
+                        if submitted.load(Ordering::Acquire) {
+                            ticket
+                                .update(state.execution_knowledge(), ProcessCleanupStatus::Pending);
+                        }
                         let _ = result_tx.send(Err(error));
                         // Cleanup can require a recovered connection. Only the start
                         // outcome and recoverability belong inside the recovery barrier.
                         drop(active_start);
-                        cleanup_process_start(&client, &process_id, &state).await;
+                        cleanup_process_start(&client, &process_id, &state, &ticket, &submitted)
+                            .await;
                     }
                 }
             };
@@ -988,6 +1145,10 @@ impl ExecServerClient {
 
     pub fn session_id(&self) -> Option<String> {
         self.inner.session_id.get().cloned()
+    }
+
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.inner.instance_id
     }
 
     fn is_disconnected(&self) -> bool {
@@ -1028,6 +1189,9 @@ impl ExecServerClient {
         let session_id = OnceLock::new();
         let (connection_changed, _connection_changed_rx) = watch::channel(());
         let inner = Arc::new(Inner {
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            cleanup_records: StdMutex::new(std::collections::VecDeque::new()),
+            cleanup_records_evicted: AtomicU64::new(0),
             unsupported_bounded_read: StdMutex::new(None),
             file_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::file_read::MAX_OPEN_FILE_READS,
@@ -1066,7 +1230,7 @@ impl ExecServerClient {
         self.call_rpc(&rpc_client, method, params).await
     }
 
-    async fn call_rpc<P, T>(
+    pub(crate) async fn call_rpc<P, T>(
         &self,
         rpc_client: &Arc<RpcClient>,
         method: &str,
@@ -1077,24 +1241,6 @@ impl ExecServerClient {
         T: serde::de::DeserializeOwned,
     {
         map_rpc_call_result(rpc_client.call(method, params).await)
-    }
-
-    async fn call_rpc_with_timeout<P, T>(
-        &self,
-        rpc_client: &Arc<RpcClient>,
-        method: &str,
-        params: &P,
-        call_timeout: Duration,
-    ) -> Result<T, ExecServerError>
-    where
-        P: serde::Serialize,
-        T: serde::de::DeserializeOwned,
-    {
-        map_rpc_call_result(
-            rpc_client
-                .call_with_timeout(method, params, call_timeout)
-                .await,
-        )
     }
 
     async fn call_for_cleanup<P, T>(&self, method: &str, params: &P) -> Result<T, ExecServerError>
@@ -1123,6 +1269,19 @@ impl ExecServerClient {
                     "timed out waiting for exec-server `{method}` cleanup after {PROCESS_TERMINATION_TIMEOUT:?}"
                 ))
             })??;
+        Self::call_for_cleanup_on_before(&rpc_client, method, params, deadline).await
+    }
+
+    pub(crate) async fn call_for_cleanup_on_before<P, T>(
+        rpc_client: &Arc<RpcClient>,
+        method: &str,
+        params: &P,
+        deadline: Instant,
+    ) -> Result<T, ExecServerError>
+    where
+        P: serde::Serialize,
+        T: serde::de::DeserializeOwned,
+    {
         let call_timeout = deadline.saturating_duration_since(Instant::now());
         if call_timeout.is_zero() {
             if method == FS_CLOSE_METHOD {
@@ -1135,7 +1294,7 @@ impl ExecServerClient {
         let result = rpc_client
             .call_for_cleanup(method, params, call_timeout)
             .await;
-        if method == FS_CLOSE_METHOD && matches!(&result, Err(RpcCallError::TimedOut { .. })) {
+        if method == FS_CLOSE_METHOD && result.is_err() {
             // File handles are connection-local. If their close could not settle,
             // discard this transport so server shutdown releases every handle;
             // keeping it live could strand a close that never entered the queue.
@@ -1162,27 +1321,64 @@ async fn cleanup_process_start(
     client: &ExecServerClient,
     process_id: &ProcessId,
     state: &Arc<SessionState>,
+    ticket: &ProcessCleanupTicket,
+    submitted: &AtomicBool,
 ) {
-    let deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
+    if !submitted.load(Ordering::Acquire) {
+        client.inner.remove_session_if(process_id, state);
+        return;
+    }
+    ticket.update(state.execution_knowledge(), ProcessCleanupStatus::Pending);
+    client.inner.retain_cleanup(ticket.clone());
+    let mut deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
     let mut poll_delay = Duration::from_millis(10);
-    loop {
-        match client.terminate_before(process_id, deadline).await {
-            Ok(response) if !response.running => break,
+    let settlement = loop {
+        match client
+            .terminate_with_incarnation_before(
+                process_id,
+                Some(state.incarnation.clone()),
+                deadline,
+            )
+            .await
+        {
+            Ok(response) if !response.running => break ProcessCleanupStatus::Confirmed,
             Ok(_) => {
                 if tokio::time::timeout_at(deadline, tokio::time::sleep(poll_delay))
                     .await
                     .is_err()
                 {
-                    break;
+                    ticket.update(
+                        state.execution_knowledge(),
+                        ProcessCleanupStatus::Unconfirmed(
+                            "termination deadline expired; cleanup remains owned".into(),
+                        ),
+                    );
+                    deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
                 }
                 poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
             }
             Err(error) if is_transport_closed_error(&error) && !client.inner.is_failed() => {
-                continue;
+                tokio::time::sleep(poll_delay).await;
+                deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
             }
-            Err(_) => break,
+            Err(error) => {
+                ticket.update(
+                    state.execution_knowledge(),
+                    ProcessCleanupStatus::Unconfirmed(
+                        error.to_string().chars().take(4096).collect(),
+                    ),
+                );
+                if client.inner.is_failed() {
+                    // Retain the identity/ticket for final enumeration. A failed
+                    // observation is not a confirmed process termination.
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                deadline = Instant::now() + PROCESS_TERMINATION_TIMEOUT;
+            }
         }
-    }
+    };
+    ticket.update(state.execution_knowledge(), settlement);
     client.inner.remove_session_if(process_id, state);
 }
 
@@ -1194,6 +1390,7 @@ impl From<RpcCallError> for ExecServerError {
             RpcCallError::Server(error) => Self::Server {
                 code: error.code,
                 message: error.message,
+                data: error.data,
             },
             RpcCallError::TimedOut { method, timeout } => Self::Protocol(format!(
                 "timed out waiting for exec-server `{method}` response after {timeout:?}"
@@ -1209,9 +1406,20 @@ impl From<RpcCallError> for ExecServerError {
 }
 
 impl SessionState {
+    fn execution_knowledge(&self) -> ProcessExecutionKnowledge {
+        self.ordered_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_exit_code
+            .map_or(
+                ProcessExecutionKnowledge::PossiblyExecuted,
+                ProcessExecutionKnowledge::ObservedExit,
+            )
+    }
     fn new(recoverable: bool) -> Self {
         let (wake_tx, _wake_rx) = watch::channel(0);
         Self {
+            incarnation: uuid::Uuid::new_v4().to_string(),
             wake_tx,
             events: ExecProcessEventLog::new(
                 PROCESS_EVENT_CHANNEL_CAPACITY,
@@ -1278,6 +1486,9 @@ impl SessionState {
                 .saturating_sub(pending_process_event_bytes(&event));
             ordered_events.last_published_seq = next_seq;
             ordered_events.exit_published |= matches!(&event, ExecProcessEvent::Exited { .. });
+            if let ExecProcessEvent::Exited { exit_code, .. } = &event {
+                ordered_events.last_exit_code = Some(*exit_code);
+            }
             let is_closed = matches!(&event, ExecProcessEvent::Closed { .. });
             ordered_events.closed_published |= is_closed;
             published_closed |= is_closed;
@@ -1311,21 +1522,27 @@ impl SessionState {
     }
 
     fn failed_response(&self) -> Option<ReadResponse> {
-        self.ordered_events
+        let message = self
+            .ordered_events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .failure
-            .clone()
-            .map(|message| self.synthesized_failure(message))
+            .clone();
+        message.map(|message| self.synthesized_failure(message))
     }
 
     fn synthesized_failure(&self, message: String) -> ReadResponse {
         let next_seq = (*self.wake_tx.borrow()).saturating_add(1);
+        let exit_code = self
+            .ordered_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_exit_code;
         ReadResponse {
             chunks: Vec::new(),
             next_seq,
-            exited: true,
-            exit_code: None,
+            exited: exit_code.is_some(),
+            exit_code,
             closed: true,
             failure: Some(message),
             output_gap: None,
@@ -1360,13 +1577,16 @@ impl OrderedSessionEvents {
         }
 
         let event_bytes = pending_process_event_bytes(&event);
-        if event_bytes > MAX_PENDING_PROCESS_EVENT_BYTES {
+        let byte_limit = self
+            .pending_byte_limit
+            .unwrap_or(MAX_PENDING_PROCESS_EVENT_BYTES);
+        if event_bytes > byte_limit {
             return Err(format!(
                 "process event exceeds {MAX_PENDING_PROCESS_EVENT_BYTES} bytes"
             ));
         }
         let pending_bytes = self.pending_bytes.saturating_add(event_bytes);
-        if !closes_gap && pending_bytes > MAX_PENDING_PROCESS_EVENT_BYTES {
+        if !closes_gap && pending_bytes > byte_limit {
             return Err(format!(
                 "process event reorder buffer exceeds {MAX_PENDING_PROCESS_EVENT_BYTES} bytes"
             ));
@@ -1405,6 +1625,22 @@ fn finish_process_event(
 }
 
 impl Session {
+    pub(crate) fn termination_is_unreachable(&self) -> bool {
+        self.client.inner.is_failed()
+    }
+
+    pub(crate) fn record_unresolved_termination(&self, reason: &str) {
+        let ticket = ProcessCleanupTicket::new(
+            self.process_id.clone(),
+            self.client.inner.session_id.get().cloned(),
+        );
+        ticket.update(
+            self.state.execution_knowledge(),
+            ProcessCleanupStatus::Unconfirmed(reason.chars().take(4096).collect()),
+        );
+        tracing::warn!(cleanup = %ticket, "remote process termination remains unconfirmed");
+        self.client.inner.retain_cleanup(ticket);
+    }
     pub(crate) fn process_id(&self) -> &ProcessId {
         &self.process_id
     }
@@ -1430,15 +1666,26 @@ impl Session {
 
             match self
                 .client
-                .read(ReadParams {
-                    process_id: self.process_id.clone(),
-                    after_seq,
-                    max_bytes,
-                    wait_ms,
-                })
+                .call::<_, ReadResponse>(
+                    EXEC_READ_METHOD,
+                    &crate::protocol::OwnedProcessParams {
+                        incarnation: Some(self.state.incarnation.clone()),
+                        params: ReadParams {
+                            process_id: self.process_id.clone(),
+                            after_seq,
+                            max_bytes,
+                            wait_ms,
+                        },
+                    },
+                )
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if let Some(message) = &response.failure {
+                        self.state.set_failure(message.clone());
+                    }
+                    return Ok(response);
+                }
                 Err(error)
                     if is_transport_closed_error(&error) && !self.client.inner.is_failed() =>
                 {
@@ -1458,10 +1705,13 @@ impl Session {
     }
 
     pub(crate) async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, ExecServerError> {
-        let params = WriteParams {
-            process_id: self.process_id.clone(),
-            chunk: chunk.into(),
-            write_id: self.state.next_write_id(),
+        let params = crate::protocol::OwnedProcessParams {
+            incarnation: Some(self.state.incarnation.clone()),
+            params: WriteParams {
+                process_id: self.process_id.clone(),
+                chunk: chunk.into(),
+                write_id: self.state.next_write_id(),
+            },
         };
         loop {
             match self.client.call(EXEC_WRITE_METHOD, &params).await {
@@ -1477,7 +1727,20 @@ impl Session {
     }
 
     pub(crate) async fn signal(&self, signal: ProcessSignal) -> Result<(), ExecServerError> {
-        self.client.signal(&self.process_id, signal).await
+        let _: SignalResponse = self
+            .client
+            .call(
+                EXEC_SIGNAL_METHOD,
+                &crate::protocol::OwnedProcessParams {
+                    incarnation: Some(self.state.incarnation.clone()),
+                    params: SignalParams {
+                        process_id: self.process_id.clone(),
+                        signal,
+                    },
+                },
+            )
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn terminate(&self) -> Result<(), ExecServerError> {
@@ -1486,7 +1749,11 @@ impl Session {
         loop {
             match self
                 .client
-                .terminate_before(&self.process_id, deadline)
+                .terminate_with_incarnation_before(
+                    &self.process_id,
+                    Some(self.state.incarnation.clone()),
+                    deadline,
+                )
                 .await
             {
                 Ok(response) if !response.running => return Ok(()),
@@ -1525,6 +1792,24 @@ impl Session {
 }
 
 impl Inner {
+    fn retain_cleanup(&self, ticket: ProcessCleanupTicket) {
+        let mut records = self
+            .cleanup_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if records
+            .iter()
+            .any(|existing| Arc::ptr_eq(&existing.0, &ticket.0))
+        {
+            return;
+        }
+        if records.len() == 128 {
+            records.pop_front();
+            self.cleanup_records_evicted.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("old process cleanup evidence evicted from bounded history");
+        }
+        records.push_back(ticket);
+    }
     fn get_session(&self, process_id: &ProcessId) -> Option<Arc<SessionState>> {
         self.sessions.load().get(process_id).cloned()
     }
@@ -1601,6 +1886,7 @@ fn is_transport_closed_error(error: &ExecServerError) -> bool {
         ExecServerError::Server {
             code: -32000,
             message,
+            ..
         } if message == "JSON-RPC transport closed"
     )
 }
@@ -1627,6 +1913,13 @@ async fn handle_server_notification(
     notification: JSONRPCNotification,
 ) -> Result<(), ExecServerError> {
     match notification.method.as_str() {
+        EXEC_FAILED_METHOD => {
+            let params: ExecFailedNotification =
+                serde_json::from_value(notification.params.unwrap_or(Value::Null))?;
+            if let Some(session) = inner.get_session(&params.process_id) {
+                session.set_failure(params.message);
+            }
+        }
         EXEC_OUTPUT_DELTA_METHOD => {
             let params: ExecOutputDeltaNotification =
                 serde_json::from_value(notification.params.unwrap_or(Value::Null))?;
@@ -1671,6 +1964,21 @@ async fn handle_server_notification(
                 });
                 if result.is_ok() {
                     session.note_change(params.seq);
+                }
+                finish_process_event(inner, &params.process_id, &session, result);
+            }
+        }
+        crate::protocol::EXEC_OUTPUT_GAP_METHOD => {
+            let params: crate::protocol::ExecOutputGapNotification =
+                serde_json::from_value(notification.params.unwrap_or(Value::Null))?;
+            if let Some(session) = inner.get_session(&params.process_id) {
+                // Capture loss occupies its sequence without bytes; publishing
+                // it in order releases events already queued behind it.
+                let result = session.publish_ordered_event(ExecProcessEvent::OutputGap {
+                    through_seq: params.through_seq,
+                });
+                if result.is_ok() {
+                    session.note_change(params.through_seq);
                 }
                 finish_process_event(inner, &params.process_id, &session, result);
             }
@@ -1742,7 +2050,6 @@ mod tests {
     use crate::protocol::ENVIRONMENT_INFO_METHOD;
     use crate::protocol::EXEC_CLOSED_METHOD;
     use crate::protocol::EXEC_EXITED_METHOD;
-    use crate::protocol::EXEC_METHOD;
     use crate::protocol::EXEC_OUTPUT_DELTA_METHOD;
     use crate::protocol::EXEC_READ_METHOD;
     use crate::protocol::EXEC_TERMINATE_METHOD;
@@ -1898,7 +2205,11 @@ mod tests {
             }
 
             let request = match read_jsonrpc_line(&mut lines).await {
-                JSONRPCMessage::Request(request) if request.method == EXEC_METHOD => request,
+                JSONRPCMessage::Request(request)
+                    if request.method == crate::protocol::EXEC_OWNED_METHOD =>
+                {
+                    request
+                }
                 other => panic!("expected process start request, got {other:?}"),
             };
             let trace = request.trace.clone();
@@ -2015,12 +2326,22 @@ mod tests {
             ));
 
             let start = match read_jsonrpc_line(&mut lines).await {
-                JSONRPCMessage::Request(request) if request.method == EXEC_METHOD => request,
+                JSONRPCMessage::Request(request)
+                    if request.method == crate::protocol::EXEC_OWNED_METHOD =>
+                {
+                    request
+                }
                 other => panic!("expected process start request, got {other:?}"),
             };
-            let start_params: ExecParams =
+            let start_params: crate::protocol::OwnedProcessParams<ExecParams> =
                 serde_json::from_value(start.params.expect("process start params should exist"))
                     .expect("process start params should deserialize");
+            assert!(
+                start_params
+                    .incarnation
+                    .as_ref()
+                    .is_some_and(|token| !token.is_empty())
+            );
             start_observed_tx
                 .send(())
                 .expect("start observer should remain open");
@@ -2030,10 +2351,15 @@ mod tests {
                 }
                 other => panic!("expected cleanup terminate request, got {other:?}"),
             };
-            let terminate_params: crate::protocol::TerminateParams =
-                serde_json::from_value(terminate.params.expect("cleanup parameters"))
-                    .expect("decode cleanup parameters");
-            assert_eq!(terminate_params.process_id, start_params.process_id);
+            let terminate_params: crate::protocol::OwnedProcessParams<
+                crate::protocol::TerminateParams,
+            > = serde_json::from_value(terminate.params.expect("cleanup parameters"))
+                .expect("decode cleanup parameters");
+            assert_eq!(terminate_params.incarnation, start_params.incarnation);
+            assert_eq!(
+                terminate_params.params.process_id,
+                start_params.params.process_id
+            );
             write_jsonrpc_line(
                 &mut server_writer,
                 JSONRPCMessage::Response(JSONRPCResponse {
@@ -2044,7 +2370,7 @@ mod tests {
             )
             .await;
             cleanup_observed_tx
-                .send(start_params.process_id)
+                .send(start_params.params.process_id)
                 .expect("cleanup observer should remain open");
             let _ = release_server_rx.await;
         });
@@ -2144,7 +2470,11 @@ mod tests {
             ));
 
             let start = match read_jsonrpc_line(&mut lines).await {
-                JSONRPCMessage::Request(request) if request.method == EXEC_METHOD => request,
+                JSONRPCMessage::Request(request)
+                    if request.method == crate::protocol::EXEC_OWNED_METHOD =>
+                {
+                    request
+                }
                 other => panic!("expected process start request, got {other:?}"),
             };
             write_jsonrpc_line(
@@ -2165,6 +2495,26 @@ mod tests {
                     request
                 }
                 other => panic!("expected cleanup terminate request, got {other:?}"),
+            };
+            // A real termination error is not evidence that this admitted
+            // process stopped. Cleanup must keep its identity and retry.
+            write_jsonrpc_line(
+                &mut server_writer,
+                JSONRPCMessage::Error(JSONRPCError {
+                    id: terminate.id,
+                    error: JSONRPCErrorError {
+                        code: -32000,
+                        message: "termination temporarily unavailable".to_string(),
+                        data: None,
+                    },
+                }),
+            )
+            .await;
+            let terminate = match read_jsonrpc_line(&mut lines).await {
+                JSONRPCMessage::Request(request) if request.method == EXEC_TERMINATE_METHOD => {
+                    request
+                }
+                other => panic!("expected retained cleanup retry, got {other:?}"),
             };
             cleanup_started_tx
                 .send(())
@@ -2226,6 +2576,10 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("process rejected"));
+        assert!(
+            client.inner.get_session(&process_id).is_some(),
+            "unconfirmed cleanup must retain the provisional process identity"
+        );
 
         let _ = release_cleanup_tx.send(());
         server.await.expect("server task should finish");
@@ -2519,6 +2873,102 @@ mod tests {
                 },
             ]
         );
+
+        // A failed observer has no exit sequence. It must wake a remote event
+        // subscriber without inventing an exit, even if no process/read is polled.
+        let failed_id = ProcessId::from("lost-observer");
+        let failed = client.register_session(&failed_id).await.unwrap();
+        let mut failed_events = failed.subscribe_events();
+        notifications_tx
+            .send(JSONRPCMessage::Notification(JSONRPCNotification {
+                method: crate::protocol::EXEC_FAILED_METHOD.to_string(),
+                params: Some(
+                    serde_json::to_value(crate::protocol::ExecFailedNotification {
+                        process_id: failed_id,
+                        message: "process exit observation lost".to_string(),
+                    })
+                    .unwrap(),
+                ),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), failed_events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            ExecProcessEvent::Failed("process exit observation lost".to_string())
+        );
+        let response = failed.read(None, None, None).await.unwrap();
+        assert!(!response.exited);
+        assert_eq!(response.exit_code, None);
+        assert_eq!(
+            response.failure.as_deref(),
+            Some("process exit observation lost")
+        );
+
+        // Capture loss occupies a sequence without bytes. Its ordered gap must
+        // release the close queued behind it instead of stalling the session.
+        let gap_id = ProcessId::from("capture-loss");
+        let gap_session = client.register_session(&gap_id).await.unwrap();
+        let mut gap_events = gap_session.subscribe_events();
+        for message in [
+            JSONRPCMessage::Notification(JSONRPCNotification {
+                method: EXEC_CLOSED_METHOD.to_string(),
+                params: Some(
+                    serde_json::to_value(ExecClosedNotification {
+                        process_id: gap_id.clone(),
+                        seq: 3,
+                        sandbox_denied: Some(false),
+                    })
+                    .unwrap(),
+                ),
+            }),
+            JSONRPCMessage::Notification(JSONRPCNotification {
+                method: EXEC_EXITED_METHOD.to_string(),
+                params: Some(
+                    serde_json::to_value(ExecExitedNotification {
+                        process_id: gap_id.clone(),
+                        seq: 1,
+                        exit_code: 0,
+                        sandbox_denied: Some(false),
+                    })
+                    .unwrap(),
+                ),
+            }),
+            JSONRPCMessage::Notification(JSONRPCNotification {
+                method: crate::protocol::EXEC_OUTPUT_GAP_METHOD.to_string(),
+                params: Some(
+                    serde_json::to_value(crate::protocol::ExecOutputGapNotification {
+                        process_id: gap_id.clone(),
+                        through_seq: 2,
+                    })
+                    .unwrap(),
+                ),
+            }),
+        ] {
+            notifications_tx.send(message).await.unwrap();
+        }
+        for expected in [
+            ExecProcessEvent::Exited {
+                seq: 1,
+                exit_code: 0,
+                sandbox_denied: Some(false),
+            },
+            ExecProcessEvent::OutputGap { through_seq: 2 },
+            ExecProcessEvent::Closed {
+                seq: 3,
+                sandbox_denied: Some(false),
+            },
+        ] {
+            assert_eq!(
+                timeout(Duration::from_secs(1), gap_events.recv())
+                    .await
+                    .expect("the ordered gap should release queued events")
+                    .unwrap(),
+                expected
+            );
+        }
 
         drop(notifications_tx);
         drop(client);
@@ -2822,6 +3272,7 @@ mod tests {
                         crate::protocol::FsGetMetadataParams {
                             path: PathUri::from_host_native_path(&path).expect("file URI"),
                             sandbox: None,
+                            include_directory_case_sensitivity: None,
                         },
                     ));
                     assert!(futures::poll!(call.as_mut()).is_pending());
@@ -2894,7 +3345,11 @@ mod tests {
                 let mut first = accept_websocket(&listener).await;
                 complete_websocket_initialize(&mut first, "timeout-session", None).await;
                 let start = match read_jsonrpc_websocket(&mut first).await {
-                    JSONRPCMessage::Request(request) if request.method == EXEC_METHOD => request,
+                    JSONRPCMessage::Request(request)
+                        if request.method == crate::protocol::EXEC_OWNED_METHOD =>
+                    {
+                        request
+                    }
                     other => panic!("expected actual process start: {other:?}"),
                 };
                 let params: ExecParams =
@@ -3080,6 +3535,7 @@ mod tests {
                         path: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                             .expect("cwd URI"),
                         sandbox: None,
+                        include_directory_case_sensitivity: None,
                     })
                     .await,
                 Err(super::ExecServerError::Disconnected(_))
@@ -3130,7 +3586,10 @@ mod tests {
                         serde_json::from_value(request.params.unwrap()).unwrap();
                     assert_eq!(params.after_seq, Some(0));
                     assert_eq!(params.wait_ms, Some(0));
-                    assert!(seen.insert(params.process_id.clone()), "duplicate recovery read");
+                    assert!(
+                        seen.insert(params.process_id.clone()),
+                        "duplicate recovery read"
+                    );
                     batch.push((request.id, params.process_id));
                 }
                 // Withhold every response for one simulated network round trip.
@@ -3178,8 +3637,7 @@ mod tests {
             let mut terminated = false;
             let mut probed = false;
             while !terminated || !probed {
-                let JSONRPCMessage::Request(request) =
-                    read_jsonrpc_websocket(&mut resumed).await
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut resumed).await
                 else {
                     panic!("expected cleanup or probe");
                 };
@@ -3200,7 +3658,10 @@ mod tests {
                 };
                 write_jsonrpc_websocket(
                     &mut resumed,
-                    JSONRPCMessage::Response(JSONRPCResponse { id: request.id, result }),
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result,
+                    }),
                 )
                 .await;
             }
@@ -3234,22 +3695,34 @@ mod tests {
             } else {
                 let event = if index == 1 {
                     assert_eq!(event, ExecProcessEvent::OutputGap { through_seq: 3 });
-                    timeout(Duration::from_secs(2), events.recv()).await.unwrap().unwrap()
+                    timeout(Duration::from_secs(2), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
                 } else {
                     event
                 };
-                assert_eq!(event, ExecProcessEvent::Output(ProcessOutputChunk {
-                    seq: if index == 1 { 4 } else { 1 },
-                    stream: ExecOutputStream::Stdout,
-                    chunk: format!("process-{index}").into_bytes().into(),
-                }));
-                assert!(sessions[index].state.recoverable.load(std::sync::atomic::Ordering::Acquire));
+                assert_eq!(
+                    event,
+                    ExecProcessEvent::Output(ProcessOutputChunk {
+                        seq: if index == 1 { 4 } else { 1 },
+                        stream: ExecOutputStream::Stdout,
+                        chunk: format!("process-{index}").into_bytes().into(),
+                    })
+                );
+                assert!(
+                    sessions[index]
+                        .state
+                        .recoverable
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
             }
         }
-        let response: serde_json::Value = timeout(Duration::from_secs(2), client.call("probe", &()))
-            .await
-            .unwrap()
-            .unwrap();
+        let response: serde_json::Value =
+            timeout(Duration::from_secs(2), client.call("probe", &()))
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(response, serde_json::json!({"usable": true}));
         let (batches, elapsed) = server.await.unwrap();
         assert_eq!(batches, vec![8, 8, 1]);
@@ -3378,8 +3851,6 @@ mod tests {
         server.await.unwrap();
     }
 
-
-
     #[tokio::test]
     async fn failed_process_start_cleanup_does_not_block_other_process_recovery() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3392,7 +3863,7 @@ mod tests {
             let JSONRPCMessage::Request(start) = read_jsonrpc_websocket(&mut first).await else {
                 panic!("expected process start");
             };
-            assert_eq!(start.method, EXEC_METHOD);
+            assert_eq!(start.method, crate::protocol::EXEC_OWNED_METHOD);
             let params: ExecParams = serde_json::from_value(start.params.unwrap()).unwrap();
             assert_eq!(params.process_id.as_str(), "unacknowledged");
             drop(first);
@@ -3927,6 +4398,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_stream_close_disconnects_only_the_originating_transport() {
+        use crate::ExecutorFileSystem;
+        for rejection in ["overload", "missing", "malformed"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let mut socket = accept_websocket(&listener).await;
+                complete_websocket_initialize(&mut socket, "origin", None).await;
+                let JSONRPCMessage::Request(open) = read_jsonrpc_websocket(&mut socket).await
+                else {
+                    panic!("open")
+                };
+                assert_eq!(open.method, crate::protocol::FS_OPEN_METHOD);
+                let params: crate::protocol::FsOpenParams =
+                    serde_json::from_value(open.params.unwrap()).unwrap();
+                write_jsonrpc_websocket(
+                    &mut socket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: open.id,
+                        result: serde_json::json!({"handleId": params.handle_id}),
+                    }),
+                )
+                .await;
+                let JSONRPCMessage::Request(close) = read_jsonrpc_websocket(&mut socket).await
+                else {
+                    panic!("close")
+                };
+                assert_eq!(close.method, crate::protocol::FS_CLOSE_METHOD);
+                let response = if rejection == "malformed" {
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: close.id,
+                        result: serde_json::Value::Null,
+                    })
+                } else {
+                    JSONRPCMessage::Error(codex_exec_server_protocol::JSONRPCError {
+                        id: close.id,
+                        error: codex_exec_server_protocol::JSONRPCErrorError {
+                            code: if rejection == "overload" {
+                                -32600
+                            } else {
+                                -32601
+                            },
+                            message: "close not admitted".into(),
+                            data: None,
+                        },
+                    })
+                };
+                write_jsonrpc_websocket(&mut socket, response).await;
+                // Keep the peer alive: only cleanup may invalidate this connection.
+                let _ = socket.next().await;
+            });
+            let lazy = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+                websocket_url: url,
+                connect_timeout: Duration::from_secs(1),
+                initialize_timeout: Duration::from_secs(1),
+            });
+            let client = lazy.get().await.unwrap();
+            let origin = client.rpc_client().await.unwrap();
+            let fs = crate::remote_file_system::RemoteFileSystem::new(lazy);
+            let path =
+                PathUri::from_host_native_path(std::env::temp_dir().join("stream-close.txt"))
+                    .unwrap();
+            let stream = fs.read_file_stream(&path, None).await.unwrap();
+
+            let replacement_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let replacement_url = format!("ws://{}", replacement_listener.local_addr().unwrap());
+            let replacement_server = tokio::spawn(async move {
+                let mut socket = accept_websocket(&replacement_listener).await;
+                // This peer uses direct connect_websocket, not LazyRemote readiness.
+                complete_websocket_session_initialize(&mut socket, "replacement", None).await;
+                let JSONRPCMessage::Request(request) = read_jsonrpc_websocket(&mut socket).await
+                else {
+                    panic!("replacement request")
+                };
+                assert_eq!(request.method, crate::protocol::FS_READ_FILE_BOUNDED_METHOD);
+                write_jsonrpc_websocket(
+                    &mut socket,
+                    JSONRPCMessage::Response(JSONRPCResponse {
+                        id: request.id,
+                        result: serde_json::json!({"dataBase64":""}),
+                    }),
+                )
+                .await;
+                let _ = socket.next().await;
+            });
+            let replacement = ExecServerClient::connect_websocket(
+                RemoteExecServerConnectArgs::new(replacement_url, "replacement-test".into()),
+            )
+            .await
+            .unwrap();
+            let replacement_rpc = replacement.rpc_client().await.unwrap();
+            client.inner.connection.lock().unwrap().status =
+                super::ConnectionStatus::Connected(Arc::clone(&replacement_rpc));
+            drop(stream);
+            timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(origin.is_disconnected());
+            assert!(!replacement_rpc.is_disconnected());
+            client
+                .fs_read_file_bounded(crate::protocol::FsReadFileBoundedParams {
+                    path,
+                    max_bytes: 1,
+                    confined_root: None,
+                    sandbox: None,
+                })
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), async {
+                while client.inner.file_read_slots.available_permits()
+                    != crate::file_read::MAX_OPEN_FILE_READS
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            replacement_rpc.request_transport_close();
+            timeout(Duration::from_secs(2), replacement_server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn process_start_deadline_includes_lazy_readiness() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let websocket_url = format!("ws://{}", listener.local_addr().unwrap());
@@ -3939,12 +4537,21 @@ mod tests {
             ready_rx.await.unwrap();
             complete_websocket_initialize(&mut websocket, "start-budget", None).await;
             assert!(matches!(read_jsonrpc_websocket(&mut websocket).await,
-                JSONRPCMessage::Request(request) if request.method == EXEC_METHOD));
+                JSONRPCMessage::Request(request) if request.method == crate::protocol::EXEC_OWNED_METHOD));
             started_tx.send(()).unwrap();
             // The test advances the client's thirty-second deadline while this
             // read waits; do not install the helper's unrelated one-second timer.
-            let frame = websocket.next().await.unwrap().unwrap();
-            let message: JSONRPCMessage = serde_json::from_slice(&frame.into_data()).unwrap();
+            let message: JSONRPCMessage = loop {
+                let frame = websocket.next().await.unwrap().unwrap();
+                match frame {
+                    Message::Text(_) | Message::Binary(_) => {
+                        break serde_json::from_slice(&frame.into_data()).unwrap();
+                    }
+                    Message::Ping(_) => websocket.flush().await.unwrap(),
+                    Message::Pong(_) => {}
+                    other => panic!("expected cleanup request, got {other:?}"),
+                }
+            };
             let JSONRPCMessage::Request(cleanup) = message else {
                 panic!("expected cleanup");
             };

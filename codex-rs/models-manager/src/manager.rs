@@ -39,6 +39,11 @@ const MODEL_REFRESH_FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
 /// manager owns refresh policy, cache behavior, and catalog merging; it calls
 /// this endpoint only when it decides a remote refresh should happen.
 pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
+    /// Local discovery has authoritative membership and does not require Codex auth.
+    fn has_authoritative_catalog(&self) -> bool {
+        false
+    }
+
     /// Returns whether this provider can authenticate command-scoped requests.
     fn has_command_auth(&self) -> bool;
 
@@ -190,6 +195,10 @@ impl ModelCatalogActivity {
 
 /// Coordinates model discovery plus cached metadata on disk.
 pub trait ModelsManager: fmt::Debug + Send + Sync {
+    /// Opaque current identity for binding consumer snapshots and continuations.
+    fn catalog_identity(&self) -> Option<String> {
+        None
+    }
     /// Return the shared demand signal used by background catalog refresh.
     fn model_catalog_activity(&self) -> Arc<ModelCatalogActivity>;
 
@@ -349,7 +358,11 @@ fn build_available_models_for_auth(
     uses_codex_backend: bool,
 ) -> Vec<ModelPreset> {
     let mut remote_models = normalize_model_catalog(remote_models);
-    remote_models.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.slug.cmp(&b.slug)));
+    remote_models.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.slug.cmp(&b.slug))
+    });
     if !uses_codex_backend {
         remote_models.retain(|model| model.supported_in_api);
     }
@@ -371,7 +384,11 @@ impl AvailableModelPresets {
     fn new(remote_models: &[ModelInfo]) -> Self {
         let normalized = normalize_model_catalog(remote_models.to_vec());
         let mut sorted_models: Vec<&ModelInfo> = normalized.iter().collect();
-        sorted_models.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.slug.cmp(&b.slug)));
+        sorted_models.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| a.slug.cmp(&b.slug))
+        });
         let mut api = Vec::with_capacity(sorted_models.len());
         let mut codex = Vec::with_capacity(sorted_models.len());
         for model in sorted_models {
@@ -424,6 +441,7 @@ struct ModelsRefreshFailure {
 #[derive(Debug)]
 struct ModelState {
     remote_models: Vec<ModelInfo>,
+    rejected_slugs: std::collections::BTreeSet<String>,
     available_models: AvailableModelPresets,
     etag: Option<String>,
     active_cache_identity: String,
@@ -436,10 +454,12 @@ impl ModelState {
         etag: Option<String>,
         active_cache_identity: String,
     ) -> Self {
-        let remote_models = normalize_model_catalog(remote_models);
+        let normalized = normalize_model_catalog_with_rejections(remote_models);
+        let remote_models = normalized.models;
         let available_models = AvailableModelPresets::new(&remote_models);
         Self {
             remote_models,
+            rejected_slugs: normalized.rejected_slugs,
             available_models,
             etag,
             active_cache_identity,
@@ -448,7 +468,12 @@ impl ModelState {
     }
 
     fn replace_remote_models(&mut self, remote_models: Vec<ModelInfo>) {
-        let remote_models = normalize_model_catalog(remote_models);
+        self.replace_catalog(normalize_model_catalog_with_rejections(remote_models));
+    }
+
+    fn replace_catalog(&mut self, normalized: NormalizedModelCatalog) {
+        self.rejected_slugs = normalized.rejected_slugs;
+        let remote_models = normalized.models;
         if self.remote_models == remote_models {
             return;
         }
@@ -525,6 +550,7 @@ impl Drop for EtagRefreshWorkerExitGuard {
 #[derive(Debug)]
 pub struct StaticModelsManager {
     remote_models: Vec<ModelInfo>,
+    rejected_slugs: std::collections::BTreeSet<String>,
     available_models: AvailableModelPresets,
     auth_manager: Option<Arc<AuthManager>>,
     model_catalog_activity: Arc<ModelCatalogActivity>,
@@ -544,7 +570,11 @@ impl OpenAiModelsManager {
         let cache_manager =
             ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL, cache_identity);
         let active_cache_identity = cache_manager.current_identity();
-        let remote_models = load_bundled_models_or_panic();
+        let remote_models = if endpoint_client.has_authoritative_catalog() {
+            Vec::new()
+        } else {
+            load_bundled_models_or_panic()
+        };
         Self {
             state: RwLock::new(ModelState::new(remote_models, None, active_cache_identity)),
             refresh_gate: tokio::sync::Mutex::new(None),
@@ -561,7 +591,8 @@ impl OpenAiModelsManager {
 impl StaticModelsManager {
     /// Construct a static model manager from an authoritative catalog.
     pub fn new(auth_manager: Option<Arc<AuthManager>>, model_catalog: ModelsResponse) -> Self {
-        let mut remote_models = normalize_model_catalog(model_catalog.models);
+        let normalized = normalize_model_catalog_with_rejections(model_catalog.models);
+        let mut remote_models = normalized.models;
         // An authoritative catalog keeps the prompts it authors. One copied
         // from the bundled file has none for local-policy models and would run
         // them without a base prompt, so only those take the local policy.
@@ -575,6 +606,7 @@ impl StaticModelsManager {
             remote_models,
             available_models,
             auth_manager,
+            rejected_slugs: normalized.rejected_slugs,
             model_catalog_activity: Arc::new(ModelCatalogActivity::new()),
             #[cfg(test)]
             list_models_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -589,6 +621,9 @@ impl StaticModelsManager {
 }
 
 impl ModelsManager for OpenAiModelsManager {
+    fn catalog_identity(&self) -> Option<String> {
+        Some(self.cache_manager.current_identity())
+    }
     fn model_catalog_activity(&self) -> Arc<ModelCatalogActivity> {
         Arc::clone(&self.model_catalog_activity)
     }
@@ -687,7 +722,12 @@ impl ModelsManager for OpenAiModelsManager {
                 self.model_catalog_activity.note_activity().await;
                 self.ensure_current_cache_identity().await;
                 let state = self.state.read().await;
-                construct_model_info_from_candidates(model, &state.remote_models, config)
+                construct_model_info_with_rejections(
+                    model,
+                    &state.remote_models,
+                    &state.rejected_slugs,
+                    config,
+                )
             }
             .instrument(tracing::info_span!("get_model_info", model = model)),
         )
@@ -722,6 +762,17 @@ impl OpenAiModelsManager {
         Ok(ModelsResponse {
             models: self.get_remote_models().await,
         })
+    }
+
+    /// Seed provider-owned discovery before sharing this manager with consumers.
+    pub fn with_discovered_catalog(mut self, models: Vec<ModelInfo>, remaining: Duration) -> Self {
+        if self.endpoint_client.has_authoritative_catalog() {
+            let normalized = self.merged_remote_models(models);
+            let state = self.state.get_mut();
+            state.replace_catalog(normalized);
+            state.fresh_until = Some(Instant::now() + remaining.min(self.cache_manager.ttl()));
+        }
+        self
     }
 
     fn submit_etag_notice(self: Arc<Self>, etag: String, http_client_factory: HttpClientFactory) {
@@ -816,24 +867,10 @@ impl OpenAiModelsManager {
                 }
             };
 
+            // Inference hints carry no frozen request authority. Equal opaque
+            // validators cannot confirm current-scope freshness after an auth switch.
             if self.get_etag().await.as_deref() == Some(notice.etag.as_str()) {
-                // A matching ETag confirms the current catalog exactly as a 304 does.
-                self.mark_memory_fresh(&refresh_identity, self.cache_manager.ttl())
-                    .await;
-                if let Some(write_basis) = write_basis
-                    && let Err(err) = self
-                        .cache_manager
-                        .renew_cache_ttl_for_identity_if_unchanged(
-                            &crate::client_version_to_whole(),
-                            &notice.etag,
-                            &refresh_identity,
-                            &write_basis,
-                        )
-                        .await
-                {
-                    error!("failed to renew cache TTL: {err}");
-                    self.ensure_current_cache_identity().await;
-                }
+                // Keep the existing expiry; only scoped /models responses renew it.
             } else {
                 let current_etag = self.get_etag().await;
                 match self
@@ -845,6 +882,16 @@ impl OpenAiModelsManager {
                     .await
                 {
                     Ok(ModelsFetchResult::Modified { models, etag }) => {
+                        if !models.is_empty()
+                            && models
+                                .iter()
+                                .all(|model| model.validate_capabilities().is_err())
+                        {
+                            error!(
+                                "rejecting entirely invalid ETag catalog; retaining last good snapshot"
+                            );
+                            continue;
+                        }
                         if !self.cache_manager.identity_is_current(&refresh_identity) {
                             self.ensure_current_cache_identity().await;
                             continue;
@@ -861,7 +908,7 @@ impl OpenAiModelsManager {
                                 && self.cache_manager.identity_is_current(&refresh_identity);
                             if refresh_state.generation == notice.generation && identity_is_current
                             {
-                                model_state.replace_remote_models(merged_models);
+                                model_state.replace_catalog(merged_models);
                                 model_state.etag = etag.clone();
                                 model_state.fresh_until =
                                     Some(Instant::now() + self.cache_manager.ttl());
@@ -876,9 +923,9 @@ impl OpenAiModelsManager {
                         }
                         if should_apply
                             && let Some(write_basis) = write_basis.as_ref()
-                            && !self
+                            && self
                                 .cache_manager
-                                .persist_cache_for_identity_if_unchanged(
+                                .persist_cache_for_identity_outcome(
                                     &models,
                                     etag,
                                     crate::client_version_to_whole(),
@@ -886,8 +933,9 @@ impl OpenAiModelsManager {
                                     write_basis,
                                 )
                                 .await
+                                == crate::cache::CacheWriteOutcome::RevisionConflict
                         {
-                            self.ensure_current_cache_identity().await;
+                            self.mark_memory_unconfirmed().await;
                         }
                     }
                     Ok(ModelsFetchResult::NotModified) => {
@@ -912,6 +960,9 @@ impl OpenAiModelsManager {
                                 .await
                         {
                             error!("failed to renew cache TTL after conditional refresh: {err}");
+                            if err.kind() == std::io::ErrorKind::InvalidData {
+                                self.mark_memory_unconfirmed().await;
+                            }
                         }
                     }
                     Err(err) => error!("failed to refresh available models: {err}"),
@@ -956,6 +1007,12 @@ impl OpenAiModelsManager {
             refresh_strategy == RefreshStrategy::OnlineIfUncached,
         )
         .await
+    }
+
+    async fn mark_memory_unconfirmed(&self) {
+        let mut state = self.state.write().await;
+        state.fresh_until = None;
+        state.etag = None;
     }
 
     async fn memory_is_fresh(&self) -> bool {
@@ -1059,9 +1116,9 @@ impl OpenAiModelsManager {
                 self.mark_memory_fresh(&fetch_identity, self.cache_manager.ttl())
                     .await;
                 if let Some(write_basis) = write_basis
-                    && !self
+                    && self
                         .cache_manager
-                        .persist_cache_for_identity_if_unchanged(
+                        .persist_cache_for_identity_outcome(
                             &models,
                             etag,
                             client_version,
@@ -1069,8 +1126,9 @@ impl OpenAiModelsManager {
                             &write_basis,
                         )
                         .await
+                        == crate::cache::CacheWriteOutcome::RevisionConflict
                 {
-                    self.ensure_current_cache_identity().await;
+                    self.mark_memory_unconfirmed().await;
                 }
             }
             ModelsFetchResult::NotModified => {
@@ -1094,6 +1152,9 @@ impl OpenAiModelsManager {
                         .await
                 {
                     error!("failed to renew cache TTL after conditional refresh: {err}");
+                    if err.kind() == std::io::ErrorKind::InvalidData {
+                        self.mark_memory_unconfirmed().await;
+                    }
                 }
             }
         }
@@ -1106,18 +1167,29 @@ impl OpenAiModelsManager {
         etag: Option<&str>,
         expected_identity: &str,
     ) -> CoreResult<ModelsFetchResult> {
-        self.endpoint_client
+        let result = self
+            .endpoint_client
             .list_models_for_identity(
                 &crate::client_version_to_whole(),
                 http_client_factory.clone(),
                 etag,
                 expected_identity,
             )
-            .await
+            .await?;
+        if let ModelsFetchResult::Modified { models, .. } = &result {
+            for model in models {
+                model
+                    .validate_capabilities()
+                    .map_err(CodexErr::InvalidRequest)?;
+            }
+        }
+        Ok(result)
     }
 
     async fn should_refresh_models(&self) -> bool {
-        self.endpoint_client.uses_codex_backend().await || self.endpoint_client.has_command_auth()
+        self.endpoint_client.has_authoritative_catalog()
+            || self.endpoint_client.uses_codex_backend().await
+            || self.endpoint_client.has_command_auth()
     }
 
     async fn get_etag(&self) -> Option<String> {
@@ -1136,6 +1208,9 @@ impl OpenAiModelsManager {
         let mut state = self.state.write().await;
         let current_identity = self.cache_manager.current_identity();
         if state.reset_for_cache_identity(current_identity.clone()) {
+            if self.endpoint_client.has_authoritative_catalog() {
+                state.replace_remote_models(Vec::new());
+            }
             info!(
                 mismatch_category = "provider_cache_identity",
                 "models cache: reset identity-scoped in-memory catalog"
@@ -1156,6 +1231,9 @@ impl OpenAiModelsManager {
 
         let mut state = self.state.try_write()?;
         if state.reset_for_cache_identity(self.cache_manager.current_identity()) {
+            if self.endpoint_client.has_authoritative_catalog() {
+                state.replace_remote_models(Vec::new());
+            }
             info!(
                 mismatch_category = "provider_cache_identity",
                 "models cache: reset identity-scoped in-memory catalog"
@@ -1171,6 +1249,16 @@ impl OpenAiModelsManager {
         etag: Option<String>,
         expected_identity: &str,
     ) -> bool {
+        if !models.is_empty()
+            && models
+                .iter()
+                .all(|model| model.validate_capabilities().is_err())
+        {
+            tracing::warn!(
+                "rejecting an entirely invalid model catalog; retaining last good snapshot"
+            );
+            return false;
+        }
         let merged_models = self.merged_remote_models(models);
         let mut state = self.state.write().await;
         if state.active_cache_identity != expected_identity
@@ -1178,14 +1266,19 @@ impl OpenAiModelsManager {
         {
             return false;
         }
-        state.replace_remote_models(merged_models);
+        state.replace_catalog(merged_models);
         state.etag = etag;
         state.fresh_until = None;
         true
     }
 
-    fn merged_remote_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-        let mut models = normalize_model_catalog(models);
+    fn merged_remote_models(&self, models: Vec<ModelInfo>) -> NormalizedModelCatalog {
+        let normalized = normalize_model_catalog_with_rejections(models);
+        if self.endpoint_client.has_authoritative_catalog() {
+            return normalized;
+        }
+        let rejected_slugs = normalized.rejected_slugs;
+        let mut models = normalized.models;
         crate::prompt_resolver::apply_prompt_policy(&mut models);
         // Use the remote models list as the source of truth if it contains at least one
         // non-hidden model and the user is using ChatGPT auth.
@@ -1199,9 +1292,13 @@ impl OpenAiModelsManager {
                     .is_some_and(AuthMode::has_chatgpt_account)
             });
         if should_use_remote_models_only {
-            models
+            NormalizedModelCatalog {
+                models,
+                rejected_slugs,
+            }
         } else {
             let mut existing_models = load_bundled_models_or_panic();
+            existing_models.retain(|model| !rejected_slugs.contains(&model.slug));
             let mut existing_indices: HashMap<String, usize> = existing_models
                 .iter()
                 .enumerate()
@@ -1215,7 +1312,11 @@ impl OpenAiModelsManager {
                     existing_models.push(model);
                 }
             }
-            existing_models
+            // The merged catalog is the active catalog too: keep it slug-ordered
+            // with bundled definitions validated, as every other branch is.
+            let mut merged = normalize_model_catalog_with_rejections(existing_models);
+            merged.rejected_slugs.extend(rejected_slugs);
+            merged
         }
     }
 
@@ -1410,7 +1511,12 @@ impl ModelsManager for StaticModelsManager {
         Box::pin(
             async move {
                 self.model_catalog_activity.note_activity().await;
-                construct_model_info_from_candidates(model, &self.remote_models, config)
+                construct_model_info_with_rejections(
+                    model,
+                    &self.remote_models,
+                    &self.rejected_slugs,
+                    config,
+                )
             }
             .instrument(tracing::info_span!("get_model_info", model = model)),
         )
@@ -1436,25 +1542,67 @@ impl ModelsManager for StaticModelsManager {
 /// Quarantine every conflicting slug, rather than letting input order choose
 /// metadata. Apply before auth-dependent merging, including cache loads.
 fn normalize_model_catalog(models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    normalize_model_catalog_with_rejections(models).models
+}
+
+struct NormalizedModelCatalog {
+    models: Vec<ModelInfo>,
+    rejected_slugs: std::collections::BTreeSet<String>,
+}
+
+fn normalize_model_catalog_with_rejections(models: Vec<ModelInfo>) -> NormalizedModelCatalog {
     let mut by_slug = std::collections::BTreeMap::<String, Option<ModelInfo>>::new();
     for model in models {
+        if let Err(error) = model.validate_capabilities() {
+            tracing::warn!(%error, "quarantining invalid model capabilities");
+            by_slug.insert(model.slug.clone(), None);
+            continue;
+        }
         match by_slug.entry(model.slug.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(Some(model));
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if entry.get().as_ref().is_some_and(|existing| existing != &model) {
+                if entry
+                    .get()
+                    .as_ref()
+                    .is_some_and(|existing| existing != &model)
+                {
                     entry.insert(None);
                 }
             }
         }
     }
-    by_slug.into_iter().filter_map(|(slug, model)| {
-        if model.is_none() {
-            tracing::warn!(%slug, "quarantining conflicting model definitions");
+    let mut normalized = NormalizedModelCatalog {
+        models: Vec::new(),
+        rejected_slugs: std::collections::BTreeSet::new(),
+    };
+    for (slug, model) in by_slug {
+        if let Some(model) = model {
+            normalized.models.push(model);
+        } else {
+            tracing::warn!(%slug, "quarantining rejected model definitions");
+            normalized.rejected_slugs.insert(slug);
         }
-        model
-    }).collect()
+    }
+    normalized
+}
+
+fn construct_model_info_with_rejections(
+    model: &str,
+    candidates: &[ModelInfo],
+    rejected_slugs: &std::collections::BTreeSet<String>,
+    config: &ModelsManagerConfig,
+) -> ModelInfo {
+    let suffix = model_info::namespaced_model_suffix(model);
+    if rejected_slugs.iter().any(|slug| {
+        model_info::matches_model_slug(model, slug)
+            || suffix.is_some_and(|suffix| model_info::matches_model_slug(suffix, slug))
+    }) {
+        tracing::warn!(%model, "using explicit fallback for quarantined model metadata");
+        return construct_model_info_from_candidates(model, &[], config);
+    }
+    construct_model_info_from_candidates(model, candidates, config)
 }
 
 fn load_bundled_models() -> Result<Vec<ModelInfo>, std::io::Error> {

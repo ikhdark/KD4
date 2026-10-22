@@ -614,10 +614,18 @@ fn push_database_row(
     options: HumanOutputOptions,
 ) {
     let sep = super::inline_separator(options);
+    let integrity_label = format!("{label} integrity");
+    let integrity = value(parsed, &integrity_label);
     let Some(path) = value(parsed, label) else {
+        if let Some(integrity) = integrity {
+            out.push(HumanDetail::Row {
+                label: integrity_label.clone(),
+                value: integrity.to_string(),
+                expected: expected(parsed, &[&integrity_label]),
+            });
+        }
         return;
     };
-    let integrity = value(parsed, &format!("{label} integrity"));
     let value = integrity.map_or_else(
         || path.to_string(),
         |integrity| format!("{path}{sep}integrity {integrity}"),
@@ -830,4 +838,31 @@ pub(super) fn is_falsy(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "" | "false" | "none" | "not set" | "unknown" | "missing" | "absent" | "no" | "—" | "-"
     )
+}
+
+#[cfg(test)]
+mod guidance_integrity_regressions {
+    use super::*;
+
+    #[test]
+    fn integrity_failure_without_path_survives_human_rendering() {
+        let parsed = vec![ParsedDetail {
+            label: "goals DB integrity".into(),
+            value: "unavailable (permission denied)".into(),
+            expected: None,
+        }];
+        for show_all in [false, true] {
+            let rows = state_details(
+                &parsed,
+                HumanOutputOptions {
+                    show_details: true,
+                    show_all,
+                    ascii: true,
+                    color_enabled: false,
+                },
+            );
+            assert!(rows.iter().any(|row| matches!(row,
+                HumanDetail::Row { label, value, .. } if label == "goals DB integrity" && value.contains("permission denied"))));
+        }
+    }
 }

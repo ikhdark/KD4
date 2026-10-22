@@ -33,6 +33,7 @@ from ._login import (
     start_device_code_login,
 )
 from ._message_router import MessageRouter
+from ._presence import UNSET, Unset
 from ._run import (
     TurnResult,
     _collect_async_turn_result,
@@ -85,7 +86,11 @@ class Codex:
         self._client = CodexClient(config=config)
         try:
             self._client.start()
-            self._init = validate_initialize_metadata(self._client.initialize())
+            self._init = validate_initialize_metadata(
+                self._client.initialize(
+                    notification_opt_outs=("thread/status/changed", "thread/started"),
+                )
+            )
         except BaseException:
             try:
                 self._client.close()
@@ -105,6 +110,14 @@ class Codex:
 
     def close(self) -> None:
         self._client.close()
+
+    def next_notification(self, timeout_s: float | None = None) -> Notification:
+        """Consume global/account/warning events; stalled consumers remain bounded.
+
+        Thread creation/status mirrors are intentionally opted out: this facade
+        obtains creation from RPC replies and turn lifecycle from turn streams.
+        """
+        return self._client.next_notification(timeout_s)
 
     def login_api_key(self, api_key: str) -> None:
         """Authenticate Codex with an API key."""
@@ -148,7 +161,7 @@ class Codex:
         personality: Personality | None = None,
         sandbox: Sandbox | None = None,
         service_name: str | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         session_start_source: ThreadStartSource | None = None,
         thread_source: ThreadSource | None = None,
     ) -> Thread:
@@ -166,7 +179,7 @@ class Codex:
             personality=personality,
             sandbox=_sandbox_mode(sandbox),
             service_name=service_name,
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             session_start_source=session_start_source,
             thread_source=thread_source,
         )
@@ -215,7 +228,7 @@ class Codex:
         model_provider: str | None = None,
         personality: Personality | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
     ) -> Thread:
         """Resume an existing conversation thread by ID."""
         approval_policy = _approval_mode_override_settings(approval_mode)
@@ -230,7 +243,7 @@ class Codex:
             model_provider=model_provider,
             personality=personality,
             sandbox=_sandbox_mode(sandbox),
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
         )
         resumed = self._client.thread_resume(thread_id, params)
         return Thread(self._client, resumed.thread.id)
@@ -249,7 +262,7 @@ class Codex:
         model: str | None = None,
         model_provider: str | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         thread_source: ThreadSource | None = None,
     ) -> Thread:
         """Create a new thread from an existing thread."""
@@ -266,7 +279,7 @@ class Codex:
             model=model,
             model_provider=model_provider,
             sandbox=_sandbox_mode(sandbox),
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             thread_source=thread_source,
         )
         forked = self._client.thread_fork(thread_id, params)
@@ -317,7 +330,9 @@ class AsyncCodex:
                 return
             try:
                 await self._client.start()
-                payload = await self._client.initialize()
+                payload = await self._client.initialize(
+                    notification_opt_outs=("thread/status/changed", "thread/started"),
+                )
                 self._init = validate_initialize_metadata(payload)
                 self._initialized = True
             except BaseException:
@@ -343,6 +358,11 @@ class AsyncCodex:
             self._init = None
             self._initialized = False
             await self._client.close()
+
+    async def next_notification(self) -> Notification:
+        """Consume important global events; creation/status mirrors are opted out."""
+        await self._ensure_initialized()
+        return await self._client.next_notification()
 
     async def login_api_key(self, api_key: str) -> None:
         """Authenticate Codex with an API key."""
@@ -391,7 +411,7 @@ class AsyncCodex:
         personality: Personality | None = None,
         sandbox: Sandbox | None = None,
         service_name: str | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         session_start_source: ThreadStartSource | None = None,
         thread_source: ThreadSource | None = None,
     ) -> AsyncThread:
@@ -410,7 +430,7 @@ class AsyncCodex:
             personality=personality,
             sandbox=_sandbox_mode(sandbox),
             service_name=service_name,
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             session_start_source=session_start_source,
             thread_source=thread_source,
         )
@@ -460,7 +480,7 @@ class AsyncCodex:
         model_provider: str | None = None,
         personality: Personality | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
     ) -> AsyncThread:
         """Resume an existing conversation thread by ID."""
         await self._ensure_initialized()
@@ -476,7 +496,7 @@ class AsyncCodex:
             model_provider=model_provider,
             personality=personality,
             sandbox=_sandbox_mode(sandbox),
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
         )
         resumed = await self._client.thread_resume(thread_id, params)
         return AsyncThread(self, resumed.thread.id)
@@ -495,7 +515,7 @@ class AsyncCodex:
         model: str | None = None,
         model_provider: str | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         thread_source: ThreadSource | None = None,
     ) -> AsyncThread:
         """Create a new thread from an existing thread."""
@@ -513,7 +533,7 @@ class AsyncCodex:
             model=model,
             model_provider=model_provider,
             sandbox=_sandbox_mode(sandbox),
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             thread_source=thread_source,
         )
         forked = await self._client.thread_fork(thread_id, params)
@@ -555,7 +575,7 @@ class Thread:
         output_schema: JsonObject | None = None,
         personality: Personality | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         summary: ReasoningSummary | None = None,
     ) -> TurnResult:
         """Run a complete turn and collect its final result."""
@@ -590,7 +610,7 @@ class Thread:
         personality: Personality | None = None,
         run_independently: bool | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         summary: ReasoningSummary | None = None,
     ) -> TurnHandle:
         """Start a turn and return a handle for streaming or control."""
@@ -607,7 +627,7 @@ class Thread:
             personality=personality,
             run_independently=run_independently,
             sandbox_policy=_sandbox_policy(sandbox),
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             summary=summary,
         )
         turn = self._client.turn_start(self.id, wire_input, params=params)
@@ -644,7 +664,7 @@ class AsyncThread:
         output_schema: JsonObject | None = None,
         personality: Personality | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         summary: ReasoningSummary | None = None,
     ) -> TurnResult:
         """Run a complete turn asynchronously and collect its final result."""
@@ -679,7 +699,7 @@ class AsyncThread:
         personality: Personality | None = None,
         run_independently: bool | None = None,
         sandbox: Sandbox | None = None,
-        service_tier: str | None = None,
+        service_tier: str | None | Unset = UNSET,
         summary: ReasoningSummary | None = None,
     ) -> AsyncTurnHandle:
         """Start a turn and return a handle for streaming or control."""
@@ -697,7 +717,7 @@ class AsyncThread:
             personality=personality,
             run_independently=run_independently,
             sandbox_policy=_sandbox_policy(sandbox),
-            service_tier=service_tier,
+            **({"service_tier": service_tier} if service_tier is not UNSET else {}),
             summary=summary,
         )
         turn = await self._codex._client.turn_start(
@@ -812,11 +832,9 @@ class AsyncTurnHandle:
         self._router = self._codex._client._sync._router
 
     def _ensure_current(self) -> None:
-        if (
-            self._closed
-            or not self._codex._initialized
-            or self._codex._client.process_epoch != self._epoch
-        ):
+        if self._closed:
+            raise TransportClosedError("turn handle is closed")
+        if not self._codex._initialized or self._codex._client.process_epoch != self._epoch:
             raise TransportClosedError("turn handle belongs to a closed Codex process")
 
     async def close(self) -> None:

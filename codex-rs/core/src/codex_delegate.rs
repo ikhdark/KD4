@@ -175,7 +175,7 @@ fn cancel_delegate_when_session_loop_terminates(
 ) {
     let session_loop_termination = codex.session_loop_termination.clone();
     tokio::spawn(async move {
-        session_loop_termination.await;
+        let _ = session_loop_termination.await;
         delegate_liveness.cancel();
     });
 }
@@ -260,15 +260,32 @@ impl PreparedCodexOneShot {
             !self.submitted,
             "prepared one-shot submitted more than once"
         );
-        self.io
-            .submit(Op::UserInput {
-                items: input,
-                final_output_json_schema,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
-            .await?;
+        let turn_id = self.io.reserve_turn_id();
+        let admitted = self
+            .io
+            .submit_with_start_admission(
+                codex_protocol::protocol::Submission {
+                    id: turn_id,
+                    trace: None,
+                    client_user_message_id: None,
+                    op: Op::UserInput {
+                        items: input,
+                        final_output_json_schema,
+                        responsesapi_client_metadata: None,
+                        additional_context: Default::default(),
+                        thread_settings: Default::default(),
+                    },
+                },
+                None,
+            )
+            .await;
+        if let Err(error) = admitted {
+            // Rejected input has no terminal. Close the unused event receiver so
+            // required shutdown notifications cannot block cleanup.
+            self.io.rx_event.close();
+            let _ = self.io.shutdown_and_wait().await;
+            return Err(error);
+        }
         self.submitted = true;
 
         // Bridge events so we can observe completion and shut down automatically.
@@ -309,7 +326,9 @@ async fn bridge_one_shot_events(
             EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
         );
         if !matches!(
-            tx_bridge.send(event).or_cancel(&child_cancel).await,
+            codex_mcp::event_queue::send_event(&tx_bridge, event)
+                .or_cancel(&child_cancel)
+                .await,
             Ok(Ok(()))
         ) || should_shutdown
         {
@@ -482,7 +501,10 @@ async fn forward_event_or_shutdown(
     cancel_token: &CancellationToken,
     event: Event,
 ) -> bool {
-    match tx_sub.send(event).or_cancel(cancel_token).await {
+    match codex_mcp::event_queue::send_event(tx_sub, event)
+        .or_cancel(cancel_token)
+        .await
+    {
         Ok(Ok(())) => true,
         _ => {
             shutdown_delegate(codex).await;

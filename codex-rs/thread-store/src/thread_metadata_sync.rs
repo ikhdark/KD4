@@ -32,6 +32,7 @@ const THREAD_UPDATED_AT_TOUCH_INTERVAL: Duration = Duration::from_secs(5);
 /// keeps append-derived metadata observation in the live layer without owning persistence-policy
 /// filtering or making `append_items` infer metadata inside a `ThreadStore` implementation.
 pub(crate) struct ThreadMetadataSync {
+    pub(crate) history_observation_uncertain: bool,
     thread_id: ThreadId,
     cwd_seen: bool,
     preview_seen: bool,
@@ -84,6 +85,7 @@ impl ThreadMetadataSync {
         };
         Self {
             thread_id: params.thread_id,
+            history_observation_uncertain: false,
             cwd_seen: !cwd.as_os_str().is_empty(),
             preview_seen: false,
             first_user_message_seen: false,
@@ -100,6 +102,7 @@ impl ThreadMetadataSync {
     pub(crate) fn for_resume(params: &ResumeThreadParams) -> Self {
         let mut sync = Self {
             thread_id: params.thread_id,
+            history_observation_uncertain: false,
             cwd_seen: params
                 .metadata
                 .cwd
@@ -290,7 +293,8 @@ impl ThreadMetadataSync {
                 | RolloutItem::InterAgentCommunication(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
-                | RolloutItem::WorldState(_) => {}
+                | RolloutItem::WorldState(_)
+                | RolloutItem::AdditionalContextState { .. } => {}
             }
         }
         Some(update)
@@ -315,6 +319,48 @@ impl ThreadMetadataSync {
                 self.title_seen = true;
                 update.title = Some(title.to_string());
             }
+        }
+    }
+
+    pub(crate) fn record_explicit_update(&mut self, patch: ThreadMetadataPatch) {
+        if patch.name.is_some() || patch.title.is_some() {
+            self.title_seen = true;
+            if let Some(pending) = self.pending_update.as_mut() {
+                pending.title = None;
+            }
+        }
+        if let Some(pending) = self.pending_update.as_mut() {
+            // These fields have already committed through the explicit owner.
+            // Retrying older observations must not restore them or re-submit
+            // an acknowledged name/project operation as a durability condition.
+            macro_rules! superseded {
+                ($($field:ident),* $(,)?) => { $(if patch.$field.is_some() { pending.$field = None; })* };
+            }
+            superseded!(
+                name,
+                rollout_path,
+                preview,
+                title,
+                model_provider,
+                model,
+                reasoning_effort,
+                created_at,
+                updated_at,
+                source,
+                thread_source,
+                agent_nickname,
+                agent_role,
+                agent_path,
+                cwd,
+                cli_version,
+                approval_mode,
+                permission_profile,
+                token_usage,
+                first_user_message,
+                git_info,
+                project_id
+            );
+            self.pending_update_generation = self.pending_update_generation.wrapping_add(1);
         }
     }
 
@@ -485,7 +531,10 @@ mod tests {
             "2025-01-03T12:00:00+00:00"
         );
         assert_eq!(update.patch.preview.as_deref(), Some("hello metadata"));
-        assert_eq!(update.patch.title, None, "resume repair must not rename the thread");
+        assert_eq!(
+            update.patch.title, None,
+            "resume repair must not rename the thread"
+        );
         assert_eq!(
             update.patch.first_user_message.as_deref(),
             Some("hello metadata")
@@ -501,9 +550,9 @@ mod tests {
             "resume-only metadata must wait for a new append"
         );
         let appended = sync
-            .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
-                user_message("new append"),
-            ))])
+            .observe_appended_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(user_message(
+                "new append",
+            )))])
             .expect("first append flushes pending resume metadata");
         assert_eq!(appended.patch.preview.as_deref(), Some("hello metadata"));
         assert!(appended.patch.updated_at.is_some());
@@ -601,7 +650,10 @@ mod tests {
             update.patch.first_user_message.as_deref(),
             Some("first user text")
         );
-        assert_eq!(update.patch.title, None, "resume repair must not rename the thread");
+        assert_eq!(
+            update.patch.title, None,
+            "resume repair must not rename the thread"
+        );
 
         let sync = ThreadMetadataSync::for_resume(&resume_params(
             thread_id,

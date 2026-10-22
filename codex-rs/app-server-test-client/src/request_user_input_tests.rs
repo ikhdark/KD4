@@ -114,7 +114,8 @@ fn collects_option_and_free_form_answers() {
 
     assert_eq!(
         response,
-        ToolRequestUserInputResponse { disposition: None,
+        ToolRequestUserInputResponse {
+            disposition: None,
             answers: HashMap::from([
                 (
                     "target".to_string(),
@@ -173,7 +174,8 @@ fn retries_invalid_selection_and_collects_other_answer() {
 
     assert_eq!(
         response,
-        ToolRequestUserInputResponse { disposition: None,
+        ToolRequestUserInputResponse {
+            disposition: None,
             answers: HashMap::from([(
                 "target".to_string(),
                 ToolRequestUserInputAnswer {

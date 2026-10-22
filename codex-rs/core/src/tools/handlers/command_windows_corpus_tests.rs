@@ -156,8 +156,12 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
     assert!(repair.repaired());
 
     let mutating_source = CommandInvocation::Argv {
-        program: "git".to_string(),
-        args: vec!["--worktree".to_string(), "status".to_string()],
+        program: "cargo".to_string(),
+        args: vec![
+            "--pakage".to_string(),
+            "example".to_string(),
+            "test".to_string(),
+        ],
     };
     assert!(
         preflight_invocation_with_equivalent_repair(

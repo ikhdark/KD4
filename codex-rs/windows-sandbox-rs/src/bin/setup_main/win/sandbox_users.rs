@@ -628,9 +628,8 @@ mod tests {
             "online",
             "online-secret",
         )?;
-        let bytes = std::fs::read(
-            super::sandbox_secrets_dir(home.path()).join("sandbox_users.json"),
-        )?;
+        let bytes =
+            std::fs::read(super::sandbox_secrets_dir(home.path()).join("sandbox_users.json"))?;
         let users: SandboxUsersFile = serde_json::from_slice(&bytes)?;
         assert_eq!(users.version, super::SETUP_VERSION);
         for (record, username, password) in [

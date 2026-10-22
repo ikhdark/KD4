@@ -302,8 +302,6 @@ mod tests {
         })
     }
 
-
-
     #[test]
     fn legacy_notify_json_matches_historical_wire_shape() -> Result<()> {
         let payload = HookPayload {

@@ -87,7 +87,11 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()> {
     let config: toml::Table = config.parse()?;
     assert!(config["marketplaces"].get("debug").is_none());
     assert!(config["marketplaces"].get("tools").is_some());
-    assert!(marketplace_install_root(codex_home.path()).join("tools").exists());
+    assert!(
+        marketplace_install_root(codex_home.path())
+            .join("tools")
+            .exists()
+    );
     assert!(
         !marketplace_install_root(codex_home.path())
             .join("debug")
@@ -112,5 +116,3 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()> {
     );
     Ok(())
 }
-
-

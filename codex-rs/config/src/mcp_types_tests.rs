@@ -31,11 +31,19 @@ fn deserialize_stdio_command_server_config() {
 
 #[test]
 fn deserialize_stdio_arguments_and_environment_are_preserved() {
-    for env in [None, Some(HashMap::from([("FOO".to_string(), "BAR".to_string())]))] {
-        let suffix = if env.is_some() { "env = { FOO = 'BAR' }" } else { "" };
-        let cfg: McpServerConfig =
-            toml::from_str(&format!("command = 'echo'\nargs = ['hello', 'world']\n{suffix}"))
-                .unwrap();
+    for env in [
+        None,
+        Some(HashMap::from([("FOO".to_string(), "BAR".to_string())])),
+    ] {
+        let suffix = if env.is_some() {
+            "env = { FOO = 'BAR' }"
+        } else {
+            ""
+        };
+        let cfg: McpServerConfig = toml::from_str(&format!(
+            "command = 'echo'\nargs = ['hello', 'world']\n{suffix}"
+        ))
+        .unwrap();
         assert_eq!(
             cfg.transport,
             McpServerTransportConfig::Stdio {
@@ -76,7 +84,6 @@ fn deserialize_remote_stdio_server_accepts_foreign_absolute_cwd() {
     );
     assert_eq!(cfg.environment_id, "remote");
 }
-
 
 #[test]
 fn deserialize_stdio_command_server_config_with_env_vars() {
@@ -185,8 +192,11 @@ fn deserialize_server_flags_preserves_independent_defaults_and_overrides() {
     ] {
         let cfg: McpServerConfig =
             toml::from_str(&format!("command = 'echo'\n{settings}")).unwrap();
-        assert_eq!((cfg.enabled, cfg.required, cfg.supports_parallel_tool_calls),
-            (enabled, required, parallel), "{settings}");
+        assert_eq!(
+            (cfg.enabled, cfg.required, cfg.supports_parallel_tool_calls),
+            (enabled, required, parallel),
+            "{settings}"
+        );
     }
 }
 
@@ -267,11 +277,18 @@ oauth_resource = "https://api.example.com"
 [oauth]
 client_id = "eci-prd-pub-codex-123"
 "#,
-    ).unwrap();
-    assert_eq!(cfg.oauth_resource.as_deref(), Some("https://api.example.com"));
-    assert_eq!(cfg.oauth, Some(McpServerOAuthConfig {
-        client_id: Some("eci-prd-pub-codex-123".to_string()),
-    }));
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.oauth_resource.as_deref(),
+        Some("https://api.example.com")
+    );
+    assert_eq!(
+        cfg.oauth,
+        Some(McpServerOAuthConfig {
+            client_id: Some("eci-prd-pub-codex-123".to_string()),
+        })
+    );
     assert_eq!(cfg.oauth_client_id(), Some("eci-prd-pub-codex-123"));
 }
 
@@ -289,7 +306,6 @@ fn deserialize_server_config_with_tool_filters() {
     assert_eq!(cfg.enabled_tools, Some(vec!["allowed".to_string()]));
     assert_eq!(cfg.disabled_tools, Some(vec!["blocked".to_string()]));
 }
-
 
 #[test]
 fn deserialize_server_config_with_default_tool_approval_mode() {
@@ -384,34 +400,43 @@ fn deserialize_ignores_unknown_server_fields() {
 #[test]
 fn deserialize_rejects_fields_for_the_wrong_transport() {
     for (base, transport, invalid_fields) in [
-        ("command = 'echo'", "stdio", vec![
-            ("url", "'https://example.com'"),
-            ("bearer_token_env_var", "'TOKEN'"),
-            ("bearer_token", "'secret'"),
-            ("http_headers", "{ 'X-Foo' = 'bar' }"),
-            ("env_http_headers", "{ 'X-Foo' = 'BAR_ENV' }"),
-            ("oauth", "{ client_id = 'eci-prd-pub-codex-123' }"),
-            ("oauth_resource", "'https://api.example.com'"),
-        ]),
-        ("url = 'https://example.com'", "streamable_http", vec![
-            ("env", "{ FOO = 'BAR' }"),
-            ("args", "['argument']"),
-            ("env_vars", "['TOKEN']"),
-            ("cwd", "'/tmp'"),
-            ("bearer_token", "'secret'"),
-        ]),
+        (
+            "command = 'echo'",
+            "stdio",
+            vec![
+                ("url", "'https://example.com'"),
+                ("bearer_token_env_var", "'TOKEN'"),
+                ("bearer_token", "'secret'"),
+                ("http_headers", "{ 'X-Foo' = 'bar' }"),
+                ("env_http_headers", "{ 'X-Foo' = 'BAR_ENV' }"),
+                ("oauth", "{ client_id = 'eci-prd-pub-codex-123' }"),
+                ("oauth_resource", "'https://api.example.com'"),
+            ],
+        ),
+        (
+            "url = 'https://example.com'",
+            "streamable_http",
+            vec![
+                ("env", "{ FOO = 'BAR' }"),
+                ("args", "['argument']"),
+                ("env_vars", "['TOKEN']"),
+                ("cwd", "'/tmp'"),
+                ("bearer_token", "'secret'"),
+            ],
+        ),
     ] {
         let _: McpServerConfig = toml::from_str(base).expect("valid transport control");
         for (field, value) in invalid_fields {
             let input = format!("{base}\n{field} = {value}");
             let error = toml::from_str::<McpServerConfig>(&input).unwrap_err();
-            assert_eq!(error.message(), format!("{field} is not supported for {transport}"),
-                "{input}");
+            assert_eq!(
+                error.message(),
+                format!("{field} is not supported for {transport}"),
+                "{input}"
+            );
         }
     }
 }
-
-
 
 #[test]
 fn mcp_timeout_conversion_boundaries() {

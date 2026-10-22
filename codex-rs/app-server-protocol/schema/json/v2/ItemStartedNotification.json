@@ -41,6 +41,17 @@
         "status": {
           "$ref": "#/definitions/CollabAgentStatus"
         },
+        "stopCause": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnExecutionStopCause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Execution scheduling cause, independent of lifecycle and task acceptance."
+        },
         "surfacedResult": {
           "anyOf": [
             {
@@ -318,6 +329,22 @@
       ],
       "type": "string"
     },
+    "EnvironmentProvenance": {
+      "properties": {
+        "environmentId": {
+          "type": "string"
+        },
+        "ownerId": {
+          "description": "Opaque registration/logical-session identity captured before dispatch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environmentId",
+        "ownerId"
+      ],
+      "type": "object"
+    },
     "FileUpdateChange": {
       "properties": {
         "diff": {
@@ -360,6 +387,89 @@
         "original"
       ],
       "type": "string"
+    },
+    "ImageGenerationUsage": {
+      "properties": {
+        "inputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "inputTokensDetails": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ImageTokenDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outputTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outputTokensDetails": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ImageTokenDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reported": {
+          "description": "False means a response was observed but supplied no usable usage object.",
+          "type": "boolean"
+        },
+        "totalTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "reported"
+      ],
+      "type": "object"
+    },
+    "ImageTokenDetails": {
+      "properties": {
+        "imageTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "textTokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "LegacyAppPathString": {
       "type": "string"
@@ -772,6 +882,16 @@
                 "null"
               ]
             },
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EnvironmentProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "executionId": {
               "description": "Unique dispatch execution id used by timing and lifecycle records.",
               "type": [
@@ -877,6 +997,16 @@
                 "$ref": "#/definitions/FileUpdateChange"
               },
               "type": "array"
+            },
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EnvironmentProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "id": {
               "type": "string"
@@ -1180,11 +1310,24 @@
                 }
               ]
             },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": "string"
             },
             "query": {
               "type": "string"
+            },
+            "status": {
+              "description": "Absent on historical/hosted items whose terminal outcome was not recorded.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "type": {
               "enum": [
@@ -1204,6 +1347,16 @@
         },
         {
           "properties": {
+            "environment": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EnvironmentProvenance"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "id": {
               "type": "string"
             },
@@ -1256,6 +1409,17 @@
           "properties": {
             "id": {
               "type": "string"
+            },
+            "providerUsage": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageGenerationUsage"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Separate image-model receipt; never add these tokens to text inference."
             },
             "result": {
               "type": "string"
@@ -1406,6 +1570,12 @@
           "type": "object"
         }
       ]
+    },
+    "TurnExecutionStopCause": {
+      "enum": [
+        "subagent_context_budget"
+      ],
+      "type": "string"
     },
     "UserInput": {
       "oneOf": [

@@ -24,23 +24,32 @@ class GitDoctorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             subprocess.run(
-                ["git", "init", "--quiet"], cwd=repo,
-                check=True, capture_output=True, timeout=30,
+                ["git", "init", "--quiet"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                timeout=30,
             )
             (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
             subprocess.run(
-                ["git", "add", "tracked.txt"], cwd=repo,
-                check=True, capture_output=True, timeout=30,
+                ["git", "add", "tracked.txt"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                timeout=30,
             )
             hook = (repo / "missing-fsmonitor").as_posix()
-            with mock.patch.object(git_doctor, "REPO_ROOT", repo), mock.patch.dict(
-                os.environ,
-                {
-                    "GIT_CONFIG_COUNT": "1",
-                    "GIT_CONFIG_KEY_0": "core.fsmonitor",
-                    "GIT_CONFIG_VALUE_0": hook,
-                    "GIT_OPTIONAL_LOCKS": "0",
-                },
+            with (
+                mock.patch.object(git_doctor, "REPO_ROOT", repo),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "GIT_CONFIG_COUNT": "1",
+                        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                        "GIT_CONFIG_VALUE_0": hook,
+                        "GIT_OPTIONAL_LOCKS": "0",
+                    },
+                ),
             ):
                 report = git_doctor.build_report(8)
         self.assertEqual(report.status_return_code, 0)

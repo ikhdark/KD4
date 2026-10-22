@@ -113,6 +113,15 @@ impl AutoCompactWindow {
             prefill_input_tokens,
         }
     }
+
+    /// The request input of the window's first server usage sample. An estimated
+    /// resume/recompute baseline covers history only, not a full prepared request.
+    pub(super) fn server_observed_prefill_input_tokens(&self) -> Option<i64> {
+        match self.prefill_input_tokens {
+            Some(AutoCompactWindowPrefill::ServerObserved(tokens)) => Some(tokens),
+            Some(AutoCompactWindowPrefill::Estimated(_)) | None => None,
+        }
+    }
 }
 
 #[cfg(test)]

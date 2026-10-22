@@ -5,7 +5,6 @@ use super::*;
 use crate::shell::ShellType;
 use crate::shell::default_user_shell;
 use codex_exec_server::Environment;
-use codex_git_utils::get_git_repo_root;
 use codex_protocol::models::PermissionProfile;
 use codex_tools::ToolExecutor;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -27,6 +26,111 @@ use crate::turn_diff_tracker::TurnDiffTracker;
 use tokio::sync::Mutex;
 
 const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
+
+#[tokio::test]
+async fn structured_rg_miss_reuses_exact_streams_without_a_new_root() {
+    use codex_utils_pty::process_observation::ProcessObservationContext;
+    use codex_utils_pty::process_observation::ProcessStartRecorder;
+    let fixture = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(fixture.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let file = fixture.path().join("input.txt");
+    std::fs::write(&file, "haystack\n").unwrap();
+    // Keep the legacy identity for the failure ledger. The current safety
+    // contract forbids absence reuse without launched-executable proof.
+    let executable_name = format!("rg{}", std::env::consts::EXE_SUFFIX);
+    let installed = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|directory| directory.join(&executable_name))
+        .find(|path| path.is_file())
+        .expect("rg executable on PATH");
+    let executable = fixture.path().join(executable_name);
+    std::fs::copy(&installed, &executable).unwrap();
+    // PATH may select a Scoop executable shim. Preserve its launch descriptor
+    // when relocating the executable, rather than testing a broken installation.
+    let shim = installed.with_extension("shim");
+    if shim.is_file() {
+        std::fs::copy(shim, executable.with_extension("shim")).unwrap();
+    }
+    let arguments = serde_json::json!({"program":executable, "args":["--no-config", "--no-ignore", "--count", "--regexp", "needle", "--", "input.txt"],
+        "workdir":fixture.path(), "force_fresh":false, "yield_time_ms":30000});
+    let base = invocation_for_payload_without_sandbox(
+        "exec_command",
+        "miss-setup",
+        ToolPayload::Function {
+            arguments: arguments.to_string(),
+        },
+    )
+    .await;
+    let recorder = Arc::new(ProcessStartRecorder::default());
+    for index in 0..4 {
+        if index == 1 {
+            // Change the executable bytes at the same path without changing its
+            // behavior (native executable formats permit trailing overlay data).
+            let mut replacement = std::fs::read(&executable).unwrap();
+            replacement.extend_from_slice(b"codex-unverified-executable-replacement");
+            std::fs::write(&executable, replacement).unwrap();
+        }
+        if index == 2 {
+            std::fs::write(&file, "needle\n").unwrap();
+        }
+        let mut arguments = arguments.clone();
+        if index == 3 {
+            arguments["force_fresh"] = true.into();
+        }
+        let payload = ToolPayload::Function {
+            arguments: arguments.to_string(),
+        };
+        let invocation = ToolInvocation {
+            session: Arc::clone(&base.session),
+            step_context: Arc::clone(&base.step_context),
+            tracker: Arc::clone(&base.tracker),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            call_id: format!("nested-miss-{index}"),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            payload: payload.clone(),
+            source: ToolCallSource::CodeMode {
+                cell_id: "search-cell".into(),
+                parent_call_id: Some("search-parent".into()),
+                runtime_tool_call_id: format!("tool-{index}"),
+                nested_deadline: None,
+                cancellation_cause: None,
+            },
+        };
+        let result =
+            ProcessObservationContext::new(Arc::clone(&recorder), format!("search-{index}"))
+                .scope(ExecCommandHandler::default().handle(invocation))
+                .await
+                .unwrap()
+                .code_mode_result(&payload);
+        assert_eq!(result["streams_complete"], true, "{result}");
+        assert_eq!(
+            result["exit_code"],
+            if index < 2 { 1 } else { 0 },
+            "{result}"
+        );
+        assert_eq!(
+            recorder.snapshot().requested_root_starts_observed,
+            index as u64 + 1,
+            "{result}"
+        );
+        assert!(result.get("execution_suppressed").is_none(), "{result}");
+        assert_ne!(result["reused"], true);
+        if index < 2 {
+            assert_eq!(result["stdout"], "");
+            assert_eq!(result["stderr"], "");
+            assert_eq!(result["search_no_match"], true);
+        }
+        if index >= 2 {
+            assert!(result["stdout"].as_str().unwrap().contains('1'));
+        }
+    }
+}
 
 #[test]
 fn exec_command_boundary_normalizes_unambiguous_legacy_forms() {
@@ -379,6 +483,8 @@ async fn nested_exec_command_preserves_explicit_output_caps() {
         }
         let home = invocation.step_context.turn.config.codex_home.clone();
         let thread_id = invocation.session.thread_id.to_string();
+        // The fixture session owns its temporary home and the artifacts in it.
+        let _session = Arc::clone(&invocation.session);
         let output = ExecCommandHandler::default()
             .handle(invocation)
             .await
@@ -1191,36 +1297,86 @@ async fn write_stdin_terminates_non_pty_process_and_retains_output() {
     );
 }
 
-async fn invocation_for_payload_with_shellless_remote(
-    call_id: &str,
-    payload: ToolPayload,
-) -> ToolInvocation {
-    let (session, mut turn) = make_session_and_context().await;
-    let turn_environment = turn
-        .environments
-        .turn_environments
-        .first_mut()
-        .expect("primary test environment");
-    turn_environment.environment_id = "shellless-remote".to_string();
-    turn_environment.environment = Arc::new(
-        Environment::create_for_tests(Some(
-            "ws://127.0.0.1:1/phase79-shellless-remote".to_string(),
-        ))
-        .expect("remote test environment"),
-    );
-    turn_environment.shell = None;
-    let turn = Arc::new(turn);
+/// Serves executor initialization and read-only path queries. Every other
+/// request is answered with an error and recorded, so a test can assert that
+/// dispatch rejected its command before any executor operation.
+async fn start_initialization_only_exec_server() -> (
+    String,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Vec<String>>,
+) {
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
 
-    ToolInvocation {
-        session: session.into(),
-        step_context: StepContext::for_test(Arc::clone(&turn)),
-        cancellation_token: tokio_util::sync::CancellationToken::new(),
-        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-        call_id: call_id.to_string(),
-        tool_name: codex_tools::ToolName::plain("exec_command"),
-        source: ToolCallSource::Direct,
-        payload,
-    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = &mut stop_rx => return Vec::new(),
+        };
+        let mut socket = tokio_tungstenite::accept_async(accepted.0).await.unwrap();
+        let mut unexpected = Vec::new();
+        loop {
+            let frame = tokio::select! {
+                frame = socket.next() => frame,
+                _ = &mut stop_rx => break,
+            };
+            let Some(Ok(frame)) = frame else { break };
+            let message: serde_json::Value = match frame {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                Message::Binary(bytes) => serde_json::from_slice(bytes.as_ref()).unwrap(),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                Message::Close(_) => break,
+                other => panic!("unexpected executor frame: {other:?}"),
+            };
+            // Notifications, including `initialized`, need no reply.
+            let Some(method) = message["method"].as_str() else {
+                continue;
+            };
+            if message.get("id").is_none() {
+                continue;
+            }
+            let reply = match method {
+                "initialize" => {
+                    json!({"id": message["id"], "result": {"sessionId": "argv-remote-session"}})
+                }
+                "environment/info" => json!({"id": message["id"], "result": {
+                    "operatingSystem": "windows",
+                    "shell": {"name": "cmd", "path": "cmd.exe"},
+                    "cwd": "file:///C:/remote-output"
+                }}),
+                "fs/canonicalize" => {
+                    json!({"id": message["id"], "result": {"path": message["params"]["path"]}})
+                }
+                // The fixture directory is outside a Git repository.
+                "fs/getMetadata"
+                    if message["params"]["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("/.git")) =>
+                {
+                    json!({"id": message["id"], "error": {"code": -32004, "message": "path does not exist"}})
+                }
+                "fs/getMetadata" => json!({"id": message["id"], "result": {
+                    "isDirectory": true, "isFile": false, "isSymlink": false,
+                    "size": 0, "createdAtMs": 0, "modifiedAtMs": 0
+                }}),
+                method => {
+                    unexpected.push(method.to_string());
+                    json!({"id": message["id"], "error": {"code": -32601, "message": "not served by this fixture"}})
+                }
+            };
+            socket
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .unwrap();
+        }
+        unexpected
+    });
+    (url, stop_tx, server)
 }
 
 #[test]
@@ -1271,27 +1427,33 @@ fn test_get_command_launches_structured_argv_without_shell_wrapping() -> anyhow:
 
 #[tokio::test]
 async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
-    let (mut session, turn) = make_session_and_context().await;
-    let workspace_cwd = turn
-        .environments
-        .single_local_environment_cwd()
-        .expect("test turn has one local environment");
+    let fixture = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(fixture.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let search_target = fixture.path().join("search-target.txt");
+    std::fs::write(&search_target, "haystack\n").unwrap();
+    let (mut session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
     session.services.command_execution =
         crate::tools::command_execution::CommandExecutionLedger::load_or_new(
             turn.config.codex_home.to_path_buf(),
             session.thread_id.to_string(),
-            workspace_cwd.as_path(),
+            fixture.path(),
         )
         .await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
-    let repo_root =
-        get_git_repo_root(workspace_cwd.as_path()).expect("test cwd is in a git repository");
-    let search_target = repo_root.join("codex-rs/core/src/tools/command_execution.rs");
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "kind": "argv",
             "program": "rg",
+            "workdir": fixture.path(),
             "args": [
                 "-n",
                 "--no-config", "--no-ignore-global", "--no-ignore-parent",
@@ -1329,7 +1491,9 @@ async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
         })
         .await;
 
-    assert_eq!(launches.process_launches, 1);
+    // An unchanged workspace/epoch is not proof of the executable selected at
+    // launch. Both requests must run until that owner can supply such proof.
+    assert_eq!(launches.process_launches, 2);
     assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
     assert_eq!(
         first.outcome_for_logging(),
@@ -1339,21 +1503,40 @@ async fn repeated_rg_miss_uses_workspace_identity_across_epoch_advance() {
         first.sampling_request_signal().unwrap()["outcome"],
         serde_json::Value::Null
     );
-    let second = second.expect("a cached search miss is successful negative evidence");
+    let second = second.expect("a fresh search miss remains successful negative evidence");
+    let codex_tools::ToolSpec::Function(spec) = ExecCommandHandler::default().spec() else {
+        panic!("exec_command function spec");
+    };
+    let full_schema = spec.output_schema.unwrap().into_value();
+    let full_validator = jsonschema::validator_for(&full_schema).unwrap();
+    let eager_schema = crate::tools::handlers::shell_spec::unified_exec_eager_output_schema();
+    let eager_validator = jsonschema::validator_for(&eager_schema).unwrap();
+    for budget in [0, 1, 4096] {
+        let result = second.code_mode_result_with_budget(&payload, budget);
+        assert!(full_validator.is_valid(&result), "{result}");
+        assert!(eager_validator.is_valid(&result), "{result}");
+        assert!(result["output"].is_string());
+        assert_eq!(result["exit_code"], 1);
+        assert_eq!(result["search_no_match"], true);
+        assert!(result.get("execution_suppressed").is_none(), "{result}");
+        assert_eq!(result["streams_complete"], true);
+        assert_eq!(result["stdout"], "");
+        assert_eq!(result["stderr"], "");
+        assert!(result.get("session_id").is_none());
+    }
     assert_eq!(
         second.outcome_for_logging(),
         codex_tools::ToolOutputOutcome::Success
     );
     let canonical = second
         .canonical_result(&payload)
-        .expect("canonical cached miss");
+        .expect("canonical fresh miss");
     for message in [
         second.log_preview(),
         second.code_mode_result(&payload).to_string(),
         String::from_utf8(canonical.bytes).expect("canonical text"),
     ] {
-        assert!(message.contains("equivalent search already produced a negative result"));
-        assert!(message.contains("execution was suppressed"));
+        assert!(!message.contains("execution was suppressed"));
     }
 }
 
@@ -1465,7 +1648,8 @@ async fn command_handlers_normalize_status_and_distinguish_search_misses_from_er
 
 #[tokio::test]
 async fn identical_tagged_validation_rg_misses_both_launch() {
-    let (session, turn) = make_session_and_context().await;
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let validation_repository = tempfile::tempdir().expect("temporary validation repository");
@@ -1696,7 +1880,8 @@ async fn nested_exec_default_yield_outlasts_a_brief_command() {
 
 #[tokio::test]
 async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
-    let (session, turn) = make_session_and_context().await;
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = PermissionProfile::Disabled;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let alternate_repository = tempfile::tempdir().expect("create alternate repository");
@@ -1729,14 +1914,17 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
                 payload.clone(),
             )
             .await;
-            let cached = run_exec_command_for_test(
+            // An unchanged repository is not proof of the executable selected at
+            // launch, so the identical repeat runs instead of replaying the miss.
+            let repeated = run_exec_command_for_test(
                 &session,
                 &turn,
-                "alternate-repository-cached-miss",
+                "alternate-repository-repeated-miss",
                 payload.clone(),
             )
             .await;
-            assert!(cached.log_preview().contains("execution was suppressed"));
+            assert!(!repeated.log_preview().contains("execution was suppressed"));
+            assert_eq!(repeated.code_mode_result(&payload)["exit_code"], 1);
             tokio::fs::write(&search_target, "after\n")
                 .await
                 .expect("mutate alternate repository search target");
@@ -1759,7 +1947,7 @@ async fn rg_miss_in_alternate_repository_is_invalidated_after_mutation() {
         })
         .await;
 
-    assert_eq!(launches.process_launches, 2);
+    assert_eq!(launches.process_launches, 3);
     assert_eq!(first.code_mode_result(&payload)["exit_code"], 1);
     let second_result = second.code_mode_result(&payload);
     assert_eq!(second_result["exit_code"], 0);
@@ -1853,82 +2041,95 @@ fn accepted_remote_shell_uses_the_remote_reported_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn shellless_remote_handler_rejects_shell_commands_but_allows_argv() {
-    let handler = ExecCommandHandler::default();
-    let shell_commands = [
-        (
-            "shellless-remote-script",
-            serde_json::json!({"kind": "script", "cmd": "printf remote"}),
-        ),
-        (
-            "shellless-remote-powershell",
-            serde_json::json!({
-                "kind": "powershell_script",
-                "script_body": "Get-ChildItem"
-            }),
-        ),
-    ];
+#[test]
+fn remote_shell_override_without_reported_shell_metadata_is_rejected() {
+    // Dispatch refreshes a remote runtime before this check, and an initialized
+    // runtime always reports its shell, so the guard stays defensive. Cover it
+    // directly with a requested shell and no reported metadata.
+    let mut args: ExecCommandArgs =
+        parse_arguments(r#"{"kind":"script","cmd":"printf remote","shell":"/bin/bash"}"#).unwrap();
+    let error = validate_and_consume_remote_shell(&mut args, None, "shellless-remote")
+        .expect_err("a requested remote shell needs reported shell metadata");
+    assert_eq!(
+        error,
+        "environment `shellless-remote` does not report a shell"
+    );
+}
 
-    for (call_id, arguments) in shell_commands {
-        let invocation = invocation_for_payload_with_shellless_remote(
-            call_id,
-            ToolPayload::Function {
-                arguments: arguments.to_string(),
-            },
-        )
-        .await;
-        let error = match handler.handle(invocation).await {
-            Ok(_) => panic!("shell-wrapped remote commands require reported shell metadata"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.to_string(),
-            "environment `shellless-remote` does not report a shell"
-        );
-    }
-
-    let argv_invocation = invocation_for_payload_with_shellless_remote(
-        "shellless-remote-argv",
-        ToolPayload::Function {
-            arguments: serde_json::json!({
-                "kind": "argv",
-                "program": "git",
-                "args": ["--worktree", "status"]
-            })
-            .to_string(),
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_structured_argv_reaches_preflight_and_rejects_shell_override() {
+    let (url, stop_server, server) = start_initialization_only_exec_server().await;
+    let (session, mut turn) = make_session_and_context().await;
+    let mut remote = crate::session::turn_context::TurnEnvironment::new(
+        "argv-remote".into(),
+        Arc::new(Environment::create_for_tests(Some(url)).expect("remote test environment")),
+        turn.cwd_uri(),
+        None,
+    );
+    // Ready environments are sampled with their initialized runtime, as
+    // environment resolution publishes them.
+    remote.refresh_runtime().await.unwrap();
+    turn.environments.turn_environments = vec![remote];
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let invocation = |call_id: &str, arguments: serde_json::Value| ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: call_id.to_string(),
+        tool_name: codex_tools::ToolName::plain("exec_command"),
+        source: ToolCallSource::Direct,
+        payload: ToolPayload::Function {
+            arguments: arguments.to_string(),
         },
-    )
-    .await;
-    let argv_error = match handler.handle(argv_invocation).await {
+    };
+    let handler = ExecCommandHandler::default();
+
+    let argv_error = match handler
+        .handle(invocation(
+            "remote-argv",
+            serde_json::json!({
+                "kind": "argv",
+                "program": "cargo",
+                "args": ["--pakage", "example", "test"]
+            }),
+        ))
+        .await
+    {
         Ok(_) => panic!("the intentionally invalid argv should fail during preflight"),
         Err(error) => error,
     };
     assert!(
         argv_error.to_string().contains("known_flag_typo"),
-        "structured argv must pass the shell-metadata guard and reach preflight: {argv_error}"
+        "structured remote argv must reach preflight: {argv_error}"
     );
 
-    let argv_with_shell_invocation = invocation_for_payload_with_shellless_remote(
-        "shellless-remote-argv-with-shell",
-        ToolPayload::Function {
-            arguments: serde_json::json!({
+    let argv_with_shell_error = match handler
+        .handle(invocation(
+            "remote-argv-with-shell",
+            serde_json::json!({
                 "kind": "argv",
                 "program": "git",
                 "args": ["status"],
                 "shell": "bash"
-            })
-            .to_string(),
-        },
-    )
-    .await;
-    let argv_with_shell_error = match handler.handle(argv_with_shell_invocation).await {
+            }),
+        ))
+        .await
+    {
         Ok(_) => panic!("structured argv must not accept a shell override"),
         Err(error) => error,
     };
     assert_eq!(
         argv_with_shell_error.to_string(),
         "`shell` is only valid for script commands; omit it when `kind` is `argv`."
+    );
+
+    let _ = stop_server.send(());
+    let unexpected = server.await.unwrap();
+    assert!(
+        unexpected.is_empty(),
+        "both requests must be rejected before any executor operation: {unexpected:?}"
     );
 }
 
@@ -2071,7 +2272,7 @@ async fn registered_exec_minimal_and_explicit_defaults_preserve_process_and_perm
 
 #[tokio::test]
 async fn read_only_preflight_repair_executes_and_releases_process_id() {
-    let invocation = invocation_for_payload(
+    let invocation = invocation_for_payload_without_sandbox(
         "exec_command",
         "preflight-repair",
         ToolPayload::Function {
@@ -2134,8 +2335,8 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
         ToolPayload::Function {
             arguments: serde_json::json!({
                 "kind": "argv",
-                "program": "git",
-                "args": ["--worktree", "status"]
+                "program": "cargo",
+                "args": ["--pakage", "example", "test"]
             })
             .to_string(),
         },
@@ -2246,7 +2447,8 @@ async fn native_rg_advisories_respect_restricted_read_policy() {
             }
         };
         assert_eq!(
-            turn.file_system_sandbox_policy().has_full_disk_read_access(),
+            turn.file_system_sandbox_policy()
+                .has_full_disk_read_access(),
             full_read
         );
         for missing_path in [true, false] {
@@ -2290,12 +2492,8 @@ async fn native_rg_advisories_respect_restricted_read_policy() {
                 pending_deferred_completions: Vec::new(),
             };
             if missing_path {
-                super::exec_command::attach_missing_rg_path_advisory(
-                    &mut output,
-                    &public,
-                    &turn,
-                )
-                .await;
+                super::exec_command::attach_missing_rg_path_advisory(&mut output, &public, &turn)
+                    .await;
             } else {
                 assert!(output.search_no_match_is_success());
                 // This is also the shared owner called by write_stdin.
@@ -2791,7 +2989,8 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
         .join("tool-output")
         .join(session.thread_id.to_string());
     let invocation = ToolInvocation {
-        session,
+        // The fixture session owns the temporary home holding the artifact.
+        session: Arc::clone(&session),
         step_context: StepContext::for_test(Arc::clone(&turn)),
         cancellation_token: tokio_util::sync::CancellationToken::new(),
         tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
@@ -3751,7 +3950,13 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
                             "shell": {"name": "cmd", "path": "cmd.exe"},
                             "cwd": "file:///C:/remote-output"
                         }),
-                        "process/start" => {
+                        // Public process handles use the incarnation-bound start.
+                        "process/startOwned" => {
+                            assert!(
+                                message["params"]["incarnation"]
+                                    .as_str()
+                                    .is_some_and(|id| !id.is_empty())
+                            );
                             starts.push(message["params"].clone());
                             process_id = Some(message["params"]["processId"].clone());
                             json!({"processId": message["params"]["processId"]})
@@ -3830,13 +4035,16 @@ async fn registered_exec_preserves_foreign_grant_with_explicit_network_request()
             } else {
                 turn_mut.cwd_uri()
             };
-            turn_mut.environments.turn_environments =
-                vec![crate::session::turn_context::TurnEnvironment::new(
-                    "grant-remote".into(),
-                    environment,
-                    cwd.clone(),
-                    None,
-                )];
+            let mut remote = crate::session::turn_context::TurnEnvironment::new(
+                "grant-remote".into(),
+                environment,
+                cwd.clone(),
+                None,
+            );
+            // Ready environments are sampled with their initialized runtime, as
+            // environment resolution publishes them.
+            remote.refresh_runtime().await.unwrap();
+            turn_mut.environments.turn_environments = vec![remote];
             let active = crate::state::ActiveTurn::default();
             active
                 .turn_state

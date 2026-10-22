@@ -12,6 +12,7 @@ run a turn::
         print(result.final_response)
 """
 
+from ._run import TurnRunError
 from ._version import __version__
 from .api import (
     ApprovalMode,
@@ -69,6 +70,7 @@ __all__ = [
     "TurnHandle",
     "AsyncTurnHandle",
     "TurnResult",
+    "TurnRunError",
     "Input",
     "InputItem",
     "RunInput",

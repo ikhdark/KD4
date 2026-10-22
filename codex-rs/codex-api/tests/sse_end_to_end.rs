@@ -255,7 +255,21 @@ async fn responses_stream_accepts_unknown_events_and_exceptional_rate_frames() -
             "metered_limit_name": "custom-limit",
             "rate_limits": {"secondary": {"used_percent": 42.0}}
         }),
-        serde_json::json!({"type": "response.output_text.delta", "delta": "hello"}),
+        // Output fragments require an active output item (provider admission).
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {"id": "m", "type": "message", "role": "assistant", "content": []}
+        }),
+        serde_json::json!({"type": "response.output_text.delta", "item_id": "m", "delta": "hello"}),
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "m",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hello"}]
+            }
+        }),
         serde_json::json!({"type": "response.completed", "response": {"id": "done"}}),
     ]);
     let client = ResponsesClient::new(
@@ -282,14 +296,16 @@ async fn responses_stream_accepts_unknown_events_and_exceptional_rate_frames() -
         }
         events.push(event);
     }
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), 5);
     assert!(matches!(&events[0], ResponseEvent::RateLimits(snapshot)
         if snapshot.limit_id.as_deref() == Some("custom_limit")
             && snapshot.primary.is_none()
             && snapshot.secondary.as_ref().is_some_and(|window| window.used_percent == 42.0)));
-    assert!(matches!(&events[1], ResponseEvent::OutputTextDelta(delta) if delta == "hello"));
+    assert!(matches!(&events[1], ResponseEvent::OutputItemAdded(_)));
+    assert!(matches!(&events[2], ResponseEvent::OutputTextDelta(delta) if delta == "hello"));
+    assert!(matches!(&events[3], ResponseEvent::OutputItemDone(_)));
     assert!(
-        matches!(&events[2], ResponseEvent::Completed { response_id, .. } if response_id == "done")
+        matches!(&events[4], ResponseEvent::Completed { response_id, .. } if response_id == "done")
     );
     Ok(())
 }

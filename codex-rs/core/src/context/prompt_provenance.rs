@@ -184,22 +184,15 @@ impl PromptProvenanceSidecar {
         items: &[ResponseItem],
         manifest: &StableContextManifest,
     ) -> Self {
-        let mut categories_by_content_hash =
-            HashMap::<[u8; 32], Option<PromptContextCategory>>::new();
+        let mut categories_by_source = HashMap::new();
         for component in manifest
             .components()
             .iter()
             .filter(|component| component.active)
         {
             let category = category_for_stable_kind(component.kind);
-            categories_by_content_hash
-                .entry(component.identity.content_hash)
-                .and_modify(|existing| {
-                    if *existing != Some(category) {
-                        *existing = None;
-                    }
-                })
-                .or_insert(Some(category));
+            categories_by_source
+                .insert((component.kind, component.identity.content_hash), category);
         }
 
         let current_input_index = items.iter().rposition(|item| {
@@ -217,21 +210,20 @@ impl PromptProvenanceSidecar {
                 aligned_items.push(PromptItemProvenance::default());
                 continue;
             };
-            let categories = content
-                .iter()
-                .map(|content| match content {
-                    ContentItem::InputText { text } => {
-                        if categories_by_content_hash.is_empty()
-                            || crate::context_manager::is_user_turn_boundary(item)
-                        {
-                            return None;
+            let mut categories = vec![None; content.len()];
+            if !categories_by_source.is_empty() {
+                // Bind accounting to the trusted source occurrence, including a
+                // presence marker's following payload. Equal prose is not origin.
+                for (range, kind, payload) in crate::stable_context::stable_content_sections(item) {
+                    if let Some(category) =
+                        categories_by_source.get(&(kind, category_lookup_hash(payload)))
+                    {
+                        for index in range {
+                            categories[index] = Some(*category);
                         }
-                        let hash = category_lookup_hash(text);
-                        categories_by_content_hash.get(&hash).copied().flatten()
                     }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+                }
+            }
             let current_input = current_input_index == Some(index)
                 || current_turn_id.is_some_and(|turn_id| item.turn_id() == Some(turn_id));
             let fingerprint = if prompt_item_requires_fingerprint(
@@ -1200,11 +1192,17 @@ mod tests {
 
     #[test]
     fn user_quote_of_stable_component_keeps_task_input_identity() {
-        let text = "exact stable policy text";
-        let items = vec![
-            message("developer", text, None),
-            message("user", text, None),
-        ];
+        let text =
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nexact stable policy text\n</INSTRUCTIONS>";
+        let mut produced = message("user", text, None);
+        crate::stable_context::mark_trusted_stable_context_item(&mut produced);
+        let mut user = message("user", text, None);
+        if let ResponseItem::Message { id, .. } = &mut user {
+            *id = Some(ResponseItemId::new(
+                crate::event_mapping::USER_INPUT_ITEM_ID_BASE,
+            ));
+        }
+        let items = vec![produced, user];
         let manifest = StableContextManifest::default().add_component_bytes(
             StableContextKind::Repository,
             "repository",
@@ -1507,6 +1505,63 @@ mod tests {
             );
             assert_eq!(breakdown.bytes(PromptContextCategory::History), 0);
         }
+    }
+
+    #[test]
+    fn kd4_ip_009_categories_follow_source_occurrences_not_equal_text() {
+        let text =
+            "# AGENTS.md instructions\n\n<INSTRUCTIONS>\nkeep the constraint\n</INSTRUCTIONS>";
+        let mut produced = message("user", text, None);
+        crate::stable_context::mark_trusted_stable_context_item(&mut produced);
+        let configured = crate::context_manager::updates::build_developer_update_item(
+            crate::stable_context::configured_developer_instructions_sections(Some(text)),
+        )
+        .unwrap();
+        let mut user = message("user", text, None);
+        if let ResponseItem::Message { id, .. } = &mut user {
+            *id = Some(ResponseItemId::new(
+                crate::event_mapping::USER_INPUT_ITEM_ID_BASE,
+            ));
+        }
+        let items = vec![produced, configured, message("assistant", text, None), user];
+        let projection = crate::stable_context::project_stable_context(
+            items.into(),
+            crate::stable_context::StableContextTarget::Sampling,
+        );
+        let items = &projection.items;
+        let before = serde_json::to_vec(items).unwrap();
+        CATEGORY_LOOKUP_BYTES.set(0);
+        let sidecar = PromptProvenanceSidecar::from_assembled_items(items, &projection.manifest);
+        // Only the two producer payloads are hashed; assistant and user copies
+        // cannot acquire repository authority or trigger redundant lookup work.
+        assert_eq!(CATEGORY_LOOKUP_BYTES.get(), text.len() * 2);
+        let repository_bytes = items.iter().filter(|item| matches!(item,
+            ResponseItem::Message { role, .. } if role == "user" && crate::stable_context::is_trusted_stable_context_item(item)
+        )).map(item_bytes).sum::<u64>();
+        let assistant_bytes = items
+            .iter()
+            .filter(|item| {
+                matches!(item,
+                    ResponseItem::Message { role, .. } if role == "assistant"
+                )
+            })
+            .map(item_bytes)
+            .sum::<u64>();
+        for measured in measure_both(items, &sidecar) {
+            assert_eq!(
+                measured.bytes(PromptContextCategory::Repository),
+                repository_bytes
+            );
+            assert_eq!(
+                measured.bytes(PromptContextCategory::History),
+                assistant_bytes
+            );
+        }
+        assert_eq!(
+            serde_json::to_vec(items).unwrap(),
+            before,
+            "accounting must not alter wire input"
+        );
     }
 
     #[test]

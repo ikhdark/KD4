@@ -29,6 +29,8 @@ pub(crate) struct ConnectionProcessor {
     session_registry: Arc<SessionRegistry>,
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
+    stop: CancellationToken,
+    connections: Arc<std::sync::Mutex<tokio_util::task::TaskTracker>>,
 }
 
 impl ConnectionProcessor {
@@ -45,7 +47,18 @@ impl ConnectionProcessor {
             session_registry: SessionRegistry::new(telemetry.clone()),
             runtime_paths,
             telemetry,
+            stop: CancellationToken::new(),
+            connections: Arc::new(std::sync::Mutex::new(tokio_util::task::TaskTracker::new())),
         }
+    }
+
+    pub(crate) fn with_shutdown(mut self, stop: CancellationToken) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    pub(crate) async fn wait_for_shutdown(&self) {
+        self.stop.cancelled().await;
     }
 
     pub(crate) async fn run_connection(
@@ -53,27 +66,69 @@ impl ConnectionProcessor {
         connection: JsonRpcConnection,
         transport: ConnectionTransport,
     ) {
-        run_connection(
+        let owner = {
+            let connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.stop.is_cancelled() {
+                return;
+            }
+            connections.token()
+        };
+        let _owner = owner;
+        run_connection_with_shutdown(
             connection,
             Arc::clone(&self.session_registry),
             self.runtime_paths.clone(),
             self.telemetry.clone(),
             transport,
+            self.stop.child_token(),
         )
         .await;
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.stop.cancel();
+        let connections = {
+            let connections = self
+                .connections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            connections.close();
+            connections.clone()
+        };
+        connections.wait().await;
         self.session_registry.shutdown().await;
     }
 }
 
+#[cfg(test)]
 async fn run_connection(
     connection: JsonRpcConnection,
     session_registry: Arc<SessionRegistry>,
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
     transport: ConnectionTransport,
+) {
+    run_connection_with_shutdown(
+        connection,
+        session_registry,
+        runtime_paths,
+        telemetry,
+        transport,
+        CancellationToken::new(),
+    )
+    .await;
+}
+
+async fn run_connection_with_shutdown(
+    connection: JsonRpcConnection,
+    session_registry: Arc<SessionRegistry>,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    transport: ConnectionTransport,
+    cancelled: CancellationToken,
 ) {
     let _connection_metrics = telemetry.connection_started(transport);
     let router = Arc::new(build_router());
@@ -93,7 +148,18 @@ async fn run_connection(
         runtime_paths,
     ));
 
-    let cancelled = CancellationToken::new();
+    if matches!(transport, ConnectionTransport::WebSocket) {
+        let handler = Arc::downgrade(&handler);
+        let cancelled = cancelled.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = cancelled.cancelled() => {},
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    if handler.upgrade().is_some_and(|handler| !handler.is_initialized()) { cancelled.cancel(); }
+                }
+            }
+        });
+    }
     let disconnect_cancelled = cancelled.clone();
     let disconnect_task = tokio::spawn(async move {
         if !*disconnected_rx.borrow() {
@@ -131,10 +197,16 @@ async fn run_connection(
     });
 
     let mut reads = tokio::task::JoinSet::new();
+    let mut controls = tokio::task::JoinSet::new();
+    const CONTROL_CAPACITY: usize = 8;
     let mut ordered = tokio::task::JoinSet::new();
     type Completion = futures::future::Shared<futures::future::BoxFuture<'static, ()>>;
     let mut last_ordered: Option<Completion> = None;
-    let mut pending_starts: HashMap<String, Completion> = HashMap::new();
+    let mut process_writes: HashMap<String, Completion> = HashMap::new();
+    let mut pending_starts: HashMap<
+        String,
+        (Completion, crate::local_process::ProcessStartIdentity),
+    > = HashMap::new();
     // Mutations retain wire order. Reads, controls, and outbound HTTP bypass
     // unrelated waits: a remote server may withhold response headers for as long
     // as its work runs, and HTTP has no ordering relation to process or file state.
@@ -142,6 +214,10 @@ async fn run_connection(
     loop {
         let event = tokio::select! {
             _ = cancelled.cancelled() => break,
+            result = controls.join_next(), if !controls.is_empty() => {
+                if !matches!(result, Some(Ok(true))) { break; }
+                continue;
+            }
             result = reads.join_next(), if !reads.is_empty() => {
                 if !matches!(result, Some(Ok(true))) { break; }
                 continue;
@@ -179,8 +255,22 @@ async fn run_connection(
             JsonRpcConnectionEvent::Message(message) => match message {
                 codex_exec_server_protocol::JSONRPCMessage::Request(request) => {
                     let request_started_at = Instant::now();
-                    if let Some((method, route)) = router.request_route(request.method.as_str()) {
+                    let request_route = router.request_route(request.method.as_str());
+                    let mut request_metrics = telemetry.request_started_at(
+                        request_route
+                            .as_ref()
+                            .map_or("unknown", |(method, _)| *method),
+                        request_started_at,
+                    );
+                    if let Some((method, route)) = request_route {
                         let initialized = handler.is_initialized();
+                        let control = initialized
+                            && matches!(
+                                method,
+                                crate::protocol::EXEC_SIGNAL_METHOD
+                                    | crate::protocol::EXEC_TERMINATE_METHOD
+                                    | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
+                            );
                         let independent_read = initialized
                             && matches!(
                                 method,
@@ -192,19 +282,36 @@ async fn run_connection(
                                     | crate::protocol::HTTP_REQUEST_CANCEL_METHOD
                             );
                         if initialized
-                            && (if independent_read {
+                            && (if control {
+                                controls.len()
+                            } else if independent_read {
                                 reads.len()
                             } else {
                                 ordered.len()
-                            }) >= CHANNEL_CAPACITY
+                            }) >= if control {
+                                CONTROL_CAPACITY
+                            } else {
+                                CHANNEL_CAPACITY
+                            }
                         {
+                            request_metrics.set_result("rejected_capacity");
                             if send_outbound(
                                 &outgoing_tx,
                                 RpcServerOutboundMessage::Error {
                                     request_id: request.id,
-                                    error: invalid_request(
-                                        "too many pending exec-server requests".to_string(),
-                                    ),
+                                    error: if matches!(
+                                        method,
+                                        crate::protocol::EXEC_METHOD
+                                            | crate::protocol::EXEC_OWNED_METHOD
+                                    ) {
+                                        crate::rpc::process_start_refused(
+                                            "too many pending exec-server requests".into(),
+                                        )
+                                    } else {
+                                        invalid_request(
+                                            "too many pending exec-server requests".into(),
+                                        )
+                                    },
                                 },
                                 &cancelled,
                             )
@@ -228,6 +335,7 @@ async fn run_connection(
                                 .reserve_http_body_stream(&params.request_id, &request.id)
                                 .await
                         {
+                            request_metrics.set_result("rejected_body_reservation");
                             if send_outbound(
                                 &outgoing_tx,
                                 RpcServerOutboundMessage::Error {
@@ -243,18 +351,127 @@ async fn run_connection(
                             }
                             continue;
                         }
-                        pending_starts.retain(|_, completion| completion.peek().is_none());
+                        // Poll completed receipts even when no successor ever
+                        // polled their Shared future; peek alone retains those
+                        // unused identities forever.
+                        pending_starts.retain(|_, (completion, _)| {
+                            completion.clone().now_or_never().is_none()
+                        });
+                        process_writes
+                            .retain(|_, completion| completion.clone().now_or_never().is_none());
+                        // Reserve the exact generation before the start is queued
+                        // behind unrelated ordered work. Its RAII guard travels
+                        // with the request, including disconnect/cancellation.
+                        let admitted_start = if initialized
+                            && matches!(
+                                method,
+                                crate::protocol::EXEC_METHOD | crate::protocol::EXEC_OWNED_METHOD
+                            ) {
+                            Some(
+                                match serde_json::from_value::<
+                                    crate::protocol::OwnedProcessParams<
+                                        crate::protocol::ExecParams,
+                                    >,
+                                >(
+                                    request.params.clone().unwrap_or_default()
+                                ) {
+                                    Ok(params)
+                                        if method == crate::protocol::EXEC_OWNED_METHOD
+                                            && params.incarnation.is_none() =>
+                                    {
+                                        Err(crate::rpc::invalid_params(
+                                            "owned start requires an incarnation".into(),
+                                        ))
+                                    }
+                                    Ok(params) => handler
+                                        .reserve_owned_start(&params)
+                                        .await
+                                        .map(|reservation| (params.params, reservation)),
+                                    Err(error) => {
+                                        Err(crate::rpc::invalid_params(error.to_string()))
+                                    }
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        let start_identity = admitted_start
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok())
+                            .map(|(_, reservation)| reservation.identity());
                         let process_id = request
                             .params
                             .as_ref()
                             .and_then(|params| params.get("processId"))
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_string);
-                        let predecessor = if independent_read {
+                        let admitted_terminate = if initialized
+                            && method == crate::protocol::EXEC_TERMINATE_METHOD
+                        {
+                            Some(
+                                match serde_json::from_value::<
+                                    crate::protocol::OwnedProcessParams<
+                                        crate::protocol::TerminateParams,
+                                    >,
+                                >(
+                                    request.params.clone().unwrap_or_default()
+                                ) {
+                                    Ok(envelope) => {
+                                        let params = envelope.params;
+                                        let identity = if let Some(incarnation) =
+                                            envelope.incarnation.as_deref()
+                                        {
+                                            // Terminate is idempotent: an expired or replaced handle is not
+                                            // running under its incarnation. Settle it like an absent ID
+                                            // below; an error here would keep cleanup owners retrying forever.
+                                            handler
+                                                .process_start_identity(&params.process_id)
+                                                .await
+                                                .map(|identity| {
+                                                    identity.filter(|identity| {
+                                                        identity.has_incarnation(incarnation)
+                                                    })
+                                                })
+                                        } else {
+                                            match pending_starts.get(params.process_id.as_str()) {
+                                                Some((_, identity)) => Ok(Some(identity.clone())),
+                                                None => {
+                                                    handler
+                                                        .process_start_identity(&params.process_id)
+                                                        .await
+                                                }
+                                            }
+                                        };
+                                        identity.map(|identity| (params, identity))
+                                    }
+                                    Err(error) => {
+                                        Err(crate::rpc::invalid_params(error.to_string()))
+                                    }
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        let predecessor = if admitted_terminate.is_some() {
+                            None
+                        } else if initialized && method == crate::protocol::EXEC_WRITE_METHOD {
+                            // A blocked terminal owns only its own FIFO. Starts
+                            // still depend on prior filesystem/environment work.
+                            process_id
+                                .as_ref()
+                                .and_then(|id| process_writes.get(id))
+                                .cloned()
+                                .or_else(|| {
+                                    process_id
+                                        .as_ref()
+                                        .and_then(|id| pending_starts.get(id))
+                                        .map(|(completion, _)| completion.clone())
+                                })
+                        } else if independent_read {
                             process_id
                                 .as_ref()
                                 .and_then(|id| pending_starts.get(id))
-                                .cloned()
+                                .map(|(completion, _)| completion.clone())
                         } else {
                             last_ordered.take()
                         };
@@ -265,19 +482,61 @@ async fn run_connection(
                             }
                             .boxed()
                             .shared();
-                            last_ordered = Some(completion.clone());
-                            if method == crate::protocol::EXEC_METHOD
-                                && let Some(process_id) = process_id
+                            if method == crate::protocol::EXEC_WRITE_METHOD {
+                                if let Some(id) = process_id.as_ref() {
+                                    process_writes.insert(id.clone(), completion.clone());
+                                }
+                            } else {
+                                last_ordered = Some(completion.clone());
+                            }
+                            if matches!(
+                                method,
+                                crate::protocol::EXEC_METHOD | crate::protocol::EXEC_OWNED_METHOD
+                            ) && let Some(process_id) = process_id
+                                && let Some(identity) = start_identity
                             {
-                                pending_starts.insert(process_id, completion);
+                                pending_starts.insert(process_id, (completion, identity));
                             }
                         }
                         let request_span = request_span(method, &request);
-                        let response =
-                            route(Arc::clone(&handler), request).instrument(request_span.clone());
+                        let response: std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<Output = Option<RpcServerOutboundMessage>>
+                                    + Send,
+                            >,
+                        > = if let Some(admitted) = admitted_start {
+                            let handler = Arc::clone(&handler);
+                            Box::pin(async move {
+                                let result = match admitted {
+                                    Ok((params, reservation)) => {
+                                        handler.exec_reserved(params, reservation).await
+                                    }
+                                    Err(error) => Err(error),
+                                };
+                                Some(process_response(request.id, result))
+                            })
+                        } else if let Some(admitted) = admitted_terminate {
+                            let handler = Arc::clone(&handler);
+                            Box::pin(async move {
+                                let result = match admitted {
+                                    Ok((params, Some(identity))) => {
+                                        handler.terminate_admitted(params, identity).await
+                                    }
+                                    // Absence belongs to admission time too. A queued
+                                    // terminate must never kill a subsequently admitted ID.
+                                    Ok((_, None)) => {
+                                        Ok(crate::protocol::TerminateResponse { running: false })
+                                    }
+                                    Err(error) => Err(error),
+                                };
+                                Some(process_response(request.id, result))
+                            })
+                        } else {
+                            route(Arc::clone(&handler), request)
+                        };
+                        let response = response.instrument(request_span.clone());
                         let request_cancelled = cancelled.clone();
                         let outgoing_tx = outgoing_tx.clone();
-                        let telemetry = telemetry.clone();
                         let operation = async move {
                             // Dropping the sender also releases successors during cancellation.
                             let _completion = completion_tx;
@@ -291,7 +550,7 @@ async fn run_connection(
                                 message = response => message,
                                 _ = request_cancelled.cancelled() => {
                                     request_span.record("result", "disconnected");
-                                    telemetry.request_completed(method, "disconnected", request_started_at.elapsed());
+                                    request_metrics.set_result("disconnected");
                                     return false;
                                 }
                             };
@@ -302,22 +561,16 @@ async fn run_connection(
                                     .is_err()
                             {
                                 request_span.record("result", "disconnected");
-                                telemetry.request_completed(
-                                    method,
-                                    "disconnected",
-                                    request_started_at.elapsed(),
-                                );
+                                request_metrics.set_result("disconnected");
                                 return false;
                             }
                             request_span.record("result", result);
-                            telemetry.request_completed(
-                                method,
-                                result,
-                                request_started_at.elapsed(),
-                            );
+                            request_metrics.set_result(result);
                             true
                         };
-                        if independent_read {
+                        if control {
+                            controls.spawn(operation);
+                        } else if independent_read {
                             reads.spawn(operation);
                         } else if initialized {
                             ordered.spawn(operation);
@@ -342,15 +595,11 @@ async fn run_connection(
                         .is_err()
                         {
                             request_span.record("result", "disconnected");
-                            telemetry.request_completed(
-                                method,
-                                "disconnected",
-                                request_started_at.elapsed(),
-                            );
+                            request_metrics.set_result("disconnected");
                             break;
                         }
                         request_span.record("result", "error");
-                        telemetry.request_completed(method, "error", request_started_at.elapsed());
+                        request_metrics.set_result("error");
                     }
                 }
                 codex_exec_server_protocol::JSONRPCMessage::Notification(notification) => {
@@ -407,6 +656,8 @@ async fn run_connection(
     while ordered.join_next().await.is_some() {}
     reads.abort_all();
     while reads.join_next().await.is_some() {}
+    controls.abort_all();
+    while controls.join_next().await.is_some() {}
     handler.shutdown().await;
     drop(handler);
     drop(outgoing_tx);
@@ -415,6 +666,18 @@ async fn run_connection(
         let _ = task.await;
     }
     let _ = outbound_task.await;
+}
+
+fn process_response<T: serde::Serialize>(
+    request_id: codex_exec_server_protocol::RequestId,
+    result: Result<T, codex_exec_server_protocol::JSONRPCErrorError>,
+) -> RpcServerOutboundMessage {
+    match result.and_then(|value| {
+        serde_json::to_value(value).map_err(|error| crate::rpc::internal_error(error.to_string()))
+    }) {
+        Ok(result) => RpcServerOutboundMessage::Response { request_id, result },
+        Err(error) => RpcServerOutboundMessage::Error { request_id, error },
+    }
 }
 
 async fn send_outbound(
@@ -586,7 +849,11 @@ mod tests {
         timeout(Duration::from_secs(1), async {
             let mut ids = Vec::new();
             for _ in 0..2 {
-                let line = lines.next_line().await.expect("read response").expect("response line");
+                let line = lines
+                    .next_line()
+                    .await
+                    .expect("read response")
+                    .expect("response line");
                 let JSONRPCMessage::Response(JSONRPCResponse { id, result }) =
                     serde_json::from_str(&line).expect("decode JSON-RPC response")
                 else {
@@ -599,7 +866,9 @@ mod tests {
             assert_eq!(ids.len(), 2);
             assert!(ids.contains(&RequestId::Integer(2)));
             assert!(ids.contains(&RequestId::Integer(3)));
-        }).await.expect("both pipelined requests must complete");
+        })
+        .await
+        .expect("both pipelined requests must complete");
 
         drop(writer);
         drop(lines);
@@ -663,6 +932,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_http_pool_keeps_cleanup_controls_admissible() {
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+        let (mut writer, mut lines, task) =
+            spawn_test_connection(Arc::clone(&registry), "full-http");
+        send_request(
+            &mut writer,
+            1,
+            INITIALIZE_METHOD,
+            &InitializeParams {
+                client_name: "test".into(),
+                resume_session_id: None,
+            },
+        )
+        .await;
+        let _: InitializeResponse = read_response(&mut lines, 1).await;
+        send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut sockets = Vec::new();
+        for id in 0..crate::connection::CHANNEL_CAPACITY {
+            send_request(
+                &mut writer,
+                10 + id as i64,
+                crate::protocol::HTTP_REQUEST_METHOD,
+                &crate::protocol::HttpRequestParams {
+                    method: "GET".into(),
+                    url: format!("http://{}/wait", listener.local_addr().unwrap()),
+                    headers: Vec::new(),
+                    body: None,
+                    timeout_ms: Some(60_000),
+                    redirect_policy: crate::protocol::HttpRedirectPolicy::Follow,
+                    request_id: format!("held-{id}"),
+                    stream_response: true,
+                },
+            )
+            .await;
+            sockets.push(
+                timeout(Duration::from_secs(2), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+            );
+        }
+        send_request(&mut writer, 500, ENVIRONMENT_INFO_METHOD, &()).await;
+        let overflow: JSONRPCMessage = serde_json::from_str(
+            &timeout(Duration::from_secs(2), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(overflow, JSONRPCMessage::Error(error) if error.id == RequestId::Integer(500)
+            && error.error.message.contains("too many pending"))
+        );
+        send_request(
+            &mut writer,
+            501,
+            EXEC_TERMINATE_METHOD,
+            &TerminateParams {
+                process_id: "missing".into(),
+            },
+        )
+        .await;
+        let response: TerminateResponse =
+            timeout(Duration::from_secs(2), read_response(&mut lines, 501))
+                .await
+                .unwrap();
+        assert!(
+            !response.running,
+            "unknown process semantics still run while ordinary requests are full"
+        );
+        send_request(
+            &mut writer,
+            502,
+            crate::protocol::HTTP_REQUEST_CANCEL_METHOD,
+            &crate::protocol::HttpRequestCancelParams {
+                request_id: "held-0".into(),
+            },
+        )
+        .await;
+        timeout(Duration::from_secs(2), async {
+            let mut cancelled = false;
+            let mut acknowledged = false;
+            while !cancelled || !acknowledged {
+                let message: JSONRPCMessage =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                match message {
+                    JSONRPCMessage::Error(error) if error.id == RequestId::Integer(10) => {
+                        assert!(error.error.message.contains("cancelled"));
+                        cancelled = true;
+                    }
+                    JSONRPCMessage::Response(response)
+                        if response.id == RequestId::Integer(502) =>
+                    {
+                        acknowledged = true
+                    }
+                    other => panic!("unexpected control outcome: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(writer);
+        drop(lines);
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(sockets);
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owned_terminate_of_an_expired_handle_settles_as_not_running() {
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+        let (mut writer, mut lines, task) =
+            spawn_test_connection(Arc::clone(&registry), "owned-terminate");
+        send_request(
+            &mut writer,
+            1,
+            INITIALIZE_METHOD,
+            &InitializeParams {
+                client_name: "test".into(),
+                resume_session_id: None,
+            },
+        )
+        .await;
+        let _: InitializeResponse = read_response(&mut lines, 1).await;
+        send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+        // Client cleanup owners retry termination errors. An incarnation that is
+        // no longer in custody (failed launch, eviction, replacement) must settle.
+        send_request(
+            &mut writer,
+            2,
+            EXEC_TERMINATE_METHOD,
+            &crate::protocol::OwnedProcessParams {
+                incarnation: Some("expired-incarnation".to_string()),
+                params: TerminateParams {
+                    process_id: ProcessId::from("expired-owned-process"),
+                },
+            },
+        )
+        .await;
+        let response: TerminateResponse =
+            timeout(Duration::from_secs(2), read_response(&mut lines, 2))
+                .await
+                .expect("owned terminate should answer");
+        assert!(!response.running);
+        drop(writer);
+        drop(lines);
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        registry.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn slow_http_headers_do_not_block_other_requests_or_cancellation() {
         let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
         let (mut writer, mut lines, task) =
@@ -715,6 +1144,7 @@ mod tests {
             &crate::protocol::FsGetMetadataParams {
                 path: PathUri::from_host_native_path(temp.path()).expect("temp directory URI"),
                 sandbox: None,
+                include_directory_case_sensitivity: None,
             },
         )
         .await;
@@ -996,6 +1426,126 @@ mod tests {
             .await
             .expect("second processor should exit")
             .expect("second processor should join");
+    }
+
+    #[test]
+    fn same_connection_terminate_cancels_preparation_before_native_launch() {
+        struct Release(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
+            let (mut writer, mut lines, task) =
+                spawn_test_connection(registry.clone(), "same-connection-cancel");
+            send_request(
+                &mut writer,
+                1,
+                INITIALIZE_METHOD,
+                &InitializeParams {
+                    client_name: "cancel".into(),
+                    resume_session_id: None,
+                },
+            )
+            .await;
+            let initialized: InitializeResponse = read_response(&mut lines, 1).await;
+            send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release = Release(Some(release_tx));
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            });
+            entered_rx.await.unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let forbidden = temp.path().join("must-not-run");
+            let id = ProcessId::from("cancel-before-launch");
+            let mut params = exec_params(id.clone());
+            params.argv = vec![
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()),
+                "/C".into(),
+                format!("echo forbidden>\"{}\"", forbidden.display()),
+            ];
+            send_request(&mut writer, 2, EXEC_METHOD, &params).await;
+            let process = registry.process_for_test(&initialized.session_id).await;
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let result = process
+                        .exec_read(ReadParams {
+                            process_id: id.clone(),
+                            after_seq: None,
+                            max_bytes: None,
+                            wait_ms: Some(0),
+                        })
+                        .await;
+                    if result
+                        .is_err_and(|error| error.message == format!("process id {id} is starting"))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            send_request(
+                &mut writer,
+                3,
+                EXEC_TERMINATE_METHOD,
+                &TerminateParams {
+                    process_id: id.clone(),
+                },
+            )
+            .await;
+            let first: TerminateResponse =
+                timeout(Duration::from_secs(1), read_response(&mut lines, 3))
+                    .await
+                    .expect("control must not wait for preparation");
+            assert!(first.running);
+            send_request(
+                &mut writer,
+                4,
+                EXEC_TERMINATE_METHOD,
+                &TerminateParams { process_id: id },
+            )
+            .await;
+            let settled: TerminateResponse =
+                timeout(Duration::from_secs(1), read_response(&mut lines, 4))
+                    .await
+                    .unwrap();
+            assert!(!settled.running);
+            assert!(!forbidden.exists());
+            drop(release);
+            blocker.await.unwrap();
+            let line = timeout(Duration::from_secs(2), lines.next_line())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let JSONRPCMessage::Error(error) = serde_json::from_str(&line).unwrap() else {
+                panic!("cancelled start must fail")
+            };
+            assert_eq!(error.id, RequestId::Integer(2));
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!forbidden.exists());
+            drop(writer);
+            drop(lines);
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            registry.shutdown().await;
+        });
     }
 
     #[test]

@@ -626,7 +626,9 @@ mod tests {
                 assert_eq!(parsed.decision, None);
                 assert_eq!(
                     parsed.invalid_reason,
-                    Some(format!("PermissionRequest hook returned unsupported {field}"))
+                    Some(format!(
+                        "PermissionRequest hook returned unsupported {field}"
+                    ))
                 );
             }
         }

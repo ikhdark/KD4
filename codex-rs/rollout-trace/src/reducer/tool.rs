@@ -144,6 +144,7 @@ impl TraceReducer {
                 raw_invocation_payload_id,
                 raw_result_payload_id: None,
                 raw_runtime_payload_ids: Vec::new(),
+                process_observations: None,
             },
         );
 

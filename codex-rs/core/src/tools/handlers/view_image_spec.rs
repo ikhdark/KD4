@@ -26,7 +26,7 @@ pub fn create_view_image_tool(options: ViewImageToolOptions) -> ToolSpec {
             JsonSchema::string_enum(
                 detail_levels,
                 Some(
-                    "Image detail level. Defaults to `high`; use `low` for lower-cost overview inspection. When available, `original` preserves exact resolution.".to_string(),
+                    "Image detail level. Defaults to `high`; use `low` for lower-cost overview inspection. When available, `original` retains source resolution within safety limits (6000 pixels per side and 10000 32-pixel patches); any resizing is disclosed with the image.".to_string(),
                 ),
             ),
         );
@@ -62,7 +62,7 @@ fn view_image_output_schema() -> Value {
             "detail": {
                 "type": "string",
                 "enum": ["low", "high", "original"],
-                "description": "Image detail hint returned by view_image: `low` for overview inspection, `high` for default resized behavior, or `original` when original resolution is preserved."
+                "description": "Requested image detail: `low` for overview inspection, `high` for default resized behavior, or `original` for the larger bounded resolution budget. Preparation discloses any original-detail resizing."
             }
         },
         "required": ["image_url", "detail"],

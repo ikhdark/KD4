@@ -1,8 +1,7 @@
 use crate::attribution::BindConnectionAttribution;
-use crate::connection_lifecycle::CancelOnShutdown;
-use rama_core::graceful::ShutdownGuard;
 use crate::config::NetworkMode;
 use crate::connect_policy::TargetCheckedTcpConnector;
+use crate::connection_lifecycle::CancelOnShutdown;
 use crate::mitm;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
@@ -31,6 +30,7 @@ use rama_core::error::BoxError;
 use rama_core::extensions::Extensions;
 use rama_core::extensions::ExtensionsMut;
 use rama_core::extensions::ExtensionsRef;
+use rama_core::graceful::ShutdownGuard;
 use rama_core::service::service_fn;
 use rama_net::address::HostWithPort;
 use rama_net::client::EstablishedClientConnection;
@@ -169,15 +169,23 @@ async fn run_socks5_with_listener(
             }));
         let socks_acceptor = base.with_udp_associator(udp_relay);
         listener
-            .serve_graceful(guard.clone(), CancelOnShutdown::new(BindConnectionAttribution::new(
-                socks_acceptor,
-                state,
-                environment_id,
-            ), &guard))
+            .serve_graceful(
+                guard.clone(),
+                CancelOnShutdown::new(
+                    BindConnectionAttribution::new(socks_acceptor, state, environment_id),
+                    &guard,
+                ),
+            )
             .await;
     } else {
         listener
-            .serve_graceful(guard.clone(), CancelOnShutdown::new(BindConnectionAttribution::new(base, state, environment_id), &guard))
+            .serve_graceful(
+                guard.clone(),
+                CancelOnShutdown::new(
+                    BindConnectionAttribution::new(base, state, environment_id),
+                    &guard,
+                ),
+            )
             .await;
     }
     Ok(())
@@ -809,6 +817,71 @@ fn policy_denied_error(reason: &str, details: &PolicyDecisionDetails<'_>) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wildcard_udp_association_pins_client_port_and_relays_echo() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UdpSocket;
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = NetworkProxyConfig {
+            allow_local_binding: true,
+            ..Default::default()
+        };
+        config.set_allowed_domains(vec!["127.0.0.1".to_string()]);
+        let state = Arc::new(crate::runtime::network_proxy_state_for_policy(config));
+        let connections = crate::connection_lifecycle::ConnectionLifecycle::new();
+        let guard = connections.guard();
+        let proxy = tokio::spawn(run_socks5_with_std_listener(
+            state, listener, None, None, true, guard,
+        ));
+        let mut control = tokio::net::TcpStream::connect(address).await.unwrap();
+        control.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0; 2];
+        control.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        control
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0; 10];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay = SocketAddr::from(([127, 0, 0, 1], u16::from_be_bytes([reply[8], reply[9]])));
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
+        packet.extend_from_slice(&echo_address.port().to_be_bytes());
+        packet.extend_from_slice(b"ping");
+        client.send_to(&packet, relay).await.unwrap();
+        let mut buffer = [0; 64];
+        let (size, sender) =
+            tokio::time::timeout(Duration::from_secs(2), echo.recv_from(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&buffer[..size], b"ping");
+        echo.send_to(&buffer[..size], sender).await.unwrap();
+        let (size, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[size - 4..size], b"ping");
+        let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        foreign.send_to(&packet, relay).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), echo.recv_from(&mut buffer))
+                .await
+                .is_err()
+        );
+        drop(control);
+        connections.shutdown().await;
+        proxy.await.unwrap().unwrap();
+    }
     use crate::config::NetworkMode;
     use crate::config::NetworkProxyConfig;
     use crate::mitm_hook::MitmHookConfig;
@@ -910,9 +983,7 @@ mod tests {
         request.extensions_mut().insert(state.clone());
 
         let err = handle_socks5_tcp(
-            request,
-            /*policy_decider*/ None,
-            /*environment_id*/ None,
+            request, /*policy_decider*/ None, /*environment_id*/ None,
         )
         .await
         .expect_err("proxy-disabled request should be denied");
@@ -948,9 +1019,7 @@ mod tests {
             let mut request = TcpRequest::new(HostWithPort::from(target));
             request.extensions_mut().insert(state.clone());
             let connection = handle_socks5_tcp(
-                request,
-                /*policy_decider*/ None,
-                /*environment_id*/ None,
+                request, /*policy_decider*/ None, /*environment_id*/ None,
             )
             .await
             .expect("allowed request should connect");
@@ -983,9 +1052,7 @@ mod tests {
 
         let (result, events) = capture_events(|| async {
             handle_socks5_tcp(
-                request,
-                /*policy_decider*/ None,
-                /*environment_id*/ None,
+                request, /*policy_decider*/ None, /*environment_id*/ None,
             )
             .await
         })
@@ -1027,9 +1094,7 @@ mod tests {
         request.extensions_mut().insert(state.clone());
 
         let result = handle_socks5_tcp(
-            request,
-            /*policy_decider*/ None,
-            /*environment_id*/ None,
+            request, /*policy_decider*/ None, /*environment_id*/ None,
         )
         .await
         .expect("limited-mode HTTPS should use MITM");
@@ -1057,9 +1122,7 @@ mod tests {
 
         let (result, events) = capture_events(|| async {
             handle_socks5_tcp(
-                request,
-                /*policy_decider*/ None,
-                /*environment_id*/ None,
+                request, /*policy_decider*/ None, /*environment_id*/ None,
             )
             .await
         })
@@ -1114,14 +1177,18 @@ mod tests {
         request.extensions_mut().insert(state.clone());
 
         let result = handle_socks5_tcp(
-            request,
-            /*policy_decider*/ None,
-            /*environment_id*/ None,
+            request, /*policy_decider*/ None, /*environment_id*/ None,
         )
         .await
         .expect("brokered TLS should defer MITM until protocol detection");
 
-        let Socks5TcpConnection::DetectTls { target, mode, allow_local_binding, .. } = result.conn else {
+        let Socks5TcpConnection::DetectTls {
+            target,
+            mode,
+            allow_local_binding,
+            ..
+        } = result.conn
+        else {
             panic!("brokered nonstandard port must select TLS detection");
         };
         assert_eq!(target.host.to_string(), "8.8.8.8");
@@ -1145,9 +1212,7 @@ mod tests {
         request.extensions_mut().insert(state.clone());
 
         let err = handle_socks5_tcp(
-            request,
-            /*policy_decider*/ None,
-            /*environment_id*/ None,
+            request, /*policy_decider*/ None, /*environment_id*/ None,
         )
         .await
         .expect_err("limited-mode HTTPS requires MITM");
@@ -1183,9 +1248,7 @@ mod tests {
         request.extensions_mut().insert(state.clone());
 
         let result = handle_socks5_tcp(
-            request,
-            /*policy_decider*/ None,
-            /*environment_id*/ None,
+            request, /*policy_decider*/ None, /*environment_id*/ None,
         )
         .await
         .expect("hooked HTTPS should use MITM");
@@ -1223,9 +1286,7 @@ mod tests {
         request.extensions_mut().insert(state.clone());
 
         let err = handle_socks5_tcp(
-            request,
-            /*policy_decider*/ None,
-            /*environment_id*/ None,
+            request, /*policy_decider*/ None, /*environment_id*/ None,
         )
         .await
         .expect_err("hooked non-HTTPS SOCKS should require MITM");

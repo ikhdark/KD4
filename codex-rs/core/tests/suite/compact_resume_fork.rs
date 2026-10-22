@@ -83,7 +83,9 @@ fn json_message_input_texts(request: &Value, role: &str) -> Vec<String> {
 
 fn is_injected_user_context(text: &str) -> bool {
     let text = text.trim_start();
-    text.starts_with("<environment_context>")
+    // The skill catalog is discovery data injected with the user role.
+    text.starts_with("<skills_instructions>")
+        || text.starts_with("<environment_context>")
         || text.starts_with("<recommended_plugins>")
         || text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<codex_task_state>")
@@ -320,7 +322,12 @@ async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Resu
         ev_assistant_message("m3", SECOND_REPLY),
         ev_completed("r3"),
     ]);
-    let sse4 = sse(vec![ev_completed("r4")]);
+    // Turn-ending responses answer; an empty completion spends the bounded
+    // missing-answer repair on another request.
+    let sse4 = sse(vec![
+        ev_assistant_message("m4", "AFTER_ROLLBACK_REPLY"),
+        ev_completed("r4"),
+    ]);
 
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
@@ -410,7 +417,13 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
                 ev_assistant_message("m2", "turn 2 assistant"),
                 ev_completed("r2"),
             ]),
-            sse(vec![ev_response_created("r3"), ev_completed("r3")]),
+            // The follow-up answers; an empty completion spends the bounded
+            // missing-answer repair on another request.
+            sse(vec![
+                ev_response_created("r3"),
+                ev_assistant_message("m3", "follow-up assistant"),
+                ev_completed("r3"),
+            ]),
         ],
     )
     .await;
@@ -559,8 +572,16 @@ async fn mount_initial_flow(server: &MockServer) -> Vec<ResponseMock> {
         ev_assistant_message("m3", "AFTER_COMPACT_REPLY"),
         ev_completed("r3"),
     ]);
-    let sse4 = sse(vec![ev_completed("r4")]);
-    let sse5 = sse(vec![ev_completed("r5")]);
+    // Turn-ending responses answer; an empty completion spends the bounded
+    // missing-answer repair on another request.
+    let sse4 = sse(vec![
+        ev_assistant_message("m4", "AFTER_RESUME_REPLY"),
+        ev_completed("r4"),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m5", "AFTER_FORK_REPLY"),
+        ev_completed("r5"),
+    ]);
 
     let match_first = |req: &wiremock::Request| {
         let body = std::str::from_utf8(&req.body).unwrap_or("");
@@ -614,14 +635,28 @@ async fn mount_second_compact_sequence(server: &MockServer) -> ResponseMock {
         ev_assistant_message("m3", "AFTER_COMPACT_REPLY"),
         ev_completed("r3"),
     ]);
-    let sse4 = sse(vec![ev_completed("r4")]);
-    let sse5 = sse(vec![ev_completed("r5")]);
+    // Turn-ending responses answer; an empty completion spends the bounded
+    // missing-answer repair on another request.
+    let sse4 = sse(vec![
+        ev_assistant_message("m-after-resume", "AFTER_RESUME_REPLY"),
+        ev_completed("r4"),
+    ]);
+    let sse5 = sse(vec![
+        ev_assistant_message("m-after-fork", "AFTER_FORK_REPLY"),
+        ev_completed("r5"),
+    ]);
     let sse6 = sse(vec![
         ev_assistant_message("m4", SUMMARY_TEXT),
         ev_completed("r6"),
     ]);
-    let sse7 = sse(vec![ev_completed("r7")]);
-    let sse8 = sse(vec![ev_completed("r8")]);
+    let sse7 = sse(vec![
+        ev_assistant_message("m-after-compact-2", "AFTER_COMPACT_2_REPLY"),
+        ev_completed("r7"),
+    ]);
+    let sse8 = sse(vec![
+        ev_assistant_message("m-after-second-resume", "AFTER_SECOND_RESUME_REPLY"),
+        ev_completed("r8"),
+    ]);
 
     mount_sse_sequence(server, vec![sse1, sse2, sse3, sse4, sse5, sse6, sse7, sse8]).await
 }

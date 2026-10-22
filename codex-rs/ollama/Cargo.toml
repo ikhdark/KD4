@@ -18,6 +18,7 @@ bytes = { workspace = true }
 codex-core = { workspace = true }
 codex-http-client = { workspace = true }
 codex-model-provider-info = { workspace = true }
+codex-model-provider = { workspace = true }
 futures = { workspace = true }
 memchr = { workspace = true }
 semver = { workspace = true }

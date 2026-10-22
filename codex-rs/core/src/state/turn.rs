@@ -121,7 +121,12 @@ pub(crate) struct TurnTerminalCoordinator {
     #[cfg(test)]
     panic_after_terminal_publication: AtomicBool,
     #[cfg(test)]
-    publication_pause: std::sync::Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
+    publication_pause: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 /// The interrupt durability fence is one state machine, not three independent
@@ -473,7 +478,12 @@ impl TurnTerminalCoordinator {
     }
 
     #[cfg(test)]
-    pub(crate) fn pause_publication_for_test(&self) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+    pub(crate) fn pause_publication_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
         let (entered, wait_entered) = tokio::sync::oneshot::channel();
         let (release, wait_release) = tokio::sync::oneshot::channel();
         *self.publication_pause.lock().unwrap() = Some((entered, wait_release));
@@ -579,6 +589,9 @@ pub(crate) struct TurnState {
     pending_elicitations: HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>,
     pending_dynamic_tools: HashMap<String, (String, oneshot::Sender<DynamicToolResponse>)>,
     pub(crate) pending_input: TurnInputQueue,
+    /// Recovery copy of the currently inspected/recorded prefix. The turn
+    /// finalizer owns its disposal or recovery after the recorder is quiescent.
+    pub(crate) input_in_flight: std::collections::VecDeque<crate::session::TurnInput>,
     mailbox_delivery_phase: MailboxDeliveryPhase,
     granted_permissions_by_approval_scope_id: HashMap<String, UriAdditionalPermissionProfile>,
     pub(crate) tool_calls: u64,

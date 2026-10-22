@@ -33,6 +33,10 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use tempfile::TempDir;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 // Windows CI can spend tens of seconds starting app-server
 // subprocesses or processing test RPCs under load.
@@ -94,7 +98,10 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
     let ThreadItem::ContextCompaction { id: started_id, .. } = started.item else {
         unreachable!("started item should be context compaction");
     };
-    let ThreadItem::ContextCompaction { id: completed_id, .. } = completed.item else {
+    let ThreadItem::ContextCompaction {
+        id: completed_id, ..
+    } = completed.item
+    else {
         unreachable!("completed item should be context compaction");
     };
 
@@ -104,7 +111,12 @@ async fn auto_compaction_local_emits_started_and_completed_items() -> Result<()>
 
     let requests = requests.requests();
     assert_eq!(requests.len(), 4);
-    assert!(requests[3].message_input_texts("user").iter().any(|text| text.contains("LOCAL_SUMMARY")));
+    assert!(
+        requests[3]
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text.contains("LOCAL_SUMMARY"))
+    );
 
     Ok(())
 }
@@ -140,6 +152,15 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
     ]);
     let responses_log =
         responses::mount_sse_sequence(&server, vec![sse1, sse2, compact_sse, sse3]).await;
+    // Remote compaction is reserved for the built-in OpenAI provider, which
+    // `is_openai` identifies by kind rather than by a custom provider's display
+    // name. This fixture serves HTTP SSE, not Responses WebSockets: advertise
+    // the supported fallback.
+    Mock::given(method("GET"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
 
     let codex_home = TempDir::new()?;
     write_mock_responses_config_toml(
@@ -148,7 +169,7 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
         &BTreeMap::default(),
         REMOTE_AUTO_COMPACT_LIMIT,
         Some(true),
-        "mock_provider",
+        "openai",
         COMPACT_PROMPT,
     )?;
     let config_path = codex_home.path().join("config.toml");
@@ -179,7 +200,10 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
     let ThreadItem::ContextCompaction { id: started_id, .. } = started.item else {
         unreachable!("started item should be context compaction");
     };
-    let ThreadItem::ContextCompaction { id: completed_id, .. } = completed.item else {
+    let ThreadItem::ContextCompaction {
+        id: completed_id, ..
+    } = completed.item
+    else {
         unreachable!("completed item should be context compaction");
     };
 
@@ -292,7 +316,10 @@ async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -
     let ThreadItem::ContextCompaction { id: started_id, .. } = started.item else {
         unreachable!("started item should be context compaction");
     };
-    let ThreadItem::ContextCompaction { id: completed_id, .. } = completed.item else {
+    let ThreadItem::ContextCompaction {
+        id: completed_id, ..
+    } = completed.item
+    else {
         unreachable!("completed item should be context compaction");
     };
 
@@ -404,7 +431,10 @@ async fn wait_for_turn_completed(mcp: &mut TestAppServer, turn_id: &str) -> Resu
         let completed: TurnCompletedNotification =
             serde_json::from_value(notification.params.clone().expect("turn/completed params"))?;
         if completed.turn.id == turn_id {
-            assert_eq!(completed.turn.status, codex_app_server_protocol::TurnStatus::Completed);
+            assert_eq!(
+                completed.turn.status,
+                codex_app_server_protocol::TurnStatus::Completed
+            );
             assert_eq!(completed.turn.error, None);
             return Ok(());
         }

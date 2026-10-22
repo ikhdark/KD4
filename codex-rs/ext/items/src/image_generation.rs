@@ -18,4 +18,35 @@ pub struct ImageGenerationItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,
+    /// Separate image-model receipt; never add these tokens to text inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_usage: Option<ImageGenerationUsage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ImageGenerationUsage {
+    pub model: Option<String>,
+    /// False means a response was observed but supplied no usable usage object.
+    pub reported: bool,
+    #[ts(type = "number | null")]
+    pub input_tokens: Option<u64>,
+    #[ts(type = "number | null")]
+    pub output_tokens: Option<u64>,
+    #[ts(type = "number | null")]
+    pub total_tokens: Option<u64>,
+    pub input_tokens_details: Option<ImageTokenDetails>,
+    pub output_tokens_details: Option<ImageTokenDetails>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ImageTokenDetails {
+    #[ts(type = "number | null")]
+    pub image_tokens: Option<u64>,
+    #[ts(type = "number | null")]
+    pub text_tokens: Option<u64>,
 }

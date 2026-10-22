@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::config::Config;
 use codex_model_provider_info::WireApi;
-use codex_protocol::num_format::format_with_separators;
+use codex_protocol::protocol::FinalOutput;
 use codex_protocol::protocol::SessionConfiguredEvent;
 use codex_utils_sandbox_summary::summarize_permission_profile;
 use owo_colors::OwoColorize;
@@ -18,7 +19,7 @@ use owo_colors::Style;
 
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
-use crate::event_processor::final_message_from_turn_items;
+use crate::event_processor::final_message_from_turn;
 use crate::event_processor::handle_last_message;
 
 pub(crate) struct EventProcessorWithHumanOutput {
@@ -34,9 +35,12 @@ pub(crate) struct EventProcessorWithHumanOutput {
     show_raw_agent_reasoning: bool,
     last_message_path: Option<PathBuf>,
     final_message: Option<String>,
+    streamed_final_message: crate::event_processor::FinalMessageSelection,
     final_message_rendered: bool,
     emit_final_message_on_shutdown: bool,
     last_total_token_usage: Option<ThreadTokenUsage>,
+    displayed_warnings: VecDeque<String>,
+    last_non_retry_error: Option<(String, String)>,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -59,9 +63,12 @@ impl EventProcessorWithHumanOutput {
             show_raw_agent_reasoning: config.show_raw_agent_reasoning,
             last_message_path,
             final_message: None,
+            streamed_final_message: Default::default(),
             final_message_rendered: false,
             emit_final_message_on_shutdown: false,
             last_total_token_usage: None,
+            displayed_warnings: VecDeque::new(),
+            last_non_retry_error: None,
         }
     }
 
@@ -96,6 +103,7 @@ impl EventProcessorWithHumanOutput {
     }
 
     fn render_item_completed(&mut self, item: ThreadItem) {
+        self.streamed_final_message.observe(&item);
         match item {
             ThreadItem::AgentMessage { text, .. } => {
                 eprintln!(
@@ -103,8 +111,8 @@ impl EventProcessorWithHumanOutput {
                     "codex".style(self.italic).style(self.magenta),
                     text
                 );
-                self.final_message = Some(text);
-                self.final_message_rendered = true;
+                self.final_message = self.streamed_final_message.message();
+                self.final_message_rendered = self.final_message.as_ref() == Some(&text);
             }
             ThreadItem::Reasoning {
                 summary, content, ..
@@ -198,7 +206,15 @@ impl EventProcessorWithHumanOutput {
                 }
             }
             ThreadItem::WebSearch(item) => {
-                eprintln!("{} {}", "web search:".style(self.bold), item.query);
+                eprintln!(
+                    "{} {} ({})",
+                    "web search:".style(self.bold),
+                    item.query,
+                    item.status.as_deref().unwrap_or("outcome unrecorded")
+                );
+                if let Some(error) = item.error {
+                    eprintln!("{error}");
+                }
             }
             ThreadItem::ContextCompaction { .. } => {
                 eprintln!("{}", "context compacted".style(self.dimmed));
@@ -215,7 +231,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         prompt: &str,
         session_configured_event: &SessionConfiguredEvent,
     ) {
-        const VERSION: &str = env!("CARGO_PKG_VERSION");
+        const VERSION: &str = codex_utils_build_info::CODEX_VERSION;
         eprintln!("OpenAI Codex v{VERSION}\n--------");
         for (key, value) in config_summary_entries(config, session_configured_event) {
             eprintln!("{} {}", format!("{key}:").style(self.bold), value);
@@ -225,6 +241,32 @@ impl EventProcessor for EventProcessorWithHumanOutput {
     }
 
     fn process_server_notification(&mut self, notification: ServerNotification) -> CodexStatus {
+        if let ServerNotification::TurnCompleted(notification) = &notification
+            && let Some(assessment) = notification
+                .timing
+                .as_ref()
+                .or(notification.turn.timing.as_ref())
+                .and_then(|timing| timing.completion_assessment.as_ref())
+        {
+            // Optional warnings can be dropped; terminal metadata cannot. Keep
+            // diagnostics on stderr, never in canonical stdout or answer files.
+            if let Some(message) = assessment.verification_warning()
+                && !self.displayed_warnings.contains(&message)
+            {
+                // Persistence diagnostics may already have been emitted as
+                // individual warnings rather than the combined assessment.
+                let mut missing = assessment.clone();
+                missing
+                    .failed_checks
+                    .retain(|check| !self.displayed_warnings.contains(check));
+                missing
+                    .verification_gaps
+                    .retain(|gap| !self.displayed_warnings.contains(gap));
+                if let Some(message) = missing.verification_warning() {
+                    self.process_warning(message);
+                }
+            }
+        }
         match notification {
             ServerNotification::ConfigWarning(notification) => {
                 let details = notification
@@ -241,6 +283,12 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             ServerNotification::Warning(notification) => self.process_warning(notification.message),
             ServerNotification::Error(notification) => {
+                if !notification.will_retry && !notification.error.message.trim().is_empty() {
+                    self.last_non_retry_error = Some((
+                        notification.turn_id.clone(),
+                        notification.error.message.clone(),
+                    ));
+                }
                 eprintln!(
                     "{} {}",
                     "ERROR:".style(self.red).style(self.bold),
@@ -300,16 +348,33 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             ServerNotification::TurnCompleted(notification) => match notification.turn.status {
                 TurnStatus::Completed => {
-                    if let Some(surfaced_result) = notification.surfaced_result.as_ref() {
+                    if let Some(surfaced_result) = notification
+                        .surfaced_result
+                        .as_ref()
+                        .or(notification.turn.surfaced_result.as_ref())
+                    {
                         self.final_message_rendered = self.final_message_rendered
                             && self.final_message == surfaced_result.canonical_message;
                         self.final_message = surfaced_result.canonical_message.clone();
-                    } else if let Some(final_message) =
-                        final_message_from_turn_items(notification.turn.items.as_slice())
-                    {
-                        self.final_message_rendered = self.final_message_rendered
-                            && self.final_message.as_deref() == Some(final_message.as_str());
-                        self.final_message = Some(final_message);
+                    } else {
+                        let timing = notification
+                            .timing
+                            .as_ref()
+                            .or(notification.turn.timing.as_ref());
+                        for item in &notification.turn.items {
+                            self.streamed_final_message.observe(item);
+                        }
+                        let final_message =
+                            if timing.is_some_and(|timing| timing.final_answer.is_some()) {
+                                final_message_from_turn(notification.turn.items.as_slice(), timing)
+                            } else {
+                                self.streamed_final_message
+                                    .message()
+                                    .or_else(|| self.final_message.clone())
+                            };
+                        self.final_message_rendered =
+                            self.final_message_rendered && self.final_message == final_message;
+                        self.final_message = final_message;
                     }
                     self.emit_final_message_on_shutdown = true;
                     CodexStatus::InitiateShutdown
@@ -318,8 +383,23 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     self.final_message = None;
                     self.final_message_rendered = false;
                     self.emit_final_message_on_shutdown = false;
-                    if let Some(error) = notification.turn.error {
-                        eprintln!("{} {}", "ERROR:".style(self.red).style(self.bold), error);
+                    let detailed = notification
+                        .turn
+                        .error
+                        .as_ref()
+                        .filter(|error| !error.message.trim().is_empty());
+                    let already_reported =
+                        self.last_non_retry_error
+                            .as_ref()
+                            .is_some_and(|(turn_id, message)| {
+                                turn_id == &notification.turn.id
+                                    && detailed.is_none_or(|error| message == &error.message)
+                            });
+                    if !already_reported {
+                        let message = detailed.map(|error| error.message.as_str()).unwrap_or("Turn failed. No error details were provided; partial output was retained.");
+                        eprintln!("{} {}", "ERROR:".style(self.red).style(self.bold), message);
+                        self.last_non_retry_error =
+                            Some((notification.turn.id.clone(), message.to_string()));
                     }
                     CodexStatus::InitiateShutdown
                 }
@@ -361,12 +441,28 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
                 CodexStatus::Running
             }
-            ServerNotification::TurnStarted(_) => CodexStatus::Running,
+            ServerNotification::TurnStarted(_) => {
+                self.displayed_warnings.clear();
+                self.streamed_final_message = Default::default();
+                self.last_non_retry_error = None;
+                CodexStatus::Running
+            }
             _ => CodexStatus::Running,
         }
     }
 
     fn process_warning(&mut self, message: String) -> CodexStatus {
+        if self.displayed_warnings.contains(&message) {
+            return CodexStatus::Running;
+        }
+        // Bound both entry count and retained bytes. Oversize diagnostics still
+        // print; they simply do not participate in replay deduplication.
+        if message.len() <= 16 * 1024 {
+            if self.displayed_warnings.len() == 64 {
+                self.displayed_warnings.pop_front();
+            }
+            self.displayed_warnings.push_back(message.clone());
+        }
         eprintln!(
             "{} {message}",
             "warning:".style(self.yellow).style(self.bold)
@@ -391,11 +487,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         };
 
         if let Some(usage) = &self.last_total_token_usage {
-            eprintln!(
-                "{}\n{}",
-                "tokens used".style(self.dimmed),
-                format_with_separators(blended_total(usage))
-            );
+            eprintln!("{}", format_token_usage(usage).style(self.dimmed));
         }
 
         let mut stdout_result = Ok(());
@@ -444,9 +536,11 @@ fn config_summary_entries(
     config: &Config,
     session_configured_event: &SessionConfiguredEvent,
 ) -> Vec<(&'static str, String)> {
-    let permission_profile = config.permissions.effective_permission_profile();
     let mut entries = vec![
-        ("workdir", config.cwd.display().to_string()),
+        (
+            "workdir",
+            session_configured_event.cwd.display().to_string(),
+        ),
         ("model", session_configured_event.model.clone()),
         (
             "provider",
@@ -454,13 +548,13 @@ fn config_summary_entries(
         ),
         (
             "approval",
-            config.permissions.approval_policy.value().to_string(),
+            session_configured_event.approval_policy.to_string(),
         ),
         (
             "sandbox",
             summarize_permission_profile(
-                &permission_profile,
-                &config.cwd,
+                &session_configured_event.permission_profile,
+                &session_configured_event.cwd,
                 config.effective_workspace_roots().as_slice(),
             ),
         ),
@@ -468,8 +562,8 @@ fn config_summary_entries(
     if config.model_provider.wire_api == WireApi::Responses {
         entries.push((
             "reasoning effort",
-            config
-                .model_reasoning_effort
+            session_configured_event
+                .reasoning_effort
                 .as_ref()
                 .map(std::string::ToString::to_string)
                 .unwrap_or_else(|| "none".to_string()),
@@ -506,10 +600,9 @@ fn reasoning_text(
     }
 }
 
-fn blended_total(usage: &ThreadTokenUsage) -> i64 {
-    let cached_input = usage.total.cached_input_tokens.max(0);
-    let non_cached_input = usage.total.input_tokens.saturating_sub(cached_input).max(0);
-    non_cached_input.saturating_add(usage.total.output_tokens.max(0))
+fn format_token_usage(usage: &ThreadTokenUsage) -> String {
+    let usage: codex_protocol::protocol::TokenUsage = usage.total.clone().into();
+    FinalOutput::from(usage).to_string()
 }
 
 fn should_print_final_message_to_stdout(

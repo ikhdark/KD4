@@ -1,6 +1,8 @@
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::error::ApiError;
+use crate::response_event_channel::ResponseEventSender;
+use crate::response_event_channel::response_event_channel;
 use crate::responses_stream::ResponsesEventError;
 use crate::responses_stream::ResponsesEventInterpreter;
 use crate::responses_stream::ResponsesStreamMetadata;
@@ -14,9 +16,9 @@ use futures::StreamExt;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::timeout;
+use tracing::Instrument;
 use tracing::debug;
 use tracing::trace;
 
@@ -168,32 +170,47 @@ fn bound_sse_events(stream: ByteStream, limit: usize) -> ByteStream {
     .boxed()
 }
 
+#[cfg(test)]
 pub fn spawn_response_stream(
     stream_response: StreamResponse,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
 ) -> ResponseStream {
-    let metadata = ResponsesStreamMetadata::from_headers(&stream_response.headers);
+    spawn_response_stream_with_dialect(stream_response, idle_timeout, telemetry, turn_state, false)
+}
+
+pub(crate) fn spawn_response_stream_with_dialect(
+    stream_response: StreamResponse,
+    idle_timeout: Duration,
+    telemetry: Option<Arc<dyn SseTelemetry>>,
+    turn_state: Option<Arc<OnceLock<String>>>,
+    ollama_single_summary: bool,
+) -> ResponseStream {
+    let mut metadata = ResponsesStreamMetadata::from_headers(&stream_response.headers);
+    metadata.ollama_single_summary = ollama_single_summary;
     metadata.apply_turn_state(turn_state.as_deref());
     let upstream_request_id = metadata.upstream_request_id().map(str::to_string);
-    let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
-    tokio::spawn(async move {
-        for event in metadata.initial_events() {
-            if tx_event.send(Ok(event)).await.is_err() {
-                return;
+    let (tx_event, rx_event) = response_event_channel::<ApiError>(1600);
+    tokio::spawn(
+        async move {
+            for event in metadata.initial_events() {
+                if tx_event.send(Ok(event)).await.is_err() {
+                    return;
+                }
             }
+            process_sse_with_metadata(
+                stream_response.bytes,
+                tx_event,
+                idle_timeout,
+                telemetry,
+                metadata,
+                turn_state,
+            )
+            .await;
         }
-        process_sse_with_metadata(
-            stream_response.bytes,
-            tx_event,
-            idle_timeout,
-            telemetry,
-            metadata,
-            turn_state,
-        )
-        .await;
-    });
+        .in_current_span(),
+    );
 
     ResponseStream {
         rx_event,
@@ -204,7 +221,7 @@ pub fn spawn_response_stream(
 #[cfg(test)]
 pub async fn process_sse(
     stream: ByteStream,
-    tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
+    tx_event: ResponseEventSender<ApiError>,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
 ) {
@@ -221,7 +238,7 @@ pub async fn process_sse(
 
 async fn process_sse_with_metadata(
     stream: ByteStream,
-    tx_event: mpsc::Sender<Result<ResponseEvent, ApiError>>,
+    tx_event: ResponseEventSender<ApiError>,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     metadata: ResponsesStreamMetadata,
@@ -392,9 +409,15 @@ async fn process_sse_with_metadata(
             let advances = event.advances_model_response();
             let is_completed = matches!(event, ResponseEvent::Completed { .. });
             let delivery_start = Instant::now();
-            if tx_event.send(Ok(event)).await.is_err() {
+            if let Err(error) = tx_event.send(Ok(event)).await {
+                let outcome = if matches!(&error, ApiError::ProviderFailure { .. }) {
+                    SseCleanupOutcome::ProtocolError
+                } else {
+                    SseCleanupOutcome::ConsumerCancelled
+                };
+                let _ = tx_event.send(Err(error)).await;
                 if let Some((t, start)) = telemetry.as_ref().zip(start) {
-                    t.on_sse_cleanup(SseCleanupOutcome::ConsumerCancelled, start.elapsed());
+                    t.on_sse_cleanup(outcome, start.elapsed());
                 }
                 return;
             }
@@ -488,6 +511,7 @@ mod tests {
     }
 
     use crate::common::SafetyBuffering;
+    use crate::response_event_channel::response_event_channel;
     use assert_matches::assert_matches;
     use bytes::Bytes;
     use codex_client::StreamResponse;
@@ -503,7 +527,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use serde_json::json;
-    use tokio::sync::mpsc;
     use tokio_test::io::Builder as IoBuilder;
     use tokio_util::io::ReaderStream;
 
@@ -540,12 +563,16 @@ mod tests {
     async fn progress_deadline_ignores_traffic_but_allows_productive_reasoning() {
         for productive in [false, true] {
             let source = stream::unfold(0, move |index| async move {
-                if index > 5 {
+                if index > 6 {
                     return None;
                 }
                 tokio::time::sleep(Duration::from_millis(30)).await;
-                let payload = if index == 5 {
+                let payload = if index == 6 {
                     json!({"type":"response.completed","response":{"id":"done"}})
+                } else if productive && index == 0 {
+                    json!({"type":"response.output_item.added","item":{"type":"reasoning","id":"reason","summary":[]}})
+                } else if productive && index == 5 {
+                    json!({"type":"response.output_item.done","item":{"type":"reasoning","id":"reason","summary":[]}})
                 } else if productive {
                     json!({"type":"response.reasoning_text.delta","delta":"thinking","content_index":0})
                 } else {
@@ -553,7 +580,7 @@ mod tests {
                 };
                 Some((Ok(Bytes::from(format!("data: {payload}\n\n"))), index + 1))
             });
-            let (tx, mut rx) = mpsc::channel(32);
+            let (tx, mut rx) = response_event_channel(32);
             process_sse(Box::pin(source), tx, Duration::from_millis(80), None).await;
             let mut completed = false;
             let mut failed = false;
@@ -580,7 +607,7 @@ mod tests {
             body.push_str(&format!("event: {kind}\ndata: {e}\n\n"));
         }
 
-        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let (tx, mut rx) = response_event_channel::<ApiError>(8);
         let stream = ReaderStream::new(std::io::Cursor::new(body))
             .map_err(|err| TransportError::Network(err.to_string()));
         tokio::spawn(process_sse(
@@ -626,9 +653,15 @@ mod tests {
             );
             let mut samples = Vec::new();
             for _ in 0..7 {
-                let chunks = stream::iter((0..1000).map(|_| Ok(frame.clone())).collect::<Vec<_>>())
+                let prefix = (name == "delta").then(|| Ok(Bytes::from(format!("data: {}\n\n", json!({"type":"response.output_item.added","item":{"id":"m","type":"message","role":"assistant","content":[]}})))));
+                let suffix = (name == "delta").then(|| Ok(Bytes::from(format!("data: {}\n\n", json!({"type":"response.output_item.done","item":{"id":"m","type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(256_000)}]}})))));
+                let chunks = stream::iter(prefix)
+                    .chain(stream::iter(
+                        (0..1000).map(|_| Ok(frame.clone())).collect::<Vec<_>>(),
+                    ))
+                    .chain(stream::iter(suffix))
                     .chain(stream::iter([Ok(completed.clone())]));
-                let (tx, mut rx) = mpsc::channel(16);
+                let (tx, mut rx) = response_event_channel(16);
                 let start = std::time::Instant::now();
                 let producer = tokio::spawn(process_sse(
                     Box::pin(chunks),
@@ -777,14 +810,15 @@ mod tests {
 
     #[tokio::test]
     async fn transport_audit_comment_flood_yields_for_cancellation() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         let consumed = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&consumed);
         let chunks = stream::iter(0..4096).map(move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok(Bytes::from_static(b": keepalive\n\n"))
         });
-        let (tx, rx) = mpsc::channel(2);
+        let (tx, rx) = response_event_channel(2);
         let producer = tokio::spawn(process_sse(Box::pin(chunks), tx, idle_timeout(), None));
         tokio::task::yield_now().await;
         assert!(
@@ -805,7 +839,7 @@ mod tests {
             r#"{"type":"response.completed","response":{"id":"same"}}"#,
         ]
         .map(|payload| Ok(Bytes::from(format!("data: {payload}\n\n"))));
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = response_event_channel(1);
         let producer = tokio::spawn(process_sse(
             Box::pin(stream::iter(chunks)),
             tx,
@@ -860,7 +894,7 @@ mod tests {
                 b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n",
             ))
         });
-        let (tx, mut rx) = mpsc::channel(2);
+        let (tx, mut rx) = response_event_channel(2);
         process_sse(
             Box::pin(chunks),
             tx,
@@ -971,7 +1005,7 @@ mod tests {
             let reader = std::io::Cursor::new(format!("{invalid_sse}{completed_sse}"));
             let stream =
                 ReaderStream::new(reader).map_err(|err| TransportError::Network(err.to_string()));
-            let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(16);
+            let (tx, mut rx) = response_event_channel::<ApiError>(16);
             tokio::spawn(process_sse(
                 Box::pin(stream),
                 tx,
@@ -1009,12 +1043,14 @@ mod tests {
     #[tokio::test]
     async fn parses_reasoning_summary_done() {
         let events = run_sse(vec![
+            json!({"type":"response.output_item.added","item":{"type":"reasoning","id":"reasoning-1","summary":[]}}),
             json!({
                 "type": "response.reasoning_summary_text.done",
                 "item_id": "reasoning-1",
                 "summary_index": 0,
                 "text": "Checking",
             }),
+            json!({"type":"response.output_item.done","item":{"type":"reasoning","id":"reasoning-1","summary":[{"type":"summary_text","text":"Checking"}]}}),
             json!({
                 "type": "response.completed",
                 "response": { "id": "resp1" },
@@ -1023,7 +1059,7 @@ mod tests {
         .await;
 
         assert_matches!(
-            &events[0],
+            &events[1],
             ResponseEvent::ReasoningSummaryDone {
                 item_id,
                 text,
@@ -1124,17 +1160,21 @@ mod tests {
     #[tokio::test]
     async fn parses_tool_call_input_deltas() {
         let events = run_sse(vec![
+            json!({"type":"response.output_item.added","item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":""}}),
             json!({
                 "type": "response.custom_tool_call_input.delta",
                 "item_id": "ctc_1",
                 "call_id": "call_1",
                 "delta": "*** Begin",
             }),
+            json!({"type":"response.output_item.done","item":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"apply_patch","input":"*** Begin"}}),
+            json!({"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_2","name":"marker","arguments":""}}),
             json!({
                 "type": "response.function_call_arguments.delta",
                 "item_id": "fc_1",
                 "delta": "{\"input\":\"",
             }),
+            json!({"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_2","name":"marker","arguments":"{\"input\":\""}}),
             json!({
                 "type": "response.completed",
                 "response": { "id": "resp1" }
@@ -1143,7 +1183,7 @@ mod tests {
         .await;
 
         assert_matches!(
-            &events[0],
+            &events[1],
             ResponseEvent::ToolCallInputDelta {
                 item_id,
                 call_id: Some(call_id),
@@ -1151,11 +1191,11 @@ mod tests {
             } if item_id == "ctc_1" && call_id == "call_1" && delta == "*** Begin"
         );
         assert_matches!(
-            &events[1],
+            &events[4],
             ResponseEvent::ToolCallInputDelta { item_id, call_id: None, delta }
                 if item_id == "fc_1" && delta == "{\"input\":\""
         );
-        assert_matches!(&events[2], ResponseEvent::Completed { .. });
+        assert_matches!(&events[6], ResponseEvent::Completed { .. });
     }
 
     #[tokio::test]
@@ -1170,7 +1210,7 @@ mod tests {
         let stream = stream::iter(vec![Ok(Bytes::from(sse1))]).chain(stream::pending());
         let stream: ByteStream = Box::pin(stream);
 
-        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let (tx, mut rx) = response_event_channel::<ApiError>(8);
         tokio::spawn(process_sse(
             stream,
             tx,
@@ -1206,7 +1246,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_response_stream_cancels_upstream_without_idle_timeout() {
         let stream: ByteStream = Box::pin(stream::pending());
-        let (tx, rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1);
+        let (tx, rx) = response_event_channel::<ApiError>(1);
         let task = tokio::spawn(process_sse(
             stream,
             tx,
@@ -1226,11 +1266,19 @@ mod tests {
         event: &'a Result<ResponseEvent, ApiError>,
         expected_response_id: &str,
     ) -> &'a ApiError {
-        let Err(ApiError::TerminalResponse { source, response_id, token_usage }) = event else {
+        let Err(ApiError::TerminalResponse {
+            source,
+            response_id,
+            token_usage,
+        }) = event
+        else {
             panic!("expected terminal response error: {event:?}");
         };
         assert_eq!(response_id.as_deref(), Some(expected_response_id));
-        assert!(token_usage.is_none(), "these failed responses contain no usage");
+        assert!(
+            token_usage.is_none(),
+            "these failed responses contain no usage"
+        );
         source
     }
 
@@ -1244,7 +1292,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        match terminal_error_source(&events[0], "resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894") {
+        match terminal_error_source(
+            &events[0],
+            "resp_689bcf18d7f08194bf3440ba62fe05d803fee0cdac429894",
+        ) {
             ApiError::Retryable { message, delay } => {
                 assert_eq!(
                     message,
@@ -1264,7 +1315,7 @@ mod tests {
         let raw_error = r#"{"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"too long"}}}"#;
         let sse = format!("event: response.failed\ndata: {raw_error}\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(sse))]).chain(stream::pending());
-        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(8);
+        let (tx, mut rx) = response_event_channel::<ApiError>(8);
         tokio::spawn(process_sse(
             Box::pin(stream),
             tx,
@@ -1294,7 +1345,10 @@ mod tests {
         assert_eq!(events.len(), 1);
 
         assert_matches!(
-            terminal_error_source(&events[0], "resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b"),
+            terminal_error_source(
+                &events[0],
+                "resp_5c66275b97b9baef1ed95550adb3b7ec13b17aafd1d2f11b"
+            ),
             ApiError::ContextWindowExceeded
         );
     }
@@ -1309,7 +1363,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        assert_matches!(terminal_error_source(&events[0], "resp_fatal_newline"), ApiError::ContextWindowExceeded);
+        assert_matches!(
+            terminal_error_source(&events[0], "resp_fatal_newline"),
+            ApiError::ContextWindowExceeded
+        );
     }
 
     #[tokio::test]
@@ -1322,7 +1379,10 @@ mod tests {
 
         assert_eq!(events.len(), 1);
 
-        assert_matches!(terminal_error_source(&events[0], "resp_fatal_quota"), ApiError::QuotaExceeded);
+        assert_matches!(
+            terminal_error_source(&events[0], "resp_fatal_quota"),
+            ApiError::QuotaExceeded
+        );
     }
 
     #[tokio::test]
@@ -1544,7 +1604,7 @@ mod tests {
                 };
                 let telemetry = Arc::new(RecordingSseTelemetry::default());
                 let body = format!("event: {name}\ndata: {payload}\n\n");
-                let (tx, mut rx) = mpsc::channel(2);
+                let (tx, mut rx) = response_event_channel(2);
                 process_sse(
                     Box::pin(stream::iter([Ok(Bytes::from(body))])),
                     tx,
@@ -1597,7 +1657,7 @@ mod tests {
         ] {
             let telemetry = Arc::new(RecordingSseTelemetry::default());
             let bytes = stream::iter([Ok(Bytes::from(format!("data: {payload}\n\n")))]).chain(tail);
-            let (tx, mut rx) = mpsc::channel(8);
+            let (tx, mut rx) = response_event_channel(8);
             let task = tokio::spawn(process_sse(
                 Box::pin(bytes),
                 tx,
@@ -1637,7 +1697,7 @@ mod tests {
             b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n",
         ))])
         .chain(tail);
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = response_event_channel(8);
         let task = tokio::spawn(process_sse(
             Box::pin(bytes),
             tx,
@@ -1662,7 +1722,7 @@ mod tests {
         );
         let stream = ReaderStream::new(std::io::Cursor::new(body))
             .map_err(|err| TransportError::Network(err.to_string()));
-        let (tx, mut rx) = mpsc::channel::<Result<ResponseEvent, ApiError>>(2);
+        let (tx, mut rx) = response_event_channel::<ApiError>(2);
 
         tokio::spawn(process_sse(
             Box::pin(stream),
@@ -1964,6 +2024,7 @@ mod tests {
                 "response": { "id": "resp-1" },
                 "safety_buffering": false
             }),
+            json!({"type":"response.output_item.added","item":{"id":"m","type":"message","role":"assistant","content":[]}}),
             json!({
                 "type": "response.output_text.delta",
                 "delta": "hello",
@@ -1981,6 +2042,7 @@ mod tests {
                     "reasons": ["user_risk"]
                 }
             }),
+            json!({"type":"response.output_item.done","item":{"id":"m","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello world"}]}}),
             json!({
                 "type": "response.completed",
                 "response": { "id": "resp-1" },
@@ -1992,29 +2054,31 @@ mod tests {
         ])
         .await;
 
-        assert_eq!(events.len(), 7);
+        assert_eq!(events.len(), 9);
         assert_matches!(&events[0], ResponseEvent::Created);
+        assert_matches!(&events[1], ResponseEvent::OutputItemAdded(_));
         assert_matches!(
-            &events[1],
+            &events[2],
             ResponseEvent::SafetyBuffering(buffering)
                 if buffering.use_cases == ["cyber"]
                     && buffering.reasons == ["user_risk"]
                     && buffering.show_buffering_ui
                     && buffering.faster_model.as_deref() == Some("gpt-fast-wire")
         );
-        assert_matches!(&events[2], ResponseEvent::OutputTextDelta(delta) if delta == "hello");
+        assert_matches!(&events[3], ResponseEvent::OutputTextDelta(delta) if delta == "hello");
         assert_matches!(
-            &events[3],
+            &events[4],
             ResponseEvent::SafetyBuffering(buffering)
                 if buffering.use_cases == ["cyber"] && buffering.reasons == ["user_risk"]
         );
-        assert_matches!(&events[4], ResponseEvent::OutputTextDelta(delta) if delta == " world");
+        assert_matches!(&events[5], ResponseEvent::OutputTextDelta(delta) if delta == " world");
+        assert_matches!(&events[6], ResponseEvent::OutputItemDone(_));
         assert_matches!(
-            &events[5],
+            &events[7],
             ResponseEvent::SafetyBuffering(buffering)
                 if buffering.use_cases == ["cyber"] && buffering.reasons == ["user_risk"]
         );
-        assert_matches!(&events[6], ResponseEvent::Completed { response_id, .. } if response_id == "resp-1");
+        assert_matches!(&events[8], ResponseEvent::Completed { response_id, .. } if response_id == "resp-1");
     }
 
     #[test]
@@ -2164,7 +2228,7 @@ mod tests {
                 b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n",
             ))
         });
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = response_event_channel(8);
         process_sse(
             Box::pin(source),
             tx,
@@ -2185,7 +2249,7 @@ mod tests {
             b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"done\"}}\n\n"
                 .as_slice(),
         ];
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = response_event_channel(1);
         let consumer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let mut completed = false;
@@ -2207,7 +2271,7 @@ mod tests {
             "{",
             r#"{"type":"response.output_item.done","item":{"type":"message"}}"#,
         ] {
-            let (tx, mut rx) = mpsc::channel(8);
+            let (tx, mut rx) = response_event_channel(8);
             process_sse(
                 Box::pin(stream::iter([Ok(Bytes::from(format!(
                     "data: {payload}\n\n"
@@ -2237,6 +2301,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_orphan_delta_is_one_nonretryable_error_not_success() {
+        let frames = [
+            json!({"type":"response.created","response":{"id":"r"}}),
+            json!({"type":"response.output_text.delta","response_id":"r","item_id":"m","output_index":0,"delta":"lost"}),
+            json!({"type":"response.completed","response":{"id":"r","output":[],"end_turn":true}}),
+        ];
+        let source =
+            stream::iter(frames.map(|event| Ok(Bytes::from(format!("data: {event}\n\n")))));
+        let (tx, mut rx) = response_event_channel(8);
+        process_sse(Box::pin(source), tx, idle_timeout(), None).await;
+        assert!(matches!(rx.recv().await, Some(Ok(ResponseEvent::Created))));
+        assert!(!crate::map_api_error(rx.recv().await.unwrap().unwrap_err()).is_retryable());
+        assert!(
+            rx.recv().await.is_none(),
+            "no delta or successful terminal may escape"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn decoded_byte_pressure_preserves_order_and_does_not_become_provider_silence() {
+        for cancel in [false, true] {
+            let mut frames = vec![json!({"type":"response.created","response":{"id":"r"}})];
+            for index in 0..8 {
+                let item = json!({"id":format!("m{index}"),"type":"message","role":"assistant","content":[]});
+                frames.push(json!({"type":"response.output_item.added","item":item}));
+                frames.push(json!({"type":"response.output_text.delta","delta":"x".repeat(512)}));
+                frames.push(json!({"type":"response.output_item.done","item":{"id":format!("m{index}"),"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(512)}]}}));
+            }
+            frames.push(json!({"type":"response.completed","response":{"id":"r"}}));
+            let source = stream::iter(
+                frames
+                    .into_iter()
+                    .map(|event| Ok(Bytes::from(format!("data: {event}\n\n")))),
+            );
+            let (tx, mut rx) = crate::response_event_channel::channel_with_limit(1600, 1024);
+            let observer = tx.clone();
+            let producer = tokio::spawn(process_sse(
+                Box::pin(source),
+                tx,
+                Duration::from_millis(50),
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while rx.len() < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(observer.queued_payload_bytes() <= 1024);
+            assert!(observer.is_backpressured(512));
+            tokio::time::advance(Duration::from_millis(100)).await;
+            if cancel {
+                drop(rx);
+                producer.await.unwrap();
+                assert_eq!(observer.queued_payload_bytes(), 0);
+            } else {
+                drop(observer);
+                let (mut text, mut done, mut completed) = (String::new(), 0, 0);
+                while let Some(event) = rx.recv().await {
+                    match event.unwrap() {
+                        ResponseEvent::OutputTextDelta(delta) => text.push_str(&delta),
+                        ResponseEvent::OutputItemDone(_) => done += 1,
+                        ResponseEvent::Completed { .. } => completed += 1,
+                        _ => {}
+                    }
+                }
+                producer.await.unwrap();
+                assert_eq!(text, "x".repeat(8 * 512));
+                assert_eq!((done, completed), (8, 1));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn permanent_framing_failures_do_not_replay_network_errors_still_can() {
         let framed = bound_sse_events(
             Box::pin(stream::iter([Ok(Bytes::from_static(
@@ -2261,7 +2400,7 @@ mod tests {
                 true,
             ),
         ] {
-            let (tx, mut rx) = mpsc::channel(2);
+            let (tx, mut rx) = response_event_channel(2);
             process_sse(source, tx, idle_timeout(), None).await;
             let error = rx.recv().await.unwrap().unwrap_err();
             assert_eq!(

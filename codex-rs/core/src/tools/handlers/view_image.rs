@@ -229,6 +229,7 @@ impl ViewImageHandler {
         let image_url = data_url_from_bytes("application/octet-stream", &file_bytes);
 
         let item = TurnItem::ImageView(ImageViewItem {
+            environment: Some(turn_environment.provenance()),
             id: call_id,
             path: path_uri,
         });

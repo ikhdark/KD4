@@ -14,7 +14,9 @@ export type TurnStartParams = {threadId: string, clientUserMessageId?: string | 
  * independent runs such as A/B tests.
  */
 runIndependently?: boolean | null, input: Array<UserInput>, /**
- * Override the working directory for this turn and subsequent turns.
+ * Override the legacy host working directory for this and subsequent turns.
+ * When `environments` is omitted, only a selected local environment is
+ * retargeted; remote cwd values and an explicitly empty selection are preserved.
  */
 cwd?: string | null, /**
  * Override the approval policy for this turn and subsequent turns.

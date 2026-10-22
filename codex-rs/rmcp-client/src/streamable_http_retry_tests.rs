@@ -13,9 +13,14 @@ use super::*;
 #[tokio::test]
 async fn recovery_failure_is_shared_only_with_existing_waiters() -> anyhow::Result<()> {
     use futures::FutureExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-    use wiremock::matchers::{method, path};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::Request;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&attempts);
@@ -36,37 +41,74 @@ async fn recovery_failure_is_shared_only_with_existing_waiters() -> anyhow::Resu
     }).mount(&server).await;
     let home = tempfile::tempdir()?;
     let client = RmcpClient::new_streamable_http_client(
-        "recovery-test", home.path().to_path_buf(), &format!("{}/mcp", server.uri()),
-        Some("fixture".into()), None, None,
+        "recovery-test",
+        home.path().to_path_buf(),
+        &format!("{}/mcp", server.uri()),
+        Some("fixture".into()),
+        None,
+        None,
         codex_config::types::OAuthCredentialsStoreMode::File,
         codex_config::types::AuthKeyringBackendKind::default(),
-        Arc::new(codex_exec_server::ReqwestHttpClient), None,
-    ).await?;
-    client.initialize(
-        rmcp::model::InitializeRequestParams::new(Default::default(), rmcp::model::Implementation::new("test", "1")),
-        Some(Duration::from_secs(5)),
-        Box::new(|_, _| async { unreachable!() }.boxed()), Box::new(|_| async {}.boxed()),
-    ).await?;
-    let outcomes = futures::future::join_all((0..8).map(|_| client.list_tools(None, Some(Duration::from_secs(5))))).await;
+        Arc::new(codex_exec_server::ReqwestHttpClient),
+        None,
+    )
+    .await?;
+    client
+        .initialize(
+            rmcp::model::InitializeRequestParams::new(
+                Default::default(),
+                rmcp::model::Implementation::new("test", "1"),
+            ),
+            Some(Duration::from_secs(5)),
+            Box::new(|_, _| async { unreachable!() }.boxed()),
+            Box::new(|_| async {}.boxed()),
+        )
+        .await?;
+    let outcomes = futures::future::join_all(
+        (0..8).map(|_| client.list_tools(None, Some(Duration::from_secs(5)))),
+    )
+    .await;
     assert!(outcomes.iter().all(Result::is_err));
-    assert_eq!(attempts.load(Ordering::SeqCst), 4, "one initial handshake plus one three-attempt recovery episode");
-    let errors: Vec<_> = outcomes.into_iter().map(|result| format!("{:#}", result.unwrap_err())).collect();
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        4,
+        "one initial handshake plus one three-attempt recovery episode"
+    );
+    let errors: Vec<_> = outcomes
+        .into_iter()
+        .map(|result| format!("{:#}", result.unwrap_err()))
+        .collect();
     assert!(errors.windows(2).all(|pair| pair[0] == pair[1]));
-    assert!(client.list_tools(None, Some(Duration::from_secs(5))).await.is_err());
-    assert_eq!(attempts.load(Ordering::SeqCst), 7, "a later caller can start a new episode");
+    assert!(
+        client
+            .list_tools(None, Some(Duration::from_secs(5)))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        7,
+        "a later caller can start a new episode"
+    );
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
 async fn retry_advice_is_preserved_through_wrappers_and_deadline() {
     let error = rmcp::service::ClientInitializeError::TransportError {
-        error: DynamicTransportError::from_parts("streamable_http", TypeId::of::<()>(), Box::new(
-            StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
-                status: StatusCode::TOO_MANY_REQUESTS, body_preview: "busy".into(),
-                retry_after: Some(Duration::from_secs(2)),
-                retry_after_received_at: time::Instant::now(),
-            })
-        )), context: "send initialize request".into(),
+        error: DynamicTransportError::from_parts(
+            "streamable_http",
+            TypeId::of::<()>(),
+            Box::new(StreamableHttpError::Client(
+                StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "busy".into(),
+                    retry_after: Some(Duration::from_secs(2)),
+                    retry_after_received_at: time::Instant::now(),
+                },
+            )),
+        ),
+        context: "send initialize request".into(),
     };
     let error = anyhow::Error::new(HandshakeError { source: error });
     let delay = retry_delay(error.as_ref(), 250);
@@ -75,18 +117,21 @@ async fn retry_advice_is_preserved_through_wrappers_and_deadline() {
     assert!(sleep_with_retry_deadline(delay, None).await);
     assert_eq!(start.elapsed(), delay);
     let start = time::Instant::now();
-    assert!(!sleep_with_retry_deadline(delay, Some(Instant::now() + Duration::from_millis(100))).await);
+    assert!(
+        !sleep_with_retry_deadline(delay, Some(Instant::now() + Duration::from_millis(100))).await
+    );
     assert!(start.elapsed() <= Duration::from_millis(101));
 }
 
 #[tokio::test(start_paused = true)]
 async fn retry_advice_counts_cleanup_time_without_restarting_or_overflowing() {
-    let error = StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        body_preview: "busy".into(),
-        retry_after: Some(Duration::from_secs(10)),
-        retry_after_received_at: time::Instant::now(),
-    });
+    let error =
+        StreamableHttpError::Client(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body_preview: "busy".into(),
+            retry_after: Some(Duration::from_secs(10)),
+            retry_after_received_at: time::Instant::now(),
+        });
     tokio::time::advance(Duration::from_secs(4)).await;
     assert_eq!(retry_delay(&error, 250), Duration::from_secs(6));
     tokio::time::advance(Duration::from_secs(8)).await;
@@ -128,6 +173,7 @@ fn retryable_streamable_http_error_includes_remote_body_stream_failure() {
             ExecServerError::Server {
                 code: JSON_RPC_INTERNAL_ERROR_CODE,
                 message: "http/request failed: error sending request for url".to_string(),
+                data: None,
             },
         )),
         StreamableHttpError::Client(StreamableHttpClientAdapterError::HttpRequest(

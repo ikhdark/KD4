@@ -7,6 +7,7 @@ use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::ProviderKind;
 use codex_model_provider_info::built_in_model_providers;
 use codex_models_manager::test_support::test_models_response as bundled_models_response;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -357,6 +358,9 @@ fn remote_v2_compaction_response() -> String {
 fn local_compaction_provider(server: &wiremock::MockServer) -> ModelProviderInfo {
     let mut provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
     provider.name = "OpenAI-compatible test provider".to_string();
+    // OpenAI behavior, including remote compaction, follows the trusted registration
+    // kind rather than the display name.
+    provider.kind = ProviderKind::Custom;
     provider.base_url = Some(format!("{}/v1", server.uri()));
     provider.supports_websockets = false;
     provider
@@ -787,17 +791,36 @@ async fn wait_for_successful_turn_complete(codex: &codex_core::CodexThread) {
 async fn wait_for_failed_turn_complete(
     codex: &codex_core::CodexThread,
 ) -> codex_protocol::protocol::ErrorEvent {
-    let error = wait_for_event_match(codex, |event| match event {
-        EventMsg::Error(error) => Some(error.clone()),
-        _ => None,
-    })
-    .await;
-    let completed = wait_for_event_match(codex, |event| match event {
-        EventMsg::Error(duplicate) => panic!("duplicate terminal compaction error: {duplicate:?}"),
-        EventMsg::TurnComplete(completed) => Some(completed.clone()),
-        _ => None,
-    })
-    .await;
+    let mut error = None;
+    let mut started = Vec::new();
+    let mut finished = Vec::new();
+    let completed = loop {
+        match wait_for_event(codex, |_| true).await {
+            EventMsg::ItemStarted(codex_protocol::protocol::ItemStartedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => started.push(item.id),
+            EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => finished.push(item.id),
+            EventMsg::Error(event) => {
+                assert!(
+                    error.is_none(),
+                    "duplicate terminal compaction error: {event:?}"
+                );
+                error = Some(event);
+            }
+            EventMsg::TurnComplete(completed) => break completed,
+            _ => {}
+        }
+    };
+    let error = error.expect("compaction failure must be reported");
+    assert_eq!(started.len(), 1, "one compaction must start");
+    assert_eq!(
+        finished, started,
+        "every started compaction must complete exactly once, even on failure"
+    );
     assert_eq!(completed.error.as_ref(), Some(&error));
     error
 }
@@ -1022,8 +1045,14 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     // Second TokenCount: from the local post-compaction estimate.
     let last = wait_for_event_match(&codex, |ev| match ev {
         EventMsg::TokenCount(tc) => tc.info.as_ref().and_then(|info| {
-            assert_eq!(info.last_token_usage.total_tokens, 0, "local estimates must not rewrite the last provider observation");
-            assert_eq!(info.total_token_usage.total_tokens, 0, "local estimates must not invent consumption");
+            assert_eq!(
+                info.last_token_usage.total_tokens, 0,
+                "local estimates must not rewrite the last provider observation"
+            );
+            assert_eq!(
+                info.total_token_usage.total_tokens, 0,
+                "local estimates must not invent consumption"
+            );
             info.estimated_context_tokens
         }),
         _ => None,
@@ -1133,6 +1162,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     let test = test_codex()
         .with_config(move |config| {
             config.model_provider.name = non_openai_provider_name;
+            // OpenAI request shaping (retained item IDs and passthrough metadata) follows
+            // the trusted registration kind rather than the display name.
+            config.model_provider.kind = ProviderKind::Custom;
             set_test_compact_prompt(config);
         })
         .build(&server)
@@ -1696,8 +1728,11 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                         .and_then(|content| content.first())
                         .and_then(|item| item.get("text"))
                         .and_then(Value::as_str);
+                    // The injected context envelope leads with the user-role skill
+                    // catalog when one is available.
                     text.is_none_or(|text| {
                         !text.starts_with("<environment_context>")
+                            && !text.starts_with("<skills_instructions>")
                             && text != SUMMARIZATION_PROMPT
                             && text != INCREMENTAL_SUMMARIZATION_PROMPT
                     })
@@ -3541,6 +3576,70 @@ async fn manual_compact_non_retryable_failure_is_not_retried() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provider_overflow_compaction_failure_is_reported_once() {
+    require_network!();
+
+    let server = start_mock_server().await;
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(sse_failed(
+                "resp-overflow",
+                "context_length_exceeded",
+                CONTEXT_LIMIT_MESSAGE,
+            )),
+            invalid_request_response("permanent compact failure"),
+        ],
+    )
+    .await;
+
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(0);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200_000);
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+    let codex = &test.codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "first turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit user input");
+    // The provider overflow starts mid-turn recovery, whose local compaction
+    // then fails permanently. That one failure ends the turn with one error.
+    let error = wait_for_failed_turn_complete(codex).await;
+    assert!(
+        error.message.contains("permanent compact failure"),
+        "{error:?}"
+    );
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "overflow recovery makes one compact request and does not sample again"
+    );
+    assert!(body_contains_text(
+        &requests[1].body_json().to_string(),
+        SUMMARIZATION_PROMPT
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_rejects_invalid_summary_without_committing_output() {
     assert_manual_compact_corrective_retry(false).await;
 }
@@ -4933,8 +5032,11 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
     let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
+            // Turn-ending responses answer; an empty completion spends the bounded
+            // missing-answer repair on another request.
             responses::sse(vec![
                 responses::ev_response_created("first-response"),
+                responses::ev_assistant_message("first-message", "first done"),
                 responses::ev_completed("first-response"),
             ]),
             responses::sse(vec![
@@ -4944,6 +5046,7 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
             ]),
             responses::sse(vec![
                 responses::ev_response_created("follow-up-response"),
+                responses::ev_assistant_message("follow-up-message", "follow-up done"),
                 responses::ev_completed("follow-up-response"),
             ]),
         ],
@@ -5165,17 +5268,22 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
+            // Turn-ending responses answer; an empty completion spends the bounded
+            // missing-answer repair on another request.
             responses::sse(vec![
                 responses::ev_response_created("remote-v2-initial-response"),
+                responses::ev_assistant_message("remote-v2-initial-message", "initial done"),
                 responses::ev_completed("remote-v2-initial-response"),
             ]),
             remote_v2_compaction_response(),
             responses::sse(vec![
                 responses::ev_response_created("remote-v2-follow-up-response"),
+                responses::ev_assistant_message("remote-v2-follow-up-message", "follow-up done"),
                 responses::ev_completed("remote-v2-follow-up-response"),
             ]),
             responses::sse(vec![
                 responses::ev_response_created("remote-v2-resumed-response"),
+                responses::ev_assistant_message("remote-v2-resumed-message", "resumed done"),
                 responses::ev_completed("remote-v2-resumed-response"),
             ]),
         ],

@@ -295,6 +295,7 @@ impl ExecutorFileSystem for FailingFileSystem {
 struct TestConfig {
     config: Config,
     user_instructions: Option<UserInstructions>,
+    _codex_home: TempDir,
 }
 
 impl Deref for TestConfig {
@@ -383,6 +384,7 @@ fn rendered_project_doc(path: &PathUri, contents: &str) -> String {
 fn stable_context_loaded(entries: &[(&str, &str)]) -> LoadedAgentsMd {
     let cwd = PathUri::parse("file:///stable-context-repository").expect("cwd URI");
     LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: entries
             .iter()
@@ -429,6 +431,7 @@ fn repository_stable_context_identity_covers_sources_order_scope_and_content() {
 fn repository_stable_context_bundle_is_a_pure_derived_value() {
     let cwd = PathUri::parse("file:///stable-context-cache-test").expect("cwd URI");
     let loaded = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: vec![InstructionEntry {
             contents: "cache-test-unique-instructions".to_string(),
@@ -494,6 +497,7 @@ fn foreign_agents_md_uses_environment_native_paths() {
     );
     let source_path = cwd.join("AGENTS.md").expect("AGENTS.md URI");
     let loaded = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: vec![InstructionEntry {
             contents: "remote instructions".to_string(),
@@ -529,6 +533,7 @@ fn multi_environment_agents_md_renders_mixed_path_conventions() {
         .join("AGENTS.md")
         .expect("Windows AGENTS.md URI");
     let loaded = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: vec![
             InstructionEntry {
@@ -598,6 +603,7 @@ async fn make_config(root: &TempDir, limit: usize, instructions: Option<&str>) -
     TestConfig {
         config,
         user_instructions,
+        _codex_home: codex_home,
     }
 }
 
@@ -648,6 +654,7 @@ async fn make_config_with_project_root_markers(
     TestConfig {
         config,
         user_instructions,
+        _codex_home: codex_home,
     }
 }
 
@@ -691,6 +698,7 @@ fn empty_loaded_instructions_are_empty() {
 #[test]
 fn loaded_instructions_with_only_empty_or_whitespace_entries_are_empty() {
     let empty = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: vec![InstructionEntry {
             contents: String::new(),
@@ -698,6 +706,7 @@ fn loaded_instructions_with_only_empty_or_whitespace_entries_are_empty() {
         }],
     };
     let whitespace = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: vec![InstructionEntry {
             contents: " \n\t".to_string(),
@@ -884,6 +893,8 @@ async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice(
     let nearest_path = candidates.last().expect("nearest candidate").path.clone();
     let config = make_config(&tmp, SOURCE_LIMIT, /*instructions*/ None).await;
     let discovery = ProjectInstructionsDiscovery {
+        environment_labels_required: false,
+        complete: true,
         environments: vec![EnvironmentProjectInstructionsDiscovery {
             environment_id: "local".to_string(),
             cwd: PathUri::from_abs_path(&tmp.path().abs()),
@@ -917,6 +928,10 @@ async fn rendered_project_doc_overhead_uses_a_bounded_aggregate_omission_notice(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "Hold the manifest owner to prove cached consumers do not queue behind stalled verification"
+)]
 async fn omitted_multi_environment_paths_are_exact_and_overflow_is_recoverable() {
     let tmp = tempfile::tempdir().unwrap();
     let config = make_config(&tmp, 1, None).await;
@@ -971,6 +986,43 @@ async fn omitted_multi_environment_paths_are_exact_and_overflow_is_recoverable()
         owner.notice(&config, &documents).await,
         notice,
         "unchanged manifest reuses its artifact and prompt identity"
+    );
+    assert!(owner.cached_manifest_available().await);
+    let in_flight_owner = owner.cached.lock().await;
+    assert!(
+        !tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            owner.cached_manifest_available(),
+        )
+        .await
+        .expect("cached consumers must not queue behind stalled verification")
+    );
+    drop(in_flight_owner);
+    let artifact_id = call["artifact_id"].as_str().unwrap();
+    fs::remove_file(
+        config
+            .codex_home
+            .join("tool-output/instructions-test")
+            .join(format!("{artifact_id}.log")),
+    )
+    .unwrap();
+    assert!(!owner.cached_manifest_available().await);
+    let replacement = owner.notice(&config, &documents).await;
+    assert!(!replacement.contains(artifact_id));
+    let recipe: serde_json::Value =
+        serde_json::from_str(replacement.split("read_tool_output: ").nth(1).unwrap()).unwrap();
+    let (recovered, _) =
+        crate::tools::command_output_artifact::read_tool_output_selectors_with_reuse(
+            config.codex_home.as_path(),
+            "instructions-test",
+            recipe["artifact_id"].as_str().unwrap(),
+            serde_json::from_value(recipe["selectors"].clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.results[0].value,
+        Some(serde_json::to_value(&documents).unwrap())
     );
 }
 
@@ -1029,6 +1081,7 @@ async fn total_byte_limit_preserves_nearest_doc_and_notices_broader_truncation()
         /*retained_bytes*/ 1,
     );
     let expected = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: vec![
             InstructionEntry {
@@ -1766,7 +1819,7 @@ async fn independent_environment_discovery_runs_concurrently_and_preserves_selec
 }
 
 #[tokio::test]
-async fn secondary_only_project_doc_uses_single_contributor_layout() {
+async fn secondary_only_project_doc_keeps_selected_environment_label() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
     fs::write(secondary.path().join("AGENTS.md"), "secondary doc").unwrap();
@@ -1788,11 +1841,14 @@ async fn secondary_only_project_doc_uses_single_contributor_layout() {
     );
 
     assert_eq!(loaded.legacy_text(), inner);
-    assert_eq!(loaded.text(), inner);
-    let expected_fragment = format!(
-        "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{inner}\n</INSTRUCTIONS>",
-        secondary.path().display()
+    let inner = format!(
+        "global instructions\n\nfor `secondary` with cwd {}\n\n{}",
+        secondary.path().display(),
+        rendered_project_doc(&source, "secondary doc")
     );
+    assert_eq!(loaded.text(), inner);
+    let expected_fragment =
+        format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{inner}\n</INSTRUCTIONS>");
     assert_eq!(
         loaded.contextual_user_fragment().render(),
         expected_fragment
@@ -1800,7 +1856,7 @@ async fn secondary_only_project_doc_uses_single_contributor_layout() {
 }
 
 #[tokio::test]
-async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_environments() {
+async fn primary_only_project_doc_keeps_selected_environment_label() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
     fs::write(primary.path().join("AGENTS.md"), "primary doc").unwrap();
@@ -1822,11 +1878,14 @@ async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_en
     );
 
     assert_eq!(loaded.legacy_text(), inner);
-    assert_eq!(loaded.text(), inner);
-    let expected_fragment = format!(
-        "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\n{inner}\n</INSTRUCTIONS>",
-        primary.path().display()
+    let inner = format!(
+        "global instructions\n\nfor `primary` with cwd {}\n\n{}",
+        primary.path().display(),
+        rendered_project_doc(&source, "primary doc")
     );
+    assert_eq!(loaded.text(), inner);
+    let expected_fragment =
+        format!("# AGENTS.md instructions\n\n<INSTRUCTIONS>\n{inner}\n</INSTRUCTIONS>");
     assert_eq!(
         loaded.contextual_user_fragment().render(),
         expected_fragment
@@ -2020,6 +2079,7 @@ async fn concatenates_root_and_cwd_docs() {
     let root_agents = repo.path().join("AGENTS.md").abs();
     let crate_agents = cfg.cwd.join("AGENTS.md");
     let expected = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: None,
         entries: vec![
             InstructionEntry {
@@ -2089,7 +2149,7 @@ async fn project_root_markers_are_honored_for_agents_discovery() {
 }
 
 #[tokio::test]
-async fn agents_md_uses_matching_config_project_root() {
+async fn agents_md_revalidates_matching_config_project_root() {
     let root = tempfile::tempdir().expect("tempdir");
     fs::write(root.path().join(".codex-root"), "").expect("project marker");
     fs::write(root.path().join("AGENTS.md"), "root doc").expect("root doc");
@@ -2111,12 +2171,13 @@ async fn agents_md_uses_matching_config_project_root() {
     let config = TestConfig {
         config,
         user_instructions: None,
+        _codex_home: codex_home,
     };
 
     let discovery = agents_md_paths(&config).await.expect("discover paths");
-    assert_eq!(
-        discovery,
-        vec![PathUri::from_abs_path(&root.path().join("AGENTS.md").abs())]
+    assert!(
+        discovery.is_empty(),
+        "a removed root marker cannot keep parent instructions applicable"
     );
 }
 
@@ -2138,8 +2199,6 @@ async fn activation_metric_distinguishes_agents_md_project_discovery_hit_and_mis
         .build()
         .await
         .expect("config with project discovery");
-    fs::remove_file(root.path().join(".codex-root")).expect("remove marker after snapshot");
-
     let metrics = MetricsClient::new(
         MetricsConfig::in_memory(
             "test",
@@ -2164,6 +2223,12 @@ async fn activation_metric_distinguishes_agents_md_project_discovery_hit_and_mis
         project_doc_paths(hit),
         vec![PathUri::from_abs_path(&root.path().join("AGENTS.md").abs())]
     );
+    fs::remove_file(root.path().join(".codex-root")).expect("remove marker after snapshot");
+    let changed =
+        super::agents_md_paths_with_metrics(&config, &cwd, LOCAL_FS.as_ref(), true, Some(&metrics))
+            .await
+            .expect("revalidated discovery");
+    assert!(changed.is_empty());
     let miss = super::agents_md_paths_with_metrics(
         &config,
         &cwd,
@@ -2214,6 +2279,12 @@ async fn activation_metric_distinguishes_agents_md_project_discovery_hit_and_mis
                 "agents_md".to_string(),
                 "hit".to_string(),
                 "matched".to_string(),
+                1,
+            ),
+            (
+                "agents_md".to_string(),
+                "miss".to_string(),
+                "boundary_changed".to_string(),
                 1,
             ),
             (
@@ -2310,6 +2381,7 @@ async fn instruction_sources_include_global_before_agents_md_docs() {
     let project_agents = cfg.cwd.join("AGENTS.md");
 
     let expected = LoadedAgentsMd {
+        environment_labels_required: false,
         user_instructions: Some(UserInstructions {
             text: "global doc".to_string(),
             source: global_agents.clone(),
@@ -2545,6 +2617,8 @@ async fn applicable_instruction_loading_has_no_inventory_wait() {
         .unwrap();
 
     let discovery = ProjectInstructionsDiscovery {
+        environment_labels_required: false,
+        complete: true,
         environments: vec![EnvironmentProjectInstructionsDiscovery {
             environment_id: "local".to_string(),
             cwd: PathUri::from_abs_path(&cwd),
@@ -2583,6 +2657,8 @@ async fn failed_discovery_preserves_truncated_source_without_charging_generated_
     );
     assert_eq!(previous.loaded.as_ref().unwrap().text(), expected);
     let discovery = ProjectInstructionsDiscovery {
+        environment_labels_required: false,
+        complete: true,
         environments: vec![EnvironmentProjectInstructionsDiscovery {
             environment_id: "local".to_string(),
             cwd: PathUri::from_abs_path(&config.cwd),
@@ -2770,6 +2846,8 @@ async fn failed_discovery_shares_rendered_overhead_and_omission_budget() {
     for label_bytes in [1, 1024, 3072] {
         let ids = ["a".repeat(label_bytes), "b".repeat(label_bytes)];
         let discovery = |failed: bool| ProjectInstructionsDiscovery {
+            environment_labels_required: false,
+            complete: true,
             environments: ids
                 .iter()
                 .enumerate()
@@ -2868,6 +2946,8 @@ async fn failed_discovery_requires_matching_accepted_source_identity() {
             sources.clear();
         }
         let discovery = ProjectInstructionsDiscovery {
+            environment_labels_required: false,
+            complete: true,
             environments: vec![EnvironmentProjectInstructionsDiscovery {
                 environment_id: if case == "environment" {
                     "other"
@@ -2902,5 +2982,161 @@ async fn failed_discovery_requires_matching_accepted_source_identity() {
         assert_eq!(retained.complete, case == "healthy_empty");
         assert!(retained.loaded.is_none(), "case={case}");
         assert!(retained.retained_sources.is_empty(), "case={case}");
+    }
+}
+#[tokio::test]
+async fn a_single_contributor_keeps_its_environment_label_in_a_multi_environment_scope() {
+    let tmp = TempDir::new().unwrap();
+    let document = tmp.path().join("AGENTS.md");
+    std::fs::write(&document, "ONLY_SECONDARY_RULES").unwrap();
+    let config = make_config(&tmp, 4096, None).await;
+    let cwd = PathUri::from_abs_path(&tmp.abs());
+    let discovery_for = |include_empty_environment| ProjectInstructionsDiscovery {
+        environment_labels_required: true,
+        complete: include_empty_environment,
+        environments: {
+            let mut discoveries = vec![EnvironmentProjectInstructionsDiscovery {
+                environment_id: "secondary".into(),
+                cwd: cwd.clone(),
+                filesystem: std::sync::Arc::clone(&codex_exec_server::LOCAL_FS),
+                result: Ok(vec![ProjectDocCandidate {
+                    path: PathUri::from_abs_path(&document.abs()),
+                    size: 20,
+                }]),
+            }];
+            if include_empty_environment {
+                discoveries.push(EnvironmentProjectInstructionsDiscovery {
+                    environment_id: "empty-primary".into(),
+                    cwd: cwd.clone(),
+                    filesystem: std::sync::Arc::clone(&codex_exec_server::LOCAL_FS),
+                    result: Ok(Vec::new()),
+                });
+            }
+            discoveries
+        },
+    };
+    // Both an empty ready primary and an unresolved selected primary require labels.
+    for include_empty_environment in [true, false] {
+        let loaded = load_project_instructions_with_fallback(
+            &config.config,
+            None,
+            discovery_for(include_empty_environment),
+            None,
+            None,
+        )
+        .await
+        .loaded
+        .expect("secondary instructions");
+        assert!(loaded.text().contains("secondary"));
+        assert!(loaded.render_stable_context().text.contains("secondary"));
+        assert!(
+            loaded
+                .render_stable_context()
+                .text
+                .contains("ONLY_SECONDARY_RULES")
+        );
+    }
+}
+
+#[tokio::test]
+async fn marker_creation_revalidates_scope_even_when_the_old_marker_survives() {
+    for initial_marker in [true, false] {
+        let root = TempDir::new().unwrap();
+        let nested = root.path().join("crate");
+        fs::create_dir(&nested).unwrap();
+        fs::write(root.path().join("AGENTS.md"), "parent rule").unwrap();
+        fs::write(nested.join("AGENTS.md"), "child rule").unwrap();
+        if initial_marker {
+            fs::write(root.path().join(".codex-root"), "").unwrap();
+        }
+        let home = TempDir::new().unwrap();
+        let config = ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .fallback_cwd(Some(nested.clone()))
+            .cli_overrides(vec![(
+                "project_root_markers".into(),
+                TomlValue::Array(vec![TomlValue::String(".codex-root".into())]),
+            )])
+            .build()
+            .await
+            .unwrap();
+        let cwd = PathUri::from_abs_path(&nested.abs());
+        let added = if initial_marker {
+            nested.join(".codex-root")
+        } else {
+            root.path().join(".codex-root")
+        };
+        fs::create_dir(&added).unwrap();
+        let paths = super::agents_md_paths(&config, &cwd, LOCAL_FS.as_ref(), true)
+            .await
+            .unwrap();
+        let expected = if initial_marker {
+            vec![PathUri::from_abs_path(&nested.join("AGENTS.md").abs())]
+        } else {
+            vec![
+                PathUri::from_abs_path(&root.path().join("AGENTS.md").abs()),
+                PathUri::from_abs_path(&nested.join("AGENTS.md").abs()),
+            ]
+        };
+        assert_eq!(project_doc_paths(paths), expected);
+        let calls = Arc::new(MetadataCallCounts::default());
+        let failing = FailingFileSystem {
+            path: added.abs(),
+            failure: InjectedFailure::Metadata(io::ErrorKind::PermissionDenied),
+            metadata_calls: calls,
+        };
+        assert_eq!(
+            super::agents_md_paths(&config, &cwd, &failing, true)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+}
+
+#[tokio::test]
+async fn final_encoded_project_payload_obeys_the_rendered_budget() {
+    const LIMIT: usize = 32_768;
+    let root = TempDir::new().unwrap();
+    let document = root.path().join("AGENTS.md");
+    let mut config = make_config(&root, LIMIT, None).await;
+    for source in [
+        "a".repeat(LIMIT),
+        format!("{}aaaaaaaa", "<INSTRUCTIONS>".repeat(2340)),
+        "</INSTRUCTIONS><AGENTS_MD_OBSERVATION></AGENTS_MD_OBSERVATION>λ".repeat(1000),
+    ] {
+        fs::write(&document, &source).unwrap();
+        for limit in [1, 128, LIMIT] {
+            config.project_doc_max_bytes = limit;
+            let environments = resolved_local_environments([
+                ("<INSTRUCTIONS>secondary</INSTRUCTIONS>", root.abs()),
+                ("empty", root.path().join("empty").abs()),
+            ]);
+            fs::create_dir_all(root.path().join("empty")).unwrap();
+            let loaded = load_project_instructions(&config.config, None, &environments).await;
+            assert!(loaded.complete);
+            let loaded = loaded.loaded.unwrap();
+            let fragment = loaded.contextual_user_fragment().render();
+            let body = fragment
+                .split_once("<INSTRUCTIONS>\n")
+                .unwrap()
+                .1
+                .strip_suffix("\n</INSTRUCTIONS>")
+                .unwrap();
+            assert!(
+                body.len() <= limit + 4096,
+                "encoded project payload: {}",
+                body.len()
+            );
+            assert_eq!(fragment.matches("</INSTRUCTIONS>").count(), 1);
+            assert_eq!(fragment.matches("<INSTRUCTIONS>").count(), 1);
+            if source == "a".repeat(LIMIT) && limit == LIMIT {
+                assert!(
+                    body.contains(&source),
+                    "ordinary source that fits is unchanged"
+                );
+            }
+        }
     }
 }

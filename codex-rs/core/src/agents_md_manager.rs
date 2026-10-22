@@ -38,6 +38,7 @@ struct AgentsMdCache {
     loaded: Option<Arc<LoadedAgentsMd>>,
     retained_sources: Vec<crate::agents_md::RetainedProjectDoc>,
     stable_context: Option<RepositoryStableContextBundle>,
+    recovered_snapshot: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -65,6 +66,24 @@ struct AgentsMdCacheKey {
 }
 
 impl AgentsMdCacheKey {
+    /// Persist scope evidence, not process-local Arc addresses. A resumed
+    /// aggregate without matching evidence remains an opaque original-scope
+    /// fallback; it must not seed the current environment's source cache.
+    fn persisted_scope(&self, environments: &TurnEnvironmentSnapshot) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "active_cwd": self.active_cwd,
+            "environment_generation": self.environment_generation,
+            "ready_environments": environments.turn_environments.iter()
+                .map(|environment| (environment.selection(), environment.owner_id()))
+                .collect::<Vec<_>>(),
+            "starting_environments": self.starting_environments,
+            "project_doc_max_bytes": self.project_doc_max_bytes,
+            "fallback_filenames": self.fallback_filenames,
+            "project_root_markers": self.project_root_markers,
+        })
+    }
+
     #[cfg(test)]
     fn capture(config: &Config, environments: &TurnEnvironmentSnapshot) -> Self {
         let project_root_markers = effective_project_root_markers(config);
@@ -101,6 +120,26 @@ impl AgentsMdCacheKey {
 }
 
 impl AgentsMdCache {
+    fn unverified_recovery_observation(&self, freshness: AgentsMdFreshness) -> AgentsMdObservation {
+        let loaded = self
+            .loaded
+            .as_ref()
+            .map(|loaded| Arc::new(loaded.without_unverified_omission_receipts()));
+        let stable_context = loaded.as_ref().zip(self.key.as_ref()).map(|(loaded, key)| {
+            let mut bundle = loaded.stable_context_bundle(&key.active_cwd);
+            bundle.source_snapshot = self
+                .stable_context
+                .as_ref()
+                .and_then(|previous| previous.source_snapshot.clone());
+            bundle
+        });
+        AgentsMdObservation {
+            loaded,
+            stable_context,
+            freshness,
+        }
+    }
+
     fn cached_observation(&self, freshness: AgentsMdFreshness) -> AgentsMdObservation {
         AgentsMdObservation {
             loaded: self.loaded.clone(),
@@ -128,6 +167,52 @@ impl AgentsMdManager {
     pub(crate) fn with_thread_id(mut self, thread_id: String) -> Self {
         self.omission_recovery = Some(crate::agents_md::ProjectDocOmissionRecovery::new(thread_id));
         self
+    }
+
+    pub(crate) async fn restore_accepted_sources(
+        &self,
+        config: &Config,
+        environments: &TurnEnvironmentSnapshot,
+        value: &serde_json::Value,
+    ) {
+        let Some((loaded, sources)) =
+            LoadedAgentsMd::restore_project_sources(value, config, self.user_instructions.clone())
+        else {
+            return;
+        };
+        let _permit = self.refresh_gate.acquire().await;
+        let key = AgentsMdCacheKey::capture_with_markers(
+            config,
+            environments,
+            &self.project_root_markers(config),
+        );
+        if value.get("observation_scope") != Some(&key.persisted_scope(environments)) {
+            return;
+        }
+        let mut cache = self.cache.lock().await;
+        let mut bundle = loaded.stable_context_bundle(&key.active_cwd);
+        bundle.source_snapshot = Some(value.clone());
+        cache.key = Some(key);
+        cache.loaded = Some(Arc::new(loaded));
+        cache.retained_sources = sources;
+        cache.stable_context = Some(bundle);
+    }
+
+    pub(crate) async fn restore_repository_snapshot(
+        &self,
+        config: &Config,
+        environments: &TurnEnvironmentSnapshot,
+        snapshot: &serde_json::Value,
+    ) {
+        if let Some(sources) = snapshot.get("source_snapshot") {
+            self.restore_accepted_sources(config, environments, sources)
+                .await;
+        }
+        self.cache.lock().await.recovered_snapshot = Some(snapshot.clone());
+    }
+
+    pub(crate) async fn recovered_snapshot(&self) -> Option<serde_json::Value> {
+        self.cache.lock().await.recovered_snapshot.clone()
     }
 
     fn project_root_markers(&self, config: &Config) -> Arc<[String]> {
@@ -242,7 +327,7 @@ impl AgentsMdManager {
         if let Ok(cache) = self.cache.try_lock()
             && cache.key.as_ref() == Some(&key)
         {
-            return cache.cached_observation(AgentsMdFreshness::CachedFallback);
+            return cache.unverified_recovery_observation(AgentsMdFreshness::CachedFallback);
         }
         let loaded = self.user_instructions.as_ref().map(|instructions| {
             Arc::new(LoadedAgentsMd::new_user(
@@ -303,6 +388,7 @@ impl AgentsMdManager {
         .await;
         let mut cache = self.cache.lock().await;
         let freshness = if load.complete {
+            cache.recovered_snapshot = None;
             AgentsMdFreshness::Refreshed
         } else if previous.is_some() {
             AgentsMdFreshness::CachedFallback
@@ -310,6 +396,12 @@ impl AgentsMdManager {
             AgentsMdFreshness::IncompleteRead
         };
         let loaded = load.loaded;
+        let source_snapshot = loaded.as_ref().map(|loaded| {
+            let mut snapshot =
+                loaded.accepted_project_sources(&key.active_cwd, &load.retained_sources);
+            snapshot["observation_scope"] = key.persisted_scope(environments);
+            snapshot
+        });
         cache.retained_sources = load.retained_sources;
         let semantically_unchanged = cache.key.as_ref() == Some(&key)
             && match (cache.loaded.as_ref(), loaded.as_ref()) {
@@ -334,21 +426,38 @@ impl AgentsMdManager {
             cache.key = Some(key);
             cache.loaded = loaded;
             cache.stable_context = stable_context;
+            if let Some(bundle) = cache.stable_context.as_mut() {
+                bundle.source_snapshot = source_snapshot;
+            }
             return AgentsMdObservation {
                 loaded: cache.loaded.clone(),
                 stable_context: cache.stable_context.clone(),
                 freshness,
             };
         }
+        if let Some(bundle) = cache.stable_context.as_mut() {
+            bundle.source_snapshot = source_snapshot;
+        }
         cache.cached_observation(freshness)
     }
 
     pub(crate) async fn get_loaded(&self) -> Option<Arc<LoadedAgentsMd>> {
-        self.cache.lock().await.loaded.clone()
+        self.get_cached_observation().await.loaded
     }
 
     /// Returns the published cache without claiming that it was refreshed for this consumer.
     pub(crate) async fn get_cached_observation(&self) -> AgentsMdObservation {
+        let available = match &self.omission_recovery {
+            Some(owner) => owner.cached_manifest_available().await,
+            None => true,
+        };
+        if !available {
+            return self
+                .cache
+                .lock()
+                .await
+                .unverified_recovery_observation(AgentsMdFreshness::CachedFallback);
+        }
         self.cache
             .lock()
             .await

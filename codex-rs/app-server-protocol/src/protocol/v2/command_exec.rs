@@ -115,6 +115,18 @@ pub struct CommandExecParams {
     pub permission_profile: Option<String>,
 }
 
+/// Per-stream capture facts, independent of the root process exit status.
+/// Complete capture requires `reachedEof` and neither limit flag. A closed
+/// producer without EOF can indicate read failure or forced reader shutdown.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ProcessOutputCaptureState {
+    pub reached_eof: bool,
+    pub cap_reached: bool,
+    pub drain_timed_out: bool,
+}
+
 /// Final buffered result for `command/exec`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +142,22 @@ pub struct CommandExecResponse {
     ///
     /// Empty when stderr was streamed via `command/exec/outputDelta`.
     pub stderr: String,
+    /// Exact undelivered stdout suffix, appended after streamed raw deltas.
+    /// When present use these bytes, not the lossy legacy `stdout` projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stdout_base64: Option<String>,
+    /// Exact undelivered stderr suffix; same contract as `stdoutBase64`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stderr_base64: Option<String>,
+    /// Absent only for peers/backends that cannot report capture facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stdout_capture: Option<ProcessOutputCaptureState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stderr_capture: Option<ProcessOutputCaptureState>,
 }
 
 /// Write stdin bytes to a running `command/exec` session, close stdin, or
@@ -144,7 +172,9 @@ pub struct CommandExecWriteParams {
     /// Optional base64-encoded stdin bytes to write.
     #[ts(optional = nullable)]
     pub delta_base64: Option<String>,
-    /// Close stdin after writing `deltaBase64`, if present.
+    /// Close input after queued bytes. Unix PTYs send canonical VEOF (including
+    /// flushing a partial line); raw/disabled-VEOF terminals return an error.
+    /// Terminal EOF is not a permanent pipe half-close.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub close_stdin: bool,
 }

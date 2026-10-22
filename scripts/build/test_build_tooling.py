@@ -23,6 +23,35 @@ from scripts.build.build_tooling_test_support import (
 
 
 class BuildToolingEnvironmentTest(unittest.TestCase):
+    def test_windows_setup_reads_changed_manifest_without_another_version_literal(self):
+        from scripts.build.build_tooling_test_support import powershell, ps_single_quote
+
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is required")
+        setup = REPO_ROOT / "codex-rs/scripts/setup-windows.ps1"
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "rust-toolchain.toml"
+            manifest.write_text(
+                '[toolchain]\nchannel = "9.8.7"\ncomponents = ["clippy"]\n'
+            )
+            command = (
+                "$ErrorActionPreference='Stop'; $tokens=$null; $errors=$null; "
+                f"$ast=[System.Management.Automation.Language.Parser]::ParseFile({ps_single_quote(setup)},[ref]$tokens,[ref]$errors); "
+                "$function=$ast.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Read-WorkspaceRustToolchain'},$true); "
+                "Invoke-Expression $function.Extent.Text; "
+                f"$value=Read-WorkspaceRustToolchain {ps_single_quote(manifest)}; "
+                "if ($value.channel -ne '9.8.7' -or $value.components.Count -ne 1 -or $value.components[0] -ne 'clippy') { throw 'wrong toolchain' }"
+            )
+            result = subprocess.run(
+                [shell, "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_core_package_selections_share_the_named_core_lane(self):
         from scripts.build.rust_build_status import _auto_lane_base
 
@@ -34,9 +63,19 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             ["-p", "codex-core-integration-tests"],
         ):
             with self.subTest(selection=selection):
-                self.assertEqual(_auto_lane_base(["cargo", "test", *selection]), "core-tests")
-                self.assertEqual(_auto_lane_base(["cargo", "test", "--release", *selection]), "core-tests-release")
-        self.assertEqual(_auto_lane_base(["cargo", "test", "-p", "codex-tui", "--", "-p", "codex-core"]), "codex-tui")
+                self.assertEqual(
+                    _auto_lane_base(["cargo", "test", *selection]), "core-tests"
+                )
+                self.assertEqual(
+                    _auto_lane_base(["cargo", "test", "--release", *selection]),
+                    "core-tests-release",
+                )
+        self.assertEqual(
+            _auto_lane_base(
+                ["cargo", "test", "-p", "codex-tui", "--", "-p", "codex-core"]
+            ),
+            "codex-tui",
+        )
 
     def test_local_sccache_preserves_explicit_base_directories(self):
         from scripts.build.rust_tool_env import local_rust_env
@@ -48,16 +87,130 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
     def test_workspace_dependency_build_policy(self):
         manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
-        self.assertEqual(set(manifest["workspace"]["dependencies"]["serde_json"]["features"]), {"alloc", "arbitrary_precision", "float_roundtrip", "preserve_order", "raw_value"})
+        self.assertEqual(
+            set(manifest["workspace"]["dependencies"]["serde_json"]["features"]),
+            {
+                "alloc",
+                "arbitrary_precision",
+                "float_roundtrip",
+                "preserve_order",
+                "raw_value",
+            },
+        )
         packages = manifest["profile"]["dev"]["package"]
         self.assertEqual(packages["*"]["debug"], "line-tables-only")
         for package in ("sha2", "libsqlite3-sys"):
             self.assertEqual(packages[package]["opt-level"], 3)
         core = load_toml(REPO_ROOT / "codex-rs" / "core" / "Cargo.toml")
         self.assertNotIn("test-deterministic-process-ids", core.get("features", {}))
-        self.assertFalse({"codex-web-search-extension", "codex-image-generation-extension"} & core["dev-dependencies"].keys())
-        tui = load_toml(REPO_ROOT / "codex-rs" / "tui" / "Cargo.toml")
-        self.assertFalse({"codex-cli", "app_test_support"} & tui["dev-dependencies"].keys())
+        self.assertFalse(
+            {"codex-web-search-extension", "codex-image-generation-extension"}
+            & core["dev-dependencies"].keys()
+        )
+
+    def test_network_contracts_do_not_pull_runtime_owners_into_lower_crates(self):
+        result = subprocess.run(
+            [
+                "cargo",
+                "metadata",
+                "--format-version=1",
+                "--no-deps",
+                "--locked",
+                "--offline",
+            ],
+            cwd=REPO_ROOT / "codex-rs",
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata = json.loads(result.stdout)
+        members = set(metadata["workspace_members"])
+        packages = {p["name"]: p for p in metadata["packages"] if p["id"] in members}
+        graph = {
+            name: {
+                d["name"]
+                for d in p["dependencies"]
+                if d["kind"] != "dev" and d.get("path") and d["name"] in packages
+            }
+            for name, p in packages.items()
+        }
+
+        def closure(owner):
+            found, pending = set(), list(graph[owner])
+            while pending:
+                dependency = pending.pop()
+                if dependency not in found:
+                    found.add(dependency)
+                    pending.extend(graph[dependency])
+            return found
+
+        runtimes = {"codex-http-client", "codex-network-proxy"}
+        self.assertFalse(closure("codex-protocol") & runtimes)
+        self.assertIn("codex-network-types", closure("codex-protocol"))
+        self.assertFalse(graph["codex-network-types"])
+        self.assertEqual(
+            {
+                d["name"]
+                for d in packages["codex-network-types"]["dependencies"]
+                if d["kind"] != "dev"
+            },
+            {"http", "httpdate", "serde", "tokio"},
+        )
+        self.assertNotIn("codex-core", closure("codex-app-server-transport"))
+        self.assertTrue(runtimes <= closure("codex-core"))
+        self.assertTrue(runtimes <= closure("codex-app-server"))
+        self.assertIn(
+            "codex-core",
+            {
+                d["name"]
+                for d in packages["codex-app-server-transport"]["dependencies"]
+                if d["kind"] == "dev"
+            },
+        )
+        self.assertEqual(
+            {
+                name
+                for name, p in packages.items()
+                if any(
+                    d["name"] == "reqwest" and d["kind"] != "dev"
+                    for d in p["dependencies"]
+                )
+            },
+            {"codex-http-client"},
+        )
+        runtime_tokio = [
+            d
+            for d in packages["codex-code-mode-runtime"]["dependencies"]
+            if d["name"] == "tokio" and d["kind"] is None
+        ]
+        self.assertEqual(len(runtime_tokio), 1)
+        self.assertIn("fs", runtime_tokio[0]["features"])
+
+        # Cargo library identities, not package-name heuristics, own lint eligibility.
+        library_names = {
+            target["name"]
+            for p in packages.values()
+            for target in p["targets"]
+            # Vendored workspace members are not first-party lint owners.
+            if "third-party" not in Path(p["manifest_path"]).parts
+            if set(target["kind"])
+            & {"lib", "proc-macro", "cdylib", "rlib", "staticlib", "dylib"}
+        }
+        import re
+
+        lint = (REPO_ROOT / "tools/argument-comment-lint/src/lib.rs").read_text(
+            encoding="utf-8"
+        )
+        predicate = lint.split("fn is_workspace_crate_name", 1)[1].split("#[test]", 1)[
+            0
+        ]
+        exceptions = set(re.findall(r'"([a-z_]+)"', predicate))
+        exceptions.discard("codex_")
+        self.assertEqual(
+            {name for name in library_names if not name.startswith("codex_")},
+            exceptions,
+        )
 
     def test_recipe_preserves_explicit_empty_compiler_wrapper(self):
         shell = load_just_shell_module()
@@ -169,9 +322,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
     def test_focused_rust_runner_recipe_receives_rust_environment(self):
         shell = load_just_shell_module()
-        command = (
-            "python scripts/build/rust_test_runner.py run-target core_lib -E 'test(retry)'"
-        )
+        command = "python scripts/build/rust_test_runner.py run-target core_lib -E 'test(retry)'"
         observed = {}
 
         def run_recipe(*args, **kwargs):
@@ -539,16 +690,28 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             for content in (b"unknown", b"\xff"):
                 for exit_code in (0, 7):
                     with self.subTest(content=content, exit_code=exit_code):
-                        command = [sys.executable, "-c", f"raise SystemExit({exit_code})"]
+                        command = [
+                            sys.executable,
+                            "-c",
+                            f"raise SystemExit({exit_code})",
+                        ]
                         cache = shell.tool_run_cache_path(command, cache_dir)
                         cache.write_bytes(content)
-                        self.assertIsNone(shell.read_cached_tool_run(command, cache_dir))
+                        self.assertIsNone(
+                            shell.read_cached_tool_run(command, cache_dir)
+                        )
                         self.assertEqual(
                             shell.cached_tool_runs(command, cache_dir=cache_dir),
                             exit_code == 0,
                         )
-                        self.assertEqual(cache.read_bytes(), b"ok" if exit_code == 0 else b"fail")
-                        with mock.patch.object(shell, "tool_runs", side_effect=AssertionError("must use repaired cache")):
+                        self.assertEqual(
+                            cache.read_bytes(), b"ok" if exit_code == 0 else b"fail"
+                        )
+                        with mock.patch.object(
+                            shell,
+                            "tool_runs",
+                            side_effect=AssertionError("must use repaired cache"),
+                        ):
                             self.assertEqual(
                                 shell.cached_tool_runs(command, cache_dir=cache_dir),
                                 exit_code == 0,
@@ -575,8 +738,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             )
 
         self.assertEqual(run.call_count, 2)
-
-
 
     def test_local_just_shell_tool_probe_cache_tracks_tool_identity(self) -> None:
         just_shell = load_just_shell_module()
@@ -776,8 +937,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 "app-server/tests/common",
                 "chatgpt",
                 "core/tests/common",
-                "mcp-server/tests/common",
-                "message-history",
                 "windows-sandbox-rs",
             }.issubset(workspace["members"])
         )
@@ -945,7 +1104,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         )
         nextest_config = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
         self.assertEqual(nextest_config["profile"]["default"]["test-threads"], 8)
-        self.assertEqual(nextest_config["test-groups"]["process_heavy"]["max-threads"], 4)
+        self.assertEqual(
+            nextest_config["test-groups"]["process_heavy"]["max-threads"], 4
+        )
         self.assertIn('rust_parallelism := "8"', justfile)
         self.assertIn(
             'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
@@ -1218,24 +1379,25 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             REPO_ROOT / "codex-rs" / "scripts" / "setup-windows.ps1"
         ).read_text(encoding="utf-8")
 
-        channel = load_toml(REPO_ROOT / "codex-rs" / "rust-toolchain.toml")[
-            "toolchain"
-        ]["channel"]
-        self.assertIn(f"$toolchain = '{channel}'", setup_windows)
+        self.assertIn(
+            "Read-WorkspaceRustToolchain (Join-Path $PSScriptRoot '..\\rust-toolchain.toml')",
+            setup_windows,
+        )
+        self.assertIn("$toolchain = $workspaceToolchain['channel']", setup_windows)
         self.assertIn(
             "& rustup toolchain install $toolchain --profile minimal",
             setup_windows,
         )
         self.assertIn(
-            "& rustup component add clippy rustfmt rust-src --toolchain $toolchain",
+            "& rustup component add @toolchainComponents --toolchain $toolchain",
             setup_windows,
         )
 
     def test_publish_build_uses_static_crt_from_cargo_config_once(self) -> None:
         script_root = REPO_ROOT / "scripts"
-        publish_entrypoint = (script_root / "install" / "publish-local-codex.ps1").read_text(
-            encoding="utf-8"
-        )
+        publish_entrypoint = (
+            script_root / "install" / "publish-local-codex.ps1"
+        ).read_text(encoding="utf-8")
         cargo_config = (REPO_ROOT / "codex-rs" / ".cargo" / "config.toml").read_text(
             encoding="utf-8"
         )
@@ -1343,10 +1505,15 @@ class StructuredPythonRecipeTest(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         (root / "codex-rs").mkdir()
         (root / "scripts" / "build").mkdir(parents=True)
-        shutil.copyfile(REPO_ROOT / "scripts" / "__init__.py", root / "scripts" / "__init__.py")
+        shutil.copyfile(
+            REPO_ROOT / "scripts" / "__init__.py", root / "scripts" / "__init__.py"
+        )
         shutil.copyfile(REPO_ROOT / "justfile", root / "justfile")
         for name in ("just-shell.py", "rust_tool_env.py"):
-            shutil.copyfile(REPO_ROOT / "scripts" / "build" / name, root / "scripts" / "build" / name)
+            shutil.copyfile(
+                REPO_ROOT / "scripts" / "build" / name,
+                root / "scripts" / "build" / name,
+            )
         return root
 
     def test_direct_recipe_preserves_environment_interpreter_streams_and_exit(self):
@@ -1359,13 +1526,23 @@ class StructuredPythonRecipeTest(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, {"PYTHONHOME": "old"}, clear=True),
-            mock.patch.object(shell, "python_tool_env", return_value={"VIRTUAL_ENV": "/venv"}),
-            mock.patch.object(shell, "rust_tool_env", return_value={"RUSTC_WRAPPER": ""}),
+            mock.patch.object(
+                shell, "python_tool_env", return_value={"VIRTUAL_ENV": "/venv"}
+            ),
+            mock.patch.object(
+                shell, "rust_tool_env", return_value={"RUSTC_WRAPPER": ""}
+            ),
             mock.patch.object(shell.shutil, "which", side_effect=which),
-            mock.patch.object(shell.subprocess, "run", return_value=subprocess.CompletedProcess([], 75)) as run,
+            mock.patch.object(
+                shell.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 75),
+            ) as run,
             mock.patch.object(shell, "run_powershell") as powershell,
         ):
-            self.assertEqual(shell.run_python("rust_test_runner.py", ["a b", "", "$x;*", "é"]), 75)
+            self.assertEqual(
+                shell.run_python("rust_test_runner.py", ["a b", "", "$x;*", "é"]), 75
+            )
         run.assert_called_once_with(
             ["/venv/python", "rust_test_runner.py", "a b", "", "$x;*", "é"], check=False
         )
@@ -1374,33 +1551,119 @@ class StructuredPythonRecipeTest(unittest.TestCase):
         self.assertEqual(seen["VIRTUAL_ENV"], "/venv")
         self.assertEqual(seen["RUSTC_WRAPPER"], "")
 
-    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    @unittest.skipUnless(
+        os.name == "nt" and shutil.which("just"), "Windows just recipes"
+    )
     def test_real_recipes_forward_exact_arguments_without_powershell(self):
         root = self.fixture()
         stub = "import json, os, sys\nprint(json.dumps(sys.argv[1:]))\nprint('diagnostic', file=sys.stderr)\nsys.exit(int(os.environ.get('STUB_EXIT', '0')))\n"
         for script in ("rust_build_status.py", "rust_test_runner.py"):
             (root / "scripts" / "build" / script).write_text(stub, encoding="utf-8")
         # A shell fallback must fail, rather than accidentally satisfying the test.
-        with (root / "scripts" / "build" / "just-shell.py").open("a", encoding="utf-8") as source:
-            source.write("\ndef run_powershell(*args, **kwargs):\n raise AssertionError('shell hop')\n")
+        with (root / "scripts" / "build" / "just-shell.py").open(
+            "a", encoding="utf-8"
+        ) as source:
+            source.write(
+                "\ndef run_powershell(*args, **kwargs):\n raise AssertionError('shell hop')\n"
+            )
         tail = ["-E", "test(a b) | test(é); '$literal'", "--skip", "*"]
         cases = [
-            (["core-test", "fixture", *tail], ["run-lane", "--lane", "core-tests", "--warm-wait-seconds", "0", "--", "just", "_core-test-reserved", "local", "fixture", "--no-fail-fast", *tail]),
-            (["core-test-fast", "fixture", *tail], ["run-lane", "--lane", "core-tests", "--warm-wait-seconds", "0", "--", "just", "_core-test-reserved", "fast", "fixture", *tail]),
-            (["core-test-small", "fixture", *tail], ["run-lane", "--lane", "core-tests-small", "--warm-wait-seconds", "0", "--", "just", "_core-test-small-reserved", "fixture", *tail]),
-            (["core-test-lane", "fixture", *tail], ["run-lane", "--lane", "fixture", "--warm-wait-seconds", "0", "--", "just", "_core-test-reserved", "fast", "fixture", *tail]),
-            (["core-gate", "one", "two"], ["run-lane", "--lane", "core-tests", "--warm-wait-seconds", "0", "--", "just", "_core-gate-reserved", "one", "two"]),
+            (
+                ["core-test", "fixture", *tail],
+                [
+                    "run-lane",
+                    "--lane",
+                    "core-tests",
+                    "--warm-wait-seconds",
+                    "0",
+                    "--",
+                    "just",
+                    "_core-test-reserved",
+                    "local",
+                    "fixture",
+                    "--no-fail-fast",
+                    *tail,
+                ],
+            ),
+            (
+                ["core-test-fast", "fixture", *tail],
+                [
+                    "run-lane",
+                    "--lane",
+                    "core-tests",
+                    "--warm-wait-seconds",
+                    "0",
+                    "--",
+                    "just",
+                    "_core-test-reserved",
+                    "fast",
+                    "fixture",
+                    *tail,
+                ],
+            ),
+            (
+                ["core-test-small", "fixture", *tail],
+                [
+                    "run-lane",
+                    "--lane",
+                    "core-tests-small",
+                    "--warm-wait-seconds",
+                    "0",
+                    "--",
+                    "just",
+                    "_core-test-small-reserved",
+                    "fixture",
+                    *tail,
+                ],
+            ),
+            (
+                ["core-test-lane", "fixture", *tail],
+                [
+                    "run-lane",
+                    "--lane",
+                    "fixture",
+                    "--warm-wait-seconds",
+                    "0",
+                    "--",
+                    "just",
+                    "_core-test-reserved",
+                    "fast",
+                    "fixture",
+                    *tail,
+                ],
+            ),
+            (
+                ["core-gate", "one", "two"],
+                [
+                    "run-lane",
+                    "--lane",
+                    "core-tests",
+                    "--warm-wait-seconds",
+                    "0",
+                    "--",
+                    "just",
+                    "_core-gate-reserved",
+                    "one",
+                    "two",
+                ],
+            ),
             (["core-test-plan", "fixture"], ["plan", "fixture"]),
             (["core-test-list"], ["list-targets"]),
             (["core-test-manifest-check"], ["check-manifest"]),
-            (["core-test-gates-for", "a b.rs", "é.rs"], ["gates-for", "a b.rs", "é.rs"]),
+            (
+                ["core-test-gates-for", "a b.rs", "é.rs"],
+                ["gates-for", "a b.rs", "é.rs"],
+            ),
         ]
         for index, (arguments, expected) in enumerate(cases):
             code = (0, 2, 75)[index % 3]
             with self.subTest(recipe=arguments[0], code=code):
                 result = subprocess.run(
-                    ["just", *arguments], cwd=root, capture_output=True,
-                    encoding="utf-8", timeout=15,
+                    ["just", *arguments],
+                    cwd=root,
+                    capture_output=True,
+                    encoding="utf-8",
+                    timeout=15,
                     env=dict(os.environ, STUB_EXIT=str(code), PYTHONIOENCODING="utf-8"),
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
@@ -1408,7 +1671,9 @@ class StructuredPythonRecipeTest(unittest.TestCase):
                 self.assertEqual(json.loads(result.stdout), expected)
                 self.assertIn("diagnostic", result.stderr)
 
-    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    @unittest.skipUnless(
+        os.name == "nt" and shutil.which("just"), "Windows just recipes"
+    )
     def test_explicit_python_override_retains_shell_semantics(self):
         root = self.fixture()
         (root / "scripts" / "build" / "rust_test_runner.py").write_text(
@@ -1417,12 +1682,17 @@ class StructuredPythonRecipeTest(unittest.TestCase):
         )
         result = subprocess.run(
             ["just", "--set", "python", "python -I", "core-test-plan", "a b"],
-            cwd=root, capture_output=True, text=True, timeout=15,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), [1, "plan", "a b"])
 
-    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    @unittest.skipUnless(
+        os.name == "nt" and shutil.which("just"), "Windows just recipes"
+    )
     def test_real_recipe_preserves_large_split_streams_and_failure(self):
         root = self.fixture()
         (root / "scripts" / "build" / "rust_build_status.py").write_text(
@@ -1431,14 +1701,19 @@ class StructuredPythonRecipeTest(unittest.TestCase):
             encoding="utf-8",
         )
         result = subprocess.run(
-            ["just", "core-gate", "fixture"], cwd=root, capture_output=True, timeout=15,
+            ["just", "core-gate", "fixture"],
+            cwd=root,
+            capture_output=True,
+            timeout=15,
         )
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout, ("é\r\n" * 40000).encode())
         self.assertTrue(result.stderr.startswith(b"failure\r\n" * 20000))
         self.assertIn(b"exit code 7", result.stderr)
 
-    @unittest.skipUnless(os.name == "nt" and shutil.which("just"), "Windows just recipes")
+    @unittest.skipUnless(
+        os.name == "nt" and shutil.which("just"), "Windows just recipes"
+    )
     def test_real_recipe_cancellation_keeps_output_and_reaps_descendants(self):
         from scripts.common import process_owner
 
@@ -1448,12 +1723,15 @@ class StructuredPythonRecipeTest(unittest.TestCase):
         (root / "scripts" / "build" / "rust_build_status.py").write_text(
             "import subprocess, sys, time\n"
             f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
-            "print('ready', flush=True)\ntime.sleep(60)\n", encoding="utf-8"
+            "print('ready', flush=True)\ntime.sleep(60)\n",
+            encoding="utf-8",
         )
         with process_owner.operation() as operation:
+
             def observe(chunk):
                 if "ready" in chunk:
                     operation.cancelled.set()
+
             result = process_owner.run_finite(
                 ["just", "core-gate", "fixture"], cwd=root, timeout=10, observe=observe
             )

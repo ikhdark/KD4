@@ -54,7 +54,10 @@ mod tests {
         let payload = r#"{"version":1,"submissions":[{"id":"first"}]}"#;
         runtime.write_thread_queue(id, payload).await?;
         runtime.write_thread_queue(id, "replacement").await?;
-        assert_eq!(runtime.read_thread_queue(id).await?.as_deref(), Some("replacement"));
+        assert_eq!(
+            runtime.read_thread_queue(id).await?.as_deref(),
+            Some("replacement")
+        );
         runtime.write_thread_queue(id, payload).await?;
         runtime.close().await;
         let reopened = StateRuntime::init(home.path().to_path_buf(), "test".to_string()).await?;
@@ -68,12 +71,21 @@ mod tests {
                 .await
                 .is_err()
         );
-        reopened.mark_archived(id, &home.path().join("archived.jsonl"), chrono::Utc::now()).await?;
+        reopened
+            .mark_archived(id, &home.path().join("archived.jsonl"), chrono::Utc::now())
+            .await?;
         assert_eq!(
-            reopened.write_thread_queue(id, "must not overwrite").await.unwrap_err().to_string(),
+            reopened
+                .write_thread_queue(id, "must not overwrite")
+                .await
+                .unwrap_err()
+                .to_string(),
             "thread not found or archived"
         );
-        assert_eq!(reopened.read_thread_queue(id).await?.as_deref(), Some(payload));
+        assert_eq!(
+            reopened.read_thread_queue(id).await?.as_deref(),
+            Some(payload)
+        );
         reopened.delete_thread(id).await?;
         assert_eq!(reopened.read_thread_queue(id).await?, None);
         assert!(reopened.write_thread_queue(id, payload).await.is_err());

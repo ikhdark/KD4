@@ -107,15 +107,30 @@ fn only_the_builtin_exec_is_labeled_as_javascript() -> anyhow::Result<()> {
     ]}))?;
     append_inference_start(&writer, "inference-1", "turn-1", payload)?;
     let rollout = replay_bundle(temp.path())?;
-    let parts = rollout.inference_calls["inference-1"].request_item_ids.iter()
+    let parts = rollout.inference_calls["inference-1"]
+        .request_item_ids
+        .iter()
         .map(|id| rollout.conversation_items[id].body.parts.clone())
         .collect::<Vec<_>>();
-    assert_eq!(parts, vec![
-        vec![ConversationPart::Code { language: "javascript".into(), source: "text(1)".into() }],
-        vec![ConversationPart::Code { language: "javascript".into(), source: "text(2)".into() }],
-        vec![ConversationPart::Text { text: "print('python')".into() }],
-        vec![ConversationPart::Text { text: "*** Begin Patch".into() }],
-    ]);
+    assert_eq!(
+        parts,
+        vec![
+            vec![ConversationPart::Code {
+                language: "javascript".into(),
+                source: "text(1)".into()
+            }],
+            vec![ConversationPart::Code {
+                language: "javascript".into(),
+                source: "text(2)".into()
+            }],
+            vec![ConversationPart::Text {
+                text: "print('python')".into()
+            }],
+            vec![ConversationPart::Text {
+                text: "*** Begin Patch".into()
+            }],
+        ]
+    );
     Ok(())
 }
 
@@ -484,7 +499,12 @@ fn incremental_request_carries_prior_request_and_response_items_forward() -> any
     );
     let usage = first.usage.as_ref().expect("recorded usage");
     assert_eq!(
-        (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens, usage.reasoning_output_tokens),
+        (
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.output_tokens,
+            usage.reasoning_output_tokens
+        ),
         (10, 1, 5, 2),
     );
 
@@ -834,10 +854,12 @@ fn repeated_image_tool_output_reuses_content_identity_across_payloads() -> anyho
         let temp = TempDir::new()?;
         let writer = create_started_writer(&temp)?;
         start_turn(&writer, "turn-1")?;
-        let output = |image: &str| json!({
-            "type": "function_call_output", "call_id": "image-call",
-            "output": [{"type": "input_image", "image_url": image}]
-        });
+        let output = |image: &str| {
+            json!({
+                "type": "function_call_output", "call_id": "image-call",
+                "output": [{"type": "input_image", "image_url": image}]
+            })
+        };
         let first = writer.write_json_payload(
             RawPayloadKind::InferenceRequest,
             &json!({"input": [output("data:image/png;base64,AAAA")]}),

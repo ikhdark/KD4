@@ -45,8 +45,6 @@ use crate::facts::CompactionStatus;
 use crate::facts::CompactionStrategy;
 use crate::facts::CompactionTrigger;
 use crate::facts::CustomAnalyticsFact;
-use crate::facts::ExternalAgentConfigImportCompletedInput;
-use crate::facts::ExternalAgentConfigImportFailureInput;
 use crate::facts::HookRunFact;
 use crate::facts::HookRunInput;
 use crate::facts::InputError;
@@ -213,7 +211,7 @@ fn sample_thread_with_metadata(
     }
 }
 
-fn sample_thread_start_response(
+pub(crate) fn sample_thread_start_response(
     thread_id: &str,
     ephemeral: bool,
     model: &str,
@@ -345,7 +343,10 @@ pub(crate) fn sample_turn_start_response(turn_id: &str) -> ClientResponsePayload
     })
 }
 
-fn sample_turn_started_notification(thread_id: &str, turn_id: &str) -> ServerNotification {
+pub(crate) fn sample_turn_started_notification(
+    thread_id: &str,
+    turn_id: &str,
+) -> ServerNotification {
     ServerNotification::TurnStarted(TurnStartedNotification {
         thread_id: thread_id.to_string(),
         turn: Turn {
@@ -373,6 +374,7 @@ pub(crate) fn sample_turn_token_usage_fact(thread_id: &str, turn_id: &str) -> Tu
             cached_input_tokens: 45,
             output_tokens: 140,
             reasoning_output_tokens: 13,
+            coverage: None,
         },
     }
 }
@@ -954,6 +956,7 @@ fn sample_command_execution_item_with_id(
     duration_ms: Option<i64>,
 ) -> ThreadItem {
     ThreadItem::CommandExecution {
+        environment: None,
         output_metadata: None,
         stdout: None,
         stderr: None,
@@ -1113,11 +1116,18 @@ fn normalize_path_for_skill_id_non_repo_paths_remain_absolute() {
     for (url, root, path) in [
         (None, None, "/Users/abc/.codex/skills/doc/SKILL.md"),
         (None, None, "/etc/codex/skills/doc/SKILL.md"),
-        (Some("https://example.com/repo.git"), Some("/repo/root"), "/other/path/.codex/skills/doc/SKILL.md"),
+        (
+            Some("https://example.com/repo.git"),
+            Some("/repo/root"),
+            "/other/path/.codex/skills/doc/SKILL.md",
+        ),
     ] {
         let skill_path = PathBuf::from(path);
         let repo_root = root.map(PathBuf::from);
-        assert_eq!(normalize_path_for_skill_id(url, repo_root.as_deref(), &skill_path), expected_absolute_path(&skill_path));
+        assert_eq!(
+            normalize_path_for_skill_id(url, repo_root.as_deref(), &skill_path),
+            expected_absolute_path(&skill_path)
+        );
     }
 }
 
@@ -1483,8 +1493,6 @@ fn compaction_implementation_serializes_remote_v2() {
 
     assert_eq!(payload, json!("responses_compaction_v2"));
 }
-
-
 
 #[test]
 fn thread_initialized_event_serializes_expected_shape() {
@@ -1989,8 +1997,6 @@ async fn thread_originator_overrides_shared_connection_across_thread_events() {
     );
 }
 
-
-
 #[tokio::test]
 async fn unrelated_client_responses_are_ignored_by_reducer() {
     let mut reducer = AnalyticsReducer::default();
@@ -2326,71 +2332,71 @@ async fn final_approval_outcome_maps_known_no_review_policies() {
 
 #[tokio::test]
 async fn abandoned_tool_items_are_flushed_with_original_context() {
-    for (status, expected) in [(AppServerTurnStatus::Interrupted, "interrupted"), (AppServerTurnStatus::Failed, "failed")] {
-    let mut reducer = AnalyticsReducer::default();
-    let mut events = Vec::new();
-    ingest_review_prerequisites(&mut reducer, &mut events).await;
-    reducer
-        .ingest(
-            AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
-                sample_turn_resolved_config("thread-1", "turn-1"),
-            ))),
-            &mut events,
-        )
-        .await;
-    reducer
-        .ingest(
-            AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
-                "thread-1", "turn-1",
-            ))),
-            &mut events,
-        )
-        .await;
-    reducer
-        .ingest(
-            AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
-                ItemStartedNotification {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    started_at_ms: 455_400,
-                    item: sample_command_execution_item(
-                        CommandExecutionStatus::InProgress,
-                        None,
-                        None,
-                    ),
-                },
-            ))),
-            &mut events,
-        )
-        .await;
-    reducer
-        .ingest(
-            AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
-                "thread-1",
-                "turn-1",
-                status,
-                None,
-            ))),
-            &mut events,
-        )
-        .await;
+    for (status, expected) in [
+        (AppServerTurnStatus::Interrupted, "interrupted"),
+        (AppServerTurnStatus::Failed, "failed"),
+    ] {
+        let mut reducer = AnalyticsReducer::default();
+        let mut events = Vec::new();
+        ingest_review_prerequisites(&mut reducer, &mut events).await;
+        reducer
+            .ingest(
+                AnalyticsFact::Custom(CustomAnalyticsFact::TurnResolvedConfig(Box::new(
+                    sample_turn_resolved_config("thread-1", "turn-1"),
+                ))),
+                &mut events,
+            )
+            .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_started_notification(
+                    "thread-1", "turn-1",
+                ))),
+                &mut events,
+            )
+            .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                    ItemStartedNotification {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        started_at_ms: 455_400,
+                        item: sample_command_execution_item(
+                            CommandExecutionStatus::InProgress,
+                            None,
+                            None,
+                        ),
+                    },
+                ))),
+                &mut events,
+            )
+            .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                    "thread-1", "turn-1", status, None,
+                ))),
+                &mut events,
+            )
+            .await;
 
-    assert_eq!(events.len(), 1);
-    let payload = serde_json::to_value(&events[0]).expect("serialize interrupted tool item event");
-    assert_eq!(payload["event_type"], "codex_command_execution_event");
-    assert_eq!(payload["event_params"]["item_id"], "item-1");
-    assert_eq!(payload["event_params"]["terminal_status"], expected);
-    assert_eq!(
-        payload["event_params"]["final_approval_outcome"],
-        "not_needed"
-    );
-    assert_eq!(payload["event_params"]["failure_kind"], json!(null));
-    assert_eq!(payload["event_params"]["started_at_ms"], 455_400);
-    assert_eq!(payload["event_params"]["completed_at_ms"], 456_000);
-    assert_eq!(payload["event_params"]["duration_ms"], 600);
+        assert_eq!(events.len(), 1);
+        let payload =
+            serde_json::to_value(&events[0]).expect("serialize interrupted tool item event");
+        assert_eq!(payload["event_type"], "codex_command_execution_event");
+        assert_eq!(payload["event_params"]["item_id"], "item-1");
+        assert_eq!(payload["event_params"]["terminal_status"], expected);
+        assert_eq!(
+            payload["event_params"]["final_approval_outcome"],
+            "not_needed"
+        );
+        assert_eq!(payload["event_params"]["failure_kind"], json!(null));
+        assert_eq!(payload["event_params"]["started_at_ms"], 455_400);
+        assert_eq!(payload["event_params"]["completed_at_ms"], 456_000);
+        assert_eq!(payload["event_params"]["duration_ms"], 600);
     }
 }
-
 
 #[tokio::test]
 async fn abandoned_tool_item_uses_millisecond_turn_completion() {
@@ -2485,6 +2491,7 @@ pub(crate) fn tool_items_with_output_payloads() -> Vec<ThreadItem> {
         command,
         ThreadItem::FileChange {
             id: "file-change-1".to_string(),
+            environment: None,
             changes: vec![
                 FileUpdateChange {
                     path: "src/added.rs".to_string(),
@@ -2559,6 +2566,7 @@ pub(crate) fn tool_items_with_output_payloads() -> Vec<ThreadItem> {
                 (
                     "thread-a".to_string(),
                     CollabAgentState {
+                        stop_cause: None,
                         status: CollabAgentStatus::Completed,
                         message: Some(payload.clone()),
                         surfaced_result: None,
@@ -2568,6 +2576,7 @@ pub(crate) fn tool_items_with_output_payloads() -> Vec<ThreadItem> {
                 (
                     "thread-b".to_string(),
                     CollabAgentState {
+                        stop_cause: None,
                         status: CollabAgentStatus::Errored,
                         message: Some(payload.clone()),
                         surfaced_result: None,
@@ -2577,6 +2586,8 @@ pub(crate) fn tool_items_with_output_payloads() -> Vec<ThreadItem> {
             ]),
         },
         ThreadItem::WebSearch(WebSearchItem {
+            status: None,
+            error: None,
             id: "web-1".to_string(),
             query: "codex".to_string(),
             action: Some(WebSearchAction::Search {
@@ -2590,6 +2601,7 @@ pub(crate) fn tool_items_with_output_payloads() -> Vec<ThreadItem> {
             revised_prompt: Some(payload.clone()),
             result: payload,
             saved_path: Some(test_path_buf("/tmp/image.png").abs()),
+            provider_usage: None,
         }),
     ]
 }
@@ -3605,7 +3617,6 @@ fn plugin_used_event_serializes_expected_shape() {
     );
 }
 
-
 #[test]
 fn plugin_install_failed_event_serializes_expected_shape() {
     let event = TrackEventRequest::PluginInstallFailed(CodexPluginInstallFailedEventRequest {
@@ -3638,7 +3649,6 @@ fn plugin_install_failed_event_serializes_expected_shape() {
         })
     );
 }
-
 
 #[test]
 fn hook_run_event_serializes_expected_shape() {
@@ -3678,22 +3688,46 @@ fn hook_run_event_serializes_expected_shape() {
 fn hook_run_metadata_maps_sources_and_statuses() {
     let tracking = test_tracking_context("thread-1", "turn-1");
     for (source, status, expected_source, expected_status) in [
-        (HookSource::System, HookRunStatus::Completed, "system", "completed"),
-        (HookSource::Project, HookRunStatus::Blocked, "project", "blocked"),
-        (HookSource::CloudRequirements, HookRunStatus::Blocked, "cloud_requirements", "blocked"),
-        (HookSource::Unknown, HookRunStatus::Failed, "unknown", "failed"),
+        (
+            HookSource::System,
+            HookRunStatus::Completed,
+            "system",
+            "completed",
+        ),
+        (
+            HookSource::Project,
+            HookRunStatus::Blocked,
+            "project",
+            "blocked",
+        ),
+        (
+            HookSource::CloudRequirements,
+            HookRunStatus::Blocked,
+            "cloud_requirements",
+            "blocked",
+        ),
+        (
+            HookSource::Unknown,
+            HookRunStatus::Failed,
+            "unknown",
+            "failed",
+        ),
         (HookSource::User, HookRunStatus::Stopped, "user", "stopped"),
         (HookSource::User, HookRunStatus::Running, "user", "failed"),
     ] {
-        let metadata = serde_json::to_value(codex_hook_run_metadata(&tracking, HookRunFact {
-            event_name: HookEventName::Stop, hook_source: source, status,
-        })).expect("serialize hook");
+        let metadata = serde_json::to_value(codex_hook_run_metadata(
+            &tracking,
+            HookRunFact {
+                event_name: HookEventName::Stop,
+                hook_source: source,
+                status,
+            },
+        ))
+        .expect("serialize hook");
         assert_eq!(metadata["hook_source"], expected_source);
         assert_eq!(metadata["status"], expected_status);
     }
 }
-
-
 
 #[tokio::test]
 async fn reducer_ingests_skill_invoked_fact() {
@@ -3883,42 +3917,39 @@ async fn reducer_ingests_plugin_state_changed_fact() {
         (PluginState::Enabled, "codex_plugin_enabled"),
         (PluginState::Disabled, "codex_plugin_disabled"),
     ] {
-    for remote_id in [None, Some("plugins~Plugin_remote")] {
-    let mut plugin = sample_plugin_metadata();
-    plugin.remote_plugin_id = remote_id.map(str::to_string);
-    let mut reducer = AnalyticsReducer::default();
-    let mut events = Vec::new();
+        for remote_id in [None, Some("plugins~Plugin_remote")] {
+            let mut plugin = sample_plugin_metadata();
+            plugin.remote_plugin_id = remote_id.map(str::to_string);
+            let mut reducer = AnalyticsReducer::default();
+            let mut events = Vec::new();
 
-    reducer
-        .ingest(
-            AnalyticsFact::Custom(CustomAnalyticsFact::PluginStateChanged(
-                PluginStateChangedInput {
-                    plugin,
-                    state,
-                },
-            )),
-            &mut events,
-        )
-        .await;
+            reducer
+                .ingest(
+                    AnalyticsFact::Custom(CustomAnalyticsFact::PluginStateChanged(
+                        PluginStateChangedInput { plugin, state },
+                    )),
+                    &mut events,
+                )
+                .await;
 
-    let payload = serde_json::to_value(&events).expect("serialize events");
-    assert_eq!(
-        payload,
-        json!([{
-            "event_type": expected_type,
-            "event_params": {
-                "plugin_id": "sample@test",
-                "remote_plugin_id": remote_id,
-                "plugin_name": "sample",
-                "marketplace_name": "test",
-                "has_skills": true,
-                "mcp_server_count": 2,
-                "connector_ids": ["calendar", "drive"],
-                "product_client_id": originator().value
-            }
-        }])
-    );
-    }
+            let payload = serde_json::to_value(&events).expect("serialize events");
+            assert_eq!(
+                payload,
+                json!([{
+                    "event_type": expected_type,
+                    "event_params": {
+                        "plugin_id": "sample@test",
+                        "remote_plugin_id": remote_id,
+                        "plugin_name": "sample",
+                        "marketplace_name": "test",
+                        "has_skills": true,
+                        "mcp_server_count": 2,
+                        "connector_ids": ["calendar", "drive"],
+                        "product_client_id": originator().value
+                    }
+                }])
+            );
+        }
     }
 }
 
@@ -3992,7 +4023,7 @@ async fn reducer_ingests_plugin_install_failed_fact() {
             AnalyticsFact::Custom(CustomAnalyticsFact::PluginInstallFailed(
                 PluginInstallFailedInput {
                     plugin: sample_plugin_metadata(),
-                    source: PluginInstallSource::ExternalAgentMigration,
+                    source: PluginInstallSource::Manual,
                     error_type: "invalid_plugin".to_string(),
                 },
             )),
@@ -4014,7 +4045,7 @@ async fn reducer_ingests_plugin_install_failed_fact() {
                 "mcp_server_count": 2,
                 "connector_ids": ["calendar", "drive"],
                 "product_client_id": originator().value,
-                "source": "external_agent_migration",
+                "source": "manual",
                 "error_type": "invalid_plugin"
             }
         }])
@@ -4065,81 +4096,6 @@ async fn reducer_ingests_plugin_install_failed_fact_without_detail() {
     );
 }
 
-#[tokio::test]
-async fn reducer_ingests_external_agent_config_import_completed_fact() {
-    let mut reducer = AnalyticsReducer::default();
-    let mut events = Vec::new();
-
-    reducer
-        .ingest(
-            AnalyticsFact::Custom(CustomAnalyticsFact::ExternalAgentConfigImportCompleted(
-                ExternalAgentConfigImportCompletedInput {
-                    import_id: "import-1".to_string(),
-                    source: "app_server".to_string(),
-                    item_type: "PLUGINS".to_string(),
-                    success_count: 2,
-                    failed_count: 1,
-                },
-            )),
-            &mut events,
-        )
-        .await;
-
-    let payload = serde_json::to_value(&events).expect("serialize events");
-    assert_eq!(
-        payload,
-        json!([{
-            "event_type": "codex_onboarding_external_agent_import_complete",
-            "event_params": {
-                "import_id": "import-1",
-                "source": "app_server",
-                "type": "PLUGINS",
-                "success_count": 2,
-                "failed_count": 1,
-                "product_client_id": originator().value,
-            }
-        }])
-    );
-}
-
-
-#[tokio::test]
-async fn reducer_ingests_external_agent_config_import_failure_fact() {
-    let mut reducer = AnalyticsReducer::default();
-    let mut events = Vec::new();
-
-    reducer
-        .ingest(
-            AnalyticsFact::Custom(CustomAnalyticsFact::ExternalAgentConfigImportFailure(
-                ExternalAgentConfigImportFailureInput {
-                    import_id: "import-1".to_string(),
-                    source: "app_server".to_string(),
-                    item_type: "SESSIONS".to_string(),
-                    failure_stage: "session_missing".to_string(),
-                    error_type: "session_missing".to_string(),
-                },
-            )),
-            &mut events,
-        )
-        .await;
-
-    let payload = serde_json::to_value(&events).expect("serialize events");
-    assert_eq!(
-        payload,
-        json!([{
-            "event_type": "codex_onboarding_external_agent_import_failure",
-            "event_params": {
-                "import_id": "import-1",
-                "source": "app_server",
-                "type": "SESSIONS",
-                "failure_stage": "session_missing",
-                "error_type": "session_missing",
-                "product_client_id": originator().value,
-            }
-        }])
-    );
-}
-
 #[test]
 fn turn_event_serializes_expected_shape() {
     let event = TrackEventRequest::TurnEvent(Box::new(CodexTurnEventRequest {
@@ -4182,6 +4138,8 @@ fn turn_event_serializes_expected_shape() {
             subagent_tool_call_count: None,
             web_search_count: None,
             image_generation_count: None,
+            token_usage_scope: "turn",
+            token_usage_coverage: None,
             input_tokens: None,
             cached_input_tokens: None,
             output_tokens: None,
@@ -4260,6 +4218,7 @@ fn turn_event_serializes_expected_shape() {
                 "subagent_tool_call_count": null,
                 "web_search_count": null,
                 "image_generation_count": null,
+                "token_usage_scope": "turn",
                 "input_tokens": null,
                 "cached_input_tokens": null,
                 "output_tokens": null,
@@ -4416,60 +4375,73 @@ async fn accepted_turn_steer_emits_expected_event() {
 #[tokio::test]
 async fn rejected_turn_steer_uses_request_connection_metadata() {
     for (error, expected) in [
-        (Some(no_active_turn_steer_error_type()), json!("no_active_turn")),
-        (Some(non_steerable_review_error_type()), json!("non_steerable_review")),
+        (
+            Some(no_active_turn_steer_error_type()),
+            json!("no_active_turn"),
+        ),
+        (
+            Some(non_steerable_review_error_type()),
+            json!("non_steerable_review"),
+        ),
         (Some(input_too_large_error_type()), json!("input_too_large")),
-        (Some(AnalyticsJsonRpcError::TurnSteer(TurnSteerRequestError::ExpectedTurnMismatch)), json!("expected_turn_mismatch")),
-        (Some(AnalyticsJsonRpcError::TurnSteer(TurnSteerRequestError::NonSteerableCompact)), json!("non_steerable_compact")),
-        (Some(AnalyticsJsonRpcError::Input(InputError::Empty)), json!("empty_input")),
+        (
+            Some(AnalyticsJsonRpcError::TurnSteer(
+                TurnSteerRequestError::ExpectedTurnMismatch,
+            )),
+            json!("expected_turn_mismatch"),
+        ),
+        (
+            Some(AnalyticsJsonRpcError::TurnSteer(
+                TurnSteerRequestError::NonSteerableCompact,
+            )),
+            json!("non_steerable_compact"),
+        ),
+        (
+            Some(AnalyticsJsonRpcError::Input(InputError::Empty)),
+            json!("empty_input"),
+        ),
         (None, json!(null)),
     ] {
-    let mut reducer = AnalyticsReducer::default();
-    let mut out = Vec::new();
-    let payload = ingest_rejected_turn_steer(
-        &mut reducer,
-        &mut out,
-        error,
-    )
-    .await;
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        let payload = ingest_rejected_turn_steer(&mut reducer, &mut out, error).await;
 
-    assert_eq!(payload["event_type"], json!("codex_turn_steer_event"));
-    assert_eq!(payload["event_params"]["thread_id"], json!("thread-2"));
-    assert_eq!(payload["event_params"]["expected_turn_id"], json!("turn-2"));
-    assert_eq!(payload["event_params"]["accepted_turn_id"], json!(null));
-    assert_eq!(payload["event_params"]["num_input_images"], json!(1));
-    assert_eq!(
-        payload["event_params"]["app_server_client"]["product_client_id"],
-        json!("codex-tui")
-    );
-    assert_eq!(
-        payload["event_params"]["runtime"]["codex_rs_version"],
-        json!("0.1.0")
-    );
-    assert_eq!(payload["event_params"]["thread_source"], json!("user"));
-    assert_eq!(payload["event_params"]["subagent_source"], json!(null));
-    assert_eq!(payload["event_params"]["parent_thread_id"], json!(null));
-    assert_eq!(payload["event_params"]["result"], json!("rejected"));
-    assert_eq!(
-        payload["event_params"]["rejection_reason"],
-        expected
-    );
-    assert!(
-        payload["event_params"]["created_at"]
-            .as_u64()
-            .expect("created_at")
-            > 0
-    );
+        assert_eq!(payload["event_type"], json!("codex_turn_steer_event"));
+        assert_eq!(payload["event_params"]["thread_id"], json!("thread-2"));
+        assert_eq!(payload["event_params"]["expected_turn_id"], json!("turn-2"));
+        assert_eq!(payload["event_params"]["accepted_turn_id"], json!(null));
+        assert_eq!(payload["event_params"]["num_input_images"], json!(1));
+        assert_eq!(
+            payload["event_params"]["app_server_client"]["product_client_id"],
+            json!("codex-tui")
+        );
+        assert_eq!(
+            payload["event_params"]["runtime"]["codex_rs_version"],
+            json!("0.1.0")
+        );
+        assert_eq!(payload["event_params"]["thread_source"], json!("user"));
+        assert_eq!(payload["event_params"]["subagent_source"], json!(null));
+        assert_eq!(payload["event_params"]["parent_thread_id"], json!(null));
+        assert_eq!(payload["event_params"]["result"], json!("rejected"));
+        assert_eq!(payload["event_params"]["rejection_reason"], expected);
+        assert!(
+            payload["event_params"]["created_at"]
+                .as_u64()
+                .expect("created_at")
+                > 0
+        );
     }
 }
-
 
 #[tokio::test]
 async fn turn_steer_does_not_emit_without_pending_request() {
     let mut reducer = AnalyticsReducer::default();
     let mut out = Vec::new();
     ingest_turn_prerequisites(&mut reducer, &mut out, true, true, true, true).await;
-    assert!(out.is_empty(), "all event prerequisites are ready except a pending steer");
+    assert!(
+        out.is_empty(),
+        "all event prerequisites are ready except a pending steer"
+    );
 
     reducer
         .ingest(
@@ -4484,8 +4456,6 @@ async fn turn_steer_does_not_emit_without_pending_request() {
 
     assert!(out.is_empty());
 }
-
-
 
 #[tokio::test]
 async fn turn_lifecycle_emits_turn_event() {
@@ -4549,7 +4519,10 @@ async fn turn_lifecycle_emits_turn_event() {
     assert_eq!(payload["event_params"]["initialization_mode"], json!("new"));
     assert_eq!(payload["event_params"]["model"], json!("gpt-5"));
     assert_eq!(payload["event_params"]["model_provider"], json!("openai"));
-    assert_eq!(payload["event_params"]["sandbox_policy"], json!("read_only"));
+    assert_eq!(
+        payload["event_params"]["sandbox_policy"],
+        json!("read_only")
+    );
     assert_eq!(payload["event_params"]["reasoning_effort"], json!(null));
     assert_eq!(payload["event_params"]["reasoning_summary"], json!(null));
     assert_eq!(payload["event_params"]["service_tier"], json!("default"));
@@ -4605,6 +4578,49 @@ async fn turn_lifecycle_emits_turn_event() {
         json!(13)
     );
     assert_eq!(payload["event_params"]["total_tokens"], json!(321));
+}
+
+#[tokio::test]
+async fn turn_usage_subtotals_keep_missing_and_legacy_coverage_distinct() {
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TokenUsageCoverage;
+    for missing in [false, true] {
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        ingest_turn_prerequisites(&mut reducer, &mut out, true, true, true, true).await;
+        let mut fact = sample_turn_token_usage_fact("thread-2", "turn-2");
+        fact.token_usage.coverage = Some(TokenUsageCoverage::fully_reported());
+        if missing {
+            fact.token_usage.add_assign(&TokenUsage::missing_receipt());
+        }
+        reducer
+            .ingest(
+                AnalyticsFact::Custom(CustomAnalyticsFact::TurnTokenUsage(Box::new(fact))),
+                &mut out,
+            )
+            .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                    "thread-2",
+                    "turn-2",
+                    AppServerTurnStatus::Completed,
+                    None,
+                ))),
+                &mut out,
+            )
+            .await;
+        let payload = serde_json::to_value(&out[0]).unwrap();
+        let params = &payload["event_params"];
+        assert_eq!(params["input_tokens"], 123);
+        assert_eq!(params["total_tokens"], 321);
+        assert_eq!(params["token_usage_scope"], "turn");
+        assert_eq!(
+            params["token_usage_coverage"]["receipts"],
+            if missing { 2 } else { 1 }
+        );
+        assert_eq!(params["token_usage_coverage"]["input_tokens"], 1);
+    }
 }
 
 #[tokio::test]
@@ -4692,6 +4708,7 @@ async fn turn_event_counts_completed_tool_items() {
     let completed_tool_items = vec![
         sample_command_execution_item(CommandExecutionStatus::Completed, Some(0), Some(1)),
         ThreadItem::FileChange {
+            environment: None,
             id: "file-change-1".to_string(),
             changes: Vec::new(),
             status: PatchApplyStatus::Completed,
@@ -4726,6 +4743,8 @@ async fn turn_event_counts_completed_tool_items() {
             agent_path: "/root/child".to_string(),
         },
         ThreadItem::WebSearch(WebSearchItem {
+            status: None,
+            error: None,
             id: "web-1".to_string(),
             query: "codex".to_string(),
             action: None,
@@ -4736,6 +4755,7 @@ async fn turn_event_counts_completed_tool_items() {
             revised_prompt: None,
             result: "ok".to_string(),
             saved_path: None,
+            provider_usage: None,
         }),
     ];
 
@@ -4790,6 +4810,67 @@ async fn turn_event_counts_completed_tool_items() {
     );
     assert_eq!(payload["event_params"]["web_search_count"], json!(1));
     assert_eq!(payload["event_params"]["image_generation_count"], json!(1));
+}
+
+#[tokio::test]
+async fn turn_event_counts_flushed_abandoned_tool_items() {
+    for (status, expected_count) in [
+        (AppServerTurnStatus::Interrupted, json!(1)),
+        (AppServerTurnStatus::Failed, json!(1)),
+        // A completed turn clears unsettled items without counting them.
+        (AppServerTurnStatus::Completed, json!(null)),
+    ] {
+        let mut reducer = AnalyticsReducer::default();
+        let mut out = Vec::new();
+        ingest_turn_prerequisites(
+            &mut reducer,
+            &mut out,
+            /*include_initialize*/ true,
+            /*include_resolved_config*/ true,
+            /*include_started*/ true,
+            /*include_token_usage*/ false,
+        )
+        .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                    ItemStartedNotification {
+                        thread_id: "thread-2".to_string(),
+                        turn_id: "turn-2".to_string(),
+                        started_at_ms: 455_400,
+                        item: sample_command_execution_item(
+                            CommandExecutionStatus::InProgress,
+                            /*exit_code*/ None,
+                            /*duration_ms*/ None,
+                        ),
+                    },
+                ))),
+                &mut out,
+            )
+            .await;
+        reducer
+            .ingest(
+                AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                    "thread-2", "turn-2", status, /*codex_error_info*/ None,
+                ))),
+                &mut out,
+            )
+            .await;
+
+        let turn_event = out
+            .iter()
+            .find(|event| matches!(event, TrackEventRequest::TurnEvent(_)))
+            .expect("turn event should be emitted");
+        let payload = serde_json::to_value(turn_event).expect("serialize turn event");
+        assert_eq!(
+            payload["event_params"]["total_tool_call_count"],
+            expected_count
+        );
+        assert_eq!(
+            payload["event_params"]["shell_command_count"],
+            expected_count
+        );
+    }
 }
 
 #[tokio::test]

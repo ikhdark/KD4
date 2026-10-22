@@ -98,10 +98,100 @@ impl TraceReducer {
                     ended_seq: None,
                     status: ExecutionStatus::Running,
                 },
+                previous_executions: Vec::new(),
+                history_before_trace: false,
                 default_model,
                 conversation_item_ids: Vec::new(),
             },
         );
+        Ok(())
+    }
+
+    /// Reopens a closed identity, or imports only the newly observed interval of
+    /// a historical child. Resuming never fabricates a spawn/delivery edge.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resume_thread(
+        &mut self,
+        seq: RawEventSeq,
+        wall_time_unix_ms: i64,
+        thread_id: String,
+        parent_thread_id: String,
+        agent_path: String,
+        metadata_payload: Option<RawPayloadRef>,
+    ) -> Result<()> {
+        self.thread_mut(&parent_thread_id)?;
+        let metadata = metadata_payload
+            .as_ref()
+            .map(|payload| self.thread_started_metadata(payload))
+            .transpose()?;
+        let spawn = metadata
+            .as_ref()
+            .map(ThreadStartedMetadata::thread_spawn)
+            .transpose()?
+            .flatten();
+        if let Some(spawn) = &spawn {
+            anyhow::ensure!(
+                spawn.parent_thread_id == parent_thread_id,
+                "resumed thread parent mismatch"
+            );
+            anyhow::ensure!(
+                spawn
+                    .agent_path
+                    .as_ref()
+                    .is_none_or(|path| path == &agent_path),
+                "resumed thread path mismatch"
+            );
+        }
+        if !self.rollout.threads.contains_key(&thread_id) {
+            self.start_thread(
+                seq,
+                wall_time_unix_ms,
+                thread_id.clone(),
+                agent_path.clone(),
+                metadata_payload,
+            )?;
+            let thread = self.thread_mut(&thread_id)?;
+            // Parent linkage remains known even when optional metadata capture failed.
+            thread.origin = AgentOrigin::Spawned {
+                spawn_edge_id: spawn_edge_id(&parent_thread_id, &thread_id),
+                parent_thread_id,
+                task_name: spawn
+                    .as_ref()
+                    .and_then(|spawn| spawn.task_name.clone())
+                    .unwrap_or_else(|| task_name_from_agent_path(&agent_path)),
+                agent_role: spawn.and_then(|spawn| spawn.agent_role).unwrap_or_default(),
+            };
+            thread.history_before_trace = true;
+            return Ok(());
+        }
+        let thread = self.thread_mut(&thread_id)?;
+        anyhow::ensure!(
+            thread.agent_path == agent_path,
+            "resumed thread path mismatch"
+        );
+        anyhow::ensure!(
+            matches!(&thread.origin, AgentOrigin::Spawned { parent_thread_id: existing, .. } if existing == &parent_thread_id),
+            "resumed thread parent mismatch"
+        );
+        anyhow::ensure!(
+            thread.execution.ended_seq.is_some(),
+            "resumed thread is still active: {thread_id}"
+        );
+        let previous = std::mem::replace(
+            &mut thread.execution,
+            ExecutionWindow {
+                started_at_unix_ms: wall_time_unix_ms,
+                started_seq: seq,
+                ended_at_unix_ms: None,
+                ended_seq: None,
+                status: ExecutionStatus::Running,
+            },
+        );
+        thread.previous_executions.push(previous);
+        if let Some(metadata) = metadata {
+            thread.default_model = metadata.model;
+            thread.nickname = metadata.nickname;
+        }
         Ok(())
     }
 
@@ -183,13 +273,14 @@ impl TraceReducer {
         turn.execution.ended_at_unix_ms = Some(wall_time_unix_ms);
         turn.execution.ended_seq = Some(seq);
         turn.execution.status = status.clone();
-        self.terminate_running_code_cells_for_turn_end(
+        self.close_code_cell_owners_for_turn_end(seq, wall_time_unix_ms, &codex_turn_id, &status)?;
+        self.close_running_inference_calls_for_turn_end(
             seq,
             wall_time_unix_ms,
             &codex_turn_id,
             &status,
-        )?;
-        self.close_running_inference_calls_for_turn_end(
+        );
+        self.close_running_compaction_requests_for_turn_end(
             seq,
             wall_time_unix_ms,
             &codex_turn_id,

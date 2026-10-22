@@ -94,8 +94,8 @@ fmt-check *args:
     runpy.run_path(script, run_name="__main__")
 
 # Inspect committed blobs; pass --base, --head, and an explicit --allowlist.
-[working-directory("..")]
 [script("python")]
+[working-directory("..")]
 check-blob-size *args:
     import runpy
     import sys
@@ -513,10 +513,6 @@ release-build-fast *args:
     # Standalone release compile proof only; publish-local-codex reads the profile target, not this lane artifact.
     $forwarded_args = @($args | Select-Object -Skip 1); $command_args = @("cargo", "build", "--release", "-p", "codex-cli") + $forwarded_args; & "{{ justfile_directory() }}\scripts\build\invoke-rust-perf-env.ps1" -CargoTargetLane "release-cli" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
 
-# Run the MCP server
-mcp-server-run *args:
-    cargo run -p codex-mcp-server -- {args}
-
 # Regenerate the thread-config protobuf bindings through the platform-native wrapper.
 [no-cd]
 [windows]
@@ -530,11 +526,9 @@ generate-config-proto-check:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\codex-rs\config\scripts\generate-proto.ps1" -Check
 
 # Regenerate or verify the checked-in exec-server relay protobuf binding.
-[no-cd]
 generate-exec-server-relay-proto:
     cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-exec-server --example generate-relay-proto
 
-[no-cd]
 generate-exec-server-relay-proto-check:
     cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-exec-server --example generate-relay-proto -- --check
 
@@ -559,9 +553,6 @@ config-schema-regenerate owner:
 # Run focused app-server runtime validation without regenerating schemas.
 app-server-runtime-check:
     just core-gate app-server-command-exec app-server-process-exec app-server-thread-status; exit $LASTEXITCODE
-
-tui-large-widget-check:
-    just core-gate tui-large-widget; exit $LASTEXITCODE
 
 deps-duplicates-check *args:
     {{ python }} "{{ justfile_directory() }}/scripts/maintenance/check_duplicate_deps.py" {args}
@@ -643,7 +634,6 @@ app-server-schema-regenerate owner experimental="":
     {{ python }} "{{ justfile_directory() }}/scripts/schemas/app_server_schema_runtime_check.py" --mode force --owner "{{ owner }}" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("app-server-schema-regenerate only accepts --experimental") } }}
 
 # Regenerate hook schema artifacts through the Rust workspace from any cwd.
-[no-cd]
 write-hooks-schema:
     cargo run --manifest-path "{{ justfile_directory() }}/codex-rs/Cargo.toml" -p codex-hooks --bin write_hooks_schema_fixtures
 

@@ -1677,7 +1677,6 @@ async fn mixed_direct_and_nested_work_is_counted_once_per_owned_call() {
     assert_ne!(cycles[1], cycles[2]);
 }
 
-
 /// A nested code-mode `read_file` must become a replay candidate, so a later
 /// identical read is served from retained bytes instead of re-delivering an
 /// unchanged file. Measured saved sessions showed this as the dominant source of

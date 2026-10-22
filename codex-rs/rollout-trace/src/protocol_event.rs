@@ -58,7 +58,11 @@ pub(crate) fn codex_turn_trace_event(
                 context_turn_id: codex_turn_id.clone(),
                 payload: RawTraceEventPayload::CodexTurnEnded {
                     codex_turn_id,
-                    status: ExecutionStatus::Completed,
+                    status: if event.error.is_some() {
+                        ExecutionStatus::Failed
+                    } else {
+                        ExecutionStatus::Completed
+                    },
                 },
             })
         }
@@ -161,6 +165,8 @@ impl Serialize for ToolRuntimePayload<'_> {
 /// strings on disk, even though live events carry `PathUri` internally.
 #[derive(Serialize)]
 struct ExecCommandBeginTracePayload<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<&'a codex_protocol::items::EnvironmentProvenance>,
     call_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     process_id: Option<&'a str>,
@@ -186,12 +192,14 @@ impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
             parsed_cmd,
             source,
             interaction_input,
+            ..
         } = event;
         Self {
             call_id,
             process_id: process_id.as_deref(),
             turn_id,
             started_at_ms: *started_at_ms,
+            environment: event.environment.as_ref(),
             command,
             cwd: cwd.inferred_native_path_string(),
             parsed_cmd,
@@ -207,6 +215,8 @@ impl<'a> From<&'a ExecCommandBeginEvent> for ExecCommandBeginTracePayload<'a> {
 /// the on-disk format rather than serializing the internal `PathUri`.
 #[derive(Serialize)]
 struct ExecCommandEndTracePayload<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment: Option<&'a codex_protocol::items::EnvironmentProvenance>,
     call_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     process_id: Option<&'a str>,
@@ -249,12 +259,14 @@ impl<'a> From<&'a ExecCommandEndEvent> for ExecCommandEndTracePayload<'a> {
             duration,
             formatted_output,
             status,
+            ..
         } = event;
         Self {
             call_id,
             process_id: process_id.as_deref(),
             turn_id,
             completed_at_ms: *completed_at_ms,
+            environment: event.environment.as_ref(),
             command,
             cwd: cwd.inferred_native_path_string(),
             parsed_cmd,
@@ -369,6 +381,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ThreadSettingsApplied(_)
         | EventMsg::TurnPhaseChanged(_)
         | EventMsg::TurnComplete(_)
+        | EventMsg::ImportedTurnClosed(_)
         | EventMsg::TokenCount(_)
         | EventMsg::AgentMessage(_)
         | EventMsg::UserMessage(_)
@@ -423,6 +436,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         EventMsg::SessionConfigured(_) => Some("session_configured"),
         EventMsg::TurnStarted(_) => Some("turn_started"),
         EventMsg::TurnComplete(_) => Some("turn_complete"),
+        EventMsg::ImportedTurnClosed(_) => Some("imported_turn_closed"),
         EventMsg::TurnAborted(_) => Some("turn_aborted"),
         EventMsg::ThreadRolledBack(_) => Some("thread_rolled_back"),
         EventMsg::Error(_) => Some("error"),

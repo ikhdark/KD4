@@ -35,6 +35,7 @@ pub(crate) struct SelectedExecutorPluginMcpState {
 
 struct CachedSelectedRoot {
     root: SelectedCapabilityRoot,
+    binding: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
     metadata: Option<SelectedPluginMetadata>,
 }
 
@@ -61,18 +62,23 @@ impl SelectedExecutorPluginMcpContributor {
         &self,
         state: &SelectedExecutorPluginMcpState,
         selected_root: &SelectedCapabilityRoot,
+        binding: Option<&codex_exec_server::ResolvedSelectedCapabilityRoot>,
     ) -> Option<SelectedPluginMetadata> {
         if let Some(cached) = state
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .find(|cached| cached.root == *selected_root)
+            .find(|cached| cached.root == *selected_root && cached.binding.as_ref() == binding)
         {
             return cached.metadata.clone();
         }
 
-        let plugin = match self.plugin_provider.resolve_bound(selected_root).await {
+        let resolved = match binding {
+            Some(binding) => self.plugin_provider.resolve_captured(binding).await,
+            None => self.plugin_provider.resolve_bound(selected_root).await,
+        };
+        let plugin = match resolved {
             Ok(plugin) => plugin,
             Err(err) => {
                 tracing::warn!(
@@ -125,12 +131,17 @@ impl SelectedExecutorPluginMcpContributor {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.iter().find(|cached| cached.root == *selected_root) {
+        if let Some(cached) = cache
+            .iter()
+            .find(|cached| cached.root == *selected_root && cached.binding.as_ref() == binding)
+        {
             return cached.metadata.clone();
         }
         if !load_failed {
+            cache.retain(|cached| cached.root != *selected_root);
             cache.push(CachedSelectedRoot {
                 root: selected_root.clone(),
+                binding: binding.cloned(),
                 metadata: metadata.clone(),
             });
         }
@@ -173,7 +184,15 @@ impl McpServerContributor<Config> for SelectedExecutorPluginMcpContributor {
                 {
                     continue;
                 }
-                let Some(plugin) = self.metadata_for_root(&state, selected_root).await else {
+                let binding = context
+                    .bound_roots()
+                    .iter()
+                    .find(|root| root.selected_root() == selected_root);
+                if !context.bound_roots().is_empty() && binding.is_none() {
+                    continue;
+                }
+                let Some(plugin) = self.metadata_for_root(&state, selected_root, binding).await
+                else {
                     continue;
                 };
                 let mut servers = plugin.servers.into_iter().collect::<HashMap<_, _>>();

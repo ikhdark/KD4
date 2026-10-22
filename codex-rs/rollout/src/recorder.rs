@@ -1,5 +1,6 @@
 //! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
@@ -89,6 +90,27 @@ pub fn is_rollout_reconstruction_notice(item: &codex_protocol::models::ResponseI
         if role == "developer" && is_rollout_reconstruction_notice_id(id))
 }
 
+/// Consumers that cannot represent partial source integrity must fail explicitly,
+/// not project a surviving terminal boundary as a complete history.
+pub fn ensure_rollout_source_integrity(items: &[RolloutItem]) -> std::io::Result<()> {
+    let partial = items.iter().any(|item| match item {
+        RolloutItem::ResponseItem(item) => is_rollout_reconstruction_notice(item),
+        RolloutItem::Compacted(item) => item
+            .replacement_history
+            .as_ref()
+            .is_some_and(|items| items.iter().any(is_rollout_reconstruction_notice)),
+        _ => false,
+    });
+    if partial {
+        Err(IoError::new(
+            ErrorKind::InvalidData,
+            "rollout history has known reconstruction gaps; partial source integrity cannot be represented by this API view",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Writes canonical session rollout items to JSONL.
 ///
 /// Rollouts are recorded as JSONL and can be inspected with tools such as:
@@ -102,7 +124,6 @@ pub struct RolloutRecorder {
     tx: Sender<RolloutCmd>,
     writer_task: Arc<RolloutWriterTask>,
     pub(crate) rollout_path: PathBuf,
-    writer_lease: Option<Arc<std::fs::File>>,
 }
 
 #[derive(Clone)]
@@ -144,7 +165,11 @@ struct CapturedRolloutItem {
 
 impl CapturedRolloutItem {
     fn new(item: RolloutItem, captured_at: OffsetDateTime) -> Self {
-        Self { captured_at, item, admission: None }
+        Self {
+            captured_at,
+            item,
+            admission: None,
+        }
     }
 
     /// Keeps the original capture time while replacing the payload, for the
@@ -194,6 +219,9 @@ enum RolloutCmd {
 struct RolloutWriterTask {
     handle: Mutex<Option<JoinHandle<()>>>,
     terminal_failure: Mutex<Option<Arc<IoError>>>,
+    // Clones share custody, not independent lease references. A stopped handle
+    // must not keep a terminated writer's logical ownership alive.
+    writer_lease: Mutex<Option<Arc<std::fs::File>>>,
     lifecycle: AtomicU8,
     /// Serializes the lifecycle check with command enqueue across recorder
     /// clones so no command can be accepted behind Shutdown.
@@ -201,23 +229,56 @@ struct RolloutWriterTask {
     pending_bytes: Arc<tokio::sync::Semaphore>,
 }
 
+/// The writer future, not its observers, owns release on cancellation or panic.
+struct RolloutLeaseCustody(Arc<RolloutWriterTask>);
+
+impl Drop for RolloutLeaseCustody {
+    fn drop(&mut self) {
+        if !matches!(
+            self.0.lifecycle.load(Ordering::Acquire),
+            WRITER_SHUT_DOWN | WRITER_FAILED
+        ) {
+            self.0.mark_failed(&IoError::other(
+                "rollout writer stopped before terminal settlement",
+            ));
+        }
+        self.0
+            .writer_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+}
+
 const MAX_PENDING_ROLLOUT_BYTES: usize = 64 * 1024 * 1024;
 
 fn rollout_admission_bytes(items: &[RolloutItem]) -> std::io::Result<u32> {
+    serialized_admission_bytes(items, items.len())
+}
+
+fn serialized_admission_bytes(
+    items: &(impl serde::Serialize + ?Sized),
+    count: usize,
+) -> std::io::Result<u32> {
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0 = self.0.saturating_add(bytes.len().saturating_mul(4));
             if self.0 > MAX_PENDING_ROLLOUT_BYTES {
-                return Err(IoError::other("rollout batch exceeds pending byte budget; no items accepted"));
+                return Err(IoError::other(
+                    "rollout batch exceeds pending byte budget; no items accepted",
+                ));
             }
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     // Account for decoded structure as well as payload bytes. Count before
     // cloning, without allocating a second serialized copy of the batch.
-    let mut counter = Counter(items.len().saturating_mul(std::mem::size_of::<CapturedRolloutItem>() + 256));
+    let mut counter =
+        Counter(count.saturating_mul(std::mem::size_of::<CapturedRolloutItem>() + 256));
     serde_json::to_writer(&mut counter, items).map_err(IoError::other)?;
     Ok(counter.0 as u32)
 }
@@ -245,7 +306,8 @@ pub struct RolloutMaintenanceGuard {
 
 impl std::fmt::Debug for RolloutMaintenanceGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RolloutMaintenanceGuard").finish_non_exhaustive()
+        f.debug_struct("RolloutMaintenanceGuard")
+            .finish_non_exhaustive()
     }
 }
 
@@ -260,7 +322,8 @@ impl RolloutMaintenanceGuard {
 
     /// A failed restore must never reopen/create a replacement rollout.
     pub fn restore_failed(mut self) {
-        self.writer_task.mark_failed(&IoError::other("rollout maintenance restoration failed"));
+        self.writer_task
+            .mark_failed(&IoError::other("rollout maintenance restoration failed"));
         if let Some(decision) = self.decision.take() {
             let _ = decision.send(MaintenanceDecision::RestoreFailed);
         }
@@ -281,6 +344,7 @@ impl RolloutWriterTask {
         Self {
             handle: Mutex::new(None),
             terminal_failure: Mutex::new(None),
+            writer_lease: Mutex::new(None),
             lifecycle: AtomicU8::new(WRITER_ACTIVE),
             enqueue_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             pending_bytes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_ROLLOUT_BYTES)),
@@ -361,6 +425,12 @@ impl RolloutWriterTask {
     }
 
     fn finish_shutdown(&self, succeeded: bool) {
+        if succeeded {
+            self.writer_lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
         self.lifecycle.store(
             if succeeded {
                 WRITER_SHUT_DOWN
@@ -488,19 +558,48 @@ fn initial_harness_build_info() -> codex_protocol::protocol::SessionBuildInfo {
         built: build.built.to_string(),
         executable_sha256: None,
         token_accounting: [
-            ("local_input_estimate", "utf8_bytes_div4_ceil_v1", "complete_serialized_logical_prompt"),
-            ("logical_category_tokens", "utf8_bytes_div4_ceil_v1", "sum_of_independently_rounded_category_fragments"),
-            ("canonical_tool_tokens", "utf8_bytes_div4_ceil_v1", "canonical_tool_text_plus_nontext_estimates"),
-            ("model_facing_tool_tokens", "utf8_bytes_div4_ceil_v1", "rendered_model_packet_plus_nontext_estimates"),
-            ("projection_text_budget", "o200k_base_count_ordinary_v1", "rendered_text"),
-            ("provider_input_tokens", "provider_reported_tokenizer_unknown", "provider_request_input"),
-        ].into_iter().map(|(name, estimator, scope)| (
-            name.to_string(),
-            codex_protocol::protocol::SessionTokenMeasurement {
-                estimator: estimator.to_string(),
-                scope: scope.to_string(),
-            },
-        )).collect(),
+            (
+                "local_input_estimate",
+                "utf8_bytes_div4_ceil_v1",
+                "complete_serialized_logical_prompt",
+            ),
+            (
+                "logical_category_tokens",
+                "utf8_bytes_div4_ceil_v1",
+                "sum_of_independently_rounded_category_fragments",
+            ),
+            (
+                "canonical_tool_tokens",
+                "utf8_bytes_div4_ceil_v1",
+                "canonical_tool_text_plus_nontext_estimates",
+            ),
+            (
+                "model_facing_tool_tokens",
+                "utf8_bytes_div4_ceil_v1",
+                "rendered_model_packet_plus_nontext_estimates",
+            ),
+            (
+                "projection_text_budget",
+                "o200k_base_count_ordinary_v1",
+                "rendered_text",
+            ),
+            (
+                "provider_input_tokens",
+                "provider_reported_tokenizer_unknown",
+                "provider_request_input",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, estimator, scope)| {
+            (
+                name.to_string(),
+                codex_protocol::protocol::SessionTokenMeasurement {
+                    estimator: estimator.to_string(),
+                    scope: scope.to_string(),
+                },
+            )
+        })
+        .collect(),
     }
 }
 
@@ -510,13 +609,36 @@ pub fn current_harness_build_info() -> codex_protocol::protocol::SessionBuildInf
     static CURRENT: std::sync::LazyLock<codex_protocol::protocol::SessionBuildInfo> =
         std::sync::LazyLock::new(|| {
             let mut build = initial_harness_build_info();
-            build.executable_sha256 = codex_utils_build_info::executable_sha256().map(str::to_owned);
+            build.executable_sha256 =
+                codex_utils_build_info::executable_sha256().map(str::to_owned);
             build
         });
     CURRENT.clone()
 }
 
 impl RolloutRecorder {
+    /// Preflight a complete response batch before image decode, cloning, or
+    /// acceptance. Borrow payloads while using the writer's exact wire shape
+    /// and pending-memory charge; this does not reserve queue capacity.
+    pub fn validate_response_items(
+        items: &[codex_protocol::models::ResponseItem],
+    ) -> std::io::Result<()> {
+        #[derive(serde::Serialize)]
+        #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+        enum BorrowedItem<'a> {
+            ResponseItem(&'a codex_protocol::models::ResponseItem),
+        }
+        let borrowed = items
+            .iter()
+            .map(BorrowedItem::ResponseItem)
+            .collect::<Vec<_>>();
+        serialized_admission_bytes(&borrowed, items.len()).map(|_| ()).map_err(|error| {
+            IoError::new(std::io::ErrorKind::InvalidInput, format!(
+                "Input batch exceeds the 64 MiB rollout admission budget (four times serialized bytes plus record overhead); no items accepted. Use fewer or smaller images/text. {error}"
+            ))
+        })
+    }
+
     /// List threads (rollout files) under the provided Codex home directory.
     #[allow(clippy::too_many_arguments)]
     pub async fn list_threads(
@@ -702,6 +824,7 @@ impl RolloutRecorder {
         let fs_page = match sort_direction {
             SortDirection::Asc => {
                 list_threads_from_files_asc(
+                    state_db_ctx.as_deref(),
                     codex_home,
                     page_size,
                     cursor,
@@ -717,6 +840,7 @@ impl RolloutRecorder {
             }
             SortDirection::Desc => {
                 list_threads_from_files_desc(
+                    state_db_ctx.as_deref(),
                     codex_home,
                     if state_db_ctx.is_some() {
                         page_size.saturating_mul(2)
@@ -881,11 +1005,7 @@ impl RolloutRecorder {
         // SQLite listing failed and list_threads_db already logged why. Return the
         // filesystem page rather than failing the list.
         let page = page_from_filesystem_scan(fs_page, sort_direction, page_size, sort_key);
-        codex_state::record_fallback(
-            "list_threads",
-            "db_error",
-            /*telemetry_override*/ None,
-        );
+        codex_state::record_fallback("list_threads", "db_error", /*telemetry_override*/ None);
         Ok(overlay_thread_item_metadata_from_state_db(
             state_db_ctx.as_deref(),
             page,
@@ -933,11 +1053,21 @@ impl RolloutRecorder {
         known_repository_context: Option<Option<RepositoryContext>>,
         lease: Arc<std::fs::File>,
     ) -> std::io::Result<Self> {
-        Self::new_with_resume_state(config, params, known_repository_context, None, Some(lease)).await
+        Self::new_with_resume_state(config, params, known_repository_context, None, Some(lease))
+            .await
     }
 
     pub fn writer_lease(&self) -> Option<Arc<std::fs::File>> {
-        self.writer_lease.clone()
+        self.writer_task
+            .writer_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Identity of the append owner, independent of path reuse or recorder clones.
+    pub fn same_writer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.writer_task, &other.writer_task)
     }
 
     /// Quiesce this recorder before acquiring rollout-move or maintenance locks.
@@ -945,11 +1075,14 @@ impl RolloutRecorder {
     pub async fn pause_for_maintenance(&self) -> std::io::Result<RolloutMaintenanceGuard> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let enqueue_guard = Arc::clone(&self.writer_task.enqueue_gate)
-                .acquire_owned().await
+                .acquire_owned()
+                .await
                 .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
             self.writer_task.ensure_active("pause for maintenance")?;
-            let permit = self.tx.reserve().await
-                .map_err(|_| self.writer_task.writer_task_failure("pause for maintenance"))?;
+            let permit = self.tx.reserve().await.map_err(|_| {
+                self.writer_task
+                    .writer_task_failure("pause for maintenance")
+            })?;
             let (decision, receiver) = oneshot::channel();
             let guard = RolloutMaintenanceGuard {
                 decision: Some(decision),
@@ -958,12 +1091,23 @@ impl RolloutRecorder {
                 _writer_lease: self.writer_lease(),
             };
             let (ack, ready) = oneshot::channel();
-            permit.send(RolloutCmd::Maintenance { ack, decision: receiver });
-            ready.await.map_err(|_| self.writer_task.writer_task_failure("pause for maintenance"))??;
+            permit.send(RolloutCmd::Maintenance {
+                ack,
+                decision: receiver,
+            });
+            ready.await.map_err(|_| {
+                self.writer_task
+                    .writer_task_failure("pause for maintenance")
+            })??;
             Ok(guard)
-        }).await.map_err(|_| IoError::new(
-            std::io::ErrorKind::TimedOut, "timed out waiting for rollout maintenance",
-        ))?
+        })
+        .await
+        .map_err(|_| {
+            IoError::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for rollout maintenance",
+            )
+        })?
     }
 
     /// Load canonical history and its manifest dictionary in one pass. The
@@ -985,24 +1129,37 @@ impl RolloutRecorder {
     ) -> std::io::Result<(Self, Vec<RolloutItem>)> {
         let (path, writer) = open_rollout_for_append(&path).await?;
         let lock_path = path.clone();
-        let _snapshot = tokio::task::spawn_blocking(move || compression::lock_rollout_for_write_blocking(&lock_path))
-            .await.map_err(IoError::other)??;
+        let _snapshot = tokio::task::spawn_blocking(move || {
+            compression::lock_rollout_for_write_blocking(&lock_path)
+        })
+        .await
+        .map_err(IoError::other)??;
         let mut items = Vec::new();
         let mut manifests = crate::ToolManifestDictionary::default();
-        let (thread_id, errors, partial_tail) = Self::for_each_rollout_item_with_integrity(&path, |item, _| {
-            if let RolloutItem::ToolManifest(manifest) = &item
-                && let Err(error) = manifests.apply(manifest)
-            {
-                warn!(%error, "failed to reconstruct persisted tool manifest");
-            }
-            items.push(item);
-        }).await?;
+        let (thread_id, errors, partial_tail, _) =
+            Self::for_each_rollout_item_with_integrity(&path, true, |item, _| {
+                if let RolloutItem::ToolManifest(manifest) = &item
+                    && let Err(error) = manifests.apply(manifest)
+                {
+                    warn!(%error, "failed to reconstruct persisted tool manifest");
+                }
+                items.push(item);
+            })
+            .await?;
         if thread_id != Some(expected_thread) {
-            return Err(IoError::other("resume rollout belongs to a different thread"));
+            return Err(IoError::other(
+                "resume rollout belongs to a different thread",
+            ));
         }
         Self::append_reconstruction_notice(&mut items, errors, partial_tail);
-        let recorder = Self::new_with_resume_state(config, RolloutRecorderParams::resume(path), None,
-            Some((writer, manifests)), lease).await?;
+        let recorder = Self::new_with_resume_state(
+            config,
+            RolloutRecorderParams::resume(path),
+            None,
+            Some((writer, manifests)),
+            lease,
+        )
+        .await?;
         Ok((recorder, items))
     }
 
@@ -1102,11 +1259,15 @@ impl RolloutRecorder {
         // writes. Using `tokio::fs::File` keeps everything on the async I/O
         // driver instead of blocking the runtime.
         let writer_task = Arc::new(RolloutWriterTask::new());
+        *writer_task
+            .writer_lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer_lease;
         let writer_task_for_spawn = Arc::clone(&writer_task);
         let rollout_path_for_spawn = rollout_path.clone();
-        let writer_lease_for_spawn = writer_lease.clone();
+        let lease_custody = RolloutLeaseCustody(Arc::clone(&writer_task));
         let handle = tokio::task::spawn(async move {
-            let _writer_lease = writer_lease_for_spawn;
+            let _lease_custody = lease_custody;
             let result = rollout_writer(
                 writer,
                 deferred_log_file_info,
@@ -1137,7 +1298,6 @@ impl RolloutRecorder {
             tx,
             writer_task,
             rollout_path,
-            writer_lease,
         })
     }
 
@@ -1159,6 +1319,29 @@ impl RolloutRecorder {
         &self,
         items: &[RolloutItem],
     ) -> std::io::Result<()> {
+        if rollout_admission_bytes(items).is_err() {
+            // Validate every individual item before accepting any prefix. Bulk
+            // inheritance may exceed admission even though each record fits.
+            for item in items {
+                rollout_admission_bytes(std::slice::from_ref(item))?;
+            }
+            let mut start = 0;
+            let mut charge = 0usize;
+            for (index, item) in items.iter().enumerate() {
+                let next = rollout_admission_bytes(std::slice::from_ref(item))? as usize;
+                if index > start && charge.saturating_add(next) > MAX_PENDING_ROLLOUT_BYTES / 2 {
+                    self.record_canonical_items(&items[start..index]).await?;
+                    // Lazy pending items release admission only after materialization.
+                    // No enqueue gate is held across this barrier.
+                    self.persist().await?;
+                    start = index;
+                    charge = 0;
+                }
+                charge = charge.saturating_add(next);
+            }
+            self.record_canonical_items(&items[start..]).await?;
+            return self.persist().await;
+        }
         // Waiting for the consumer's acknowledgement also waits for its preceding
         // disk write. Queue admission already transfers ownership and preserves
         // ordering with barriers/shutdown under the enqueue gate. Reuse that path
@@ -1306,8 +1489,9 @@ impl RolloutRecorder {
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
         let mut items = Vec::new();
-        let (thread_id, parse_errors, trailing_partial_records) =
-            Self::for_each_rollout_item_with_integrity(path, |item, _| items.push(item)).await?;
+        let (thread_id, parse_errors, trailing_partial_records, _) =
+            Self::for_each_rollout_item_with_integrity(path, false, |item, _| items.push(item))
+                .await?;
         tracing::debug!(
             "Resumed rollout with {} items, thread ID: {:?}, parse errors: {}",
             items.len(),
@@ -1318,7 +1502,11 @@ impl RolloutRecorder {
         Ok((items, thread_id, parse_errors))
     }
 
-    fn append_reconstruction_notice(items: &mut Vec<RolloutItem>, parse_errors: usize, trailing_partial_records: usize) {
+    fn append_reconstruction_notice(
+        items: &mut Vec<RolloutItem>,
+        parse_errors: usize,
+        trailing_partial_records: usize,
+    ) {
         if parse_errors > 0 {
             let malformed_records = parse_errors.saturating_sub(trailing_partial_records);
             items.push(RolloutItem::ResponseItem(
@@ -1357,14 +1545,16 @@ impl RolloutRecorder {
     where
         F: FnMut(RolloutItem, usize),
     {
-        let (thread_id, errors, _) = Self::for_each_rollout_item_with_integrity(path, visit).await?;
+        let (thread_id, errors, _, _) =
+            Self::for_each_rollout_item_with_integrity(path, false, visit).await?;
         Ok((thread_id, errors))
     }
 
-    async fn for_each_rollout_item_with_integrity<F>(
+    pub(crate) async fn for_each_rollout_item_with_integrity<F>(
         path: &Path,
+        enroll_dependencies: bool,
         mut visit: F,
-    ) -> std::io::Result<(Option<ThreadId>, usize, usize)>
+    ) -> std::io::Result<(Option<ThreadId>, usize, usize, usize)>
     where
         F: FnMut(RolloutItem, usize),
     {
@@ -1373,6 +1563,9 @@ impl RolloutRecorder {
         let mut parse_errors = 0usize;
         let mut last_record_partial = false;
         let mut reader = compression::open_rollout_line_reader(path).await?;
+        if enroll_dependencies {
+            reader.enroll_payload_dependencies();
+        }
         let mut saw_non_empty_line = false;
         let mut record_number = 0usize;
         while let Some(line) = reader.next_line().await? {
@@ -1396,6 +1589,20 @@ impl RolloutRecorder {
                 Some(Value::Number(version)) => version.as_u64() == Some(0),
                 Some(_) => false,
             };
+            if let Some(version) = v.get("format_version")
+                && version.as_u64() != Some(0)
+                && version.as_u64()
+                    != Some(u64::from(
+                        codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION,
+                    ))
+            {
+                return Err(IoError::new(
+                    ErrorKind::Unsupported,
+                    format!(
+                        "unsupported rollout format version {version} at record {record_number}"
+                    ),
+                ));
+            }
             if is_v0 && migrate_v0_ghost_snapshot_rollout_line(&mut v) {
                 trace!("skipping legacy ghost_snapshot rollout line");
                 continue;
@@ -1407,6 +1614,11 @@ impl RolloutRecorder {
                 reject_unknown_thread_history_mode(&v)?;
             }
 
+            // Secondary session metadata is provenance for a fork source, not
+            // the canonical thread's schema/operational history. Preserve the
+            // existing recoverable-gap treatment for that optional provenance.
+            let secondary_metadata = thread_id.is_some()
+                && v.get("type").and_then(Value::as_str) == Some("session_meta");
             // Parse the rollout line structure
             match serde_json::from_value::<RolloutLine>(v) {
                 Ok(rollout_line) => {
@@ -1421,6 +1633,14 @@ impl RolloutRecorder {
                     visit(item, record_number);
                 }
                 Err(e) => {
+                    if !secondary_metadata && e.to_string().contains("unknown variant") {
+                        return Err(IoError::new(
+                            ErrorKind::Unsupported,
+                            format!(
+                                "unsupported rollout representation at record {record_number}: {e}"
+                            ),
+                        ));
+                    }
                     trace!("failed to parse rollout line: {e}");
                     parse_errors = parse_errors.saturating_add(1);
                 }
@@ -1432,10 +1652,16 @@ impl RolloutRecorder {
 
         // A damaged metadata payload must not hide an otherwise usable rollout.
         let thread_id = thread_id.or_else(|| {
-            let (_, id) = crate::list::parse_timestamp_uuid_from_filename(path.file_name()?.to_str()?)?;
+            let (_, id) =
+                crate::list::parse_timestamp_uuid_from_filename(path.file_name()?.to_str()?)?;
             ThreadId::from_string(&id.to_string()).ok()
         });
-        Ok((thread_id, parse_errors, usize::from(last_record_partial)))
+        Ok((
+            thread_id,
+            parse_errors,
+            usize::from(last_record_partial),
+            reader.unresolved_payloads(),
+        ))
     }
 
     async fn existing_tool_manifests(
@@ -1452,6 +1678,7 @@ impl RolloutRecorder {
         let mut manifests = crate::ToolManifestDictionary::default();
         let mut parse_errors = 0usize;
         let mut reader = compression::open_rollout_line_reader(path).await?;
+        reader.enroll_payload_dependencies();
         while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -1507,29 +1734,42 @@ impl RolloutRecorder {
     /// A queued discard remains owned by the writer if the caller is cancelled.
     /// Earlier commands may be blocked on storage; do not wait indefinitely for them.
     pub async fn discard(&self) -> std::io::Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let enqueue_guard = self.writer_task.enqueue_gate.acquire().await
-                .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
-            if self.writer_task.lifecycle.load(Ordering::Acquire) == WRITER_SHUT_DOWN {
-                return Ok(());
-            }
-            let permit = self.tx.reserve().await.map_err(|e| {
-                self.writer_task.terminal_failure().unwrap_or_else(|| {
-                    IoError::other(format!("failed to reserve rollout discard command: {e}"))
-                })
-            })?;
-            self.writer_task.begin_shutdown()?;
-            let (ack, done) = oneshot::channel();
-            permit.send(RolloutCmd::Discard { ack });
-            drop(enqueue_guard);
-            done.await.map_err(|e| {
-                self.writer_task.terminal_failure().unwrap_or_else(|| {
-                    IoError::other(format!("failed waiting for rollout discard: {e}"))
-                })
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.discard_owned())
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for rollout discard",
+                )
+            })?
+    }
+
+    /// Await actual terminal settlement from an independently owned lifecycle
+    /// task. Its observer may time out, but must not cancel registry cleanup.
+    pub async fn discard_owned(&self) -> std::io::Result<()> {
+        let enqueue_guard = self
+            .writer_task
+            .enqueue_gate
+            .acquire()
+            .await
+            .map_err(|_| IoError::other("rollout enqueue gate is closed"))?;
+        if self.writer_task.lifecycle.load(Ordering::Acquire) == WRITER_SHUT_DOWN {
+            return Ok(());
+        }
+        let permit = self.tx.reserve().await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed to reserve rollout discard command: {e}"))
             })
-        }).await.map_err(|_| IoError::new(
-            std::io::ErrorKind::TimedOut, "timed out waiting for rollout discard",
-        ))?
+        })?;
+        self.writer_task.begin_shutdown()?;
+        let (ack, done) = oneshot::channel();
+        permit.send(RolloutCmd::Discard { ack });
+        drop(enqueue_guard);
+        done.await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed waiting for rollout discard: {e}"))
+            })
+        })
     }
 
     /// Drain pending items before stopping the writer task.
@@ -1718,6 +1958,7 @@ fn overlay_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadItem) {
 
 #[allow(clippy::too_many_arguments)]
 async fn list_threads_from_files_desc(
+    state_db_ctx: Option<&StateRuntime>,
     codex_home: &Path,
     page_size: usize,
     cursor: Option<&Cursor>,
@@ -1751,8 +1992,13 @@ async fn list_threads_from_files_desc(
             .await?;
             scanned_files = scanned_files.saturating_add(page.num_scanned_files);
             reached_scan_cap |= page.reached_scan_cap;
-            filter_thread_items_by_search_term(codex_home, &mut page.items, Some(search_term))
-                .await?;
+            filter_thread_items_by_search_term(
+                state_db_ctx,
+                codex_home,
+                &mut page.items,
+                Some(search_term),
+            )
+            .await?;
             matching_items.extend(page.items);
             page_cursor = page.next_cursor;
             if matching_items.len() > page_size || page_cursor.is_none() {
@@ -1838,6 +2084,7 @@ async fn list_threads_from_files_desc_unfiltered(
 
 #[allow(clippy::too_many_arguments)]
 async fn list_threads_from_files_asc(
+    state_db_ctx: Option<&StateRuntime>,
     codex_home: &Path,
     page_size: usize,
     cursor: Option<&Cursor>,
@@ -1886,7 +2133,13 @@ async fn list_threads_from_files_asc(
             .num_scanned_files
             .saturating_add(scanned.num_scanned_files);
         page.reached_scan_cap |= scanned.reached_scan_cap;
-        filter_thread_items_by_search_term(codex_home, &mut scanned.items, search_term).await?;
+        filter_thread_items_by_search_term(
+            state_db_ctx,
+            codex_home,
+            &mut scanned.items,
+            search_term,
+        )
+        .await?;
         page.items.extend(scanned.items);
         page_cursor = scanned.next_cursor;
         if search_term.is_none() || page.items.len() > page_size || page_cursor.is_none() {
@@ -1908,6 +2161,7 @@ async fn list_threads_from_files_asc(
 }
 
 async fn filter_thread_items_by_search_term(
+    state_db_ctx: Option<&StateRuntime>,
     codex_home: &Path,
     items: &mut Vec<ThreadItem>,
     search_term: Option<&str>,
@@ -1916,13 +2170,41 @@ async fn filter_thread_items_by_search_term(
         return Ok(());
     };
 
-    // Titles come from the sidecar index and previews from the rollout summary.
-    // Match SQLite's title-or-preview substring predicate in both fallback sort orders.
+    // Match the title the listing displays: SQLite owns explicit titles, and the sidecar index
+    // is the compatibility fallback (it can lack a committed rename). Previews come from the
+    // rollout summary. Match SQLite's title-or-preview substring predicate in both sort orders.
     let thread_ids = items
         .iter()
         .filter_map(|item| item.thread_id)
         .collect::<HashSet<_>>();
-    let thread_names = find_thread_names_by_ids(codex_home, &thread_ids).await?;
+    let mut thread_names = HashMap::with_capacity(thread_ids.len());
+    if let Some(state_db_ctx) = state_db_ctx
+        && !thread_ids.is_empty()
+    {
+        let ids = thread_ids.iter().copied().collect::<Vec<_>>();
+        match state_db_ctx.get_thread_titles(&ids).await {
+            Ok(titles) => {
+                for (thread_id, title, first_user_message) in titles {
+                    let title = title.trim();
+                    if !title.is_empty()
+                        && first_user_message.as_deref().map(str::trim) != Some(title)
+                    {
+                        thread_names.insert(thread_id, title.to_string());
+                    }
+                }
+            }
+            Err(err) => {
+                warn!("state db get_thread_titles failed while filtering thread search: {err}");
+            }
+        }
+    }
+    let unresolved_thread_ids = thread_ids
+        .into_iter()
+        .filter(|thread_id| !thread_names.contains_key(thread_id))
+        .collect::<HashSet<_>>();
+    for (thread_id, name) in find_thread_names_by_ids(codex_home, &unresolved_thread_ids).await? {
+        thread_names.entry(thread_id).or_insert(name);
+    }
     items.retain(|item| {
         item.thread_id
             .and_then(|thread_id| thread_names.get(&thread_id))
@@ -1998,8 +2280,8 @@ impl LockedRolloutFile {
         JsonlWriter {
             path: self.path,
             file: tokio::fs::File::from_std(self.file),
-            _append_lock: self.append_lock,
-            _payload_retention: self.payload_retention,
+            _append_lock: Arc::new(self.append_lock),
+            _payload_retention: Arc::new(self.payload_retention),
             #[cfg(test)]
             write_fault: None,
             #[cfg(test)]
@@ -2049,6 +2331,7 @@ fn open_log_file_with_options(
 /// unwritten suffix so the next barrier can reopen the file and retry.
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
+    residency: Option<(Arc<compression::RolloutAppendLock>, Arc<std::fs::File>)>,
     deferred_log_file_info: Option<LogFileInfo>,
     pending_items: Vec<CapturedRolloutItem>,
     meta: Option<SessionMeta>,
@@ -2059,7 +2342,10 @@ struct RolloutWriterState {
     retry_blocked_error: Option<String>,
     tool_manifests: crate::ToolManifestDictionary,
     last_settings: Option<serde_json::Value>,
-    pending_agent_message_mirrors: std::collections::VecDeque<codex_protocol::protocol::AgentMessageEvent>,
+    settings_prefix_len: Option<u64>,
+    namespace_sync_pending: bool,
+    pending_agent_message_mirrors:
+        std::collections::VecDeque<codex_protocol::protocol::AgentMessageEvent>,
 }
 
 impl RolloutWriterState {
@@ -2072,8 +2358,15 @@ impl RolloutWriterState {
         rollout_path: PathBuf,
         tool_manifests: crate::ToolManifestDictionary,
     ) -> Self {
+        let residency = writer.as_ref().map(|writer| {
+            (
+                Arc::clone(&writer._append_lock),
+                Arc::clone(&writer._payload_retention),
+            )
+        });
         Self {
             writer,
+            residency,
             deferred_log_file_info,
             pending_items: Vec::new(),
             meta,
@@ -2084,6 +2377,8 @@ impl RolloutWriterState {
             retry_blocked_error: None,
             tool_manifests,
             last_settings: None,
+            settings_prefix_len: None,
+            namespace_sync_pending: true,
             pending_agent_message_mirrors: Default::default(),
         }
     }
@@ -2091,8 +2386,11 @@ impl RolloutWriterState {
     fn add_items(&mut self, items: Vec<CapturedRolloutItem>) {
         for captured in items {
             if let Some(expected) = self.pending_agent_message_mirrors.pop_front() {
-                if let RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::AgentMessage(actual)) = &captured.item
-                    && expected.message == actual.message && expected.phase == actual.phase
+                if let RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::AgentMessage(
+                    actual,
+                )) = &captured.item
+                    && expected.message == actual.message
+                    && expected.phase == actual.phase
                 {
                     continue;
                 }
@@ -2106,38 +2404,18 @@ impl RolloutWriterState {
                         "ignoring inherited session metadata; recorder owns the canonical record"
                     );
                 }
-                RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ThreadSettingsApplied(settings)) => {
-                    // Preserve actual transitions (including a return to an older
-                    // value), but do not re-store identical instruction payloads.
-                    let mut compact = settings.clone();
-                    match serde_json::to_value(settings) {
-                        Ok(value) => {
-                            if self.last_settings.as_ref() == Some(&value) {
-                                continue;
-                            }
-                            if self.last_settings.as_ref().is_some_and(|previous| {
-                                previous["thread_settings"].get("developer_instructions")
-                                    == value["thread_settings"].get("developer_instructions")
-                            }) {
-                                // This existing presence-aware field is already
-                                // reduced as "unchanged" by resume/fork consumers.
-                                compact.thread_settings.developer_instructions = None;
-                            }
-                            self.last_settings = Some(value);
-                        }
-                        Err(_) => self.last_settings = None,
-                    }
-                    self.pending_items.push(captured.with_item(RolloutItem::EventMsg(
-                        codex_protocol::protocol::EventMsg::ThreadSettingsApplied(compact),
-                    )));
-                }
                 RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::ItemCompleted(event)) => {
                     if let codex_protocol::items::TurnItem::AgentMessage(message) = &event.item {
-                        self.pending_agent_message_mirrors = message.as_legacy_events().into_iter()
+                        self.pending_agent_message_mirrors = message
+                            .as_legacy_events()
+                            .into_iter()
                             .filter_map(|event| match event {
-                                codex_protocol::protocol::EventMsg::AgentMessage(message) => Some(message),
+                                codex_protocol::protocol::EventMsg::AgentMessage(message) => {
+                                    Some(message)
+                                }
                                 _ => None,
-                            }).collect();
+                            })
+                            .collect();
                     }
                     self.pending_items.push(captured);
                 }
@@ -2190,6 +2468,14 @@ impl RolloutWriterState {
         crate::payload_artifact::sync_payload_artifacts(&self.rollout_path).await?;
         if let Some(writer) = self.writer.as_ref() {
             writer.file.sync_data().await?;
+            if self.namespace_sync_pending {
+                let path = self.rollout_path.clone();
+                tokio::task::spawn_blocking(move || sync_rollout_namespace(&path))
+                    .await
+                    .map_err(IoError::other)??;
+                // Failure or cancellation leaves the namespace charged for retry.
+                self.namespace_sync_pending = false;
+            }
         }
         Ok(())
     }
@@ -2285,10 +2571,41 @@ impl RolloutWriterState {
             .map(|info| info.path.as_path())
             .unwrap_or(self.rollout_path.as_path());
         let path = path.to_path_buf();
-        let file = tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
+        let writer = if let Some((append_lock, payload_retention)) = &self.residency {
+            // Recovery replaces only the data handle. Residency still excludes
+            // relocation, and a vanished materialized file must not be recreated.
+            let file = tokio::task::spawn_blocking(move || {
+                let _write = compression::lock_rollout_for_write_blocking(&path)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .append(true)
+                    .open(&path)?;
+                ensure_rollout_is_newline_terminated(&mut file)?;
+                Ok::<_, IoError>(file)
+            })
             .await
             .map_err(IoError::other)??;
-        self.writer = Some(file.into_jsonl_writer());
+            JsonlWriter {
+                path: self.rollout_path.clone(),
+                file: tokio::fs::File::from_std(file),
+                _append_lock: Arc::clone(append_lock),
+                _payload_retention: Arc::clone(payload_retention),
+                #[cfg(test)]
+                write_fault: None,
+                #[cfg(test)]
+                append_transaction_count: 0,
+            }
+        } else {
+            tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
+                .await
+                .map_err(IoError::other)??
+                .into_jsonl_writer()
+        };
+        self.residency = Some((
+            Arc::clone(&writer._append_lock),
+            Arc::clone(&writer._payload_retention),
+        ));
+        self.writer = Some(writer);
         self.deferred_log_file_info = None;
         Ok(())
     }
@@ -2383,17 +2700,57 @@ impl RolloutWriterState {
         let Some(writer) = self.writer.as_mut() else {
             return Err(IoError::other("rollout writer is not open"));
         };
-
+        // Only the immediately preceding committed prefix authorizes delta
+        // compaction. Independent append owners invalidate our private cache.
+        let prefix_len = writer.file.metadata().await?.len();
+        let mut last_settings = if self.settings_prefix_len == Some(prefix_len) {
+            self.last_settings.clone()
+        } else {
+            None
+        };
+        let mut compacted = Vec::with_capacity(self.pending_items.len());
+        for captured in &self.pending_items {
+            if let RolloutItem::EventMsg(
+                codex_protocol::protocol::EventMsg::ThreadSettingsApplied(settings),
+            ) = &captured.item
+            {
+                let value = serde_json::to_value(settings).map_err(IoError::other)?;
+                if last_settings.as_ref() == Some(&value) {
+                    continue;
+                }
+                let mut settings = settings.clone();
+                if last_settings.as_ref().is_some_and(|previous| {
+                    previous["thread_settings"].get("developer_instructions")
+                        == value["thread_settings"].get("developer_instructions")
+                }) {
+                    settings.thread_settings.developer_instructions = None;
+                }
+                last_settings = Some(value);
+                compacted.push(captured.clone().with_item(RolloutItem::EventMsg(
+                    codex_protocol::protocol::EventMsg::ThreadSettingsApplied(settings),
+                )));
+            } else {
+                compacted.push(captured.clone());
+            }
+        }
         let items = session_meta_item
             .iter()
-            .chain(self.pending_items.iter())
+            .chain(compacted.iter())
             .collect::<Vec<_>>();
         if items.is_empty() {
+            self.pending_items.clear();
             return Ok(());
         }
         writer
             .write_rollout_items_locked(&items, &write_lock)
             .await?;
+        self.last_settings = last_settings;
+        self.settings_prefix_len = writer
+            .file
+            .metadata()
+            .await
+            .ok()
+            .map(|metadata| metadata.len());
         if session_meta_item.is_some() {
             self.meta = None;
         }
@@ -2453,6 +2810,7 @@ async fn rollout_writer(
             }
             RolloutCmd::Shutdown { ack } => match state.shutdown().await {
                 Ok(()) => {
+                    drop(state);
                     writer_task.finish_shutdown(true);
                     let _ = ack.send(Ok(()));
                     return Ok(());
@@ -2482,6 +2840,7 @@ async fn rollout_writer(
                 }
                 // Keep lazy records, dictionaries and metadata in this owner.
                 state.writer.take();
+                state.residency.take();
                 let _ = ack.send(Ok(()));
                 match decision.await.unwrap_or(MaintenanceDecision::Resume) {
                     MaintenanceDecision::Commit => {
@@ -2495,6 +2854,10 @@ async fn rollout_writer(
                     MaintenanceDecision::Resume if materialized => {
                         // Restore must have succeeded: never create a new file.
                         let (_, writer) = open_rollout_for_append(&state.rollout_path).await?;
+                        state.residency = Some((
+                            Arc::clone(&writer._append_lock),
+                            Arc::clone(&writer._payload_retention),
+                        ));
                         state.writer = Some(writer);
                     }
                     MaintenanceDecision::Resume => {}
@@ -2519,6 +2882,7 @@ async fn rollout_writer(
 
     // Closing the last sender still must finish writes for accepted records.
     state.shutdown().await?;
+    drop(state);
     writer_task.finish_shutdown(true);
     Ok(())
 }
@@ -2546,12 +2910,45 @@ pub async fn append_rollout_item_to_path(
 
 async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, JsonlWriter)> {
     let path = path.to_path_buf();
-    let (path, file) = tokio::task::spawn_blocking(move || {
-        open_log_file_with_options(path.as_path(), /*create*/ false)
+    let lock_path = path.clone();
+    let (payload_retention, append_lock, snapshot) = tokio::task::spawn_blocking(move || {
+        // Same order as ordinary publication: payload lease, representation,
+        // then byte writer. Keep all three across preflight and materialization.
+        let retention = crate::payload_artifact::lock_publication(&lock_path)?;
+        let append = compression::lock_rollout_before_append_blocking(&lock_path)?;
+        let snapshot = compression::lock_rollout_for_write_blocking(&lock_path)?;
+        Ok::<_, IoError>((retention, append, snapshot))
     })
     .await
     .map_err(IoError::other)??;
-    Ok((path, file.into_jsonl_writer()))
+    match RolloutRecorder::for_each_rollout_item_with_integrity(&path, false, |_, _| {}).await {
+        // A live owner can reopen an empty file after an interrupted initial
+        // write. There is no unknown semantic record to fence in that case.
+        Err(error)
+            if error.kind() == ErrorKind::InvalidData
+                && error.to_string() == "empty session file" => {}
+        result => {
+            result?;
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        let path = compression::materialize_rollout_for_append_locked(&path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        ensure_rollout_is_newline_terminated(&mut file)?;
+        let file = LockedRolloutFile {
+            path: path.clone(),
+            file,
+            append_lock,
+            payload_retention,
+        };
+        drop(snapshot);
+        Ok((path, file.into_jsonl_writer()))
+    })
+    .await
+    .map_err(IoError::other)?
 }
 
 fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> {
@@ -2569,11 +2966,51 @@ fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> 
     Ok(())
 }
 
+// A file sync alone does not persist its name or freshly created date directories.
+// Do this once per writer lifetime, never on every append or ordinary flush.
+fn sync_rollout_namespace(path: &Path) -> std::io::Result<()> {
+    for directory in path
+        .ancestors()
+        .skip(1)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        #[cfg(unix)]
+        let result = std::fs::File::open(directory).and_then(|file| file.sync_all());
+        #[cfg(windows)]
+        let result = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Windows directory flushing is best effort, matching artifact publication.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0x0200_0000)
+                .open(directory)
+                .and_then(|file| file.sync_all())
+        };
+        #[cfg(not(any(unix, windows)))]
+        let result: std::io::Result<()> = Ok(());
+        // The walk reaches ancestors this writer never created. An unreadable
+        // one (for example an execute-only `/home`) or a filesystem without
+        // directory sync cannot be fixed by retrying, so it must not fail every
+        // later durable barrier. A missing directory still fails.
+        if let Err(error) = result
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+                    | std::io::ErrorKind::InvalidInput
+            )
+        {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 struct JsonlWriter {
     path: PathBuf,
     file: tokio::fs::File,
-    _append_lock: compression::RolloutAppendLock,
-    _payload_retention: std::fs::File,
+    _append_lock: Arc<compression::RolloutAppendLock>,
+    _payload_retention: Arc<std::fs::File>,
     #[cfg(test)]
     write_fault: Option<JsonlWriteFault>,
     #[cfg(test)]
@@ -2851,3 +3288,7 @@ fn thread_item_from_state_metadata(
 #[cfg(test)]
 #[path = "recorder_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recorder_compat_tests.rs"]
+mod compatibility_tests;

@@ -105,6 +105,7 @@ async fn assert_installed_host_skill_fragment(
     let skill_path_string = skill_path.to_string_lossy().into_owned();
     let mut outcome = SkillLoadOutcome::default();
     outcome.skills.push(SkillMetadata {
+        source: None,
         name: "demo".to_string(),
         description: "Demo skill.".to_string(),
         short_description: None,
@@ -166,6 +167,7 @@ async fn assert_installed_host_skill_fragment(
                     text_elements: Vec::new(),
                 }],
                 environments: Vec::new(),
+                bound_selected_capability_roots: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
             },
             &session_store,
@@ -260,6 +262,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "turn-estimate",
             environments: std::slice::from_ref(&turn_environment),
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &selected_roots,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -274,6 +277,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "turn-1",
             environments: std::slice::from_ref(&turn_environment),
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &selected_roots,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -306,6 +310,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
                     text_elements: Vec::new(),
                 }],
                 environments: Vec::new(),
+                bound_selected_capability_roots: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
             },
             &session_store,
@@ -332,6 +337,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "turn-cached-estimate",
             environments: std::slice::from_ref(&turn_environment),
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &selected_roots,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -351,6 +357,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "turn-2",
             environments: &[],
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &[],
             session_store: &session_store,
             thread_store: &thread_store,
@@ -373,6 +380,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "turn-3",
             environments: &[turn_environment],
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &selected_roots,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -400,6 +408,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "turn-4",
             environments: &[],
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &selected_roots,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -780,7 +789,10 @@ async fn estimate_thread_context_does_not_populate_orchestrator_cache() -> TestR
         .contribute_thread_context(&session_store, &thread_store)
         .await;
     assert_eq!(1, cached_runtime_fragments.len());
-    assert_eq!(runtime_fragments[0].text(), cached_runtime_fragments[0].text());
+    assert_eq!(
+        runtime_fragments[0].text(),
+        cached_runtime_fragments[0].text()
+    );
     assert_eq!(
         2,
         list_calls.load(Ordering::Relaxed),
@@ -851,6 +863,7 @@ async fn orchestrator_failure_is_retried_only_by_explicit_discovery() -> TestRes
                         text_elements: Vec::new(),
                     }],
                     environments: Vec::new(),
+                    bound_selected_capability_roots: Vec::new(),
                     ready_selected_capability_roots: Vec::new(),
                 },
                 &session_store,
@@ -951,6 +964,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
                 environment_id: "env-1".to_string(),
                 cwd: PathUri::parse("file:///workspace").expect("cwd URI"),
             }],
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &selected_roots,
             session_store: &session_store,
             thread_store: &thread_store,
@@ -966,6 +980,7 @@ async fn root_qualified_locator_selects_only_the_matching_executor_skill() -> Te
                     path: root_b_locator.to_string(),
                 }],
                 environments: Vec::new(),
+                bound_selected_capability_roots: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
             },
             &session_store,
@@ -1043,6 +1058,7 @@ async fn prompt_hidden_skill_can_still_be_invoked() -> TestResult {
                     text_elements: Vec::new(),
                 }],
                 environments: Vec::new(),
+                bound_selected_capability_roots: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
             },
             &session_store,
@@ -1377,6 +1393,7 @@ async fn executor_failure_retries_next_turn_and_real_input_populates_snapshot() 
             thread_id: codex_protocol::ThreadId::new(),
             turn_id: "estimate",
             environments: &[],
+            bound_selected_capability_roots: &[],
             ready_selected_capability_roots: &roots,
             session_store: &session,
             thread_store: &thread,
@@ -1402,6 +1419,7 @@ async fn executor_failure_retries_next_turn_and_real_input_populates_snapshot() 
                         text_elements: Vec::new(),
                     }],
                     environments: Vec::new(),
+                    bound_selected_capability_roots: Vec::new(),
                     ready_selected_capability_roots: roots.clone(),
                 },
                 &session,
@@ -1418,6 +1436,7 @@ async fn executor_failure_retries_next_turn_and_real_input_populates_snapshot() 
                 thread_id: codex_protocol::ThreadId::new(),
                 turn_id,
                 environments: &[],
+                bound_selected_capability_roots: &[],
                 ready_selected_capability_roots: &roots,
                 session_store: &session,
                 thread_store: &thread,
@@ -1465,6 +1484,7 @@ async fn truncated_instructions_are_visible_and_scalar_metadata_is_escaped() -> 
                     path: resource.clone(),
                 }],
                 environments: Vec::new(),
+                bound_selected_capability_roots: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
             },
             &session,
@@ -1598,6 +1618,7 @@ async fn omitted_selected_instructions_warn_the_user() -> TestResult {
             path: resource,
         }],
         environments: Vec::new(),
+        bound_selected_capability_roots: Vec::new(),
         ready_selected_capability_roots: Vec::new(),
     };
     // A rebuilt pending plan contributes the same turn again; its warning is shown once.
@@ -1672,6 +1693,7 @@ async fn mismatched_resources_are_rejected_for_injection_and_tools() -> TestResu
                         text_elements: Vec::new(),
                     }],
                     environments: Vec::new(),
+                    bound_selected_capability_roots: Vec::new(),
                     ready_selected_capability_roots: Vec::new(),
                 },
                 &session,
@@ -1847,8 +1869,13 @@ async fn omitted_catalog_entries_are_recoverable_through_advertised_list_route()
         args["cursor"] = response["next_cursor"].clone();
     }
     assert_eq!(
-        recovered.iter().map(|skill| skill["package"].clone()).collect::<Vec<_>>(),
-        (0..12).map(|index| serde_json::json!(format!("orchestrator/skill-{index}"))).collect::<Vec<_>>()
+        recovered
+            .iter()
+            .map(|skill| skill["package"].clone())
+            .collect::<Vec<_>>(),
+        (0..12)
+            .map(|index| serde_json::json!(format!("orchestrator/skill-{index}")))
+            .collect::<Vec<_>>()
     );
     let last = recovered.last().ok_or("last skill")?;
     assert_eq!(last["package"], "orchestrator/skill-11");
@@ -2139,6 +2166,7 @@ async fn empty_incomplete_catalog_advertises_recovery_without_automatic_rediscov
                 turn_id: "initial-turn".to_string(),
                 user_input: Vec::new(),
                 environments: Vec::new(),
+                bound_selected_capability_roots: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
             },
             &session,
@@ -2183,6 +2211,7 @@ async fn empty_incomplete_catalog_advertises_recovery_without_automatic_rediscov
                     text_elements: Vec::new(),
                 }],
                 environments: Vec::new(),
+                bound_selected_capability_roots: Vec::new(),
                 ready_selected_capability_roots: Vec::new(),
             },
             &session,

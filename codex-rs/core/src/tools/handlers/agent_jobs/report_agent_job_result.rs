@@ -106,7 +106,10 @@ pub async fn handle(
             ))
         })?;
     let content =
-        serde_json::to_string(&ReportAgentJobResultToolResult { accepted }).map_err(|err| {
+        serde_json::to_string(&ReportAgentJobResultToolResult {
+            accepted,
+            rejection_reason: (!accepted).then_some("No running item owned by this worker accepted the report. The job or assignment may have ended or changed, or a report may already exist. Do not automatically replay; inspect the job or report the submission blocker."),
+        }).map_err(|err| {
             FunctionCallError::Fatal(format!(
                 "failed to serialize report_agent_job_result result: {err}"
             ))

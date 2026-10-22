@@ -197,6 +197,80 @@ struct RetryingTerminationProcess {
     stall_first: bool,
 }
 
+struct PermanentlyUnreachableProcess {
+    id: ProcessId,
+    attempts: AtomicUsize,
+    record: std::sync::Mutex<Option<String>>,
+}
+
+impl ExecProcess for PermanentlyUnreachableProcess {
+    fn process_id(&self) -> &ProcessId {
+        &self.id
+    }
+    fn subscribe_wake(&self) -> watch::Receiver<u64> {
+        watch::channel(0).1
+    }
+    fn subscribe_events(&self) -> ExecProcessEventReceiver {
+        ExecProcessEventReceiver::empty()
+    }
+    fn read(
+        &self,
+        _: Option<u64>,
+        _: Option<usize>,
+        _: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        panic!("unexpected read")
+    }
+    fn write(&self, _: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
+        panic!("unexpected write")
+    }
+    fn signal(&self, _: ProcessSignal) -> ExecProcessFuture<'_, ()> {
+        panic!("unexpected signal")
+    }
+    fn terminate(&self) -> ExecProcessFuture<'_, ()> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(ExecServerError::Disconnected(
+                "immutable failed session".into(),
+            ))
+        })
+    }
+    fn termination_is_unreachable(&self) -> bool {
+        true
+    }
+    fn record_unresolved_termination(&self, reason: &str) {
+        *self.record.lock().unwrap() = Some(reason.into());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn permanent_remote_cleanup_drains_tracker_without_claiming_termination() {
+    let process = Arc::new(PermanentlyUnreachableProcess {
+        id: "unreachable".into(),
+        attempts: AtomicUsize::new(0),
+        record: Default::default(),
+    });
+    let tasks = tokio_util::task::TaskTracker::new();
+    let owned: Arc<dyn ExecProcess> = process.clone();
+    tasks.spawn(retry_remote_user_shell_termination(owned));
+    tasks.close();
+    timeout(Duration::from_secs(1), tasks.wait())
+        .await
+        .expect("unreachable cleanup must not retain the persistence barrier");
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(process.attempts.load(Ordering::SeqCst), 0);
+    assert!(
+        process
+            .record
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("unconfirmed")
+    );
+    assert_eq!(Arc::strong_count(&process), 1);
+}
+
 impl ExecProcess for RetryingTerminationProcess {
     fn process_id(&self) -> &ProcessId {
         &self.process_id

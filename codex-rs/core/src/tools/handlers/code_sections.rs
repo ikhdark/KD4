@@ -35,6 +35,8 @@ pub(crate) struct CodeItem {
     #[serde(skip)]
     pub start: usize,
     #[serde(skip)]
+    pub header_end: usize,
+    #[serde(skip)]
     pub end: usize,
 }
 
@@ -44,6 +46,15 @@ pub(crate) fn parse(
     sha256: &str,
     deadline: Instant,
 ) -> Option<Vec<CodeItem>> {
+    parse_with_completeness(path, source, sha256, deadline).map(|(items, _)| items)
+}
+
+fn parse_with_completeness(
+    path: &str,
+    source: &str,
+    sha256: &str,
+    deadline: Instant,
+) -> Option<(Vec<CodeItem>, bool)> {
     let rust = path.ends_with(".rs");
     let language = if rust {
         tree_sitter_rust::LANGUAGE
@@ -66,6 +77,7 @@ pub(crate) fn parse(
         None,
         Some(tree_sitter::ParseOptions::new().progress_callback(&mut cancelled)),
     )?;
+    let complete = !tree.root_node().has_error();
     let mut items = Vec::new();
     let mut test_contexts = std::collections::HashMap::new();
     let mut cursor = tree.walk();
@@ -320,6 +332,7 @@ pub(crate) fn parse(
                 syntax_error,
                 trait_method_alias,
                 start,
+                header_end: signature_end,
                 end: node.end_byte(),
             });
         }
@@ -331,7 +344,7 @@ pub(crate) fn parse(
                 break;
             }
             if !cursor.goto_parent() {
-                return Some(items);
+                return Some((items, complete));
             }
         }
     }
@@ -339,9 +352,10 @@ pub(crate) fn parse(
 
 /// Whether `after` removes or rewrites a test item of `before`: an item under
 /// a test attribute or `#[cfg(test)]` (every item when `whole_file_is_test`),
-/// compared by qualified name and exact text including attributes. Modules,
-/// impls, traits and classes only contain tests, so adding a test or moving an
-/// unchanged one is not a change. `None` when a side cannot be parsed in time.
+/// compared by qualified name, occurrence count, exact text and enclosing
+/// execution-policy headers. Non-declaration test-scope statements retain
+/// fixtures/oracles without treating a new sibling test as an existing edit.
+/// `None` when a side cannot be parsed in time.
 pub(crate) fn existing_tests_changed(
     path: &str,
     before: &str,
@@ -349,29 +363,124 @@ pub(crate) fn existing_tests_changed(
     whole_file_is_test: bool,
     deadline: Instant,
 ) -> Option<bool> {
+    // Test fingerprint (identity, text, enclosing headers) -> occurrence count.
+    type TestOccurrences<'a> =
+        std::collections::HashMap<(String, Vec<&'a str>, Vec<&'a str>), usize>;
+
     fn tests<'a>(
         path: &str,
         source: &'a str,
         whole_file_is_test: bool,
         deadline: Instant,
-    ) -> Option<std::collections::HashSet<(String, &'a str)>> {
-        Some(
-            parse(path, source, "", deadline)?
-                .into_iter()
-                .filter(|item| {
-                    (whole_file_is_test || item.in_test_context)
-                        && !matches!(item.kind, "mod" | "impl" | "trait" | "class" | "extern")
-                })
-                .map(|item| (item.qualified_name, &source[item.start..item.end]))
-                .collect(),
-        )
+    ) -> Option<TestOccurrences<'a>> {
+        struct Scope<'a> {
+            end: usize,
+            cursor: usize,
+            name: String,
+            header: &'a str,
+            active: bool,
+            statements: Vec<&'a str>,
+        }
+        impl<'a> Scope<'a> {
+            fn collect(&mut self, source: &'a str, end: usize, deadline: Instant) -> Option<()> {
+                if self.active {
+                    for line in source[self.cursor..end].lines() {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        let line = line.trim();
+                        if !matches!(line, "" | "{" | "}") {
+                            self.statements.push(line);
+                        }
+                    }
+                }
+                self.cursor = end;
+                Some(())
+            }
+        }
+        let mut tests = std::collections::HashMap::new();
+        let mut owners = vec![Scope {
+            end: source.len(),
+            cursor: 0,
+            name: String::new(),
+            header: "",
+            active: whole_file_is_test,
+            statements: Vec::new(),
+        }];
+        let (items, complete) = parse_with_completeness(path, source, "", deadline)?;
+        if !complete {
+            return None;
+        }
+        for item in items {
+            if Instant::now() >= deadline || item.syntax_error {
+                return None;
+            }
+            while owners.len() > 1 && owners.last()?.end <= item.start {
+                let mut owner = owners.pop()?;
+                owner.collect(source, owner.end, deadline)?;
+                if owner.active && !owner.statements.is_empty() {
+                    let headers = owners
+                        .iter()
+                        .map(|owner| owner.header)
+                        .chain(std::iter::once(owner.header))
+                        .collect();
+                    *tests
+                        .entry((format!("scope:{}", owner.name), owner.statements, headers))
+                        .or_insert(0) += 1;
+                }
+            }
+            let owner = owners.last_mut()?;
+            // A leaf is fingerprinted in full; do not separately traverse its
+            // nested declarations or use their offsets as occurrence identity.
+            if item.start < owner.cursor {
+                continue;
+            }
+            owner.collect(source, item.start, deadline)?;
+            owner.cursor = item.end;
+            if matches!(item.kind, "mod" | "impl" | "trait" | "class" | "extern") {
+                owners.push(Scope {
+                    end: item.end,
+                    cursor: item.header_end,
+                    name: item.qualified_name,
+                    header: &source[item.start..item.header_end],
+                    active: whole_file_is_test || item.in_test_context,
+                    statements: Vec::new(),
+                });
+            } else if whole_file_is_test || item.in_test_context {
+                *tests
+                    .entry((
+                        format!("item:{}", item.qualified_name),
+                        vec![&source[item.start..item.end]],
+                        owners.iter().map(|owner| owner.header).collect(),
+                    ))
+                    .or_insert(0) += 1;
+            }
+        }
+        while let Some(mut owner) = owners.pop() {
+            owner.collect(source, owner.end, deadline)?;
+            if owner.active && !owner.statements.is_empty() {
+                let headers = owners
+                    .iter()
+                    .map(|owner| owner.header)
+                    .chain(std::iter::once(owner.header))
+                    .collect();
+                *tests
+                    .entry((format!("scope:{}", owner.name), owner.statements, headers))
+                    .or_insert(0) += 1;
+            }
+        }
+        Some(tests)
     }
     let before = tests(path, before, whole_file_is_test, deadline)?;
     let after = match after {
         Some(after) => tests(path, after, whole_file_is_test, deadline)?,
-        None => std::collections::HashSet::new(),
+        None => std::collections::HashMap::new(),
     };
-    Some(!before.is_subset(&after))
+    Some(
+        before
+            .iter()
+            .any(|(evidence, count)| after.get(evidence).copied().unwrap_or(0) < *count),
+    )
 }
 
 // A standalone file does not establish its crate-root or parent #[path] context.
@@ -602,6 +711,62 @@ pub(crate) fn sections(items: &[CodeItem]) -> Vec<ToolProjectionSection> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn existing_test_policy_headers_change_but_sibling_additions_do_not() {
+        let python = "class TestBug(unittest.TestCase):\n def test_bug(self): pass\n";
+        let rust = "#[cfg(test)]\nmod tests { #[test] fn bug() {} }";
+        for (path, before, after, expected) in [
+            (
+                "test_bug.py",
+                python.to_owned(),
+                format!("@unittest.skip('temporary')\n{python}"),
+                true,
+            ),
+            (
+                "test_bug.py",
+                python.to_owned(),
+                python.replace("unittest.TestCase", "object"),
+                true,
+            ),
+            (
+                "test_bug.py",
+                python.to_owned(),
+                format!("{python} def test_new(self): pass\n"),
+                false,
+            ),
+            (
+                "test_bug.py",
+                format!("@unittest.skip('policy')\n{python}"),
+                format!("@unittest.skip('policy')\n{python}"),
+                false,
+            ),
+            (
+                "lib.rs",
+                rust.to_owned(),
+                format!("#[cfg(any())]\n{rust}"),
+                true,
+            ),
+            (
+                "lib.rs",
+                rust.to_owned(),
+                rust.replace("fn bug() {}", "fn bug() {} #[test] fn added() {}"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                existing_tests_changed(
+                    path,
+                    &before,
+                    Some(&after),
+                    true,
+                    Instant::now() + Duration::from_secs(2)
+                ),
+                Some(expected),
+                "{after}"
+            );
+        }
+    }
 
     fn items(path: &str, source: &str) -> Vec<CodeItem> {
         parse(

@@ -180,7 +180,9 @@ mod tests {
         for (args, expected) in [
             (root_and_child.to_vec(), vec!["a=1", "a=2"]),
             (
-                vec!["codex", "-c", "a=1", "own", "-c", "a=2", "leaf", "-c", "a=3"],
+                vec![
+                    "codex", "-c", "a=1", "own", "-c", "a=2", "leaf", "-c", "a=3",
+                ],
                 vec!["a=1", "a=2", "a=3"],
             ),
             (vec!["codex", "own", "leaf", "--config", "a=3"], vec!["a=3"]),
@@ -202,11 +204,17 @@ mod tests {
             ("42", Value::Integer(42)),
             ("true", Value::Boolean(true)),
             ("false", Value::Boolean(false)),
-            ("[1, 2, 3]", Value::Array(vec![1.into(), 2.into(), 3.into()])),
-            ("{a = 1, b = 2}", Value::Table(toml::Table::from_iter([
-                ("a".to_string(), Value::Integer(1)),
-                ("b".to_string(), Value::Integer(2)),
-            ]))),
+            (
+                "[1, 2, 3]",
+                Value::Array(vec![1.into(), 2.into(), 3.into()]),
+            ),
+            (
+                "{a = 1, b = 2}",
+                Value::Table(toml::Table::from_iter([
+                    ("a".to_string(), Value::Integer(1)),
+                    ("b".to_string(), Value::Integer(2)),
+                ])),
+            ),
         ] {
             assert_eq!(parse_toml_value(input).expect("parse"), expected, "{input}");
         }
@@ -254,5 +262,4 @@ mod tests {
             ]
         );
     }
-
 }

@@ -105,7 +105,7 @@ impl SkillsThreadState {
         let mut catalog = SkillCatalog::default();
         for root in roots {
             query.executor_roots = vec![root.clone()];
-            if let Some(cached) = self.cached_executor_catalog(&root, &query.turn_id) {
+            if let Some(cached) = self.cached_executor_catalog(&root, &query) {
                 catalog.extend(cached);
             } else {
                 catalog.extend(catalog_or_warning(
@@ -300,6 +300,11 @@ impl SkillsThreadState {
         root: SelectedCapabilityRoot,
         query: SkillListQuery,
     ) -> SkillCatalog {
+        let binding = query
+            .bound_executor_roots
+            .iter()
+            .find(|bound| bound.selected_root() == &root)
+            .cloned();
         let slot = {
             let mut cache = self
                 .executor_cache
@@ -307,6 +312,7 @@ impl SkillsThreadState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(cached) = cache.iter().find(|cached| {
                 cached.root == root
+                    && cached.binding == binding
                     && (matches!(cached.catalog.get(), Some(Ok(_)))
                         || cached.turn_id == query.turn_id)
             }) {
@@ -316,6 +322,7 @@ impl SkillsThreadState {
                 let slot = Arc::new(OnceCell::new());
                 cache.push(CachedExecutorCatalog {
                     root,
+                    binding,
                     turn_id: query.turn_id.clone(),
                     catalog: Arc::clone(&slot),
                 });
@@ -334,7 +341,7 @@ impl SkillsThreadState {
     fn cached_executor_catalog(
         &self,
         root: &SelectedCapabilityRoot,
-        turn_id: &str,
+        query: &SkillListQuery,
     ) -> Option<SkillCatalog> {
         self.executor_cache
             .lock()
@@ -342,7 +349,13 @@ impl SkillsThreadState {
             .iter()
             .find(|cached| {
                 &cached.root == root
-                    && (matches!(cached.catalog.get(), Some(Ok(_))) || cached.turn_id == turn_id)
+                    && cached.binding.as_ref()
+                        == query
+                            .bound_executor_roots
+                            .iter()
+                            .find(|bound| bound.selected_root() == root)
+                    && (matches!(cached.catalog.get(), Some(Ok(_)))
+                        || cached.turn_id == query.turn_id)
             })
             .and_then(|cached| cached.catalog.get().cloned())
             .map(catalog_or_warning)
@@ -351,6 +364,7 @@ impl SkillsThreadState {
 
 struct CachedExecutorCatalog {
     root: SelectedCapabilityRoot,
+    binding: Option<codex_exec_server::ResolvedSelectedCapabilityRoot>,
     turn_id: String,
     catalog: Arc<OnceCell<SkillProviderResult<SkillCatalog>>>,
 }
@@ -513,6 +527,7 @@ mod tests {
         SkillListQuery {
             continuation: None,
             turn_id: turn_id.to_string(),
+            bound_executor_roots: Vec::new(),
             executor_roots: vec![SelectedCapabilityRoot {
                 id: root.to_string(),
                 location: CapabilityRootLocation::Environment {

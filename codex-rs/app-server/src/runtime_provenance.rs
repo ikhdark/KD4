@@ -60,14 +60,19 @@ pub(crate) fn write_desktop_runtime_receipt(
 }
 
 fn published_identity(
-    published: Option<&AbsolutePathBuf>, running_sha256: &str, codex_home: &Path,
+    published: Option<&AbsolutePathBuf>,
+    running_sha256: &str,
+    codex_home: &Path,
 ) -> (Option<String>, Option<bool>, Option<PathBuf>, Option<bool>) {
     let hash = published.and_then(|path| codex_utils_build_info::file_sha256(path.as_path()).ok());
     let build_match = hash.as_ref().map(|hash| hash == running_sha256);
-    let home = published.and_then(|path| path.as_path().parent())
+    let home = published
+        .and_then(|path| path.as_path().parent())
         .filter(|parent| parent.file_name().is_some_and(|name| name == "bin"))
-        .and_then(Path::parent).map(Path::to_path_buf);
-    let home_match = home.as_ref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
+    let home_match = home
+        .as_ref()
         .map(|expected| path_utils::paths_match_after_normalization(codex_home, expected));
     (hash, build_match, home, home_match)
 }
@@ -297,12 +302,19 @@ mod tests {
         assert_ne!(different_build.0.as_deref(), Some(running_hash.as_str()));
         assert_eq!(different_build.1, Some(false));
         assert_eq!(different_build.3, Some(true));
-        let changed = published_identity(Some(&binary), &running_hash, &dir.path().join("other-home"));
+        let changed =
+            published_identity(Some(&binary), &running_hash, &dir.path().join("other-home"));
         assert_eq!(changed.1, Some(false));
         assert_eq!(changed.3, Some(false));
         std::fs::remove_file(binary.as_path()).unwrap();
-        assert_eq!(published_identity(Some(&binary), &running_hash, dir.path()).1, None);
-        assert_eq!(published_identity(None, &running_hash, dir.path()), (None, None, None, None));
+        assert_eq!(
+            published_identity(Some(&binary), &running_hash, dir.path()).1,
+            None
+        );
+        assert_eq!(
+            published_identity(None, &running_hash, dir.path()),
+            (None, None, None, None)
+        );
     }
 
     #[test]

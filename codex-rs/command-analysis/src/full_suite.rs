@@ -5,22 +5,278 @@
 //! projects keep their own test conventions.
 
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::argv_commands;
 use super::infer_direct_shell_type;
 use codex_shell_command::shell_detect::ShellType;
 
 #[derive(Debug, Default)]
-pub struct FullSuiteBudget(AtomicBool);
+pub struct FullSuiteBudget(Mutex<Option<SuiteReservation>>, Option<(String, String)>);
+
+#[derive(Debug)]
+struct SuiteReservation {
+    owner: String,
+    started: bool,
+    acknowledgement: Option<(PathBuf, String)>,
+}
+
+/// Dropping a prelaunch reservation releases it. Possible execution never does.
+pub struct FullSuitePermit {
+    budget: Arc<FullSuiteBudget>,
+    owner: String,
+}
+
+const BUDGET_EXHAUSTED: &str = "Full-suite launch blocked: this user task already reserved or started its full Rust suite allowance. Failure, cancellation, source edits and force_fresh do not reset a started allowance. Resume a live run or run focused tests; another full suite requires explicit user permission.";
 
 impl FullSuiteBudget {
+    pub fn for_task(task: String, grant: String) -> Self {
+        Self(Mutex::new(None), Some((task, grant)))
+    }
+
+    pub fn task_scope(&self) -> Option<&(String, String)> {
+        self.1.as_ref()
+    }
+
     pub fn admit(&self, full_suite: bool) -> Result<(), String> {
-        if full_suite && self.0.swap(true, Ordering::Relaxed) {
-            return Err("Full-suite launch blocked: this user turn already admitted its one full Rust suite attempt. Failure, cancellation, source edits and force_fresh do not reset the allowance. Resume a live run or run focused tests; another full suite requires explicit user permission.".into());
+        if full_suite {
+            let mut state = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.is_some() {
+                return Err(BUDGET_EXHAUSTED.into());
+            }
+            *state = Some(SuiteReservation {
+                owner: String::new(),
+                started: true,
+                acknowledgement: None,
+            });
         }
         Ok(())
+    }
+
+    pub fn reserve(
+        self: &Arc<Self>,
+        full_suite: bool,
+        owner: String,
+    ) -> Result<Option<FullSuitePermit>, String> {
+        if !full_suite {
+            return Ok(None);
+        }
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.is_some() {
+            return Err(BUDGET_EXHAUSTED.into());
+        }
+        *state = Some(SuiteReservation {
+            owner: owner.clone(),
+            started: false,
+            acknowledgement: None,
+        });
+        Ok(Some(FullSuitePermit {
+            budget: Arc::clone(self),
+            owner,
+        }))
+    }
+
+    pub async fn refresh_owned_nonexecution(&self) {
+        // Read storage outside the state lock. Reconcile only the exact owner
+        // sampled before the read; a newer reservation must never be refunded.
+        let previous = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .acknowledgement
+                    .clone()
+                    .map(|ack| (state.owner.clone(), ack))
+            });
+        let observation = previous.clone();
+        let refund = if observation.is_some() {
+            tokio::task::spawn_blocking(move || {
+                observation
+                    .is_some_and(|(_, (path, attempt))| owned_suite_nonexecution(&path, &attempt))
+            })
+            .await
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refund
+            && state.as_ref().is_some_and(|state| {
+                previous
+                    .as_ref()
+                    .is_some_and(|(owner, _)| state.owner == *owner)
+            })
+        {
+            *state = None;
+        }
+    }
+
+    pub fn reserved_for(&self, owner: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|state| state.owner == owner && !state.started)
+    }
+
+    pub fn started_for(&self, owner: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|state| state.owner == owner && state.started)
+    }
+
+    pub fn start(
+        &self,
+        owner: &str,
+        acknowledgement: Option<(PathBuf, String)>,
+    ) -> Result<(), String> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(state) = state
+            .as_mut()
+            .filter(|state| state.owner == owner && !state.started)
+        else {
+            return Err(BUDGET_EXHAUSTED.into());
+        };
+        state.started = true;
+        state.acknowledgement = acknowledgement;
+        Ok(())
+    }
+}
+
+impl Drop for FullSuitePermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .as_ref()
+            .is_some_and(|state| state.owner == self.owner && !state.started)
+        {
+            *state = None;
+        }
+    }
+}
+
+/// This is a private, first-write-wins owner channel, not stdout or exit 75.
+pub fn owned_suite_nonexecution(path: &Path, attempt: &str) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file.take(4097).read_to_end(&mut bytes).is_err() || bytes.len() > 4096 {
+        return false;
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|record| {
+        record["version"] == 1 && record["attempt"] == attempt && record["status"] == "not_started"
+    })
+}
+
+#[cfg(test)]
+mod permit_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn prelaunch_rejection_releases_but_possible_start_never_does() {
+        let budget = Arc::new(FullSuiteBudget::default());
+        let rejected = budget.reserve(true, "rejected".into()).unwrap();
+        assert!(budget.reserve(true, "competitor".into()).is_err());
+        drop(rejected);
+        let started = budget.reserve(true, "started".into()).unwrap();
+        budget.start("started", None).unwrap();
+        drop(started);
+        assert!(budget.reserve(true, "cancelled-or-failed".into()).is_err());
+        assert!(budget.reserve(false, "focused".into()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn only_exact_owner_nonexecution_can_release_a_dispatched_wrapper() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("ack.json");
+        let budget = Arc::new(FullSuiteBudget::default());
+        let permit = budget.reserve(true, "wrapper".into()).unwrap();
+        budget
+            .start("wrapper", Some((path.clone(), "nonce".into())))
+            .unwrap();
+        drop(permit);
+        // Each rejected acknowledgement must survive a refresh; without one
+        // these reservations would fail regardless of the record.
+        budget.refresh_owned_nonexecution().await;
+        assert!(budget.reserve(true, "missing-ack".into()).is_err());
+        std::fs::write(
+            &path,
+            r#"{"version":1,"attempt":"other","status":"not_started"}"#,
+        )
+        .unwrap();
+        budget.refresh_owned_nonexecution().await;
+        assert!(budget.reserve(true, "wrong-owner".into()).is_err());
+        std::fs::write(
+            &path,
+            r#"{"version":1,"attempt":"nonce","status":"started"}"#,
+        )
+        .unwrap();
+        budget.refresh_owned_nonexecution().await;
+        assert!(budget.reserve(true, "counterfeit-busy".into()).is_err());
+        std::fs::write(
+            &path,
+            r#"{"version":1,"attempt":"nonce","status":"not_started"}"#,
+        )
+        .unwrap();
+        budget.refresh_owned_nonexecution().await;
+        let retry = budget.reserve(true, "retry".into()).unwrap();
+        budget.start("retry", None).unwrap();
+        drop(retry);
+        assert!(budget.reserve(true, "second-start".into()).is_err());
+    }
+
+    #[test]
+    fn racing_reservations_allow_exactly_one_possible_start() {
+        let budget = Arc::new(FullSuiteBudget::default());
+        let barrier = std::sync::Barrier::new(8);
+        let starts = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|index| {
+                    let budget = Arc::clone(&budget);
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let owner = index.to_string();
+                        if let Ok(permit) = budget.reserve(true, owner.clone()) {
+                            budget.start(&owner, None).unwrap();
+                            drop(permit);
+                            1
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .sum::<usize>()
+        });
+        assert_eq!(starts, 1);
     }
 }
 
@@ -82,7 +338,17 @@ fn check_command(
         let Some(commands) = commands else {
             // Fail closed for visibly test-bearing opaque scripts, not for all
             // scripting. This is deliberately not an OS subprocess sandbox.
-            if command.iter().any(|arg| visibly_runs_tests(arg)) {
+            let visible = match shell_type {
+                ShellType::Bash | ShellType::Sh | ShellType::Zsh => {
+                    command.last().is_some_and(|script| {
+                        codex_shell_command::bash::possible_command_argvs(script)
+                            .iter()
+                            .any(|argv| visibly_runs_test_argv(argv, 0))
+                    })
+                }
+                _ => command.iter().any(|arg| visibly_runs_tests(arg)),
+            };
+            if visible {
                 return Err("Cannot verify full-suite scope in this script. Use one standalone test command (and the workdir argument), not a loop or generated command.".into());
             }
             return Ok(false);
@@ -120,13 +386,12 @@ fn check_command(
         return Ok(false);
     };
     let program = basename(program);
-    if matches!(program.as_str(), "env" | "command") {
-        let start = args
-            .iter()
-            .position(|arg| !arg.starts_with('-') && !arg.contains('='));
-        return start.map_or(Ok(false), |start| {
-            check_command(&args[start..], None, depth + 1)
-        });
+    if matches!(program.as_str(), "env" | "command" | "rustup") {
+        use codex_shell_command::validation::ExecutionWrapper;
+        return match codex_shell_command::validation::decode_execution_wrapper(&program, args) {
+            ExecutionWrapper::Child(start) => check_command(&args[start..], None, depth + 1),
+            ExecutionWrapper::NonExecution | ExecutionWrapper::Opaque => Ok(false),
+        };
     }
     if matches!(program.as_str(), "python" | "python3" | "py") {
         if let Some(index) = args
@@ -244,60 +509,99 @@ fn just_recipe_index(args: &[String]) -> Option<usize> {
     (index < args.len()).then_some(index)
 }
 
-/// Whether an unparsed script launches tests, judged one statement at a time.
-/// Naming a test tool as a path, pattern or lane (`lanes/core-tests`, a process
-/// filter, `rg core-test justfile`) launches nothing and stays inspectable.
+/// Source-owned possible launches; this is not proof that a leaf executes.
 fn visibly_runs_tests(script: &str) -> bool {
-    script
-        .split([';', '|', '&', '(', ')', '{', '}', '\n', '\r'])
-        .any(|statement| {
-            let tokens = statement
-                .split_whitespace()
-                .map(|token| basename(token.trim_matches(['\'', '"'])))
-                .collect::<Vec<_>>();
-            tokens.iter().enumerate().any(|(index, token)| {
-                let rest = &tokens[index + 1..];
-                match token.as_str() {
-                    "cargo" => rest
-                        .first()
-                        .is_some_and(|next| matches!(next.as_str(), "test" | "nextest")),
-                    "just" => just_recipe_index(rest).is_some_and(|recipe| {
-                        rest[recipe].starts_with("core-test") || rest[recipe].starts_with("test")
-                    }),
-                    "rust_test_runner.py" => {
-                        // Exempt only a literal subcommand help query, not a
-                        // script that merely contains --help elsewhere. Use
-                        // raw arguments: basename normalization can turn an
-                        // option value such as path/--help into a help flag.
-                        let mut args = statement.split_whitespace().skip(index + 1);
-                        if matches!(
-                            (args.next(), args.next(), args.next()),
-                            (
-                                Some("run-target" | "run-gate" | "check-gates"),
-                                Some("--help" | "-h"),
-                                None
-                            )
-                        ) {
-                            return false;
-                        }
-                        rest.iter().any(|arg| {
-                            matches!(arg.as_str(), "run-target" | "run-gate" | "check-gates")
-                        })
-                    }
-                    _ => false,
-                }
-            })
+    let commands = super::possible_powershell_commands(script);
+    if commands.iter().any(|argv| visibly_runs_test_argv(argv, 0)) {
+        return true;
+    }
+    // Invoke-Expression of a variable or pipeline input evaluates source that
+    // is not its literal argument. Quoted script data may then be that source,
+    // so quoting test command text must not hide the launch.
+    commands.iter().any(|argv| evaluates_dynamic_source(argv))
+        && commands.iter().flatten().any(|word| {
+            super::possible_powershell_commands(word)
+                .iter()
+                .any(|argv| visibly_runs_test_argv(argv, 1))
         })
 }
 
+fn evaluates_dynamic_source(argv: &[String]) -> bool {
+    let Some((program, rest)) = argv.split_first() else {
+        return false;
+    };
+    matches!(basename(program).as_str(), "iex" | "invoke-expression")
+        && (rest.iter().all(|arg| arg.starts_with('-')) || rest.iter().any(|arg| arg.contains('$')))
+}
+
+fn visibly_runs_test_argv(argv: &[String], depth: usize) -> bool {
+    if depth > 4 {
+        return true;
+    }
+    let Some((program, rest)) = argv.split_first() else {
+        return false;
+    };
+    match basename(program).as_str() {
+        "cargo" => matches!(
+            codex_shell_command::validation::classify_argv(program, rest),
+            codex_shell_command::validation::ValidationClassification::Validation { leaves, .. }
+                if leaves.iter().any(|leaf| leaf.operation == codex_shell_command::validation::ValidationOperation::Test)
+        ),
+        "just" => just_recipe_index(rest).is_some_and(|recipe| {
+            rest[recipe].starts_with("core-test") || rest[recipe].starts_with("test")
+        }),
+        "env" | "command" | "time" | "exec" | "rustup" => {
+            use codex_shell_command::validation::ExecutionWrapper;
+            use codex_shell_command::validation::decode_execution_wrapper;
+            match decode_execution_wrapper(&basename(program), rest) {
+                ExecutionWrapper::Child(index) => visibly_runs_test_argv(&rest[index..], depth + 1),
+                ExecutionWrapper::NonExecution | ExecutionWrapper::Opaque => false,
+            }
+        }
+        "iex" | "invoke-expression" => rest.iter().any(|source| {
+            super::possible_powershell_commands(source)
+                .iter()
+                .any(|argv| visibly_runs_test_argv(argv, depth + 1))
+        }),
+        _ => {
+            let runner = if basename(program) == "rust_test_runner.py" {
+                Some(0)
+            } else if matches!(basename(program).as_str(), "python" | "python3" | "py") {
+                argv.iter()
+                    .position(|arg| basename(arg) == "rust_test_runner.py")
+            } else {
+                None
+            };
+            let Some(runner) = runner else {
+                return false;
+            };
+            let args = &argv[runner + 1..];
+            if matches!(args, [command, help] if matches!(command.as_str(), "run-target" | "run-gate" | "check-gates") && matches!(help.as_str(), "--help" | "-h"))
+            {
+                return false;
+            }
+            args.iter()
+                .any(|arg| matches!(arg.as_str(), "run-target" | "run-gate" | "check-gates"))
+        }
+    }
+}
+
 fn check_test_args(args: &[String], mut positionals: usize, nextest: bool) -> Result<bool, String> {
+    let runner_all = positionals > 0;
+    let mut libtest = false;
     let mut focused = false;
     let mut explicit_all = false;
     let mut no_fail_fast = false;
     let mut zero_retries = false;
     let mut conflict = false;
+    let mut unknown_arity = false;
     let mut index = 0;
     while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            libtest = !nextest;
+            index += 1;
+            continue;
+        }
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(key, value)| (key, Some(value)));
@@ -307,75 +611,135 @@ fn check_test_args(args: &[String], mut positionals: usize, nextest: bool) -> Re
         ) {
             return Ok(false);
         }
-        let takes_value = matches!(
-            flag,
-            "-E" | "--filterset"
-                | "--retries"
-                | "--profile"
-                | "--cargo-profile"
-                | "-p"
-                | "--package"
-                | "--test"
-                | "--bin"
-                | "--example"
-                | "--bench"
-                | "--manifest-path"
-                | "--manifest"
-                | "--target-dir"
-                | "--target"
-                | "--features"
-                | "-F"
-                | "--exclude"
-                | "--skip"
-                | "--run-ignored"
-                | "--partition"
-                | "--test-threads"
-                | "-j"
-                | "--jobs"
-                | "--color"
-                | "--status-level"
-                | "--final-status-level"
-                | "--success-output"
-                | "--failure-output"
-                | "--show-progress"
-                | "--command-timeout-seconds"
-                | "--admission-timeout-seconds"
-                | "--config-file"
-                | "--config"
-                | "--no-tests"
-                | "--message-format"
-                | "-P"
-                | "--archive-file"
-                | "--workspace-remap"
-                | "--binaries-metadata"
-                | "--cargo-metadata"
-                | "--build-jobs"
-                | "--cargo-message-format"
-                | "--platform-filter"
-                | "--flaky-result"
-                | "--max-fail"
-                | "--stress-count"
-                | "--stress-duration"
-                | "--debugger"
-                | "--tracer"
-                | "--max-progress-running"
-                | "--message-format-version"
-                | "--archive-format"
-                | "--extract-to"
-                | "--target-dir-remap"
-                | "--build-dir-remap"
-                | "--user-config-file"
-                | "--tool-config-file"
-                | "-R"
-                | "--rerun"
-        );
+        let takes_value = if libtest {
+            matches!(
+                flag,
+                "--format"
+                    | "--color"
+                    | "--logfile"
+                    | "--test-threads"
+                    | "--skip"
+                    | "--shuffle-seed"
+            )
+        } else {
+            matches!(
+                flag,
+                "-E" | "--filterset"
+                    | "--retries"
+                    | "--profile"
+                    | "--cargo-profile"
+                    | "-p"
+                    | "--package"
+                    | "--test"
+                    | "--bin"
+                    | "--example"
+                    | "--bench"
+                    | "--manifest-path"
+                    | "--manifest"
+                    | "--target-dir"
+                    | "--target"
+                    | "--features"
+                    | "-F"
+                    | "--exclude"
+                    | "--skip"
+                    | "--run-ignored"
+                    | "--partition"
+                    | "--test-threads"
+                    | "-j"
+                    | "--jobs"
+                    | "--color"
+                    | "--status-level"
+                    | "--final-status-level"
+                    | "--success-output"
+                    | "--failure-output"
+                    | "--show-progress"
+                    | "--command-timeout-seconds"
+                    | "--admission-timeout-seconds"
+                    | "--config-file"
+                    | "--config"
+                    | "--no-tests"
+                    | "--message-format"
+                    | "-P"
+                    | "--archive-file"
+                    | "--workspace-remap"
+                    | "--binaries-metadata"
+                    | "--cargo-metadata"
+                    | "--build-jobs"
+                    | "--cargo-message-format"
+                    | "--platform-filter"
+                    | "--flaky-result"
+                    | "--max-fail"
+                    | "--stress-count"
+                    | "--stress-duration"
+                    | "--debugger"
+                    | "--tracer"
+                    | "--max-progress-running"
+                    | "--message-format-version"
+                    | "--archive-format"
+                    | "--extract-to"
+                    | "--target-dir-remap"
+                    | "--build-dir-remap"
+                    | "--user-config-file"
+                    | "--tool-config-file"
+                    | "-R"
+                    | "--rerun"
+            )
+        };
         let value = if takes_value {
             inline.or_else(|| args.get(index + 1).map(String::as_str))
         } else {
             inline
         };
+        // Unknown options may own the next bare word. They cannot manufacture
+        // a focused exception to the full-suite budget.
+        if arg.starts_with('-')
+            && !takes_value
+            && inline.is_none()
+            && !matches!(
+                flag,
+                "--all"
+                    | "--all-tests"
+                    | "--workspace"
+                    | "--no-fail-fast"
+                    | "--nff"
+                    | "--fail-fast"
+                    | "--ff"
+                    | "--lib"
+                    | "--bins"
+                    | "--tests"
+                    | "--benches"
+                    | "--examples"
+                    | "--all-targets"
+                    | "--doc"
+                    | "--release"
+                    | "--locked"
+                    | "--frozen"
+                    | "--offline"
+                    | "--all-features"
+                    | "--no-default-features"
+                    | "-q"
+                    | "--quiet"
+                    | "-v"
+                    | "-vv"
+                    | "--verbose"
+                    | "--exact"
+                    | "--ignored"
+                    | "--include-ignored"
+                    | "--nocapture"
+                    | "--show-output"
+                    | "--shuffle"
+                    | "--exclude-should-panic"
+                    | "--report-time"
+                    | "--ensure-time"
+                    | "--bench"
+                    | "--test"
+            )
+        {
+            unknown_arity = true;
+        }
         match flag {
-            "--all" | "--all-tests" => explicit_all = true,
+            "--all" if runner_all => explicit_all = true,
+            "--all-tests" => explicit_all = true,
             "--no-fail-fast" | "--nff" => no_fail_fast = true,
             "--fail-fast" | "--ff" | "--max-fail" | "--stress-count" | "--stress-duration" => {
                 conflict = true;
@@ -404,7 +768,7 @@ fn check_test_args(args: &[String], mut positionals: usize, nextest: bool) -> Re
             1
         };
     }
-    if focused && !explicit_all {
+    if focused && !explicit_all && !unknown_arity {
         return Ok(false);
     }
     if conflict || !no_fail_fast || (nextest && !zero_retries) {
@@ -827,6 +1191,107 @@ mod tests {
                 .is_err(),
                 "{script}",
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit36_suite_regressions {
+    use super::*;
+
+    #[test]
+    fn wrapper_and_option_values_do_not_change_suite_scope() {
+        for command in [
+            "env -u NAME cargo test --no-fail-fast",
+            "env --unset=NAME cargo test --no-fail-fast",
+            "env -C somewhere cargo test --no-fail-fast",
+            "cargo test --no-fail-fast -- --format pretty",
+            "cargo test --no-fail-fast -- --format=pretty --color never",
+        ] {
+            let argv = command
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(check_command(&argv, None, 0), Ok(true), "{command}");
+        }
+        for command in [
+            "cargo test --all one_test",
+            "cargo test --workspace one_test",
+            "env --version cargo test",
+            "command -v cargo test",
+        ] {
+            let argv = command
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(check_command(&argv, None, 0), Ok(false), "{command}");
+        }
+        let budget = FullSuiteBudget::default();
+        budget.admit(true).unwrap();
+        assert!(budget.admit(true).is_err());
+        assert!(budget.admit(false).is_ok());
+    }
+
+    #[test]
+    fn comments_and_quoted_examples_do_not_launch_tests() {
+        for (shell, flag, script) in [
+            ("bash", "-c", "echo harmless # cargo test"),
+            ("bash", "-c", "cat <<'EOF'\ncargo test\nEOF"),
+            (
+                "pwsh",
+                "-Command",
+                "$example='example; cargo test'; Write-Output $example",
+            ),
+        ] {
+            assert_eq!(
+                check_command(&[shell.into(), flag.into(), script.into()], None, 0),
+                Ok(false),
+                "{script}"
+            );
+        }
+        for script in ["for x in 1 2; do cargo test; done", "echo $(cargo test)"] {
+            assert!(check_command(&["bash".into(), "-c".into(), script.into()], None, 0).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit120_suite_regressions {
+    use super::*;
+
+    #[test]
+    fn output_options_and_rustup_do_not_create_focused_exceptions() {
+        for wrapper in [
+            "",
+            "env -u RUST_LOG ",
+            "rustup run stable ",
+            "rustup run --install stable ",
+            "rustup --quiet run stable -- ",
+        ] {
+            for output in [
+                "--format pretty",
+                "--format=pretty",
+                "--logfile output.log",
+                "--logfile=output.log",
+            ] {
+                let argv = format!("{wrapper}cargo test --no-fail-fast -- {output}")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                assert_eq!(check_command(&argv, None, 0), Ok(true), "{argv:?}");
+                let without_flags = argv
+                    .iter()
+                    .filter(|arg| *arg != "--no-fail-fast")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert!(
+                    check_command(&without_flags, None, 0).is_err(),
+                    "{without_flags:?}"
+                );
+                let mut focused = without_flags;
+                focused.push("real_test_name".into());
+                assert_eq!(check_command(&focused, None, 0), Ok(false), "{focused:?}");
+            }
         }
     }
 }

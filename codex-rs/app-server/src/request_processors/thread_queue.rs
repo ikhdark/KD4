@@ -41,6 +41,19 @@ struct Queue {
     /// Immutable execution inputs; submissions retain original UI/idempotency input.
     #[serde(default)]
     execution_inputs: HashMap<String, Vec<V2UserInput>>,
+    /// Internal observations, not a change to the public queue/turn clock.
+    /// Old persisted entries deliberately have unknown acceptance times.
+    #[serde(default)]
+    task_observations: HashMap<String, QueueTaskObservation>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueTaskObservation {
+    version: u32,
+    accepted_at_unix_ms: u64,
+    #[serde(default)]
+    execution_started_at_unix_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,26 +80,46 @@ impl Default for Queue {
             pending_start: None,
             accepted: Vec::new(),
             execution_inputs: HashMap::new(),
+            task_observations: HashMap::new(),
         }
     }
 }
 
 impl Queue {
-    async fn add_sealed(&mut self, params: ThreadQueueAddParams) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
+    async fn add_sealed(
+        &mut self,
+        params: ThreadQueueAddParams,
+    ) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
         let (item, added) = self.add(params)?;
-        if added && item.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+        if added
+            && item
+                .input
+                .iter()
+                .any(|input| matches!(input, V2UserInput::LocalImage { .. }))
+        {
             match seal_queue_input(item.input.clone()).await {
-                Ok(input) => { self.execution_inputs.insert(item.id.clone(), input); }
+                Ok(input) => {
+                    self.execution_inputs.insert(item.id.clone(), input);
+                }
                 Err(error) => {
-                    self.submissions.retain(|submission| submission.id != item.id);
+                    self.submissions
+                        .retain(|submission| submission.id != item.id);
+                    self.task_observations.remove(&item.id);
                     return Err(error);
                 }
             }
         }
+        if added && let Some(observation) = self.task_observations.get_mut(&item.id) {
+            // Seal preparation precedes durable acceptance, not task execution.
+            observation.accepted_at_unix_ms = super::turn_processor::task_wall_time_ms();
+        }
         Ok((item, added))
     }
 
-    fn add(&mut self, params: ThreadQueueAddParams) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
+    fn add(
+        &mut self,
+        params: ThreadQueueAddParams,
+    ) -> Result<(QueuedSubmission, bool), JSONRPCErrorError> {
         if let Some(client_id) = &params.client_user_message_id
             && let Some(existing) = self
                 .submissions
@@ -110,6 +143,14 @@ impl Queue {
             input: params.input,
         };
         self.submissions.push(submission.clone());
+        self.task_observations.insert(
+            submission.id.clone(),
+            QueueTaskObservation {
+                version: 1,
+                accepted_at_unix_ms: super::turn_processor::task_wall_time_ms(),
+                execution_started_at_unix_ms: None,
+            },
+        );
         Ok((submission, true))
     }
 
@@ -122,13 +163,21 @@ impl Queue {
                 ));
             }
         }
-        let before = self.submissions.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let before = self
+            .submissions
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
         self.submissions.sort_by_key(|item| {
             ids.iter()
                 .position(|id| id == &item.id)
                 .unwrap_or(ids.len())
         });
-        Ok(self.submissions.iter().map(|item| &item.id).ne(before.iter()))
+        Ok(self
+            .submissions
+            .iter()
+            .map(|item| &item.id)
+            .ne(before.iter()))
     }
 
     fn page(
@@ -158,6 +207,26 @@ impl Queue {
         Ok(ThreadQueueListResponse {
             data: self.submissions[offset..end].to_vec(),
             next_cursor: (end < self.submissions.len()).then(|| format!("{}:{end}", self.revision)),
+            snapshot: Some(codex_app_server_protocol::ThreadQueueSnapshot {
+                revision: self.revision,
+                paused: self.paused,
+                pending_start: self.pending_start.as_ref().map(|pending| {
+                    codex_app_server_protocol::ThreadQueuePendingStart {
+                        queued_submission_id: pending.submission_id.clone(),
+                        turn_id: pending.turn_id.clone(),
+                    }
+                }),
+                accepted_submissions: self
+                    .accepted
+                    .iter()
+                    .map(
+                        |accepted| codex_app_server_protocol::ThreadQueueAcceptedSubmission {
+                            queued_submission_id: accepted.submission.id.clone(),
+                            turn_id: accepted.turn_id.clone(),
+                        },
+                    )
+                    .collect(),
+            }),
         })
     }
 }
@@ -239,7 +308,13 @@ impl ThreadQueueRequestProcessor {
     }
 
     async fn save(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
-        queue.execution_inputs.retain(|id, _| queue.submissions.iter().any(|item| &item.id == id));
+        queue
+            .execution_inputs
+            .retain(|id, _| queue.submissions.iter().any(|item| &item.id == id));
+        queue.task_observations.retain(|id, _| {
+            queue.submissions.iter().any(|item| &item.id == id)
+                || queue.accepted.iter().any(|item| &item.submission.id == id)
+        });
         // A pause protects the prompts queued when a turn was interrupted; it
         // must not outlive them and silently disable later automatic follow-ups.
         if queue.submissions.is_empty() && queue.pending_start.is_none() {
@@ -251,7 +326,8 @@ impl ThreadQueueRequestProcessor {
             .ok_or_else(|| internal_error("queue revision overflow"))?;
         let mut payload = serde_json::to_string(queue).map_err(queue_error)?;
         while payload.len() > MAX_QUEUE_BYTES && !queue.accepted.is_empty() {
-            queue.accepted.remove(0);
+            let evicted = queue.accepted.remove(0);
+            queue.task_observations.remove(&evicted.submission.id);
             payload = serde_json::to_string(queue).map_err(queue_error)?;
         }
         if payload.len() > MAX_QUEUE_BYTES {
@@ -304,7 +380,7 @@ impl ThreadQueueRequestProcessor {
         .map_err(|_| invalid_request("thread queue is busy; retry the request"))?
     }
 
-    async fn changed(&self, id: ThreadId) {
+    async fn changed(&self, id: ThreadId, revision: u64) {
         let connections = self
             .thread_state_manager
             .subscribed_connection_ids(id)
@@ -314,22 +390,33 @@ impl ThreadQueueRequestProcessor {
                 &connections,
                 ServerNotification::ThreadQueueChanged(ThreadQueueChangedNotification {
                     thread_id: id.to_string(),
+                    revision: Some(revision),
                 }),
             )
             .await;
     }
 
     async fn recover(&self, id: ThreadId, queue: &mut Queue) -> Result<(), JSONRPCErrorError> {
-        let Some(pending) = &queue.pending_start else { return Ok(()) };
+        let Some(pending) = &queue.pending_start else {
+            return Ok(());
+        };
         let thread = self.thread_manager.get_thread(id).await.ok();
         if let Some(thread) = &thread {
             thread.flush_rollout().await.map_err(queue_error)?;
         }
-        let history = self.thread_store.read_thread(codex_thread_store::ReadThreadParams {
-            thread_id: id, include_archived: false, include_history: true,
-        }).await.map_err(queue_error)?;
-        let accepted = history.history.as_ref().is_some_and(|history|
-            pending_input_recorded(&history.items, &pending.turn_id));
+        let history = self
+            .thread_store
+            .read_thread(codex_thread_store::ReadThreadParams {
+                thread_id: id,
+                include_archived: false,
+                include_history: true,
+            })
+            .await
+            .map_err(queue_error)?;
+        let accepted = history
+            .history
+            .as_ref()
+            .is_some_and(|history| pending_input_recorded(&history.items, &pending.turn_id));
         // Accepted input belongs to history even while the turn is running.
         // Without that evidence, worker installation is not enough to release
         // custody: it may still be starting or recording the prompt.
@@ -344,17 +431,25 @@ impl ThreadQueueRequestProcessor {
                 return Ok(());
             }
         }
-        let origin_present = self.origins.lock()
+        let origin_present = self
+            .origins
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(&(id, pending.submission_id.clone()));
         let pending = queue.pending_start.take().ok_or_else(|| {
             internal_error("pending thread queue start disappeared during recovery")
         })?;
         if accepted
-            && let Some(index) = queue.submissions.iter().position(|item| item.id == pending.submission_id)
+            && let Some(index) = queue
+                .submissions
+                .iter()
+                .position(|item| item.id == pending.submission_id)
         {
             let submission = queue.submissions.remove(index);
-            queue.accepted.push(AcceptedSubmission { submission, turn_id: pending.turn_id });
+            queue.accepted.push(AcceptedSubmission {
+                submission,
+                turn_id: pending.turn_id,
+            });
             if queue.accepted.len() > MAX_ACCEPTED_SUBMISSIONS {
                 queue.accepted.remove(0);
             }
@@ -363,10 +458,12 @@ impl ThreadQueueRequestProcessor {
         queue.paused |= !accepted || !origin_present;
         self.save(id, queue).await?;
         if accepted {
-            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            self.origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&(id, pending.submission_id));
         }
-        self.changed(id).await;
+        self.changed(id, queue.revision).await;
         Ok(())
     }
 
@@ -379,9 +476,13 @@ impl ThreadQueueRequestProcessor {
         let mut queue = self.load(id).await?;
         self.recover(id, &mut queue).await?;
         let (result, changed) = mutation(&mut queue)?;
-        if changed { self.save(id, &mut queue).await?; }
+        if changed {
+            self.save(id, &mut queue).await?;
+        }
         drop(guard);
-        if changed { self.changed(id).await; }
+        if changed {
+            self.changed(id, queue.revision).await;
+        }
         Ok(result)
     }
 
@@ -408,9 +509,23 @@ impl ThreadQueueRequestProcessor {
         self.recover(id, &mut queue).await?;
         // Duplicate accepted IDs are resolved before reading mutable source paths.
         let (queued_submission, added) = queue.add_sealed(params).await?;
-        if added { self.save(id, &mut queue).await?; }
+        if added {
+            self.save(id, &mut queue).await?;
+        }
+        if let Some(observation) = queue.task_observations.get(&queued_submission.id) {
+            super::turn_processor::observe_task_boundary(
+                id,
+                &queued_submission.id,
+                None,
+                "queue_accepted",
+                observation.accepted_at_unix_ms,
+                None,
+            );
+        }
         drop(guard);
-        if added { self.changed(id).await; }
+        if added {
+            self.changed(id, queue.revision).await;
+        }
         if added {
             self.origins
                 .lock()
@@ -437,14 +552,26 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueUpdateParams,
     ) -> Result<ThreadQueueUpdateResponse, JSONRPCErrorError> {
         TurnRequestProcessor::validate_queue_input(&params.input)?;
-        let execution_input = if params.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) {
+        let execution_input = if params
+            .input
+            .iter()
+            .any(|input| matches!(input, V2UserInput::LocalImage { .. }))
+        {
             Some(seal_queue_input(params.input.clone()).await?)
-        } else { None };
+        } else {
+            None
+        };
         let id = parse_thread_id_for_request(&params.thread_id)?;
         let queued_submission = self
             .mutate(id, |queue| {
-                if queue.pending_start.as_ref().is_some_and(|pending| pending.submission_id == params.queued_submission_id) {
-                    return Err(invalid_request("queued submission is starting; input is still owned by the queue"));
+                if queue
+                    .pending_start
+                    .as_ref()
+                    .is_some_and(|pending| pending.submission_id == params.queued_submission_id)
+                {
+                    return Err(invalid_request(
+                        "queued submission is starting; input is still owned by the queue",
+                    ));
                 }
                 let item = queue
                     .submissions
@@ -472,8 +599,14 @@ impl ThreadQueueRequestProcessor {
         let id = parse_thread_id_for_request(&params.thread_id)?;
         let deleted = self
             .mutate(id, |queue| {
-                if queue.pending_start.as_ref().is_some_and(|pending| pending.submission_id == params.queued_submission_id) {
-                    return Err(invalid_request("queued submission is starting; input is still owned by the queue"));
+                if queue
+                    .pending_start
+                    .as_ref()
+                    .is_some_and(|pending| pending.submission_id == params.queued_submission_id)
+                {
+                    return Err(invalid_request(
+                        "queued submission is starting; input is still owned by the queue",
+                    ));
                 }
                 let before = queue.submissions.len();
                 queue
@@ -484,7 +617,9 @@ impl ThreadQueueRequestProcessor {
             })
             .await?;
         if deleted {
-            self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            self.origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&(id, params.queued_submission_id));
         }
         Ok(ThreadQueueDeleteResponse { deleted })
@@ -495,8 +630,12 @@ impl ThreadQueueRequestProcessor {
         params: ThreadQueueReorderParams,
     ) -> Result<ThreadQueueReorderResponse, JSONRPCErrorError> {
         let id = parse_thread_id_for_request(&params.thread_id)?;
-        self.mutate(id, |queue| queue.reorder(&params.queued_submission_ids).map(|changed| ((), changed)))
-            .await?;
+        self.mutate(id, |queue| {
+            queue
+                .reorder(&params.queued_submission_ids)
+                .map(|changed| ((), changed))
+        })
+        .await?;
         Ok(ThreadQueueReorderResponse {})
     }
 
@@ -543,18 +682,30 @@ impl ThreadQueueRequestProcessor {
         };
         // An explicit starter owns only this submission. Automatic starts use
         // its original connection, never the last client to touch the thread.
-        let mut origin = match origin.or_else(|| self.origins.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&(id, item.id.clone())).cloned()) {
+        let mut origin = match origin.or_else(|| {
+            self.origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&(id, item.id.clone()))
+                .cloned()
+        }) {
             Some(origin) => origin,
             None => return Ok(None),
         };
-        let connections = self.thread_state_manager.subscribed_connection_ids(id).await;
-        if selected.is_none() && !connections.contains(&origin.request_id.connection_id) { return Ok(None); }
-        self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        let connections = self
+            .thread_state_manager
+            .subscribed_connection_ids(id)
+            .await;
+        if selected.is_none() && !connections.contains(&origin.request_id.connection_id) {
+            return Ok(None);
+        }
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert((id, item.id.clone()), origin.clone());
         if selected.is_none() {
-            origin.request_id.request_id = RequestId::String(format!("thread-queue-{}", uuid::Uuid::new_v4()));
+            origin.request_id.request_id =
+                RequestId::String(format!("thread-queue-{}", uuid::Uuid::new_v4()));
         }
         let thread = self
             .thread_manager
@@ -564,17 +715,40 @@ impl ThreadQueueRequestProcessor {
         let turn_id = thread.reserve_turn_id();
         let execution_input = match queue.execution_inputs.get(&item.id) {
             Some(input) => input.clone(),
-            None if item.input.iter().any(|input| matches!(input, V2UserInput::LocalImage { .. })) => {
-                return Err(invalid_request("queued local image predates immutable snapshots; update the submission before starting it"));
+            None if item
+                .input
+                .iter()
+                .any(|input| matches!(input, V2UserInput::LocalImage { .. })) =>
+            {
+                return Err(invalid_request(
+                    "queued local image predates immutable snapshots; update the submission before starting it",
+                ));
             }
             None => item.input.clone(),
         };
         queue.paused = false;
+        if let Some(observation) = queue.task_observations.get_mut(&item.id) {
+            observation
+                .execution_started_at_unix_ms
+                .get_or_insert_with(super::turn_processor::task_wall_time_ms);
+        }
         queue.pending_start = Some(PendingStart {
             submission_id: item.id.clone(),
             turn_id: turn_id.clone(),
         });
         self.save(id, &mut queue).await?;
+        if let Some(observation) = queue.task_observations.get(&item.id) {
+            super::turn_processor::observe_task_boundary(
+                id,
+                &item.id,
+                Some(&turn_id),
+                "queue_execution_start",
+                observation
+                    .execution_started_at_unix_ms
+                    .unwrap_or(observation.accepted_at_unix_ms),
+                None,
+            );
+        }
         let result = self
             .turn_processor
             .start_queued_turn(
@@ -597,7 +771,7 @@ impl ThreadQueueRequestProcessor {
                 // custody. The input event reconciles that handoff; completion
                 // and later queue requests remain recovery paths.
                 drop(guard);
-                self.changed(id).await;
+                self.changed(id, queue.revision).await;
                 Ok(Some(ThreadQueueStartResponse {
                     turn: response.turn,
                 }))
@@ -651,8 +825,15 @@ impl ThreadQueueRequestProcessor {
     }
 
     pub(super) fn input_recorded(&self, id: ThreadId) {
-        if !self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys().any(|(thread_id, _)| *thread_id == id) { return; }
+        if !self
+            .origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .any(|(thread_id, _)| *thread_id == id)
+        {
+            return;
+        }
         let processor = self.clone();
         // Never wait for the queue lock or storage in the event listener: a
         // start can still hold the lock while core is publishing this event.
@@ -667,8 +848,15 @@ impl ThreadQueueRequestProcessor {
     }
 
     pub(super) fn kick(&self, id: ThreadId) {
-        if !self.origins.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keys().any(|(thread_id, _)| *thread_id == id) { return; }
+        if !self
+            .origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .any(|(thread_id, _)| *thread_id == id)
+        {
+            return;
+        }
         let processor = self.clone();
         self.background_tasks.spawn(async move {
             let Ok(thread) = processor.thread_manager.get_thread(id).await else {
@@ -706,7 +894,9 @@ fn pending_input_recorded(items: &[RolloutItem], turn_id: &str) -> bool {
     let mut in_turn = false;
     for item in items {
         match item {
-            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => in_turn = event.turn_id == turn_id,
+            RolloutItem::EventMsg(EventMsg::TurnStarted(event)) => {
+                in_turn = event.turn_id == turn_id
+            }
             RolloutItem::EventMsg(EventMsg::UserMessage(_)) if in_turn => return true,
             RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
                 if event.turn_id == turn_id
@@ -725,12 +915,15 @@ fn queue_error(error: impl std::fmt::Display) -> JSONRPCErrorError {
 }
 
 async fn seal_queue_input(input: Vec<V2UserInput>) -> Result<Vec<V2UserInput>, JSONRPCErrorError> {
-    if !input.iter().any(|item| matches!(item, V2UserInput::LocalImage { .. })) {
+    if !input
+        .iter()
+        .any(|item| matches!(item, V2UserInput::LocalImage { .. }))
+    {
         return Ok(input);
     }
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
         use codex_protocol::models::ContentItem;
+        use std::io::Read;
         let mut sealed = Vec::new();
         let mut remaining = MAX_QUEUE_BYTES;
         for item in input {
@@ -743,21 +936,37 @@ async fn seal_queue_input(input: Vec<V2UserInput>) -> Result<Vec<V2UserInput>, J
                     return Err(invalid_params("queued image must be a regular file"));
                 }
                 let mut bytes = Vec::new();
-                file.take(remaining as u64 + 1).read_to_end(&mut bytes).map_err(queue_error)?;
+                file.take(remaining as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(queue_error)?;
                 if bytes.len() > remaining {
                     return Err(invalid_params("queued images exceed their storage limit"));
                 }
                 remaining -= bytes.len();
                 let prepared = codex_protocol::models::local_image_content_items_with_label_number(
-                    &path, bytes, None, detail.unwrap_or(codex_protocol::models::DEFAULT_IMAGE_DETAIL),
+                    &path,
+                    bytes,
+                    None,
+                    detail.unwrap_or(codex_protocol::models::DEFAULT_IMAGE_DETAIL),
                 );
-                if !prepared.iter().any(|item| matches!(item, ContentItem::InputImage { .. })) {
+                if !prepared
+                    .iter()
+                    .any(|item| matches!(item, ContentItem::InputImage { .. }))
+                {
                     return Err(invalid_params("queued local image could not be decoded"));
                 }
                 for item in prepared {
                     match item {
-                        ContentItem::InputImage { image_url, detail } => sealed.push(V2UserInput::Image { url: image_url, detail }),
-                        ContentItem::InputText { text } => sealed.push(V2UserInput::Text { text, text_elements: Vec::new() }),
+                        ContentItem::InputImage { image_url, detail } => {
+                            sealed.push(V2UserInput::Image {
+                                url: image_url,
+                                detail,
+                            })
+                        }
+                        ContentItem::InputText { text } => sealed.push(V2UserInput::Text {
+                            text,
+                            text_elements: Vec::new(),
+                        }),
                         _ => {}
                     }
                 }
@@ -766,15 +975,67 @@ async fn seal_queue_input(input: Vec<V2UserInput>) -> Result<Vec<V2UserInput>, J
             }
         }
         if serde_json::to_vec(&sealed).map_err(queue_error)?.len() > MAX_QUEUE_BYTES {
-            return Err(invalid_params("sealed queue input exceeds its storage limit"));
+            return Err(invalid_params(
+                "sealed queue input exceeds its storage limit",
+            ));
         }
         Ok(sealed)
-    }).await.map_err(queue_error)?
+    })
+    .await
+    .map_err(queue_error)?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_pages_preserve_phase_revision_and_accepted_turn_receipts() {
+        let accepted = QueuedSubmission {
+            id: "accepted".into(),
+            client_user_message_id: None,
+            input: Vec::new(),
+        };
+        let pending = QueuedSubmission {
+            id: "pending".into(),
+            ..accepted.clone()
+        };
+        let queue = Queue {
+            revision: 17,
+            paused: true,
+            submissions: vec![pending],
+            pending_start: Some(PendingStart {
+                submission_id: "pending".into(),
+                turn_id: "starting-turn".into(),
+            }),
+            accepted: vec![AcceptedSubmission {
+                submission: accepted,
+                turn_id: "accepted-turn".into(),
+            }],
+            ..Queue::default()
+        };
+        let page = queue
+            .page(&ThreadQueueListParams {
+                thread_id: "thread".into(),
+                cursor: None,
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert!(
+            page.next_cursor.is_none(),
+            "one-page snapshots still need revision and custody"
+        );
+        let snapshot = page.snapshot.unwrap();
+        assert_eq!(snapshot.revision, 17);
+        assert!(snapshot.paused);
+        assert_eq!(snapshot.pending_start.unwrap().turn_id, "starting-turn");
+        assert_eq!(
+            snapshot.accepted_submissions[0].queued_submission_id,
+            "accepted"
+        );
+        assert_eq!(snapshot.accepted_submissions[0].turn_id, "accepted-turn");
+    }
 
     #[tokio::test]
     async fn queue_seals_local_image_before_acceptance_and_preserves_retry_identity() {
@@ -785,18 +1046,29 @@ mod tests {
         let bytes = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==").unwrap();
         std::fs::write(&path, bytes).unwrap();
         let params = ThreadQueueAddParams {
-            thread_id: "thread".into(), client_user_message_id: Some("image".into()),
-            input: vec![V2UserInput::LocalImage { path: path.clone(), detail: None }],
+            thread_id: "thread".into(),
+            client_user_message_id: Some("image".into()),
+            input: vec![V2UserInput::LocalImage {
+                path: path.clone(),
+                detail: None,
+            }],
         };
         let mut queue = Queue::default();
         let (item, added) = queue.add_sealed(params.clone()).await.unwrap();
         assert!(added);
         assert_eq!(item.input, params.input);
         let expected = queue.execution_inputs[&item.id].clone();
-        assert!(expected.iter().any(|item| matches!(item, V2UserInput::Image { url, .. } if url.starts_with("data:image/"))));
-        assert!(!expected.iter().any(|item| matches!(item, V2UserInput::LocalImage { .. })));
+        assert!(expected.iter().any(
+            |item| matches!(item, V2UserInput::Image { url, .. } if url.starts_with("data:image/"))
+        ));
+        assert!(
+            !expected
+                .iter()
+                .any(|item| matches!(item, V2UserInput::LocalImage { .. }))
+        );
         std::fs::write(&path, b"replacement is not an image").unwrap();
-        let mut restored: Queue = serde_json::from_slice(&serde_json::to_vec(&queue).unwrap()).unwrap();
+        let mut restored: Queue =
+            serde_json::from_slice(&serde_json::to_vec(&queue).unwrap()).unwrap();
         let (retry, added) = restored.add_sealed(params.clone()).await.unwrap();
         assert!(!added);
         assert_eq!(retry, item);
@@ -823,63 +1095,133 @@ mod tests {
                 client_user_message_id: Some(text.to_string()),
                 input: input(text),
             })
-            .expect("queue add").0
+            .expect("queue add")
+            .0
     }
 
     #[test]
     fn thread_queue_preserves_input_and_deduplicates_client_retries() {
         let mut queue = Queue::default();
         let first = add(&mut queue, "first");
+        let accepted_at = queue.task_observations[&first.id].accepted_at_unix_ms;
+        queue
+            .task_observations
+            .get_mut(&first.id)
+            .unwrap()
+            .execution_started_at_unix_ms = Some(accepted_at + 1000);
         let params = ThreadQueueAddParams {
-            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
+            thread_id: "unused".into(),
+            client_user_message_id: Some("first".into()),
+            input: input("first"),
         };
         let (retry, changed) = queue.add(params.clone()).unwrap();
         assert_eq!(retry, first);
         assert!(!changed);
-        assert!(queue.add(ThreadQueueAddParams { input: input("different"), ..params.clone() }).is_err());
+        assert!(
+            queue
+                .add(ThreadQueueAddParams {
+                    input: input("different"),
+                    ..params.clone()
+                })
+                .is_err()
+        );
         assert_eq!(queue.submissions, vec![first.clone()]);
         queue.accepted.push(AcceptedSubmission {
-            submission: queue.submissions.remove(0), turn_id: "accepted-turn".into(),
+            submission: queue.submissions.remove(0),
+            turn_id: "accepted-turn".into(),
         });
-        let mut restored: Queue = serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        let mut restored: Queue =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
         let (retry, changed) = restored.add(params.clone()).unwrap();
         assert_eq!(retry, first);
         assert!(!changed);
         assert!(restored.submissions.is_empty());
-        assert!(restored.add(ThreadQueueAddParams { input: input("different"), ..params }).is_err());
+        let observation = &restored.task_observations[&first.id];
+        assert_eq!(
+            observation.accepted_at_unix_ms, accepted_at,
+            "retry/restart must not reset acceptance"
+        );
+        assert_eq!(
+            observation.execution_started_at_unix_ms,
+            Some(accepted_at + 1000)
+        );
+        assert!(
+            restored
+                .add(ThreadQueueAddParams {
+                    input: input("different"),
+                    ..params
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn old_queue_state_keeps_task_acceptance_unknown() {
+        let mut queue = Queue::default();
+        let first = add(&mut queue, "old");
+        let mut value = serde_json::to_value(queue).unwrap();
+        value.as_object_mut().unwrap().remove("taskObservations");
+        let restored: Queue = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.submissions[0], first);
+        assert!(
+            restored.task_observations.is_empty(),
+            "never fabricate historical timestamps"
+        );
     }
 
     #[test]
     fn queue_ownership_requires_input_not_just_worker_start() {
-        let start = |id: &str| RolloutItem::EventMsg(EventMsg::TurnStarted(
-            codex_protocol::protocol::TurnStartedEvent {
-                turn_id: id.into(), trace_id: None, started_at: None,
-                model_context_window: None, collaboration_mode_kind: Default::default(),
-            }
-        ));
+        let start = |id: &str| {
+            RolloutItem::EventMsg(EventMsg::TurnStarted(
+                codex_protocol::protocol::TurnStartedEvent {
+                    turn_id: id.into(),
+                    trace_id: None,
+                    started_at: None,
+                    model_context_window: None,
+                    collaboration_mode_kind: Default::default(),
+                },
+            ))
+        };
         let input = RolloutItem::EventMsg(EventMsg::UserMessage(
-            codex_protocol::protocol::UserMessageEvent { message: "prompt".into(), ..Default::default() }
+            codex_protocol::protocol::UserMessageEvent {
+                message: "prompt".into(),
+                ..Default::default()
+            },
         ));
         assert!(!pending_input_recorded(&[start("turn")], "turn"));
-        assert!(!pending_input_recorded(&[start("turn"), start("other"), input.clone()], "turn"));
+        assert!(!pending_input_recorded(
+            &[start("turn"), start("other"), input.clone()],
+            "turn"
+        ));
         assert!(pending_input_recorded(&[start("turn"), input], "turn"));
     }
 
     #[test]
     fn queue_ownership_recognizes_paginated_input_only_for_its_turn() {
-        use codex_protocol::items::{TurnItem, UserMessageItem};
-        use codex_protocol::protocol::{ItemCompletedEvent, ItemStartedEvent};
+        use codex_protocol::items::TurnItem;
+        use codex_protocol::items::UserMessageItem;
+        use codex_protocol::protocol::ItemCompletedEvent;
+        use codex_protocol::protocol::ItemStartedEvent;
 
         let item = TurnItem::UserMessage(UserMessageItem::new(&[]));
         let thread_id = ThreadId::new();
         let started = RolloutItem::EventMsg(EventMsg::ItemStarted(ItemStartedEvent {
-            thread_id, turn_id: "turn".into(), item: item.clone(), started_at_ms: 0,
+            thread_id,
+            turn_id: "turn".into(),
+            item: item.clone(),
+            started_at_ms: 0,
         }));
         let completed = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
-            thread_id, turn_id: "turn".into(), item, completed_at_ms: 0,
+            thread_id,
+            turn_id: "turn".into(),
+            item,
+            completed_at_ms: 0,
         }));
         assert!(!pending_input_recorded(&[started], "turn"));
-        assert!(!pending_input_recorded(std::slice::from_ref(&completed), "other"));
+        assert!(!pending_input_recorded(
+            std::slice::from_ref(&completed),
+            "other"
+        ));
         assert!(pending_input_recorded(&[completed], "turn"));
     }
 
@@ -896,7 +1238,11 @@ mod tests {
         let expected = vec![third, first, second];
         assert_eq!(queue.submissions, expected);
         // Both rejected requests would move `second` to the front if applied.
-        assert!(queue.reorder(&[second_id.clone(), second_id.clone()]).is_err());
+        assert!(
+            queue
+                .reorder(&[second_id.clone(), second_id.clone()])
+                .is_err()
+        );
         assert!(queue.reorder(&[second_id, "unknown".to_string()]).is_err());
         assert_eq!(queue.submissions, expected);
     }
@@ -915,9 +1261,13 @@ mod tests {
         assert_eq!(page.data, vec![first.clone()]);
         params.cursor = page.next_cursor;
         assert_eq!(params.cursor.as_deref(), Some("0:1"));
-        let (_, changed) = queue.add(ThreadQueueAddParams {
-            thread_id: "unused".into(), client_user_message_id: Some("first".into()), input: input("first"),
-        }).unwrap();
+        let (_, changed) = queue
+            .add(ThreadQueueAddParams {
+                thread_id: "unused".into(),
+                client_user_message_id: Some("first".into()),
+                input: input("first"),
+            })
+            .unwrap();
         assert!(!changed);
         assert!(!queue.reorder(&[first.id]).unwrap());
         let page = queue.page(&params).expect("last page");

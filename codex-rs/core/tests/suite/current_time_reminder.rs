@@ -174,11 +174,21 @@ async fn zero_current_time_reminder_interval_delivers_when_time_moves_backward()
     require_network!();
 
     let server = start_mock_server().await;
+    // Each turn delivers an answer; an empty response would add the turn's
+    // missing-answer repair request, which also receives a reminder.
     let responses = mount_sse_sequence(
         &server,
         vec![
-            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;
@@ -325,13 +335,21 @@ async fn current_time_reminder_is_refreshed_after_compaction() -> Result<()> {
     let responses = mount_sse_sequence(
         &server,
         vec![
-            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-1"),
+            ]),
             sse(vec![
                 ev_response_created("resp-compact"),
                 ev_assistant_message("msg-compact", "compact summary"),
                 ev_completed("resp-compact"),
             ]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;
@@ -518,7 +536,11 @@ async fn current_time_tool_returns_json_through_code_mode() -> Result<()> {
                 ),
                 ev_completed("resp-1"),
             ]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "done"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;

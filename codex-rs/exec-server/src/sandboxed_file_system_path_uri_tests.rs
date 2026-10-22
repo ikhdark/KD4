@@ -63,6 +63,30 @@ fn sandbox_errors_preserve_protocol_categories() {
     }
 }
 
+#[test]
+fn sandbox_errors_prefer_typed_native_categories() {
+    for kind in [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::AlreadyExists,
+        io::ErrorKind::NotADirectory,
+        io::ErrorKind::IsADirectory,
+        io::ErrorKind::DirectoryNotEmpty,
+        io::ErrorKind::InvalidData,
+        io::ErrorKind::Unsupported,
+        io::ErrorKind::Interrupted,
+        io::ErrorKind::TimedOut,
+        io::ErrorKind::BrokenPipe,
+    ] {
+        let error = map_sandbox_error(JSONRPCErrorError {
+            code: -32603,
+            message: "native failure".into(),
+            data: Some(codex_exec_server_protocol::file_system_error_data(kind)),
+        });
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), "native failure");
+    }
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn disabled_windows_sandbox_rejects_file_access_before_helper_spawn() {

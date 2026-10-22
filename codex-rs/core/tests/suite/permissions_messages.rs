@@ -20,6 +20,7 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::require_network;
 use core_test_support::responses::ResponsesRequest;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
@@ -44,7 +45,6 @@ fn model_with_approval_messages(
 ) -> codex_protocol::openai_models::ModelInfo {
     let mut model = model_info_from_slug(slug);
     model.model_messages = Some(ModelMessages {
-        token_budget: None,
         instructions_template: None,
         instructions_variables: None,
         approvals: Some(ApprovalMessages {
@@ -85,7 +85,11 @@ async fn catalog_approval_message_is_sent_in_initial_permissions() -> Result<()>
     let server = start_mock_server().await;
     let req = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
     )
     .await;
     let model_slug = "catalog-approvals-model";
@@ -119,12 +123,20 @@ async fn model_change_appends_new_catalog_approval_message() -> Result<()> {
     let server = start_mock_server().await;
     let req1 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
     )
     .await;
     let req2 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ]),
     )
     .await;
     let first_slug = "catalog-approvals-model-a";
@@ -171,14 +183,24 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
+    // Each turn delivers a final answer, so neither consumes the other's
+    // response through the bounded missing-answer repair.
     let req1 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
     )
     .await;
     let req2 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ]),
     )
     .await;
 
@@ -438,7 +460,10 @@ async fn resume_replays_permissions_messages() -> Result<()> {
 
     initial.codex.flush_rollout().await?;
     initial.codex.submit(Op::Shutdown).await?;
-    wait_for_event(&initial.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
     let resumed = builder.resume(&server, home, rollout_path).await?;
     resumed
         .codex
@@ -467,24 +492,42 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     require_network!();
 
     let server = start_mock_server().await;
+    // Each turn delivers a final answer, so none consumes a later turn's
+    // response through the bounded missing-answer repair.
     let _req1 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]),
     )
     .await;
     let req2 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "done"),
+            ev_completed("resp-2"),
+        ]),
     )
     .await;
     let req3 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+        sse(vec![
+            ev_response_created("resp-3"),
+            ev_assistant_message("msg-3", "done"),
+            ev_completed("resp-3"),
+        ]),
     )
     .await;
     let req4 = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]),
+        sse(vec![
+            ev_response_created("resp-4"),
+            ev_assistant_message("msg-4", "done"),
+            ev_completed("resp-4"),
+        ]),
     )
     .await;
 
@@ -543,7 +586,10 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     assert!(permissions_base[0].contains("Approval policy is `never`"));
     initial.codex.flush_rollout().await?;
     initial.codex.submit(Op::Shutdown).await?;
-    wait_for_event(&initial.codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    wait_for_event(&initial.codex, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
 
     builder = builder.with_config(|config| {
         config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);

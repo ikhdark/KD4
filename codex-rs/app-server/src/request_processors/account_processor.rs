@@ -400,6 +400,13 @@ impl AccountRequestProcessor {
         ) {
             Ok(()) => {
                 self.auth_manager.reload().await;
+                self.config_manager
+                    .complete_auth_transition(
+                        self.auth_manager.clone(),
+                        self.config.chatgpt_base_url.clone(),
+                        self.config.http_client_factory(),
+                    )
+                    .await;
                 Ok(())
             }
             Err(err) => Err(internal_error(format!("failed to save api key: {err}"))),
@@ -553,19 +560,23 @@ impl AccountRequestProcessor {
         let auth_url = server.auth_url.clone();
         tokio::spawn(async move {
             let _ = response_enqueued.await;
-            let (success, error_msg) = match tokio::time::timeout(
-                LOGIN_CHATGPT_TIMEOUT,
-                server.block_until_done(),
-            )
-            .await
-            {
-                Ok(Ok(())) => (true, None),
-                Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
-                Err(_elapsed) => {
-                    shutdown_handle.shutdown();
-                    (false, Some("Login timed out".to_string()))
-                }
-            };
+            let completion = server.block_until_done();
+            tokio::pin!(completion);
+            let (success, error_msg) =
+                match tokio::time::timeout(LOGIN_CHATGPT_TIMEOUT, &mut completion).await {
+                    Ok(Ok(())) => (true, None),
+                    Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
+                    Err(_elapsed) => {
+                        if shutdown_handle.try_cancel() {
+                            (false, Some("Login timed out".to_string()))
+                        } else {
+                            match completion.await {
+                                Ok(()) => (true, None),
+                                Err(err) => (false, Some(format!("Login server error: {err}"))),
+                            }
+                        }
+                    }
+                };
 
             Self::send_chatgpt_login_completion_notifications(
                 &outgoing_clone,
@@ -719,6 +730,13 @@ impl AccountRequestProcessor {
     ) -> std::result::Result<(), CancelLoginError> {
         let mut guard = self.active_login.lock().await;
         if guard.as_ref().map(ActiveLogin::login_id) == Some(login_id) {
+            if let Some(ActiveLogin::Browser {
+                shutdown_handle, ..
+            }) = guard.as_ref()
+                && !shutdown_handle.try_cancel()
+            {
+                return Err(CancelLoginError::NotFound);
+            }
             if let Some(active) = guard.take() {
                 drop(active);
             }
@@ -799,13 +817,12 @@ impl AccountRequestProcessor {
             )))
             .await
             .map_err(|err| internal_error(format!("failed to set external auth: {err}")))?;
-        self.config_manager.replace_cloud_config_bundle_loader(
-            self.auth_manager.clone(),
-            self.config.chatgpt_base_url.clone(),
-            self.config.http_client_factory(),
-        );
         self.config_manager
-            .sync_default_client_residency_requirement()
+            .complete_auth_transition(
+                self.auth_manager.clone(),
+                self.config.chatgpt_base_url.clone(),
+                self.config.http_client_factory(),
+            )
             .await;
 
         Ok(LoginAccountResponse::ChatgptAuthTokens {})
@@ -859,13 +876,12 @@ impl AccountRequestProcessor {
         let account_updated = if success {
             let auth_manager = thread_manager.auth_manager();
             auth_manager.reload().await;
-            config_manager.replace_cloud_config_bundle_loader(
-                auth_manager.clone(),
-                chatgpt_base_url,
-                http_client_factory,
-            );
             config_manager
-                .sync_default_client_residency_requirement()
+                .complete_auth_transition(
+                    auth_manager.clone(),
+                    chatgpt_base_url,
+                    http_client_factory,
+                )
                 .await;
 
             let auth = auth_manager.auth_cached();
@@ -910,6 +926,14 @@ impl AccountRequestProcessor {
                 return Err(internal_error(format!("logout failed: {err}")));
             }
         }
+
+        self.config_manager
+            .complete_auth_transition(
+                self.auth_manager.clone(),
+                self.config.chatgpt_base_url.clone(),
+                self.config.http_client_factory(),
+            )
+            .await;
 
         Self::maybe_refresh_plugin_caches_for_current_config(
             &self.config_manager,
@@ -1484,8 +1508,14 @@ mod tests {
         );
 
         for (backend_type, api_type) in [
-            (BackendWorkspaceMessageType::Announcement, WorkspaceMessageType::Announcement),
-            (BackendWorkspaceMessageType::Unknown, WorkspaceMessageType::Unknown),
+            (
+                BackendWorkspaceMessageType::Announcement,
+                WorkspaceMessageType::Announcement,
+            ),
+            (
+                BackendWorkspaceMessageType::Unknown,
+                WorkspaceMessageType::Unknown,
+            ),
         ] {
             let response = AccountRequestProcessor::workspace_messages_response(
                 BackendWorkspaceMessagesResponse {
@@ -1498,17 +1528,21 @@ mod tests {
                     }],
                 },
                 false,
-            ).expect("absent timestamps are valid");
-            assert_eq!(response, GetWorkspaceMessagesResponse {
-                feature_enabled: false,
-                messages: vec![WorkspaceMessage {
-                    message_id: "other-id".to_string(),
-                    message_type: api_type,
-                    message_body: "Other body".to_string(),
-                    created_at: None,
-                    archived_at: None,
-                }],
-            });
+            )
+            .expect("absent timestamps are valid");
+            assert_eq!(
+                response,
+                GetWorkspaceMessagesResponse {
+                    feature_enabled: false,
+                    messages: vec![WorkspaceMessage {
+                        message_id: "other-id".to_string(),
+                        message_type: api_type,
+                        message_body: "Other body".to_string(),
+                        created_at: None,
+                        archived_at: None,
+                    }],
+                }
+            );
         }
         for (created_at, archived_at) in [(Some("invalid"), None), (None, Some("invalid"))] {
             let error = AccountRequestProcessor::workspace_messages_response(
@@ -1522,9 +1556,14 @@ mod tests {
                     }],
                 },
                 true,
-            ).expect_err("invalid timestamps must not be silently dropped");
+            )
+            .expect_err("invalid timestamps must not be silently dropped");
             assert_eq!(error.code, -32603);
-            assert!(error.message.starts_with("failed to parse workspace message timestamp `invalid`:"));
+            assert!(
+                error
+                    .message
+                    .starts_with("failed to parse workspace message timestamp `invalid`:")
+            );
         }
     }
 
@@ -1559,6 +1598,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
 
+        let _ports = core_test_support::login_port::LoginPortLease::acquire().await?;
         let server = core_test_support::responses::start_mock_server().await;
         let model_catalog = codex_models_manager::bundled_models_response()?;
         let test = core_test_support::test_codex::test_codex()

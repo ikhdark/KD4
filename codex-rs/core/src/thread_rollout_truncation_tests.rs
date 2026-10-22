@@ -1,5 +1,6 @@
 use super::*;
 use crate::session::tests::build_world_state_from_turn_context;
+use crate::session::tests::legacy_inter_agent_mail_rollout;
 use crate::session::tests::make_session_and_context;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
@@ -49,6 +50,38 @@ fn developer_msg(text: &str) -> ResponseItem {
     }
 }
 
+#[test]
+fn durable_audit_08_and_14_checkpoint_gaps_survive_real_prefix_crops() {
+    let mut notice = developer_msg("source history incomplete");
+    notice.set_id(Some(ResponseItemId::new("msg_rollout_gap")));
+    let source = vec![
+        RolloutItem::ResponseItem(user_msg("keep")),
+        RolloutItem::ResponseItem(user_msg("exclude")),
+        RolloutItem::Compacted(codex_protocol::protocol::CompactedItem {
+            message: "checkpoint".into(),
+            replacement_history: Some(vec![notice.clone()]),
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+    ];
+    let cropped = truncate_rollout_before_nth_user_message_from_start(&source, 1);
+    assert!(matches!(&cropped[0], RolloutItem::ResponseItem(item) if item == &user_msg("keep")));
+    assert!(
+        cropped
+            .iter()
+            .any(|item| matches!(item, RolloutItem::ResponseItem(item) if item == &notice))
+    );
+    assert!(codex_rollout::ensure_rollout_source_integrity(&cropped).is_err());
+    assert!(truncate_rollout_before_nth_user_message_from_start(&source, 0).is_empty());
+    assert!(codex_rollout::ensure_rollout_source_integrity(&source[..1]).is_ok());
+}
+
+/// Mail as writers before typed delivery persisted it: an assistant message whose
+/// only text is the serialized communication. Rollout readers count it as a turn
+/// only before the first typed-delivery or turn-attributed record; current writers
+/// use `inter_agent_communication` (or delivery metadata) instead.
 fn inter_agent_msg(text: &str, trigger_turn: bool) -> ResponseItem {
     let communication = InterAgentCommunication::new(
         AgentPath::root(),
@@ -117,18 +150,31 @@ fn truncates_rollout_after_terminal_canonical_turn_id() {
 fn fork_rejects_late_terminal_prefix_containing_successor() {
     for completed_successor in [false, true] {
         for aborted in [false, true] {
-            let mut rollout = vec![turn_started("a"), turn_started("b"),
-                RolloutItem::ResponseItem(user_msg("B must not enter fork A"))];
-            if completed_successor { rollout.push(turn_completed("b")); }
+            let mut rollout = vec![
+                turn_started("a"),
+                turn_started("b"),
+                RolloutItem::ResponseItem(user_msg("B must not enter fork A")),
+            ];
+            if completed_successor {
+                rollout.push(turn_completed("b"));
+            }
             rollout.push(if aborted {
-                RolloutItem::EventMsg(EventMsg::TurnAborted(codex_protocol::protocol::TurnAbortedEvent {
-                    turn_id: Some("a".into()),
-                    reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
-                    completed_at: None, duration_ms: None, timing: None,
-                }))
-            } else { turn_completed("a") });
+                RolloutItem::EventMsg(EventMsg::TurnAborted(
+                    codex_protocol::protocol::TurnAbortedEvent {
+                        turn_id: Some("a".into()),
+                        reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                        completed_at: None,
+                        duration_ms: None,
+                        timing: None,
+                    },
+                ))
+            } else {
+                turn_completed("a")
+            });
             let error = truncate_rollout_after_turn_id(&rollout, "a").unwrap_err();
-            assert!(matches!(error, CodexErr::InvalidRequest(message) if message.contains("interleaved successor")));
+            assert!(
+                matches!(error, CodexErr::InvalidRequest(message) if message.contains("interleaved successor"))
+            );
         }
     }
 }
@@ -377,10 +423,7 @@ fn truncates_rollout_from_start_preserves_users_before_rolled_back_inter_agent_t
     let rollout_items = vec![
         RolloutItem::ResponseItem(user_msg("u1")),
         RolloutItem::ResponseItem(assistant_msg("a1")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task",
-            /*trigger_turn*/ true,
-        )),
+        inter_agent_communication("triggered task", /*trigger_turn*/ true),
         RolloutItem::ResponseItem(assistant_msg("a2")),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
             num_turns: 1,
@@ -445,15 +488,9 @@ fn truncates_rollout_to_last_n_fork_turns_counts_trigger_turn_messages() {
     let rollout = vec![
         RolloutItem::ResponseItem(user_msg("u1")),
         RolloutItem::ResponseItem(assistant_msg("a1")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "queued message",
-            /*trigger_turn*/ false,
-        )),
+        inter_agent_communication("queued message", /*trigger_turn*/ false),
         RolloutItem::ResponseItem(assistant_msg("a2")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task",
-            /*trigger_turn*/ true,
-        )),
+        inter_agent_communication("triggered task", /*trigger_turn*/ true),
         RolloutItem::ResponseItem(assistant_msg("a3")),
         RolloutItem::ResponseItem(user_msg("u2")),
         RolloutItem::ResponseItem(assistant_msg("a4")),
@@ -558,10 +595,7 @@ fn truncates_rollout_to_last_n_fork_turns_applies_thread_rollback_markers() {
     let rollout = vec![
         RolloutItem::ResponseItem(user_msg("u1")),
         RolloutItem::ResponseItem(assistant_msg("a1")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task",
-            /*trigger_turn*/ true,
-        )),
+        inter_agent_communication("triggered task", /*trigger_turn*/ true),
         RolloutItem::ResponseItem(assistant_msg("a2")),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
             num_turns: 1,
@@ -582,10 +616,7 @@ fn truncates_rollout_to_last_n_fork_turns_applies_thread_rollback_markers() {
 fn fork_turn_positions_ignore_zero_turn_rollback_markers() {
     let rollout = vec![
         RolloutItem::ResponseItem(user_msg("u1")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task",
-            /*trigger_turn*/ true,
-        )),
+        inter_agent_communication("triggered task", /*trigger_turn*/ true),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
             num_turns: 0,
         })),
@@ -600,10 +631,7 @@ fn truncates_rollout_to_last_n_fork_turns_discards_trigger_boundaries_in_rolled_
     let rollout = vec![
         RolloutItem::ResponseItem(user_msg("u1")),
         RolloutItem::ResponseItem(user_msg("u2")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task",
-            /*trigger_turn*/ true,
-        )),
+        inter_agent_communication("triggered task", /*trigger_turn*/ true),
         RolloutItem::ResponseItem(assistant_msg("a1")),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
             num_turns: 1,
@@ -627,18 +655,12 @@ fn truncates_rollout_to_last_n_fork_turns_discards_rolled_back_assistant_instruc
     let rollout = vec![
         RolloutItem::ResponseItem(user_msg("u1")),
         RolloutItem::ResponseItem(assistant_msg("a1")),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task 1",
-            /*trigger_turn*/ true,
-        )),
+        inter_agent_communication("triggered task 1", /*trigger_turn*/ true),
         RolloutItem::ResponseItem(assistant_msg("a2")),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
             num_turns: 1,
         })),
-        RolloutItem::ResponseItem(inter_agent_msg(
-            "triggered task 2",
-            /*trigger_turn*/ true,
-        )),
+        inter_agent_communication("triggered task 2", /*trigger_turn*/ true),
         RolloutItem::ResponseItem(assistant_msg("a3")),
     ];
 
@@ -657,6 +679,103 @@ fn truncates_rollout_to_last_n_fork_turns_discards_rolled_back_assistant_instruc
         serde_json::to_value(&truncated).unwrap(),
         serde_json::to_value(&rollout).unwrap()
     );
+}
+
+fn response_items_at(items: &[RolloutItem], indexes: &[usize]) -> Vec<ResponseItem> {
+    indexes
+        .iter()
+        .map(|&index| match &items[index] {
+            RolloutItem::ResponseItem(item) => item.clone(),
+            other => panic!("record {index} is not a response item: {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn legacy_assistant_encoded_mail_keeps_its_fork_and_rollback_turns() {
+    let rollout = legacy_inter_agent_mail_rollout();
+
+    // The recorded rollback removed the mail turn (u1 at 1 survives, u2 at 10 follows).
+    assert_eq!(fork_turn_positions_in_rollout(&rollout), vec![1, 10]);
+    assert_eq!(user_message_positions_in_rollout(&rollout), vec![1, 10]);
+    assert_eq!(
+        serde_json::to_value(
+            truncate_rollout_to_last_n_fork_turns(&rollout, /*n_from_end*/ 2).unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&rollout[1..]).unwrap()
+    );
+    let before_second_user =
+        truncate_rollout_before_nth_user_message_from_start(&rollout, /*n_from_start*/ 1);
+    assert_eq!(
+        serde_json::to_value(&before_second_user).unwrap(),
+        serde_json::to_value(&rollout[..10]).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(truncate_rollout_after_turn_id(&rollout, "turn-1").unwrap()).unwrap(),
+        serde_json::to_value(&rollout[..4]).unwrap()
+    );
+    // Resume replays the recorded marker the same way.
+    assert_eq!(
+        crate::session::Session::reconstruct_model_history_from_rollout(&rollout),
+        response_items_at(&rollout, &[1, 2, 10, 11])
+    );
+
+    // A fork assigns response-item IDs to the copied records; the child must
+    // still replay the copied marker against the legacy mail turn.
+    let mut child = before_second_user;
+    for item in &mut child {
+        if let RolloutItem::ResponseItem(item) = item {
+            item.set_id(Some(ResponseItemId::new("msg")));
+        }
+    }
+    assert_eq!(
+        crate::session::Session::reconstruct_model_history_from_rollout(&child),
+        response_items_at(&child, &[1, 2])
+    );
+}
+
+#[test]
+fn assistant_json_from_typed_delivery_writers_is_never_a_fork_or_rollback_turn() {
+    let rollback = || {
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        }))
+    };
+    let mut attributed_json = inter_agent_msg("example", /*trigger_turn*/ true);
+    attributed_json.set_turn_id_if_missing("turn-2");
+    let mut attributed_user = user_msg("u2");
+    attributed_user.set_turn_id_if_missing("turn-2");
+    for rollout in [
+        // The writer stamped turn attribution onto the JSON itself.
+        vec![
+            RolloutItem::ResponseItem(user_msg("u1")),
+            RolloutItem::ResponseItem(user_msg("u2")),
+            RolloutItem::ResponseItem(attributed_json),
+            RolloutItem::ResponseItem(assistant_msg("a")),
+            rollback(),
+        ],
+        // An earlier turn-attributed record identifies a typed-delivery writer.
+        vec![
+            RolloutItem::ResponseItem(user_msg("u1")),
+            RolloutItem::ResponseItem(attributed_user),
+            RolloutItem::ResponseItem(inter_agent_msg("example", /*trigger_turn*/ true)),
+            RolloutItem::ResponseItem(assistant_msg("a")),
+            rollback(),
+        ],
+    ] {
+        // The rollback removes u2's turn; the JSON is ordinary assistant text.
+        assert_eq!(fork_turn_positions_in_rollout(&rollout), vec![0]);
+        assert_eq!(user_message_positions_in_rollout(&rollout), vec![0]);
+    }
+
+    // A typed delivery record identifies such a writer as well.
+    let rollout = vec![
+        RolloutItem::ResponseItem(user_msg("u1")),
+        inter_agent_communication("queued", /*trigger_turn*/ false),
+        RolloutItem::ResponseItem(inter_agent_msg("example", /*trigger_turn*/ true)),
+    ];
+    assert_eq!(fork_turn_positions_in_rollout(&rollout), vec![0]);
 }
 #[test]
 fn last_n_fork_trims_each_checkpoint_without_losing_checkpoint_only_content() {
@@ -764,4 +883,40 @@ fn last_n_fork_rejects_missing_or_ambiguous_checkpoint_boundaries() {
                 .is_empty()
         );
     }
+}
+#[test]
+fn ctxaudit_prefix_forks_carry_only_authenticated_source_integrity() {
+    let mut notice = developer_msg("source history incomplete");
+    notice.set_id(Some(ResponseItemId::new("msg_rollout_gap")));
+    let notice = RolloutItem::ResponseItem(notice);
+    let source = vec![
+        turn_started("a"),
+        RolloutItem::ResponseItem(user_msg("retained")),
+        turn_completed("a"),
+        turn_started("b"),
+        RolloutItem::ResponseItem(user_msg("excluded")),
+        turn_completed("b"),
+        notice,
+    ];
+    let terminal = truncate_rollout_after_turn_id(&source, "a").unwrap();
+    let nth = truncate_rollout_before_nth_user_message_from_start(&source, 1);
+    for retained in [terminal, nth] {
+        assert_eq!(retained.iter().filter(|item| matches!(item,
+            RolloutItem::ResponseItem(item) if codex_rollout::is_rollout_reconstruction_notice(item))).count(), 1);
+        assert!(!retained.iter().any(|item| matches!(item,
+            RolloutItem::ResponseItem(item) if item == &user_msg("excluded"))));
+        assert_eq!(
+            serde_json::to_value(carry_source_integrity_notice(&source, retained.clone())).unwrap(),
+            serde_json::to_value(retained).unwrap()
+        );
+    }
+    assert!(carry_source_integrity_notice(&source, Vec::new()).is_empty());
+    let clean = vec![
+        RolloutItem::ResponseItem(user_msg("retained")),
+        RolloutItem::ResponseItem(developer_msg("source history incomplete")),
+    ];
+    assert_eq!(
+        serde_json::to_value(carry_source_integrity_notice(&clean, clean[..1].to_vec())).unwrap(),
+        serde_json::to_value(&clean[..1]).unwrap()
+    );
 }

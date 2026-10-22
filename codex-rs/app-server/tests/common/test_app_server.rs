@@ -179,7 +179,10 @@ impl TestAppServer {
         .await
         .context("app-server did not shut down gracefully within 10 seconds")?
         .context("waiting for graceful app-server shutdown")?;
-        ensure!(status.success(), "app-server graceful shutdown failed: {status}");
+        ensure!(
+            status.success(),
+            "app-server graceful shutdown failed: {status}"
+        );
         Ok(())
     }
 
@@ -1861,7 +1864,9 @@ mod tests {
             #[cfg(windows)]
             let (program, script) = (
                 Path::new("powershell.exe"),
-                format!("[Console]::In.ReadToEnd() | Out-Null; Start-Sleep -Milliseconds 300; [Console]::Write(('x' * 262144)); exit {exit_code}"),
+                format!(
+                    "[Console]::In.ReadToEnd() | Out-Null; Start-Sleep -Milliseconds 300; [Console]::Write(('x' * 262144)); exit {exit_code}"
+                ),
             );
             #[cfg(unix)]
             let args = ["-c", script.as_str()];
@@ -1879,7 +1884,10 @@ mod tests {
                 result?;
             } else {
                 assert!(
-                    result.unwrap_err().to_string().contains("graceful shutdown failed"),
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("graceful shutdown failed"),
                     "a failed process must not establish a persistence barrier"
                 );
             }
@@ -1945,7 +1953,10 @@ mod tests {
             };
             assert_eq!(preserved.id, RequestId::Integer(7));
             assert_eq!(preserved.method, "test/serverRequest");
-            assert_eq!(preserved.params, Some(serde_json::json!({"marker": "preserve"})));
+            assert_eq!(
+                preserved.params,
+                Some(serde_json::json!({"marker": "preserve"}))
+            );
         }
         Ok(())
     }

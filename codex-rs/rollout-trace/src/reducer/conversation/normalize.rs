@@ -53,11 +53,42 @@ pub(super) fn normalize_model_items(
 
 pub(super) fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
     Some(TokenUsage {
+        total_tokens: u64_field(value, "total_tokens"),
+        coverage: value
+            .get("coverage")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
         input_tokens: u64_field(value, "input_tokens")?,
         cached_input_tokens: u64_field(value, "cached_input_tokens")?,
         output_tokens: u64_field(value, "output_tokens")?,
         reasoning_output_tokens: u64_field(value, "reasoning_output_tokens")?,
     })
+}
+
+#[cfg(test)]
+mod token_usage_tests {
+    use super::token_usage_from_value;
+
+    #[test]
+    fn normalized_usage_preserves_provider_total_and_legacy_absence() {
+        let mut raw = serde_json::json!({"input_tokens": 100, "cached_input_tokens": 80,
+            "output_tokens": 23, "reasoning_output_tokens": 3, "total_tokens": 150});
+        let usage = token_usage_from_value(&raw).unwrap();
+        assert_eq!(usage.total_tokens, Some(150));
+        assert_ne!(
+            usage.total_tokens,
+            Some(usage.input_tokens + usage.output_tokens)
+        );
+        let encoded = serde_json::to_value(&usage).unwrap();
+        assert_eq!(encoded["total_tokens"], 150);
+        raw.as_object_mut().unwrap().remove("total_tokens");
+        let legacy = token_usage_from_value(&raw).unwrap();
+        assert_eq!(legacy.total_tokens, None);
+        assert!(legacy.coverage.is_none());
+        assert_eq!(
+            serde_json::from_value::<crate::model::TokenUsage>(raw).unwrap(),
+            legacy
+        );
+    }
 }
 
 fn normalize_model_item(

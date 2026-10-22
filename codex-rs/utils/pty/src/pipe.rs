@@ -140,16 +140,24 @@ fn terminate_process(process: &OwnedHandle) -> io::Result<()> {
     }
 }
 
-async fn read_output_stream<R>(mut reader: R, output_tx: mpsc::Sender<Vec<u8>>)
-where
+async fn read_output_stream<R>(
+    mut reader: R,
+    output_tx: mpsc::Sender<Vec<u8>>,
+    complete: Arc<AtomicBool>,
+) where
     R: AsyncRead + Unpin,
 {
     let mut buf = vec![0u8; 8_192];
     loop {
         match reader.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => {
+                complete.store(true, std::sync::atomic::Ordering::Release);
+                break;
+            }
             Ok(n) => {
-                let _ = output_tx.send(buf[..n].to_vec()).await;
+                if output_tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
             }
             Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -259,6 +267,12 @@ async fn finish_pipe_process_setup(
     mut child: tokio::process::Child,
     managed: ManagedRootProcess,
 ) -> Result<SpawnedProcess> {
+    let observation = crate::process_observation::observe_process_start(
+        "unified_pipe",
+        crate::process_observation::ProcessRole::RequestedRoot,
+        child.id(),
+        None,
+    );
     #[cfg(windows)]
     let windows_terminator = {
         let pid = child
@@ -266,7 +280,10 @@ async fn finish_pipe_process_setup(
             .ok_or_else(|| io::Error::other("missing child pid"))?;
         if let Err(error) = managed.attach_and_resume(pid) {
             if let Err(cleanup_error) = managed.cleanup_after_failed_attach(child).await {
+                observation.cleanup_observed("attach_failed_cleanup_failed");
                 log::warn!("failed to finish pipe attachment cleanup: {cleanup_error}");
+            } else {
+                observation.cleanup_observed("attach_failed_cleanup_completed");
             }
             return Err(error.into());
         }
@@ -313,16 +330,29 @@ async fn finish_pipe_process_setup(
         tokio::spawn(async {})
     };
 
+    let capture = crate::process::OutputCapture::default();
+    if stdout.is_none() {
+        capture
+            .stdout
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    if stderr.is_none() {
+        capture
+            .stderr
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     let stdout_handle = stdout.map(|stdout| {
         let stdout_tx = stdout_tx.clone();
+        let complete = Arc::clone(&capture.stdout);
         tokio::spawn(async move {
-            read_output_stream(BufReader::new(stdout), stdout_tx).await;
+            read_output_stream(BufReader::new(stdout), stdout_tx, complete).await;
         })
     });
     let stderr_handle = stderr.map(|stderr| {
         let stderr_tx = stderr_tx.clone();
+        let complete = Arc::clone(&capture.stderr);
         tokio::spawn(async move {
-            read_output_stream(BufReader::new(stderr), stderr_tx).await;
+            read_output_stream(BufReader::new(stderr), stderr_tx, complete).await;
         })
     });
     let mut reader_abort_handles = Vec::new();
@@ -371,6 +401,7 @@ async fn finish_pipe_process_setup(
             log::warn!("Windows pipe failed to preserve descendants after root exit: {err}");
         }
         let code = exit_code_from_status(status);
+        observation.cleanup_observed("root_reaped; descendants_unknown");
         publish_exit_status(&wait_exit_status, &wait_exit_code, code);
         let _ = exit_tx.send(code);
     });
@@ -392,7 +423,8 @@ async fn finish_pipe_process_setup(
         exit_code,
         None,
         /*resizer*/ None,
-    );
+    )
+    .with_output_capture(capture);
 
     Ok(SpawnedProcess {
         session: handle,
@@ -449,3 +481,63 @@ pub async fn spawn_process_no_stdin_with_inherited_fds(
 #[cfg(all(test, windows))]
 #[path = "pipe_tests.rs"]
 mod tests;
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
+    use tokio::io::ReadBuf;
+
+    struct Tail {
+        interrupted: bool,
+        fail: bool,
+    }
+    impl AsyncRead for Tail {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if std::mem::take(&mut self.interrupted) {
+                Poll::Ready(Err(std::io::Error::from(ErrorKind::Interrupted)))
+            } else if self.fail {
+                Poll::Ready(Err(std::io::Error::other("injected reader failure")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_capture_distinguishes_eof_error_and_abort() {
+        for prefix in [b"".as_slice(), b"known prefix".as_slice()] {
+            for fail in [false, true] {
+                let complete = Arc::new(AtomicBool::new(false));
+                let (tx, mut rx) = mpsc::channel(2);
+                let reader = std::io::Cursor::new(prefix.to_vec()).chain(Tail {
+                    interrupted: true,
+                    fail,
+                });
+                read_output_stream(reader, tx, Arc::clone(&complete)).await;
+                let mut delivered = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    delivered.extend(chunk);
+                }
+                assert_eq!(delivered, prefix);
+                assert_eq!(complete.load(std::sync::atomic::Ordering::Acquire), !fail);
+            }
+        }
+        let (mut writer, reader) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"prefix")
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(2);
+        let complete = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(read_output_stream(reader, tx, Arc::clone(&complete)));
+        assert_eq!(rx.recv().await.unwrap(), b"prefix");
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!complete.load(std::sync::atomic::Ordering::Acquire));
+    }
+}

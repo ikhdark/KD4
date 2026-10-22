@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -22,7 +23,7 @@ use codex_protocol::protocol::SessionConfiguredEvent;
 
 pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
-use crate::event_processor::final_message_from_turn_items;
+use crate::event_processor::final_message_from_turn;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
 use crate::exec_events::CodeModeCellItem;
@@ -68,7 +69,8 @@ pub struct EventProcessorWithJsonOutput {
     last_total_token_usage: Option<ThreadTokenUsage>,
     last_critical_error: Option<ThreadErrorEvent>,
     final_message: Option<String>,
-    last_agent_message_id: Option<String>,
+    streamed_final_message: crate::event_processor::FinalMessageSelection,
+    completed_text_item_ids: HashSet<String>,
     output: Box<dyn Write + Send>,
     output_error: Option<std::io::Error>,
     emit_final_message_on_shutdown: bool,
@@ -97,7 +99,8 @@ impl EventProcessorWithJsonOutput {
             last_total_token_usage: None,
             last_critical_error: None,
             final_message: None,
-            last_agent_message_id: None,
+            streamed_final_message: Default::default(),
+            completed_text_item_ids: HashSet::new(),
             output: Box::new(std::io::stdout()),
             output_error: None,
             emit_final_message_on_shutdown: false,
@@ -132,6 +135,7 @@ impl EventProcessorWithJsonOutput {
             return Usage::default();
         };
         Usage {
+            coverage: usage.total.coverage,
             input_tokens: usage.total.input_tokens,
             cached_input_tokens: usage.total.cached_input_tokens,
             output_tokens: usage.total.output_tokens,
@@ -156,6 +160,7 @@ impl EventProcessorWithJsonOutput {
                 }
                 _ => error.message,
             },
+            ..Default::default()
         }
     }
 
@@ -164,9 +169,13 @@ impl EventProcessorWithJsonOutput {
         make_id: impl FnOnce() -> String,
     ) -> Option<ExecThreadItem> {
         match item {
-            ThreadItem::AgentMessage { text, .. } => Some(ExecThreadItem {
+            ThreadItem::AgentMessage { text, phase, .. } => Some(ExecThreadItem {
                 id: make_id(),
-                details: ThreadItemDetails::AgentMessage(AgentMessageItem { text }),
+                details: ThreadItemDetails::AgentMessage(AgentMessageItem { text, phase }),
+            }),
+            ThreadItem::Plan { text, .. } => Some(ExecThreadItem {
+                id: make_id(),
+                details: ThreadItemDetails::Plan(crate::exec_events::PlanItem { text }),
             }),
             ThreadItem::Reasoning { summary, .. } => {
                 let text = summary.join("\n");
@@ -322,6 +331,7 @@ impl EventProcessorWithJsonOutput {
                             (
                                 thread_id,
                                 CollabAgentState {
+                                    stop_cause: state.stop_cause,
                                     status: match state.status {
                                         codex_app_server_protocol::CollabAgentStatus::PendingInit => {
                                             CollabAgentStatus::PendingInit
@@ -362,8 +372,10 @@ impl EventProcessorWithJsonOutput {
             ThreadItem::WebSearch(item) => Some(ExecThreadItem {
                 id: make_id(),
                 details: ThreadItemDetails::WebSearch(WebSearchItem {
-                    id: item.id,
+                    call_id: item.id,
                     query: item.query,
+                    status: item.status,
+                    error: item.error,
                     action: match item.action {
                         Some(AppServerWebSearchAction::Search { query, queries }) => {
                             WebSearchAction::Search { query, queries }
@@ -405,7 +417,9 @@ impl EventProcessorWithJsonOutput {
 
     fn map_started_item(&mut self, item: ThreadItem) -> Option<ExecThreadItem> {
         match item {
-            ThreadItem::AgentMessage { .. } | ThreadItem::Reasoning { .. } => None,
+            ThreadItem::AgentMessage { .. }
+            | ThreadItem::Plan { .. }
+            | ThreadItem::Reasoning { .. } => None,
             other => {
                 let raw_id = other.id().to_string();
                 Self::map_item_with_id(other, || self.started_item_id(&raw_id))
@@ -443,8 +457,7 @@ impl EventProcessorWithJsonOutput {
                     ThreadItemDetails::CodeModeCell(CodeModeCellItem {
                         status: CodeModeCellStatus::InProgress | CodeModeCellStatus::Yielded,
                         ..
-                    }) |
-                    ThreadItemDetails::CommandExecution(CommandExecutionItem {
+                    }) | ThreadItemDetails::CommandExecution(CommandExecutionItem {
                         status: ExecCommandExecutionStatus::InProgress,
                         ..
                     }) | ThreadItemDetails::FileChange(FileChangeItem {
@@ -505,13 +518,19 @@ impl EventProcessorWithJsonOutput {
                 },
             }));
         }
-        let error = ThreadErrorEvent { message };
+        let error = ThreadErrorEvent {
+            message,
+            ..Default::default()
+        };
         self.last_critical_error = Some(error.clone());
         events.push(ThreadEvent::Error(error.clone()));
         events.push(ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
             error,
             disposition: crate::exec_events::TurnFailureDisposition::TransportLost,
-            usage: self.last_total_token_usage.as_ref().map(|_| self.usage_from_last_total()),
+            usage: self
+                .last_total_token_usage
+                .as_ref()
+                .map(|_| self.usage_from_last_total()),
             timing: None,
         })));
         events
@@ -579,7 +598,9 @@ impl EventProcessorWithJsonOutput {
                 CodexStatus::Running
             }
             ServerNotification::ItemStarted(notification) => {
-                let already_started = self.raw_to_exec_item_id.contains_key(notification.item.id());
+                let already_started = self
+                    .raw_to_exec_item_id
+                    .contains_key(notification.item.id());
                 if let Some(item) = self.map_started_item(notification.item) {
                     if already_started {
                         events.push(ThreadEvent::ItemUpdated(ItemUpdatedEvent { item }));
@@ -590,14 +611,25 @@ impl EventProcessorWithJsonOutput {
                 CodexStatus::Running
             }
             ServerNotification::ItemCompleted(notification) => {
-                if let ThreadItem::AgentMessage { id, .. } = &notification.item {
-                    self.last_agent_message_id = Some(id.clone());
+                if matches!(
+                    &notification.item,
+                    ThreadItem::AgentMessage { .. } | ThreadItem::Plan { .. }
+                ) && !self
+                    .completed_text_item_ids
+                    .insert(notification.item.id().to_string())
+                {
+                    return CollectedThreadEvents {
+                        events,
+                        status: CodexStatus::Running,
+                    };
                 }
+                self.streamed_final_message.observe(&notification.item);
                 if let Some(item) = self.map_completed_item_mut(notification.item) {
-                    if let ThreadItemDetails::AgentMessage(AgentMessageItem { text }) =
-                        &item.details
-                    {
-                        self.final_message = Some(text.clone());
+                    if matches!(
+                        &item.details,
+                        ThreadItemDetails::AgentMessage(_) | ThreadItemDetails::Plan(_)
+                    ) {
+                        self.final_message = self.streamed_final_message.message();
                     }
                     events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }));
                 }
@@ -606,32 +638,36 @@ impl EventProcessorWithJsonOutput {
             ServerNotification::CommandExecutionOutputDelta(notification) => {
                 if let Some(item_id) = self.raw_to_exec_item_id.get(&notification.item_id) {
                     let (delta, truncated) = bounded_progress_text(notification.delta);
-                    events.push(ThreadEvent::ItemProgress(crate::exec_events::ItemProgressEvent {
-                        item_id: item_id.clone(),
-                        call_id: notification.item_id,
-                        progress: crate::exec_events::ItemProgress::CommandOutput {
-                            delta,
-                            stream: notification.stream,
-                            decoding_lossy: notification.decoding_lossy,
-                            truncated,
+                    events.push(ThreadEvent::ItemProgress(
+                        crate::exec_events::ItemProgressEvent {
+                            item_id: item_id.clone(),
+                            call_id: notification.item_id,
+                            progress: crate::exec_events::ItemProgress::CommandOutput {
+                                delta,
+                                stream: notification.stream,
+                                decoding_lossy: notification.decoding_lossy,
+                                truncated,
+                            },
                         },
-                    }));
+                    ));
                 }
                 CodexStatus::Running
             }
             ServerNotification::McpToolCallProgress(notification) => {
                 if let Some(item_id) = self.raw_to_exec_item_id.get(&notification.item_id) {
                     let (message, truncated) = bounded_progress_text(notification.message);
-                    events.push(ThreadEvent::ItemProgress(crate::exec_events::ItemProgressEvent {
-                        item_id: item_id.clone(),
-                        call_id: notification.item_id,
-                        progress: crate::exec_events::ItemProgress::Mcp {
-                            message,
-                            progress: notification.progress,
-                            total: notification.total,
-                            truncated,
+                    events.push(ThreadEvent::ItemProgress(
+                        crate::exec_events::ItemProgressEvent {
+                            item_id: item_id.clone(),
+                            call_id: notification.item_id,
+                            progress: crate::exec_events::ItemProgress::Mcp {
+                                message,
+                                progress: notification.progress,
+                                total: notification.total,
+                                truncated,
+                            },
                         },
-                    }));
+                    ));
                 }
                 CodexStatus::Running
             }
@@ -667,7 +703,10 @@ impl EventProcessorWithJsonOutput {
                 }
                 events.extend(self.reconcile_unfinished_started_items(&notification.turn.items));
                 if self.terminal_emitted {
-                    return CollectedThreadEvents { events, status: CodexStatus::InitiateShutdown };
+                    return CollectedThreadEvents {
+                        events,
+                        status: CodexStatus::InitiateShutdown,
+                    };
                 }
                 if notification.turn.status != TurnStatus::InProgress {
                     self.terminal_emitted = true;
@@ -675,35 +714,53 @@ impl EventProcessorWithJsonOutput {
                 let timing = notification.timing.or(notification.turn.timing);
                 match notification.turn.status {
                     TurnStatus::Completed => {
-                        if let Some(surfaced_result) = notification.surfaced_result.as_ref() {
-                            self.final_message = surfaced_result.canonical_message.clone();
-                        } else if let Some(final_message) =
-                            final_message_from_turn_items(notification.turn.items.as_slice())
+                        if let Some(surfaced_result) = notification
+                            .surfaced_result
+                            .as_ref()
+                            .or(notification.turn.surfaced_result.as_ref())
                         {
-                            self.final_message = Some(final_message);
-                            if let Some(ThreadItem::AgentMessage { id, text, .. }) = notification
+                            self.final_message = surfaced_result.canonical_message.clone();
+                        } else {
+                            for item in &notification.turn.items {
+                                self.streamed_final_message.observe(item);
+                            }
+                            self.final_message = if timing
+                                .as_ref()
+                                .is_some_and(|timing| timing.final_answer.is_some())
+                            {
+                                final_message_from_turn(
+                                    notification.turn.items.as_slice(),
+                                    timing.as_ref(),
+                                )
+                            } else {
+                                self.streamed_final_message.message()
+                            };
+                            if let Some(item) = notification
                                 .turn
                                 .items
                                 .iter()
                                 .rev()
-                                .find(|item| matches!(item, ThreadItem::AgentMessage { .. }))
-                                && self.last_agent_message_id.as_ref() != Some(id)
+                                .find(|item| matches!(item, ThreadItem::AgentMessage { text, phase, .. }
+                                    if *phase != Some(codex_protocol::models::MessagePhase::Commentary)
+                                        && Some(text) == self.final_message.as_ref()))
+                                .or_else(|| notification.turn.items.iter().rev()
+                                    .find(|item| matches!(item, ThreadItem::Plan { text, .. }
+                                        if Some(text) == self.final_message.as_ref())))
+                                && self.completed_text_item_ids.insert(item.id().to_string())
+                                && let Some(item) = Self::map_item_with_id(item.clone(), || self.next_item_id())
                             {
-                                events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
-                                    item: ExecThreadItem {
-                                        id: self.next_item_id(),
-                                        details: ThreadItemDetails::AgentMessage(
-                                            AgentMessageItem { text: text.clone() },
-                                        ),
-                                    },
-                                }));
-                                self.last_agent_message_id = Some(id.clone());
+                                events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }));
                             }
                         }
                         self.emit_final_message_on_shutdown = true;
                         events.push(ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
-                            usage: self.usage_from_last_total(),
-                            surfaced_result: notification.surfaced_result,
+                            usage: self
+                                .last_total_token_usage
+                                .as_ref()
+                                .map(|_| self.usage_from_last_total()),
+                            surfaced_result: notification
+                                .surfaced_result
+                                .or(notification.turn.surfaced_result),
                             timing,
                         })));
                         CodexStatus::InitiateShutdown
@@ -718,11 +775,15 @@ impl EventProcessorWithJsonOutput {
                             .or_else(|| self.last_critical_error.clone())
                             .unwrap_or_else(|| ThreadErrorEvent {
                                 message: "turn failed".to_string(),
+                                ..Default::default()
                             });
                         events.push(ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                             error,
                             disposition: crate::exec_events::TurnFailureDisposition::Failed,
-                            usage: self.last_total_token_usage.as_ref().map(|_| self.usage_from_last_total()),
+                            usage: self
+                                .last_total_token_usage
+                                .as_ref()
+                                .map(|_| self.usage_from_last_total()),
                             timing,
                         })));
                         CodexStatus::InitiateShutdown
@@ -737,11 +798,15 @@ impl EventProcessorWithJsonOutput {
                             .or_else(|| self.last_critical_error.clone())
                             .unwrap_or_else(|| ThreadErrorEvent {
                                 message: "turn interrupted".to_string(),
+                                ..Default::default()
                             });
                         events.push(ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                             error,
                             disposition: crate::exec_events::TurnFailureDisposition::Interrupted,
-                            usage: self.last_total_token_usage.as_ref().map(|_| self.usage_from_last_total()),
+                            usage: self
+                                .last_total_token_usage
+                                .as_ref()
+                                .map(|_| self.usage_from_last_total()),
                             timing,
                         })));
                         CodexStatus::InitiateShutdown
@@ -779,6 +844,8 @@ impl EventProcessorWithJsonOutput {
             ServerNotification::TurnStarted(_) => {
                 self.terminal_emitted = false;
                 self.last_critical_error = None;
+                self.streamed_final_message = Default::default();
+                self.final_message = None;
                 events.push(ThreadEvent::TurnStarted(TurnStartedEvent {}));
                 CodexStatus::Running
             }
@@ -822,6 +889,12 @@ impl EventProcessor for EventProcessorWithJsonOutput {
         for event in collected.events {
             self.emit(event);
         }
+        if self.output_error.is_some() {
+            // A failed stdout delivery stays authoritative: a later turn
+            // completion must not re-arm the last message from undelivered items.
+            self.final_message = None;
+            self.emit_final_message_on_shutdown = false;
+        }
         collected.status
     }
 
@@ -849,6 +922,14 @@ impl EventProcessor for EventProcessorWithJsonOutput {
             handle_last_message(self.final_message.as_deref(), path)?;
         }
         Ok(())
+    }
+
+    fn process_invocation_error(&mut self, message: String) {
+        self.emit(ThreadEvent::Error(ThreadErrorEvent {
+            message,
+            code: Some("session_persistence_unconfirmed".to_string()),
+            phase: Some("finalization".to_string()),
+        }));
     }
 }
 

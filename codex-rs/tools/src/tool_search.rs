@@ -86,7 +86,11 @@ impl ToolSearchInfo {
         output: Arc<LoadableToolSpec>,
         source_info: Option<ToolSearchSourceInfo>,
     ) -> Self {
-        let tool_names = output.callable_tool_names().into_iter().map(|name| name.name).collect();
+        let tool_names = output
+            .callable_tool_names()
+            .into_iter()
+            .map(|name| name.name)
+            .collect();
         match output.as_ref() {
             LoadableToolSpec::Function(tool) => append_output_search_text(tool, &mut search_text),
             LoadableToolSpec::Namespace(namespace) => {
@@ -96,7 +100,13 @@ impl ToolSearchInfo {
             }
         }
         Self {
-            entry: ToolSearchEntry { search_text, callable_title: None, tool_names, output, normalize_on_selection: true },
+            entry: ToolSearchEntry {
+                search_text,
+                callable_title: None,
+                tool_names,
+                output,
+                normalize_on_selection: true,
+            },
             source_info,
         }
     }
@@ -187,9 +197,10 @@ fn default_tool_search_text(spec: &ToolSpec) -> String {
         ToolSpec::Namespace(namespace) => {
             for tool in &namespace.tools {
                 let ResponsesApiNamespaceTool::Function(tool) = tool;
-                push_search_part(&mut parts, &namespace_member_search_text(
-                    &namespace.name, &namespace.description, tool,
-                ));
+                push_search_part(
+                    &mut parts,
+                    &namespace_member_search_text(&namespace.name, &namespace.description, tool),
+                );
             }
         }
         ToolSpec::ToolSearch { description, .. } => {
@@ -216,9 +227,10 @@ pub fn namespace_member_search_text(
     let mut parts = String::new();
     push_search_part(&mut parts, namespace);
     push_search_part(&mut parts, description);
-    push_search_part(&mut parts, &code_mode_name_for_tool_name(&crate::ToolName::namespaced(
-        namespace, tool.name.clone(),
-    )));
+    push_search_part(
+        &mut parts,
+        &code_mode_name_for_tool_name(&crate::ToolName::namespaced(namespace, tool.name.clone())),
+    );
     append_function_search_text(tool, &mut parts, false);
     parts
 }
@@ -245,15 +257,17 @@ fn append_description(description: &str, parts: &mut String, activation: bool) {
 fn append_activation_description(description: &str, parts: &mut String) {
     // Most descriptions contain no exclusion/routing cue. Check byte prefixes
     // without allocating, lowercasing Unicode, or splitting those descriptions.
-    if !description.as_bytes().windows(3).any(|word| {
-        match word[0].to_ascii_lowercase() {
+    if !description
+        .as_bytes()
+        .windows(3)
+        .any(|word| match word[0].to_ascii_lowercase() {
             b'c' => word.eq_ignore_ascii_case(b"can"),
             b'd' => word.eq_ignore_ascii_case(b"don") || word.eq_ignore_ascii_case(b"doe"),
             b'n' => word.eq_ignore_ascii_case(b"nev") || word.eq_ignore_ascii_case(b"not"),
             b'i' => word.eq_ignore_ascii_case(b"ins"),
             _ => false,
-        }
-    }) {
+        })
+    {
         push_search_part(parts, description);
         return;
     }
@@ -275,27 +289,41 @@ fn append_activation_description(description: &str, parts: &mut String) {
                     offset += piece.len();
                     continue;
                 }
-                if first.is_empty() { first = word; }
+                if first.is_empty() {
+                    first = word;
+                }
                 let negative = match word.as_bytes()[0].to_ascii_lowercase() {
-                    b'c' => word.eq_ignore_ascii_case("cannot") || word.eq_ignore_ascii_case("can't"),
-                    b'd' => word.eq_ignore_ascii_case("doesn't") || word.eq_ignore_ascii_case("don't"),
+                    b'c' => {
+                        word.eq_ignore_ascii_case("cannot") || word.eq_ignore_ascii_case("can't")
+                    }
+                    b'd' => {
+                        word.eq_ignore_ascii_case("doesn't") || word.eq_ignore_ascii_case("don't")
+                    }
                     b'n' => word.eq_ignore_ascii_case("never"),
                     _ => false,
                 };
                 let pair = word.eq_ignore_ascii_case("not")
-                    && (previous.0.eq_ignore_ascii_case("do") || previous.0.eq_ignore_ascii_case("does"));
+                    && (previous.0.eq_ignore_ascii_case("do")
+                        || previous.0.eq_ignore_ascii_case("does"));
                 // "Does not only read ..." and "doesn't only read ..." affirm
                 // the capability; they do not prohibit it.
-                let not_only = (pair || word.eq_ignore_ascii_case("doesn't")
+                let not_only = (pair
+                    || word.eq_ignore_ascii_case("doesn't")
                     || word.eq_ignore_ascii_case("don't"))
-                    && clause[offset + piece.len()..].split_whitespace().next()
+                    && clause[offset + piece.len()..]
+                        .split_whitespace()
+                        .next()
                         .is_some_and(|next| next.eq_ignore_ascii_case("only"));
                 if cutoff == clause.len() && (negative || pair) && !not_only {
                     cutoff = if pair { previous.1 } else { offset };
                 }
                 if (first.eq_ignore_ascii_case("to") || first.eq_ignore_ascii_case("use"))
-                    && word.trim_end_matches(['.', ';']).eq_ignore_ascii_case("instead") {
-                    cutoff = positive_start; break;
+                    && word
+                        .trim_end_matches(['.', ';'])
+                        .eq_ignore_ascii_case("instead")
+                {
+                    cutoff = positive_start;
+                    break;
                 }
                 previous = (word, offset);
             }
@@ -306,15 +334,23 @@ fn append_activation_description(description: &str, parts: &mut String) {
 }
 
 fn append_output_search_text(tool: &ResponsesApiTool, parts: &mut String) {
-    let Some(schema) = &tool.output_schema else { return; };
+    let Some(schema) = &tool.output_schema else {
+        return;
+    };
     let start = parts.len();
     for name in schema.search_field_names().take(64) {
         // No descriptions, literals, recursive refs, or unbounded field names.
-        if name.len() > 256 { continue; }
+        if name.len() > 256 {
+            continue;
+        }
         let words = identifier_search_words(name);
-        if parts.len() - start + name.len() + words.len() + 2 > 2048 { break; }
+        if parts.len() - start + name.len() + words.len() + 2 > 2048 {
+            break;
+        }
         push_search_part(parts, name);
-        if words != name { push_search_part(parts, &words); }
+        if words != name {
+            push_search_part(parts, &words);
+        }
     }
 }
 
@@ -330,10 +366,13 @@ pub fn identifier_search_words(identifier: &str) -> String {
             continue;
         }
         let previous = index.checked_sub(1).map(|index| chars[index]);
-        let boundary = ch.is_uppercase() && previous.is_some_and(|previous| {
-            previous.is_lowercase() || previous.is_numeric()
-                || (previous.is_uppercase() && chars.get(index + 1).is_some_and(|next| next.is_lowercase()))
-        });
+        let boundary = ch.is_uppercase()
+            && previous.is_some_and(|previous| {
+                previous.is_lowercase()
+                    || previous.is_numeric()
+                    || (previous.is_uppercase()
+                        && chars.get(index + 1).is_some_and(|next| next.is_lowercase()))
+            });
         if boundary && !words.ends_with(' ') {
             words.push(' ');
         }
@@ -408,9 +447,14 @@ fn append_schema_search_text(schema: &JsonSchema, parts: &mut String, activation
 fn append_schema_identifier(parts: &mut String, name: &str) {
     push_search_part(parts, name);
     // Ordinary lowercase names already tokenize correctly; avoid duplicate text.
-    if name.bytes().any(|byte| byte == b'_' || byte.is_ascii_uppercase()) {
+    if name
+        .bytes()
+        .any(|byte| byte == b'_' || byte.is_ascii_uppercase())
+    {
         let words = identifier_search_words(name);
-        if words != name { push_search_part(parts, &words); }
+        if words != name {
+            push_search_part(parts, &words);
+        }
     }
 }
 

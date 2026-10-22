@@ -112,6 +112,7 @@ fn attach_connection_cancellation(
 #[derive(Clone)]
 pub(crate) struct CommandExecManager {
     sessions: Arc<Mutex<HashMap<ConnectionProcessId, CommandExecSession>>>,
+    run_tasks: tokio_util::task::TaskTracker,
     next_generated_process_id: Arc<AtomicI64>,
 }
 
@@ -119,6 +120,7 @@ impl Default for CommandExecManager {
     fn default() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            run_tasks: tokio_util::task::TaskTracker::new(),
             next_generated_process_id: Arc::new(AtomicI64::new(1)),
         }
     }
@@ -199,6 +201,13 @@ struct SpawnProcessOutputParams {
     output_bytes_cap: Option<usize>,
 }
 
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    cap_reached: bool,
+    drain_timed_out: bool,
+    reached_eof: bool,
+}
+
 #[derive(Clone)]
 struct OutputDeliveryRelay {
     tx: mpsc::Sender<QueuedOutputDelivery>,
@@ -264,6 +273,11 @@ impl CommandExecManager {
             size,
         } = params;
         let connection_cancellation = rpc_gate.cancellation_token().child_token();
+        // Register before spawning, under the connection's admission fence.
+        // The token follows the run owner through child exit, output and reply.
+        let run_owner = rpc_gate
+            .try_commit(|| self.run_tasks.token())
+            .ok_or_else(|| invalid_request("connection is closed"))?;
         if process_id.is_none() && (tty || stream_stdin || stream_stdout_stderr) {
             return Err(invalid_request(
                 "command/exec tty or streaming requires a client-supplied processId",
@@ -316,6 +330,7 @@ impl CommandExecManager {
             let mut exec_request = exec_request;
             attach_connection_cancellation(&mut exec_request, connection_cancellation.clone());
             tokio::spawn(async move {
+                let _run_owner = run_owner;
                 let _started_network_proxy = started_network_proxy;
                 let (delivery_relay, delivery_handle) = if stream_stdout_stderr {
                     let (relay, handle) = spawn_output_delivery_relay(
@@ -331,7 +346,7 @@ impl CommandExecManager {
                     InternalProcessId::Generated(_) => None,
                     InternalProcessId::Client(id) => Some(id.clone()),
                 };
-                let (stdout_stream, event_relay_handle) =
+                let (stdout_stream, event_relay_handle, first_hop_recovery) =
                     match (delivery_relay.clone(), notification_process_id) {
                         (Some(delivery_relay), Some(process_id)) => {
                             let (tx_event, rx_event) =
@@ -382,16 +397,17 @@ impl CommandExecManager {
                                 }
                                 undelivered
                             });
-                            (
-                                Some(StdoutStream::without_progress(
-                                    String::new(),
-                                    String::new(),
-                                    tx_event,
-                                )),
-                                Some(handle),
-                            )
+                            let (stream, recovery) = StdoutStream::with_delivery_recovery(
+                                String::new(),
+                                String::new(),
+                                tx_event,
+                                output_bytes_cap
+                                    .unwrap_or(DEFAULT_OUTPUT_BYTES_CAP)
+                                    .min(DEFAULT_OUTPUT_BYTES_CAP),
+                            );
+                            (Some(stream), Some(handle), Some(recovery))
                         }
-                        _ => (None, None),
+                        _ => (None, None, None),
                     };
                 let output = codex_core::sandboxing::execute_env(exec_request, stdout_stream).await;
                 let event_fallback = if let Some(handle) = event_relay_handle {
@@ -408,6 +424,10 @@ impl CommandExecManager {
                 sessions.lock().await.remove(&process_key);
                 let undelivered = match undelivered.and_then(|mut output| {
                     output.append_tail(event_fallback?);
+                    if let Some(recovery) = first_hop_recovery {
+                        let (stdout, stderr) = recovery.take_suffix();
+                        output.append_tail(UndeliveredOutput { stdout, stderr });
+                    }
                     Ok(output)
                 }) {
                     Ok(output) => output,
@@ -428,6 +448,15 @@ impl CommandExecManager {
                                 request_id,
                                 CommandExecResponse {
                                     exit_code: output.exit_code,
+                                    stdout_base64: (stream_stdout_stderr
+                                        && !undelivered.stdout.is_empty())
+                                    .then(|| STANDARD.encode(&undelivered.stdout)),
+                                    stderr_base64: (stream_stdout_stderr
+                                        && !undelivered.stderr.is_empty())
+                                    .then(|| STANDARD.encode(&undelivered.stderr)),
+                                    // This legacy sandbox backend has no per-stream EOF receipt.
+                                    stdout_capture: None,
+                                    stderr_capture: None,
                                     stdout: if stream_stdout_stderr {
                                         bytes_to_string_smart(&undelivered.stdout)
                                     } else {
@@ -528,6 +557,7 @@ impl CommandExecManager {
             }
         };
         tokio::spawn(async move {
+            let _run_owner = run_owner;
             let _started_network_proxy = started_network_proxy;
             run_command(RunCommandParams {
                 outgoing,
@@ -706,6 +736,11 @@ impl CommandExecManager {
         }
     }
 
+    pub(crate) async fn drain_run_tasks(&self) {
+        self.run_tasks.close();
+        self.run_tasks.wait().await;
+    }
+
     async fn send_control(
         &self,
         process_id: ConnectionProcessId,
@@ -857,6 +892,23 @@ async fn run_command(params: RunCommandParams) {
 
     let stdout = stdout_handle.await;
     let stderr = stderr_handle.await;
+    let native_capture = session.output_capture();
+    let stdout_capture =
+        stdout.as_ref().ok().map(
+            |output| codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: output.reached_eof && native_capture.stdout_complete(),
+                cap_reached: output.cap_reached,
+                drain_timed_out: output.drain_timed_out,
+            },
+        );
+    let stderr_capture =
+        stderr.as_ref().ok().map(
+            |output| codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: output.reached_eof && native_capture.stderr_complete(),
+                cap_reached: output.cap_reached,
+                drain_timed_out: output.drain_timed_out,
+            },
+        );
     timeout_handle.abort();
     drop(delivery_relay);
     let undelivered = if let Some(delivery_handle) = delivery_handle {
@@ -871,8 +923,8 @@ async fn run_command(params: RunCommandParams) {
         // Relay failures precede chunks rejected by relay admission. Decode the
         // entire suffix once, including split UTF-8 codepoints.
         output.append_tail(UndeliveredOutput {
-            stdout: stdout?,
-            stderr: stderr?,
+            stdout: stdout?.bytes,
+            stderr: stderr?.bytes,
         });
         Ok(output)
     }) {
@@ -893,6 +945,12 @@ async fn run_command(params: RunCommandParams) {
             request_id,
             CommandExecResponse {
                 exit_code,
+                stdout_base64: (stream_stdout_stderr && !undelivered.stdout.is_empty())
+                    .then(|| STANDARD.encode(&undelivered.stdout)),
+                stderr_base64: (stream_stdout_stderr && !undelivered.stderr.is_empty())
+                    .then(|| STANDARD.encode(&undelivered.stderr)),
+                stdout_capture,
+                stderr_capture,
                 stdout: bytes_to_string_smart(&undelivered.stdout),
                 stderr: bytes_to_string_smart(&undelivered.stderr),
             },
@@ -975,7 +1033,9 @@ fn accounted_output_delivery_bytes(delta_base64: &str, process_id: &str) -> usiz
         .saturating_add(OUTPUT_DELIVERY_EVENT_OVERHEAD_BYTES)
 }
 
-fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHandle<Vec<u8>> {
+fn spawn_process_output(
+    params: SpawnProcessOutputParams,
+) -> tokio::task::JoinHandle<CapturedOutput> {
     let SpawnProcessOutputParams {
         process_id,
         mut output_rx,
@@ -988,13 +1048,25 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
         let mut cap = OutputByteCap::new(output_bytes_cap);
+        let mut drain_timed_out = false;
+        // Every loop exit decides whether the pipe reached EOF.
+        let reached_eof;
         loop {
+            if *stdio_timeout_rx.borrow() {
+                reached_eof = output_rx.is_closed() && output_rx.is_empty();
+                drain_timed_out = !reached_eof;
+                break;
+            }
             let mut chunk = tokio::select! {
                 chunk = output_rx.recv() => match chunk {
                     Some(chunk) => chunk,
-                    None => break,
+                    None => { reached_eof = true; break; },
                 },
-                _ = stdio_timeout_rx.wait_for(|&v| v) => break,
+                _ = stdio_timeout_rx.wait_for(|&v| v) => {
+                    reached_eof = output_rx.is_closed() && output_rx.is_empty();
+                    drain_timed_out = !reached_eof;
+                    break;
+                },
             };
             // Individual chunks are at most 8KiB, so overshooting a bit is acceptable.
             while chunk.len() < OUTPUT_CHUNK_SIZE_HINT
@@ -1031,7 +1103,12 @@ fn spawn_process_output(params: SpawnProcessOutputParams) -> tokio::task::JoinHa
                 buffer.extend_from_slice(capped_chunk);
             }
         }
-        buffer
+        CapturedOutput {
+            bytes: buffer,
+            cap_reached: cap.truncated(),
+            drain_timed_out,
+            reached_eof,
+        }
     })
 }
 
@@ -1081,7 +1158,10 @@ async fn handle_process_write(
             .map_err(|_| invalid_request("stdin is already closed"))?;
     }
     if close_stdin {
-        session.close_stdin();
+        session
+            .close_stdin_ordered()
+            .await
+            .map_err(|error| invalid_request(error.to_string()))?;
     }
     Ok(())
 }
@@ -1248,11 +1328,95 @@ mod tests {
         let local_tail = collector
             .await
             .expect("collector finishes without delivery");
-        assert_eq!(local_tail, vec![0x82, 0xac, b'!', b'?']);
+        assert_eq!(local_tail.bytes, vec![0x82, 0xac, b'!', b'?']);
+        assert!(local_tail.cap_reached);
+        assert!(!local_tail.drain_timed_out);
         drop(relay);
         let undelivered = delivery_handle.await.expect("relay finishes");
         assert_eq!(undelivered.stdout, vec![0xe2]);
         assert!(undelivered.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn command_stream_prefix_and_fallback_keep_split_scalar_bytes() {
+        let bytes = "é€🙂".as_bytes();
+        for split in 1..bytes.len() {
+            let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
+            let outgoing = Arc::new(OutgoingMessageSender::new(
+                outgoing_tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            ));
+            let (relay, delivery) =
+                spawn_output_delivery_relay(outgoing, ConnectionId(31), CancellationToken::new());
+            let (output_tx, output_rx) = mpsc::channel(1);
+            let (_drain_tx, stdio_timeout_rx) = watch::channel(false);
+            let collector = spawn_process_output(SpawnProcessOutputParams {
+                process_id: Some("split".into()),
+                output_rx,
+                stdio_timeout_rx,
+                delivery_relay: Some(relay.clone()),
+                stream: CommandExecOutputStream::Stdout,
+                stream_output: true,
+                output_bytes_cap: None,
+            });
+            output_tx.send(bytes[..split].to_vec()).await.unwrap();
+            let OutgoingEnvelope::ToConnection {
+                message:
+                    OutgoingMessage::AppServerNotification(ServerNotification::CommandExecOutputDelta(
+                        delta,
+                    )),
+                ..
+            } = timeout(Duration::from_secs(1), outgoing_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("delivered prefix");
+            };
+            let mut received = STANDARD.decode(delta.delta_base64).unwrap();
+            relay.byte_budget.close(); // Reject only the later suffix.
+            output_tx.send(bytes[split..].to_vec()).await.unwrap();
+            drop(output_tx);
+            let capture = collector.await.unwrap();
+            drop(relay);
+            let undelivered = delivery.await.unwrap();
+            assert!(undelivered.stdout.is_empty());
+            received.extend(capture.bytes);
+            assert_eq!(received, bytes, "split {split}");
+            assert!(!capture.cap_reached);
+            assert!(!capture.drain_timed_out);
+        }
+    }
+
+    #[tokio::test]
+    async fn command_drain_timeout_keeps_its_distinct_disposition() {
+        for keep_open in [false, true] {
+            let (output_tx, output_rx) = mpsc::channel(1);
+            output_tx.send(b"prefix".to_vec()).await.unwrap();
+            let (drain_tx, stdio_timeout_rx) = watch::channel(false);
+            let collector = spawn_process_output(SpawnProcessOutputParams {
+                process_id: None,
+                output_rx,
+                stdio_timeout_rx,
+                delivery_relay: None,
+                stream: CommandExecOutputStream::Stdout,
+                stream_output: false,
+                output_bytes_cap: None,
+            });
+            drop(output_tx.reserve().await.unwrap());
+            if keep_open {
+                drain_tx.send_replace(true);
+            } else {
+                drop(output_tx);
+            }
+            let capture = timeout(Duration::from_secs(1), collector)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(capture.bytes, b"prefix");
+            assert_eq!(capture.drain_timed_out, keep_open);
+            assert!(!capture.cap_reached);
+        }
     }
 
     #[tokio::test]
@@ -1395,13 +1559,17 @@ mod tests {
         for (rows, cols) in [(0, 1), (1, 0), (0, 0)] {
             let error = terminal_size_from_protocol(PtyTerminalSize { rows, cols }, "process")
                 .expect_err("zero dimensions should be rejected");
-            assert_eq!(error, invalid_params("process size rows and cols must be greater than 0"));
+            assert_eq!(
+                error,
+                invalid_params("process size rows and cols must be greater than 0")
+            );
         }
     }
 
     #[tokio::test]
     async fn windows_sandbox_streaming_exec_failure_is_delivered_and_releases_process_id() {
         let (tx, mut rx) = mpsc::channel(1);
+        let blocked_reply = tx.clone().reserve_owned().await.unwrap();
         let temp = tempfile::tempdir().expect("temporary execution directory");
         let missing_cwd = temp.path().join("missing-working-directory");
         let mut exec_request = windows_sandbox_exec_request();
@@ -1430,6 +1598,12 @@ mod tests {
             })
             .await
             .expect("streaming sandbox request is admitted before execution");
+        let mut drain = Box::pin(manager.drain_run_tasks());
+        assert!(
+            futures::poll!(drain.as_mut()).is_pending(),
+            "accepted run ownership must include terminal reply admission"
+        );
+        drop(blocked_reply);
         let envelope = timeout(Duration::from_secs(10), rx.recv())
             .await
             .expect("failed execution must produce a terminal RPC reply")
@@ -1457,6 +1631,9 @@ mod tests {
             !missing_cwd.exists(),
             "failed execution must not create the requested cwd"
         );
+        timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("actual run and reply must settle before clean shutdown");
     }
 
     #[tokio::test]
@@ -1537,8 +1714,13 @@ mod tests {
             while writer_probe.strong_count() < 3 {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("stdin worker must block before termination is requested");
-        assert!(matches!(write_response_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        })
+        .await
+        .expect("stdin worker must block before termination is requested");
+        assert!(matches!(
+            write_response_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
         let (terminate_response_tx, terminate_response_rx) = oneshot::channel();
         control_tx
             .send(CommandControlRequest {

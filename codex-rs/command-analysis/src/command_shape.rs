@@ -434,13 +434,13 @@ pub fn powershell_script_failure_advisory(
         return None;
     }
     let looks_like_measure_object_failure = lower.contains("measure-object")
-        && (lower.contains("cannot bind")
-            || lower.contains("parameter")
-            || lower.contains("property")
-            || lower.contains("scriptblock"));
+        && lower.contains("cannot convert")
+        && lower.contains("scriptblock")
+        && lower.contains("system.string")
+        && lower.contains("property");
     if looks_like_measure_object_failure {
         return Some(
-            "Hint: PowerShell Measure-Object expects property names for -Property. For computed values, pipe numbers first, for example `... | ForEach-Object { <number> } | Measure-Object -Sum`; for real properties, use `Measure-Object -Property Count -Sum`.",
+            "Hint: this host could not convert the Measure-Object -Property ScriptBlock. Older PowerShell hosts require property names; pipe computed numbers first, for example `... | ForEach-Object { <number> } | Measure-Object -Sum`. Modern PowerShell supports ScriptBlock properties.",
         );
     }
 
@@ -464,4 +464,22 @@ pub fn powershell_script_failure_advisory(
         || lower.contains("parameter cannot be processed"))).then_some(
         "Hint: check PowerShell parameter binding and quoting; use script_body only when nested shell quoting changed the intended script.",
     )
+}
+
+#[cfg(test)]
+mod audit36_advice_regressions {
+    use super::*;
+
+    #[test]
+    fn unrelated_measure_object_binding_error_has_no_computed_property_workaround() {
+        assert_eq!(
+            powershell_script_failure_advisory(
+                Some(ShellType::PowerShell),
+                Some(1),
+                true,
+                "Measure-Object: A parameter cannot be found that matches parameter name 'Smu'.",
+            ),
+            None
+        );
+    }
 }

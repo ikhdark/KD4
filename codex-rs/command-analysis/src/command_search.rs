@@ -146,10 +146,7 @@ pub fn classify_rg_search_with_repository(
                     // Repository snapshots do not prove the effective default
                     // global Git excludes or ignores above the repository root.
                     // Nor can they prove the output of an external preprocessor.
-                    !roles.follows_links
-                        && roles.no_ignore_global
-                        && roles.no_ignore_parent
-                        && codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv)
+                    roles.unresolved_file_inputs(argv).is_empty()
                 }),
         },
     )))
@@ -354,8 +351,16 @@ fn hash_scope_path(
         // rg follows configuration links even without --follow. The source-tree
         // no-follow fingerprint cannot prove their effective rules unchanged.
         if path.file_name().is_some_and(|name| {
-            [".ignore", ".rgignore", ".gitignore", "exclude", "commondir", ".git"]
-                .iter().any(|candidate| name == *candidate)
+            [
+                ".ignore",
+                ".rgignore",
+                ".gitignore",
+                "exclude",
+                "commondir",
+                ".git",
+            ]
+            .iter()
+            .any(|candidate| name == *candidate)
         }) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -596,13 +601,34 @@ pub fn search_path_normalization_count() -> usize {
     SEARCH_PATH_NORMALIZATION_COUNT.with(std::cell::Cell::get)
 }
 
+#[derive(Debug)]
+pub struct RgSearchDependencies {
+    pub paths: Vec<PathBuf>,
+    pub unresolved_inputs: Vec<&'static str>,
+}
+
+impl RgSearchDependencies {
+    pub fn is_complete(&self) -> bool {
+        self.unresolved_inputs.is_empty()
+    }
+}
+
 /// Files affecting a search result, not merely the searched path operands.
 /// Keep option inputs and ancestor ignore rules in the same existing scope
 /// owner used by miss invalidation; preflight still consumes operands alone.
-pub fn rg_search_dependency_paths(argv: &[String], cwd: &Path) -> Option<Vec<PathBuf>> {
+pub fn rg_search_dependency_paths(argv: &[String], cwd: &Path) -> Option<RgSearchDependencies> {
     let roles = RgArgumentRoles::parse(argv);
+    // `None` means the invocation reads nothing. A stdin-capable search still
+    // reads files (without a readable stdin, rg walks the cwd), so it keeps
+    // its targets and reports stdin as an unresolved input instead.
     if !roles.searches {
         return None;
+    }
+    let mut unresolved_inputs = roles.unresolved_file_inputs(argv);
+    // History has no effective child environment. Require explicit opt-out of
+    // ambient RIPGREP_CONFIG_PATH rather than assuming the host's environment.
+    if !roles.no_config {
+        unresolved_inputs.push("ambient_ripgrep_configuration");
     }
     let targets = if roles.path_indices.is_empty() {
         vec![cwd.to_path_buf()]
@@ -626,14 +652,20 @@ pub fn rg_search_dependency_paths(argv: &[String], cwd: &Path) -> Option<Vec<Pat
         .cloned()
         .collect::<Vec<_>>();
     if directories.is_empty() {
-        return Some(targets.into_iter().chain(inputs).collect());
+        return Some(RgSearchDependencies {
+            paths: targets.into_iter().chain(inputs).collect(),
+            unresolved_inputs,
+        });
     }
     let root = codex_git_utils::get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let mut paths = search_state_paths(&directories, &inputs, &root);
     paths.extend(targets);
     paths.sort_unstable();
     paths.dedup();
-    Some(paths)
+    Some(RgSearchDependencies {
+        paths,
+        unresolved_inputs,
+    })
 }
 
 pub fn rg_search_path_operands(commands: &[Vec<String>]) -> Option<Vec<String>> {
@@ -735,6 +767,14 @@ pub fn missing_rg_path_advisory_with_cancellation(
     cancellation: CancellationToken,
 ) -> Option<String> {
     let mut budget = suggestion_budget(cancellation);
+    missing_rg_path_advisory_with_budget(output, cwd, &mut budget)
+}
+
+fn missing_rg_path_advisory_with_budget(
+    output: &str,
+    cwd: &Path,
+    budget: &mut SearchSnapshotBudget,
+) -> Option<String> {
     #[expect(
         clippy::expect_used,
         reason = "the fixed missing-path regex is valid and exercised by advisory tests"
@@ -761,7 +801,7 @@ pub fn missing_rg_path_advisory_with_cancellation(
             if missing.exists() {
                 return None;
             }
-            let suggestions = nearest_existing_paths_with_budget(&missing, cwd, &mut budget);
+            let suggestions = nearest_existing_paths_with_budget(&missing, cwd, budget);
             (!suggestions.is_empty()).then(|| {
                 let suggestions = suggestions
                     .iter()
@@ -945,11 +985,32 @@ struct RgArgumentRoles<'a> {
     follows_links: bool,
     no_ignore_global: bool,
     no_ignore_parent: bool,
+    no_config: bool,
     files_mode: bool,
     explicit_pattern: bool,
+    uses_stdin: bool,
 }
 
 impl<'a> RgArgumentRoles<'a> {
+    fn unresolved_file_inputs(&self, argv: &[String]) -> Vec<&'static str> {
+        let mut unresolved = Vec::new();
+        for (present, reason) in [
+            (self.uses_stdin, "stdin"),
+            (self.follows_links, "symlink_targets"),
+            (!self.no_ignore_global, "global_ignore_configuration"),
+            (!self.no_ignore_parent, "parent_ignore_files"),
+            (
+                !codex_shell_command::is_safe_command::is_known_safe_direct_argv(argv),
+                "unsupported_transform_or_options",
+            ),
+        ] {
+            if present {
+                unresolved.push(reason);
+            }
+        }
+        unresolved
+    }
+
     fn option(&mut self, flag: &str, value: Option<&'a str>) {
         match flag {
             "--hidden" => self.hidden = true,
@@ -973,12 +1034,17 @@ impl<'a> RgArgumentRoles<'a> {
             "--no-ignore-global" => self.no_ignore_global = true,
             "--ignore-global" => self.no_ignore_global = false,
             "--no-ignore-parent" => self.no_ignore_parent = true,
+            "--no-config" => self.no_config = true,
             "--ignore-parent" => self.no_ignore_parent = false,
             "--files" => self.files_mode = true,
             "-e" | "--regexp" => self.explicit_pattern = true,
             "-f" | "--file" | "--ignore-file" => {
                 self.explicit_pattern |= flag != "--ignore-file";
-                self.input_files.extend(value);
+                if flag != "--ignore-file" && value == Some("-") {
+                    self.uses_stdin = true;
+                } else {
+                    self.input_files.extend(value);
+                }
             }
             "-L" | "--follow" => self.follows_links = true,
             "-h" | "--help" | "-V" | "--version" | "--type-list" | "--pcre2-version"
@@ -997,8 +1063,10 @@ impl<'a> RgArgumentRoles<'a> {
             follows_links: false,
             no_ignore_global: false,
             no_ignore_parent: false,
+            no_config: false,
             files_mode: false,
             explicit_pattern: false,
+            uses_stdin: false,
         };
         let mut options_finished = false;
         let mut index = 1;
@@ -1040,6 +1108,16 @@ impl<'a> RgArgumentRoles<'a> {
         if !roles.files_mode && !roles.explicit_pattern && !roles.path_indices.is_empty() {
             roles.path_indices.remove(0);
         }
+        // With no explicit path, rg may select a readable stdin stream.
+        roles.uses_stdin |= !roles.files_mode && roles.path_indices.is_empty();
+        roles.path_indices.retain(|&index| {
+            if argv[index] == "-" {
+                roles.uses_stdin = true;
+                false
+            } else {
+                true
+            }
+        });
         roles
     }
 }
@@ -1062,9 +1140,19 @@ mod deadline_tests {
             for contents in ["data.txt\n", ""] {
                 std::fs::write(&rules, contents).unwrap();
                 let mut search = classify_rg_search_narrowing(
-                    &["rg".into(), "--no-ignore-global".into(), "--no-ignore-parent".into(), "needle".into(), ".".into()],
-                    None, &root, &root,
-                ).unwrap().unwrap();
+                    &[
+                        "rg".into(),
+                        "--no-ignore-global".into(),
+                        "--no-ignore-parent".into(),
+                        "needle".into(),
+                        ".".into(),
+                    ],
+                    None,
+                    &root,
+                    &root,
+                )
+                .unwrap()
+                .unwrap();
                 observe_rg_search_scope_state(&mut search).await;
                 assert!(search.scope_state_identity.is_none(), "{name}");
             }
@@ -1426,7 +1514,10 @@ mod missing_path_tests {
             "rg: codex-rs/justfile: No such file or directory (os error 2)\n",
             "rg: .github: The system cannot find the path specified. (os error 3)\n",
         );
-        let advisory = missing_rg_path_advisory(output, root.path()).expect("advisory");
+        let mut budget = suggestion_budget(CancellationToken::new());
+        budget.deadline = Instant::now() + Duration::from_secs(10);
+        let advisory = missing_rg_path_advisory_with_budget(output, root.path(), &mut budget)
+            .expect("advisory");
         for expected in [
             "`codex-rs/core/src/tools/spec.rs` -> `codex-rs/core/src/tools/spec_plan.rs`",
             "`codex-rs/core/src/tools/handlers/code_mode.rs` -> `codex-rs/core/src/tools/code_mode/`",
@@ -1447,5 +1538,79 @@ mod missing_path_tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod audit36_stdin_regressions {
+    use super::*;
+
+    #[test]
+    fn live_search_and_pattern_streams_are_never_negative_cache_eligible() {
+        let root = tempfile::tempdir().unwrap();
+        for (args, eligible) in [
+            (vec!["needle", "-"], false),
+            (vec!["needle"], false),
+            (vec!["-f", "-", "input.txt"], false),
+            (vec!["-nf-", "input.txt"], false),
+            (vec!["--file=-", "input.txt"], false),
+            (vec!["--regexp", "needle", "--", "-"], false),
+            (vec!["--regexp", "-", "input.txt"], true),
+            (vec!["needle", "./-"], true),
+            (vec!["-f", "patterns.txt", "input.txt"], true),
+        ] {
+            let argv = [
+                "rg",
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
+            ]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            let search = classify_rg_search_narrowing(&argv, None, root.path(), root.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(search.can_record_miss, eligible, "{args:?}");
+            if !eligible {
+                assert!(
+                    !search
+                        .state_paths
+                        .iter()
+                        .any(|path| path == &root.path().join("-"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_capable_searches_keep_their_file_scope_without_claiming_closure() {
+        // History treats `None` as "reads nothing"; a search that may read
+        // stdin still walks or reads files and must stay incomplete.
+        let root = tempfile::tempdir().unwrap();
+        for (args, target) in [
+            (vec!["needle"], root.path().to_path_buf()),
+            (vec!["-f", "-", "input.txt"], root.path().join("input.txt")),
+        ] {
+            let argv = [
+                "rg",
+                "--no-config",
+                "--no-ignore-global",
+                "--no-ignore-parent",
+            ]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            let dependencies = rg_search_dependency_paths(&argv, root.path())
+                .unwrap_or_else(|| panic!("{args:?} reads files"));
+            assert!(dependencies.paths.contains(&target), "{args:?}");
+            assert!(
+                dependencies.unresolved_inputs.contains(&"stdin"),
+                "{args:?}"
+            );
+            assert!(!dependencies.is_complete(), "{args:?}");
+        }
     }
 }

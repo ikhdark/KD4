@@ -98,10 +98,12 @@ describe("Codex", () => {
       const secondRequest = requests[1];
       expect(secondRequest).toBeDefined();
       const payload = secondRequest!.json;
-      expect(payload.input.at(-1)).toEqual(expect.objectContaining({
-        role: "user",
-        content: [{ type: "input_text", text: "second input" }],
-      }));
+      expect(payload.input.at(-1)).toEqual(
+        expect.objectContaining({
+          role: "user",
+          content: [{ type: "input_text", text: "second input" }],
+        }),
+      );
 
       const assistantEntry = payload.input.find(
         (entry: { role: string }) => entry.role === "assistant",
@@ -155,10 +157,12 @@ describe("Codex", () => {
       const secondRequest = requests[1];
       expect(secondRequest).toBeDefined();
       const payload = secondRequest!.json;
-      expect(payload.input.at(-1)).toEqual(expect.objectContaining({
-        role: "user",
-        content: [{ type: "input_text", text: "second input" }],
-      }));
+      expect(payload.input.at(-1)).toEqual(
+        expect.objectContaining({
+          role: "user",
+          content: [{ type: "input_text", text: "second input" }],
+        }),
+      );
 
       const assistantEntry = payload.input.find(
         (entry: { role: string }) => entry.role === "assistant",
@@ -180,7 +184,8 @@ describe("Codex", () => {
       responseBodies: [
         sse(
           responseStarted("response_1"),
-          assistantMessage("Structured response", "item_1"),
+          // The final answer must satisfy the forwarded output schema.
+          assistantMessage(JSON.stringify({ answer: "Structured response" }), "item_1"),
           responseCompleted("response_1"),
         ),
       ],

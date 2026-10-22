@@ -57,7 +57,11 @@ async fn stream_stops_after_an_exact_block_boundary() -> Result<()> {
         chunks.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
         vec![BLOCK_SIZE, BLOCK_SIZE]
     );
-    assert!(chunks.iter().all(|chunk| chunk.iter().all(|byte| *byte == b'x')));
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk.iter().all(|byte| *byte == b'x'))
+    );
     Ok(())
 }
 
@@ -249,7 +253,7 @@ async fn open_enforces_the_per_connection_limit_and_close_releases_capacity() ->
         })
         .await
         .expect_err("opening beyond the limit should fail");
-    let ExecServerError::Server { code, message } = error else {
+    let ExecServerError::Server { code, message, .. } = error else {
         anyhow::bail!("expected server error, got {error:?}");
     };
     assert_eq!(
@@ -298,7 +302,7 @@ async fn open_rejects_handle_ids_longer_than_32_bytes() -> Result<()> {
         .await
         .expect_err("oversized handle ID should fail");
 
-    let ExecServerError::Server { code, message } = error else {
+    let ExecServerError::Server { code, message, .. } = error else {
         anyhow::bail!("expected server error, got {error:?}");
     };
     assert_eq!(

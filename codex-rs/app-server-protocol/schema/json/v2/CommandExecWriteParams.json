@@ -3,7 +3,7 @@
   "description": "Write stdin bytes to a running `command/exec` session, close stdin, or both.",
   "properties": {
     "closeStdin": {
-      "description": "Close stdin after writing `deltaBase64`, if present.",
+      "description": "Close input after queued bytes. Unix PTYs send canonical VEOF (including flushing a partial line); raw/disabled-VEOF terminals return an error. Terminal EOF is not a permanent pipe half-close.",
       "type": "boolean"
     },
     "deltaBase64": {

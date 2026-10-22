@@ -237,7 +237,10 @@ enabled = true
     for plugins in [&full, &hooks_only] {
         for (config_name, expected_error) in [
             ("disabled@test", None),
-            ("invalid", Some("invalid plugin key `invalid`; expected <plugin>@<marketplace>")),
+            (
+                "invalid",
+                Some("invalid plugin key `invalid`; expected <plugin>@<marketplace>"),
+            ),
             ("malformed@test", Some("missing or invalid plugin.json")),
             ("missing@test", Some("plugin is not installed")),
             ("warning@test", None),
@@ -278,7 +281,9 @@ async fn disabled_required_app_withholds_only_that_plugins_skills() {
         ("needs", r#"{"id":"connector_needed","required":true}"#),
         ("optional", r#"{"id":"connector_needed"}"#),
     ] {
-        let root = temp_dir.path().join(format!("plugins/cache/test/{name}/local"));
+        let root = temp_dir
+            .path()
+            .join(format!("plugins/cache/test/{name}/local"));
         write_file(
             &root.join(".codex-plugin/plugin.json"),
             &format!(r#"{{"name":"{name}"}}"#),
@@ -287,9 +292,13 @@ async fn disabled_required_app_withholds_only_that_plugins_skills() {
             &root.join("skills/example/SKILL.md"),
             "---\nname: example\ndescription: example skill\n---\n",
         );
-        write_file(&root.join(".app.json"), &format!(r#"{{"apps":{{"app":{app}}}}}"#));
+        write_file(
+            &root.join(".app.json"),
+            &format!(r#"{{"apps":{{"app":{app}}}}}"#),
+        );
     }
-    let plugins = "[plugins.\"needs@test\"]\nenabled = true\n\n[plugins.\"optional@test\"]\nenabled = true\n";
+    let plugins =
+        "[plugins.\"needs@test\"]\nenabled = true\n\n[plugins.\"optional@test\"]\nenabled = true\n";
     let store = PluginStore::new(temp_dir.path().to_path_buf());
     for (apps, needs_has_skills) in [
         ("", true),

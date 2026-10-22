@@ -186,6 +186,10 @@ impl CommandExecRequestProcessor {
             .await;
     }
 
+    pub(crate) async fn drain_run_tasks(&self) {
+        self.command_exec_manager.drain_run_tasks().await;
+    }
+
     fn require_local_environment(&self) -> Result<(), JSONRPCErrorError> {
         self.environment_manager
             .try_local_environment()

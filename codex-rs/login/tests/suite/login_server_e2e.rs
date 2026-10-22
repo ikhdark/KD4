@@ -116,7 +116,9 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     // A guessed success URL (including display flags) must not complete the login or
     // prevent the real callback from subsequently authenticating this same server.
     let early_success = client
-        .get(format!("http://127.0.0.1:{login_port}/success?codex_streamlined_login=true"))
+        .get(format!(
+            "http://127.0.0.1:{login_port}/success?codex_streamlined_login=true"
+        ))
         .send()
         .await?;
     let url = format!(
@@ -129,11 +131,31 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     assert_eq!(success_url.host_str(), Some("localhost"));
     assert_eq!(success_url.path(), "/success");
 
+    // Credential commit, not browser navigation, fixes the terminal outcome.
+    let callback_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.block_until_done_with_callback_result(),
+    )
+    .await??;
+    assert_eq!(client.get(&url).send().await?.status(), 200);
+    let authorization_exchanges = mock_issuer
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            url::form_urlencoded::parse(&request.body)
+                .any(|(key, value)| key == "grant_type" && value == "authorization_code")
+        })
+        .count();
+    assert_eq!(
+        authorization_exchanges, 1,
+        "replay must not exchange the single-use code twice"
+    );
     let success_resp = client.get(success_url).send().await?;
     assert!(success_resp.status().is_success());
 
     // Wait for server shutdown
-    let callback_result = server.block_until_done_with_callback_result().await?;
     assert!(
         !early_success.status().is_success(),
         "display parameters cannot authorize an unauthenticated success page"
@@ -156,6 +178,8 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
     assert_eq!(json["tokens"]["access_token"], "access-123");
     assert_eq!(json["tokens"]["refresh_token"], "refresh-123");
     assert_eq!(json["tokens"]["account_id"], chatgpt_account_id);
+    assert_eq!(json["oauth_context"]["issuer"], mock_issuer.uri());
+    assert_eq!(json["oauth_context"]["client_id"], codex_login::CLIENT_ID);
 
     Ok(())
 }
@@ -188,6 +212,40 @@ async fn success_page_without_callback_does_not_complete_login() -> Result<()> {
     assert!(!tmp.path().join("auth.json").exists());
     assert!(result.is_err(), "viewing the success page is not authentication");
     assert!(!response.status().is_success(), "unauthenticated success requests must be rejected");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cli_login_waits_for_local_success_page_before_exit() -> Result<()> {
+    require_network!();
+    let issuer = start_mock_issuer(WORKSPACE_ID_ALLOWED).await;
+    let home = tempdir()?;
+    let server = run_login_server(ServerOptions {
+        codex_home: home.path().to_path_buf(),
+        cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
+        client_id: codex_login::CLIENT_ID.to_string(),
+        issuer: issuer.uri(),
+        port: 0,
+        open_browser: false,
+        force_state: Some("cli-success-page".into()),
+        forced_chatgpt_workspace_id: None,
+        codex_streamlined_login: false,
+        login_success_page: LoginSuccessPage::Local,
+        auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+    })?;
+    let port = server.actual_port;
+    let mut completed = tokio::spawn(server.block_until_done());
+    let client = HttpClientBuilder::new().without_redirects().build_direct()?;
+    let response = client.get(format!(
+        "http://127.0.0.1:{port}/auth/callback?code=abc&state=cli-success-page"
+    )).send().await?;
+    assert_eq!(response.status(), 302);
+    let success_url = response.headers()["location"].to_str()?.to_string();
+    assert!(tokio::time::timeout(Duration::from_millis(100), &mut completed).await.is_err(),
+        "the CLI must keep its runtime alive until the local success page is served");
+    assert!(client.get(success_url).send().await?.status().is_success());
+    tokio::time::timeout(Duration::from_secs(2), completed).await???;
     Ok(())
 }
 
@@ -553,24 +611,14 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() -> Result<()> {
     require_network!();
-
-    match TcpListener::bind(("127.0.0.1", FALLBACK_LOGIN_PORT)) {
-        Ok(listener) => drop(listener),
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("Skipping test because 127.0.0.1:{FALLBACK_LOGIN_PORT} is already in use");
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    }
-
-    let default_port_listener = match TcpListener::bind(("127.0.0.1", DEFAULT_LOGIN_PORT)) {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("Skipping test because 127.0.0.1:{DEFAULT_LOGIN_PORT} is already in use");
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let _ports = core_test_support::login_port::LoginPortLease::acquire().await?;
+    // External listeners do not honor the fixture lease. Fail setup rather than
+    // certifying fallback behavior without reaching its assertions.
+    drop(TcpListener::bind(("127.0.0.1", FALLBACK_LOGIN_PORT)).map_err(|err| {
+        anyhow::anyhow!("OAuth fallback behavior unverified: port {FALLBACK_LOGIN_PORT}: {err}")
+    })?);
+    let default_port_listener = TcpListener::bind(("127.0.0.1", DEFAULT_LOGIN_PORT))
+        .map_err(|err| anyhow::anyhow!("OAuth fallback behavior unverified: port {DEFAULT_LOGIN_PORT}: {err}"))?;
     let default_port_server =
         Arc::new(tiny_http::Server::from_listener(default_port_listener, None).unwrap());
     let default_port_server_handle = {

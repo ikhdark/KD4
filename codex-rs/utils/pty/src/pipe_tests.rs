@@ -17,6 +17,8 @@ use winapi::um::winnt::SYNCHRONIZE;
 #[tokio::test(flavor = "current_thread")]
 async fn pipe_setup_native_assignment_failure_reaps_child_before_returning_error()
 -> anyhow::Result<()> {
+    use crate::process_observation::ProcessObservationContext;
+    use crate::process_observation::ProcessStartRecorder;
     let mut managed = ManagedRootProcess::reserve()?;
     managed.restrict_job_to_query_access_for_test()?;
     let mut command = tokio::process::Command::new("cmd.exe");
@@ -28,6 +30,7 @@ async fn pipe_setup_native_assignment_failure_reaps_child_before_returning_error
         .creation_flags(WINDOWS_CREATE_SUSPENDED)
         .kill_on_drop(true);
     let child = command.spawn()?;
+    let child_pid = child.id();
     let process =
         unsafe { BorrowedHandle::borrow_raw(child.raw_handle().unwrap()) }.try_clone_to_owned()?;
     assert_eq!(
@@ -37,11 +40,13 @@ async fn pipe_setup_native_assignment_failure_reaps_child_before_returning_error
 
     // This is the normal setup boundary called immediately after public pipe creation.
     // Only its native Job resource has reduced rights; child, assignment, kill and wait are real.
-    let result = tokio::time::timeout(
-        Duration::from_secs(8),
-        finish_pipe_process_setup(child, managed),
-    )
-    .await?;
+    let recorder = Arc::new(ProcessStartRecorder::default());
+    let result = ProcessObservationContext::new(Arc::clone(&recorder), "attach-failure".into())
+        .scope(tokio::time::timeout(
+            Duration::from_secs(8),
+            finish_pipe_process_setup(child, managed),
+        ))
+        .await?;
     let error = match result {
         Ok(_) => anyhow::bail!("query-only Job unexpectedly admitted the pipe process"),
         Err(error) => error,
@@ -58,6 +63,13 @@ async fn pipe_setup_native_assignment_failure_reaps_child_before_returning_error
         unsafe { WaitForSingleObject(process.as_raw_handle() as _, 0) },
         WAIT_OBJECT_0,
         "normal setup must confirm native exit before returning its assignment error",
+    );
+    let observations = recorder.snapshot();
+    assert_eq!(observations.requested_root_starts_observed, 1);
+    assert_eq!(observations.roots[0].os_pid, child_pid);
+    assert_eq!(
+        observations.roots[0].cleanup_observation.as_deref(),
+        Some("attach_failed_cleanup_completed")
     );
     Ok(())
 }
@@ -223,7 +235,11 @@ fn pipe_root_fallback_does_not_hide_tree_termination_failure() -> anyhow::Result
     let error = terminator
         .kill()
         .expect_err("root kill cannot prove tree cleanup");
-    assert!(error.to_string().contains("root process fallback succeeded"));
+    assert!(
+        error
+            .to_string()
+            .contains("root process fallback succeeded")
+    );
     // SAFETY: child owns this process handle for the bounded native wait.
     assert_eq!(
         unsafe { WaitForSingleObject(child.as_raw_handle() as _, 5_000) },

@@ -15,7 +15,7 @@ use chrono::Datelike;
 use chrono::Local;
 use chrono::Utc;
 use codex_async_utils::CancelErr;
-use codex_http_client::RetryAfter;
+use codex_network_types::RetryAfter;
 use http::StatusCode;
 use serde_json;
 use std::io;
@@ -213,9 +213,16 @@ impl CodexErr {
 
     /// Prefer the original HTTP deadline over later provider-body advice.
     pub fn with_retry_after(mut self, advice: Option<RetryAfter>) -> Self {
-        if let Self::TerminalResponse { source, response_id, token_usage } = self {
+        if let Self::TerminalResponse {
+            source,
+            response_id,
+            token_usage,
+        } = self
+        {
             return Self::TerminalResponse {
-                source: Box::new(source.with_retry_after(advice)), response_id, token_usage,
+                source: Box::new(source.with_retry_after(advice)),
+                response_id,
+                token_usage,
             };
         }
         let slot = match &mut self {

@@ -390,18 +390,19 @@ async fn source_paging_advice_excludes_transformations_and_unpaged_reads() {
         )
         .await
         .unwrap();
+        assert_eq!(outcome.invocation, invocation);
         assert_eq!(
-            source_paging_advisory(&outcome.validation_invocations, Some(ShellType::PowerShell)),
+            source_paging_advisory(&command, Some(ShellType::PowerShell)),
             None,
             "{script}"
         );
     }
-    let stages = [CommandInvocation::Argv {
-        program: "Get-Content".into(),
-        args: strings(&["source.rs", "-Head", "3"]),
-    }];
-    assert_eq!(source_paging_advisory(&stages, Some(ShellType::Bash)), None);
-    assert_eq!(source_paging_advisory(&stages, None), None);
+    let command = strings(&["Get-Content", "source.rs", "-Head", "3"]);
+    assert_eq!(
+        source_paging_advisory(&command, Some(ShellType::Bash)),
+        None
+    );
+    assert_eq!(source_paging_advisory(&command, None), None);
 }
 
 #[cfg(windows)]
@@ -806,7 +807,10 @@ async fn linked_ignore_changes_search_results_without_reusable_miss_evidence() {
             let mut search = classify_rg_search_narrowing(&command, None, &root, &root)
                 .unwrap()
                 .unwrap();
-            assert!(search.can_record_miss, "the fixture must exercise scope capture");
+            assert!(
+                search.can_record_miss,
+                "the fixture must exercise scope capture"
+            );
             crate::command_search::observe_rg_search_scope_state(&mut search).await;
             assert_eq!(search.scope_state_identity, None, "{name}");
         }
@@ -1407,8 +1411,8 @@ fn arguments_after_double_dash_are_not_linted_or_repaired() {
 #[test]
 fn never_repairs_mutating_command_flag_typos() {
     let invocation = CommandInvocation::Argv {
-        program: "git".to_string(),
-        args: strings(&["--worktree", "status"]),
+        program: "cargo".to_string(),
+        args: strings(&["--pakage", "example", "test"]),
     };
     let issue = preflight_invocation_with_equivalent_repair_detailed(
         &invocation,
@@ -1421,8 +1425,8 @@ fn never_repairs_mutating_command_flag_typos() {
     assert_eq!(
         issue.retry,
         Some(CommandPreflightRetry::Argv {
-            program: "git".to_string(),
-            args: strings(&["--work-tree", "status"]),
+            program: "cargo".to_string(),
+            args: strings(&["--package", "example", "test"]),
         })
     );
 }
@@ -1512,6 +1516,7 @@ fn recurse_typo_advice_is_limited_to_cmdlets_that_support_recurse() {
     assert!(error.contains("-Recurse"));
 }
 
+#[cfg(windows)]
 #[test]
 fn rejects_bare_rg_path_globs_but_preserves_patterns_and_glob_options() {
     for glob in ["*.rs", "?file.rs"] {
@@ -1528,6 +1533,7 @@ fn rejects_bare_rg_path_globs_but_preserves_patterns_and_glob_options() {
     }
 }
 
+#[cfg(windows)]
 #[test]
 fn rg_glob_preflight_uses_search_argument_roles() {
     for args in [
@@ -1763,6 +1769,7 @@ async fn kd4_runtime_off_preserves_command_without_repair() {
     assert!(enabled.repaired());
 }
 
+#[cfg(windows)]
 #[test]
 fn rejects_rg_literal_glob_path_for_direct_argv() {
     let issue = preflight_command_issue(
@@ -1829,13 +1836,16 @@ fn rg_literal_glob_path_in_a_script_runs_with_an_advisory() {
         program: "rg".to_string(),
         args: strings(&["-n", "TODO", "src/runner*"]),
     };
-    let error = preflight_invocation_with_equivalent_repair(
+    let result = preflight_invocation_with_equivalent_repair(
         &argv,
         &argv.to_direct_argv().unwrap(),
         /*shell_type*/ None,
-    )
-    .expect_err("direct argv is a single command and is still rejected");
-    assert!(error.contains("rg_literal_glob_path"), "{error}");
+    );
+    if cfg!(windows) {
+        assert!(result.unwrap_err().contains("rg_literal_glob_path"));
+    } else {
+        assert_eq!(result.unwrap().invocation, argv);
+    }
 }
 
 #[test]
@@ -1900,7 +1910,7 @@ fn accepts_rg_literal_glob_path_in_posix_script() {
 
 #[test]
 fn powershell_cmdlet_retry_uses_powershell_literal_quoting() {
-    let issue = preflight_command_issue(
+    let issue = lint_direct_argv_powershell_cmdlet(
         &strings(&[
             "Get-Content",
             "-LiteralPath",
@@ -2050,7 +2060,7 @@ fn render_truncates_rejected_command_on_char_boundary() {
 }
 
 #[test]
-fn preflight_preserves_each_plain_pipeline_stage_for_validation() {
+fn preflight_preserves_pipeline_control_flow_for_validation() {
     let script = "cargo test | Select-Object -First 1";
     let invocation = CommandInvocation::PowerShellScript(script.to_string());
     let outcome = preflight_invocation_with_equivalent_repair(
@@ -2060,19 +2070,7 @@ fn preflight_preserves_each_plain_pipeline_stage_for_validation() {
     )
     .expect("the deterministic pipeline should pass preflight");
 
-    assert_eq!(
-        outcome.validation_invocations,
-        vec![
-            CommandInvocation::Argv {
-                program: "cargo".to_string(),
-                args: vec!["test".to_string()],
-            },
-            CommandInvocation::Argv {
-                program: "Select-Object".to_string(),
-                args: vec!["-First".to_string(), "1".to_string()],
-            },
-        ]
-    );
+    assert_eq!(outcome.validation_invocations, vec![invocation]);
 }
 
 #[cfg(windows)]
@@ -2087,12 +2085,10 @@ fn preflight_requires_explicit_powershell_for_cmdlets_and_rejects_invalid_source
             program: command[0].clone(),
             args: command[1..].to_vec(),
         };
-        let error = preflight_invocation_with_equivalent_repair(&invocation, &command, None)
-            .expect_err("automatic repair must not introduce a shell or its profile");
-        assert!(error.contains("not a standalone executable"));
-        assert!(error.contains("script_body: \""));
-        assert!(!error.contains("kind: "));
-        assert!(error.contains("\"kind\":\"direct_argv_powershell_cmdlet\""));
+        let outcome = preflight_invocation_with_equivalent_repair(&invocation, &command, None)
+            .expect("a name alone cannot disprove a native executable");
+        assert_eq!(outcome.invocation, invocation);
+        assert!(!outcome.repaired());
     }
     let error = preflight_invocation_with_equivalent_repair(
         &CommandInvocation::PowerShellScript("Get-Content '".into()),
@@ -2103,6 +2099,8 @@ fn preflight_requires_explicit_powershell_for_cmdlets_and_rejects_invalid_source
     assert!(error.contains("invalid script syntax"));
     assert!(error.contains("line 1, column"), "{error}");
     assert!(error.contains("TerminatorExpectedAtEndOfString"), "{error}");
+    // A script rejection keeps its own remediation, not leaf-flag advice.
+    assert!(error.contains("Use: Correct the script syntax."), "{error}");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2136,4 +2134,148 @@ async fn blocking_command_analysis_does_not_stall_the_async_runtime() {
     release_tx.send(()).expect("release blocking worker");
 
     assert_eq!(analysis.await.expect("blocking worker"), 42);
+}
+#[test]
+fn argv_shell_wrapper_is_never_replaced_by_a_repaired_leaf() {
+    for (program, args) in [
+        (
+            "bash",
+            strings(&["-c", "rg --ignorecase needle input.txt; printf KEEP"]),
+        ),
+        (
+            "cmd",
+            strings(&["/d", "/c", "rg --ignorecase needle input.txt & echo KEEP"]),
+        ),
+        (
+            "pwsh",
+            strings(&[
+                "-NoProfile",
+                "-Command",
+                "rg --ignorecase needle input.txt; Write-Output KEEP",
+            ]),
+        ),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: program.into(),
+            args,
+        };
+        let issue = preflight_invocation_with_equivalent_repair_detailed(
+            &invocation,
+            &invocation.to_direct_argv().unwrap(),
+            None,
+        )
+        .expect_err("a leaf repair must not replace its entire wrapper");
+        assert_eq!(issue.code, CommandPreflightIssueCode::KnownFlagTypo);
+        assert!(issue.retry.is_none(), "isolated leaf is not a retry");
+        assert!(issue.guidance.unwrap().contains("original invocation"));
+    }
+}
+
+#[test]
+fn cmd_lexing_preserves_escaped_stages_empty_args_and_quoted_carets() {
+    assert_eq!(
+        split_cmd_plain_commands("echo x^&rg --ignorecase needle src"),
+        Some(vec![strings(&[
+            "echo",
+            "x&rg",
+            "--ignorecase",
+            "needle",
+            "src"
+        ])])
+    );
+    assert_eq!(
+        split_cmd_plain_commands("rg \"\" src"),
+        Some(vec![strings(&["rg", "", "src"])])
+    );
+    assert_eq!(
+        split_cmd_plain_commands("rg \"a^b\" src"),
+        Some(vec![strings(&["rg", "a^b", "src"])])
+    );
+    for script in [
+        "rg needle %TARGET%",
+        "rg needle !TARGET!",
+        "call rg needle src",
+        "(rg needle src)",
+    ] {
+        assert!(split_cmd_plain_commands(script).is_none(), "{script}");
+    }
+}
+
+#[test]
+fn git_subcommand_worktree_and_explicit_cmdlet_named_executables_remain_exact() {
+    for argv in [
+        strings(&["git", "config", "--worktree", "--get", "audit36.key"]),
+        strings(&["git", "restore", "--worktree", "file"]),
+        strings(&["/tools/Get-Content", "space value"]),
+        strings(&[r"C:\tools\Get-Content.exe", "space value"]),
+        strings(&["/tools/gc", "file"]),
+        strings(&["Get-Content", "file"]),
+    ] {
+        let invocation = CommandInvocation::Argv {
+            program: argv[0].clone(),
+            args: argv[1..].to_vec(),
+        };
+        assert_eq!(
+            preflight_invocation_with_equivalent_repair(&invocation, &argv, None)
+                .unwrap()
+                .invocation,
+            invocation
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn posix_literal_wildcard_paths_are_not_rewritten() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["literal*.txt", "literal?.txt"] {
+        let path = root.path().join(name);
+        std::fs::write(&path, "needle").unwrap();
+        let invocation = CommandInvocation::Argv {
+            program: "rg".into(),
+            args: vec![
+                "-n".into(),
+                "needle".into(),
+                "--".into(),
+                path.to_str().unwrap().into(),
+            ],
+        };
+        assert_eq!(
+            preflight_invocation_with_equivalent_repair(
+                &invocation,
+                &invocation.to_direct_argv().unwrap(),
+                None,
+            )
+            .unwrap()
+            .invocation,
+            invocation
+        );
+    }
+}
+
+#[test]
+fn preflight_validation_metadata_does_not_erase_shell_exit_guards() {
+    for invocation in [
+        CommandInvocation::PowerShellScript(
+            "cargo test; if ($LASTEXITCODE -ne 0) { exit 0 }".into(),
+        ),
+        CommandInvocation::Script("cargo test || true".into()),
+    ] {
+        let command = match &invocation {
+            CommandInvocation::PowerShellScript(script) => strings(&["pwsh", "-Command", script]),
+            CommandInvocation::Script(script) => strings(&["bash", "-c", script]),
+            _ => unreachable!(),
+        };
+        let outcome =
+            preflight_invocation_with_equivalent_repair(&invocation, &command, None).unwrap();
+        let validation = crate::validation::CommandValidation {
+            execution_context: None,
+            declared: None,
+            receipt_runner: None,
+            classification: crate::validation::classify_validation_invocations(
+                &outcome.validation_invocations,
+            ),
+        };
+        assert_eq!(validation.signal()["proof"], false);
+    }
 }

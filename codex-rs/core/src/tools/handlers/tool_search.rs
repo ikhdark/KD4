@@ -2062,11 +2062,65 @@ mod tests {
     use std::thread;
     use tokio_util::sync::CancellationToken;
 
+    #[test]
+    fn owned_resource_routing_does_not_activate_web_research_contracts() {
+        use crate::tools::handlers::ListMcpResourceTemplatesHandler;
+        use crate::tools::handlers::ListMcpResourcesHandler;
+        use crate::tools::handlers::ReadMcpResourceHandler;
+
+        let inventory = vec![
+            executor_search_info(ListMcpResourcesHandler),
+            executor_search_info(ListMcpResourceTemplatesHandler),
+            executor_search_info(ReadMcpResourceHandler),
+        ];
+        for reverse in [false, true] {
+            let mut infos = inventory.clone();
+            if reverse {
+                infos.reverse();
+            }
+            let handler = ToolSearchHandler::new(infos);
+            for limit in [1, 8, 64] {
+                for query in ["public web research", "tool discovery", "send email"] {
+                    let result = handler.search(query, limit).unwrap();
+                    assert!(
+                        result.activation_tools.is_empty(),
+                        "{query}: {:?}",
+                        result.activation_tools
+                    );
+                    assert!(result.serialized_tools.is_empty(), "{query}");
+                }
+                for (query, expected) in [
+                    ("resource templates", "list_mcp_resource_templates"),
+                    ("read resource", "read_mcp_resource"),
+                    ("resource URI", "read_mcp_resource"),
+                    ("list_mcp_resources", "list_mcp_resources"),
+                    ("list_mcp_resource_templates", "list_mcp_resource_templates"),
+                    ("read_mcp_resource", "read_mcp_resource"),
+                ] {
+                    let result = handler.search(query, limit).unwrap();
+                    assert!(
+                        result.activation_tools.contains(&ToolName::plain(expected)),
+                        "{query}: {:?}",
+                        result.activation_tools
+                    );
+                }
+                let schemas = handler.search("database schemas", limit).unwrap();
+                assert!(!schemas.activation_tools.is_empty());
+                assert!(schemas.activation_tools.iter().all(|name| matches!(
+                    name.name.as_str(),
+                    "list_mcp_resources" | "list_mcp_resource_templates"
+                )));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn native_and_hybrid_search_advice_expires_after_success_and_new_turn() {
         use codex_protocol::ResponseItemId;
-        use codex_protocol::models::{ContentItem, ResponseItem};
-        use codex_protocol::openai_models::{InputModality, ToolMode};
+        use codex_protocol::models::ContentItem;
+        use codex_protocol::models::ResponseItem;
+        use codex_protocol::openai_models::InputModality;
+        use codex_protocol::openai_models::ToolMode;
         let is_advice = |item: &ResponseItem| {
             matches!(item,
             ResponseItem::Message { id: Some(id), role, .. }
@@ -2546,7 +2600,8 @@ mod tests {
                 },
             },
         });
-        let runtime = codex_code_mode_runtime::InProcessCodeModeSession::with_delegate(delegate.clone());
+        let runtime =
+            codex_code_mode_runtime::InProcessCodeModeSession::with_delegate(delegate.clone());
         let started = std::time::Instant::now();
         let result = runtime.execute(codex_code_mode::ExecuteRequest {
             state_path: None, tool_call_id: "one-cell".into(), enabled_tools,

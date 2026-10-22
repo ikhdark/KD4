@@ -375,6 +375,9 @@
       ],
       "type": "string"
     },
+    "PathUri": {
+      "type": "string"
+    },
     "PermissionProfile_for_AbsolutePathBuf": {
       "description": "Canonical active runtime permissions for a conversation, turn, or command.",
       "oneOf": [
@@ -603,6 +606,21 @@
       ],
       "type": "object"
     },
+    "ThreadSelectedEnvironment": {
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/PathUri"
+        },
+        "environmentId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cwd",
+        "environmentId"
+      ],
+      "type": "object"
+    },
     "ThreadSettings": {
       "properties": {
         "activePermissionProfile": {
@@ -632,6 +650,16 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "environments": {
+          "description": "Ordered applied selection; first is primary, empty disables environment access. Absent only when restoring legacy settings without selection information.",
+          "items": {
+            "$ref": "#/definitions/ThreadSelectedEnvironment"
+          },
+          "type": [
+            "array",
+            "null"
           ]
         },
         "model": {

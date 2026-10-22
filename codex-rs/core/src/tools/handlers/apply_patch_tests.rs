@@ -29,6 +29,118 @@ fn sample_patch() -> &'static str {
 *** End Patch"#
 }
 
+#[test]
+fn destination_only_session_overlap_is_reported_for_move_hunks() {
+    let parsed = codex_apply_patch::parse_patch(
+        "*** Begin Patch\n*** Update File: source\n*** Move to: destination\n*** End Patch",
+    )
+    .unwrap();
+    let root = TempDir::new().unwrap();
+    let endpoints = hunk_endpoints(&parsed.hunks)
+        .into_iter()
+        .map(|path| root.path().join(path))
+        .collect::<Vec<_>>();
+    let other = serde_json::from_value(json!({
+        "version": 1, "thread_id": "peer", "workspace": root.path(), "intent": "destination writer",
+        "edited_paths": [root.path().join("destination")], "updated_at_ms": 0,
+    }))
+    .unwrap();
+    let note = crate::live_sessions::overlapping_edits(&[other], &endpoints, root.path()).unwrap();
+    assert!(note.contains("destination writer"));
+}
+
+#[tokio::test]
+async fn delayed_environment_never_executes_already_sampled_patches_or_commands() {
+    use crate::environment_selection::StartingTurnEnvironment;
+    use crate::tools::handlers::unified_exec::ExecCommandHandler;
+    use crate::tools::handlers::unified_exec::ExecCommandHandlerOptions;
+    use std::time::Duration;
+    for starting_primary in [true, false] {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            "Never create forbidden.txt.",
+        )
+        .unwrap();
+        let (session, mut turn) = make_session_and_context().await;
+        turn.permission_profile = PermissionProfile::Disabled;
+        let late = TurnEnvironment::new(
+            "late".into(),
+            Arc::new(codex_exec_server::Environment::default_for_tests()),
+            PathUri::from_host_native_path(workspace.path()).unwrap(),
+            None,
+        );
+        let release = Arc::new(tokio::sync::Notify::new());
+        turn.environments.starting = vec![StartingTurnEnvironment::for_test(
+            late,
+            usize::from(!starting_primary),
+            Arc::clone(&release),
+        )];
+        let session = Arc::new(session);
+        let step_context = StepContext::for_test(Arc::new(turn));
+        let call = |payload: ToolPayload, tool: &str| ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: Arc::clone(&step_context),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: tool.into(),
+            tool_name: ToolName::plain(tool),
+            source: crate::tools::context::ToolCallSource::Direct,
+            payload,
+        };
+        let patch = call(ToolPayload::Custom { input: "*** Begin Patch\n*** Environment ID: late\n*** Add File: forbidden.txt\n+forbidden\n*** End Patch".into() }, "apply_patch");
+        let exec = call(
+            ToolPayload::Function {
+                arguments: json!({"environment_id":"late", "cmd":"echo forbidden > forbidden.txt"})
+                    .to_string(),
+            },
+            "exec_command",
+        );
+        let handler = ApplyPatchHandler::new(true);
+        let exec_handler = ExecCommandHandler::new(ExecCommandHandlerOptions {
+            allow_login_shell: false,
+            allow_escalated_sandbox_permissions: false,
+            exec_permission_approvals_enabled: false,
+            include_environment_id: true,
+            include_shell_parameter: false,
+        });
+        // Both calls share one startup future; neither may continue into I/O.
+        let mutations =
+            async { tokio::join!(handler.handle_call(patch), exec_handler.handle_call(exec)) };
+        tokio::pin!(mutations);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut mutations)
+                .await
+                .is_err()
+        );
+        assert!(!workspace.path().join("forbidden.txt").exists());
+        release.notify_one();
+        let (patch, exec) = tokio::time::timeout(Duration::from_secs(5), mutations)
+            .await
+            .unwrap();
+        for result in [patch, exec] {
+            let Err(FunctionCallError::RespondToModel(message)) = result else {
+                panic!("an unobserved scope must not execute")
+            };
+            assert!(message.contains("No operation was started"));
+            assert!(message.contains("AGENTS.md"));
+        }
+        assert!(!workspace.path().join("forbidden.txt").exists());
+        // A cancelled wait also cannot start any operation.
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        assert!(
+            crate::tools::handlers::wait_for_observed_tool_environment(
+                &step_context.environments,
+                Some("late"),
+                &cancellation
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
 #[tokio::test]
 async fn patch_reports_only_added_line_whitespace_and_conflict_diagnostics() {
     let workspace = TempDir::new().unwrap();
@@ -188,18 +300,18 @@ async fn retained_retry_reaches_filesystem_once_and_hooks_see_expanded_code() {
             "*** Begin Patch\n*** Retry Patch: {id}\n*** Replace Chunk: 1 1\n@@\n-current\n+new\n*** End Patch"
         ),
     };
-    for change_environment in [false, true] {
+    for scope_change in ["cwd", "alias", "instance"] {
         let other = TempDir::new().unwrap();
         let mut wrong_scope = call.clone();
         let mut step = (*wrong_scope.step_context).clone();
         step.environments.turn_environments = vec![TurnEnvironment::new(
-            if change_environment {
+            if scope_change == "alias" {
                 "different-environment".into()
             } else {
                 codex_exec_server::LOCAL_ENVIRONMENT_ID.into()
             },
             Arc::new(codex_exec_server::Environment::default_for_tests()),
-            if change_environment {
+            if scope_change != "cwd" {
                 PathUri::from_host_native_path(workspace.path()).unwrap()
             } else {
                 PathUri::from_host_native_path(other.path()).unwrap()
@@ -291,6 +403,7 @@ async fn hook_replacement_consumes_retained_id_without_replaying_original_code()
         .retain(
             patch,
             &environment.environment_id,
+            &environment.owner_id(),
             environment.cwd(),
             &Default::default(),
             None,
@@ -619,7 +732,10 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                     "fs/readFile" => json!({
                         "dataBase64": STANDARD.encode(std::fs::read(backing_file).unwrap()),
                     }),
-                    "fs/writeFile" => {
+                    // Patch writes, including prefix restoration, are conditional
+                    // replacements of the observed preimage; there is no unconditional
+                    // fs/writeFile fallback.
+                    "fs/mutateFileIfMatches" => {
                         let params = message["params"].clone();
                         assert_eq!(
                             params["path"],
@@ -640,13 +756,20 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
                             error = Some(
                                 json!({"code": -32000, "message": "Permission denied: remote patch policy"}),
                             );
+                            json!({})
+                        } else if params["expectedBase64"]
+                            .as_str()
+                            .map(|expected| STANDARD.decode(expected).unwrap())
+                            != Some(std::fs::read(backing_file).unwrap())
+                        {
+                            json!({"outcome": {"kind": "conflict"}})
                         } else {
                             let bytes = STANDARD
-                                .decode(params["dataBase64"].as_str().unwrap())
+                                .decode(params["replacementBase64"].as_str().unwrap())
                                 .unwrap();
                             std::fs::write(backing_file, bytes).unwrap();
+                            json!({"outcome": {"kind": "committed"}})
                         }
-                        json!({})
                     }
                     method => panic!("unexpected executor operation {method}: {message}"),
                 };
@@ -701,12 +824,16 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         turn_mut.windows_sandbox_level = sandbox_level;
         turn_mut.model_info.apply_patch_tool_type =
             Some(codex_protocol::openai_models::ApplyPatchToolType::Freeform);
-        turn_mut.environments.turn_environments = vec![TurnEnvironment::new(
+        let mut remote = TurnEnvironment::new(
             "patch-remote".into(),
             Arc::new(codex_exec_server::Environment::create_for_tests(Some(url)).unwrap()),
             cwd_uri.clone(),
             None,
-        )];
+        );
+        // Ready environments are sampled with their initialized runtime, as
+        // environment resolution publishes them.
+        remote.refresh_runtime().await.unwrap();
+        turn_mut.environments.turn_environments = vec![remote];
         *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
         let step = StepContext::for_test(turn);
         let router = Arc::new(crate::tools::router::ToolRouter::from_context(
@@ -762,7 +889,9 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         }).await.unwrap_or_else(|error| {
             panic!("registered remote patch completes (sandbox={sandbox_enabled}, deny={deny_write}, approvals={approvals}, operations={:?}): {error}", observed_operations.lock().unwrap())
         });
-        stop_tx.send(()).unwrap();
+        // The remote client may close the socket after returning, which also
+        // lets the server exit before this stop signal is sent.
+        let _ = stop_tx.send(());
         let writes = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
@@ -779,7 +908,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
         assert_eq!(writes[0]["path"], json!(target_uri));
         assert_eq!(
             STANDARD
-                .decode(writes[0]["dataBase64"].as_str().unwrap())
+                .decode(writes[0]["replacementBase64"].as_str().unwrap())
                 .unwrap(),
             b"replacement\n"
         );
@@ -922,7 +1051,7 @@ async fn registered_remote_apply_patch_preserves_requested_sandbox() {
             assert_eq!(writes[2]["sandbox"], writes[0]["sandbox"]);
             assert_eq!(
                 STANDARD
-                    .decode(writes[2]["dataBase64"].as_str().unwrap())
+                    .decode(writes[2]["replacementBase64"].as_str().unwrap())
                     .unwrap(),
                 b"original\n"
             );

@@ -7,6 +7,347 @@ use notify::event::ModifyKind;
 use pretty_assertions::assert_eq;
 use tokio::time::timeout;
 
+#[tokio::test]
+async fn shared_factory_reuses_the_live_replacement_not_the_terminal_entry() {
+    let first = FileWatcher::shared().unwrap();
+    first.state.write().unwrap().terminal = true;
+    let replacement = FileWatcher::shared().unwrap();
+    assert!(!Arc::ptr_eq(&first, &replacement));
+    assert!(Arc::ptr_eq(&replacement, &FileWatcher::shared().unwrap()));
+}
+
+#[tokio::test]
+async fn failed_missing_target_promotion_retries_without_another_parent_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let target = root.join("missing/target");
+    let file = target.join("nested/file");
+    let watcher = Arc::new(FileWatcher::new().unwrap());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _lease = subscriber.register_path(target.clone(), true);
+    {
+        // Hold reconciliation until both the one-shot fault and the complete
+        // prospective subtree exist. Native event production remains real.
+        let _state = watcher.state.write().unwrap();
+        watcher
+            .inner
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fail_watch_attempts = 1;
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "before-recovery").unwrap();
+    }
+    tokio::time::sleep(DEGRADED_RECONCILE_MAX_DELAY * 2).await;
+    while matches!(
+        timeout(Duration::from_millis(50), rx.recv()).await,
+        Ok(Some(_))
+    ) {}
+    std::fs::write(&file, "after-recovery").unwrap();
+    wait_for_native_bytes(&mut rx, &file, "after-recovery").await;
+}
+
+#[test]
+fn access_pressure_never_consumes_raw_mutation_capacity() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let overflow = AtomicBool::new(false);
+    let wake = Notify::new();
+    for _ in 0..20_000 {
+        enqueue_raw_event(
+            &tx,
+            &overflow,
+            &wake,
+            Ok(notify_event(
+                EventKind::Access(AccessKind::Read),
+                vec![path("/read-only")],
+            )),
+        );
+    }
+    assert!(!overflow.load(Ordering::Acquire));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    enqueue_raw_event(
+        &tx,
+        &overflow,
+        &wake,
+        Ok(notify_event(
+            EventKind::Create(CreateKind::File),
+            vec![path("/changed")],
+        )),
+    );
+    assert!(rx.try_recv().is_ok());
+    enqueue_raw_event(
+        &tx,
+        &overflow,
+        &wake,
+        Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)),
+    );
+    assert!(overflow.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn producer_closure_closes_receivers_with_live_logical_handles() {
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _lease = subscriber.register_path(path("/watched"), true);
+    let (tx, raw) = mpsc::channel(1);
+    watcher.spawn_event_loop_for_test(raw);
+    drop(tx);
+    assert!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .rescan_required
+    );
+    assert!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!watcher.is_live());
+    assert!(
+        subscriber
+            .register_paths(vec![WatchPath {
+                path: path("/watched"),
+                recursive: true
+            }])
+            .is_err()
+    );
+}
+
+async fn wait_for_native_bytes(rx: &mut Receiver, target: &Path, expected: &str) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let event = rx.recv().await.expect("live receiver");
+            if (event.rescan_required || event.paths.iter().any(|path| target.starts_with(path)))
+                && std::fs::read_to_string(target).ok().as_deref() == Some(expected)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("native notification must reach prescribed bytes");
+}
+
+#[tokio::test]
+async fn retiring_child_preserves_recursive_parent_native_coverage() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let child = root.join("child");
+    std::fs::create_dir(&child).unwrap();
+    let file = child.join("file");
+    std::fs::write(&file, "before").unwrap();
+    let watcher = Arc::new(FileWatcher::new().unwrap());
+    let (parent, mut rx) = watcher.add_subscriber();
+    let _parent = parent.register_path(root.clone(), true);
+    let (other, _) = watcher.add_subscriber();
+    let lease = other.register_path(child.clone(), true);
+    drop(lease);
+    while matches!(
+        timeout(Duration::from_millis(50), rx.recv()).await,
+        Ok(Some(_))
+    ) {}
+    std::fs::write(&file, "after-child-retirement").unwrap();
+    wait_for_native_bytes(&mut rx, &file, "after-child-retirement").await;
+    let nested = child.join("new");
+    std::fs::create_dir(&nested).unwrap();
+    let later = nested.join("later");
+    std::fs::write(&later, "new-descendant").unwrap();
+    wait_for_native_bytes(&mut rx, &later, "new-descendant").await;
+}
+
+#[tokio::test]
+async fn ancestor_relocation_rebinds_exact_file_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let old = root.join("old");
+    // Windows cannot rename a directory containing an open descendant directory
+    // handle, even with delete sharing. Relocate the file's immediate ancestor:
+    // its own watch handle permits rename and exercises the same namespace rebind.
+    std::fs::create_dir(&old).unwrap();
+    let file = old.join("file");
+    std::fs::write(&file, "before").unwrap();
+    let watcher = Arc::new(FileWatcher::new().unwrap());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _lease = subscriber.register_path(file.clone(), false);
+    std::fs::rename(&old, root.join("moved")).unwrap();
+    timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::create_dir(&old).unwrap();
+    std::fs::write(&file, "recreated").unwrap();
+    wait_for_native_bytes(&mut rx, &file, "recreated").await;
+    while matches!(
+        timeout(Duration::from_millis(50), rx.recv()).await,
+        Ok(Some(_))
+    ) {}
+    std::fs::write(&file, "follow-up").unwrap();
+    wait_for_native_bytes(&mut rx, &file, "follow-up").await;
+
+    // Preserve the deeper-ancestor case without native directory handles:
+    // inject the backend rename event into the real reconciliation loop.
+    let deep_temp = tempfile::tempdir().unwrap();
+    let deep_root = deep_temp.path().canonicalize().unwrap();
+    let ancestor = deep_root.join("old");
+    let deep_file = ancestor.join("nested/file");
+    std::fs::create_dir_all(deep_file.parent().unwrap()).unwrap();
+    std::fs::write(&deep_file, "before").unwrap();
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut events) = watcher.add_subscriber();
+    let _deep_lease = subscriber.register_path(deep_file.clone(), false);
+    let (raw_tx, raw_rx) = mpsc::channel(1);
+    watcher.spawn_event_loop_for_test(raw_rx);
+    std::fs::rename(&ancestor, deep_root.join("moved")).unwrap();
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            vec![ancestor.clone()],
+        )))
+        .await
+        .unwrap();
+    let event = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(event.paths.iter().any(|path| deep_file.starts_with(path)));
+    let actual_path = || {
+        let state = watcher.state.read().unwrap();
+        state.subscribers[&subscriber.id]
+            .watched_paths
+            .iter()
+            .find(|(key, _)| !key.namespace_guard && key.requested.path == deep_file)
+            .unwrap()
+            .1
+            .actual
+            .path
+            .clone()
+    };
+    assert_eq!(actual_path(), deep_root);
+    std::fs::create_dir_all(deep_file.parent().unwrap()).unwrap();
+    std::fs::write(&deep_file, "recreated").unwrap();
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Create(CreateKind::Folder),
+            vec![ancestor],
+        )))
+        .await
+        .unwrap();
+    wait_for_native_bytes(&mut events, &deep_file, "recreated").await;
+    assert_eq!(actual_path(), deep_file);
+    std::fs::write(&deep_file, "follow-up").unwrap();
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Modify(ModifyKind::Any),
+            vec![deep_file.clone()],
+        )))
+        .await
+        .unwrap();
+    wait_for_native_bytes(&mut events, &deep_file, "follow-up").await;
+}
+
+#[tokio::test]
+async fn canonical_aliases_share_native_coverage_without_losing_requested_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let real = root.join("real");
+    std::fs::create_dir(&real).unwrap();
+    let file = real.join("file");
+    std::fs::write(&file, "A").unwrap();
+    let alias_a = root.join("a");
+    let alias_b = root.join("b");
+    symlink_dir(&real, &alias_a).unwrap();
+    symlink_dir(&real, &alias_b).unwrap();
+    let watcher = Arc::new(FileWatcher::new().unwrap());
+    let (a, mut rx_a) = watcher.add_subscriber();
+    let (b, mut rx_b) = watcher.add_subscriber();
+    let lease_a = a.register_path(alias_a.clone(), true);
+    let _lease_b = b.register_path(alias_b.clone(), true);
+    std::fs::write(&file, "B").unwrap();
+    wait_for_native_bytes(&mut rx_a, &alias_a.join("file"), "B").await;
+    wait_for_native_bytes(&mut rx_b, &alias_b.join("file"), "B").await;
+    drop(lease_a);
+    while matches!(
+        timeout(Duration::from_millis(50), rx_b.recv()).await,
+        Ok(Some(_))
+    ) {}
+    std::fs::write(&file, "after-alias-drop").unwrap();
+    wait_for_native_bytes(&mut rx_b, &alias_b.join("file"), "after-alias-drop").await;
+}
+
+#[tokio::test]
+async fn dropping_one_shared_lease_does_not_cancel_pending_promotion() {
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, _) = watcher.add_subscriber();
+    let first = subscriber.register_path(path("/missing/target"), true);
+    let _second = subscriber.register_path(path("/missing/target"), true);
+    let key = first
+        .watched_paths
+        .iter()
+        .find(|key| !key.namespace_guard)
+        .unwrap()
+        .clone();
+    watcher
+        .state
+        .write()
+        .unwrap()
+        .pending_requests
+        .insert((subscriber.id, key.clone()));
+    drop(first);
+    assert!(
+        watcher
+            .state
+            .read()
+            .unwrap()
+            .pending_requests
+            .contains(&(subscriber.id, key))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn rescan_repairs_missing_child_while_recursive_root_stays_registered() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let child = root.join("child");
+    std::fs::create_dir(&child).unwrap();
+    let file = child.join("file");
+    std::fs::write(&file, "before").unwrap();
+    let watcher = Arc::new(FileWatcher::new().unwrap());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _lease = subscriber.register_path(root, true);
+    // Keep the native root registered in the same recursive mode: ordinary
+    // watch(root, Recursive) remains a no-op and cannot repair this missing child.
+    watcher
+        .inner
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .watcher
+        .unwatch(&child)
+        .unwrap();
+    FileWatcher::reconcile_changes(
+        &watcher.state,
+        watcher.inner.as_ref(),
+        watcher.reconcile_tx.as_ref(),
+        ObservedChanges {
+            rescan_required: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(rx.recv().await.unwrap().rescan_required);
+    std::fs::write(&file, "after-repair").unwrap();
+    wait_for_native_bytes(&mut rx, &file, "after-repair").await;
+}
+
 const TEST_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
 
 #[test]
@@ -40,7 +381,14 @@ fn notify_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
 }
 
 fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_dir(target, link)
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -204,7 +552,13 @@ async fn throttled_receiver_preserves_rescan_across_cancellation_and_later_paths
             .is_err()
     );
     tx.add_changed_paths(&[path("b")]).await;
-    assert!(throttled.recv().await.expect("pending rescan").rescan_required);
+    assert!(
+        throttled
+            .recv()
+            .await
+            .expect("pending rescan")
+            .rescan_required
+    );
     drop(tx);
     assert_eq!(throttled.recv().await, None);
 }
@@ -391,11 +745,21 @@ async fn subscriber_buffer_overflow_retains_coarse_path_evidence() {
     assert!(event.paths.len() < SUBSCRIBER_PATH_BUFFER_CAPACITY);
     for original in &paths {
         assert!(
-            event.paths.iter().any(|changed| original.starts_with(changed)),
-            "lost evidence for {}: {:?}", original.display(), event.paths
+            event
+                .paths
+                .iter()
+                .any(|changed| original.starts_with(changed)),
+            "lost evidence for {}: {:?}",
+            original.display(),
+            event.paths
         );
     }
-    assert!(event.paths.iter().all(|changed| changed.starts_with("workspace/generated")));
+    assert!(
+        event
+            .paths
+            .iter()
+            .all(|changed| changed.starts_with("workspace/generated"))
+    );
 }
 
 #[test]
@@ -433,10 +797,18 @@ fn register_dedupes_by_path_and_scope() {
 
     let watcher = Arc::new(FileWatcher::noop());
     let (subscriber, _rx) = watcher.add_subscriber();
-    let _first = subscriber.register_paths(vec![
-        WatchPath { path: skills.clone(), recursive: false },
-        WatchPath { path: skills.clone(), recursive: false },
-    ]).expect("deduplicate one registration batch");
+    let _first = subscriber
+        .register_paths(vec![
+            WatchPath {
+                path: skills.clone(),
+                recursive: false,
+            },
+            WatchPath {
+                path: skills.clone(),
+                recursive: false,
+            },
+        ])
+        .expect("deduplicate one registration batch");
     let _second = subscriber.register_path(skills.clone(), /*recursive*/ false);
     let _third = subscriber.register_path(skills.clone(), /*recursive*/ true);
     let _fourth = subscriber.register_path(other_skills.clone(), /*recursive*/ true);
@@ -473,7 +845,12 @@ async fn subscriber_drop_unregisters_paths_and_closes_receiver() {
     drop(subscriber);
 
     assert_eq!(watcher.watch_counts_for_test(&skills), None);
-    assert_eq!(timeout(Duration::from_secs(1), rx.recv()).await.expect("closed recv timeout"), None);
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("closed recv timeout"),
+        None
+    );
     drop(registration);
     assert_eq!(watcher.watch_counts_for_test(&skills), None);
 }
@@ -488,11 +865,15 @@ fn missing_path_registers_nearest_existing_parent() {
     let (subscriber, _rx) = watcher.add_subscriber();
     let registration = subscriber.register_path(missing_file.clone(), /*recursive*/ false);
 
-    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), Some((1, 0)));
+    assert_eq!(
+        content_watch_counts(&watcher, temp_dir.path()),
+        Some((1, 0))
+    );
     assert_eq!(watcher.watch_counts_for_test(&missing_file), None);
 
     drop(registration);
 
+    // The parent's namespace guard is released with the registration too.
     assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), None);
 }
 
@@ -507,7 +888,10 @@ fn deeply_missing_path_registers_nearest_existing_directory_ancestor() {
     let (subscriber, _rx) = watcher.add_subscriber();
     let _registration = subscriber.register_path(missing_file, /*recursive*/ false);
 
-    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), Some((1, 0)));
+    assert_eq!(
+        content_watch_counts(&watcher, temp_dir.path()),
+        Some((1, 0))
+    );
 }
 
 #[test]
@@ -550,6 +934,20 @@ async fn failed_watch_does_not_commit_a_logical_registration() {
                 .is_empty()
         );
     }
+    // Backend state is keyed by the canonical spelling passed to the backend.
+    let root = root.canonicalize().expect("canonical root");
+    // The failed attempt degrades its root. Reconciliation cannot run before
+    // this task yields, so only reconciliation can satisfy the wait below.
+    assert!(
+        watcher
+            .inner
+            .as_ref()
+            .expect("watcher inner")
+            .lock()
+            .expect("inner lock")
+            .degraded_paths
+            .contains(&root)
+    );
     timeout(Duration::from_secs(1), async {
         loop {
             let reconciled = {
@@ -592,7 +990,10 @@ async fn failed_batch_registration_restores_preexisting_watch_mode() {
             };
             let (actual, matched, fallback) = actual_watch_path(&requested);
             SubscriberWatchRegistration {
-                key: SubscriberWatchKey { requested },
+                key: SubscriberWatchKey {
+                    requested,
+                    namespace_guard: false,
+                },
                 actual,
                 matched,
                 fallback,
@@ -602,7 +1003,11 @@ async fn failed_batch_registration_restores_preexisting_watch_mode() {
     // Reproduce removal between public path resolution and backend registration:
     // the first mode upgrade succeeds, but the second backend watch must fail.
     std::fs::remove_dir(&second_root).expect("remove second root after resolution");
-    assert!(watcher.register_paths(subscriber.id, &registrations).is_err());
+    assert!(
+        watcher
+            .register_paths(subscriber.id, &registrations)
+            .is_err()
+    );
     assert_eq!(watcher.watch_counts_for_test(&first_root), Some((1, 0)));
     assert_eq!(watcher.watch_counts_for_test(&second_root), None);
     {
@@ -612,8 +1017,12 @@ async fn failed_batch_registration_restores_preexisting_watch_mode() {
             .get(&subscriber.id)
             .expect("subscriber")
             .watched_paths;
-        assert_eq!(registered.len(), 1);
+        assert_eq!(
+            registered.keys().filter(|key| !key.namespace_guard).count(),
+            1
+        );
         assert!(registered.contains_key(&SubscriberWatchKey {
+            namespace_guard: false,
             requested: WatchPath {
                 path: first_root.clone(),
                 recursive: false,
@@ -626,10 +1035,14 @@ async fn failed_batch_registration_restores_preexisting_watch_mode() {
             .lock()
             .expect("inner lock");
         assert_eq!(
-            inner.watched_paths.get(&first_root),
+            inner.watched_paths.get(&registrations[0].actual.path),
             Some(&RecursiveMode::NonRecursive)
         );
-        assert!(!inner.watched_paths.contains_key(&second_root));
+        assert!(
+            !inner
+                .watched_paths
+                .contains_key(&registrations[1].actual.path)
+        );
     }
     let changed = first_root.join("still-watched.txt");
     std::fs::write(&changed, "retained watch").expect("write watched file");
@@ -667,6 +1080,17 @@ async fn failed_unwatch_is_reconciled_after_logical_registration_is_removed() {
                 .is_empty()
         );
     }
+    // Backend state is keyed by the canonical spelling passed to the backend.
+    let root = root.canonicalize().expect("canonical root");
+    {
+        // The failed release leaves the backend watch in place and degraded.
+        // Reconciliation cannot run before this task yields, so only
+        // reconciliation can satisfy the wait below.
+        let inner = watcher.inner.as_ref().expect("watcher inner");
+        let inner = inner.lock().expect("inner lock");
+        assert!(inner.watched_paths.contains_key(&root));
+        assert!(inner.degraded_paths.contains(&root));
+    }
     timeout(Duration::from_secs(1), async {
         loop {
             let reconciled = {
@@ -690,16 +1114,19 @@ async fn recursive_registration_downgrades_to_non_recursive_after_drop() {
     let root = temp_dir.path().join("watched-dir");
     std::fs::create_dir(&root).expect("create root");
 
+    // Backend state is keyed by the canonical spelling passed to the backend.
+    let canonical_root = root.canonicalize().expect("canonical root");
+
     let watcher = Arc::new(FileWatcher::new().expect("watcher"));
     let (subscriber, _rx) = watcher.add_subscriber();
     let non_recursive = subscriber.register_path(root.clone(), /*recursive*/ false);
-    let recursive = subscriber.register_path(root.clone(), /*recursive*/ true);
+    let recursive = subscriber.register_path(root, /*recursive*/ true);
 
     {
         let inner = watcher.inner.as_ref().expect("watcher inner");
         let inner = inner.lock().expect("inner lock");
         assert_eq!(
-            inner.watched_paths.get(&root),
+            inner.watched_paths.get(&canonical_root),
             Some(&RecursiveMode::Recursive)
         );
     }
@@ -710,7 +1137,7 @@ async fn recursive_registration_downgrades_to_non_recursive_after_drop() {
         let inner = watcher.inner.as_ref().expect("watcher inner");
         let inner = inner.lock().expect("inner lock");
         assert_eq!(
-            inner.watched_paths.get(&root),
+            inner.watched_paths.get(&canonical_root),
             Some(&RecursiveMode::NonRecursive)
         );
     }
@@ -739,10 +1166,11 @@ async fn mode_change_replaces_the_backend_watch_without_unwatching() {
 
     let _recursive = subscriber.register_path(root.clone(), /*recursive*/ true);
 
+    let canonical_root = root.canonicalize().expect("canonical root");
     let inner = watcher.inner.as_ref().expect("watcher inner");
     let inner = inner.lock().expect("inner lock");
     assert_eq!(
-        inner.watched_paths.get(&root),
+        inner.watched_paths.get(&canonical_root),
         Some(&RecursiveMode::Recursive)
     );
     assert!(inner.fail_next_unwatch, "a mode change must not unwatch");
@@ -768,6 +1196,8 @@ async fn failed_mode_change_keeps_the_previous_watch_until_reconciled() {
 
     drop(recursive);
 
+    // Backend state is keyed by the canonical spelling passed to the backend.
+    let root = root.canonicalize().expect("canonical root");
     // A failed replacement leaves the previous watch covering the remaining
     // registration while the downgrade is retried.
     {
@@ -835,14 +1265,54 @@ async fn failed_old_watch_release_after_move_is_reconciled() {
         .send_paths_for_test(vec![temp_dir.path().to_path_buf()])
         .await;
 
+    // Backend state is keyed by the canonical spelling passed to the backend.
+    let parent = temp_dir.path().canonicalize().expect("canonical parent");
+    let canonical_requested = requested.canonicalize().expect("canonical requested");
+    // The requested path's namespace guard keeps its parent registered, so the
+    // promotion releases no native watch and the injected failure stays armed.
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let promoted = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                inner.watched_paths.get(&canonical_requested) == Some(&RecursiveMode::NonRecursive)
+                    && inner.watched_paths.get(&parent) == Some(&RecursiveMode::NonRecursive)
+                    && !inner.degraded_paths.contains(&parent)
+            };
+            if promoted {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the fallback watch should move to the created directory");
+    assert!(
+        watcher
+            .inner
+            .as_ref()
+            .expect("watcher inner")
+            .lock()
+            .expect("inner lock")
+            .fail_next_unwatch,
+        "releasing a guarded fallback parent must not stop its native watch"
+    );
+
+    // Removing the directory moves the watch back to its parent and retires the
+    // directory's own native watch. That release fails once and is reconciled.
+    std::fs::remove_dir(&requested).expect("remove requested directory");
+    watcher
+        .send_paths_for_test(vec![canonical_requested.clone()])
+        .await;
     timeout(Duration::from_secs(1), async {
         loop {
             let reconciled = {
                 let inner = watcher.inner.as_ref().expect("watcher inner");
                 let inner = inner.lock().expect("inner lock");
-                inner.watched_paths.get(&requested) == Some(&RecursiveMode::NonRecursive)
-                    && !inner.watched_paths.contains_key(temp_dir.path())
-                    && !inner.degraded_paths.contains(temp_dir.path())
+                !inner.fail_next_unwatch
+                    && !inner.watched_paths.contains_key(&canonical_requested)
+                    && !inner.degraded_paths.contains(&canonical_requested)
+                    && inner.watched_paths.get(&parent) == Some(&RecursiveMode::NonRecursive)
             };
             if reconciled {
                 break;
@@ -851,7 +1321,7 @@ async fn failed_old_watch_release_after_move_is_reconciled() {
         }
     })
     .await
-    .expect("failed release of a fallback watch should be reconciled");
+    .expect("failed release of a moved watch should be reconciled");
 }
 
 async fn recv_event_for(rx: &mut Receiver, expected: &Path) {
@@ -867,13 +1337,43 @@ async fn recv_event_for(rx: &mut Receiver, expected: &Path) {
     .expect("watched path event timeout");
 }
 
+/// Registry counts at `path` minus those owned by namespace guards. Every
+/// registration also guards each ancestor of its requested path, once per
+/// spelling, so raw counts at a parent depend on platform canonicalization.
+/// Fallback placement is a property of the requested paths' own watches.
+fn content_watch_counts(watcher: &FileWatcher, path: &Path) -> Option<(usize, usize)> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let state = watcher.state.read().expect("state lock");
+    let (mut non_recursive, mut recursive) = state
+        .path_ref_counts
+        .get(&path)
+        .map_or((0, 0), |counts| (counts.non_recursive, counts.recursive));
+    for (key, watch) in state
+        .subscribers
+        .values()
+        .flat_map(|subscriber| subscriber.watched_paths.iter())
+    {
+        if key.namespace_guard && watch.actual.path == path {
+            let owned = if watch.actual.recursive {
+                &mut recursive
+            } else {
+                &mut non_recursive
+            };
+            *owned = owned
+                .checked_sub(watch.count)
+                .expect("namespace guards are counted in the registry");
+        }
+    }
+    (non_recursive != 0 || recursive != 0).then_some((non_recursive, recursive))
+}
+
 async fn wait_for_watch_counts(
     watcher: &FileWatcher,
     path: &Path,
     expected: Option<(usize, usize)>,
 ) {
     timeout(Duration::from_secs(10), async {
-        while watcher.watch_counts_for_test(path) != expected {
+        while content_watch_counts(watcher, path) != expected {
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -982,7 +1482,10 @@ async fn backend_error_rearms_the_watch_it_names() {
     let (subscriber, mut rx) = watcher.add_subscriber();
     let _registration = subscriber.register_path(root.clone(), /*recursive*/ true);
     // A backend that cannot re-arm a read stops that watch and reports an
-    // error naming its root.
+    // error naming its root, in the canonical spelling it was watched under.
+    // The backend keys watches by that spelling and silently ignores an
+    // unwatch of any other, which would leave the watch running.
+    let canonical_root = root.canonicalize().expect("canonical root");
     watcher
         .inner
         .as_ref()
@@ -990,14 +1493,14 @@ async fn backend_error_rearms_the_watch_it_names() {
         .lock()
         .expect("inner lock")
         .watcher
-        .unwatch(&root)
+        .unwatch(&canonical_root)
         .expect("stop backend watch");
     let (raw_tx, raw_rx) = mpsc::channel(1);
     watcher.spawn_event_loop_for_test(raw_rx);
 
     raw_tx
         .send(Err(
-            notify::Error::generic("rearm failed").add_path(root.clone())
+            notify::Error::generic("rearm failed").add_path(canonical_root)
         ))
         .await
         .expect("send backend error");
@@ -1014,6 +1517,76 @@ async fn backend_error_rearms_the_watch_it_names() {
     let child = root.join("after-error.txt");
     std::fs::write(&child, "rearmed").expect("write child");
     recv_event_for(&mut rx, &child).await;
+}
+
+#[tokio::test]
+async fn failed_rearm_degrades_every_lost_root_until_reconciled() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let first = temp_dir.path().join("first");
+    let second = temp_dir.path().join("second");
+    std::fs::create_dir(&first).expect("create first root");
+    std::fs::create_dir(&second).expect("create second root");
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, _rx) = watcher.add_subscriber();
+    let _first = subscriber.register_path(first.clone(), /*recursive*/ true);
+    let _second = subscriber.register_path(second.clone(), /*recursive*/ true);
+    // Every replacement fails, so reconciliation cannot clear either root yet.
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .fail_watch_attempts = usize::MAX;
+    let (raw_tx, raw_rx) = mpsc::channel(1);
+    watcher.spawn_event_loop_for_test(raw_rx);
+
+    // One loss batch makes a single re-arm attempt covering both roots.
+    let lost = notify::Error::generic("watches lost")
+        .add_path(first.clone())
+        .add_path(second.clone());
+    raw_tx.send(Err(lost)).await.expect("send backend error");
+    // Backend state is keyed by the canonical spelling passed to the backend.
+    let first = first.canonicalize().expect("canonical first root");
+    let second = second.canonicalize().expect("canonical second root");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let degraded = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                inner.degraded_paths.contains(&first) && inner.degraded_paths.contains(&second)
+            };
+            if degraded {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed re-arm must degrade every lost root, not only the first");
+
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .fail_watch_attempts = 0;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let reconciled = {
+                let inner = watcher.inner.as_ref().expect("watcher inner");
+                let inner = inner.lock().expect("inner lock");
+                !inner.degraded_paths.contains(&first) && !inner.degraded_paths.contains(&second)
+            };
+            if reconciled {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("reconciliation should re-arm every degraded root");
 }
 
 #[tokio::test]
@@ -1049,7 +1622,10 @@ async fn rescan_moves_a_stable_watch_whose_root_disappeared() {
     );
     // The rescan is requested only after the watch followed the removal.
     assert_eq!(watcher.watch_counts_for_test(&root), None);
-    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), Some((1, 0)));
+    assert_eq!(
+        content_watch_counts(&watcher, temp_dir.path()),
+        Some((1, 0))
+    );
 }
 
 #[tokio::test]
@@ -1063,23 +1639,26 @@ async fn overflow_rearms_a_lost_backend_watch_before_delivering_rescan() {
 
     // Model the backend losing its watch while the removal report is dropped.
     // Logical state still claims the root is watched; the real backend is not.
-    watcher
-        .inner
-        .as_ref()
-        .expect("watcher inner")
-        .lock()
-        .expect("inner lock")
-        .watcher
-        .unwatch(&root)
-        .expect("stop backend watch");
+    // The root's namespace guard watches its parent, which would also report the
+    // replacement, so that watch is lost as well. Native watches are canonical.
+    {
+        let inner = watcher.inner.as_ref().expect("watcher inner");
+        let mut inner = inner.lock().expect("inner lock");
+        for lost in [root.as_path(), temp_dir.path()] {
+            let lost = lost.canonicalize().expect("canonical watch path");
+            inner.watcher.unwatch(&lost).expect("stop backend watch");
+        }
+    }
     std::fs::remove_dir(&root).expect("remove root");
     std::fs::create_dir(&root).expect("recreate root");
 
     let (raw_tx, raw_rx) = mpsc::channel(1);
     let raw_overflow = Arc::new(AtomicBool::new(false));
     let raw_overflow_notify = Arc::new(Notify::new());
+    // Non-mutating reports never consume raw capacity, so an earlier change
+    // report fills the queue and the removal report is dropped.
     for kind in [
-        EventKind::Other,
+        EventKind::Modify(ModifyKind::Any),
         EventKind::Remove(notify::event::RemoveKind::Folder),
     ] {
         enqueue_raw_event(
@@ -1151,7 +1730,7 @@ async fn shared_fallback_watches_resolve_once_per_batch() {
             );
         }
         assert_eq!(
-            watcher.watch_counts_for_test(if exists { &requested } else { directory.path() }),
+            content_watch_counts(&watcher, if exists { &requested } else { directory.path() }),
             Some((32, 0))
         );
         assert_eq!(resolutions, 1);
@@ -1167,9 +1746,11 @@ async fn shared_fallback_watches_resolve_once_per_batch() {
         },
     )
     .await;
+    // A rescan re-resolves every watch: the requested path and each ancestor's
+    // namespace guard once, however many subscribers share them.
     assert_eq!(
         watcher.take_actual_watch_path_resolution_count_for_test(),
-        1
+        requested.ancestors().count()
     );
     for (_, _, receiver) in &mut subscribers {
         assert_eq!(
@@ -1261,10 +1842,11 @@ async fn unregister_holds_state_lock_until_unwatch_finishes() {
 
     assert_eq!(watcher.watch_counts_for_test(&root), Some((1, 0)));
 
+    let canonical_root = root.canonicalize().expect("canonical root");
     let inner = watcher.inner.as_ref().expect("watcher inner");
     let inner = inner.lock().expect("inner lock");
     assert_eq!(
-        inner.watched_paths.get(&root),
+        inner.watched_paths.get(&canonical_root),
         Some(&RecursiveMode::NonRecursive)
     );
     drop(inner);
@@ -1351,8 +1933,14 @@ async fn unrelated_events_skip_fallback_watch_resolution() {
         temp_dir.path().join("missing").join("FETCH_HEAD"),
         /*recursive*/ false,
     );
+    // Native watches use canonical paths, which the backend reports back.
+    let canonical_temp = temp_dir.path().canonicalize().expect("canonical temp dir");
 
-    watcher.send_paths_for_test(vec![changed.clone()]).await;
+    watcher
+        .send_paths_for_test(vec![
+            canonical_temp.join("source").join("nested").join("main.rs"),
+        ])
+        .await;
 
     assert_eq!(
         watcher.take_actual_watch_path_resolution_count_for_test(),
@@ -1370,13 +1958,233 @@ async fn unrelated_events_skip_fallback_watch_resolution() {
     );
 
     // The fallback's ancestor watch can report a sibling that becomes a
-    // missing component or symlink target, so that still re-resolves.
+    // missing component or symlink target, so that still re-resolves. Both
+    // fallbacks on that ancestor do: the requested file and the namespace guard
+    // of its missing parent directory.
     watcher
-        .send_paths_for_test(vec![temp_dir.path().join("sibling")])
+        .send_paths_for_test(vec![canonical_temp.join("sibling")])
         .await;
     assert_eq!(
         watcher.take_actual_watch_path_resolution_count_for_test(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn unrelated_events_skip_fallback_watch_reached_through_ancestor_link() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    // Native watches use canonical paths, which the backend reports back.
+    // Spell the request canonically too, so the link below resolves to one of
+    // the request's own literal ancestors on every platform.
+    let root = temp_dir.path().canonicalize().expect("canonical temp dir");
+    let ancestor = root.join("ancestor");
+    let other = root.join("other");
+    std::fs::create_dir(&ancestor).expect("create ancestor dir");
+    std::fs::create_dir(&other).expect("create other dir");
+    let link = ancestor.join("up");
+    symlink_dir(&ancestor, &link).expect("create ancestor directory symlink");
+    let requested = link.join("FILE");
+    let watcher = Arc::new(FileWatcher::noop());
+    let (fallback_subscriber, mut fallback_rx) = watcher.add_subscriber();
+    let (other_subscriber, mut other_rx) = watcher.add_subscriber();
+    let _fallback = fallback_subscriber.register_path(requested.clone(), /*recursive*/ false);
+    let _other = other_subscriber.register_path(other.clone(), /*recursive*/ true);
+    {
+        let state = watcher.state.read().expect("watch state");
+        let (_, watch) = state.subscribers[&fallback_subscriber.id]
+            .watched_paths
+            .iter()
+            .find(|(key, _)| !key.namespace_guard)
+            .expect("requested watch");
+        // The missing file is watched through the link's target directory,
+        // which is also a literal ancestor of the request.
+        assert!(watch.fallback);
+        assert_eq!(watch.actual.path, ancestor);
+        assert_eq!(watch.matched.path, ancestor.join("FILE"));
+    }
+    let (raw_tx, raw_rx) = mpsc::channel(RAW_EVENT_BUFFER_CAPACITY);
+    watcher.spawn_event_loop_for_test(raw_rx);
+
+    // An event below that directory's parent but outside the directory cannot
+    // change the fallback. The other subscriber's delivery shows the batch has
+    // been reconciled.
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Create(CreateKind::File),
+            vec![other.join("changed.txt")],
+        )))
+        .await
+        .expect("queue unrelated event");
+    assert_eq!(
+        timeout(Duration::from_secs(1), other_rx.recv())
+            .await
+            .expect("unrelated event timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![other.join("changed.txt")],
+            rescan_required: false,
+        })
+    );
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        0
+    );
+
+    // The fallback's own target still re-resolves it, once, and is delivered
+    // in the requested spelling.
+    std::fs::write(ancestor.join("FILE"), "created").expect("create target");
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Create(CreateKind::File),
+            vec![ancestor.join("FILE")],
+        )))
+        .await
+        .expect("queue target event");
+    assert_eq!(
+        timeout(Duration::from_secs(1), fallback_rx.recv())
+            .await
+            .expect("target event timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![requested],
+            rescan_required: false,
+        })
+    );
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
         1
+    );
+}
+
+#[tokio::test]
+async fn retargeted_alias_reresolves_the_watch_requested_through_it() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    // Requests keep the caller's spelling (on Windows without `\\?\`, on macOS
+    // through `/var`), while native watches report canonical spellings.
+    let aliases = temp_dir.path().join("aliases");
+    let observed = temp_dir.path().join("observed");
+    let first = temp_dir.path().join("targets").join("first");
+    let second = temp_dir.path().join("targets").join("second");
+    std::fs::create_dir(&aliases).expect("create aliases dir");
+    std::fs::create_dir(&observed).expect("create observed dir");
+    std::fs::create_dir_all(&first).expect("create first target");
+    std::fs::create_dir_all(&second).expect("create second target");
+    let alias = aliases.join("alias");
+    symlink_dir(&first, &alias).expect("create alias");
+    let canonical_root = temp_dir.path().canonicalize().expect("canonical temp dir");
+    let canonical_aliases = canonical_root.join("aliases");
+
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let (observer, mut observer_rx) = watcher.add_subscriber();
+    let _alias = subscriber.register_path(alias.clone(), /*recursive*/ true);
+    let _observed = observer.register_path(observed.clone(), /*recursive*/ true);
+    let actual_path = || {
+        let state = watcher.state.read().expect("watch state");
+        let (_, watch) = state.subscribers[&subscriber.id]
+            .watched_paths
+            .iter()
+            .find(|(key, _)| !key.namespace_guard)
+            .expect("requested watch");
+        watch.actual.path.clone()
+    };
+    let canonical_first = first.canonicalize().expect("canonical first target");
+    assert_eq!(actual_path(), canonical_first);
+    let (raw_tx, raw_rx) = mpsc::channel(RAW_EVENT_BUFFER_CAPACITY);
+    watcher.spawn_event_loop_for_test(raw_rx);
+
+    // Unrelated entries beside the alias and beside its directory must neither
+    // re-resolve nor notify the alias. Nor must the timestamp report Windows
+    // adds for the alias's directory when a sibling changes (elsewhere
+    // `Modify(Any)` is structural). The observer's delivery shows that these
+    // reports were reconciled.
+    let mut unrelated = vec![
+        notify_event(
+            EventKind::Create(CreateKind::File),
+            vec![canonical_aliases.join("sibling")],
+        ),
+        notify_event(
+            EventKind::Create(CreateKind::File),
+            vec![canonical_root.join("unrelated")],
+        ),
+    ];
+    if cfg!(windows) {
+        unrelated.push(notify_event(
+            EventKind::Modify(ModifyKind::Any),
+            vec![canonical_aliases.clone()],
+        ));
+    }
+    unrelated.push(notify_event(
+        EventKind::Create(CreateKind::File),
+        vec![canonical_root.join("observed").join("changed")],
+    ));
+    for event in unrelated {
+        raw_tx.send(Ok(event)).await.expect("queue event");
+    }
+    assert_eq!(
+        timeout(Duration::from_secs(1), observer_rx.recv())
+            .await
+            .expect("observer event timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![observed.join("changed")],
+            rescan_required: false,
+        })
+    );
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        0
+    );
+    let unrelated_notification = timeout(TEST_THROTTLE_INTERVAL, rx.recv()).await;
+    assert!(
+        unrelated_notification.is_err(),
+        "{unrelated_notification:?}"
+    );
+
+    // Retarget the alias. The native watch on its directory reports the new
+    // entry in that directory's canonical spelling, which the directory's
+    // namespace guard maps back to the requested spelling.
+    #[cfg(windows)]
+    std::fs::remove_dir(&alias).expect("remove alias");
+    #[cfg(unix)]
+    std::fs::remove_file(&alias).expect("remove alias");
+    symlink_dir(&second, &alias).expect("retarget alias");
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Create(CreateKind::Folder),
+            vec![canonical_aliases.join("alias")],
+        )))
+        .await
+        .expect("queue alias event");
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("alias retarget timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![alias.clone()],
+            rescan_required: false,
+        })
+    );
+    assert_eq!(
+        watcher.take_actual_watch_path_resolution_count_for_test(),
+        1
+    );
+    let canonical_second = second.canonicalize().expect("canonical second target");
+    assert_eq!(actual_path(), canonical_second);
+
+    // The watch now follows the new target.
+    raw_tx
+        .send(Ok(notify_event(
+            EventKind::Create(CreateKind::File),
+            vec![canonical_second.join("file")],
+        )))
+        .await
+        .expect("queue new target event");
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("new target event timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![alias.join("file")],
+            rescan_required: false,
+        })
     );
 }
 
@@ -1386,7 +2194,8 @@ async fn non_recursive_watch_ignores_grandchildren() {
     let child = directory.path().join("SKILL.md");
     let watcher = Arc::new(FileWatcher::noop());
     let (subscriber, rx) = watcher.add_subscriber();
-    let _registration = subscriber.register_path(directory.path().to_path_buf(), /*recursive*/ false);
+    let _registration =
+        subscriber.register_path(directory.path().to_path_buf(), /*recursive*/ false);
     let mut rx = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
 
     watcher
@@ -1397,8 +2206,13 @@ async fn non_recursive_watch_ignores_grandchildren() {
     assert_eq!(event.is_err(), true);
     watcher.send_paths_for_test(vec![child.clone()]).await;
     assert_eq!(
-        timeout(Duration::from_secs(1), rx.recv()).await.expect("direct child event"),
-        Some(FileWatcherEvent { paths: vec![child], rescan_required: false })
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("direct child event"),
+        Some(FileWatcherEvent {
+            paths: vec![child],
+            rescan_required: false
+        })
     );
 }
 
@@ -1414,7 +2228,7 @@ async fn ancestor_events_notify_child_watches() {
 
     let watcher = Arc::new(FileWatcher::noop());
     let (subscriber, rx) = watcher.add_subscriber();
-    let _registration = subscriber.register_path(skill_file, /*recursive*/ false);
+    let _registration = subscriber.register_path(skill_file.clone(), /*recursive*/ false);
     let mut rx = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
 
     watcher.send_paths_for_test(vec![skills_dir.clone()]).await;
@@ -1423,15 +2237,21 @@ async fn ancestor_events_notify_child_watches() {
         .await
         .expect("ancestor event timeout")
         .expect("ancestor event");
-    assert_eq!(
-        event,
-        FileWatcherEvent {
-            paths: vec![skills_dir],
-            rescan_required: false,
-        }
+    // The event is reported in the requested namespace. Where the backend's
+    // canonical spelling differs from it, the ancestor is normalized to the
+    // watched path itself; either way the path covers the watched file.
+    assert!(!event.rescan_required);
+    assert_eq!(event.paths.len(), 1, "{event:?}");
+    assert!(
+        skill_file.starts_with(&event.paths[0]) && event.paths[0].starts_with(&skills_dir),
+        "{event:?}"
     );
 }
 
+// Only Windows reports are classified as directory timestamp reports (see
+// `ObservedChanges::record`); elsewhere `Modify(Any)` is structural and must
+// reach the watch, so the suppression asserted here does not apply.
+#[cfg(windows)]
 #[tokio::test]
 async fn ancestor_timestamp_reports_stop_at_a_watched_ancestor() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -1458,30 +2278,52 @@ async fn ancestor_timestamp_reports_stop_at_a_watched_ancestor() {
             .expect("watcher remains open")
     }
 
-    // Nothing watches `parent`, so its timestamp is the only evidence that the
-    // entry leading to the root may have been replaced.
-    raw_tx.send(timestamp(&parent)).await.expect("send event");
-    assert_eq!(next_event(&mut events).await.paths, vec![parent.clone()]);
+    // Native watches use canonical paths, which the backend reports back.
+    let canonical_parent = parent.canonicalize().expect("canonical parent");
+    let canonical_source = canonical_parent.join("root").join("source.txt");
 
+    // The root's namespace guard already watches `parent`, which reports the
+    // entry leading to the root directly. The later source change proves the
+    // timestamp report was processed and not merely delayed.
+    raw_tx
+        .send(timestamp(&canonical_parent))
+        .await
+        .expect("send event");
+    raw_tx
+        .send(timestamp(&canonical_source))
+        .await
+        .expect("send event");
+    assert_eq!(next_event(&mut events).await.paths, vec![source.clone()]);
+
+    // Another owner's fallback watch on `parent` keeps it watched.
     let (other, _other_events) = watcher.add_subscriber();
     let _missing = other.register_path(parent.join(".git"), /*recursive*/ false);
-    assert_eq!(watcher.watch_counts_for_test(&parent), Some((1, 0)));
-
-    // The watch on `parent` now reports its entries directly. The later source
-    // change proves the timestamp report was processed and not merely delayed.
-    raw_tx.send(timestamp(&parent)).await.expect("send event");
-    raw_tx.send(timestamp(&source)).await.expect("send event");
+    assert_eq!(content_watch_counts(&watcher, &parent), Some((1, 0)));
+    raw_tx
+        .send(timestamp(&canonical_parent))
+        .await
+        .expect("send event");
+    raw_tx
+        .send(timestamp(&canonical_source))
+        .await
+        .expect("send event");
     assert_eq!(next_event(&mut events).await.paths, vec![source]);
 
-    // A rename of that directory is not a timestamp report and still arrives.
+    // A rename of that directory is not a timestamp report and still arrives,
+    // in the requested namespace and covering the root.
     raw_tx
         .send(Ok(notify_event(
             EventKind::Modify(ModifyKind::Name(RenameMode::From)),
-            vec![parent.clone()],
+            vec![canonical_parent],
         )))
         .await
         .expect("send event");
-    assert_eq!(next_event(&mut events).await.paths, vec![parent]);
+    let renamed = next_event(&mut events).await;
+    assert_eq!(renamed.paths.len(), 1, "{renamed:?}");
+    assert!(
+        root.starts_with(&renamed.paths[0]) && renamed.paths[0].starts_with(&parent),
+        "{renamed:?}"
+    );
 }
 
 #[tokio::test]
@@ -1547,7 +2389,10 @@ async fn missing_directory_watch_moves_to_created_directory_for_child_events() {
     let _registration = subscriber.register_path(skills_dir.clone(), /*recursive*/ false);
     let mut rx = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
 
-    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), Some((1, 0)));
+    assert_eq!(
+        content_watch_counts(&watcher, temp_dir.path()),
+        Some((1, 0))
+    );
     assert_eq!(watcher.watch_counts_for_test(&skills_dir), None);
 
     std::fs::create_dir(&skills_dir).expect("create skills dir");
@@ -1566,7 +2411,8 @@ async fn missing_directory_watch_moves_to_created_directory_for_child_events() {
             rescan_required: false,
         }
     );
-    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), None);
+    // Only the requested path's namespace guard still holds the parent.
+    assert_eq!(content_watch_counts(&watcher, temp_dir.path()), None);
     assert_eq!(watcher.watch_counts_for_test(&skills_dir), Some((1, 0)));
 
     std::fs::write(&skill_file, "name: rust\n").expect("write skill file");
@@ -1601,9 +2447,14 @@ async fn missing_watch_rekeys_canonical_identity_when_symlink_appears() {
 
     symlink_dir(&real_dir, &linked_dir).expect("create directory symlink");
     let canonical_file = real_file.canonicalize().expect("canonical file");
-    watcher
-        .send_paths_for_test(vec![canonical_file.clone()])
-        .await;
+    // The fallback's native watch on the canonical parent reports the new link
+    // entry in that canonical spelling.
+    let canonical_link = temp_dir
+        .path()
+        .canonicalize()
+        .expect("canonical temp dir")
+        .join("linked");
+    watcher.send_paths_for_test(vec![canonical_link]).await;
 
     assert_eq!(
         timeout(Duration::from_secs(1), rx.recv())
@@ -1614,7 +2465,8 @@ async fn missing_watch_rekeys_canonical_identity_when_symlink_appears() {
             rescan_required: false,
         })
     );
-    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), None);
+    // Only the requested path's namespace guard still holds the parent.
+    assert_eq!(content_watch_counts(&watcher, temp_dir.path()), None);
     assert_eq!(watcher.watch_counts_for_test(&requested_file), Some((1, 0)));
 
     watcher.send_paths_for_test(vec![canonical_file]).await;
@@ -1682,7 +2534,7 @@ async fn raw_event_buffer_overflow_requires_a_rescan() {
         &raw_overflow,
         &raw_overflow_notify,
         Ok(notify_event(
-            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Create(CreateKind::File),
             vec![path("/tmp/skills/first")],
         )),
     );

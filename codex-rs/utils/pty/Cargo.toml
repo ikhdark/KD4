@@ -14,6 +14,7 @@ test-support = []
 anyhow = { workspace = true }
 log = { workspace = true }
 portable-pty = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]

@@ -134,7 +134,6 @@ fn context_compaction_notifications_preserve_lifecycle_and_json_shape() {
     }
 }
 
-
 #[test]
 fn session_configured_produces_thread_started_event() {
     let thread_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")
@@ -201,6 +200,7 @@ fn turn_started_emits_turn_started_event() {
 fn command_execution_started_and_completed_translate_to_thread_events() {
     let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
     let command_item = ThreadItem::from(CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
+        environment: None,
         output_metadata: None,
         id: "cmd-1".to_string(),
         process_id: Some("123".to_string()),
@@ -267,6 +267,7 @@ fn command_execution_started_and_completed_translate_to_thread_events() {
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::from(CoreTurnItem::CommandExecution(CoreCommandExecutionItem {
+                environment: None,
                 output_metadata: None,
                 id: "cmd-1".to_string(),
                 process_id: Some("123".to_string()),
@@ -410,9 +411,10 @@ fn unsupported_items_do_not_consume_synthetic_ids() {
 
     let ignored = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
-            item: ThreadItem::Plan {
-                id: "plan-1".to_string(),
-                text: "ignored plan".to_string(),
+            item: ThreadItem::UserMessage {
+                id: "user-1".to_string(),
+                client_id: None,
+                content: Vec::new(),
             },
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
@@ -449,6 +451,7 @@ fn unsupported_items_do_not_consume_synthetic_ids() {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::AgentMessage(AgentMessageItem {
                         text: "hello".to_string(),
+                        phase: None,
                     }),
                 },
             })],
@@ -490,7 +493,6 @@ fn reasoning_items_emit_summary_not_raw_content() {
     );
 }
 
-
 #[test]
 fn web_search_completion_preserves_page_actions() {
     let cases = [
@@ -520,6 +522,8 @@ fn web_search_completion_preserves_page_actions() {
         let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
             ItemCompletedNotification {
                 item: ThreadItem::WebSearch(ApiWebSearchItem {
+                    status: None,
+                    error: None,
                     id: "search-1".to_string(),
                     query: "rust async await".to_string(),
                     action: Some(api_action),
@@ -537,7 +541,9 @@ fn web_search_completion_preserves_page_actions() {
                     item: ExecThreadItem {
                         id: "item_0".to_string(),
                         details: ThreadItemDetails::WebSearch(WebSearchItem {
-                            id: "search-1".to_string(),
+                            status: None,
+                            error: None,
+                            call_id: "search-1".to_string(),
                             query: "rust async await".to_string(),
                             action: expected_action,
                         }),
@@ -556,6 +562,8 @@ fn web_search_start_and_completion_reuse_item_id() {
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
             item: ThreadItem::WebSearch(ApiWebSearchItem {
+                status: None,
+                error: None,
                 id: "search-1".to_string(),
                 query: String::new(),
                 action: None,
@@ -568,6 +576,8 @@ fn web_search_start_and_completion_reuse_item_id() {
     let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::WebSearch(ApiWebSearchItem {
+                status: None,
+                error: None,
                 id: "search-1".to_string(),
                 query: "rust async await".to_string(),
                 action: Some(ApiWebSearchAction::Search {
@@ -588,7 +598,9 @@ fn web_search_start_and_completion_reuse_item_id() {
                 item: ExecThreadItem {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::WebSearch(WebSearchItem {
-                        id: "search-1".to_string(),
+                        status: None,
+                        error: None,
+                        call_id: "search-1".to_string(),
                         query: String::new(),
                         action: WebSearchAction::Other,
                     }),
@@ -604,7 +616,9 @@ fn web_search_start_and_completion_reuse_item_id() {
                 item: ExecThreadItem {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::WebSearch(WebSearchItem {
-                        id: "search-1".to_string(),
+                        status: None,
+                        error: None,
+                        call_id: "search-1".to_string(),
                         query: "rust async await".to_string(),
                         action: WebSearchAction::Search {
                             query: Some("rust async await".to_string()),
@@ -893,6 +907,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                 agents_states: std::collections::HashMap::from([(
                     "thread-child".to_string(),
                     ApiCollabAgentState {
+                        stop_cause: None,
                         status: ApiCollabAgentStatus::Running,
                         message: None,
                         surfaced_result: None,
@@ -939,6 +954,7 @@ fn collab_spawn_begin_and_end_emit_item_events() {
                         agents_states: std::collections::HashMap::from([(
                             "thread-child".to_string(),
                             CollabAgentState {
+                                stop_cause: None,
                                 status: CollabAgentStatus::Running,
                                 message: None,
                                 surfaced_result: None,
@@ -992,6 +1008,7 @@ fn file_change_completion_maps_change_kinds() {
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::FileChange {
+                environment: None,
                 id: "patch-1".to_string(),
                 changes: vec![
                     ApiFileUpdateChange {
@@ -1055,6 +1072,7 @@ fn file_change_declined_preserves_status_and_wire_shape() {
     let collected = processor.collect_thread_events(ServerNotification::ItemCompleted(
         ItemCompletedNotification {
             item: ThreadItem::FileChange {
+                environment: None,
                 id: "patch-2".to_string(),
                 changes: vec![ApiFileUpdateChange {
                     path: "file.txt".to_string(),
@@ -1116,6 +1134,7 @@ fn agent_message_item_updates_final_message() {
                     id: "item_0".to_string(),
                     details: ThreadItemDetails::AgentMessage(AgentMessageItem {
                         text: "hello".to_string(),
+                        phase: None,
                     }),
                 },
             })],
@@ -1149,7 +1168,6 @@ fn agent_message_item_started_is_ignored() {
         }
     );
 }
-
 
 #[test]
 fn plan_update_emits_started_then_updated_then_completed() {
@@ -1279,7 +1297,7 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 }),
                 ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                     surfaced_result: None,
-                    usage: Usage::default(),
+                    usage: None,
                     timing: None,
                 })),
             ],
@@ -1371,6 +1389,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                         cached_input_tokens: 3,
                         output_tokens: 29,
                         reasoning_output_tokens: 7,
+                        coverage: None,
                     },
                     last: TokenUsageBreakdown {
                         total_tokens: 5,
@@ -1378,6 +1397,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
                         cached_input_tokens: 1,
                         output_tokens: 3,
                         reasoning_output_tokens: 0,
+                        coverage: None,
                     },
                     model_context_window: Some(128_000),
                 },
@@ -1415,12 +1435,13 @@ fn token_usage_update_is_emitted_on_turn_completion() {
         CollectedThreadEvents {
             events: vec![ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                 surfaced_result: None,
-                usage: Usage {
+                usage: Some(Usage {
                     input_tokens: 10,
                     cached_input_tokens: 3,
                     output_tokens: 29,
                     reasoning_output_tokens: 7,
-                },
+                    coverage: None,
+                }),
                 timing: None,
             }))],
             status: CodexStatus::InitiateShutdown,
@@ -1464,13 +1485,14 @@ fn turn_completion_recovers_final_message_from_turn_items() {
                     item: ExecThreadItem {
                         id: "item_0".to_string(),
                         details: ThreadItemDetails::AgentMessage(AgentMessageItem {
-                            text: "final answer".to_string()
+                            text: "final answer".to_string(),
+                            phase: None,
                         }),
                     },
                 }),
                 ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                     surfaced_result: None,
-                    usage: Usage::default(),
+                    usage: None,
                     timing: None,
                 }))
             ],
@@ -1487,6 +1509,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
     let started =
         processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
             item: ThreadItem::CommandExecution {
+                environment: None,
                 output_metadata: None,
                 stdout: None,
                 stderr: None,
@@ -1543,6 +1566,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
                 items: vec![ThreadItem::CommandExecution {
+                    environment: None,
                     output_metadata: None,
                     stdout: None,
                     stderr: None,
@@ -1598,7 +1622,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
                 }),
                 ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                     surfaced_result: None,
-                    usage: Usage::default(),
+                    usage: None,
                     timing: None,
                 })),
             ],
@@ -1655,13 +1679,14 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
                     item: ExecThreadItem {
                         id: "item_1".to_string(),
                         details: ThreadItemDetails::AgentMessage(AgentMessageItem {
-                            text: "final answer".to_string()
+                            text: "final answer".to_string(),
+                            phase: None,
                         }),
                     },
                 }),
                 ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                     surfaced_result: None,
-                    usage: Usage::default(),
+                    usage: None,
                     timing: None,
                 }))
             ],
@@ -1712,7 +1737,7 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
         CollectedThreadEvents {
             events: vec![ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
                 surfaced_result: None,
-                usage: Usage::default(),
+                usage: None,
                 timing: None,
             }))],
             status: CodexStatus::InitiateShutdown,
@@ -1854,11 +1879,21 @@ fn turn_completion_falls_back_to_final_plan_text() {
     assert_eq!(
         completed,
         CollectedThreadEvents {
-            events: vec![ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
-                surfaced_result: None,
-                usage: Usage::default(),
-                timing: None,
-            }))],
+            events: vec![
+                ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                    item: ExecThreadItem {
+                        id: "item_0".to_string(),
+                        details: ThreadItemDetails::Plan(codex_exec::PlanItem {
+                            text: "ship the typed adapter".to_string(),
+                        }),
+                    },
+                }),
+                ThreadEvent::TurnCompleted(Box::new(TurnCompletedEvent {
+                    surfaced_result: None,
+                    usage: None,
+                    timing: None,
+                }))
+            ],
             status: CodexStatus::InitiateShutdown,
         }
     );
@@ -1884,6 +1919,7 @@ fn turn_failure_prefers_structured_error_message() {
         CollectedThreadEvents {
             events: vec![ThreadEvent::Error(ThreadErrorEvent {
                 message: "backend failed (request id abc)".to_string(),
+                ..Default::default()
             })],
             status: CodexStatus::Running,
         }
@@ -1914,6 +1950,7 @@ fn turn_failure_prefers_structured_error_message() {
             events: vec![ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                 error: ThreadErrorEvent {
                     message: "backend failed (request id abc)".to_string(),
+                    ..Default::default()
                 },
                 disposition: codex_exec::TurnFailureDisposition::Failed,
                 usage: None,
@@ -1985,6 +2022,7 @@ fn interrupted_turn_emits_turn_failed_terminal_event() {
             events: vec![ThreadEvent::TurnFailed(Box::new(TurnFailedEvent {
                 error: ThreadErrorEvent {
                     message: "turn interrupted".to_string(),
+                    ..Default::default()
                 },
                 disposition: codex_exec::TurnFailureDisposition::Interrupted,
                 usage: None,

@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use anyhow::Result;
 use anyhow::anyhow;
 use base64::Engine as _;
-use codex_utils_der::first_der_item;
+use codex_utils_der::trusted_certificate_for_server_auth;
 use rama_net::tls::ApplicationProtocol;
 use rama_tls_rustls::dep::pki_types::CertificateDer;
 use rama_tls_rustls::dep::pki_types::PrivateKeyDer;
@@ -358,9 +358,9 @@ fn read_ca_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
                 format!("failed to parse startup CA bundle: {}", path.display())
             })?;
             let cert = if trusted {
-                let der = first_der_item(cert.as_ref()).ok_or_else(|| {
+                let der = trusted_certificate_for_server_auth(cert.as_ref()).map_err(|detail| {
                     anyhow!(
-                        "startup CA bundle contained an invalid trusted certificate: {}",
+                        "startup CA bundle contained an invalid trusted certificate ({detail}): {}",
                         path.display()
                     )
                 })?;
@@ -790,7 +790,9 @@ mod tests {
         let der_with_trailing_data = [0x30, 0x00, 0x05, 0x00];
         let mut ordinary = String::new();
         push_certificate_pem(&mut ordinary, &der_with_trailing_data);
-        let trusted = ordinary.replace("CERTIFICATE", "TRUSTED CERTIFICATE");
+        let mut trusted = String::new();
+        push_certificate_pem(&mut trusted, &[0x30, 0x00, 0x30, 0x00]);
+        let trusted = trusted.replace("CERTIFICATE", "TRUSTED CERTIFICATE");
 
         for newline in ["\n", "\r\n", "\r"] {
             for (pem, expected) in [
@@ -832,6 +834,21 @@ mod tests {
     }
 
     #[test]
+    fn startup_ca_bundle_rejects_nonempty_aux_before_export() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("restricted.pem");
+        let mut pem = String::new();
+        push_certificate_pem(&mut pem, &[0x30, 0, 0x30, 3, 0x06, 1, 0x2a]);
+        fs::write(&path, pem.replace("CERTIFICATE", "TRUSTED CERTIFICATE")).unwrap();
+        assert!(
+            read_ca_certificates(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("AUX policy")
+        );
+    }
+
+    #[test]
     fn ca_publication_preserves_existing_file_and_removes_temporary_artifact() {
         let home = tempdir().unwrap();
         let path = home.path().join("certificate.pem");
@@ -857,7 +874,10 @@ mod tests {
     }
 
     fn managed_ca_proxy_builder(home: &Path, mitm: bool) -> crate::NetworkProxyBuilder {
+        // A disabled proxy is inert: it neither builds the managed CA bundle nor
+        // publishes environment overrides, so these regressions need it enabled.
         let config = crate::NetworkProxyConfig {
+            enabled: true,
             mitm,
             ..Default::default()
         };

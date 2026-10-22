@@ -463,8 +463,16 @@ mod tests {
     #[test]
     fn resource_attributes_only_include_nonempty_host_names_for_logs() {
         for (kind, host, expected_host) in [
-            (ResourceKind::Logs, Some("opentelemetry-test"), Some("opentelemetry-test")),
-            (ResourceKind::Logs, Some("  opentelemetry-test  "), Some("opentelemetry-test")),
+            (
+                ResourceKind::Logs,
+                Some("opentelemetry-test"),
+                Some("opentelemetry-test"),
+            ),
+            (
+                ResourceKind::Logs,
+                Some("  opentelemetry-test  "),
+                Some("opentelemetry-test"),
+            ),
             (ResourceKind::Logs, None, None),
             (ResourceKind::Logs, Some("   "), None),
             (ResourceKind::Traces, Some("opentelemetry-test"), None),
@@ -527,8 +535,14 @@ mod tests {
             for signal in ["logs", "traces", "metrics"] {
                 for (entries, expected) in [
                     (vec![("bad name", "secret")], "invalid OTLP header name"),
-                    (vec![("authorization", "secret\nvalue")], "invalid OTLP header value"),
-                    (vec![("X-Token", "secret"), ("x-token", "different-secret")], "duplicate OTLP header name"),
+                    (
+                        vec![("authorization", "secret\nvalue")],
+                        "invalid OTLP header value",
+                    ),
+                    (
+                        vec![("X-Token", "secret"), ("x-token", "different-secret")],
+                        "duplicate OTLP header name",
+                    ),
                 ] {
                     let headers = entries
                         .into_iter()

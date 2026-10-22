@@ -35,6 +35,51 @@ impl std::error::Error for ThreadSpawnEdgeWriteError {
 }
 
 impl StateRuntime {
+    /// Traverse current durable parents and live-only lineage in one read.
+    pub async fn list_reconciled_thread_spawn_edges(
+        &self,
+        root: ThreadId,
+        live_edges: &[(ThreadId, ThreadId)],
+    ) -> anyhow::Result<Vec<(ThreadId, ThreadId)>> {
+        let live_edges = live_edges
+            .iter()
+            .map(|(parent, child)| (child.to_string(), parent.to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let rows = sqlx::query(
+            r#"
+WITH RECURSIVE live(parent, child) AS (
+    SELECT value, key FROM json_each(?)
+), reachable(id) AS (
+    SELECT ?
+    UNION
+    SELECT edge.child_thread_id FROM thread_spawn_edges AS edge
+    JOIN reachable ON edge.parent_thread_id = reachable.id
+    UNION
+    SELECT live.child FROM live JOIN reachable ON live.parent = reachable.id
+    WHERE NOT EXISTS (SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = live.child)
+)
+SELECT parent_thread_id AS parent, child_thread_id AS child
+FROM thread_spawn_edges WHERE parent_thread_id IN (SELECT id FROM reachable)
+UNION ALL
+SELECT parent, child FROM live WHERE parent IN (SELECT id FROM reachable)
+AND NOT EXISTS (SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = live.child)
+ORDER BY parent, child
+            "#,
+        )
+        .bind(serde_json::to_string(&live_edges)?)
+        .bind(root.to_string())
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    ThreadId::try_from(row.try_get::<String, _>("parent")?)?,
+                    ThreadId::try_from(row.try_get::<String, _>("child")?)?,
+                ))
+            })
+            .collect()
+    }
+
     /// Fetches `(id, title, first_user_message)` for existing requested threads.
     /// A JSON array keeps this to one query without SQLite's bind-variable limit.
     pub async fn get_thread_titles(
@@ -71,6 +116,8 @@ impl StateRuntime {
             r#"
 SELECT
     threads.id,
+    threads.session_id,
+    (SELECT parent_thread_id FROM thread_spawn_edges WHERE child_thread_id = threads.id) AS current_parent_thread_id,
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
@@ -260,49 +307,46 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         root_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
+        // The unique incoming-child key means a reachable cycle must include the root.
+        // Excluding it terminates legacy cycles without quadratic ancestor-string work.
         let root_thread_id = root_thread_id.to_string();
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-WITH RECURSIVE subtree(child_thread_id, depth, visited) AS (
-    SELECT child_thread_id, 1, ',' ||
-            "#,
-        );
-        builder.push_bind(root_thread_id.clone());
-        builder.push(
-            r#" || ',' || child_thread_id || ','
+WITH RECURSIVE subtree(child_thread_id, depth) AS (
+    SELECT child_thread_id, 1
     FROM thread_spawn_edges
     WHERE parent_thread_id =
             "#,
         );
         builder.push_bind(root_thread_id.clone());
         builder.push(" AND child_thread_id != ");
-        builder.push_bind(root_thread_id);
+        builder.push_bind(root_thread_id.clone());
         if let Some(status) = status {
             let status = status.to_string();
             builder.push(" AND status = ").push_bind(status.clone());
             builder.push(
                 r#"
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1,
-           subtree.visited || edge.child_thread_id || ','
+    SELECT edge.child_thread_id, subtree.depth + 1
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-    WHERE instr(subtree.visited, ',' || edge.child_thread_id || ',') = 0
-      AND edge.status =
+    WHERE edge.child_thread_id !=
                 "#,
             );
+            builder.push_bind(root_thread_id);
+            builder.push(" AND edge.status = ");
             builder.push_bind(status);
         } else {
             builder.push(
                 r#"
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1,
-           subtree.visited || edge.child_thread_id || ','
+    SELECT edge.child_thread_id, subtree.depth + 1
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-    WHERE instr(subtree.visited, ',' || edge.child_thread_id || ',') = 0
+    WHERE edge.child_thread_id !=
                 "#,
             );
+            builder.push_bind(root_thread_id);
         }
         builder.push(
             r#"
@@ -408,9 +452,38 @@ ON CONFLICT(child_thread_id) DO NOTHING
         let Some(parent_thread_id) = thread_spawn_parent_thread_id_from_source_str(source) else {
             return Ok(());
         };
-        self.insert_thread_spawn_edge_if_absent(parent_thread_id, child_thread_id)
-            .await?;
-        Ok(())
+        self.infer_thread_spawn_edge_if_absent(parent_thread_id, child_thread_id)
+            .await
+    }
+
+    /// Persist lineage inferred from history, typically after a metadata write.
+    ///
+    /// An explicitly deleted endpoint means the edge is intentionally absent: the
+    /// deletion trigger still rejects the insert, but that settles inference instead
+    /// of failing a surviving thread's already-committed metadata. Explicit edge
+    /// writes keep the rejection through [`Self::insert_thread_spawn_edge_if_absent`].
+    pub async fn infer_thread_spawn_edge_if_absent(
+        &self,
+        parent_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    ) -> anyhow::Result<()> {
+        let Err(err) = self
+            .insert_thread_spawn_edge_if_absent(parent_thread_id, child_thread_id)
+            .await
+        else {
+            return Ok(());
+        };
+        let deleted_owner = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM deleted_thread_owners WHERE thread_id IN (?, ?))",
+        )
+        .bind(parent_thread_id.to_string())
+        .bind(child_thread_id.to_string())
+        .fetch_one(self.pool.as_ref())
+        .await?;
+        if deleted_owner != 0 {
+            return Ok(());
+        }
+        Err(err.into())
     }
 
     /// Find a rollout path by thread id using the underlying database.
@@ -438,16 +511,17 @@ ON CONFLICT(child_thread_id) DO NOTHING
             .map(PathBuf::from))
     }
 
-    /// Find the newest thread whose user-facing title exactly matches `title`.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn find_thread_by_exact_title(
+    /// Find threads whose user-facing title exactly matches `title`, newest first.
+    ///
+    /// There is no cwd filter: metadata writers store a canonicalized cwd, which need not match
+    /// a caller's configured cwd textually, so callers compare cwd after path normalization.
+    pub async fn find_threads_by_exact_title(
         &self,
         title: &str,
         allowed_sources: &[String],
         model_providers: Option<&[String]>,
         archived_only: bool,
-        cwd: Option<&Path>,
-    ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+    ) -> anyhow::Result<Vec<crate::ThreadMetadata>> {
         let mut builder = QueryBuilder::<Sqlite>::new("");
         push_thread_select_columns(&mut builder);
         builder.push(" FROM threads");
@@ -469,22 +543,12 @@ ON CONFLICT(child_thread_id) DO NOTHING
         );
         builder.push(" AND threads.title = ");
         builder.push_bind(title);
-        if let Some(cwd) = cwd {
-            builder.push(" AND threads.cwd = ");
-            builder.push_bind(cwd.display().to_string());
-        }
-        push_thread_order_and_limit(
-            &mut builder,
-            crate::SortKey::UpdatedAt,
-            SortDirection::Desc,
-            OrderByIndex::Enabled,
-            /*include_thread_id_tiebreaker*/ false,
-            /*limit*/ 1,
-        );
+        builder.push(" ORDER BY threads.updated_at_ms DESC, threads.id DESC");
 
-        let row = builder.build().fetch_optional(self.pool.as_ref()).await?;
-        row.map(|row| ThreadRow::try_from_row(&row).and_then(crate::ThreadMetadata::try_from))
-            .transpose()
+        let rows = builder.build().fetch_all(self.pool.as_ref()).await?;
+        rows.iter()
+            .map(|row| ThreadRow::try_from_row(row).and_then(crate::ThreadMetadata::try_from))
+            .collect()
     }
 
     /// List threads using the underlying database.
@@ -613,10 +677,13 @@ ON CONFLICT(child_thread_id) DO NOTHING
         patch(&mut metadata).map_err(anyhow::Error::msg)?;
         if let Some(id) = metadata.project_id.as_deref() {
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE id = ?")
-                .bind(id).fetch_one(&mut *tx).await?;
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
             anyhow::ensure!(exists != 0, "project not found: {id}");
         }
-        self.upsert_thread_on_connection(&mut tx, &metadata, true).await?;
+        self.upsert_thread_on_connection(&mut tx, &metadata, true)
+            .await?;
         // Explicit patches can clear Git/project fields; rollout upserts instead
         // deliberately preserve those fields. Both writes share this transaction.
         sqlx::query("UPDATE threads SET git_sha = ?, git_branch = ?, git_origin_url = ?, project_id = ? WHERE id = ?")
@@ -627,9 +694,11 @@ ON CONFLICT(child_thread_id) DO NOTHING
             .bind(metadata.id.to_string())
             .execute(&mut *tx).await?;
         let metadata = Self::get_thread_on_connection(&mut tx, metadata.id)
-            .await?.ok_or_else(|| anyhow::anyhow!("thread metadata disappeared during patch"))?;
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("thread metadata disappeared during patch"))?;
         tx.commit().await?;
-        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str()).await?;
+        self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
+            .await?;
         Ok(metadata)
     }
 
@@ -640,6 +709,108 @@ ON CONFLICT(child_thread_id) DO NOTHING
     ) -> anyhow::Result<()> {
         self.upsert_thread_with_timestamps(metadata, /*allocate_timestamps*/ false)
             .await
+    }
+
+    /// Read repair owns only its named fields. Do not recreate a concurrently
+    /// deleted row or allocate artificial recency for an otherwise read-only operation.
+    pub async fn patch_existing_thread_metadata(
+        &self,
+        id: ThreadId,
+        patch: impl FnOnce(&mut crate::ThreadMetadata) + Send,
+    ) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let Some(mut current) = Self::get_thread_on_connection(&mut tx, id).await? else {
+            return Ok(false);
+        };
+        let previous = current.clone();
+        patch(&mut current);
+        if current != previous {
+            self.upsert_thread_on_connection(&mut tx, &current, false)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Merge filesystem extraction against current authority under the write
+    /// reservation. An older snapshot cannot replace a newer explicit update.
+    pub async fn thread_metadata_for_rollout_path(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<Option<crate::ThreadMetadata>> {
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM threads WHERE rollout_path IN (?, ?) LIMIT 1")
+                .bind(path.display().to_string())
+                .bind(path.with_extension("jsonl.zst").display().to_string())
+                .fetch_optional(self.pool.as_ref())
+                .await?;
+        match id {
+            Some(id) => self.get_thread(ThreadId::from_string(&id)?).await,
+            None => Ok(None),
+        }
+    }
+
+    pub async fn reconcile_thread_metadata(
+        &self,
+        extracted: &crate::ThreadMetadata,
+        expected: Option<&crate::ThreadMetadata>,
+        source_version: &(PathBuf, u64, Option<std::time::SystemTime>),
+    ) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let source = tokio::fs::metadata(&source_version.0).await?;
+        anyhow::ensure!(
+            source.len() == source_version.1 && source.modified().ok() == source_version.2,
+            "rollout changed during metadata extraction; reconciliation remains pending"
+        );
+        let current = Self::get_thread_on_connection(&mut tx, extracted.id).await?;
+        if expected.is_none()
+            && let Some(mut current) = current.clone()
+            && current.rollout_path != extracted.rollout_path
+        {
+            // A completed move can leave the index under its previous path.
+            // Repair only location now, then retry extraction from this base.
+            current.rollout_path = extracted.rollout_path.clone();
+            current.archived_at = extracted.archived_at;
+            self.upsert_thread_on_connection(&mut tx, &current, false)
+                .await?;
+            tx.commit().await?;
+            anyhow::bail!("rollout location repaired; retry metadata reconciliation");
+        }
+        anyhow::ensure!(
+            current.as_ref() == expected,
+            "thread metadata changed during extraction; stale snapshot rejected"
+        );
+        let mut merged = extracted.clone();
+        if let Some(current) = current {
+            if extracted.updated_at < current.updated_at {
+                // Identity is immutable and can be recovered independently of newer
+                // mutable settings. Do not leave legacy rows permanently unknown.
+                if current.session_id.is_none()
+                    && let Some(session_id) = extracted.session_id
+                {
+                    sqlx::query(
+                        "UPDATE threads SET session_id = ? WHERE id = ? AND session_id IS NULL",
+                    )
+                    .bind(session_id.to_string())
+                    .bind(current.id.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                // Path/archive repair is a separate, narrow operation. The
+                // source does not authorize reverting any current row fields.
+                tx.commit().await?;
+                return Ok(());
+            }
+            merged.prefer_existing_git_info(&current);
+            merged.prefer_existing_explicit_title(&current);
+            // A legacy rollout with no model observation cannot clear the last
+            // observed model. A known canonical model still takes precedence.
+            merged.model = merged.model.or(current.model);
+        }
+        self.upsert_thread_on_connection(&mut tx, &merged, false)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn update_thread_title(
@@ -795,6 +966,7 @@ impl StateRuntime {
             r#"
 INSERT INTO threads (
     id,
+    session_id,
     rollout_path,
     created_at,
     updated_at,
@@ -825,8 +997,9 @@ INSERT INTO threads (
     git_branch,
     git_origin_url,
     project_id
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
+    session_id = COALESCE(threads.session_id, excluded.session_id),
     rollout_path = excluded.rollout_path,
     created_at = excluded.created_at,
     updated_at = excluded.updated_at,
@@ -859,6 +1032,7 @@ ON CONFLICT(id) DO UPDATE SET
             "#,
         )
         .bind(metadata.id.to_string())
+        .bind(metadata.session_id.map(|id| id.to_string()))
         .bind(metadata.rollout_path.display().to_string())
         .bind(datetime_to_epoch_seconds(metadata.created_at))
         .bind(datetime_to_epoch_seconds(updated_at))
@@ -927,6 +1101,7 @@ ON CONFLICT(id) DO UPDATE SET
         let mut metadata = existing_metadata
             .clone()
             .unwrap_or_else(|| builder.build(&self.default_provider));
+        metadata.session_id = metadata.session_id.or(builder.session_id);
         metadata.rollout_path = builder.rollout_path.clone();
         crate::extract::apply_rollout_items(&mut metadata, items, &self.default_provider);
         if let Some(existing_metadata) = existing_metadata.as_ref() {
@@ -941,7 +1116,7 @@ ON CONFLICT(id) DO UPDATE SET
         self.insert_thread_spawn_edge_from_source_if_absent(metadata.id, metadata.source.as_str())
             .await?;
         if let Some(parent_thread_id) = builder.parent_thread_id {
-            self.insert_thread_spawn_edge_if_absent(parent_thread_id, builder.id)
+            self.infer_thread_spawn_edge_if_absent(parent_thread_id, builder.id)
                 .await?;
         }
         Ok(())
@@ -1009,6 +1184,48 @@ ON CONFLICT(id) DO UPDATE SET
         &self,
         thread_ids: &[ThreadId],
     ) -> anyhow::Result<(u64, usize)> {
+        self.delete_threads_with_boundary(thread_ids, None).await
+    }
+
+    /// Validate the selected subtree under the same writer reservation as deletion.
+    /// A crossing edge requires replanning while staged files can still roll back.
+    pub async fn delete_thread_subtree_strict(
+        &self,
+        root: ThreadId,
+        thread_ids: &[ThreadId],
+    ) -> anyhow::Result<u64> {
+        let (rows, _) = self
+            .delete_threads_with_boundary(thread_ids, Some(root))
+            .await?;
+        Ok(rows)
+    }
+
+    /// Explicit restore/import authorization only; ordinary metadata inference
+    /// must never clear deletion evidence. Receipts otherwise have no expiry.
+    /// Replace any ThreadManager that retired these UUIDs before reloading them;
+    /// its in-process retirement fence deliberately lasts for that manager's lifetime.
+    pub async fn restore_deleted_thread_owners(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> anyhow::Result<()> {
+        let ids = thread_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        sqlx::query(
+            "DELETE FROM deleted_thread_owners WHERE thread_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::to_string(&ids)?)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_threads_with_boundary(
+        &self,
+        thread_ids: &[ThreadId],
+        root: Option<ThreadId>,
+    ) -> anyhow::Result<(u64, usize)> {
         if thread_ids.is_empty() {
             return Ok((0, 0));
         }
@@ -1019,8 +1236,28 @@ ON CONFLICT(id) DO UPDATE SET
             .collect::<Vec<_>>();
         let thread_ids_json = serde_json::to_string(&thread_id_strings)?;
         let now = Utc::now().timestamp();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let mut primary_statement_count = 0;
+        if let Some(root) = root {
+            anyhow::ensure!(
+                thread_ids.contains(&root),
+                "subtree deletion must include its root"
+            );
+            let crossing: i64 = sqlx::query_scalar(
+                r#"
+WITH selected(id) AS (SELECT value FROM json_each(?))
+SELECT EXISTS (
+    SELECT 1 FROM thread_spawn_edges
+    WHERE (parent_thread_id IN selected AND child_thread_id NOT IN selected)
+       OR (child_thread_id IN selected AND child_thread_id != ? AND parent_thread_id NOT IN selected)
+)
+                "#,
+            ).bind(&thread_ids_json).bind(root.to_string()).fetch_one(&mut *tx).await?;
+            anyhow::ensure!(
+                crossing == 0,
+                "subtree topology changed during deletion; retry the operation"
+            );
+        }
 
         // If both the job runner and worker are being deleted, requeueing the worker item would
         // leave a running job with no loop to consume it.
@@ -1113,6 +1350,9 @@ WHERE parent_thread_id IN (SELECT value FROM json_each(?))
                 .await?
                 .rows_affected();
         primary_statement_count += 1;
+        sqlx::query("INSERT OR IGNORE INTO deleted_thread_owners (thread_id) SELECT value FROM json_each(?)")
+            .bind(&thread_ids_json).execute(&mut *tx).await?;
+        primary_statement_count += 1;
         tx.commit().await?;
 
         if let Err(err) =
@@ -1173,7 +1413,7 @@ SELECT EXISTS(
     if parent_is_descendant {
         return Err(ThreadSpawnEdgeWriteError::InvalidRequest {
             message: format!(
-                "cannot make thread {parent_thread_id} the parent of its descendant {child_thread_id}"
+                "cannot make thread {parent_thread_id} the parent of its ancestor {child_thread_id}; this would create a cycle"
             ),
         });
     }
@@ -1264,6 +1504,8 @@ pub(super) fn push_thread_select_columns(builder: &mut QueryBuilder<Sqlite>) {
         r#"
 SELECT
     threads.id,
+    threads.session_id,
+    (SELECT parent_thread_id FROM thread_spawn_edges WHERE child_thread_id = threads.id) AS current_parent_thread_id,
     threads.rollout_path,
     threads.created_at_ms AS created_at,
     threads.updated_at_ms AS updated_at,
@@ -1493,6 +1735,60 @@ mod tests {
     use std::path::PathBuf;
 
     #[tokio::test]
+    async fn durable_audit_06_full_reconciliation_rejects_stale_and_deleted_bases() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let id = ThreadId::new();
+        let original = test_thread_metadata(home.path(), id, home.path().into());
+        std::fs::write(&original.rollout_path, b"canonical source\n")?;
+        let file = std::fs::metadata(&original.rollout_path)?;
+        let version = (
+            original.rollout_path.clone(),
+            file.len(),
+            file.modified().ok(),
+        );
+        runtime.upsert_thread(&original).await?;
+        let expected = runtime.get_thread(id).await?.unwrap();
+        runtime
+            .patch_thread_metadata(&expected, |current| {
+                current.title = "new explicit title".into();
+                current.model = Some("new-model".into());
+                current.tokens_used = 999;
+                Ok(())
+            })
+            .await?;
+        assert!(
+            runtime
+                .reconcile_thread_metadata(&original, Some(&expected), &version)
+                .await
+                .is_err()
+        );
+        let latest = runtime.get_thread(id).await?.unwrap();
+        assert_eq!(latest.title, "new explicit title");
+        assert_eq!(latest.model.as_deref(), Some("new-model"));
+        assert_eq!(latest.tokens_used, 999);
+        sqlx::query("DELETE FROM threads WHERE id = ?")
+            .bind(id.to_string())
+            .execute(runtime.pool.as_ref())
+            .await?;
+        assert!(
+            runtime
+                .reconcile_thread_metadata(&original, Some(&latest), &version)
+                .await
+                .is_err()
+        );
+        assert!(runtime.get_thread(id).await?.is_none());
+        assert!(
+            !runtime
+                .patch_existing_thread_metadata(id, |current| current.rollout_path =
+                    home.path().join("new"))
+                .await?
+        );
+        runtime.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn metadata_patches_merge_against_current_row_not_stale_fallback() -> Result<()> {
         let home = tempfile::tempdir()?;
         let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
@@ -1501,10 +1797,12 @@ mod tests {
         runtime.upsert_thread(&fallback).await?;
         let (title, model) = tokio::join!(
             runtime.patch_thread_metadata(&fallback, |current| {
-                current.title = "new title".into(); Ok(())
+                current.title = "new title".into();
+                Ok(())
             }),
             runtime.patch_thread_metadata(&fallback, |current| {
-                current.model = Some("new model".into()); Ok(())
+                current.model = Some("new model".into());
+                Ok(())
             }),
         );
         title?;
@@ -1538,8 +1836,16 @@ mod tests {
             .await?;
         rows.sort_by_key(|row| row.0.to_string());
         let mut expected = vec![
-            (first, "  chosen title  ".to_string(), Some("first message".to_string())),
-            (second, "default title".to_string(), Some("default title".to_string())),
+            (
+                first,
+                "  chosen title  ".to_string(),
+                Some("first message".to_string()),
+            ),
+            (
+                second,
+                "default title".to_string(),
+                Some("default title".to_string()),
+            ),
         ];
         expected.sort_by_key(|row| row.0.to_string());
         assert_eq!(rows, expected);
@@ -1691,7 +1997,6 @@ mod tests {
         Ok(())
     }
 
-
     #[tokio::test]
     async fn delete_thread_cleans_associated_state() -> Result<()> {
         let codex_home = unique_temp_dir();
@@ -1749,7 +2054,7 @@ mod tests {
             .await?;
 
         assert_eq!(rows, 1);
-        assert_eq!(primary_statement_count, 6);
+        assert_eq!(primary_statement_count, 7);
         assert!(runtime.get_thread(thread_id).await?.is_none());
         let dynamic_tool_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id = ?")
@@ -2155,7 +2460,13 @@ END
                                 SortKey::UpdatedAt => last.updated_at,
                                 SortKey::RecencyAt => last.recency_at,
                             };
-                            assert_eq!(page.next_anchor, Some(Anchor { ts, id: Some(last.id) }));
+                            assert_eq!(
+                                page.next_anchor,
+                                Some(Anchor {
+                                    ts,
+                                    id: Some(last.id)
+                                })
+                            );
                         }
                         assert!(listed.len() <= ids.len(), "pagination must progress");
                         anchor = page.next_anchor;
@@ -2830,7 +3141,6 @@ END
         );
     }
 
-
     #[tokio::test]
     async fn rollout_upserts_preserve_equal_persisted_timestamps() {
         let codex_home = unique_temp_dir();
@@ -3009,6 +3319,7 @@ END
                         output_tokens: 0,
                         reasoning_output_tokens: 0,
                         total_tokens: 321,
+                        coverage: None,
                     },
                     last_token_usage: codex_protocol::protocol::TokenUsage::default(),
                     model_context_window: None,
@@ -3106,6 +3417,199 @@ END
                 )
                 .await?,
             vec![child]
+        );
+        runtime.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconciled_edges_bridge_alternating_gaps_and_prefer_durable_parents() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let ids = (0..7)
+            .map(|n| ThreadId::from_string(&format!("00000000-0000-0000-0000-{n:012}")))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        runtime
+            .upsert_thread_spawn_edge(ids[0], ids[1], DirectionalThreadSpawnEdgeStatus::Closed)
+            .await?;
+        runtime
+            .upsert_thread_spawn_edge(ids[2], ids[3], DirectionalThreadSpawnEdgeStatus::Open)
+            .await?;
+        let edges = runtime
+            .list_reconciled_thread_spawn_edges(
+                ids[0],
+                &[
+                    (ids[1], ids[2]),
+                    (ids[3], ids[4]),
+                    (ids[0], ids[3]), // stale live parent must not compete with the durable edge
+                    (ids[5], ids[6]), // unrelated component
+                ],
+            )
+            .await?;
+        assert_eq!(
+            edges,
+            vec![
+                (ids[0], ids[1]),
+                (ids[1], ids[2]),
+                (ids[2], ids[3]),
+                (ids[3], ids[4])
+            ]
+        );
+        runtime.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subtree_delete_rejects_late_edges_and_retains_explicit_deletion_evidence() -> Result<()>
+    {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let root = ThreadId::new();
+        let child = ThreadId::new();
+        let root_meta = test_thread_metadata(home.path(), root, home.path().to_path_buf());
+        let child_meta = test_thread_metadata(home.path(), child, home.path().to_path_buf());
+        runtime.upsert_thread(&root_meta).await?;
+        runtime.upsert_thread(&child_meta).await?;
+        // The selection was [root]; a fully acknowledged edge arrived afterward.
+        runtime
+            .upsert_thread_spawn_edge(root, child, DirectionalThreadSpawnEdgeStatus::Open)
+            .await?;
+        assert!(
+            runtime
+                .delete_thread_subtree_strict(root, &[root])
+                .await
+                .is_err()
+        );
+        assert!(runtime.get_thread(root).await?.is_some());
+        assert!(runtime.get_thread(child).await?.is_some());
+        assert_eq!(runtime.list_thread_spawn_children(root).await?, vec![child]);
+        runtime
+            .delete_thread_subtree_strict(root, &[root, child])
+            .await?;
+        assert!(
+            runtime.upsert_thread(&child_meta).await.is_err(),
+            "delayed metadata cannot resurrect deletion"
+        );
+        assert!(
+            runtime
+                .insert_thread_spawn_edge_if_absent(root, ThreadId::new())
+                .await
+                .is_err()
+        );
+        // Missing history endpoints remain valid unless explicitly deleted.
+        runtime
+            .insert_thread_spawn_edge_if_absent(ThreadId::new(), ThreadId::new())
+            .await?;
+        runtime
+            .restore_deleted_thread_owners(&[root, child])
+            .await?;
+        runtime.upsert_thread(&child_meta).await?;
+        runtime
+            .insert_thread_spawn_edge_if_absent(root, child)
+            .await?;
+        runtime.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleted_parent_does_not_fail_surviving_child_metadata_writes() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let parent = ThreadId::new();
+        let child = ThreadId::new();
+        let parent_meta = test_thread_metadata(home.path(), parent, home.path().to_path_buf());
+        let mut child_meta = test_thread_metadata(home.path(), child, home.path().to_path_buf());
+        child_meta.source = crate::extract::enum_to_string(&SessionSource::SubAgent(
+            codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        ));
+        runtime.upsert_thread(&parent_meta).await?;
+        runtime.upsert_thread(&child_meta).await?;
+        assert_eq!(
+            runtime.list_thread_spawn_children(parent).await?,
+            vec![child]
+        );
+
+        // Only the parent was deleted; the surviving child keeps writing metadata.
+        runtime.delete_thread(parent).await?;
+        runtime.upsert_thread(&child_meta).await?;
+        let renamed = runtime
+            .patch_thread_metadata(&child_meta, |current| {
+                current.title = "survivor".to_string();
+                Ok(())
+            })
+            .await?;
+        assert_eq!(renamed.title, "survivor");
+        assert_eq!(renamed.current_parent_thread_id, None);
+        assert!(runtime.list_thread_spawn_children(parent).await?.is_empty());
+        assert!(
+            runtime
+                .insert_thread_spawn_edge_if_absent(parent, child)
+                .await
+                .is_err(),
+            "explicit late edges for a deleted owner remain rejected"
+        );
+        runtime.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deep_descendants_preserve_breadth_first_order_and_filter_barriers() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
+        let ids = (0..=1002)
+            .map(|n| ThreadId::from_string(&format!("00000000-0000-0000-0000-{n:012}")))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut tx = runtime.pool.begin().await?;
+        for n in 1..=1000 {
+            sqlx::query("INSERT INTO thread_spawn_edges VALUES (?, ?, 'open')")
+                .bind(ids[n - 1].to_string())
+                .bind(ids[n].to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
+        for (n, status) in [(1001, "open"), (1002, "future")] {
+            sqlx::query("INSERT INTO thread_spawn_edges VALUES (?, ?, ?)")
+                .bind(ids[0].to_string())
+                .bind(ids[n].to_string())
+                .bind(status)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        let mut expected = vec![ids[1], ids[1001], ids[1002]];
+        expected.extend_from_slice(&ids[2..=1000]);
+        assert_eq!(
+            runtime.list_thread_spawn_descendants(ids[0]).await?,
+            expected
+        );
+        runtime
+            .set_thread_spawn_edge_status(ids[500], DirectionalThreadSpawnEdgeStatus::Closed)
+            .await?;
+        let mut open = vec![ids[1], ids[1001]];
+        open.extend_from_slice(&ids[2..500]);
+        assert_eq!(
+            runtime
+                .list_thread_spawn_descendants_with_status(
+                    ids[0],
+                    DirectionalThreadSpawnEdgeStatus::Open
+                )
+                .await?,
+            open
+        );
+        assert!(
+            runtime
+                .list_thread_spawn_descendants_with_status(
+                    ids[0],
+                    DirectionalThreadSpawnEdgeStatus::Closed
+                )
+                .await?
+                .is_empty()
         );
         runtime.close().await;
         Ok(())

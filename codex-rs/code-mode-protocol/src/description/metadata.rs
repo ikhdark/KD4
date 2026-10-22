@@ -158,8 +158,16 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
     // JSON only for projections that lost structure; ordinary tools do not pay
     // for a second schema tree in every cell. Output recovery can page this text.
     for (label, schema, incomplete) in [
-        ("input_schema", definition.input_schema.as_ref(), input_fragments.incomplete),
-        ("output_schema", definition.output_schema.as_ref(), output_fragments.incomplete),
+        (
+            "input_schema",
+            definition.input_schema.as_ref(),
+            input_fragments.incomplete,
+        ),
+        (
+            "output_schema",
+            definition.output_schema.as_ref(),
+            output_fragments.incomplete,
+        ),
     ] {
         if let Some(schema) = schema
             && incomplete
@@ -198,7 +206,13 @@ fn render_code_mode_sample_for_definition(definition: &ToolDefinition) -> String
     }
     let declaration = format!(
         "{preamble}declare const tools: {{ {} }};",
-        render_code_mode_tool_declaration(&definition.name, input_name, input_type, output_type, false)
+        render_code_mode_tool_declaration(
+            &definition.name,
+            input_name,
+            input_type,
+            output_type,
+            false
+        )
     );
     format!("{description}\n\nexec tool declaration:\n```ts\n{declaration}\n```")
 }
@@ -241,9 +255,10 @@ pub fn render_code_mode_tool_bundle(definitions: &[ToolDefinition]) -> String {
         output.push('\n');
     }
     let mut declarations = Vec::with_capacity(definitions.len());
-    for (index, (definition, (input_type, mut output_type))) in definitions.iter().zip(types).enumerate() {
-        if fragments[index * 2].incomplete || fragments[index * 2 + 1].incomplete
-        {
+    for (index, (definition, (input_type, mut output_type))) in
+        definitions.iter().zip(types).enumerate()
+    {
+        if fragments[index * 2].incomplete || fragments[index * 2 + 1].incomplete {
             output.push_str(&format!(
                 "// Use resolve_tool({}) for its authoritative JSON schema; do not infer arguments from unknown.\n",
                 JsonValue::String(definition.name.clone())
@@ -323,9 +338,13 @@ mod tests {
             (small, large.clone(), "output_schema"),
         ] {
             let definition = ToolDefinition {
-                name: "sample".into(), tool_name: ToolName::plain("sample"),
-                description: "Operation".into(), kind: CodeModeToolKind::Function,
-                input_schema: Some(input), output_schema: Some(output), default_timeout_ms: None,
+                name: "sample".into(),
+                tool_name: ToolName::plain("sample"),
+                description: "Operation".into(),
+                kind: CodeModeToolKind::Function,
+                input_schema: Some(input),
+                output_schema: Some(output),
+                default_timeout_ms: None,
             };
             let bundle = render_code_mode_tool_bundle(std::slice::from_ref(&definition));
             assert!(bundle.contains("resolve_tool(\"sample\")"));
@@ -333,8 +352,16 @@ mod tests {
             assert!(bundle.contains("Root prerequisite"));
             let augmented = augment_tool_definition(definition);
             assert_eq!(augmented.description.matches("Authoritative ").count(), 1);
-            let marker = format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
-            let json = augmented.description.split_once(&marker).unwrap().1.split_once("\n```").unwrap().0;
+            let marker =
+                format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
+            let json = augmented
+                .description
+                .split_once(&marker)
+                .unwrap()
+                .1
+                .split_once("\n```")
+                .unwrap()
+                .0;
             assert_eq!(serde_json::from_str::<JsonValue>(json).unwrap(), large);
         }
     }
@@ -371,15 +398,37 @@ mod tests {
                         output_schema: output.then(|| schema.clone()),
                         default_timeout_ms: None,
                     };
-                    let label = if output { "output_schema" } else { "input_schema" };
+                    let label = if output {
+                        "output_schema"
+                    } else {
+                        "input_schema"
+                    };
                     let augmented = augment_tool_definition(definition.clone());
-                    let marker = format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
-                    let recovered = augmented.description.split_once(&marker)
-                        .unwrap_or_else(|| panic!("lost {keyword}, redundant_type={redundant_type}, {label}: {}", augmented.description))
-                        .1.split_once("\n```").unwrap().0;
-                    assert_eq!(serde_json::from_str::<JsonValue>(recovered).unwrap(), schema);
+                    let marker = format!(
+                        "Authoritative {label} (TypeScript projection incomplete):\n```json\n"
+                    );
+                    let recovered = augmented
+                        .description
+                        .split_once(&marker)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "lost {keyword}, redundant_type={redundant_type}, {label}: {}",
+                                augmented.description
+                            )
+                        })
+                        .1
+                        .split_once("\n```")
+                        .unwrap()
+                        .0;
+                    assert_eq!(
+                        serde_json::from_str::<JsonValue>(recovered).unwrap(),
+                        schema
+                    );
                     let bundle = render_code_mode_tool_bundle(&[definition]);
-                    assert!(bundle.contains("resolve_tool(\"ref_siblings\")"), "{bundle}");
+                    assert!(
+                        bundle.contains("resolve_tool(\"ref_siblings\")"),
+                        "{bundle}"
+                    );
                 }
             }
         }
@@ -399,21 +448,40 @@ mod tests {
             "$defs": {"minutes": {"type": "number", "description": "duration in minutes"}}
         });
         let definition = ToolDefinition {
-            name: "guidance".into(), tool_name: ToolName::plain("guidance"),
-            description: "".into(), kind: CodeModeToolKind::Function,
-            input_schema: Some(schema), output_schema: None, default_timeout_ms: None,
+            name: "guidance".into(),
+            tool_name: ToolName::plain("guidance"),
+            description: "".into(),
+            kind: CodeModeToolKind::Function,
+            input_schema: Some(schema),
+            output_schema: None,
+            default_timeout_ms: None,
         };
         let rendered = augment_tool_definition(definition.clone());
         let bundle = render_code_mode_tool_bundle(&[definition]);
         for text in [rendered.description.as_ref(), &bundle] {
-            for guidance in ["duration in minutes", "Use canonical recipient IDs", "Archive only after confirmation", "Read without marking seen"] {
+            for guidance in [
+                "duration in minutes",
+                "Use canonical recipient IDs",
+                "Archive only after confirmation",
+                "Read without marking seen",
+            ] {
                 assert_eq!(text.matches(guidance).count(), 1, "{text}");
             }
         }
         let duplicate = json!({"$ref":"#/$defs/value", "description":"minutes", "$defs":{"value":{"type":"number", "description":"minutes"}}});
-        assert_eq!(super::super::schema_ts::render_json_schema_to_typescript(&duplicate).matches("minutes").count(), 1);
+        assert_eq!(
+            super::super::schema_ts::render_json_schema_to_typescript(&duplicate)
+                .matches("minutes")
+                .count(),
+            1
+        );
         let property = json!({"type":"object", "properties":{"duration":duplicate}, "$defs":{"value":{"type":"number", "description":"minutes"}}});
-        assert_eq!(super::super::schema_ts::render_json_schema_to_typescript(&property).matches("minutes").count(), 1);
+        assert_eq!(
+            super::super::schema_ts::render_json_schema_to_typescript(&property)
+                .matches("minutes")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -442,17 +510,38 @@ mod tests {
         ] {
             for output in [false, true] {
                 let definition = ToolDefinition {
-                    name: "incomplete".into(), tool_name: ToolName::plain("incomplete"),
-                    description: "".into(), kind: CodeModeToolKind::Function,
+                    name: "incomplete".into(),
+                    tool_name: ToolName::plain("incomplete"),
+                    description: "".into(),
+                    kind: CodeModeToolKind::Function,
                     input_schema: (!output).then(|| schema.clone()),
-                    output_schema: output.then(|| schema.clone()), default_timeout_ms: None,
+                    output_schema: output.then(|| schema.clone()),
+                    default_timeout_ms: None,
                 };
-                assert!(render_code_mode_tool_bundle(std::slice::from_ref(&definition)).contains("resolve_tool"));
+                assert!(
+                    render_code_mode_tool_bundle(std::slice::from_ref(&definition))
+                        .contains("resolve_tool")
+                );
                 let rendered = augment_tool_definition(definition);
-                let label = if output { "output_schema" } else { "input_schema" };
-                let marker = format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
-                let recovered = rendered.description.split_once(&marker).unwrap().1.split_once("\n```").unwrap().0;
-                assert_eq!(serde_json::from_str::<JsonValue>(recovered).unwrap(), schema);
+                let label = if output {
+                    "output_schema"
+                } else {
+                    "input_schema"
+                };
+                let marker =
+                    format!("Authoritative {label} (TypeScript projection incomplete):\n```json\n");
+                let recovered = rendered
+                    .description
+                    .split_once(&marker)
+                    .unwrap()
+                    .1
+                    .split_once("\n```")
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    serde_json::from_str::<JsonValue>(recovered).unwrap(),
+                    schema
+                );
             }
         }
     }
@@ -605,10 +694,22 @@ mod tests {
         // apply schema-valued items to all elements, unlike the 2020-12 core
         // sections 10.3.1.1/.2 instead apply items only after the prefix.
         for (dialect, expected) in [
-            (Some("http://json-schema.org/draft-07/schema#"), "Array<never>"),
-            (Some("https://json-schema.org/draft-07/schema"), "Array<never>"),
-            (Some("https://json-schema.org/draft/2019-09/schema"), "Array<never>"),
-            (Some("https://json-schema.org/draft/2020-12/schema"), "[(string)?]"),
+            (
+                Some("http://json-schema.org/draft-07/schema#"),
+                "Array<never>",
+            ),
+            (
+                Some("https://json-schema.org/draft-07/schema"),
+                "Array<never>",
+            ),
+            (
+                Some("https://json-schema.org/draft/2019-09/schema"),
+                "Array<never>",
+            ),
+            (
+                Some("https://json-schema.org/draft/2020-12/schema"),
+                "[(string)?]",
+            ),
             (None, "[(string)?]"),
         ] {
             let mut payload = json!({
@@ -633,8 +734,10 @@ mod tests {
             let augmented = augment_tool_definition(definition.clone());
             let bundle = render_code_mode_tool_bundle(&[definition]);
             for description in [augmented.description.as_ref(), &bundle] {
-                assert!(description.contains(&format!("Promise<CallToolResult<{expected}>>")),
-                    "dialect={dialect:?}: {description}");
+                assert!(
+                    description.contains(&format!("Promise<CallToolResult<{expected}>>")),
+                    "dialect={dialect:?}: {description}"
+                );
             }
             assert_eq!(augmented.output_schema, Some(envelope));
         }

@@ -32,6 +32,7 @@ fn environment(id: &str, cwd: PathUri, shell: impl Into<String>) -> (String, Env
     (
         id.to_string(),
         EnvironmentState {
+            owner_id: None,
             cwd,
             status: EnvironmentStatus::Available,
             shell: Some(shell.into()),
@@ -48,6 +49,7 @@ fn environment_state(
     subagents: Option<String>,
 ) -> EnvironmentsState {
     EnvironmentsState {
+        primary_environment_id: None,
         environments: environments.into_iter().collect(),
         current_date,
         timezone,

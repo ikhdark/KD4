@@ -171,22 +171,34 @@ def nextest_run_payload(
     """Author native libtest-json-plus events, retaining duplicate terminals."""
     metadata = {"crate": package, "test_binary": binary, "kind": kind}
     events = [
-        {"type": "suite", "event": "started", "test_count": len(tests), "nextest": metadata}
+        {
+            "type": "suite",
+            "event": "started",
+            "test_count": len(tests),
+            "nextest": metadata,
+        }
     ]
     for test, outcome in tests:
         name = f"{package}::{binary}${test}"
         if outcome != "ignored":
             events.append({"type": "test", "event": "started", "name": name})
-        events.append({"type": "test", "event": outcome, "name": name, "exec_time": 0.001})
+        events.append(
+            {"type": "test", "event": outcome, "name": name, "exec_time": 0.001}
+        )
     failed = sum(outcome == "failed" for _, outcome in tests)
-    events.append({
-        "type": "suite", "event": "failed" if failed else "ok",
-        "passed": sum(outcome == "ok" for _, outcome in tests),
-        "failed": failed,
-        "ignored": sum(outcome == "ignored" for _, outcome in tests),
-        "measured": 0, "filtered_out": 0, "exec_time": 0.001,
-        "nextest": metadata,
-    })
+    events.append(
+        {
+            "type": "suite",
+            "event": "failed" if failed else "ok",
+            "passed": sum(outcome == "ok" for _, outcome in tests),
+            "failed": failed,
+            "ignored": sum(outcome == "ignored" for _, outcome in tests),
+            "measured": 0,
+            "filtered_out": 0,
+            "exec_time": 0.001,
+            "nextest": metadata,
+        }
+    )
     return "".join(json.dumps(event) + "\n" for event in events)
 
 
@@ -251,12 +263,17 @@ class FakeExecutor:
             kind = "test" if "--test" in args else "bin" if "--bin" in args else "lib"
             binary = (
                 args[args.index(f"--{kind}") + 1]
-                if kind != "lib" else package.replace("-", "_")
+                if kind != "lib"
+                else package.replace("-", "_")
             )
             return nextest_run_payload(
-                [(test, "ignored" if ignored else "ok")
-                 for test, ignored in self._listing_for(args).items()],
-                package=package, binary=binary, kind=kind,
+                [
+                    (test, "ignored" if ignored else "ok")
+                    for test, ignored in self._listing_for(args).items()
+                ],
+                package=package,
+                binary=binary,
+                kind=kind,
             )
         if args[:2] == ["cargo", "build"]:
             return self._artifact_output(args)
@@ -362,8 +379,10 @@ class RunnerTestCase(unittest.TestCase):
 class CriticalPathDiscoveryTest(RunnerTestCase):
     def test_duplicate_discovery_keeps_each_gate_contract_and_is_invocation_local(self):
         step = copy.deepcopy(MANIFEST_DATA["gates"]["demo-gate"]["steps"][0])
-        gates = {name: {"description": name, "steps": [copy.deepcopy(step)]}
-                 for name in ["one", "two"]}
+        gates = {
+            name: {"description": name, "steps": [copy.deepcopy(step)]}
+            for name in ["one", "two"]
+        }
         runner, executor = self.runner(manifest=self.manifest(gates=gates))
         runner.check_gates(["one", "two"], include_generated=False)
         self.assertEqual(len(executor.calls), 1)
@@ -373,47 +392,115 @@ class CriticalPathDiscoveryTest(RunnerTestCase):
         runner, executor = self.runner(manifest=self.manifest(gates=gates))
         with self.assertRaisesRegex(RunnerError, "wrong test-ID set"):
             runner.check_gates(["one", "two"], include_generated=False)
-        self.assertEqual(len(executor.calls), 1, "reuse listing, not the parity verdict")
+        self.assertEqual(
+            len(executor.calls), 1, "reuse listing, not the parity verdict"
+        )
 
     def test_retaining_build_metadata_decodes_listing_once(self):
         runner, _ = self.runner()
-        with mock.patch.object(rust_test_runner.json, "loads", wraps=json.loads) as loads:
-            tests = runner._list_tests(runner.target("core_lib"), [], discovered_build={})
+        with mock.patch.object(
+            rust_test_runner.json, "loads", wraps=json.loads
+        ) as loads:
+            tests = runner._list_tests(
+                runner.target("core_lib"), [], discovered_build={}
+            )
         self.assertEqual(tests, {"mod::tests::alpha": False})
         self.assertEqual(loads.call_count, 1)
         sink = {}
         with self.assertRaises(RunnerError):
-            rust_test_runner.parse_nextest_list('{"test-count":7,"rust-suites":{}}', parsed_payload=sink)
+            rust_test_runner.parse_nextest_list(
+                '{"test-count":7,"rust-suites":{}}', parsed_payload=sink
+            )
         self.assertEqual(sink, {}, "invalid metadata must not be published")
 
 
 class WallClockRunnerTest(RunnerTestCase):
-    def discovered_build_runner(self):
+    def discovered_build_runner(
+        self, *, effects=None, binary_name="core.py", build_platform="target"
+    ):
         data = copy.deepcopy(MANIFEST_DATA)
         data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
         fake = FakeExecutor(artifacts={"codex": self.helper_executable("codex")})
         runner, _ = self.runner(manifest=Manifest.from_data(data), executor=fake)
         commands = []
         builds = []
+        effects = [] if effects is None else effects
+        binary_dir = self.target_dir / "debug"
+        # Identical passing test IDs cannot distinguish these implementations.
+        # Only consuming binary-path and checking its independent effect can.
+        for name, effect in (
+            ("core.py", {"version": "current", "oracle_value": 42}),
+            ("stale-core.py", {"version": "old", "oracle_value": 7}),
+        ):
+            (binary_dir / name).write_text(
+                "import sys\nfrom pathlib import Path\n"
+                f"Path(sys.argv[1]).write_text({json.dumps(effect)!r}, encoding='utf-8')\n"
+                "print(sys.argv[2], end='')\n"
+                "sys.exit(int(sys.argv[3]))\n",
+                encoding="utf-8",
+            )
 
         def execute(args, **kwargs):
             commands.append(list(args))
             if "--binaries-metadata" in args:
                 path = Path(args[args.index("--binaries-metadata") + 1])
                 builds.append(json.loads(path.read_text()))
-                # The fixture simulates the binary Nextest selects from metadata.
-                result = fake([*args[:3], "-p", "codex-core", "--lib", *args[5:]], **kwargs)
+                binary = builds[-1]["rust-binaries"]["codex-core"]
+                effect_path = (
+                    Path(tempfile.mkdtemp(prefix="selected binary ", dir=self.temp_dir))
+                    / "effect.json"
+                )
+                payload = nextest_run_payload(
+                    [
+                        (test, "ignored" if ignored else "ok")
+                        for test, ignored in fake._listing_for(args).items()
+                    ],
+                    binary=binary["binary-name"],
+                    kind=binary["kind"],
+                )
+                # Stand in for nextest, not for the selected executable. Python
+                # launches the authored child portably, without an .exe shim.
+                capture = kwargs["capture"]
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-B",
+                        binary["binary-path"],
+                        str(effect_path),
+                        payload,
+                        str(int("--lib" in fake.failing_runs)),
+                    ],
+                    cwd=kwargs["cwd"],
+                    env=kwargs["env"],
+                    text=True,
+                    timeout=10,
+                    check=False,
+                    stdout=subprocess.PIPE
+                    if capture != rust_test_runner.CAPTURE_NONE
+                    else None,
+                    stderr=subprocess.PIPE
+                    if capture == rust_test_runner.CAPTURE_BOTH
+                    else None,
+                )
+                effects.append(
+                    (effect_path, json.loads(effect_path.read_text(encoding="utf-8")))
+                )
             else:
                 result = fake(args, **kwargs)
             if args[:3] == ["cargo", "nextest", "list"]:
                 root = json.loads(result.stdout)
                 suite = next(iter(root["rust-suites"].values()))
-                suite.update({
-                    "binary-id": "codex-core", "binary-name": "codex_core",
-                    "package-id": "path+file:///codex-core#0.0.0", "kind": "lib",
-                    "binary-path": str(self.target_dir / "debug" / "core.exe"),
-                    "build-platform": "target",
-                })
+                suite.update(
+                    {
+                        "binary-id": "codex-core",
+                        "binary-name": "codex_core",
+                        "package-id": "path+file:///codex-core#0.0.0",
+                        "kind": "lib",
+                        "binary-path": str(binary_dir / binary_name),
+                        "build-platform": build_platform,
+                    }
+                )
                 root["rust-suites"] = {"codex-core": suite}
                 root["rust-build-meta"] = {
                     "target-directory": str(self.target_dir),
@@ -427,7 +514,8 @@ class WallClockRunnerTest(RunnerTestCase):
         return runner, fake, commands, builds
 
     def test_discovery_build_is_reused_only_within_current_run(self):
-        runner, fake, commands, builds = self.discovered_build_runner()
+        effects = []
+        runner, fake, commands, builds = self.discovered_build_runner(effects=effects)
         # Keep a real helper between discovery and execution, the source of
         # feature/fingerprint churn in the production path.
         fake.default_listing = {"other::alpha": False}
@@ -436,25 +524,99 @@ class WallClockRunnerTest(RunnerTestCase):
         for _ in range(2):
             receipt = runner.run_target("core_lib", filters, no_fail_fast=True)
             self.assertEqual(receipt, {"codex-core": ["other::alpha"]})
-        self.assertEqual([cmd[:3] for cmd in commands], [
-            ["cargo", "nextest", "list"],
-            ["cargo", "build", "--message-format=json-render-diagnostics"],
-            ["cargo", "nextest", "run"],
-        ] * 2)
+        self.assertEqual(
+            [cmd[:3] for cmd in commands],
+            [
+                ["cargo", "nextest", "list"],
+                ["cargo", "build", "--message-format=json-render-diagnostics"],
+                ["cargo", "nextest", "run"],
+            ]
+            * 2,
+        )
         for command in (commands[2], commands[5]):
             self.assertIn("--binaries-metadata", command)
             self.assertNotIn("--target-dir", command)
             self.assertNotIn("-p", command)
             self.assertIn("--no-tests=fail", command)
             self.assertIn("--no-fail-fast", command)
-            self.assertEqual(command[-len(filters):], filters)
+            self.assertEqual(command[-len(filters) :], filters)
         self.assertNotEqual(commands[2][4], commands[5][4])
-        self.assertEqual(set(builds[0]["rust-binaries"]), {"codex-core"})
-        self.assertNotIn("testcases", builds[0]["rust-binaries"]["codex-core"])
-        self.assertEqual(builds[0]["rust-build-meta"]["non-test-binaries"],
-                         {"codex-core": ["core-helper"]})
-        self.assertEqual(builds[0]["rust-build-meta"]["build-script-out-dirs"],
-                         {"codex-core": "out"})
+        for build in builds:
+            self.assertEqual(
+                build["rust-binaries"],
+                {
+                    "codex-core": {
+                        "binary-id": "codex-core",
+                        "binary-name": "codex_core",
+                        "package-id": "path+file:///codex-core#0.0.0",
+                        "kind": "lib",
+                        "binary-path": str(self.target_dir / "debug" / "core.py"),
+                        "build-platform": "target",
+                    }
+                },
+            )
+        self.assertEqual(
+            [effect for _, effect in effects],
+            [{"version": "current", "oracle_value": 42}] * 2,
+        )
+        self.assertNotEqual(effects[0][0], effects[1][0])
+        self.assertEqual(
+            builds[0]["rust-build-meta"]["non-test-binaries"],
+            {"codex-core": ["core-helper"]},
+        )
+        self.assertEqual(
+            builds[0]["rust-build-meta"]["build-script-out-dirs"], {"codex-core": "out"}
+        )
+
+    def test_discovery_consumer_distinguishes_same_id_stale_binary(self):
+        receipts = []
+        for name, expected in (
+            ("core.py", {"version": "current", "oracle_value": 42}),
+            ("stale-core.py", {"version": "old", "oracle_value": 7}),
+        ):
+            with self.subTest(binary=name):
+                effects = []
+                runner, _, _, _ = self.discovered_build_runner(
+                    effects=effects, binary_name=name
+                )
+                receipts.append(runner.run_target("core_lib", ["alpha"]))
+                self.assertEqual([effect for _, effect in effects], [expected])
+        # A nominal pass is deliberately identical for the current/stale child.
+        self.assertEqual(receipts, [{"codex-core": ["mod::tests::alpha"]}] * 2)
+
+    def test_discovery_preserves_fixture_declared_platform(self):
+        for platform in ("target", "host"):
+            with self.subTest(platform=platform):
+                runner, _, _, builds = self.discovered_build_runner(
+                    build_platform=platform
+                )
+                runner.run_target("core_lib", ["alpha"])
+                self.assertEqual(
+                    builds[0]["rust-binaries"]["codex-core"]["build-platform"], platform
+                )
+
+    def test_incomplete_discovery_metadata_falls_back_to_cargo(self):
+        for field in ("binary-path", "build-platform"):
+            with self.subTest(field=field):
+                runner, _, commands, builds = self.discovered_build_runner()
+                execute = runner.executor
+
+                def incomplete(args, execute=execute, field=field, **kwargs):
+                    result = execute(args, **kwargs)
+                    if args[:3] == ["cargo", "nextest", "list"]:
+                        root = json.loads(result.stdout)
+                        del root["rust-suites"]["codex-core"][field]
+                        result.stdout = json.dumps(root)
+                    return result
+
+                runner.executor = incomplete
+                self.assertEqual(
+                    runner.run_target("core_lib", ["alpha"]),
+                    {"codex-core": ["mod::tests::alpha"]},
+                )
+                self.assertEqual(builds, [])
+                self.assertIn("--target-dir", commands[-1])
+                self.assertNotIn("--binaries-metadata", commands[-1])
 
     def test_discovered_build_retention_failure_falls_back_to_cargo(self):
         runner, _, commands, builds = self.discovered_build_runner()
@@ -475,12 +637,20 @@ class WallClockRunnerTest(RunnerTestCase):
     def discovered_gate_runner(self, *, helpers=("codex",)):
         runner, fake, commands, builds = self.discovered_build_runner()
         runner.platform = "linux"
-        runner.manifest = self.manifest(gates={
-            "filtered": {"steps": [{
-                "target": "core_lib", "filter": "test(alpha)",
-                "tests": ["mod::tests::alpha"], "helpers": list(helpers),
-            }]},
-        })
+        runner.manifest = self.manifest(
+            gates={
+                "filtered": {
+                    "steps": [
+                        {
+                            "target": "core_lib",
+                            "filter": "test(alpha)",
+                            "tests": ["mod::tests::alpha"],
+                            "helpers": list(helpers),
+                        }
+                    ]
+                },
+            }
+        )
         return runner, fake, commands, builds
 
     def test_gate_reuses_discovery_build_but_never_prior_test_results(self):
@@ -489,23 +659,30 @@ class WallClockRunnerTest(RunnerTestCase):
             receipts = runner.run_gates(["filtered"], quiet=True)
             self.assertEqual(receipts, {"filtered": ["mod::tests::alpha"]})
             self.assertEqual(receipts.executed, receipts.required)
-        self.assertEqual([command[:3] for command in commands], [
-            ["cargo", "nextest", "list"],
-            ["cargo", "build", "--message-format=json-render-diagnostics"],
-            ["cargo", "nextest", "run"],
-        ] * 2)
+        self.assertEqual(
+            [command[:3] for command in commands],
+            [
+                ["cargo", "nextest", "list"],
+                ["cargo", "build", "--message-format=json-render-diagnostics"],
+                ["cargo", "nextest", "run"],
+            ]
+            * 2,
+        )
         for command in (commands[2], commands[5]):
             self.assertIn("--binaries-metadata", command)
             self.assertNotIn("--target-dir", command)
             self.assertIn("--no-tests=fail", command)
             self.assertIn("--no-fail-fast", command)
             self.assertEqual(command[command.index("--retries") + 1], "0")
-            self.assertEqual(command[command.index("-E") + 1], "test(=mod::tests::alpha)")
+            self.assertEqual(
+                command[command.index("-E") + 1], "test(=mod::tests::alpha)"
+            )
         self.assertNotEqual(commands[2][4], commands[5][4])
         self.assertEqual(len(builds), 2)
         self.assertEqual(set(builds[0]["rust-binaries"]), {"codex-core"})
-        self.assertEqual(builds[0]["rust-build-meta"]["build-script-out-dirs"],
-                         {"codex-core": "out"})
+        self.assertEqual(
+            builds[0]["rust-build-meta"]["build-script-out-dirs"], {"codex-core": "out"}
+        )
 
     def test_gate_build_reuse_preserves_parity_and_ignored_test_rejection(self):
         for listing in ({"unexpected": False}, {"mod::tests::alpha": True}):
@@ -517,7 +694,9 @@ class WallClockRunnerTest(RunnerTestCase):
                 self.assertEqual(len(commands), 1)
                 self.assertEqual(builds, [])
 
-    def test_gate_build_reuse_falls_back_when_retention_or_metadata_is_unavailable(self):
+    def test_gate_build_reuse_falls_back_when_retention_or_metadata_is_unavailable(
+        self,
+    ):
         for incomplete in (False, True):
             with self.subTest(incomplete=incomplete):
                 runner, fake, commands, builds = self.discovered_gate_runner(helpers=())
@@ -525,10 +704,14 @@ class WallClockRunnerTest(RunnerTestCase):
                     runner.executor = fake
                     context = contextlib.nullcontext()
                 else:
-                    context = mock.patch.object(runner, "_retain_text", return_value=None)
+                    context = mock.patch.object(
+                        runner, "_retain_text", return_value=None
+                    )
                 with context:
-                    self.assertEqual(runner.run_gates(["filtered"], quiet=True),
-                                     {"filtered": ["mod::tests::alpha"]})
+                    self.assertEqual(
+                        runner.run_gates(["filtered"], quiet=True),
+                        {"filtered": ["mod::tests::alpha"]},
+                    )
                 self.assertEqual(builds, [])
                 command = fake.calls[-1]["args"]
                 self.assertIn("--target-dir", command)
@@ -547,13 +730,18 @@ class WallClockRunnerTest(RunnerTestCase):
         runner, _, commands, builds = self.discovered_gate_runner()
         first = runner.gate("filtered").steps[0]
         runner.manifest.gates["without-helper"] = rust_test_runner.Gate(
-            "without-helper", "", (rust_test_runner.replace(first, helpers=()),),
+            "without-helper",
+            "",
+            (rust_test_runner.replace(first, helpers=()),),
         )
         receipt = runner.run_gates(["filtered", "without-helper"], quiet=True)
-        self.assertEqual(receipt.executed, {
-            ("codex-core", frozenset({"codex"}), "mod::tests::alpha"),
-            ("codex-core", frozenset(), "mod::tests::alpha"),
-        })
+        self.assertEqual(
+            receipt.executed,
+            {
+                ("codex-core", frozenset({"codex"}), "mod::tests::alpha"),
+                ("codex-core", frozenset(), "mod::tests::alpha"),
+            },
+        )
         self.assertEqual(receipt.required, receipt.executed)
         self.assertEqual(len(commands), 4, "one listing/build, two distinct executions")
         self.assertEqual(len(builds), 2)
@@ -562,13 +750,23 @@ class WallClockRunnerTest(RunnerTestCase):
         runner, _, commands, builds = self.discovered_gate_runner(helpers=())
         data = copy.deepcopy(MANIFEST_DATA)
         data["targets"]["core_bin"] = {
-            "package": "codex-core", "bin": "fixture_bin", "helpers": [],
+            "package": "codex-core",
+            "bin": "fixture_bin",
+            "helpers": [],
         }
-        data["gates"] = {"filtered": {"steps": [
-            {"target": "core_lib", "filter": "test(alpha)",
-             "tests": ["mod::tests::alpha"], "helpers": []},
-            {"target": "core_bin", "tests": ["bin::beta"], "helpers": []},
-        ]}}
+        data["gates"] = {
+            "filtered": {
+                "steps": [
+                    {
+                        "target": "core_lib",
+                        "filter": "test(alpha)",
+                        "tests": ["mod::tests::alpha"],
+                        "helpers": [],
+                    },
+                    {"target": "core_bin", "tests": ["bin::beta"], "helpers": []},
+                ]
+            }
+        }
         runner.manifest = Manifest.from_data(data)
         runner.metadata.packages["codex-core"]["targets"].append(
             {"name": "fixture_bin", "kind": ["bin"]},
@@ -581,14 +779,22 @@ class WallClockRunnerTest(RunnerTestCase):
                 self.assertNotIn("--binaries-metadata", args)
                 self.assertIn("--lib", args)
                 self.assertIn("--bin", args)
-                return subprocess.CompletedProcess(args, 0,
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
                     nextest_run_payload([("mod::tests::alpha", "ok")])
-                    + nextest_run_payload([("bin::beta", "ok")], binary="fixture_bin", kind="bin"), "")
+                    + nextest_run_payload(
+                        [("bin::beta", "ok")], binary="fixture_bin", kind="bin"
+                    ),
+                    "",
+                )
             return execute(args, **kwargs)
 
         runner.executor = batch_executor
-        self.assertEqual(runner.run_gates(["filtered"], quiet=True),
-                         {"filtered": ["bin::beta", "mod::tests::alpha"]})
+        self.assertEqual(
+            runner.run_gates(["filtered"], quiet=True),
+            {"filtered": ["bin::beta", "mod::tests::alpha"]},
+        )
         self.assertEqual(len(commands), 2)
         self.assertEqual(builds, [])
 
@@ -760,7 +966,9 @@ class WallClockRunnerTest(RunnerTestCase):
         # The real fixture uses an in-process provider and unsandboxed local
         # execution even for this test's real command path. Keep the manifest
         # wired through run_target, not just an assertion on its TOML value.
-        test = "tools::parallel::tests::registered_file_readers_share_the_repository_gate"
+        test = (
+            "tools::parallel::tests::registered_file_readers_share_the_repository_gate"
+        )
         for exact in (False, True):
             with self.subTest(exact=exact):
                 runner, executor = self.runner(
@@ -768,7 +976,10 @@ class WallClockRunnerTest(RunnerTestCase):
                     platform="linux",
                     executor=FakeExecutor(default_listing={test: False}),
                 )
-                filters = ["-E", f"test(={test})" if exact else "test(tools::parallel::tests::)"]
+                filters = [
+                    "-E",
+                    f"test(={test})" if exact else "test(tools::parallel::tests::)",
+                ]
                 result = runner.run_target("core_lib", filters)
                 self.assertEqual(result, {"codex-core": [test]})
                 self.assertEqual(executor.commands(["cargo", "build"]), [])
@@ -826,13 +1037,20 @@ class WallClockRunnerTest(RunnerTestCase):
                         artifacts={
                             name: self.helper_executable(name)
                             for name in ("codex", "codex-command-runner")
-                        }
+                        },
                     ),
                 )
                 receipt = runner.run_target("core_lib", filters)
                 self.assertEqual(receipt, {"codex-core": selected})
-                self.assertEqual({test for _, _, test in receipt.required}, set(selected))
-                self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
+                self.assertEqual(
+                    {test for _, _, test in receipt.required}, set(selected)
+                )
+                # Helpers need no discovery. --run-ignored alone lists once: native
+                # summaries repeat ignored counts that only nextest's catalog binds.
+                self.assertEqual(
+                    len(executor.commands(["cargo", "nextest", "list"])),
+                    int("--run-ignored" in filters),
+                )
                 self.assertEqual(
                     [
                         command[index + 1]
@@ -856,6 +1074,30 @@ class WallClockRunnerTest(RunnerTestCase):
                 self.assertEqual(
                     len(executor.commands(["cargo", "nextest", "list"])), 1
                 )
+
+    def test_ignored_catalog_discovery_keeps_named_exact_obligations(self):
+        # Failed-only reruns add --run-ignored all. Catalog discovery binds the
+        # report to what nextest selects; it must not drop a named exact ID.
+        data = copy.deepcopy(MANIFEST_DATA)
+        data["targets"]["core_lib"]["helpers_by_test_prefix"] = {"mod::tests::": []}
+        selection = ["-E", "test(=mod::tests::alpha) | test(=mod::tests::deleted)"]
+        for tail in ([], ["--run-ignored", "all"]):
+            with self.subTest(tail=tail):
+                runner, executor = self.runner(manifest=Manifest.from_data(data))
+                with (
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(RunnerError) as raised,
+                ):
+                    runner.run_target("core_lib", [*selection, *tail])
+                self.assertEqual(raised.exception.outcome, "not_executed")
+                self.assertIn("mod::tests::deleted", str(raised.exception))
+                receipts = raised.exception.completed_tests
+                self.assertEqual(receipts, {"codex-core": ["mod::tests::alpha"]})
+                self.assertEqual(
+                    {test for _, _, test in receipts.required},
+                    {"mod::tests::alpha", "mod::tests::deleted"},
+                )
+                self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
 
     def test_mixed_unknown_selection_keeps_fallback_helpers(self):
         data = copy.deepcopy(MANIFEST_DATA)
@@ -1038,6 +1280,72 @@ class WallClockRunnerTest(RunnerTestCase):
 
 
 class RealExecutorTest(RunnerTestCase):
+    def test_blocked_live_sink_does_not_hold_cleaned_executor(self):
+        import threading
+
+        for boundary in ("write", "flush"):
+            with self.subTest(boundary=boundary):
+                entered, release, returned = (
+                    threading.Event(),
+                    threading.Event(),
+                    threading.Event(),
+                )
+                failures, timings = [], {}
+
+                class Sink:
+                    def write(self, text):
+                        if boundary == "write" and text:
+                            entered.set()
+                            release.wait(10)
+
+                    def flush(self):
+                        if boundary == "flush":
+                            entered.set()
+                            release.wait(10)
+
+                def execute():
+                    try:
+                        rust_test_runner._default_executor(
+                            [
+                                sys.executable,
+                                "-B",
+                                "-c",
+                                "import sys,time; sys.stderr.write('durable stderr'); sys.stderr.flush(); time.sleep(30)",
+                            ],
+                            cwd=self.temp_dir,
+                            env={
+                                **os.environ,
+                                "CODEX_RUST_TEST_LOG_DIR": str(self.temp_dir),
+                                "CODEX_RUST_TEST_TIMEOUT_SECS": "1",
+                            },
+                            capture=rust_test_runner.CAPTURE_STDOUT,
+                            timings=timings,
+                        )
+                    except RunnerError as error:
+                        failures.append(error)
+                    finally:
+                        returned.set()
+
+                with mock.patch.object(sys, "stderr", Sink()):
+                    worker = threading.Thread(target=execute)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(5))
+                        self.assertTrue(
+                            returned.wait(5), "sink must not control command teardown"
+                        )
+                        self.assertTrue(timings["live_display_incomplete"])
+                        self.assertEqual(failures[0].outcome, "timed_out")
+                        self.assertTrue(
+                            any(
+                                path.read_bytes() == b"durable stderr"
+                                for path in self.temp_dir.glob("rust-test-stderr-*.log")
+                            )
+                        )
+                    finally:
+                        release.set()
+                        worker.join(timeout=10)
+
     # Allow busy Windows startup/cleanup, but reject a ten-second delay and
     # waiting for the sleeping child's natural exit.
     CLEANUP_ALLOWANCE_SECS = 8
@@ -1227,7 +1535,12 @@ class RealExecutorTest(RunnerTestCase):
                     else:
                         with self.assertRaises(RunnerError) as failure:
                             runner.run_gates(["demo-gate"], quiet=True)
-                        self.assertEqual(failure.exception.outcome, "not_executed")
+                        # A complete empty report never ran the test; duplicate
+                        # completions are inconsistent reporter evidence.
+                        self.assertEqual(
+                            failure.exception.outcome,
+                            "not_executed" if count == 0 else "evidence_incomplete",
+                        )
                         detail = str(failure.exception)
                         self.assertIn("gate evidence diagnostic", detail)
                         self.assertLess(len(detail), 10000)
@@ -1505,8 +1818,12 @@ class NamedSelectionTest(RunnerTestCase):
                 self.subTest(command=command, names=names),
                 mock.patch.object(Manifest, "load", return_value=self.manifest()),
                 mock.patch.object(rust_test_runner, "load_metadata") as metadata,
-                mock.patch.object(rust_test_runner, "execution_dependency_manifest") as provenance,
-                mock.patch.object(rust_build_status, "reserve_rust_test_target") as lane,
+                mock.patch.object(
+                    rust_test_runner, "execution_dependency_manifest"
+                ) as provenance,
+                mock.patch.object(
+                    rust_build_status, "reserve_rust_test_target"
+                ) as lane,
                 mock.patch.object(RustTestRunner, "_execute") as execute,
                 mock.patch.object(subprocess, "Popen") as child,
                 mock.patch.object(Path, "read_bytes") as fingerprint_inputs,
@@ -1514,17 +1831,37 @@ class NamedSelectionTest(RunnerTestCase):
             ):
                 args = rust_test_runner.build_parser().parse_args([command, *names])
                 self.assertEqual(rust_test_runner._main(args), 2)
-                self.assertIn(f"unknown named Rust test {kind} 'nope'", stderr.getvalue())
-                for call in (metadata, provenance, lane, execute, child, fingerprint_inputs):
+                self.assertIn(
+                    f"unknown named Rust test {kind} 'nope'", stderr.getvalue()
+                )
+                for call in (
+                    metadata,
+                    provenance,
+                    lane,
+                    execute,
+                    child,
+                    fingerprint_inputs,
+                ):
                     call.assert_not_called()
 
     def test_valid_cli_names_recheck_only_selected_definitions_after_admission(self):
         manifest = self.manifest()
         current_manifests = {}
         for change, edit in (
-            ("manifest", lambda data: data["gates"]["demo-gate"]["steps"][0].update(tests=["new::test"])),
-            ("selected_target", lambda data: data["targets"]["core_all"].update(helpers=["codex"])),
-            ("unrelated_target", lambda data: data["targets"]["core_shard"].update(helpers=[])),
+            (
+                "manifest",
+                lambda data: data["gates"]["demo-gate"]["steps"][0].update(
+                    tests=["new::test"]
+                ),
+            ),
+            (
+                "selected_target",
+                lambda data: data["targets"]["core_all"].update(helpers=["codex"]),
+            ),
+            (
+                "unrelated_target",
+                lambda data: data["targets"]["core_shard"].update(helpers=[]),
+            ),
         ):
             changed_data = copy.deepcopy(MANIFEST_DATA)
             edit(changed_data)
@@ -1559,20 +1896,42 @@ class NamedSelectionTest(RunnerTestCase):
                 with (
                     self.subTest(command=command, change=change),
                     mock.patch.object(rust_test_runner, "__file__", str(source_path)),
-                    mock.patch.object(Manifest, "load", side_effect=[
-                        manifest, current_manifests.get(change, manifest)
-                    ]) as load_manifest,
-                    mock.patch.object(rust_test_runner, "load_metadata", return_value=self.metadata()) as metadata,
-                    mock.patch.object(rust_build_status, "reserve_rust_test_target", side_effect=reserve) as lane,
-                    mock.patch.object(rust_test_runner, "execution_dependency_manifest", return_value=None) as provenance,
-                    mock.patch.object(RustTestRunner, method, return_value={}) as execute,
-                    mock.patch.object(rust_test_runner, "emit_execution_receipt") as receipt,
+                    mock.patch.object(
+                        Manifest,
+                        "load",
+                        side_effect=[manifest, current_manifests.get(change, manifest)],
+                    ) as load_manifest,
+                    mock.patch.object(
+                        rust_test_runner, "load_metadata", return_value=self.metadata()
+                    ) as metadata,
+                    mock.patch.object(
+                        rust_build_status,
+                        "reserve_rust_test_target",
+                        side_effect=reserve,
+                    ) as lane,
+                    mock.patch.object(
+                        rust_test_runner,
+                        "execution_dependency_manifest",
+                        return_value=None,
+                    ) as provenance,
+                    mock.patch.object(
+                        RustTestRunner, method, return_value={}
+                    ) as execute,
+                    mock.patch.object(
+                        rust_test_runner, "emit_execution_receipt"
+                    ) as receipt,
                     contextlib.redirect_stderr(io.StringIO()) as stderr,
                 ):
-                    args = rust_test_runner.build_parser().parse_args([
-                        "--manifest", str(manifest_path), "--target-dir", str(self.target_dir),
-                        command, *names,
-                    ])
+                    args = rust_test_runner.build_parser().parse_args(
+                        [
+                            "--manifest",
+                            str(manifest_path),
+                            "--target-dir",
+                            str(self.target_dir),
+                            command,
+                            *names,
+                        ]
+                    )
                     # Only a definition this launch executes invalidates its wait.
                     rejected = change == "selected_target" or (
                         change == "manifest" and command != "run-target"
@@ -1588,14 +1947,20 @@ class NamedSelectionTest(RunnerTestCase):
                         execute.assert_not_called()
                     else:
                         if command == "run-target":
-                            execute.assert_called_once_with("core_all", [], allow_all=False)
+                            execute.assert_called_once_with(
+                                "core_all", [], allow_all=False
+                            )
                         else:
                             execute.assert_called_once_with(names)
-                        self.assertEqual(provenance.call_count, int(command != "check-gates"))
+                        self.assertEqual(
+                            provenance.call_count, int(command != "check-gates")
+                        )
                         if command != "check-gates":
                             # Runner edits keep the code this process loaded; the
                             # receipt still names the launch-time runner inputs.
-                            self.assertEqual(receipt.call_args.args[0], launch_fingerprint)
+                            self.assertEqual(
+                                receipt.call_args.args[0], launch_fingerprint
+                            )
 
     def test_unknown_target_name_fails(self) -> None:
         runner, _ = self.runner()
@@ -1629,12 +1994,20 @@ class GatesForTest(RunnerTestCase):
         root.write_text("", encoding="utf-8")
         orphan = crate / "src/orphan.rs"
         orphan.write_text("#[test] fn works() {}", encoding="utf-8")
-        runner, executor = self.runner(manifest=self.manifest(gates={
-            "orphan": {"steps": [{"target": "core_lib", "tests": ["orphan::works"]}]},
-        }))
+        runner, executor = self.runner(
+            manifest=self.manifest(
+                gates={
+                    "orphan": {
+                        "steps": [{"target": "core_lib", "tests": ["orphan::works"]}]
+                    },
+                }
+            )
+        )
         core = runner.metadata.packages["codex-core"]
         core["manifest_path"] = str(crate / "Cargo.toml")
-        core["targets"] = [{"name": "codex_core", "kind": ["lib"], "src_path": str(root)}]
+        core["targets"] = [
+            {"name": "codex_core", "kind": ["lib"], "src_path": str(root)}
+        ]
         result = runner.gates_for([str(orphan)])
         self.assertEqual(result["gates"], [])
         self.assertEqual(result["paths"], {str(orphan): []})
@@ -1663,18 +2036,25 @@ class GatesForTest(RunnerTestCase):
             path = crate / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-        manifest = self.manifest(gates={
-            name: {"steps": [{"target": "core_lib", "tests": [identity]}]}
-            for name, identity in (
-                ("renamed", "analytics::tests::renamed::works"),
-                ("second", "analytics::tests::second::works"),
-            )
-        })
+        manifest = self.manifest(
+            gates={
+                name: {"steps": [{"target": "core_lib", "tests": [identity]}]}
+                for name, identity in (
+                    ("renamed", "analytics::tests::renamed::works"),
+                    ("second", "analytics::tests::second::works"),
+                )
+            }
+        )
         runner, executor = self.runner(manifest=manifest)
         core = runner.metadata.packages["codex-core"]
         core["manifest_path"] = str(crate / "Cargo.toml")
-        core["targets"] = [{"name": "codex_core", "kind": ["lib"],
-                            "src_path": str(crate / "src/lib.rs")}]
+        core["targets"] = [
+            {
+                "name": "codex_core",
+                "kind": ["lib"],
+                "src_path": str(crate / "src/lib.rs"),
+            }
+        ]
         leaf = str(crate / "src/analytics/leaf.rs")
         result = runner.gates_for([leaf])
         self.assertEqual(result["target_paths"], {leaf: ["core_lib"]})
@@ -1699,14 +2079,18 @@ class GatesForTest(RunnerTestCase):
         runner, executor = self.runner(manifest=self.manifest(gates={}))
         core = runner.metadata.packages["codex-core"]
         core["manifest_path"] = str(crate / "Cargo.toml")
-        core["targets"] = [{"name": "codex_core", "kind": ["lib"], "src_path": str(lib)}]
+        core["targets"] = [
+            {"name": "codex_core", "kind": ["lib"], "src_path": str(lib)}
+        ]
         declaration = '#[path = "real.rs"] mod fake;'
         sources = [
             "// " + declaration,
             "/* outer /* nested */ " + declaration + " */",
             'const TEXT: &str = "' + declaration.replace('"', '\\"') + '";',
-            *(f'const TEXT: &str = {prefix}###"before " {declaration} "###;'
-              for prefix in ("r", "br", "cr")),
+            *(
+                f'const TEXT: &str = {prefix}###"before " {declaration} "###;'
+                for prefix in ("r", "br", "cr")
+            ),
             "/* unterminated " + declaration,
         ]
         for source in sources:
@@ -1716,13 +2100,17 @@ class GatesForTest(RunnerTestCase):
                 self.assertEqual(result["target_paths"], {str(real): ["core_lib"]})
                 self.assertEqual(result["unresolved_targets"], [])
         # Real renamed declarations still establish the actual module prefix.
-        lib.write_text('#[path = "real.rs"] pub(crate) mod renamed;\n', encoding="utf-8")
+        lib.write_text(
+            '#[path = "real.rs"] pub(crate) mod renamed;\n', encoding="utf-8"
+        )
         decoy.write_text("", encoding="utf-8")
         self.assertEqual(rust_test_runner._rust_module(lib, real), "renamed")
         self.assertEqual(runner.gates_for([str(real)])["targets"], ["core_lib"])
         self.assertEqual(executor.calls, [])
 
-    def test_named_targets_verify_nested_shards_without_gates_or_execution(self) -> None:
+    def test_named_targets_verify_nested_shards_without_gates_or_execution(
+        self,
+    ) -> None:
         crate = self.temp_dir / "core"
 
         def shard(modules):
@@ -1735,9 +2123,9 @@ class GatesForTest(RunnerTestCase):
         files = {
             "src/lib.rs": "",
             "tests/all.rs": (
-                '// mod suite;\n'
+                "// mod suite;\n"
                 'const DECOY: &str = r#"mod suite;"#;\n'
-                '/* mod suite; */\n'
+                "/* mod suite; */\n"
             ),
             "tests/core_shard.rs": shard(["thread_fork", "thread_resume"]),
             "tests/core_shard_two.rs": shard(["thread_list"]),
@@ -1755,7 +2143,12 @@ class GatesForTest(RunnerTestCase):
         core["manifest_path"] = str(crate / "Cargo.toml")
         for target in core["targets"]:
             target["src_path"] = str(
-                crate / ("src/lib.rs" if "lib" in target["kind"] else f"tests/{target['name']}.rs")
+                crate
+                / (
+                    "src/lib.rs"
+                    if "lib" in target["kind"]
+                    else f"tests/{target['name']}.rs"
+                )
             )
         fork, resume, orphan = [
             f"core/tests/suite/v2/{name}.rs"
@@ -1764,21 +2157,33 @@ class GatesForTest(RunnerTestCase):
         result = runner.gates_for([fork, resume, orphan], cwd=self.temp_dir)
         self.assertEqual(result["gates"], [])
         self.assertEqual(result["targets"], ["core_shard"])
-        self.assertEqual(result["target_paths"], {
-            fork: ["core_shard"], resume: ["core_shard"], orphan: [],
-        })
+        self.assertEqual(
+            result["target_paths"],
+            {
+                fork: ["core_shard"],
+                resume: ["core_shard"],
+                orphan: [],
+            },
+        )
         self.assertEqual(result["unresolved_targets"], [orphan])
         self.assertEqual(result["ambiguous_targets"], {})
 
         # A new query must see registration edits; multiple real owners are
         # explicit advice, not an automatic choice or execution proof.
-        (crate / "tests/core_shard.rs").write_text(shard(["thread_fork"]), encoding="utf-8")
-        (crate / "tests/core_shard_two.rs").write_text(shard(["thread_fork"]), encoding="utf-8")
+        (crate / "tests/core_shard.rs").write_text(
+            shard(["thread_fork"]), encoding="utf-8"
+        )
+        (crate / "tests/core_shard_two.rs").write_text(
+            shard(["thread_fork"]), encoding="utf-8"
+        )
         result = runner.gates_for([fork, resume], cwd=self.temp_dir)
         self.assertEqual(result["target_paths"][fork], ["core_shard", "core_shard_two"])
-        self.assertEqual(result["ambiguous_targets"], {
-            fork: ["core_shard", "core_shard_two"],
-        })
+        self.assertEqual(
+            result["ambiguous_targets"],
+            {
+                fork: ["core_shard", "core_shard_two"],
+            },
+        )
         self.assertEqual(result["unresolved_targets"], [resume])
 
         # Duplicate declarations cannot establish a unique route.
@@ -1809,9 +2214,9 @@ class GatesForTest(RunnerTestCase):
         ]
         result = runner.gates_for(paths, cwd=REPO_ROOT)
         self.assertEqual(result["targets"], ["app_server_sessions"])
-        self.assertEqual(result["target_paths"], {
-            path: ["app_server_sessions"] for path in paths
-        })
+        self.assertEqual(
+            result["target_paths"], {path: ["app_server_sessions"] for path in paths}
+        )
         self.assertEqual(result["unresolved_targets"], [])
         self.assertEqual(result["ambiguous_targets"], {})
         self.assertEqual(executor.calls, [])
@@ -1826,16 +2231,28 @@ class GatesForTest(RunnerTestCase):
         two.write_text("", encoding="utf-8")
         read_text, glob = Path.read_text, Path.glob
         reads, scans = [], []
+
         def read(path, *args, **kwargs):
             reads.append(path)
             return read_text(path, *args, **kwargs)
+
         def scan(path, pattern):
             scans.append(path)
             return glob(path, pattern)
-        with mock.patch.object(Path, "read_text", read), mock.patch.object(Path, "glob", scan):
+
+        with (
+            mock.patch.object(Path, "read_text", read),
+            mock.patch.object(Path, "glob", scan),
+        ):
             declarations = {}
-            self.assertEqual(rust_test_runner._rust_module(lib, one, declarations=declarations), "first")
-            self.assertEqual(rust_test_runner._rust_module(lib, two, declarations=declarations), "two")
+            self.assertEqual(
+                rust_test_runner._rust_module(lib, one, declarations=declarations),
+                "first",
+            )
+            self.assertEqual(
+                rust_test_runner._rust_module(lib, two, declarations=declarations),
+                "two",
+            )
         self.assertEqual(scans, [root])
         self.assertCountEqual(reads, [lib, one, two])
         lib.write_text('#[path = "one.rs"] mod changed;\n', encoding="utf-8")
@@ -1875,7 +2292,9 @@ class GatesForTest(RunnerTestCase):
                         }
                     ]
                 },
-                "suite": {"steps": [{"target": "core_all", "tests": ["suite::exec::beta"]}]},
+                "suite": {
+                    "steps": [{"target": "core_all", "tests": ["suite::exec::beta"]}]
+                },
                 "broad": {"steps": [{"target": "core_lib", "filter": "test(alpha)"}]},
             }
         )
@@ -1884,7 +2303,12 @@ class GatesForTest(RunnerTestCase):
         core["manifest_path"] = str(crate / "Cargo.toml")
         for target in core["targets"]:
             target["src_path"] = str(
-                crate / ("src/lib.rs" if "lib" in target["kind"] else f"tests/{target['name']}.rs")
+                crate
+                / (
+                    "src/lib.rs"
+                    if "lib" in target["kind"]
+                    else f"tests/{target['name']}.rs"
+                )
             )
 
         result = runner.gates_for(
@@ -1957,8 +2381,11 @@ class FilteringArgumentPolicyTest(unittest.TestCase):
 
     def test_filterset_after_separator_explains_placement(self) -> None:
         for option in ("-E", "--filterset", "--filterset=test(alpha)"):
-            with self.subTest(option=option), self.assertRaisesRegex(
-                RunnerError, f"put {option.split('=', 1)[0]} before --"
+            with (
+                self.subTest(option=option),
+                self.assertRaisesRegex(
+                    RunnerError, f"put {option.split('=', 1)[0]} before --"
+                ),
             ):
                 rust_test_runner.validate_filtering_args(["--", option, "test(alpha)"])
 
@@ -1966,10 +2393,19 @@ class FilteringArgumentPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(RunnerError, "must be default, only, or all"):
             rust_test_runner.validate_filtering_args(["--run-ignored", "sometimes"])
 
-    def test_success_output_is_runner_owned_and_rejections_list_accepted_options(self) -> None:
+    def test_success_output_is_runner_owned_and_rejections_list_accepted_options(
+        self,
+    ) -> None:
         split = rust_test_runner._split_runner_owned_options
         filters, _, _, _, success_output = split(
-            ["-E", "test(=a::b)", "--run-ignored", "only", "--success-output", "immediate"]
+            [
+                "-E",
+                "test(=a::b)",
+                "--run-ignored",
+                "only",
+                "--success-output",
+                "immediate",
+            ]
         )
         self.assertEqual(filters, ["-E", "test(=a::b)", "--run-ignored", "only"])
         self.assertEqual(success_output, "immediate")
@@ -1978,13 +2414,20 @@ class FilteringArgumentPolicyTest(unittest.TestCase):
             ["--success-output", "always"],
             ["--success-output=final", "--success-output=never"],
         ):
-            with self.subTest(argv=argv), self.assertRaisesRegex(RunnerError, "--success-output"):
+            with (
+                self.subTest(argv=argv),
+                self.assertRaisesRegex(RunnerError, "--success-output"),
+            ):
                 split(argv)
         # After a further `--` it is a libtest argument, not runner policy.
         for argv in (["--", "--success-output", "immediate"], ["--nocapture"]):
-            with self.subTest(argv=argv), self.assertRaisesRegex(
-                RunnerError, r"unsupported test filtering option .*; accepted filtering: "
-                r".*--success-output never"
+            with (
+                self.subTest(argv=argv),
+                self.assertRaisesRegex(
+                    RunnerError,
+                    r"unsupported test filtering option .*; accepted filtering: "
+                    r".*--success-output never",
+                ),
             ):
                 rust_test_runner.validate_filtering_args(split(argv)[0])
 
@@ -2242,13 +2685,21 @@ class TargetDirectoryPropagationTest(RunnerTestCase):
                 )
                 self.assertEqual(actual.resolve(), expected)
 
-    def test_target_environment_precedence_and_cargo_relative_paths_are_preserved(self) -> None:
+    def test_target_environment_precedence_and_cargo_relative_paths_are_preserved(
+        self,
+    ) -> None:
         cargo_cwd = self.temp_dir / "codex-rs"
         for configured, expected in [
             ({}, self.metadata().target_directory),
             ({"CARGO_TARGET_DIR": "target/cargo"}, cargo_cwd / "target/cargo"),
             ({"CODEX_CARGO_LANE_TARGET_DIR": "target/lane"}, cargo_cwd / "target/lane"),
-            ({"CODEX_CARGO_LANE_TARGET_DIR": "target/lane", "CARGO_TARGET_DIR": "target/cargo"}, cargo_cwd / "target/lane"),
+            (
+                {
+                    "CODEX_CARGO_LANE_TARGET_DIR": "target/lane",
+                    "CARGO_TARGET_DIR": "target/cargo",
+                },
+                cargo_cwd / "target/lane",
+            ),
             ({"CARGO_TARGET_DIR": str(self.target_dir)}, self.target_dir),
             ({"CODEX_CARGO_LANE_TARGET_DIR": str(self.target_dir)}, self.target_dir),
         ]:
@@ -2258,16 +2709,22 @@ class TargetDirectoryPropagationTest(RunnerTestCase):
                 mock.patch.object(Path, "cwd", return_value=self.temp_dir / "caller"),
             ):
                 self.assertEqual(
-                    rust_test_runner._resolve_target_dir(None, self.metadata(), cwd=cargo_cwd),
+                    rust_test_runner._resolve_target_dir(
+                        None, self.metadata(), cwd=cargo_cwd
+                    ),
                     expected,
                 )
                 # Explicit absolute paths win over either environment variable.
                 self.assertEqual(
-                    rust_test_runner._resolve_target_dir(str(self.target_dir), self.metadata(), cwd=cargo_cwd),
+                    rust_test_runner._resolve_target_dir(
+                        str(self.target_dir), self.metadata(), cwd=cargo_cwd
+                    ),
                     self.target_dir,
                 )
 
-    def test_cli_target_reaches_admission_and_all_commands_without_rerooting(self) -> None:
+    def test_cli_target_reaches_admission_and_all_commands_without_rerooting(
+        self,
+    ) -> None:
         relative = "codex-rs/target/lanes/demo"
         expected = (self.temp_dir / relative).resolve()
         for arguments in [
@@ -2278,21 +2735,35 @@ class TargetDirectoryPropagationTest(RunnerTestCase):
             with (
                 self.subTest(arguments=arguments),
                 mock.patch.object(Path, "cwd", return_value=self.temp_dir),
-                mock.patch.object(rust_test_runner, "load_metadata", return_value=self.metadata()),
+                mock.patch.object(
+                    rust_test_runner, "load_metadata", return_value=self.metadata()
+                ),
                 mock.patch.object(Manifest, "load", return_value=self.manifest()),
-                mock.patch.object(rust_test_runner, "_dispatch_with_admission", return_value=0) as dispatch,
-                mock.patch.dict(os.environ, {
-                    "CODEX_CARGO_LANE_TARGET_DIR": str(self.temp_dir / "unused-lane"),
-                    "CARGO_TARGET_DIR": str(self.temp_dir / "unused-cargo"),
-                }),
+                mock.patch.object(
+                    rust_test_runner, "_dispatch_with_admission", return_value=0
+                ) as dispatch,
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CODEX_CARGO_LANE_TARGET_DIR": str(
+                            self.temp_dir / "unused-lane"
+                        ),
+                        "CARGO_TARGET_DIR": str(self.temp_dir / "unused-cargo"),
+                    },
+                ),
             ):
                 self.assertEqual(rust_test_runner.main(arguments), 0)
                 runner = dispatch.call_args.args[1]
                 self.assertEqual(runner.target_dir, expected)
                 plan = runner.plan("core_all")
                 for command in [plan["run"], *plan["builds"]]:
-                    self.assertEqual(command[command.index("--target-dir") + 1], str(expected))
-                self.assertEqual(runner.base_env["CODEX_RUST_TEST_LOG_DIR"], str(expected / "test-runner-logs"))
+                    self.assertEqual(
+                        command[command.index("--target-dir") + 1], str(expected)
+                    )
+                self.assertEqual(
+                    runner.base_env["CODEX_RUST_TEST_LOG_DIR"],
+                    str(expected / "test-runner-logs"),
+                )
                 self.assertFalse((self.temp_dir / "codex-rs/codex-rs").exists())
 
     def test_every_cargo_command_targets_the_active_lane(self) -> None:
@@ -2321,18 +2792,25 @@ class RunTargetTest(RunnerTestCase):
         runner, _ = self.runner(executor=executor, manifest=manifest)
         with self.assertRaisesRegex(RunnerError, "unfulfilled.*missing") as error:
             runner.run_target("core_all", ["-E", "test(=alpha) | test(=missing)"])
-        self.assertEqual(error.exception.completed_tests, {"codex-core::all": ["alpha"]})
+        self.assertEqual(
+            error.exception.completed_tests, {"codex-core::all": ["alpha"]}
+        )
         self.assertEqual(error.exception.outcome, "not_executed")
         self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 1)
         self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
-        receipt = runner.run_target("core_all", ["-E", "test(=alpha) | test(=missing)",
-                                                "--", "--skip", "missing"])
+        receipt = runner.run_target(
+            "core_all",
+            ["-E", "test(=alpha) | test(=missing)", "--", "--skip", "missing"],
+        )
         self.assertEqual(receipt, {"codex-core::all": ["alpha"]})
 
     def test_trusted_declaration_covers_parser_global_options(self):
         config = json.loads((REPO_ROOT / ".codex/test-runners.json").read_text())
-        declaration = next(row for row in config["runners"]
-                           if row.get("receipt_runner") == "rust_test_runner")
+        declaration = next(
+            row
+            for row in config["runners"]
+            if row.get("receipt_runner") == "rust_test_runner"
+        )
         for action in rust_test_runner.build_parser()._actions:
             for option in action.option_strings:
                 if option not in {"-h", "--help"}:
@@ -2376,9 +2854,14 @@ class RunTargetTest(RunnerTestCase):
                         ("suite::duplicate", "ok"),
                         ("suite::duplicate", "ok"),
                         ("suite::skipped", "ignored"),
-                    ], binary="all", kind="test",
+                    ],
+                    binary="all",
+                    kind="test",
                 ) + nextest_run_payload(
-                    [("suite::foreign", "ok")], package="other", binary="all", kind="test",
+                    [("suite::foreign", "ok")],
+                    package="other",
+                    binary="all",
+                    kind="test",
                 )
             return result
 
@@ -2411,14 +2894,17 @@ class RunTargetTest(RunnerTestCase):
                 result.returncode = 100
                 result.stdout = nextest_run_payload(
                     [("suite::passed", "ok"), *((test, "failed") for test in failed)],
-                    binary="all", kind="test",
+                    binary="all",
+                    kind="test",
                 )
             return result
 
         runner.executor = execute
         output = io.StringIO()
         with contextlib.redirect_stderr(output), self.assertRaises(RunnerError):
-            runner.run_target("core_all", ["-E", " | ".join(f"test(={test})" for test in selected)])
+            runner.run_target(
+                "core_all", ["-E", " | ".join(f"test(={test})" for test in selected)]
+            )
         rendered = output.getvalue()
         self.assertIn("passed=1, failed=94, not-run=1", rendered)
         for test in failed:
@@ -2436,11 +2922,22 @@ class RunTargetTest(RunnerTestCase):
     def test_execution_receipt_names_selected_packages_not_source_roots(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            rust_test_runner.emit_execution_receipt("a" * 64, {"suite": ["test"]},
-                ["gate"], skipped=0,
-                selected_packages=["codex-tui", "codex-core", "codex-app-server", "codex-core"])
-        self.assertEqual(json.loads(output.getvalue())["selected_packages"],
-                         ["codex-app-server", "codex-core", "codex-tui"])
+            rust_test_runner.emit_execution_receipt(
+                "a" * 64,
+                {"suite": ["test"]},
+                ["gate"],
+                skipped=0,
+                selected_packages=[
+                    "codex-tui",
+                    "codex-core",
+                    "codex-app-server",
+                    "codex-core",
+                ],
+            )
+        self.assertEqual(
+            json.loads(output.getvalue())["selected_packages"],
+            ["codex-app-server", "codex-core", "codex-tui"],
+        )
 
     def test_abnormal_exit_reports_observed_failures_without_pass_receipts(self):
         runner, _ = self.runner(executor=self.build_executor())
@@ -2451,14 +2948,21 @@ class RunTargetTest(RunnerTestCase):
             if args[:3] == ["cargo", "nextest", "run"]:
                 result.returncode = 101
                 result.stdout = nextest_run_payload(
-                    [("suite::passed", "ok"), ("suite::failed", "failed")], binary="all", kind="test",
+                    [("suite::passed", "ok"), ("suite::failed", "failed")],
+                    binary="all",
+                    kind="test",
                 )
             return result
 
         runner.executor = execute
         output = io.StringIO()
-        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as caught:
-            runner.run_target("core_all", ["-E", "test(=suite::passed) | test(=suite::failed)"])
+        with (
+            contextlib.redirect_stderr(output),
+            self.assertRaises(RunnerError) as caught,
+        ):
+            runner.run_target(
+                "core_all", ["-E", "test(=suite::passed) | test(=suite::failed)"]
+            )
         self.assertEqual(caught.exception.completed_tests, {})
         self.assertIn("\ncodex-core::all suite::failed\n", output.getvalue())
         self.assertIn("passed=1, failed=1, not-run=0", output.getvalue())
@@ -2488,7 +2992,10 @@ class RunTargetTest(RunnerTestCase):
 
         runner.executor = execute
         output = io.StringIO()
-        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as caught:
+        with (
+            contextlib.redirect_stderr(output),
+            self.assertRaises(RunnerError) as caught,
+        ):
             runner.run_target("core_all", ["-E", "test(=suite::passed)"])
         rendered = output.getvalue()
         self.assertIn("not executed", rendered)
@@ -2503,7 +3010,9 @@ class RunTargetTest(RunnerTestCase):
         # The failure still propagates: nothing is reported as passing.
         self.assertEqual(caught.exception.outcome, "failed")
 
-    def test_helper_free_compile_failure_has_unverified_outcomes_not_empty_inventory(self):
+    def test_helper_free_compile_failure_has_unverified_outcomes_not_empty_inventory(
+        self,
+    ):
         data = copy.deepcopy(MANIFEST_DATA)
         data["targets"]["core_lib"]["helpers"] = []
         runner, executor = self.runner(manifest=Manifest.from_data(data))
@@ -2511,12 +3020,18 @@ class RunTargetTest(RunnerTestCase):
         def compile_failure(args, **kwargs):
             executor(args, **kwargs)
             return subprocess.CompletedProcess(
-                args, 101, "", "error[E0063]: missing field in test target\n",
+                args,
+                101,
+                "",
+                "error[E0063]: missing field in test target\n",
             )
 
         runner.executor = compile_failure
         output = io.StringIO()
-        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as caught:
+        with (
+            contextlib.redirect_stderr(output),
+            self.assertRaises(RunnerError) as caught,
+        ):
             runner.run_target("core_lib", ["-E", "test(=mod::tests::alpha)"])
         self.assertEqual(len(executor.calls), 1)
         self.assertEqual(executor.calls[0]["args"][:3], ["cargo", "nextest", "run"])
@@ -2547,7 +3062,8 @@ class RunTargetTest(RunnerTestCase):
 
                 def execute(args, **kwargs):
                     return rust_test_runner._default_executor(
-                        [sys.executable, "-c", script], **kwargs,
+                        [sys.executable, "-c", script],
+                        **kwargs,
                     )
 
                 runner.executor = execute
@@ -2560,7 +3076,9 @@ class RunTargetTest(RunnerTestCase):
                         deadline = time.monotonic() + 5
                         while not marker.exists() and time.monotonic() < deadline:
                             time.sleep(0.01)
-                        self.assertTrue(marker.exists(), "child must execute before interruption")
+                        self.assertTrue(
+                            marker.exists(), "child must execute before interruption"
+                        )
                         if outcome == "timed_out":
                             raise subprocess.TimeoutExpired(process.args, 5)
                         raise KeyboardInterrupt
@@ -2587,7 +3105,11 @@ class RunTargetTest(RunnerTestCase):
                 self.assertNotIn("Failed test IDs (complete)", rendered)
                 # The child independently demonstrates real execution, even
                 # though the interrupted command produced no CompletedProcess.
-                logs = list((runner.target_dir / "test-runner-logs").glob("rust-test-stdout-*.log"))
+                logs = list(
+                    (runner.target_dir / "test-runner-logs").glob(
+                        "rust-test-stdout-*.log"
+                    )
+                )
                 self.assertTrue(any(payload in path.read_text() for path in logs))
 
     def test_phase_report_separates_build_from_tests_without_extra_commands(
@@ -2671,7 +3193,9 @@ class RunTargetTest(RunnerTestCase):
     def test_cross_package_helpers_build_once_before_exact_run_without_discovery(
         self,
     ) -> None:
-        executor = self.build_executor(default_listing={"suite::one": False, "suite::two": False})
+        executor = self.build_executor(
+            default_listing={"suite::one": False, "suite::two": False}
+        )
         runner, _ = self.runner(executor=executor)
         expression = "test(=suite::one) | test(=suite::two)"
 
@@ -2697,11 +3221,17 @@ class RunTargetTest(RunnerTestCase):
         )
         # Feature unification must not widen the selected helper binaries.
         self.assertEqual(
-            [build["args"][i + 1] for i, arg in enumerate(build["args"]) if arg == "--bin"],
+            [
+                build["args"][i + 1]
+                for i, arg in enumerate(build["args"])
+                if arg == "--bin"
+            ],
             ["codex", "codex-code-mode-host", "test_stdio_server"],
         )
         self.assertEqual(run["args"][run["args"].index("--show-progress") + 1], "none")
-        self.assertEqual(run["args"][run["args"].index("--success-output") + 1], "never")
+        self.assertEqual(
+            run["args"][run["args"].index("--success-output") + 1], "never"
+        )
         self.assertEqual(run["args"][run["args"].index("-E") + 1], expression)
         self.assertEqual(run["args"][run["args"].index("--test") + 1], "all")
         self.assertIn("--no-tests=fail", run["args"])
@@ -2855,9 +3385,17 @@ class RunTargetTest(RunnerTestCase):
                 runner.return_value.cargo_profile = None
                 runner.return_value.base_env = {}
                 runner.return_value.platform = "windows"
-                runner.return_value.manifest = Manifest.load(rust_test_runner.DEFAULT_MANIFEST)
-                runner.return_value.target.side_effect = runner.return_value.manifest.target
-                runner.return_value.run_target.return_value = {"codex-core": ["tests::alpha"]}
+                runner.return_value.manifest = Manifest.load(
+                    rust_test_runner.DEFAULT_MANIFEST
+                )
+                runner.return_value.target.side_effect = (
+                    runner.return_value.manifest.target
+                )
+                # The receipt records helper artifacts the real runner observed.
+                runner.return_value.execution_artifacts = {}
+                runner.return_value.run_target.return_value = {
+                    "codex-core": ["tests::alpha"]
+                }
                 self.assertEqual(
                     rust_test_runner.main(["run-target", "core_lib", *arguments]), 0
                 )
@@ -2910,18 +3448,27 @@ class RunTargetTest(RunnerTestCase):
         }
         return FakeExecutor(artifacts=artifacts, **kwargs)
 
-
-    def test_requested_success_output_is_streamed_without_changing_receipts(self) -> None:
+    def test_requested_success_output_is_streamed_without_changing_receipts(
+        self,
+    ) -> None:
         receipts = {}
         for value in rust_test_runner.SUCCESS_OUTPUT_VALUES:
             executor = self.build_executor(default_listing={"tests::alpha": False})
             runner = RustTestRunner(
-                self.manifest(), self.metadata(), target_dir=self.target_dir,
-                platform="windows", executor=executor, success_output=value,
+                self.manifest(),
+                self.metadata(),
+                target_dir=self.target_dir,
+                platform="windows",
+                executor=executor,
+                success_output=value,
             )
+
             def displayed_output(args, **kwargs):
                 result = executor(args, **kwargs)
-                if args[:3] == ["cargo", "nextest", "run"] and value in ("final", "immediate-final"):
+                if args[:3] == ["cargo", "nextest", "run"] and value in (
+                    "final",
+                    "immediate-final",
+                ):
                     # Native machine events occur once on stdout. Human final
                     # reports and requested test output are on stderr only.
                     report = "Summary [ 0.01s] 1 test run: 1 passed\nPASS [ 0.01s] codex-core::all tests::alpha\n  stdout ---\nbenchmark output\n"
@@ -2930,17 +3477,25 @@ class RunTargetTest(RunnerTestCase):
                     else:
                         print(report, file=sys.stderr)
                 return result
+
             runner.executor = displayed_output
-            receipts[value] = runner.run_target("core_all", ["-E", "test(=tests::alpha)"])
+            receipts[value] = runner.run_target(
+                "core_all", ["-E", "test(=tests::alpha)"]
+            )
             (run,) = executor.commands(["cargo", "nextest", "run"])
             self.assertEqual(run[run.index("--success-output") + 1], value)
             (capture,) = [
-                call["capture"] for call in executor.calls
+                call["capture"]
+                for call in executor.calls
                 if list(call["args"][:3]) == ["cargo", "nextest", "run"]
             ]
             # Machine events stay retained for receipts; requested output streams.
-            self.assertEqual(capture, rust_test_runner.CAPTURE_BOTH
-                             if value == "never" else rust_test_runner.CAPTURE_STDOUT)
+            self.assertEqual(
+                capture,
+                rust_test_runner.CAPTURE_BOTH
+                if value == "never"
+                else rust_test_runner.CAPTURE_STDOUT,
+            )
         for value in rust_test_runner.SUCCESS_OUTPUT_VALUES:
             self.assertEqual(receipts[value], receipts["never"])
         with self.assertRaisesRegex(RunnerError, "--success-output must be one of"):
@@ -2963,7 +3518,6 @@ class RunTargetTest(RunnerTestCase):
                 "nextest": rust_test_runner.CAPTURE_BOTH,
             },
         )
-
 
     def test_grouped_helper_artifacts_parse_the_retained_log_once(self) -> None:
         runner, executor = self.runner(executor=self.build_executor())
@@ -2998,7 +3552,8 @@ class RunTargetTest(RunnerTestCase):
         scans.assert_called_once_with(result, "stdout")
         self.assertEqual(parses.call_count, len(rows))
         self.assertEqual(
-            artifacts, {name: path.resolve() for name, path in executor.artifacts.items()}
+            artifacts,
+            {name: path.resolve() for name, path in executor.artifacts.items()},
         )
 
     def test_grouped_helper_artifacts_reject_duplicates_and_missing_files(self) -> None:
@@ -3047,13 +3602,94 @@ class RunTargetTest(RunnerTestCase):
 
 
 class RunGateTest(RunnerTestCase):
+    def test_audit112_corrupt_reporter_never_emits_execution_proof(self):
+        metadata = {"crate": "codex-core", "test_binary": "codex_core", "kind": "lib"}
+        events = [
+            {"type": "suite", "event": "started", "test_count": 1, "nextest": metadata},
+            {
+                "type": "test",
+                "event": "started",
+                "name": "codex-core::codex_core$alpha",
+            },
+            {"type": "test", "event": "ok", "name": "codex-core::codex_core$alpha"},
+            {
+                "type": "suite",
+                "event": "ok",
+                "passed": 1,
+                "failed": 0,
+                "ignored": 0,
+                "measured": 0,
+                "filtered_out": 0,
+                "nextest": metadata,
+            },
+        ]
+        contradictory = copy.deepcopy(events)
+        contradictory[-1]["passed"] = 99
+        cases = {
+            "missing_terminal": events[:-1],
+            "missing_test_start": [events[0], *events[2:]],
+            "contradictory_count": contradictory,
+            "missing_suite_start": events[1:],
+        }
+        step = {"target": "core_lib", "helpers": [], "tests": ["alpha"]}
+        targets = copy.deepcopy(MANIFEST_DATA["targets"])
+        targets["core_lib"]["helpers"] = []
+        manifest = self.manifest(
+            targets=targets,
+            gates={"proof": {"steps": [step]}, "overlap": {"steps": [step]}},
+        )
+        for names in (["proof"], ["proof", "overlap"]):
+            for name, rows in cases.items():
+                with self.subTest(gates=names, corrupt=name):
+                    runner, _ = self.runner(manifest=manifest)
+                    result = subprocess.CompletedProcess(
+                        [], 0, "\n".join(map(json.dumps, rows)), ""
+                    )
+                    with (
+                        mock.patch.object(runner, "_checked", return_value=result),
+                        self.assertRaises(RunnerError) as caught,
+                    ):
+                        runner.run_gates(names, quiet=True)
+                    self.assertEqual(caught.exception.outcome, "evidence_incomplete")
+                    self.assertEqual(caught.exception.completed_gates, {})
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        rust_test_runner.emit_execution_receipt(
+                            "a" * 64,
+                            caught.exception.completed_gates,
+                            names,
+                            skipped=0,
+                            exit_code=2,
+                        )
+                    receipt = json.loads(output.getvalue())
+                    self.assertEqual(receipt["executions"], [])
+                    self.assertEqual(receipt["satisfied_gates"], {})
+                    stderr = io.StringIO()
+                    with (
+                        mock.patch.object(runner, "_checked", return_value=result),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(RunnerError) as target_error,
+                    ):
+                        runner.run_target("core_lib", ["-E", "test(=alpha)"])
+                    self.assertEqual(
+                        target_error.exception.outcome, "evidence_incomplete"
+                    )
+                    self.assertEqual(target_error.exception.completed_tests, {})
+                    self.assertIn("no confirmed test outcomes", stderr.getvalue())
+                    self.assertNotIn("passed=1", stderr.getvalue())
+
     def test_receipts_preserve_binary_helper_identity_and_overlapping_gates(self):
         def step(target="core_lib", helpers=()):
             return {"target": target, "tests": ["alpha"], "helpers": list(helpers)}
+
         pure = {"binary": "codex-core", "helpers": [], "test": "alpha"}
         integration = {"binary": "codex-core::all", "helpers": [], "test": "alpha"}
         helper = {"binary": "codex-core", "helpers": ["codex"], "test": "alpha"}
-        both_helpers = {"binary": "codex-core", "helpers": ["codex", "codex-command-runner"], "test": "alpha"}
+        both_helpers = {
+            "binary": "codex-core",
+            "helpers": ["codex", "codex-command-runner"],
+            "test": "alpha",
+        }
         for steps, expected in [
             ([step()], [pure]),
             ([step(), step("core_all")], [pure, integration]),
@@ -3061,22 +3697,36 @@ class RunGateTest(RunnerTestCase):
             ([step(helpers=["codex-command-runner", "codex"])], [both_helpers]),
         ]:
             with self.subTest(steps=steps):
-                manifest = self.manifest(gates={"a": {"steps": steps}, "b": {"steps": steps}})
-                runner, executor = self.runner(manifest=manifest,
-                    executor=FakeExecutor(default_listing={"alpha": False},
-                        artifacts={name: self.helper_executable(name)
-                                   for name in ("codex", "codex-command-runner")}))
+                manifest = self.manifest(
+                    gates={"a": {"steps": steps}, "b": {"steps": steps}}
+                )
+                runner, executor = self.runner(
+                    manifest=manifest,
+                    executor=FakeExecutor(
+                        default_listing={"alpha": False},
+                        artifacts={
+                            name: self.helper_executable(name)
+                            for name in ("codex", "codex-command-runner")
+                        },
+                    ),
+                )
                 receipts = runner.run_gates(["a", "b"], quiet=True)
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
-                    rust_test_runner.emit_execution_receipt("a" * 64, receipts, ["a", "b"], skipped=0)
+                    rust_test_runner.emit_execution_receipt(
+                        "a" * 64, receipts, ["a", "b"], skipped=0
+                    )
                 receipt = json.loads(output.getvalue())
                 self.assertEqual(receipt["executed_tests"], len(expected))
                 self.assertEqual(receipt["executions"], expected)
                 self.assertEqual(receipt["required_executions"], expected)
-                self.assertEqual(receipt["completed_tests"],
-                                 {entry["binary"]: ["alpha"] for entry in expected})
-                self.assertEqual(receipt["satisfied_gates"], {"a": ["alpha"], "b": ["alpha"]})
+                self.assertEqual(
+                    receipt["completed_tests"],
+                    {entry["binary"]: ["alpha"] for entry in expected},
+                )
+                self.assertEqual(
+                    receipt["satisfied_gates"], {"a": ["alpha"], "b": ["alpha"]}
+                )
                 self.assertEqual(executor.commands(["cargo", "nextest", "list"]), [])
 
     def test_filter_only_gate_plan_preserves_module_and_exact_steps(self):
@@ -3194,8 +3844,9 @@ class RunGateTest(RunnerTestCase):
         )
         good = nextest_run_payload([("alpha", "ok")])
         bad = nextest_run_payload([("beta", "failed")])
+        failed_selection = nextest_run_payload([("alpha", "ok"), ("beta", "failed")])
         cases = (
-            (good + bad, 100, {"a": ["alpha"]}),
+            (failed_selection, 100, {"a": ["alpha"]}),
             (good, 0, {"a": ["alpha"]}),
             (good + bad, 101, {}),
             (good + good + bad, 100, {}),
@@ -3298,7 +3949,9 @@ class RunGateTest(RunnerTestCase):
         # The call inventory proves only the helper-free library batch ran;
         # the blocked integration selection must not acquire an empty verdict.
         self.assertIn("Test results core_all: not executed", output.getvalue())
-        self.assertIn("Selected but never started (1): suite::mod::beta", output.getvalue())
+        self.assertIn(
+            "Selected but never started (1): suite::mod::beta", output.getvalue()
+        )
         self.assertNotIn("Test results core_all: passed=0, failed=0", output.getvalue())
 
         for outcome in ("cancelled", "timed_out", "cleanup_failed"):
@@ -3318,18 +3971,31 @@ class RunGateTest(RunnerTestCase):
 
     def test_helper_free_gate_compile_failure_has_no_complete_empty_inventory(self):
         data = copy.deepcopy(MANIFEST_DATA)
-        data["gates"] = {"pure": {"steps": [
-            {"target": "core_lib", "tests": ["mod::tests::alpha"], "helpers": []},
-        ]}}
+        data["gates"] = {
+            "pure": {
+                "steps": [
+                    {
+                        "target": "core_lib",
+                        "tests": ["mod::tests::alpha"],
+                        "helpers": [],
+                    },
+                ]
+            }
+        }
         runner, executor = self.runner(manifest=Manifest.from_data(data))
 
         def compile_failure(args, **kwargs):
             executor(args, **kwargs)
-            return subprocess.CompletedProcess(args, 101, "", "error: could not compile test target")
+            return subprocess.CompletedProcess(
+                args, 101, "", "error: could not compile test target"
+            )
 
         runner.executor = compile_failure
         output = io.StringIO()
-        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as caught:
+        with (
+            contextlib.redirect_stderr(output),
+            self.assertRaises(RunnerError) as caught,
+        ):
             runner.run_gate("pure")
         self.assertEqual(len(executor.calls), 1)
         self.assertEqual(executor.calls[0]["args"][:3], ["cargo", "nextest", "run"])
@@ -3760,16 +4426,22 @@ class RunGateTest(RunnerTestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             receipts = runner.run_gates(["demo-gate"])
-        self.assertEqual(receipts, {"demo-gate": ["mod::tests::alpha", "suite::mod::beta"]})
+        self.assertEqual(
+            receipts, {"demo-gate": ["mod::tests::alpha", "suite::mod::beta"]}
+        )
         self.assertEqual(
             output.getvalue(), "gate core_lib: 1 passed\ngate core_all: 1 passed\n"
         )
         runs = executor.commands(["cargo", "nextest", "run"])
-        self.assertEqual([executor._selector_for(command) for command in runs], ["--lib", "all"])
+        self.assertEqual(
+            [executor._selector_for(command) for command in runs], ["--lib", "all"]
+        )
         for command in runs:
             self.assertEqual(command[command.index("--status-level") + 1], "pass")
 
-    def test_test_failure_reports_diagnostics_once_and_keeps_independent_gate_proof(self):
+    def test_test_failure_reports_diagnostics_once_and_keeps_independent_gate_proof(
+        self,
+    ):
         executor = self.gate_executor(self.matching_listings())
         original = executor.__call__
         runner, _ = self.runner(executor=executor)
@@ -3784,15 +4456,27 @@ class RunGateTest(RunnerTestCase):
 
         runner.executor = execute
         output = io.StringIO()
-        with contextlib.redirect_stderr(output), self.assertRaises(RunnerError) as failed:
+        with (
+            contextlib.redirect_stderr(output),
+            self.assertRaises(RunnerError) as failed,
+        ):
             runner.run_gates(["demo-gate"], quiet=True)
         detail = str(failed.exception)
-        self.assertEqual(detail.count("unique assertion diagnostic: expected 2, got 1"), 1)
+        self.assertEqual(
+            detail.count("unique assertion diagnostic: expected 2, got 1"), 1
+        )
         self.assertIn("\ncodex-core mod::tests::alpha\n", output.getvalue())
         self.assertIn("passed=0, failed=1, not-run=0", output.getvalue())
         self.assertIn("test(=mod::tests::alpha)", output.getvalue())
-        self.assertNotIn("test(=suite::mod::beta)", output.getvalue().split("Rerun failed only")[1])
-        self.assertEqual(detail.count('"event": "failed", "name": "codex-core::codex_core$mod::tests::alpha"'), 1)
+        self.assertNotIn(
+            "test(=suite::mod::beta)", output.getvalue().split("Rerun failed only")[1]
+        )
+        self.assertEqual(
+            detail.count(
+                '"event": "failed", "name": "codex-core::codex_core$mod::tests::alpha"'
+            ),
+            1,
+        )
         self.assertIn("missing(1)", detail)
         self.assertIn("passed exactly once", detail)
         self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
@@ -3828,8 +4512,8 @@ class RunGateTest(RunnerTestCase):
         with self.assertRaisesRegex(RunnerError, "passed exactly once") as raised:
             runner.run_gate("demo-gate")
         self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
-        self.assertEqual(raised.exception.outcome, "not_executed")
-
+        # No reporter events at all: incomplete evidence, as for run_target.
+        self.assertEqual(raised.exception.outcome, "evidence_incomplete")
 
     def test_binary_gate_runs_the_named_binary(self) -> None:
         data = copy.deepcopy(MANIFEST_DATA)
@@ -4085,9 +4769,13 @@ class RunGateTest(RunnerTestCase):
             with self.subTest(status=status):
                 executor = FakeExecutor(default_listing={"tests::alpha": False})
                 render = executor._stdout
-                executor._stdout = lambda args, render=render, status=status: render(
-                    args
-                ).replace('"event": "ok"', f'"event": "{status}"')
+                # Keep suite totals consistent with the native status, so the
+                # failed completion itself (not corrupt framing) blocks the gate.
+                executor._stdout = lambda args, render=render, status=status: (
+                    nextest_run_payload([("tests::alpha", status)])
+                    if args[:3] == ["cargo", "nextest", "run"]
+                    else render(args)
+                )
                 runner, _ = self.runner(
                     manifest=Manifest.from_data(data), executor=executor
                 )
@@ -4169,12 +4857,22 @@ class RunGateTest(RunnerTestCase):
                 )
 
     def test_success_exit_without_exact_completed_results_is_rejected(self) -> None:
-        for output in (
-            "",
-            nextest_run_payload([("wrong::test", "ok")]),
-            nextest_run_payload([("mod::tests::alpha", "ok")], package="wrong-binary"),
-            nextest_run_payload([("mod::tests::alpha", "ignored")]),
-            nextest_run_payload([("mod::tests::alpha", "ok")] * 2),
+        # As for run_target: absent or duplicated reporter evidence is
+        # incomplete; a complete report without the required pass is not run.
+        for output, outcome in (
+            ("", "evidence_incomplete"),
+            (nextest_run_payload([("wrong::test", "ok")]), "not_executed"),
+            (
+                nextest_run_payload(
+                    [("mod::tests::alpha", "ok")], package="wrong-binary"
+                ),
+                "not_executed",
+            ),
+            (nextest_run_payload([("mod::tests::alpha", "ignored")]), "not_executed"),
+            (
+                nextest_run_payload([("mod::tests::alpha", "ok")] * 2),
+                "evidence_incomplete",
+            ),
         ):
             with self.subTest(output=output):
                 executor = self.gate_executor(self.matching_listings())
@@ -4186,9 +4884,11 @@ class RunGateTest(RunnerTestCase):
                     else original(args)
                 )
                 runner, _ = self.runner(executor=executor)
-                with self.assertRaisesRegex(RunnerError, "passed exactly once") as raised:
+                with self.assertRaisesRegex(
+                    RunnerError, "passed exactly once"
+                ) as raised:
                     runner.run_gates(["demo-gate"], quiet=True)
-                self.assertEqual(raised.exception.outcome, "not_executed")
+                self.assertEqual(raised.exception.outcome, outcome)
                 self.assertEqual(raised.exception.completed_gates, {})
                 self.assertEqual(len(executor.commands(["cargo", "nextest", "run"])), 2)
 
@@ -4217,7 +4917,6 @@ class RunGateTest(RunnerTestCase):
             "all": {"suite::mod::beta": False},
         }
 
-
     def test_missing_expected_test_id_fails_the_gate(self) -> None:
         listings = self.matching_listings()
         listings["all"] = {"suite::mod::unrelated": False}
@@ -4225,7 +4924,6 @@ class RunGateTest(RunnerTestCase):
         with self.assertRaisesRegex(RunnerError, "wrong test-ID set"):
             runner.check_gates(["demo-gate"])
         self.assertEqual(executor.commands(["cargo", "nextest", "run"]), [])
-
 
     def test_gate_verifies_every_step_before_running_any(self) -> None:
         listings = self.matching_listings()
@@ -4338,13 +5036,18 @@ class RepositoryManifestTest(unittest.TestCase):
                     identity = module if name.startswith("_") else test
                     with self.subTest(gate=gate.name, test=test):
                         self.assertIsNotNone(
-                            rust_test_runner._rust_test_source(binary, identity, REPO_ROOT),
+                            rust_test_runner._rust_test_source(
+                                binary, identity, REPO_ROOT
+                            ),
                             "gate declares a test that does not exist",
                         )
 
     def test_prevention_and_capability_gates_preserve_combined_coverage(self):
         # Preflight tests live in codex-command-analysis; header tests stay in codex-core.
-        preflight = ("command_analysis_lib", "command_preflight::command_preflight_tests::")
+        preflight = (
+            "command_analysis_lib",
+            "command_preflight::command_preflight_tests::",
+        )
         headers = ("core_lib", "tools::handlers::request_user_input::tests::")
 
         def ids(owner, *names):
@@ -4354,6 +5057,9 @@ class RepositoryManifestTest(unittest.TestCase):
         capability = ids(
             preflight,
             "never_repairs_mutating_command_flag_typos",
+            "argv_shell_wrapper_is_never_replaced_by_a_repaired_leaf",
+            "cmd_lexing_preserves_escaped_stages_empty_args_and_quoted_carets",
+            "git_subcommand_worktree_and_explicit_cmdlet_named_executables_remain_exact",
             "leaf_glob_repair_is_bounded_and_preserves_exact_scope",
             "kd4_runtime_off_preserves_command_without_repair",
         )
@@ -4381,10 +5087,13 @@ class RepositoryManifestTest(unittest.TestCase):
                 for step in steps:
                     # core_lib steps opt out of the conservative core helper set;
                     # command_analysis_lib declares no helpers of its own.
-                    self.assertEqual(step.helpers, () if step.target == "core_lib" else None)
+                    self.assertEqual(
+                        step.helpers, () if step.target == "core_lib" else None
+                    )
                     self.assertIsNone(step.filterset)
                 self.assertEqual(
-                    {(step.target, test) for step in steps for test in step.tests}, expected
+                    {(step.target, test) for step in steps for test in step.tests},
+                    expected,
                 )
 
     def test_manifest_parses_strictly(self) -> None:
@@ -4425,13 +5134,16 @@ class RepositoryManifestTest(unittest.TestCase):
         }
         self.assertEqual(sources, declared)
 
-
-    def assert_core_suite_registration(self, tests_dir: Path, targets: list[str]) -> None:
+    def assert_core_suite_registration(
+        self, tests_dir: Path, targets: list[str]
+    ) -> None:
         suite = (tests_dir / "suite").resolve()
         owners = {}
 
         def visit(binary: Path, prefix: str, text: str) -> None:
-            for (kind, name), declarations in rust_test_runner._rust_scope_items(text).items():
+            for (kind, name), declarations in rust_test_runner._rust_scope_items(
+                text
+            ).items():
                 if kind != "mod":
                     continue
                 module = f"{prefix}::{name}" if prefix else name
@@ -4440,8 +5152,12 @@ class RepositoryManifestTest(unittest.TestCase):
                 if body is not None:
                     visit(binary, module, body)
                     continue
-                resolved = rust_test_runner._rust_module_source(binary, module, tests_dir)
-                self.assertIsNotNone(resolved, f"unresolved module {binary.name}::{module}")
+                resolved = rust_test_runner._rust_module_source(
+                    binary, module, tests_dir
+                )
+                self.assertIsNotNone(
+                    resolved, f"unresolved module {binary.name}::{module}"
+                )
                 source, _ = resolved
                 self.assertTrue(source.is_relative_to(suite), str(source))
                 self.assertNotIn(source, owners, f"repeated suite source: {source}")
@@ -4453,15 +5169,20 @@ class RepositoryManifestTest(unittest.TestCase):
             visit(binary, "", binary.read_text(encoding="utf-8"))
         # The shared prelude is intentionally included by every shard, not a
         # standalone suite. The migration-contract test checks those includes.
-        expected = {path.resolve() for path in suite.rglob("*.rs")} - {suite / "prelude.rs"}
+        expected = {path.resolve() for path in suite.rglob("*.rs")} - {
+            suite / "prelude.rs"
+        }
         self.assertEqual(set(owners), expected, "suite registration mismatch")
 
     def test_core_shards_register_every_suite_source_exactly_once(self) -> None:
         self.assert_core_suite_registration(
             REPO_ROOT / "codex-rs" / "core" / "tests",
-            [target.selector_value for target in self.manifest.targets.values()
-             if target.package == "codex-core-integration-tests"
-             and target.selector_kind == "test"],
+            [
+                target.selector_value
+                for target in self.manifest.targets.values()
+                if target.package == "codex-core-integration-tests"
+                and target.selector_kind == "test"
+            ],
         )
 
     def test_core_suite_inventory_rejects_omissions_duplicates_and_cycles(self) -> None:
@@ -4585,12 +5306,24 @@ class RepositoryManifestTest(unittest.TestCase):
                 "web_search",
             ],
         }
-        # `test_codex()` sessions resolve codex-code-mode-host; only modules
-        # that launch the CLI need the full `codex` build.
+        # `test_codex()` sessions resolve codex-code-mode-host. Direct CLI
+        # launches and the shared elevated Windows runtime also need `codex`.
+        # These modules enable elevation; TestCodexBuilder resolves the runtime
+        # helper in common/test_codex.rs even without a leaf cargo_bin call.
+        shared_elevated_modules = {
+            "core_code_mode_mcp": {"code_mode_elicitation"},
+            "core_exec_permissions": {
+                "apply_patch_cli",
+                "approvals",
+                "request_permissions",
+            },
+        }
         expected_helpers = {
             target: ["codex-code-mode-host"] for target in expected_modules
         }
         expected_helpers["core_cli_workspace"].insert(0, "codex")
+        for target in shared_elevated_modules:
+            expected_helpers[target].insert(0, "codex")
         expected_helpers["core_code_mode_mcp"] += [
             "test_stdio_server",
             "test_streamable_http_server",
@@ -4618,17 +5351,28 @@ class RepositoryManifestTest(unittest.TestCase):
                     expected_helpers[target_name],
                 )
                 target = self.manifest.targets[target_name]
-                launches_cli = {
-                    module: 'cargo_bin("codex")'
-                    in (tests_dir / "suite" / f"{module}.rs").read_text(
+                module_sources = {
+                    module: (tests_dir / "suite" / f"{module}.rs").read_text(
                         encoding="utf-8"
                     )
                     for module in modules
                 }
-                self.assertEqual("codex" in target.helpers, any(launches_cli.values()))
-                # A filtered run narrows helpers by test prefix, so only the
-                # modules that launch the CLI may still build it.
-                for module, launches in launches_cli.items():
+                elevated = shared_elevated_modules.get(target_name, set())
+                self.assertLessEqual(elevated, set(modules))
+                for module in elevated:
+                    self.assertIn(
+                        "set_windows_elevated_sandbox_enabled(true)",
+                        module_sources[module],
+                    )
+                needs_codex = elevated | {
+                    module
+                    for module, text in module_sources.items()
+                    if 'cargo_bin("codex")' in text
+                }
+                self.assertEqual("codex" in target.helpers, bool(needs_codex))
+                # A declared prefix can narrow the shared upper bound. Without
+                # one, filtered runs intentionally retain the shard's helpers.
+                for module in modules:
                     test_id = f"suite::{module}::test"
                     helpers = next(
                         (
@@ -4636,9 +5380,14 @@ class RepositoryManifestTest(unittest.TestCase):
                             for prefix, names in target.helpers_by_test_prefix.items()
                             if test_id.startswith(prefix)
                         ),
-                        target.helpers,
+                        None,
                     )
-                    self.assertEqual("codex" in helpers, launches, module)
+                    if helpers is None:
+                        helpers = target.helpers
+                        expected_codex = bool(needs_codex)
+                    else:
+                        expected_codex = module in needs_codex
+                    self.assertEqual("codex" in helpers, expected_codex, module)
 
 
 class RunEnvironmentTest(RunnerTestCase):
@@ -4971,11 +5720,11 @@ class JustfileContractTest(unittest.TestCase):
         return found
 
     def test_extracts_shell_and_python_recipes_without_losing_arguments(self):
-        source = '''
+        source = """
     python "{{ justfile_directory() }}/scripts/build/rust_test_runner.py" run-target "{{ target }}"; exit $LASTEXITCODE
     raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_test_runner.py", ["plan", *sys.argv[1:]], program=r"{{ python }}"))
     raise SystemExit(adapter["run_python"](r"{{ justfile_directory() }}/scripts/build/rust_test_runner.py", ["invalid-command", "--bad-option"], program=r"{{ python }}"))
-'''
+"""
         self.assertEqual(
             self.invocations(source),
             [
@@ -4985,7 +5734,9 @@ class JustfileContractTest(unittest.TestCase):
             ],
         )
 
-    def test_every_justfile_invocation_parses_and_names_declared_selections(self) -> None:
+    def test_every_justfile_invocation_parses_and_names_declared_selections(
+        self,
+    ) -> None:
         invocations = self.invocations()
         self.assertGreaterEqual(
             len(invocations), 10, "runner invocations were not found"
@@ -5091,14 +5842,20 @@ class TestSpeedContractTest(RunnerTestCase):
             scope_source, text = resolved
             if text is None:
                 text = scope_source.read_text(encoding="utf-8")
-            for (kind, module), declarations in rust_test_runner._rust_scope_items(text).items():
+            for (kind, module), declarations in rust_test_runner._rust_scope_items(
+                text
+            ).items():
                 if kind != "mod":
                     continue
                 self.assertEqual(len(declarations), 1, f"ambiguous module {module}")
                 identity = f"{prefix}::{module}" if prefix else module
-                registered = rust_test_runner._rust_module_source(source, identity, root)
+                registered = rust_test_runner._rust_module_source(
+                    source, identity, root
+                )
                 self.assertIsNotNone(registered, f"unresolved module {module}")
-                self.assertEqual(registered[0], (root / "suite" / "v2" / f"{module}.rs").resolve())
+                self.assertEqual(
+                    registered[0], (root / "suite" / "v2" / f"{module}.rs").resolve()
+                )
                 self.assertNotIn(module, owners, f"duplicate module {module}")
                 owners[module] = source
             if source.name != "mod.rs":
@@ -5113,7 +5870,9 @@ class TestSpeedContractTest(RunnerTestCase):
             ).items():
                 if kind != "mod":
                     continue
-                self.assertEqual(len(declarations), 1, f"ambiguous nested module {name}")
+                self.assertEqual(
+                    len(declarations), 1, f"ambiguous nested module {name}"
+                )
                 filename, body = declarations[0]
                 if filename is None or body is not None:
                     continue
@@ -5167,7 +5926,9 @@ class TestSpeedContractTest(RunnerTestCase):
                 (suite / "child.rs").write_text("", encoding="utf-8")
                 leaf.write_text('#[path = "child.rs"] mod child;\n', encoding="utf-8")
                 self.test_app_server_shards_own_each_v2_module_exactly_once()
-                leaf.write_text('// #[path = "child.rs"] mod child;\n', encoding="utf-8")
+                leaf.write_text(
+                    '// #[path = "child.rs"] mod child;\n', encoding="utf-8"
+                )
                 with self.assertRaises(AssertionError):
                     self.test_app_server_shards_own_each_v2_module_exactly_once()
 

@@ -36,6 +36,7 @@ async fn progress_notifications_reach_jsonl_only_for_the_primary_turn() {
     let mut processor = EventProcessorWithJsonOutput::new(None);
     let items = [
         AppServerThreadItem::CommandExecution {
+            environment: None,
             id: "command".into(),
             command: "running command".into(),
             cwd: test_path_buf("/tmp/project").abs().into(),
@@ -75,11 +76,22 @@ async fn progress_notifications_reach_jsonl_only_for_the_primary_turn() {
             started_at_ms: 0,
             item,
         });
-        assert!(prepare_server_notification(
-            false, "thread-1", "turn-1", false, &mut notification,
-            async |_| panic!("progress must not read history"),
-        ).await.unwrap());
-        assert_eq!(processor.collect_thread_events(notification).events.len(), 1);
+        assert!(
+            prepare_server_notification(
+                false,
+                "thread-1",
+                "turn-1",
+                false,
+                &mut notification,
+                async |_| panic!("progress must not read history"),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            processor.collect_thread_events(notification).events.len(),
+            1
+        );
     }
 
     // The runtime filter must preserve own-turn progress, while preventing
@@ -91,34 +103,51 @@ async fn progress_notifications_reach_jsonl_only_for_the_primary_turn() {
     ] {
         for (mut notification, expected) in [
             (
-                ServerNotification::CommandExecutionOutputDelta(CommandExecutionOutputDeltaNotification {
-                    thread_id: thread_id.into(), turn_id: turn_id.into(), item_id: "command".into(),
-                    delta: "output λ".into(),
-                    stream: Some(codex_protocol::protocol::ExecOutputStream::Stderr),
-                    decoding_lossy: Some(false),
-                }),
+                ServerNotification::CommandExecutionOutputDelta(
+                    CommandExecutionOutputDeltaNotification {
+                        thread_id: thread_id.into(),
+                        turn_id: turn_id.into(),
+                        item_id: "command".into(),
+                        delta: "output λ".into(),
+                        stream: Some(codex_protocol::protocol::ExecOutputStream::Stderr),
+                        decoding_lossy: Some(false),
+                    },
+                ),
                 serde_json::json!({"type":"item.progress", "item_id":"item_0", "call_id":"command",
                     "kind":"command_output", "delta":"output λ", "stream":"stderr",
                     "decoding_lossy":false, "truncated":false}),
             ),
             (
                 ServerNotification::McpToolCallProgress(McpToolCallProgressNotification {
-                    thread_id: thread_id.into(), turn_id: turn_id.into(), item_id: "mcp".into(),
-                    message: "working".into(), progress: Some(2.0), total: Some(3.0),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                    item_id: "mcp".into(),
+                    message: "working".into(),
+                    progress: Some(2.0),
+                    total: Some(3.0),
                 }),
                 serde_json::json!({"type":"item.progress", "item_id":"item_1", "call_id":"mcp",
                     "kind":"mcp", "message":"working", "progress":2.0, "total":3.0, "truncated":false}),
             ),
         ] {
             let accepted = prepare_server_notification(
-                false, "thread-1", "turn-1", false, &mut notification,
+                false,
+                "thread-1",
+                "turn-1",
+                false,
+                &mut notification,
                 async |_| panic!("progress must not read history"),
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             assert_eq!(accepted, admitted);
             if accepted {
                 let events = processor.collect_thread_events(notification);
                 assert_eq!(events.status, CodexStatus::Running);
-                assert_eq!(serde_json::to_value(events.events).unwrap(), serde_json::json!([expected]));
+                assert_eq!(
+                    serde_json::to_value(events.events).unwrap(),
+                    serde_json::json!([expected])
+                );
             }
         }
     }
@@ -262,99 +291,13 @@ async fn recovery_failure_preserves_authoritative_results_but_missing_turn_is_an
     );
 }
 
-#[tokio::test]
-async fn latest_cwd_reads_across_chunks_and_skips_malformed_tail() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("rollout.jsonl");
-    let old_cwd = dir.path().join("old");
-    let latest_cwd = dir.path().join("latest-新");
-    let context = |cwd: &Path| {
-        serde_json::json!({
-        "timestamp":"2026-09-13T00:00:00Z", "type":"turn_context", "payload": {
-            "cwd":cwd, "approval_policy":"never", "sandbox_policy":{"type":"danger-full-access"},
-            "model":"gpt-5", "summary":"auto"
-        }
-    }).to_string()
-    };
-    std::fs::write(
-        &path,
-        format!(
-            "{}\r\n{}\r\n{}\n{{broken tail",
-            context(&old_cwd),
-            context(&latest_cwd),
-            "x".repeat(20000)
-        ),
-    )
-    .expect("write history");
-    assert_eq!(parse_latest_turn_context_cwd(&path).await, Some(latest_cwd));
-    std::fs::write(&path, context(&old_cwd)).expect("write first record without newline");
-    assert_eq!(parse_latest_turn_context_cwd(&path).await, Some(old_cwd));
-    std::fs::write(&path, "invalid\n").expect("invalid history");
-    assert_eq!(parse_latest_turn_context_cwd(&path).await, None);
-}
-
 #[test]
-fn latest_cwd_prefilter_preserves_rollout_decoding() {
-    let cwd = test_path_buf("/tmp/latest-新");
-    let legacy = serde_json::json!({
-        "timestamp": "2026-09-13T00:00:00Z",
-        "type": "turn_context",
-        "payload": {
-            "cwd": cwd,
-            "approval_policy": "never",
-            "sandbox_policy": {"type": "danger-full-access"},
-            "model": "gpt-5",
-            "summary": "auto"
-        }
-    });
-    let mut current = legacy.clone();
-    current["format_version"] = serde_json::json!(1);
-    current["payload"]
-        .as_object_mut()
-        .unwrap()
-        .remove("summary");
-    let mut future = current.clone();
-    future["format_version"] = serde_json::json!(u32::MAX);
-    let mut invalid = current.clone();
-    invalid["payload"].as_object_mut().unwrap().remove("cwd");
-    let legacy = legacy.to_string();
-    let lines = [
-        legacy.clone(),
-        current.to_string(),
-        future.to_string(),
-        invalid.to_string(),
-        legacy.replace("turn_context", "turn\\u005fcontext"),
-        format!("{{\"type\":\"event_msg\",{}", &legacy[1..]),
-        format!("{},\"type\":\"event_msg\"}}", &legacy[..legacy.len() - 1]),
-        serde_json::json!({
-            "timestamp": "2026-09-13T00:00:00Z",
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "call_id": "large-output",
-                "output": "turn_context".repeat(32768)
-            }
-        })
-        .to_string(),
-        "{\"type\":\"turn_context\",\"payload\":null}".to_string(),
-        "{broken tail".to_string(),
-    ];
-    for (index, line) in lines.into_iter().enumerate() {
-        let expected = serde_json::from_str::<RolloutLine>(&line)
-            .ok()
-            .and_then(|line| match line.item {
-                RolloutItem::TurnContext(item) => Some(item.cwd.into_path_buf()),
-                _ => None,
-            });
-        if matches!(index, 0 | 1 | 4 | 5) {
-            assert_eq!(expected.as_ref(), Some(&cwd));
-        } else {
-            assert_eq!(expected, None);
-        }
-        let mut reversed = line.into_bytes();
-        reversed.reverse();
-        assert_eq!(cwd_from_reversed_rollout_line(&mut reversed), expected);
-    }
+fn resume_cwd_uses_the_authoritative_settings_summary_without_reading_history() {
+    let mut thread = recovery_thread_fixture();
+    let current = AbsolutePathBuf::current_dir().unwrap();
+    thread.cwd = current.clone();
+    thread.path = Some(current.join("nonexistent-rollout.jsonl").into_path_buf());
+    assert_eq!(latest_thread_cwd(&thread), current.as_path());
 }
 
 fn test_tracing_subscriber() -> impl tracing::Subscriber + Send + Sync {
@@ -494,7 +437,11 @@ fn decode_prompt_bytes_decodes_supported_encodings() {
         &[0xFF, 0xFE, b'h', 0, b'i', 0, b'\n', 0],
         &[0xFE, 0xFF, 0, b'h', 0, b'i', 0, b'\n'],
     ] {
-        assert_eq!(decode_prompt_bytes(input), Ok("hi\n".to_string()), "{input:?}");
+        assert_eq!(
+            decode_prompt_bytes(input),
+            Ok("hi\n".to_string()),
+            "{input:?}"
+        );
     }
     assert_eq!(decode_prompt_bytes(&[]), Ok(String::new()));
 }
@@ -502,14 +449,50 @@ fn decode_prompt_bytes_decodes_supported_encodings() {
 #[test]
 fn decode_prompt_bytes_rejects_unsupported_and_invalid_encodings() {
     for (input, expected) in [
-        (b"\xff\xfe\0\0h\0\0\0i\0\0\0\n\0\0\0".as_slice(), PromptDecodeError::UnsupportedBom { encoding: "UTF-32LE" }),
-        (b"\0\0\xfe\xff\0\0\0h\0\0\0i\0\0\0\n".as_slice(), PromptDecodeError::UnsupportedBom { encoding: "UTF-32BE" }),
-        (b"\xc3(".as_slice(), PromptDecodeError::InvalidUtf8 { valid_up_to: 0 }),
-        (b"ok\xc3(".as_slice(), PromptDecodeError::InvalidUtf8 { valid_up_to: 2 }),
-        (b"\xff\xfeh".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16LE" }),
-        (b"\xfe\xffh".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16BE" }),
-        (b"\xff\xfe\0\xd8".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16LE" }),
-        (b"\xfe\xff\xd8\0".as_slice(), PromptDecodeError::InvalidUtf16 { encoding: "UTF-16BE" }),
+        (
+            b"\xff\xfe\0\0h\0\0\0i\0\0\0\n\0\0\0".as_slice(),
+            PromptDecodeError::UnsupportedBom {
+                encoding: "UTF-32LE",
+            },
+        ),
+        (
+            b"\0\0\xfe\xff\0\0\0h\0\0\0i\0\0\0\n".as_slice(),
+            PromptDecodeError::UnsupportedBom {
+                encoding: "UTF-32BE",
+            },
+        ),
+        (
+            b"\xc3(".as_slice(),
+            PromptDecodeError::InvalidUtf8 { valid_up_to: 0 },
+        ),
+        (
+            b"ok\xc3(".as_slice(),
+            PromptDecodeError::InvalidUtf8 { valid_up_to: 2 },
+        ),
+        (
+            b"\xff\xfeh".as_slice(),
+            PromptDecodeError::InvalidUtf16 {
+                encoding: "UTF-16LE",
+            },
+        ),
+        (
+            b"\xfe\xffh".as_slice(),
+            PromptDecodeError::InvalidUtf16 {
+                encoding: "UTF-16BE",
+            },
+        ),
+        (
+            b"\xff\xfe\0\xd8".as_slice(),
+            PromptDecodeError::InvalidUtf16 {
+                encoding: "UTF-16LE",
+            },
+        ),
+        (
+            b"\xfe\xff\xd8\0".as_slice(),
+            PromptDecodeError::InvalidUtf16 {
+                encoding: "UTF-16BE",
+            },
+        ),
     ] {
         assert_eq!(decode_prompt_bytes(input), Err(expected), "{input:?}");
     }
@@ -594,7 +577,10 @@ async fn resume_lookup_model_providers_filters_only_last_lookup() {
         resume_lookup_model_providers(&config, &last_args),
         Some(vec!["test-provider".to_string()])
     );
-    assert_eq!(resume_lookup_model_providers(&config, &named_args), None);
+    assert_eq!(
+        resume_lookup_model_providers(&config, &named_args),
+        Some(Vec::new())
+    );
 }
 
 fn recovery_thread_fixture() -> AppServerThread {
@@ -748,7 +734,10 @@ async fn thread_start_params_preserve_configured_permissions() {
         .active_permission_profile()
         .expect("default config selects a built-in permission profile");
     assert_eq!(params.sandbox, None);
-    assert_eq!(params.thread_source, Some(codex_app_server_protocol::ThreadSource::User));
+    assert_eq!(
+        params.thread_source,
+        Some(codex_app_server_protocol::ThreadSource::User)
+    );
     assert_eq!(params.permissions, Some(active_profile.id));
 }
 
@@ -772,7 +761,6 @@ async fn headless_approval_policy_applies() {
         AskForApproval::Never
     );
 }
-
 
 #[tokio::test]
 async fn thread_lifecycle_params_preserve_hook_trust_bypass() {

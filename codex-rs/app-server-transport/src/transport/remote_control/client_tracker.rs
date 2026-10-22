@@ -367,6 +367,31 @@ impl ClientTracker {
         };
 
         let event_name = transport_event_name(&event);
+        if let TransportEvent::IncomingMessage {
+            message: JSONRPCMessage::Request(_),
+            ..
+        } = &event
+        {
+            let control = match &event {
+                TransportEvent::IncomingMessage { message, .. } => {
+                    crate::transport::ingress_message_is_control(message)
+                }
+                _ => false,
+            };
+            return crate::transport::try_send_with_control_reserve(
+                &self.transport_event_tx,
+                event,
+                control,
+                crate::transport::ingress_reserve(&self.transport_event_tx),
+            )
+            .map_err(|_| {
+                warn!(
+                    transport_event = event_name,
+                    "remote control ingress capacity exhausted or closed"
+                );
+                Stopped
+            });
+        }
         match timeout(
             REMOTE_CONTROL_TRANSPORT_EVENT_SEND_TIMEOUT,
             self.transport_event_tx.send(event),
@@ -443,9 +468,7 @@ impl ClientTracker {
                         result = transport_event_tx.send(event) => result,
                     }
                 }
-                Err(mpsc::error::TrySendError::Closed(event)) => {
-                    Err(mpsc::error::SendError(event))
-                }
+                Err(mpsc::error::TrySendError::Closed(event)) => Err(mpsc::error::SendError(event)),
             };
             result.map_err(|_| {
                 warn!(
@@ -620,7 +643,10 @@ mod tests {
             .expect("bookkeeping should process the closed task")
             .expect("closed task should return client id");
         assert_eq!(closed_client_id.0, ClientId("client-1".to_string()));
-        assert!(writer.is_closed(), "cancellation must close the outbound receiver");
+        assert!(
+            writer.is_closed(),
+            "cancellation must close the outbound receiver"
+        );
         client_tracker
             .close_client(&closed_client_id)
             .await
@@ -737,7 +763,11 @@ mod tests {
                 .expect("prefill ingress");
         }
         let mut cleanup = tracker.spawn_connection_closed(next_connection_id());
-        assert!(timeout(Duration::from_millis(20), &mut cleanup).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(20), &mut cleanup)
+                .await
+                .is_err()
+        );
 
         shutdown.cancel();
         timeout(Duration::from_secs(1), tracker.shutdown())
@@ -785,7 +815,11 @@ mod tests {
         }
         let close = tracker.shutdown();
         tokio::pin!(close);
-        assert!(timeout(Duration::from_millis(20), &mut close).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(20), &mut close)
+                .await
+                .is_err()
+        );
         assert!(!shutdown.is_cancelled());
         for _ in 0..2 {
             assert!(matches!(
@@ -801,8 +835,6 @@ mod tests {
             other => panic!("expected close event, got {other:?}"),
         }
     }
-
-
 
     #[tokio::test]
     async fn incoming_message_timeout_does_not_advance_seq_id() {

@@ -250,7 +250,8 @@ async fn flattened_tool_identifier_collisions_are_rejected_before_cell_start() {
                     default_timeout_ms: None,
                     output_schema: None,
                 },
-            ].into(),
+            ]
+            .into(),
             ..execute_request("text('unreachable');")
         })
         .await;
@@ -381,27 +382,49 @@ async fn passive_command_wait_has_no_default_nested_deadline() {
         tool.name = "write_stdin".into();
         tool.tool_name = ToolName::plain("write_stdin");
         tool.default_timeout_ms = Some(10);
-        let cell = service.execute(ExecuteRequest {
-            enabled_tools: vec![tool].into(),
-            source: format!("await tools.write_stdin({arguments}{options}); text('completed');"),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        }).await.unwrap();
+        let cell = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![tool].into(),
+                source: format!(
+                    "await tools.write_stdin({arguments}{options}); text('completed');"
+                ),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
         assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
         if !bounded {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert!(events_rx.try_recv().is_err(), "passive wait must not time out");
+            assert!(
+                events_rx.try_recv().is_err(),
+                "passive wait must not time out"
+            );
             delegate.tool_release.notify_one();
         }
-        let RuntimeResponse::Result { error_text, content_items, .. } = cell.initial_response().await.unwrap() else {
+        let RuntimeResponse::Result {
+            error_text,
+            content_items,
+            ..
+        } = cell.initial_response().await.unwrap()
+        else {
             panic!("expected a terminal result");
         };
         if bounded {
-            assert!(error_text.as_deref().is_some_and(|error| error.starts_with("Error: nested tool `write_stdin` exceeded its 10ms timeout")), "{error_text:?}");
+            assert!(
+                error_text.as_deref().is_some_and(|error| error
+                    .starts_with("Error: nested tool `write_stdin` exceeded its 10ms timeout")),
+                "{error_text:?}"
+            );
             assert!(content_items.is_empty());
         } else {
             assert_eq!(error_text, None);
-            assert_eq!(content_items, vec![FunctionCallOutputContentItem::InputText { text: "completed".into() }]);
+            assert_eq!(
+                content_items,
+                vec![FunctionCallOutputContentItem::InputText {
+                    text: "completed".into()
+                }]
+            );
         }
         service.shutdown().await.unwrap();
     }
@@ -457,30 +480,38 @@ async fn tool_owned_deadline_survives_service_conversion_and_explicit_options() 
         let mut tool = blocking_tool();
         tool.default_timeout_ms = Some(0);
         let options = if explicit { ", {timeout_ms:10}" } else { "" };
-        let cell = service.execute(ExecuteRequest {
-            enabled_tools: vec![tool].into(),
-            source: format!("await tools.block({{}}{options});"),
-            yield_time_ms: Some(60_000), default_tool_timeout_ms: Some(5),
-            ..execute_request("")
-        }).await.unwrap();
+        let cell = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![tool].into(),
+                source: format!("await tools.block({{}}{options});"),
+                yield_time_ms: Some(60_000),
+                default_tool_timeout_ms: Some(5),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
         assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
         if !explicit {
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(events_rx.try_recv().is_err());
             delegate.tool_release.notify_one();
         }
-        let RuntimeResponse::Result { error_text, .. } = cell.initial_response().await.unwrap() else {
+        let RuntimeResponse::Result { error_text, .. } = cell.initial_response().await.unwrap()
+        else {
             panic!("terminal result");
         };
         if explicit {
-            assert!(error_text.as_deref().is_some_and(|error| error.starts_with("Error: nested tool `block` exceeded its 10ms timeout")), "{error_text:?}");
+            assert!(
+                error_text.as_deref().is_some_and(|error| error
+                    .starts_with("Error: nested tool `block` exceeded its 10ms timeout")),
+                "{error_text:?}"
+            );
         } else {
             assert_eq!(error_text, None);
         }
         service.shutdown().await.unwrap();
     }
 }
-
 
 #[tokio::test]
 async fn per_tool_default_survives_runtime_conversion_without_extending_other_tools() {
@@ -641,9 +672,11 @@ async fn sibling_deadline_is_local_until_an_uncaught_rejection_ends_the_cell() {
         let mut read = blocking_tool();
         read.name = "read".to_string();
         read.tool_name = ToolName::plain("read");
-        let cell = service.execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool(), read].into(),
-            source: format!(r#"
+        let cell = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![blocking_tool(), read].into(),
+                source: format!(
+                    r#"
 const command = tools.block({{}});
 const read = tools.read({{}}, {{timeout_ms: 10}}).catch(async error => {{
     await notify(String(error));
@@ -651,35 +684,63 @@ const read = tools.read({{}}, {{timeout_ms: 10}}).catch(async error => {{
 }});
 const results = await Promise.{join}([command, read]);
 text(results.map(result => result.status).join(','));
-"#),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        }).await.unwrap();
+"#
+                ),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
         let expected_id = cell.cell_id.clone();
         assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
         assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
         tokio::time::timeout(Duration::from_secs(2), delegate.deadline_seen.notified())
-            .await.expect("the read deadline must be observed");
+            .await
+            .expect("the read deadline must be observed");
         if handled {
-            assert!(!inner.tool_finished.load(Ordering::Acquire), "sibling cancelled by another tool's deadline");
+            assert!(
+                !inner.tool_finished.load(Ordering::Acquire),
+                "sibling cancelled by another tool's deadline"
+            );
             inner.tool_release.notify_one();
         }
         let response = tokio::time::timeout(Duration::from_secs(3), cell.initial_response())
-            .await.expect("cell must finish with an attributable outcome").unwrap();
-        let RuntimeResponse::Result { error_text, content_items, .. } = response else {
+            .await
+            .expect("cell must finish with an attributable outcome")
+            .unwrap();
+        let RuntimeResponse::Result {
+            error_text,
+            content_items,
+            ..
+        } = response
+        else {
             panic!("expected a terminal cell response: {response:?}");
         };
         if handled {
             assert_eq!(error_text, None);
-            assert_eq!(content_items, vec![FunctionCallOutputContentItem::InputText {
-                text: "fulfilled,rejected".into(),
-            }]);
+            assert_eq!(
+                content_items,
+                vec![FunctionCallOutputContentItem::InputText {
+                    text: "fulfilled,rejected".into(),
+                }]
+            );
         } else {
-            assert!(error_text.as_deref().is_some_and(|error| error.contains("10ms timeout")), "{error_text:?}");
-            assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolCancelled);
+            assert!(
+                error_text
+                    .as_deref()
+                    .is_some_and(|error| error.contains("10ms timeout")),
+                "{error_text:?}"
+            );
+            assert_eq!(
+                next_event(&mut events_rx).await,
+                DelegateEvent::ToolCancelled
+            );
         }
         assert!(inner.tool_finished.load(Ordering::Acquire));
-        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::CellClosed(expected_id.clone()));
+        assert_eq!(
+            next_event(&mut events_rx).await,
+            DelegateEvent::CellClosed(expected_id.clone())
+        );
         service.shutdown().await.unwrap();
         assert!(events_rx.try_recv().is_err());
     }
@@ -947,7 +1008,9 @@ async fn repeated_termination_is_rejected_while_callback_cleanup_is_pending() {
 async fn second_observer_is_rejected_without_displacing_the_first() {
     let service = InProcessCodeModeSession::new();
     let cell = service
-        .execute(execute_request("await new Promise(resolve => setTimeout(resolve, 600_000));"))
+        .execute(execute_request(
+            "await new Promise(resolve => setTimeout(resolve, 600_000));",
+        ))
         .await
         .unwrap();
     let expected_id = cell.cell_id.clone();
@@ -997,7 +1060,9 @@ async fn second_observer_is_rejected_without_displacing_the_first() {
 async fn dropped_wait_observer_leaves_the_cell_available() {
     let service = InProcessCodeModeSession::new();
     let cell = service
-        .execute(execute_request("await new Promise(resolve => setTimeout(resolve, 600_000));"))
+        .execute(execute_request(
+            "await new Promise(resolve => setTimeout(resolve, 600_000));",
+        ))
         .await
         .unwrap();
     let expected_id = cell.cell_id.clone();
@@ -1115,7 +1180,10 @@ async fn natural_completion_cleans_up_callbacks_before_responding() {
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "done".to_string(),
             }],
-            error_text: Some("cell completed with 1 unawaited tool call(s); outstanding tool work is cancelled".to_string()),
+            error_text: Some(
+                "cell completed with 1 unawaited tool call(s); outstanding tool work is cancelled"
+                    .to_string()
+            ),
         }
     );
     assert!(delegate.tool_finished.load(Ordering::Acquire));
@@ -1138,17 +1206,24 @@ async fn exit_rejects_abandoned_tools_after_cleanup() {
         let (delegate, mut events_rx) = BlockingDelegate::new();
         delegate.hold_cancelled_tool.store(true, Ordering::Release);
         let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-        let cell = service.execute(ExecuteRequest {
-            enabled_tools: vec![blocking_tool()].into(),
-            source: format!("tools.block({{}}); text('partial'); {exit} text('unreachable');"),
-            yield_time_ms: Some(60_000),
-            ..execute_request("")
-        }).await.unwrap();
+        let cell = service
+            .execute(ExecuteRequest {
+                enabled_tools: vec![blocking_tool()].into(),
+                source: format!("tools.block({{}}); text('partial'); {exit} text('unreachable');"),
+                yield_time_ms: Some(60_000),
+                ..execute_request("")
+            })
+            .await
+            .unwrap();
         let expected_id = cell.cell_id.clone();
         assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
         let mut response = Box::pin(cell.initial_response());
-        assert!(tokio::time::timeout(Duration::from_millis(25), &mut response).await.is_err(),
-            "exit must not respond while cancelled work is still draining");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut response)
+                .await
+                .is_err(),
+            "exit must not respond while cancelled work is still draining"
+        );
         assert!(!delegate.tool_finished.load(Ordering::Acquire));
         delegate.tool_release.notify_one();
         assert_eq!(
@@ -1164,10 +1239,19 @@ async fn exit_rejects_abandoned_tools_after_cleanup() {
             "{exit} must preserve partial text without claiming success",
         );
         assert!(delegate.tool_finished.load(Ordering::Acquire));
-        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolCancelled);
-        assert_eq!(next_event(&mut events_rx).await, DelegateEvent::CellClosed(expected_id.clone()));
+        assert_eq!(
+            next_event(&mut events_rx).await,
+            DelegateEvent::ToolCancelled
+        );
+        assert_eq!(
+            next_event(&mut events_rx).await,
+            DelegateEvent::CellClosed(expected_id.clone())
+        );
         service.shutdown().await.unwrap();
-        assert!(events_rx.try_recv().is_err(), "cancellation and closure must occur exactly once");
+        assert!(
+            events_rx.try_recv().is_err(),
+            "cancellation and closure must occur exactly once"
+        );
     }
 }
 
@@ -1180,20 +1264,30 @@ async fn exit_without_abandoned_tools_succeeds() {
         for awaited_tool in [false, true] {
             let (delegate, mut events_rx) = BlockingDelegate::new();
             let service = InProcessCodeModeSession::with_delegate(delegate.clone());
-            let prefix = if awaited_tool { "await tools.block({});" } else { "" };
-            let cell = service.execute(ExecuteRequest {
-                enabled_tools: vec![blocking_tool()].into(),
-                source: format!("{prefix} text('complete'); {exit} text('unreachable');"),
-                yield_time_ms: Some(60_000),
-                ..execute_request("")
-            }).await.unwrap();
+            let prefix = if awaited_tool {
+                "await tools.block({});"
+            } else {
+                ""
+            };
+            let cell = service
+                .execute(ExecuteRequest {
+                    enabled_tools: vec![blocking_tool()].into(),
+                    source: format!("{prefix} text('complete'); {exit} text('unreachable');"),
+                    yield_time_ms: Some(60_000),
+                    ..execute_request("")
+                })
+                .await
+                .unwrap();
             let expected_id = cell.cell_id.clone();
             if awaited_tool {
                 assert_eq!(next_event(&mut events_rx).await, DelegateEvent::ToolStarted);
                 delegate.tool_release.notify_one();
             }
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(2), cell.initial_response()).await.unwrap().unwrap(),
+                tokio::time::timeout(Duration::from_secs(2), cell.initial_response())
+                    .await
+                    .unwrap()
+                    .unwrap(),
                 RuntimeResponse::Result {
                     output_loss: None,
                     cell_id: expected_id.clone(),
@@ -1204,9 +1298,15 @@ async fn exit_without_abandoned_tools_succeeds() {
                 },
             );
             assert_eq!(delegate.tool_finished.load(Ordering::Acquire), awaited_tool);
-            assert_eq!(next_event(&mut events_rx).await, DelegateEvent::CellClosed(expected_id.clone()));
+            assert_eq!(
+                next_event(&mut events_rx).await,
+                DelegateEvent::CellClosed(expected_id.clone())
+            );
             service.shutdown().await.unwrap();
-            assert!(events_rx.try_recv().is_err(), "clean exit must not cancel settled work");
+            assert!(
+                events_rx.try_recv().is_err(),
+                "clean exit must not cancel settled work"
+            );
         }
     }
 }

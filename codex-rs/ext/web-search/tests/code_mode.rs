@@ -64,12 +64,18 @@ async fn assert_code_mode_standalone_web_search(
     require_network!();
 
     let server = responses::start_mock_server().await;
-    let accepted_path = if redirect { "/v1/redirected-search" } else { "/v1/alpha/search" };
+    let accepted_path = if redirect {
+        "/v1/redirected-search"
+    } else {
+        "/v1/alpha/search"
+    };
     if redirect {
         Mock::given(method("POST"))
             .and(path("/v1/alpha/search"))
             .respond_with(ResponseTemplate::new(307).insert_header("Location", accepted_path))
-            .expect(1).mount(&server).await;
+            .expect(1)
+            .mount(&server)
+            .await;
     }
     Mock::given(method("POST"))
         .and(path(accepted_path))

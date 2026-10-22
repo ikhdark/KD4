@@ -30,9 +30,9 @@ pub(crate) use self::types::CellHost;
 pub(crate) use self::types::CellState;
 pub(crate) use self::types::CellToolCall;
 pub(crate) use self::types::CompletionCommit;
-pub(crate) use self::types::prepend_initial_yield;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;
+pub(crate) use self::types::prepend_initial_yield;
 use crate::TaskFailureHandler;
 use crate::runtime::MAX_BUFFERED_OUTPUT_BYTES;
 use crate::runtime::OutputAdmission;
@@ -524,7 +524,8 @@ async fn run_cell<H: CellHost>(
         task_failure_handler.as_ref(),
     )
     .await;
-    host.closed(cell_state.terminal_event()).await;
+    let finalized = host.closed(cell_state.terminal_event()).await;
+    cell_state.finalize_termination_receipt(finalized);
     cell_state.mark_closed();
 }
 

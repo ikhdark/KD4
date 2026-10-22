@@ -91,6 +91,17 @@ pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
         .unwrap_or(block)
         .strip_suffix("</app-context>")
         .unwrap_or(block);
+    // The supported projection is flat H3 sections under the Desktop title.
+    // A shallower heading ends an H3 subtree; splitting only on H3 would hide
+    // its unrelated instructions. Fail open instead of guessing its scope.
+    if body
+        .lines()
+        .skip_while(|line| line.trim() != "# Codex desktop context")
+        .skip(1)
+        .any(|line| matches!(line.split_whitespace().next(), Some("#" | "##")))
+    {
+        return Cow::Borrowed(instructions);
+    }
     let mut kept = String::new();
     let mut deferred = Vec::new();
     for (index, section) in body.split("\n### ").enumerate() {
@@ -121,6 +132,47 @@ pub(crate) fn project(instructions: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shallower_sections_after_every_deferred_feature_stay_eager() {
+        for feature in [
+            "Automations",
+            "Thread Coordination",
+            "Worktrees",
+            "Sidebar Organization",
+            "Pull request diff links",
+            "Inline Code Comments",
+            "Inline Artifact Follow-Ups",
+        ] {
+            for heading in ["#", "##"] {
+                for newline in ["\n", "\r\n"] {
+                    let instructions = format!("outside prefix\n<app-context>\n# Codex desktop context\n### {feature}\nUse `missing_tool`.\n#### Nested feature details\nDeferred details.\n  {heading} Mandatory scope\nDO_NOT_EDIT_PRODUCTION\nAnswer in JSON.\n</app-context>\noutside suffix").replace('\n', newline);
+                    assert!(matches!(project(&instructions), Cow::Borrowed(_)));
+                    assert_eq!(project(&instructions), instructions);
+                    assert!(unavailable_tools(&instructions, &Default::default()).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_projection_preserves_unknown_sections_and_outside_bytes() {
+        let instructions = "prefix\n<app-context>\n# Codex desktop context\n### Worktrees\nDeferred.\n#### Nested\nAlso deferred.\n### Mandatory scope\nDO_NOT_EDIT_PRODUCTION\n### Response format\nAnswer in JSON.\n</app-context>\nsuffix";
+        let projected = project(instructions);
+        assert!(projected.starts_with("prefix\n<app-context>"));
+        assert!(projected.ends_with("</app-context>\nsuffix"));
+        assert!(projected.contains("### Mandatory scope\nDO_NOT_EDIT_PRODUCTION"));
+        assert!(projected.contains("### Response format\nAnswer in JSON."));
+        assert!(projected.contains(LOCATOR));
+        assert!(!projected.contains("Deferred.") && !projected.contains("#### Nested"));
+        for ambiguous in [
+            format!("{instructions}{instructions}"),
+            instructions.replace("Deferred.", "```\ncode\n```"),
+            instructions.replace("Codex desktop context", "Unknown context"),
+        ] {
+            assert_eq!(project(&ambiguous), ambiguous);
+        }
+    }
 
     #[test]
     fn unavailable_desktop_tools_are_scoped_to_deferred_guidance_and_live_inventory() {

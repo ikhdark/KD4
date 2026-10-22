@@ -281,7 +281,7 @@ fn is_workspace_crate_name(name: &str) -> bool {
     name.starts_with("codex_")
         || matches!(
             name,
-            "app_test_support" | "core_test_support" | "mcp_test_support"
+            "app_test_support" | "core_test_support" | "core_test_support_base"
         )
 }
 
@@ -293,12 +293,14 @@ fn ui() {
 #[test]
 fn workspace_crate_filter_accepts_first_party_names_only() {
     assert!(is_workspace_crate_name("codex_core"));
-    assert!(is_workspace_crate_name("codex_tui"));
+    assert!(is_workspace_crate_name("codex_exec"));
     assert!(is_workspace_crate_name("core_test_support"));
+    assert!(is_workspace_crate_name("core_test_support_base"));
     assert!(is_workspace_crate_name("app_test_support"));
-    assert!(is_workspace_crate_name("mcp_test_support"));
     assert!(!is_workspace_crate_name("std"));
     assert!(!is_workspace_crate_name("tokio"));
     assert!(!is_workspace_crate_name("codex"));
     assert!(!is_workspace_crate_name("my_codex_core"));
+    assert!(!is_workspace_crate_name("external_test_support"));
+    assert!(!is_workspace_crate_name("core_test_support_base_extra"));
 }

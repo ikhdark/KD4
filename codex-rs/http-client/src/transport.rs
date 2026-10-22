@@ -39,10 +39,15 @@ pub struct TransportTiming {
 pub async fn capture_transport_timing<F: std::future::Future>(
     future: F,
 ) -> (F::Output, TransportTiming) {
-    TRANSPORT_TIMING.scope(std::cell::Cell::new(TransportTiming::default()), async move {
-        let result = future.await;
-        (result, TRANSPORT_TIMING.with(std::cell::Cell::get))
-    }).await
+    TRANSPORT_TIMING
+        .scope(
+            std::cell::Cell::new(TransportTiming::default()),
+            async move {
+                let result = future.await;
+                (result, TRANSPORT_TIMING.with(std::cell::Cell::get))
+            },
+        )
+        .await
 }
 
 fn record_response_header_time(duration: std::time::Duration) {
@@ -71,7 +76,9 @@ async fn collect_error_body(
     let deadline = tokio::time::Instant::now() + ERROR_BODY_TIMEOUT;
     let mut body = Vec::new();
     loop {
-        if tokio::time::Instant::now() >= deadline { break; }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
         match tokio::time::timeout_at(deadline, stream.next()).await {
             Ok(Some(Ok(chunk))) => {
                 let remaining = MAX_ERROR_BODY_BYTES - body.len();
@@ -102,6 +109,15 @@ async fn collect_success_body(
     stream: impl futures::Stream<Item = Result<Bytes, reqwest::Error>>,
     limit: usize,
 ) -> Result<Bytes, TransportError> {
+    collect_response_body(stream, limit).await.map(Bytes::from)
+}
+
+/// Collect a decoded response without retaining more than `limit` body bytes.
+/// On overflow the remaining stream is dropped, never drained or retried.
+pub async fn collect_response_body(
+    stream: impl futures::Stream<Item = Result<Bytes, reqwest::Error>>,
+    limit: usize,
+) -> Result<Vec<u8>, TransportError> {
     tokio::pin!(stream);
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -111,7 +127,7 @@ async fn collect_success_body(
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body.into())
+    Ok(body)
 }
 
 pub trait HttpTransport: Send + Sync {
@@ -144,12 +160,16 @@ impl ReqwestTransport {
     }
 
     pub fn from_http_client(client: HttpClient) -> Self {
-        Self { client: TransportClient::Fixed(client) }
+        Self {
+            client: TransportClient::Fixed(client),
+        }
     }
 
     /// Keeps route selection at dispatch, including each redirect hop.
     pub fn from_client_pool(pool: crate::RouteAwareClientPool) -> Self {
-        Self { client: TransportClient::Routed(Box::new(pool)) }
+        Self {
+            client: TransportClient::Routed(Box::new(pool)),
+        }
     }
 
     fn build(client: &HttpClient, req: Request) -> Result<RequestBuilder, TransportError> {
@@ -186,7 +206,10 @@ impl ReqwestTransport {
             TransportClient::Fixed(client) => {
                 let builder = Self::build(client, req)?;
                 let start = std::time::Instant::now();
-                let response = builder.send().await.map_err(Self::map_error)?;
+                let response = crate::admit_dispatch(builder.send())
+                    .await
+                    .map_err(TransportError::Build)?
+                    .map_err(Self::map_error)?;
                 record_response_header_time(start.elapsed());
                 Ok(response)
             }
@@ -204,7 +227,10 @@ impl ReqwestTransport {
                 let response = builder.send().await.map_err(|error| match error {
                     crate::RouteAwareRequestError::Request(error) => Self::map_error(error),
                     crate::RouteAwareRequestError::Timeout => TransportError::Timeout,
-                    _ => TransportError::Build("failed to route HTTP request".into()),
+                    error => TransportError::Build(format!(
+                        "HTTP routing failed: {}",
+                        error.safe_category()
+                    )),
                 })?;
                 record_response_header_time(start.elapsed());
                 Ok(response)
@@ -214,7 +240,10 @@ impl ReqwestTransport {
 
     fn map_error(err: reqwest::Error) -> TransportError {
         if err.is_builder() || is_permanent_connection_error(&err) {
-            TransportError::Build(format!("permanent transport configuration failure: {:#}", err.without_url()))
+            TransportError::Build(format!(
+                "permanent transport configuration failure: {:#}",
+                err.without_url()
+            ))
         } else if err.is_connect() {
             TransportError::Connection(err.without_url())
         } else if err.is_timeout() {
@@ -226,7 +255,8 @@ impl ReqwestTransport {
 
     fn trace_request(&self, req: &Request) {
         if let TransportClient::Fixed(client) = &self.client
-            && client.request_logging_enabled() && enabled!(Level::TRACE)
+            && client.request_logging_enabled()
+            && enabled!(Level::TRACE)
         {
             trace!(
                 "{} to {}: {}",
@@ -242,24 +272,28 @@ impl ReqwestTransport {
 /// socket errors or remote TLS alerts as permanent network failures.
 pub fn is_permanent_connection_error(mut error: &(dyn std::error::Error + 'static)) -> bool {
     loop {
-        if error.downcast_ref::<rustls::Error>().is_some_and(|error| matches!(error,
-            rustls::Error::InvalidCertificate(_)
-                | rustls::Error::NoCertificatesPresented
-                | rustls::Error::UnsupportedNameType
-                | rustls::Error::PeerIncompatible(_)
-                | rustls::Error::InvalidCertRevocationList(_)
-                | rustls::Error::InconsistentKeys(_)
-                | rustls::Error::BadMaxFragmentSize
-                | rustls::Error::NoApplicationProtocol
-        ))
-            || error.downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidInput)
+        if error.downcast_ref::<rustls::Error>().is_some_and(|error| {
+            matches!(
+                error,
+                rustls::Error::InvalidCertificate(_)
+                    | rustls::Error::NoCertificatesPresented
+                    | rustls::Error::UnsupportedNameType
+                    | rustls::Error::PeerIncompatible(_)
+                    | rustls::Error::InvalidCertRevocationList(_)
+                    | rustls::Error::InconsistentKeys(_)
+                    | rustls::Error::BadMaxFragmentSize
+                    | rustls::Error::NoApplicationProtocol
+            )
+        }) || error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::InvalidInput)
         {
             return true;
         }
         // io::Error::source can delegate to the wrapped error's source, skipping
         // the typed TLS error itself. Inspect its payload before walking on.
-        let source = error.downcast_ref::<std::io::Error>()
+        let source = error
+            .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::get_ref)
             .map(|inner| inner as &(dyn std::error::Error + 'static))
             .or_else(|| error.source());
@@ -302,7 +336,10 @@ impl HttpTransport for ReqwestTransport {
             });
         }
         let bytes = if let Some(limit) = max_response_bytes {
-            if resp.content_length().is_some_and(|length| length > limit as u64) {
+            if resp
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
+            {
                 return Err(TransportError::ResponseTooLarge { limit });
             }
             collect_success_body(resp.bytes_stream(), limit).await?

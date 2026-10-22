@@ -605,7 +605,10 @@ async fn responses_websocket_request_prewarm_reuses_connection() {
     .await;
 
     let mut provider = websocket_provider(&server);
-    provider.name = ModelProviderInfo::create_openai_provider(/*base_url*/ None).name;
+    // OpenAI behavior follows the trusted registration kind, not the display name.
+    let openai = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    provider.name = openai.name;
+    provider.kind = openai.kind;
     let harness = websocket_harness_with_provider_options(
         provider,
         /*runtime_metrics_enabled*/ true,
@@ -837,7 +840,10 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
         }],
     );
 
-    let payload = &rollout.raw_payloads[&inference.raw_request_payload_id];
+    let payload = &rollout.raw_payloads[inference
+        .raw_request_payload_id
+        .as_ref()
+        .expect("captured request")];
     let captured: serde_json::Value = serde_json::from_slice(
         &std::fs::read(trace_dir.path().join(&payload.path)).expect("read capture"),
     )
@@ -885,7 +891,10 @@ async fn responses_websocket_request_prewarm_traces_logical_request() {
         .values()
         .find(|call| call.response_id.as_deref() == Some("resp-2"))
         .expect("second inference");
-    let payload = &rollout.raw_payloads[&next.raw_request_payload_id];
+    let payload = &rollout.raw_payloads[next
+        .raw_request_payload_id
+        .as_ref()
+        .expect("captured next request")];
     let next_capture: serde_json::Value = serde_json::from_slice(
         &std::fs::read(trace_dir.path().join(&payload.path)).expect("read next capture"),
     )
@@ -997,7 +1006,10 @@ async fn responses_lite_websocket_disables_parallel_tool_calls_for_prewarm_and_t
 
     for use_responses_lite in [false, true] {
         let server = start_websocket_server(vec![vec![
-            vec![ev_response_created("resp-prewarm"), ev_completed("resp-prewarm")],
+            vec![
+                ev_response_created("resp-prewarm"),
+                ev_completed("resp-prewarm"),
+            ],
             vec![ev_response_created("resp-1"), ev_completed("resp-1")],
         ]])
         .await;
@@ -1342,9 +1354,12 @@ async fn responses_websocket_v2_connection_is_reused_but_response_chain_resets_a
     ]])
     .await;
 
-    // use OpenAI provider to check metadata logic
+    // use OpenAI provider to check metadata logic; OpenAI behavior follows the
+    // trusted registration kind, not the display name.
     let mut provider = websocket_provider(&server);
-    provider.name = ModelProviderInfo::create_openai_provider(/*base_url*/ None).name;
+    let openai = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    provider.name = openai.name;
+    provider.kind = openai.kind;
     let harness = websocket_harness_with_provider_options(
         provider,
         /*runtime_metrics_enabled*/ false,
@@ -1852,10 +1867,19 @@ async fn responses_websocket_connection_limit_error_reconnects_and_completes() {
 
     let server = start_websocket_server(vec![
         vec![
-            vec![ev_response_created("resp-prewarm"), ev_completed("resp-prewarm")],
+            vec![
+                ev_response_created("resp-prewarm"),
+                ev_completed("resp-prewarm"),
+            ],
             vec![websocket_connection_limit_error],
         ],
-        vec![vec![ev_response_created("resp-1"), ev_completed("resp-1")]],
+        // The reconnected turn must deliver a final answer; an empty completion
+        // would trigger the bounded missing-answer repair request.
+        vec![vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-1"),
+        ]],
     ])
     .await;
     let mut builder = test_codex().with_config(|config| {
@@ -2406,7 +2430,9 @@ fn websocket_provider_with_connect_timeout(
         websocket_connect_timeout_ms,
         requires_openai_auth: false,
         supports_websockets: true,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     }
 }
 

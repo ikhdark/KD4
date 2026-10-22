@@ -76,8 +76,8 @@ fn elide_text(text: &str, visible: &[&str], elided: &mut HashSet<[u8; 32]>) -> O
             .find('\n')
             .map_or(text.len(), |offset| cursor + offset + 1);
         let label = text[cursor..line_end].trim_end_matches(['\r', '\n']);
-        let Some((body_end, next)) = body_line_count(label)
-            .and_then(|lines| body_bounds(text, line_end, lines))
+        let Some((body_end, next)) =
+            body_line_count(label).and_then(|lines| body_bounds(text, line_end, lines))
         else {
             output.push_str(&text[cursor..line_end]);
             cursor = line_end;
@@ -205,8 +205,14 @@ mod tests {
         let mut elided = HashSet::new();
 
         let first = elide(&reread, &prompt, &mut elided);
-        assert!(!first.contains(&unchanged), "the visible body is not repeated");
-        assert!(first.contains(&edited), "text the model has not seen still prints");
+        assert!(
+            !first.contains(&unchanged),
+            "the visible body is not repeated"
+        );
+        assert!(
+            first.contains(&edited),
+            "text the model has not seen still prints"
+        );
         let reference = first
             .lines()
             .find(|line| line.contains("already_in_context"))
@@ -214,7 +220,10 @@ mod tests {
         let label: serde_json::Value =
             serde_json::from_str(&reference["[source ".len()..reference.len() - 1]).unwrap();
         assert_eq!(label["path"], "src/lib.rs");
-        assert_eq!(label["already_in_context"]["first_line"], "fn unchanged() {");
+        assert_eq!(
+            label["already_in_context"]["first_line"],
+            "fn unchanged() {"
+        );
         // The following label still starts its own line, so it stays parseable.
         assert!(first.contains("\n[source {\"body\":2,"));
 
@@ -251,10 +260,7 @@ mod tests {
             assert_eq!(elide(&reread, &prompt, &mut elided), reread);
         }
         let small = printed(&[("src/small.rs", "fn small() {}")]);
-        assert_eq!(
-            elide(&small, &[earlier_output(&small)], &mut elided),
-            small
-        );
+        assert_eq!(elide(&small, &[earlier_output(&small)], &mut elided), small);
         // A packet truncated inside a body leaves that body alone.
         let cut = &reread[..reread.len() - 200];
         assert_eq!(elide(cut, &[earlier_output(&text)], &mut elided), cut);

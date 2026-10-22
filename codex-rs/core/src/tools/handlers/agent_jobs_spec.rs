@@ -8,7 +8,7 @@ use super::multi_agents_common::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
 
 fn spawn_agents_on_csv_description() -> String {
     format!(
-        "Process a CSV by spawning one worker sub-agent per row. Workers use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. The instruction string is a template where `{{column}}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
+        "Root-agent-only: process a CSV by spawning one worker sub-agent per data record, including explicit empty records. Nested CSV jobs are unsupported because a waiting subagent can hold the capacity its batch needs. A header-only CSV exports zero outcomes. Workers use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. The instruction string is a template where `{{column}}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
     )
 }
 
@@ -127,7 +127,7 @@ pub fn create_report_agent_job_result_tool() -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "report_agent_job_result".to_string(),
         description:
-            "Worker-only tool to report a result for an agent job item. Main agents should not call this."
+            "Worker-only tool to report a result for an agent job item. Main agents should not call this. Inspect accepted: only accepted:true confirms this call recorded the item. For accepted:false, follow rejection_reason; a successful tool call alone is not an accepted report."
                 .to_string(),
         strict: false,
         defer_loading: None,

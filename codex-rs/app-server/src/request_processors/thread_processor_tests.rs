@@ -99,13 +99,15 @@ fn thread_store_absence_maps_to_structured_thread_reason() {
     );
 
     assert_eq!(error.code, crate::error_code::INVALID_REQUEST_ERROR_CODE);
+    // Store absence is a missing thread; a known live thread without a rollout
+    // is classified as NotMaterialized before this mapping.
     assert_eq!(
         serde_json::from_value::<codex_app_server_protocol::ThreadErrorData>(
             error.data.expect("thread error data")
         )
         .expect("valid thread error data"),
         codex_app_server_protocol::ThreadErrorData {
-            reason: codex_app_server_protocol::ThreadErrorReason::NotMaterialized,
+            reason: codex_app_server_protocol::ThreadErrorReason::NotFound,
         }
     );
 }
@@ -888,6 +890,7 @@ mod thread_processor_behavior_tests {
         StoredThread {
             project_id: None,
             thread_id,
+            session_id: None,
             extra_config: None,
             rollout_path: Some(test_path_buf("/tmp/thread.jsonl")),
             forked_from_id: None,
@@ -1140,7 +1143,9 @@ mod thread_processor_behavior_tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            kind: Default::default(),
             supports_standalone_web_search: false,
+            supports_hosted_web_search: false,
         };
         let config_manager = ConfigManager::new(
             temp_dir.path().to_path_buf(),
@@ -1290,7 +1295,11 @@ mod thread_processor_behavior_tests {
     fn persisted_settings_override_mask_uses_parsed_rpc_paths() {
         for (model, windows, permissions) in [
             ("model", "windows.sandbox", "permissions.workspace"),
-            ("\"model\"", "\"windows\".sandbox", "\"permissions\".workspace"),
+            (
+                "\"model\"",
+                "\"windows\".sandbox",
+                "\"permissions\".workspace",
+            ),
             ("'model'", "windows.'sandbox'", "permissions.'workspace'"),
         ] {
             let overrides = HashMap::from([
@@ -1298,12 +1307,16 @@ mod thread_processor_behavior_tests {
                 (windows.to_string(), json!("elevated")),
                 (permissions.to_string(), json!({})),
             ]);
-            let mask = persisted_settings_override_mask(
-                Some(&overrides),
-                &ConfigOverrides::default(),
+            let mask =
+                persisted_settings_override_mask(Some(&overrides), &ConfigOverrides::default());
+            assert!(
+                mask.model,
+                "model override {model} must survive reconstruction"
             );
-            assert!(mask.model, "model override {model} must survive reconstruction");
-            assert!(mask.windows_sandbox_level, "sandbox override {windows} must survive reconstruction");
+            assert!(
+                mask.windows_sandbox_level,
+                "sandbox override {windows} must survive reconstruction"
+            );
             assert!(mask.permission_profile);
             assert!(mask.active_permission_profile);
             assert!(mask.profile_workspace_roots);
@@ -1400,6 +1413,8 @@ mod thread_processor_behavior_tests {
     #[test]
     fn stored_thread_projections_preserve_metadata_and_empty_preview() {
         let mut stored = summary_test_stored_thread();
+        let session_id = codex_protocol::SessionId::new();
+        stored.session_id = Some(session_id);
         let parent_thread_id = ThreadId::new();
         stored.source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
@@ -1420,13 +1435,21 @@ mod thread_processor_behavior_tests {
         assert_eq!(summary.preview, "");
         assert_eq!(summary.model_provider, "fallback");
         assert_eq!(summary.conversation_id, stored.thread_id);
-        assert_eq!(summary.path, stored.rollout_path.clone().expect("rollout path"));
+        assert_eq!(
+            summary.path,
+            stored.rollout_path.clone().expect("rollout path")
+        );
         let fallback_cwd = test_path_buf("/tmp").abs();
         let (thread, history) = thread_from_stored_thread(stored, "fallback", &fallback_cwd);
+        assert_eq!(thread.session_id, session_id.to_string());
+        assert_ne!(thread.session_id, thread.id);
         assert_eq!(thread.agent_nickname.as_deref(), Some("atlas"));
         assert_eq!(thread.agent_role.as_deref(), Some("explorer"));
         assert_eq!(thread.forked_from_id, Some(parent_thread_id.to_string()));
-        assert_eq!(thread.thread_source, Some(codex_protocol::protocol::ThreadSource::Subagent));
+        assert_eq!(
+            thread.thread_source,
+            Some(codex_protocol::protocol::ThreadSource::Subagent)
+        );
         assert_eq!(thread.preview, "");
         assert_eq!(thread.model_provider, "fallback");
         assert!(history.is_none());
@@ -1590,7 +1613,11 @@ mod thread_processor_behavior_tests {
         let wait_for_subscriber = manager.wait_for_thread_subscriber(thread_id);
         tokio::pin!(wait_for_subscriber);
         assert!(futures::poll!(&mut wait_for_subscriber).is_pending());
-        assert!(manager.try_add_connection_to_thread(thread_id, connection).await);
+        assert!(
+            manager
+                .try_add_connection_to_thread(thread_id, connection)
+                .await
+        );
         tokio::time::timeout(Duration::from_secs(1), wait_for_subscriber).await?;
         Ok(())
     }

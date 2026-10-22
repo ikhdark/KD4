@@ -183,10 +183,7 @@ fn audit_everyone_writable_with_candidates(
             Err(err) => {
                 *incomplete = true;
                 debug_log(
-                    &format!(
-                        "AUDIT: unable to inspect ACL: {} ({err})",
-                        path.display()
-                    ),
+                    &format!("AUDIT: unable to inspect ACL: {} ({err})", path.display()),
                     logs_base_dir,
                 );
                 false
@@ -510,8 +507,10 @@ mod tests {
 
     #[test]
     fn audit_deny_failure_is_reported_after_remaining_paths_are_protected() -> anyhow::Result<()> {
-        use crate::acl::native_deny_write_test::{Stage, with_error};
-        use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+        use crate::acl::native_deny_write_test::Stage;
+        use crate::acl::native_deny_write_test::with_error;
+        use windows_sys::Win32::Foundation::HLOCAL;
+        use windows_sys::Win32::Foundation::LocalFree;
 
         for stage in [Stage::Entries, Stage::Security] {
             let home = tempfile::tempdir()?;
@@ -660,7 +659,10 @@ mod tests {
     fn audit_directory_read_failure_reports_incomplete() -> anyhow::Result<()> {
         let cwd = tempfile::tempdir()?;
         let missing = cwd.path().join("missing");
-        assert_eq!(fs::read_dir(&missing).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            fs::read_dir(&missing).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
         let scan = super::audit_everyone_writable_with_candidates(
             &missing,
             None,

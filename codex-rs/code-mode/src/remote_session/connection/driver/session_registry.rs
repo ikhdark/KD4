@@ -101,9 +101,8 @@ impl SessionRegistry {
         if record.remote != *session {
             return Err("stale code-mode session generation".to_string());
         }
-        if record.phase == SessionPhase::Closing {
-            return Err("code-mode session is already closing".to_string());
-        }
+        // A pending close may be observed again for this exact generation.
+        // Closing still fences execution; it is not permission to reopen it.
         record.phase = SessionPhase::Closing;
         Ok(())
     }
@@ -183,11 +182,12 @@ impl SessionRegistry {
         })
     }
 
-    pub(super) fn remove_session(&mut self, session_id: &SessionId) -> Vec<CellOwner> {
-        let Some(session) = self.records.remove(session_id) else {
-            return Vec::new();
-        };
-        session
+    pub(super) fn remove_session(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Option<(SessionCleanup, Vec<CellOwner>)> {
+        let session = self.records.remove(session_id)?;
+        let owners = session
             .cells
             .into_values()
             .map(|cell_id| CellOwner {
@@ -195,7 +195,8 @@ impl SessionRegistry {
                 cell_id,
                 delegate: Arc::clone(&session.delegate),
             })
-            .collect()
+            .collect();
+        Some((session.cleanup, owners))
     }
 
     pub(super) fn drain(&mut self) -> Vec<FailedSession> {

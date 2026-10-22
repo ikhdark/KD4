@@ -66,6 +66,19 @@ impl AbsolutePathBuf {
         Self(resolved)
     }
 
+    /// Resolve a native filesystem payload literally, without expanding `~`.
+    /// The base must be absolute, as for [`Self::resolve_path_against_base`].
+    pub fn resolve_literal_path_against_base<P: AsRef<Path>, B: AsRef<Path>>(
+        path: P,
+        base_path: B,
+    ) -> Self {
+        let path = normalize_path_for_platform(path.as_ref());
+        let base_path = normalize_path_for_platform(base_path.as_ref());
+        let resolved = absolutize::absolutize_from(path.as_ref(), base_path.as_ref());
+        assert!(resolved.is_absolute(), "path base must be absolute");
+        Self(resolved)
+    }
+
     pub fn from_absolute_path<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let expanded = Self::maybe_expand_home_directory(path.as_ref());
         let expanded = normalize_path_for_platform(&expanded);
@@ -155,8 +168,22 @@ impl AbsolutePathBuf {
 }
 
 fn normalize_path_for_platform(path: &Path) -> Cow<'_, Path> {
-    // dunce only simplifies native Windows paths when ordinary-path semantics
-    // are equivalent; foreign backslashes and unsafe verbatim paths stay intact.
+    // dunce handles drive aliases, but deliberately leaves VerbatimUNC alone.
+    // Reuse its filename/device/length checks for the UNC components before
+    // removing that namespace; unsafe or non-Unicode paths stay verbatim.
+    #[cfg(windows)]
+    if matches!(path.components().next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::VerbatimUNC(_, _)))
+        && let Some(raw) = path.to_str()
+        && let Some(tail) = raw.strip_prefix(r"\\?\UNC\")
+        && raw.encode_utf16().count() <= 260
+    {
+        let probe = PathBuf::from(format!(r"\\?\C:\{tail}"));
+        if dunce::simplified(&probe) != probe {
+            return Cow::Owned(PathBuf::from(format!(r"\\{tail}")));
+        }
+    }
     Cow::Borrowed(dunce::simplified(path))
 }
 
@@ -495,8 +522,7 @@ mod tests {
 
         // With `..` in the input only the canonical result names the file that was checked.
         let traversal = root.join("view").join("nested").join("..").join("marker");
-        let expected =
-            dunce::canonicalize(root.join("real").join("marker")).expect("marker path");
+        let expected = dunce::canonicalize(root.join("real").join("marker")).expect("marker path");
         for resolved in [
             canonicalize_preserving_symlinks(&traversal),
             canonicalize_existing_preserving_symlinks(&traversal),
@@ -731,7 +757,11 @@ mod tests {
             }
             let input = serde_json::to_string(raw).expect("serialize path");
             let path: AbsolutePathBuf = serde_json::from_str(&input).expect("deserialize path");
-            let expected = if raw == "~" { home.clone() } else { home.join("code") };
+            let expected = if raw == "~" {
+                home.clone()
+            } else {
+                home.join("code")
+            };
             assert_eq!(path.as_path(), expected.as_path(), "{raw:?}");
         }
     }

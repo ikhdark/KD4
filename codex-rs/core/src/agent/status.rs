@@ -5,6 +5,8 @@ use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::AssignmentAdmissionOrigin;
 
+pub(crate) const NO_COMPLETION_DIAGNOSTICS: &str = "Host terminal boundary: no completion diagnostics recorded; this is not verification evidence.";
+
 /// Derive the next agent status from a single emitted event.
 /// Returns `None` when the event does not affect status tracking.
 pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
@@ -12,18 +14,28 @@ pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
         EventMsg::TurnStarted(_) => Some(AgentStatus::Running),
         EventMsg::TurnComplete(ev) => {
             let mut status = if let Some(error) = ev.error.as_ref() {
-            AgentStatus::Errored(error.message.clone())
-        } else {
-            match ev.surfaced_result.clone() {
-                Some(surfaced_result) => AgentStatus::CompletedWithSurface {
+                AgentStatus::Errored(error.message.clone())
+            } else if let Some(stop_cause) = ev.timing.as_ref().and_then(|timing| timing.stop_cause)
+            {
+                AgentStatus::Stopped {
                     last_agent_message: ev.last_agent_message.clone(),
-                    surfaced_result,
-                },
-                None => AgentStatus::Completed(ev.last_agent_message.clone()),
-            }
+                    stop_cause,
+                }
+            } else {
+                match ev.surfaced_result.clone() {
+                    Some(surfaced_result) => AgentStatus::CompletedWithSurface {
+                        last_agent_message: ev.last_agent_message.clone(),
+                        surfaced_result,
+                    },
+                    None => AgentStatus::Completed(ev.last_agent_message.clone()),
+                }
             };
-            if let Some(summary) = ev.timing.as_ref().and_then(|timing| timing.completion_assessment.as_ref())
-                .and_then(|assessment| assessment.bounded_summary(&ev.turn_id)) {
+            if let Some(summary) = ev
+                .timing
+                .as_ref()
+                .and_then(|timing| timing.completion_assessment.as_ref())
+                .and_then(|assessment| assessment.bounded_summary(&ev.turn_id))
+            {
                 append_host_observation(&mut status, &summary);
             }
             Some(status)
@@ -62,13 +74,86 @@ pub(crate) fn agent_status_from_task(
     observed_status: Option<(codex_agent_task_store::AttemptId, &AgentStatus)>,
 ) -> Option<AgentStatus> {
     let mut status = agent_status_from_task_inner(task, observed_status)?;
-    for observation in task.observations.iter().filter(|observation| {
-        observation.attempt_id == task.current_attempt.attempt_id
-            && observation.kind == codex_agent_task_store::ObservationKind::HostCompletion
-    }).rev().take(1) {
-        append_host_observation(&mut status, &observation.summary);
+    if let Some(summary) = completion_diagnostics_from_task(task) {
+        append_host_observation(&mut status, &summary);
+    }
+    let current_observation =
+        observed_status.filter(|(attempt, _)| *attempt == task.current_attempt.attempt_id);
+    let cause = match current_observation {
+        Some((_, AgentStatus::Stopped { stop_cause, .. })) => Some(*stop_cause),
+        Some(_) => None, // A later live outcome must not revive an older capacity stop.
+        None => task
+            .observations
+            .iter()
+            .rev()
+            .find(|observation| {
+                observation.attempt_id == task.current_attempt.attempt_id
+                    && observation.kind == codex_agent_task_store::ObservationKind::HostCompletion
+                    && observation
+                        .call_id
+                        .as_deref()
+                        .is_some_and(|origin| !origin.ends_with(":parent-delivery"))
+            })
+            .and_then(|observation| observation.execution_stop_cause.as_ref())
+            .and_then(|code| serde_json::from_value(serde_json::Value::String(code.clone())).ok()),
+    };
+    if let Some(stop_cause) = cause {
+        let last_agent_message = match status {
+            AgentStatus::Completed(message)
+            | AgentStatus::Stopped {
+                last_agent_message: message,
+                ..
+            }
+            | AgentStatus::CompletedWithSurface {
+                last_agent_message: message,
+                ..
+            } => message,
+            AgentStatus::Errored(message) => Some(message),
+            _ => None,
+        };
+        status = AgentStatus::Stopped {
+            last_agent_message,
+            stop_cause,
+        };
     }
     Some(status)
+}
+
+/// Only the newest terminal origin and its delivery recovery apply. A later
+/// clean terminal marker supersedes older diagnostics even within one attempt.
+pub(crate) fn completion_diagnostics_from_task(task: &AgentTask) -> Option<String> {
+    let observations = || {
+        task.observations.iter().filter(|observation| {
+            observation.attempt_id == task.current_attempt.attempt_id
+                && observation.kind == codex_agent_task_store::ObservationKind::HostCompletion
+        })
+    };
+    let terminal = observations().rev().find(|observation| {
+        observation
+            .call_id
+            .as_deref()
+            .is_some_and(|origin| !origin.ends_with(":parent-delivery"))
+    });
+    let Some(terminal) = terminal else {
+        return observations().next_back().map(|observation| {
+            format!(
+                "Terminal diagnostic provenance is incomplete. {}",
+                observation.summary,
+            )
+        });
+    };
+    let delivery_origin = format!("{}:parent-delivery", terminal.call_id.as_deref()?);
+    let mut summaries = Vec::new();
+    if terminal.summary != NO_COMPLETION_DIAGNOSTICS {
+        summaries.push(terminal.summary.as_str());
+    }
+    if let Some(delivery) = observations()
+        .rev()
+        .find(|observation| observation.call_id.as_deref() == Some(delivery_origin.as_str()))
+    {
+        summaries.push(&delivery.summary);
+    }
+    (!summaries.is_empty()).then(|| summaries.join("\n\n"))
 }
 
 fn append_host_observation(status: &mut AgentStatus, summary: &str) {
@@ -76,18 +161,26 @@ fn append_host_observation(status: &mut AgentStatus, summary: &str) {
         // Host observations must not manufacture an authored final response:
         // the missing-receipt path distinguishes Completed(None) from Some.
         AgentStatus::Completed(Some(message)) => message,
-        AgentStatus::CompletedWithSurface { last_agent_message: message, .. } => {
-            message.get_or_insert_with(String::new)
-        }
+        AgentStatus::CompletedWithSurface {
+            last_agent_message: message,
+            ..
+        } => message.get_or_insert_with(String::new),
+        AgentStatus::Stopped {
+            last_agent_message: Some(message),
+            ..
+        } => message,
         AgentStatus::Errored(message) => message,
         _ => return,
     };
     // Only presentation deduplication: no prose is parsed into host authority.
-    if !message.contains(summary) {
+    if !message.starts_with(summary) {
         // Put known host facts before potentially long authored prose so the
         // bounded notification cannot discard them merely because prose is long.
-        *message = if message.is_empty() { summary.to_string() }
-            else { format!("{summary}\n\n{message}") };
+        *message = if message.is_empty() {
+            summary.to_string()
+        } else {
+            format!("{summary}\n\n{message}")
+        };
     }
 }
 
@@ -103,19 +196,32 @@ fn agent_status_from_task_inner(
         task.assignment.admission_origin,
         AssignmentAdmissionOrigin::LegacyMessage { .. }
     );
-    let failures = task.gates.iter().filter(|gate| matches!(gate.status,
-        codex_agent_task_store::GateStatus::Failed |
-        codex_agent_task_store::GateStatus::ChangesRequested |
-        codex_agent_task_store::GateStatus::Violated))
+    let failures = task
+        .gates
+        .iter()
+        .filter(|gate| {
+            matches!(
+                gate.status,
+                codex_agent_task_store::GateStatus::Failed
+                    | codex_agent_task_store::GateStatus::ChangesRequested
+                    | codex_agent_task_store::GateStatus::Violated
+            )
+        })
         .map(|gate| format!("{:?}: {:?}: {}", gate.kind, gate.status, gate.reason))
-        .collect::<Vec<_>>().join("; ");
+        .collect::<Vec<_>>()
+        .join("; ");
     let needs_main = task.current_attempt.state == codex_agent_task_store::AttemptState::NeedsMain;
     if receipt.status == AgentStatusClaim::Completed
         && (needs_main || (!plain_message && !failures.is_empty()))
     {
-        let acceptance = if needs_main { "needs_main" } else { "blocked by gates" };
+        let acceptance = if needs_main {
+            "needs_main"
+        } else {
+            "blocked by gates"
+        };
         return Some(AgentStatus::Errored(format!(
-            "Agent execution completed; acceptance {acceptance}. {failures}\n\nAgent-reported result (not verification evidence): {}", receipt.summary
+            "Agent execution completed; acceptance {acceptance}. {failures}\n\nAgent-reported result (not verification evidence): {}",
+            receipt.summary
         )));
     }
     let observed_status = observed_status
@@ -137,10 +243,16 @@ fn agent_status_from_task_inner(
     // worker to reconstruct it. The attempt check above still excludes stale text,
     // and neither this prose nor a pending gate is promoted into verification.
     let reported_message = match (receipt.status, observed_status) {
-        (AgentStatusClaim::Completed, Some(AgentStatus::Completed(Some(message))
-            | AgentStatus::CompletedWithSurface { last_agent_message: Some(message), .. })) => {
-            message.as_str()
-        }
+        (
+            AgentStatusClaim::Completed,
+            Some(
+                AgentStatus::Completed(Some(message))
+                | AgentStatus::CompletedWithSurface {
+                    last_agent_message: Some(message),
+                    ..
+                },
+            ),
+        ) => message.as_str(),
         _ => receipt.summary.as_str(),
     };
     if !plain_message
@@ -237,6 +349,48 @@ mod tests {
     use codex_protocol::protocol::NonSteerableTurnKind;
     use codex_protocol::protocol::SurfacedToolResult;
     use codex_protocol::protocol::TurnCompleteEvent;
+
+    #[test]
+    fn durable_projection_aggregates_same_turn_facts_and_clears_older_diagnostics() {
+        let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
+        let observation =
+            |attempt_id, origin: &str, summary: &str| codex_agent_task_store::RuntimeObservation {
+                execution_stop_cause: None,
+                event_id: codex_agent_task_store::MutationEventId::new(),
+                wake_event_id: codex_agent_task_store::WakeEventId::new(),
+                assignment_id: task.assignment.assignment_id,
+                attempt_id,
+                kind: codex_agent_task_store::ObservationKind::HostCompletion,
+                summary: summary.into(),
+                call_id: Some(origin.into()),
+                created_at: chrono::Utc::now(),
+            };
+        task.observations = vec![
+            observation(
+                task.current_attempt.attempt_id,
+                "thread:turn",
+                "validation failed",
+            ),
+            observation(
+                task.current_attempt.attempt_id,
+                "thread:turn:parent-delivery",
+                "delivery failed",
+            ),
+            observation(AttemptId::new(), "other:turn", "wrong attempt"),
+        ];
+        let summary = completion_diagnostics_from_task(&task).unwrap();
+        assert_eq!(summary, "validation failed\n\ndelivery failed");
+        assert!(
+            matches!(agent_status_from_task(&task, None), Some(AgentStatus::Completed(Some(text)))
+            if text.starts_with(&summary) && !text.contains("wrong attempt"))
+        );
+        task.observations.push(observation(
+            task.current_attempt.attempt_id,
+            "thread:resolved",
+            NO_COMPLETION_DIAGNOSTICS,
+        ));
+        assert_eq!(completion_diagnostics_from_task(&task), None);
+    }
 
     #[test]
     fn aborted_turns_preserve_interruption_and_explain_failures() {
@@ -367,35 +521,129 @@ mod tests {
         assert_eq!(no_report, AgentStatus::Completed(None));
         for surfaced in [false, true] {
             let event = TurnCompleteEvent {
-                turn_id: "diagnostic-turn".into(), last_agent_message: Some("done".into()),
+                turn_id: "diagnostic-turn".into(),
+                last_agent_message: Some("done".into()),
                 surfaced_result: surfaced.then(|| SurfacedToolResult {
-                    adapter: "owner".into(), value: serde_json::json!(42), canonical_message: None,
+                    adapter: "owner".into(),
+                    value: serde_json::json!(42),
+                    canonical_message: None,
                 }),
-                error: None, completed_at: None, duration_ms: None, time_to_first_token_ms: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
                 timing: Some(codex_protocol::protocol::TurnTiming {
-                    completion_assessment: Some(codex_protocol::protocol::TurnCompletionAssessment {
-                        failed_checks: vec!["check-alpha failed".into()],
-                        verification_gaps: vec!["check-beta awaits terminal evidence".into()],
-                        ..Default::default()
-                    }), ..Default::default()
+                    completion_assessment: Some(
+                        codex_protocol::protocol::TurnCompletionAssessment {
+                            failed_checks: vec!["check-alpha failed".into()],
+                            verification_gaps: vec!["check-beta awaits terminal evidence".into()],
+                            ..Default::default()
+                        },
+                    ),
+                    ..Default::default()
                 }),
             };
             let status = agent_status_from_event(&EventMsg::TurnComplete(event)).unwrap();
             let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
-            let projected = agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status))).unwrap();
+            let projected =
+                agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status)))
+                    .unwrap();
             let text = match projected {
-                AgentStatus::Completed(Some(message)) |
-                AgentStatus::CompletedWithSurface { last_agent_message: Some(message), .. } => message,
+                AgentStatus::Completed(Some(message))
+                | AgentStatus::CompletedWithSurface {
+                    last_agent_message: Some(message),
+                    ..
+                } => message,
                 _ => panic!("completion lifecycle must be unchanged"),
             };
             assert!(text.contains("check-alpha failed"));
             assert!(text.contains("check-beta awaits terminal evidence"));
             assert!(text.contains("diagnostic-turn"));
             task.workspace_status.pending_gates = vec![codex_agent_task_store::GateKind::Review];
-            assert!(matches!(agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status))),
-                Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates") && message.contains("check-alpha")));
-            assert!(matches!(agent_status_from_task(&task, Some((AttemptId::new(), &status))),
-                Some(AgentStatus::Completed(Some(message))) if !message.contains("check-alpha")));
+            assert!(
+                matches!(agent_status_from_task(&task, Some((task.current_attempt.attempt_id, &status))),
+                Some(AgentStatus::Completed(Some(message))) if message.contains("pending gates") && message.contains("check-alpha"))
+            );
+            assert!(
+                matches!(agent_status_from_task(&task, Some((AttemptId::new(), &status))),
+                Some(AgentStatus::Completed(Some(message))) if !message.contains("check-alpha"))
+            );
+        }
+    }
+
+    #[test]
+    fn audit115_capacity_cause_survives_event_and_durable_task_projection() {
+        use codex_protocol::protocol::TurnCompleteEvent;
+        use codex_protocol::protocol::TurnExecutionStopCause;
+        use codex_protocol::protocol::TurnTiming;
+        let cause = TurnExecutionStopCause::SubagentContextBudget;
+        for report in [None, Some("One deliverable done; two remain.".to_owned())] {
+            let event = EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: "capacity-turn".into(),
+                last_agent_message: report.clone(),
+                surfaced_result: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                timing: Some(TurnTiming {
+                    stop_cause: Some(cause),
+                    ..Default::default()
+                }),
+            });
+            let replay: EventMsg =
+                serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+            assert_eq!(
+                agent_status_from_event(&replay),
+                Some(AgentStatus::Stopped {
+                    last_agent_message: report,
+                    stop_cause: cause,
+                })
+            );
+        }
+        for accepted in [false, true] {
+            let claim = if accepted {
+                AgentStatusClaim::Completed
+            } else {
+                AgentStatusClaim::NeedsMain
+            };
+            let mut task = typed_task_with_receipt(claim, false);
+            task.observations
+                .push(codex_agent_task_store::RuntimeObservation {
+                    execution_stop_cause: Some("subagent_context_budget".into()),
+                    event_id: codex_agent_task_store::MutationEventId::new(),
+                    wake_event_id: codex_agent_task_store::WakeEventId::new(),
+                    assignment_id: task.assignment.assignment_id,
+                    attempt_id: task.current_attempt.attempt_id,
+                    kind: codex_agent_task_store::ObservationKind::HostCompletion,
+                    summary: "Capacity stop; acceptance is independent.".into(),
+                    call_id: Some("thread:turn".into()),
+                    created_at: chrono::Utc::now(),
+                });
+            let cold: AgentTask =
+                serde_json::from_value(serde_json::to_value(&task).unwrap()).unwrap();
+            assert!(
+                matches!(agent_status_from_task(&cold, None), Some(AgentStatus::Stopped {
+                last_agent_message: Some(message), stop_cause,
+            }) if stop_cause == cause && message.contains("durable summary"))
+            );
+            assert_eq!(
+                cold.receipt.as_ref().unwrap().status,
+                claim,
+                "capacity alone must not downgrade an accepted receipt"
+            );
+            let mut later = cold;
+            let mut clean = later.observations[0].clone();
+            clean.execution_stop_cause = None;
+            clean.call_id = Some("thread:later-clean".into());
+            later.observations.push(clean);
+            assert!(
+                !matches!(
+                    agent_status_from_task(&later, None),
+                    Some(AgentStatus::Stopped { .. })
+                ),
+                "later clean outcomes supersede the scheduling cause"
+            );
         }
     }
 
@@ -404,6 +652,8 @@ mod tests {
         let attempt_id = AttemptId::new();
         let now = chrono::Utc::now();
         AgentTask {
+            dependency_admissions: Vec::new(),
+            criterion_assessments: Vec::new(),
             assignment: Assignment {
                 assignment_id,
                 root_session_id: "root".to_string(),
@@ -414,6 +664,7 @@ mod tests {
                 capability_profile: CapabilityProfile::ReadSearch,
                 objective: "inspect".to_string(),
                 acceptance_criteria: vec![AcceptanceCriterion {
+                    evidence_policy: None,
                     id: "criterion".to_string(),
                     text: "report".to_string(),
                 }],
@@ -568,27 +819,41 @@ mod tests {
 
     #[test]
     fn failed_acceptance_is_not_recovered_as_execution_success() {
-        for kind in [codex_agent_task_store::GateKind::Review, codex_agent_task_store::GateKind::Verification] {
+        for kind in [
+            codex_agent_task_store::GateKind::Review,
+            codex_agent_task_store::GateKind::Verification,
+        ] {
             let mut task = typed_task_with_receipt(AgentStatusClaim::Completed, false);
             task.current_attempt.state = AttemptState::NeedsMain;
             task.gates.push(codex_agent_task_store::AgentGate {
-                assignment_id: task.assignment.assignment_id, kind,
+                assignment_id: task.assignment.assignment_id,
+                kind,
                 status: codex_agent_task_store::GateStatus::Failed,
-                reason: "missing behavior".into(), waiver_reason: None,
-                evidence_epoch: 0, updated_at: chrono::Utc::now(), sealed_at: Some(chrono::Utc::now()),
+                reason: "missing behavior".into(),
+                waiver_reason: None,
+                evidence_epoch: 0,
+                updated_at: chrono::Utc::now(),
+                sealed_at: Some(chrono::Utc::now()),
             });
             let observed = AgentStatus::Completed(Some("worker finished".into()));
             for live in [None, Some((task.current_attempt.attempt_id, &observed))] {
-                assert!(matches!(agent_status_from_task(&task, live), Some(AgentStatus::Errored(message))
-                    if message.contains("execution completed") && message.contains("needs_main") && message.contains("missing behavior")));
+                assert!(
+                    matches!(agent_status_from_task(&task, live), Some(AgentStatus::Errored(message))
+                    if message.contains("execution completed") && message.contains("needs_main") && message.contains("missing behavior"))
+                );
             }
-            assert_eq!(task.receipt.as_ref().unwrap().status, AgentStatusClaim::Completed);
+            assert_eq!(
+                task.receipt.as_ref().unwrap().status,
+                AgentStatusClaim::Completed
+            );
             // The first changes-requested review leaves execution Completed,
             // but acceptance is blocked until an explicit correction is reviewed.
             task.current_attempt.state = AttemptState::Completed;
             task.gates[0].status = codex_agent_task_store::GateStatus::ChangesRequested;
-            assert!(matches!(agent_status_from_task(&task, None), Some(AgentStatus::Errored(message))
-                if message.contains("blocked by gates") && message.contains("ChangesRequested")));
+            assert!(
+                matches!(agent_status_from_task(&task, None), Some(AgentStatus::Errored(message))
+                if message.contains("blocked by gates") && message.contains("ChangesRequested"))
+            );
         }
     }
 

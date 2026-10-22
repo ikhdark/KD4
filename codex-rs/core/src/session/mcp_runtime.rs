@@ -125,6 +125,23 @@ impl McpRuntimeSnapshot {
     #[cfg(test)]
     pub(crate) fn new_uninitialized_for_test(config: &crate::config::Config) -> Arc<Self> {
         use codex_exec_server::EnvironmentManager;
+
+        Self::new_uninitialized_for_test_with_context(
+            config,
+            McpRuntimeContext::new(
+                Arc::new(EnvironmentManager::default_for_tests()),
+                config.cwd.to_path_buf(),
+            ),
+        )
+    }
+
+    /// Session fixtures pass the context a published refresh would bind, because
+    /// step reuse compares the session's environment identities and local cwd.
+    #[cfg(test)]
+    pub(crate) fn new_uninitialized_for_test_with_context(
+        config: &crate::config::Config,
+        runtime_context: McpRuntimeContext,
+    ) -> Arc<Self> {
         use codex_features::Feature;
         use codex_mcp::ResolvedMcpCatalog;
         use rmcp::model::ElicitationCapability;
@@ -151,10 +168,6 @@ impl McpRuntimeSnapshot {
             &config.permissions.approval_policy,
             config.permissions.permission_profile(),
             config.prefix_mcp_tool_names(),
-        );
-        let runtime_context = McpRuntimeContext::new(
-            Arc::new(EnvironmentManager::default_for_tests()),
-            config.cwd.to_path_buf(),
         );
         Arc::new(Self::new(
             0,

@@ -2,6 +2,7 @@
 pub(crate) struct ProcessState {
     pub(crate) has_exited: bool,
     pub(crate) exit_code: Option<i32>,
+    pub(crate) exit_observed_at: Option<std::time::Instant>,
     pub(crate) failure_message: Option<String>,
     pub(crate) sandbox_denied: bool,
 }
@@ -11,6 +12,10 @@ impl ProcessState {
         Self {
             has_exited: true,
             exit_code,
+            exit_observed_at: Some(
+                self.exit_observed_at
+                    .unwrap_or_else(std::time::Instant::now),
+            ),
             failure_message: self.failure_message.clone(),
             sandbox_denied: self.sandbox_denied,
         }
@@ -20,6 +25,7 @@ impl ProcessState {
         Self {
             has_exited: self.has_exited,
             exit_code: self.exit_code,
+            exit_observed_at: self.exit_observed_at,
             failure_message: Some(message),
             sandbox_denied: self.sandbox_denied,
         }
@@ -51,9 +57,11 @@ mod tests {
                     ProcessState {
                         has_exited: true,
                         exit_code,
+                        exit_observed_at: exited.exit_observed_at,
                         ..failed.clone()
                     }
                 );
+                assert!(exited.exit_observed_at.is_some());
                 assert_eq!(
                     exited.failed("later error".into()),
                     ProcessState {

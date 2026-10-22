@@ -154,9 +154,9 @@ mod tests {
         let session_store = codex_extension_api::ExtensionData::new("session");
         let thread_store = codex_extension_api::ExtensionData::new(thread_id.to_string());
         let turn_store = codex_extension_api::ExtensionData::new("turn-warning");
-        turn_store.insert(codex_core::skills::model::HostSkillsSnapshot::new(Arc::new(
-            codex_core::skills::SkillLoadOutcome::default(),
-        )));
+        turn_store.insert(codex_core::skills::model::HostSkillsSnapshot::new(
+            Arc::new(codex_core::skills::SkillLoadOutcome::default()),
+        ));
         for contributor in registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(codex_extension_api::ThreadStartInput {
@@ -173,6 +173,7 @@ mod tests {
             turn_id: "turn-warning".to_string(),
             user_input: Vec::new(),
             environments: Vec::new(),
+            bound_selected_capability_roots: Vec::new(),
             ready_selected_capability_roots: vec![
                 codex_protocol::capabilities::SelectedCapabilityRoot {
                     id: "missing-skills".to_string(),

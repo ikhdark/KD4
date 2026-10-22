@@ -17,6 +17,7 @@ anyhow = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 chrono = { workspace = true }
+codex-network-types = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 codex-utils-der = { workspace = true }
 codex-utils-home-dir = { workspace = true }
@@ -32,6 +33,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }
 url = { workspace = true }
 rama-core = { workspace = true }
+rama-dns = "=0.3.0-alpha.4"
 rama-http = { workspace = true }
 rama-http-backend = { workspace = true, features = ["tls"] }
 rama-net = { workspace = true, features = ["http", "tls"] }

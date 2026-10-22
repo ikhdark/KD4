@@ -39,20 +39,15 @@ pub(crate) fn available_skills_fragment(
             SkillSourceKind::Orchestrator => "orchestrator resource",
             SkillSourceKind::Custom(_) => "custom resource",
         };
-        let line_bytes = entry
-            .name
-            .len()
-            .saturating_add(entry.rendered_path().len())
-            .saturating_add(locator_kind.len())
-            .saturating_add(description.len())
-            .saturating_add(if description.is_empty() { 8 } else { 9 });
+        let line = render_skill_line(entry, description.as_ref(), locator_kind);
+        let line_bytes = line.len().saturating_add(1);
         let next_bytes = total_bytes.saturating_add(line_bytes);
         if next_bytes > MAX_AVAILABLE_SKILLS_BYTES {
             omitted = omitted.saturating_add(1);
             continue;
         }
         total_bytes = next_bytes;
-        skill_lines.push(render_skill_line(entry, description.as_ref(), locator_kind));
+        skill_lines.push(line);
     }
 
     let incomplete = catalog.continuation.is_some();
@@ -118,9 +113,12 @@ pub(crate) fn truncate_catalog_skill_description(description: &str) -> Cow<'_, s
 }
 
 fn render_skill_line(entry: &SkillCatalogEntry, description: &str, locator_kind: &str) -> String {
-    let name = entry.name.as_str();
+    let empty = description.is_empty();
+    let name = codex_utils_string::xml_text(&entry.name);
+    let description = codex_utils_string::xml_text(description);
     let path = entry.rendered_path();
-    if description.is_empty() {
+    let path = codex_utils_string::xml_text(path);
+    if empty {
         format!("- {name}: ({locator_kind}: {path})")
     } else {
         format!("- {name}: {description} ({locator_kind}: {path})")
@@ -215,7 +213,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            available_skills_fragment(&catalog).expect("catalog").render(),
+            available_skills_fragment(&catalog)
+                .expect("catalog")
+                .render(),
             format!(
                 "{EXTENSION_SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills\n{SKILLS_INTRO_WITH_ABSOLUTE_PATHS}\n### Available skills\n- demo: Demo skill. (file: host/demo/SKILL.md)\n{EXTENSION_SKILLS_INSTRUCTIONS_CLOSE_TAG}"
             )
@@ -236,15 +236,21 @@ mod tests {
             )],
             ..Default::default()
         };
-        let rendered = available_skills_fragment(&catalog).expect("catalog").render();
+        let rendered = available_skills_fragment(&catalog)
+            .expect("catalog")
+            .render();
 
         assert!(rendered.contains(
             "For omitted or newly relevant host skills, search read_file(path=\"skill:catalog\")"
         ));
-        assert!(rendered.contains("For other sources, use their provider-specific discovery routes."));
+        assert!(
+            rendered.contains("For other sources, use their provider-specific discovery routes.")
+        );
         assert!(rendered.contains("(orchestrator resource: skill://test/demo/SKILL.md)"));
         assert!(rendered.contains("skills.list({\"authority\":{\"kind\":\"orchestrator\"}})"));
-        assert!(rendered.contains("pass the returned authority, package, and main_resource as resource to skills.read"));
+        assert!(rendered.contains(
+            "pass the returned authority, package, and main_resource as resource to skills.read"
+        ));
     }
 
     #[test]

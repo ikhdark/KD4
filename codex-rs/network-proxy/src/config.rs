@@ -637,7 +637,10 @@ mod tests {
         let config = settings;
 
         assert_eq!(config.allowed_domains(), None);
-        assert_eq!(config.denied_domains(), Some(vec!["example.com".to_string()]));
+        assert_eq!(
+            config.denied_domains(),
+            Some(vec!["example.com".to_string()])
+        );
 
         let value = serde_json::to_value(&config).unwrap();
 

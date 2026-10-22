@@ -41,13 +41,22 @@ import tomllib
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from scripts.common.process_owner import owned_process, CleanupFailed, OwnedThreadPoolExecutor, run_owned
+from scripts.common.process_owner import (
+    owned_process,
+    CleanupFailed,
+    OwnedThreadPoolExecutor,
+    run_owned,
+)
 from scripts.build.rust_tool_env import (
     CORE_TEST_PACKAGES,
     cargo_package_specs,
     local_rust_env,
+    prepare_shared_sccache,
 )
-from scripts.build.cargo_child_diagnostics import diagnostic_command, wait_with_diagnostics
+from scripts.build.cargo_child_diagnostics import (
+    diagnostic_command,
+    wait_with_diagnostics,
+)
 from scripts.build.validation_metrics import ValidationMetrics
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -77,13 +86,21 @@ class ExecutionReceipts(dict):
 
     @staticmethod
     def identities(values):
-        return [{"binary": binary, "helpers": sorted(helpers), "test": test}
-                for binary, helpers, test in sorted(values, key=lambda row: (row[0], sorted(row[1]), row[2]))]
+        return [
+            {"binary": binary, "helpers": sorted(helpers), "test": test}
+            for binary, helpers, test in sorted(
+                values, key=lambda row: (row[0], sorted(row[1]), row[2])
+            )
+        ]
 
     def completed_tests(self):
         binaries = sorted({binary for binary, _, _ in self.executed})
-        return {binary: sorted({test for owner, _, test in self.executed if owner == binary})
-                for binary in binaries}
+        return {
+            binary: sorted(
+                {test for owner, _, test in self.executed if owner == binary}
+            )
+            for binary in binaries
+        }
 
 
 class RunnerError(RuntimeError):
@@ -168,6 +185,7 @@ class Manifest:
     helpers: Mapping[str, Helper]
     targets: Mapping[str, Target]
     gates: Mapping[str, Gate]
+    contracts: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> Manifest:
@@ -181,7 +199,9 @@ class Manifest:
     @classmethod
     def from_data(cls, raw: Any) -> Manifest:
         root = _require_table(raw, "manifest")
-        _reject_unknown(root, {"version", "helpers", "targets", "gates"}, "manifest")
+        _reject_unknown(
+            root, {"version", "helpers", "targets", "gates", "contracts"}, "manifest"
+        )
 
         version = _require_int(root.get("version"), "manifest.version")
         if version != SCHEMA_VERSION:
@@ -327,7 +347,87 @@ class Manifest:
                 )
             gates[gate_name] = Gate(gate_name, description, tuple(steps))
 
-        return cls(version, helpers, targets, gates)
+        contracts = {}
+        if "contracts" in root:
+            declared = _require_table(root["contracts"], "contracts")
+            _reject_unknown(declared, {"version", "obligations"}, "contracts")
+            if _require_int(declared.get("version"), "contracts.version") != 1:
+                raise RunnerError("contracts.version must be 1")
+            for name, value in _require_table(
+                declared.get("obligations"), "contracts.obligations"
+            ).items():
+                name = _require_name(name, "contract obligation")
+                prefix = f"contracts.obligations.{name}"
+                value = _require_table(value, prefix)
+                _reject_unknown(value, {"paths", "required_gates", "consumer"}, prefix)
+                paths = _require_string_list(value.get("paths"), f"{prefix}.paths")
+                required = _require_string_list(
+                    value.get("required_gates"), f"{prefix}.required_gates"
+                )
+                if not paths or not required:
+                    raise RunnerError(
+                        f"{prefix} requires nonempty paths and required_gates"
+                    )
+                for path in paths:
+                    if (
+                        path.startswith("/")
+                        or "\\" in path
+                        or ":" in path
+                        or any(part in {"", ".", ".."} for part in path.split("/"))
+                    ):
+                        raise RunnerError(
+                            f"{prefix}.paths must be repository-relative POSIX patterns"
+                        )
+                _reject_duplicates(paths, f"{prefix}.paths")
+                _reject_duplicates(required, f"{prefix}.required_gates")
+                if not set(required).issubset(gates):
+                    raise RunnerError(f"{prefix} references an unknown required gate")
+                contracts[name] = {
+                    "paths": tuple(paths),
+                    "required_gates": tuple(required),
+                    "consumer": _require_string(
+                        value.get("consumer"), f"{prefix}.consumer"
+                    ),
+                }
+        return cls(version, helpers, targets, gates, contracts)
+
+    def required_contracts(
+        self, paths: Sequence[str], *, cwd: Path | None = None
+    ) -> dict[str, Any]:
+        """Explicit obligations only; absence of a declaration is not completeness proof."""
+        cwd = (cwd or Path.cwd()).resolve()
+        root = REPO_ROOT if cwd.is_relative_to(REPO_ROOT) else cwd
+        obligations = {}
+        unresolved = []
+        for raw in dict.fromkeys(paths):
+            path = Path(raw)
+            path = (cwd / path).resolve()
+            try:
+                relative = path.relative_to(root).as_posix()
+            except ValueError:
+                unresolved.append(raw)
+                continue
+            for name, contract in self.contracts.items():
+                if any(
+                    fnmatch.fnmatchcase(relative, pattern)
+                    for pattern in contract["paths"]
+                ):
+                    obligation = obligations.setdefault(
+                        name, {**contract, "triggered_by": []}
+                    )
+                    obligation["triggered_by"].append(raw)
+        return {
+            "required_gates": sorted(
+                {
+                    gate
+                    for value in obligations.values()
+                    for gate in value["required_gates"]
+                }
+            ),
+            "required_obligations": obligations,
+            "unresolved_contract_paths": unresolved,
+            "contract_scope": "explicit declarations only; undeclared consumer obligations remain unverified",
+        }
 
     def target(self, name: str) -> Target:
         try:
@@ -490,7 +590,9 @@ _LIB_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
 
 
 def _rust_module_owners(
-    metadata: MetadataIndex, raw: str, cwd: Path,
+    metadata: MetadataIndex,
+    raw: str,
+    cwd: Path,
     declarations: dict | None = None,
 ) -> tuple[str, list[tuple[str, str | None, str]], set[tuple[str, str | None]]] | None:
     """Return declared module routes and their registered Cargo selectors."""
@@ -498,7 +600,9 @@ def _rust_module_owners(
         return None
     if declarations is None:
         declarations = {}
-    candidates = [Path(raw)] if Path(raw).is_absolute() else [cwd / raw, REPO_ROOT / raw]
+    candidates = (
+        [Path(raw)] if Path(raw).is_absolute() else [cwd / raw, REPO_ROOT / raw]
+    )
     for path in (candidate.resolve() for candidate in candidates):
         owner = None
         for name, package in metadata.packages.items():
@@ -530,7 +634,9 @@ def _rust_module_owners(
         modules = []
         registered = set()
         for (kind, value), src in roots or [
-            (selector, src) for selector, src in targets if path.is_relative_to(src.parent)
+            (selector, src)
+            for selector, src in targets
+            if path.is_relative_to(src.parent)
         ]:
             module = _rust_module(src, path, declarations=declarations)
             # Layout alone does not establish membership in sibling shards.
@@ -546,7 +652,9 @@ def _rust_module_owners(
             else:
                 # A renamed module need not be declared beside its source.
                 # Layout is only a fast candidate, not an inverse module graph.
-                declared = _rust_module_routes(src, owner[1], declarations).get(path, [])
+                declared = _rust_module_routes(src, owner[1], declarations).get(
+                    path, []
+                )
                 if declared:
                     modules.extend((kind, value, module) for module in declared)
                     registered.add((kind, value))
@@ -570,13 +678,17 @@ def _rust_module(
                     text = sibling.read_text(encoding="utf-8", errors="replace")
                     # Use the regex only as a cheap prefilter. Ownership must
                     # come from declarations, never comments or string literals.
-                    modules = [
-                        (declared, name)
-                        for (kind, name), items in _rust_scope_items(text).items()
-                        if kind == "mod"
-                        for declared, body in items
-                        if declared is not None and body is None
-                    ] if _PATH_MODULE.search(text) else []
+                    modules = (
+                        [
+                            (declared, name)
+                            for (kind, name), items in _rust_scope_items(text).items()
+                            if kind == "mod"
+                            for declared, body in items
+                            if declared is not None and body is None
+                        ]
+                        if _PATH_MODULE.search(text)
+                        else []
+                    )
                 except (OSError, ValueError):
                     continue
                 siblings.append((sibling, modules))
@@ -587,7 +699,10 @@ def _rust_module(
             for declared, module in modules:
                 if declared == path.name:
                     parent = _rust_module(
-                        crate_root, sibling.resolve(), depth + 1, declarations=declarations
+                        crate_root,
+                        sibling.resolve(),
+                        depth + 1,
+                        declarations=declarations,
                     )
                     return f"{parent}::{module}" if parent else module
     parts = list(path.relative_to(crate_root.parent).with_suffix("").parts)
@@ -727,7 +842,9 @@ def _rust_module_source(
 
 
 def _rust_module_routes(
-    binary_root: Path, repo_root: Path, declarations: dict,
+    binary_root: Path,
+    repo_root: Path,
+    declarations: dict,
 ) -> dict[Path, list[str]]:
     """Fallback registration graph, cached only within one ownership query."""
     binary_root, repo_root = binary_root.resolve(), repo_root.resolve()
@@ -744,7 +861,9 @@ def _rust_module_routes(
                 # Most reachable files are leaves. This negative prefilter only
                 # skips impossible module declarations; positive hits still use
                 # the lexer so comments and literals never establish ownership.
-                declarations[key] = _rust_scope_items(text) if re.search(r"\bmod\b", text) else {}
+                declarations[key] = (
+                    _rust_scope_items(text) if re.search(r"\bmod\b", text) else {}
+                )
             except (OSError, UnicodeError, ValueError):
                 declarations[key] = {}
         return declarations[key]
@@ -765,24 +884,45 @@ def _rust_module_routes(
                     continue
                 visit(nested, module, directory, directory, ancestors, depth + 1)
                 continue
-            candidates = [attribute_dir / path] if path else [
-                module_dir / f"{name}.rs", module_dir / name / "mod.rs",
+            candidates = (
+                [attribute_dir / path]
+                if path
+                else [
+                    module_dir / f"{name}.rs",
+                    module_dir / name / "mod.rs",
+                ]
+            )
+            candidates = [
+                candidate.resolve() for candidate in candidates if candidate.is_file()
             ]
-            candidates = [candidate.resolve() for candidate in candidates if candidate.is_file()]
             if len(candidates) != 1:
                 continue
             source = candidates[0]
             if not source.is_relative_to(repo_root) or source in ancestors:
                 continue
             routes.setdefault(source, []).append(module)
-            directory = source.parent if source.name == "mod.rs" else source.with_suffix("")
-            visit(scope(source), module, directory, source.parent,
-                  ancestors | {source}, depth + 1)
+            directory = (
+                source.parent if source.name == "mod.rs" else source.with_suffix("")
+            )
+            visit(
+                scope(source),
+                module,
+                directory,
+                source.parent,
+                ancestors | {source},
+                depth + 1,
+            )
 
     if binary_root.is_file():
         routes[binary_root] = [""]
-        visit(scope(binary_root), "", binary_root.parent, binary_root.parent,
-              {binary_root}, 0)
+        visit(
+            scope(binary_root),
+            "",
+            binary_root.parent,
+            binary_root.parent,
+            {binary_root},
+            0,
+        )
     declarations[key] = routes
     return routes
 
@@ -840,7 +980,9 @@ def _stdout_text(result: subprocess.CompletedProcess[str]) -> str:
 
 
 def _failure_diagnostic_excerpt(
-    result: subprocess.CompletedProcess[str], stream: str, tail: str,
+    result: subprocess.CompletedProcess[str],
+    stream: str,
+    tail: str,
 ) -> str:
     """Display selected diagnostics, never replace retained bytes or test proof.
 
@@ -867,11 +1009,14 @@ def _failure_diagnostic_excerpt(
             return tail
         for raw in _output_lines(result, stream):
             line = re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip("\r\n")
-            diagnostic = bool(re.search(
-                r"^\s*(?:error(?:\[E\d+\])?:|(?:lld-link|rust-lld): error:|"
-                r"(?:=\s*)?note: (?:lld-link|rust-lld): error:)|"
-                r"\bpanicked at\b", line,
-            ))
+            diagnostic = bool(
+                re.search(
+                    r"^\s*(?:error(?:\[E\d+\])?:|(?:lld-link|rust-lld): error:|"
+                    r"(?:=\s*)?note: (?:lld-link|rust-lld): error:)|"
+                    r"\bpanicked at\b",
+                    line,
+                )
+            )
             # Rustc puts causal types, bounds and secondary await/borrow spans
             # beyond the primary caret. Keep its rendered diagnostic block,
             # not just four lines; unrelated warning notes are not evidence
@@ -889,18 +1034,26 @@ def _failure_diagnostic_excerpt(
                 and line.startswith(" " * compiler_prose_indent)
             )
             continuation = compiler_context and (
-                prose_continuation or not line.strip() or bool(re.match(
-                    r"\s*(?:\d+\s*\||\||-->|:::|(?:=\s*)?(?:note|help):)", line,
-                ))
+                prose_continuation
+                or not line.strip()
+                or bool(
+                    re.match(
+                        r"\s*(?:\d+\s*\||\||-->|:::|(?:=\s*)?(?:note|help):)",
+                        line,
+                    )
+                )
             )
             compiler_context = compiler_start or continuation
             if compiler_context and child_header:
                 compiler_prose_indent = child_header.end()
             elif not prose_continuation or not compiler_context:
                 compiler_prose_indent = None
-            status = bool(re.match(
-                r"\s*(?:FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL|ABORT)\s+\[", line,
-            ))
+            status = bool(
+                re.match(
+                    r"\s*(?:FAIL|LEAK-FAIL|TIMEOUT|EXECFAIL|ABORT)\s+\[",
+                    line,
+                )
+            )
             if not (diagnostic or status or context or continuation):
                 continue
             if diagnostic:
@@ -921,7 +1074,12 @@ def _failure_diagnostic_excerpt(
         return tail
     if not selected:
         return tail
-    return heading + "".join(selected) + separator + (tail[-tail_size:] if tail_size else "")
+    return (
+        heading
+        + "".join(selected)
+        + separator
+        + (tail[-tail_size:] if tail_size else "")
+    )
 
 
 def _nextest_json_lines(chunks: Iterable[str]) -> Iterable[str]:
@@ -988,7 +1146,9 @@ def _nextest_json_lines(chunks: Iterable[str]) -> Iterable[str]:
         yield "".join(parts)
 
 
-def _nextest_events(result: subprocess.CompletedProcess[str]) -> Iterable[dict[str, Any]]:
+def _nextest_events(
+    result: subprocess.CompletedProcess[str],
+) -> Iterable[dict[str, Any]]:
     """Read the nextest machine channel, never captured test text or stderr.
 
     Human immediate output has no unambiguous end-of-payload delimiter. Its
@@ -999,11 +1159,16 @@ def _nextest_events(result: subprocess.CompletedProcess[str]) -> Iterable[dict[s
     with ExitStack() as stack:
         path = getattr(result, "stdout_path", None)
         if path is not None:
-            output = stack.enter_context(path.open(encoding="utf-8", errors="replace", newline="\n"))
+            output = stack.enter_context(
+                path.open(encoding="utf-8", errors="replace", newline="\n")
+            )
             chunks = iter(lambda: output.read(65_536), "")
         else:
             output = result.stdout or ""
-            chunks = (output[start:start + 65_536] for start in range(0, len(output), 65_536))
+            chunks = (
+                output[start : start + 65_536]
+                for start in range(0, len(output), 65_536)
+            )
         for line in _nextest_json_lines(chunks):
             try:
                 event = json.loads(line)
@@ -1013,23 +1178,54 @@ def _nextest_events(result: subprocess.CompletedProcess[str]) -> Iterable[dict[s
                 yield event
 
 
+@dataclass(frozen=True)
+class NextestResults:
+    outcomes: tuple[tuple[str, str, str], ...]
+    verified_outcomes: tuple[tuple[str, str, str], ...]
+    complete: bool
+    invalid_tests: frozenset[tuple[str, str]]
+    invalid_owners: frozenset[str]
+    selected_count: int | None = None
+
+    def __iter__(self):
+        return iter(self.outcomes)
+
+
 def _nextest_results(
     result: subprocess.CompletedProcess[str],
     *,
-    completeness: list[bool] | None = None,
-) -> Iterable[tuple[str, str, str]]:
+    expected: Mapping[str, set[str]] | None = None,
+    ignored_catalog: Mapping[str, set[str]] | None = None,
+) -> NextestResults:
     binaries: dict[str, str | None] = {}
     completions: list[tuple[str, str, str]] = []
+    verified: set[tuple[str, str]] = set()
     suites: dict[str, dict[str, Any]] = {}
+    invalid_tests: set[tuple[str, str]] = set()
+    invalid_owners: set[str] = set()
     framed = True
+    suite_starts = []
+    suite_ignored = []
     for event in _nextest_events(result):
+        if event.get("type") == "suite":
+            if event.get("event") == "started":
+                suite_starts.append(event.get("test_count"))
+            elif event.get("event") in ("ok", "failed"):
+                suite_ignored.append(event.get("ignored"))
         if event.get("type") == "suite" and event.get("event") == "started":
             metadata = event.get("nextest")
             if not isinstance(metadata, dict):
                 framed = False
                 continue
-            package, binary, kind = (metadata.get(key) for key in ("crate", "test_binary", "kind"))
-            if not isinstance(package, str) or not package or not isinstance(binary, str) or not binary:
+            package, binary, kind = (
+                metadata.get(key) for key in ("crate", "test_binary", "kind")
+            )
+            if (
+                not isinstance(package, str)
+                or not package
+                or not isinstance(binary, str)
+                or not binary
+            ):
                 framed = False
                 continue
             if kind in ("lib", "proc-macro"):
@@ -1042,28 +1238,45 @@ def _nextest_results(
                 framed = False
                 continue
             owner = f"{package}::{binary}"
+            catalog = None if ignored_catalog is None else ignored_catalog.get(identity)
+            requested = None if expected is None else expected.get(identity)
             if owner in suites:
                 suite = suites[owner]
                 # libtest-json-plus can close/reopen a binary around an ignored
                 # case before all declared tests have been reported. Its
                 # count/identity stay global; passed/failed are per fragment,
                 # while ignored is repeated. Never reset execution identities.
-                if (suite["terminal"] is None or metadata != suite["metadata"]
-                        or type(event.get("test_count")) is not int
-                        or event.get("test_count") != suite["count"]
-                        or type(suite["count"]) is not int
-                        or len(suite["names"]) >= suite["count"]
-                        or not suite["ignored_count"]):
+                if (
+                    suite["terminal"] is None
+                    or metadata != suite["metadata"]
+                    or type(event.get("test_count")) is not int
+                    or event.get("test_count") != suite["count"]
+                    or type(suite["count"]) is not int
+                    or len(suite["names"]) >= suite["count"]
+                    or not suite["ignored_count"]
+                ):
                     framed = False
+                    invalid_owners.add(owner)
                 suite["terminal"] = None
                 suite["fragment"] = {"ok": 0, "failed": 0}
                 suite["fragment_started"] = set()
+                suite["fragment_completed"] = set()
             else:
-                suites[owner] = {"count": event.get("test_count"), "terminal": None,
-                                 "observed": {"ok": 0, "failed": 0, "ignored": 0},
-                                 "fragment": {"ok": 0, "failed": 0},
-                                 "fragment_started": set(), "ignored_count": None,
-                                 "started": set(), "ignored": set(), "names": set(), "metadata": metadata}
+                suites[owner] = {
+                    "count": event.get("test_count"),
+                    "terminal": None,
+                    "observed": {"ok": 0, "failed": 0, "ignored": 0},
+                    "fragment": {"ok": 0, "failed": 0},
+                    "fragment_completed": set(),
+                    "fragment_started": set(),
+                    "ignored_count": None,
+                    "started": set(),
+                    "ignored": set(),
+                    "names": set(),
+                    "metadata": metadata,
+                    "catalog": catalog,
+                    "requested": requested,
+                }
             if owner not in binaries:
                 binaries[owner] = identity
             elif binaries[owner] != identity:
@@ -1077,36 +1290,78 @@ def _nextest_results(
                 continue
             owner = f"{metadata.get('crate')}::{metadata.get('test_binary')}"
             suite = suites.get(owner)
-            if (suite is None or suite["terminal"] is not None
-                    or metadata != suite["metadata"] or event.get("event") not in ("ok", "failed")):
+            if (
+                suite is None
+                or suite["terminal"] is not None
+                or metadata != suite["metadata"]
+                or event.get("event") not in ("ok", "failed")
+            ):
                 framed = False
+                invalid_owners.add(owner)
             else:
                 suite["terminal"] = event
-                counts = [event.get(key) for key in
-                          ("passed", "failed", "ignored", "measured", "filtered_out")]
+                counts = [
+                    event.get(key)
+                    for key in (
+                        "passed",
+                        "failed",
+                        "ignored",
+                        "measured",
+                        "filtered_out",
+                    )
+                ]
                 if any(type(count) is not int or count < 0 for count in counts):
                     framed = False
                     continue
                 passed, failed, ignored, measured, _filtered = counts
+                catalog = suite["catalog"]
+                requested = suite["requested"]
+                bound_ignored = catalog is not None and requested is not None
+                if bound_ignored and (
+                    ignored != len(catalog)
+                    or suite["count"] != len(catalog) + len(requested - catalog)
+                ):
+                    framed = False
+                    invalid_owners.add(owner)
                 if suite["ignored_count"] is None:
                     suite["ignored_count"] = ignored
                 elif ignored != suite["ignored_count"]:
                     framed = False
-                # Some native reporters emit one skipped fixture as a started
-                # name plus an empty terminal, without a per-test ignored event.
-                # Reconcile only that unambiguous skip-only shape. It cannot
+                # Native reporters can emit skipped names plus an empty terminal,
+                # without per-test ignored events. An independent exact selection
+                # also binds multiple unselected names in one skip-only fragment.
+                # Without that selection, retain the single-name bound. This cannot
                 # create an execution receipt, and the final aggregate must
                 # still account for every declared test and every ignored name.
                 pending = suite["fragment_started"] - suite["names"]
-                if (passed == failed == 0 and len(suite["fragment_started"]) == 1
-                        and len(pending) == 1 and ignored > suite["observed"]["ignored"]):
+                if (
+                    passed == failed == 0
+                    and pending
+                    and (len(suite["fragment_started"]) == 1 or requested is not None)
+                    and len(pending) <= ignored - suite["observed"]["ignored"]
+                    and (requested is None or pending.isdisjoint(requested))
+                    and (catalog is None or pending <= catalog)
+                ):
                     suite["ignored"].update(pending)
                     suite["names"].update(pending)
-                    suite["observed"]["ignored"] += 1
-                if (suite["fragment"] != {"ok": passed, "failed": failed}
-                        or ignored < suite["observed"]["ignored"] or measured != 0
-                        or (event["event"] == "ok") != (failed == 0)):
+                    suite["observed"]["ignored"] += len(pending)
+                if (
+                    suite["fragment"] != {"ok": passed, "failed": failed}
+                    or type(suite["count"]) is not int
+                    or suite["count"] < sum(suite["observed"].values())
+                    or ignored != suite["ignored_count"]
+                    or ignored < suite["observed"]["ignored"]
+                    or measured != 0
+                    or (event["event"] == "ok") != (failed == 0)
+                ):
                     framed = False
+                else:
+                    # A consistent terminal binds these completions even if
+                    # another fragment/binary is missing. Per-test invalidity
+                    # below still retracts duplicates and unstarted results.
+                    verified.update(
+                        (owner, test) for test in suite["fragment_completed"]
+                    )
         elif event.get("type") == "test" and event.get("event") == "started":
             name = event.get("name")
             if not isinstance(name, str):
@@ -1117,12 +1372,28 @@ def _nextest_results(
                 framed = False
                 continue
             suite = suites[owner]
-            if (suite["terminal"] is not None or test in suite["started"]
-                    or test in suite["names"]):
+            if (
+                suite["requested"] is not None
+                and test not in suite["requested"]
+                and suite["catalog"] is not None
+                and test not in suite["catalog"]
+            ):
                 framed = False
+                invalid_tests.add((owner, test))
+            if (
+                suite["terminal"] is not None
+                or test in suite["started"]
+                or test in suite["names"]
+            ):
+                framed = False
+                invalid_tests.add((owner, test))
             suite["started"].add(test)
             suite["fragment_started"].add(test)
-        elif event.get("type") == "test" and event.get("event") in ("ok", "failed", "ignored"):
+        elif event.get("type") == "test" and event.get("event") in (
+            "ok",
+            "failed",
+            "ignored",
+        ):
             name = event.get("name")
             if not isinstance(name, str):
                 framed = False
@@ -1130,9 +1401,24 @@ def _nextest_results(
             owner, separator, test = name.partition("$")
             if separator and test and owner in binaries:
                 suite = suites[owner]
-                if (suite["terminal"] is not None or test in suite["names"]
-                        or (event["event"] != "ignored" and test not in suite["started"])):
+                if (
+                    suite["requested"] is not None
+                    and test not in suite["requested"]
+                    and (
+                        event["event"] != "ignored"
+                        or suite["catalog"] is not None
+                        and test not in suite["catalog"]
+                    )
+                ):
                     framed = False
+                    invalid_tests.add((owner, test))
+                if (
+                    suite["terminal"] is not None
+                    or test in suite["names"]
+                    or (event["event"] != "ignored" and test not in suite["started"])
+                ):
+                    framed = False
+                    invalid_tests.add((owner, test))
                 suite["names"].add(test)
                 suite["observed"][event["event"]] += 1
                 if event["event"] == "ignored":
@@ -1141,7 +1427,10 @@ def _nextest_results(
                 # Keep duplicate completions: callers require exactly once.
                 if event["event"] != "ignored":
                     suite["fragment"][event["event"]] += 1
-                    completions.append(("PASS" if event["event"] == "ok" else "FAIL", owner, test))
+                    suite["fragment_completed"].add(test)
+                    completions.append(
+                        ("PASS" if event["event"] == "ok" else "FAIL", owner, test)
+                    )
             else:
                 framed = False
         elif event.get("type") == "test" and event.get("event") != "started":
@@ -1151,36 +1440,75 @@ def _nextest_results(
         if terminal is None or binaries.get(owner) is None:
             framed = False
             continue
-        if (type(suite["count"]) is not int or suite["count"] < 0
-                or suite["count"] != sum(suite["observed"].values())
-                or suite["ignored_count"] != suite["observed"]["ignored"]
-                or suite["started"] | suite["ignored"] != suite["names"]):
+        catalog, requested = suite["catalog"], suite["requested"]
+        if catalog is not None and requested is not None:
+            # --run-ignored reports the full ignored catalog in every fragment,
+            # including ignored cases that actually execute. Bind that repeated
+            # count to independent discovery, and every execution to its requested ID.
+            counts_match = (
+                suite["count"] == len(catalog) + len(requested - catalog)
+                and suite["ignored_count"] == len(catalog)
+                and suite["ignored"] <= catalog - requested
+                and suite["names"] - suite["ignored"] == requested
+            )
+        elif requested is not None and suite["ignored_count"]:
+            # Default execution excludes ignored cases. Exact requested IDs
+            # independently bind the executable count even when nextest omits
+            # names for unselected ignored cases from its repeated summaries.
+            counts_match = (
+                suite["count"] == len(requested) + suite["ignored_count"]
+                and suite["observed"]["ignored"] <= suite["ignored_count"]
+                and suite["names"] - suite["ignored"] == requested
+            )
+        else:
+            counts_match = (
+                suite["count"] == sum(suite["observed"].values())
+                and suite["ignored_count"] == suite["observed"]["ignored"]
+            )
+        if (
+            type(suite["count"]) is not int
+            or suite["count"] < 0
+            or not counts_match
+            or suite["started"] | suite["ignored"] != suite["names"]
+        ):
             framed = False
-    if completeness is not None:
-        completeness.append(framed and bool(suites))
-    for status, owner, test in completions:
-        if (identity := binaries.get(owner)) is not None:
-            yield status, identity, test
+    # Iteration yields each completion with a known binary identity, including
+    # duplicates and unframed results: callers enforce exactly-once results and
+    # `complete`. Only verified outcomes (valid, terminal-bound) become receipts.
+    outcomes = tuple(
+        (status, identity, test)
+        for status, owner, test in completions
+        if (identity := binaries.get(owner)) is not None
+    )
+    verified_outcomes = tuple(
+        (status, identity, test)
+        for status, owner, test in completions
+        if owner not in invalid_owners
+        and (owner, test) not in invalid_tests
+        and (owner, test) in verified
+        and (identity := binaries.get(owner)) is not None
+    )
+    # Ignored counts cannot establish a filtered selection without discovery.
+    selected_count = None
+    if (
+        suite_starts
+        and len(suite_starts) == len(suite_ignored)
+        and all(type(count) is int and count >= 0 for count in suite_starts)
+        and all(type(count) is int and count == 0 for count in suite_ignored)
+    ):
+        selected_count = sum(suite_starts)
+    return NextestResults(
+        outcomes,
+        verified_outcomes,
+        framed and bool(suites),
+        frozenset(invalid_tests),
+        frozenset(invalid_owners),
+        selected_count,
+    )
 
 
 def _nextest_selected_count(result: subprocess.CompletedProcess[str]) -> int | None:
-    starts = []
-    ignored = []
-    for event in _nextest_events(result):
-        if event.get("type") != "suite":
-            continue
-        if event.get("event") == "started":
-            starts.append(event.get("test_count"))
-        elif event.get("event") in ("ok", "failed"):
-            ignored.append(event.get("ignored"))
-    # libtest-json counts ignored cases before nextest's name filter. Without
-    # discovery we cannot distinguish unmatched ignored cases from selected
-    # ones under --run-ignored all/only; do not invent a not-run count.
-    if (not starts or len(starts) != len(ignored)
-            or any(type(count) is not int or count < 0 for count in starts)
-            or any(type(count) is not int or count != 0 for count in ignored)):
-        return None
-    return sum(starts)
+    return _nextest_results(result).selected_count
 
 
 def _stop_process_tree(process: subprocess.Popen) -> None:
@@ -1204,27 +1532,37 @@ def _stop_process_tree(process: subprocess.Popen) -> None:
 
 
 def _stream_retained_log(
-    path: Path, destination: Any, stopped: threading.Event
+    path: Path,
+    destination: Any,
+    stopped: threading.Event,
+    abandoned: threading.Event,
 ) -> None:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    with path.open("rb") as output:
-        while True:
+    position = 0
+    while not abandoned.is_set():
+        # Do not pin a log handle across an uninterruptible presentation write.
+        with path.open("rb") as output:
+            output.seek(position)
             chunk = output.read(8192)
-            if chunk:
-                text = decoder.decode(chunk)
-            elif stopped.is_set():
-                text = decoder.decode(b"", final=True)
-            else:
-                stopped.wait(0.05)
-                continue
-            try:
-                destination.write(text)
-                destination.flush()
-            except (OSError, ValueError):
-                # A closed terminal must not prevent durable result retention.
+        position += len(chunk)
+        if chunk:
+            text = decoder.decode(chunk)
+        elif stopped.is_set():
+            text = decoder.decode(b"", final=True)
+        else:
+            stopped.wait(0.05)
+            continue
+        try:
+            if abandoned.is_set():
                 return
-            if not chunk:
+            destination.write(text)
+            if abandoned.is_set():
                 return
+            destination.flush()
+        except (OSError, ValueError):
+            return
+        if not chunk:
+            return
 
 
 def _default_executor(
@@ -1245,6 +1583,29 @@ def _default_executor(
         raise RunnerError(
             "command timeout must be a finite positive number of seconds"
         ) from exc
+    # Start a shared cache outside the per-command owner. Otherwise a cold Cargo
+    # phase can auto-start its daemon inside the Job that phase cleanup kills.
+    # Metadata/planning and nextest's prebuilt-binary execution do not compile.
+    cargo = Path(args[0]).stem.lower() == "cargo" if args else False
+    compiles = cargo and (
+        len(args) > 1
+        and args[1] in {"build", "check", "clippy", "test"}
+        or len(args) > 2
+        and args[1] == "nextest"
+        and args[2] in {"list", "run"}
+        and not any(
+            arg == "--binaries-metadata" or arg.startswith("--binaries-metadata=")
+            for arg in args
+        )
+    )
+    if compiles:
+        try:
+            prepare_shared_sccache(env=env, cwd=cwd)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RunnerError(
+                f"shared compiler cache preparation failed: {error}",
+                outcome="could_not_start",
+            ) from error
     paths: dict[str, Path] = {}
     cleanup_started = None
 
@@ -1257,6 +1618,7 @@ def _default_executor(
         streams = {}
         followers = []
         stopped = threading.Event()
+        abandoned = threading.Event()
         for name, enabled in (
             ("stdout", capture != CAPTURE_NONE),
             ("stderr", capture == CAPTURE_BOTH),
@@ -1276,7 +1638,7 @@ def _default_executor(
             if not enabled:
                 follower = threading.Thread(
                     target=_stream_retained_log,
-                    args=(paths[name], getattr(sys, name), stopped),
+                    args=(paths[name], getattr(sys, name), stopped, abandoned),
                     daemon=True,
                 )
                 follower.start()
@@ -1284,8 +1646,13 @@ def _default_executor(
 
         def finish_streams() -> None:
             stopped.set()
+            deadline = time.monotonic() + 0.25
             for follower in followers:
-                follower.join()
+                follower.join(timeout=max(0, deadline - time.monotonic()))
+            incomplete = any(follower.is_alive() for follower in followers)
+            abandoned.set()
+            if timings is not None:
+                timings["live_display_incomplete"] = incomplete
 
         # The process owner exits first, so final output is drained before logs close.
         stack.callback(finish_streams)
@@ -1308,14 +1675,25 @@ def _default_executor(
                 if timings is not None:
                     timings["launch_argv"] = launch_args
                     timings["child_environment_observations"] = str(diagnostic_path)
-                print(f"Cargo child OS observations: {diagnostic_path}", file=sys.stderr)
+                print(
+                    f"Cargo child OS observations: {diagnostic_path}", file=sys.stderr
+                )
                 try:
                     returncode = wait_with_diagnostics(
-                        process, timeout=timeout, log_path=diagnostic_path,
+                        process,
+                        timeout=timeout,
+                        log_path=diagnostic_path,
                     )
                 except (OSError, RuntimeError) as error:
-                    print(f"Cargo child environment capture UNVERIFIED: {error}", file=sys.stderr)
-                    remaining = None if timeout is None else max(0, timeout - (time.monotonic() - wait_started))
+                    print(
+                        f"Cargo child environment capture UNVERIFIED: {error}",
+                        file=sys.stderr,
+                    )
+                    remaining = (
+                        None
+                        if timeout is None
+                        else max(0, timeout - (time.monotonic() - wait_started))
+                    )
                     returncode = process.wait(timeout=remaining)
             else:
                 returncode = process.wait(timeout=timeout)
@@ -1366,6 +1744,12 @@ def _default_executor(
     )
     for name, path in paths.items():
         setattr(result, f"{name}_path", path)
+    # Only this executor may transfer deletion rights for the streams it created.
+    # Injected executor paths and caller-selected retained log directories are not
+    # disposable metadata-probe files.
+    result.owned_probe_paths = (
+        tuple(paths.values()) if "CODEX_RUST_TEST_LOG_DIR" not in env else ()
+    )
     return result
 
 
@@ -1426,7 +1810,7 @@ def _required_exact_test_ids(args: Sequence[str]) -> list[str] | None:
     head, tail = (list(args), [])
     if "--" in head:
         separator = head.index("--")
-        head, tail = head[:separator], head[separator + 1:]
+        head, tail = head[:separator], head[separator + 1 :]
     selected = _exact_test_ids(head)
     if selected is None:
         return None
@@ -1443,14 +1827,26 @@ def _required_exact_test_ids(args: Sequence[str]) -> list[str] | None:
         elif not token.startswith("-"):
             names.append(token)
         index += 1
-    matches = (lambda name, pattern: name == pattern) if "--exact" in tail else (lambda name, pattern: pattern in name)
-    return sorted({name for name in selected
-                   if (not names or any(matches(name, pattern) for pattern in names))
-                   and not any(matches(name, pattern) for pattern in skips)})
+    matches = (
+        (lambda name, pattern: name == pattern)
+        if "--exact" in tail
+        else (lambda name, pattern: pattern in name)
+    )
+    return sorted(
+        {
+            name
+            for name in selected
+            if (not names or any(matches(name, pattern) for pattern in names))
+            and not any(matches(name, pattern) for pattern in skips)
+        }
+    )
 
 
 def _validate_cargo_profile(cargo_profile: str | None) -> None:
-    if cargo_profile is not None and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None:
+    if (
+        cargo_profile is not None
+        and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None
+    ):
         raise RunnerError("Cargo profile must be a profile name, not a filesystem path")
 
 
@@ -1513,6 +1909,7 @@ class RustTestRunner:
         self.base_env.setdefault("RUST_MIN_STACK", RUST_MIN_STACK_BYTES)
         self._sccache_disabled = False
         self.metrics: ValidationMetrics | None = None
+        self.execution_artifacts: dict[str, dict[str, Any]] = {}
         # CARGO_INCREMENTAL stays untouched on purpose. The shared launcher policy
         # points RUSTC_WRAPPER at sccache, and sccache aborts
         # the whole build when that variable asks for incremental compilation
@@ -1657,7 +2054,9 @@ class RustTestRunner:
             }
         raise RunnerError(f"unknown named Rust test target or gate {name!r}")
 
-    def gates_for(self, paths: Sequence[str], *, cwd: Path | None = None) -> dict[str, Any]:
+    def gates_for(
+        self, paths: Sequence[str], *, cwd: Path | None = None
+    ) -> dict[str, Any]:
         """Gates whose declared test IDs live in the module owning each file.
 
         Ownership comes from Cargo target roots, module file layout, and sibling
@@ -1666,6 +2065,7 @@ class RustTestRunner:
         rather than listed with nextest.
         """
         selected: dict[str, list[str]] = {}
+        required_contracts = self.manifest.required_contracts(paths, cwd=cwd)
         target_paths: dict[str, list[str]] = {}
         unmapped: list[str] = []
         not_evaluated: set[str] = set()
@@ -1683,7 +2083,8 @@ class RustTestRunner:
                 continue
             package, modules, registered = owners
             target_paths[raw] = sorted(
-                target.name for target in self.manifest.targets.values()
+                target.name
+                for target in self.manifest.targets.values()
                 if target.package == package
                 and (target.selector_kind, target.selector_value) in registered
             )
@@ -1694,22 +2095,38 @@ class RustTestRunner:
                     if target.package != package:
                         continue
                     for kind, value, module in modules:
-                        if (target.selector_kind, target.selector_value) != (kind, value):
+                        if (target.selector_kind, target.selector_value) != (
+                            kind,
+                            value,
+                        ):
                             continue
                         if not step.tests:
                             not_evaluated.add(gate.name)
                         elif any(
-                            not module or test == module or test.startswith(f"{module}::")
+                            not module
+                            or test == module
+                            or test.startswith(f"{module}::")
                             for test in step.tests
                         ):
                             gates.append(gate.name)
             selected[raw] = list(dict.fromkeys(gates))
         return {
-            "gates": sorted({gate for gates in selected.values() for gate in gates}),
+            "gates": sorted(
+                {gate for gates in selected.values() for gate in gates}
+                | set(required_contracts["required_gates"])
+            ),
+            "advisory_gates": sorted(
+                {gate for gates in selected.values() for gate in gates}
+            ),
+            **required_contracts,
             "paths": selected,
-            "targets": sorted({name for names in target_paths.values() for name in names}),
+            "targets": sorted(
+                {name for names in target_paths.values() for name in names}
+            ),
             "target_paths": target_paths,
-            "unresolved_targets": [raw for raw, names in target_paths.items() if not names],
+            "unresolved_targets": [
+                raw for raw, names in target_paths.items() if not names
+            ],
             "ambiguous_targets": {
                 raw: names for raw, names in target_paths.items() if len(names) > 1
             },
@@ -1739,6 +2156,12 @@ class RustTestRunner:
         required_ids = _required_exact_test_ids(args)
         selected = required_ids
         discovered_build: dict[str, Any] = {}
+        ignored_catalog: dict[str, set[str]] = {}
+        runs_ignored = any(
+            arg in {"--run-ignored", "--ignored", "--include-ignored"}
+            or arg.startswith("--run-ignored=")
+            for arg in args
+        )
         print(
             f"Rust test target {name}: {subprocess.list2cmdline(target.selection_args())}; "
             f"target-dir={self.target_dir}; helper upper bound="
@@ -1751,6 +2174,21 @@ class RustTestRunner:
                 + json.dumps(self.environment_updates, sort_keys=True),
                 file=sys.stderr,
             )
+        listed = None
+        if runs_ignored:
+            # Native ignored-test summaries repeat unselected ignored counts.
+            # Discovery supplies the independent catalog needed to verify them.
+            # It binds the report to what nextest selects; a named exact ID it
+            # cannot select stays an unfulfilled obligation, never a dropped one.
+            listed = self._list_tests(
+                target,
+                args,
+                discovered_build=discovered_build,
+                ignored_inventory=ignored_catalog,
+            )
+            if selected is None:
+                selected = listed
+                required_ids = sorted(listed)
         # Narrowing is worthwhile only if some prefix can omit an active helper.
         # Otherwise the direct run already rejects an empty selection.
         if any(
@@ -1767,7 +2205,9 @@ class RustTestRunner:
                     file=sys.stderr,
                 )
                 try:
-                    selected = self._list_tests(target, args, discovered_build=discovered_build)
+                    selected = self._list_tests(
+                        target, args, discovered_build=discovered_build
+                    )
                     if required_ids is None:
                         required_ids = sorted(selected)
                 except RunnerError:
@@ -1789,7 +2229,9 @@ class RustTestRunner:
                 )
             helpers = self._active_helper_names(required)
         try:
-            env = self._helper_environment([target], helpers, self._build_helpers(helpers))
+            env = self._helper_environment(
+                [target], helpers, self._build_helpers(helpers)
+            )
         except RunnerError:
             # Helper build failed: the selected tests never started.
             self._report_failed_tests(name, [], [], selected, executed=False)
@@ -1799,10 +2241,14 @@ class RustTestRunner:
         # compile it again. Reuse that build, not test results or a previous run.
         binaries_metadata = (
             self._retain_text(json.dumps(discovered_build), prefix="discovered-build-")
-            if discovered_build else None
+            if discovered_build
+            else None
         )
         command = self._run_command(
-            target, args, no_fail_fast=no_fail_fast, report_results=True,
+            target,
+            args,
+            no_fail_fast=no_fail_fast,
+            report_results=True,
             binaries_metadata=binaries_metadata,
         )
         failure = None
@@ -1818,35 +2264,82 @@ class RustTestRunner:
             result = error.result
         binary_id = _nextest_binary_id(target)
         outcomes: dict[str, list[str]] = {}
-        completeness: list[bool] = []
-        for status, binary, test in _nextest_results(result, completeness=completeness):
+        reported_ids = sorted(listed) if listed is not None else required_ids
+        parsed = _nextest_results(
+            result,
+            expected={binary_id: set(reported_ids)}
+            if reported_ids is not None
+            else None,
+            ignored_catalog=ignored_catalog if runs_ignored else None,
+        )
+        unexpected_binary = False
+        for status, binary, test in parsed:
             if binary == binary_id:
                 outcomes.setdefault(test, []).append(status)
+            else:
+                unexpected_binary = True
         passed = sorted(
             test
             for test, statuses in outcomes.items()
             if statuses in (["PASS"], ["LEAK"])
         )
-        receipts = {binary_id: passed} if passed and result.returncode in {0, 100} else {}
+        if parsed.complete and required_ids is None:
+            # Complete structural accounting establishes the selected executed
+            # identities without a second discovery/compilation invocation.
+            required_ids = sorted(outcomes)
+        # Only independently framed, started, unique completions can repair a
+        # failed selection. An unrelated incomplete suite must not erase them.
+        required_set = set(required_ids) if required_ids is not None else None
+        verified_passed = sorted(
+            test
+            for status, binary, test in parsed.verified_outcomes
+            if binary == binary_id
+            and status == "PASS"
+            and (required_set is None or test in required_set)
+        )
+        receipts = (
+            {binary_id: verified_passed}
+            if (verified_passed and result.returncode in {0, 100})
+            else {}
+        )
         helper_ids = frozenset(helper.name for helper in helpers)
-        receipts = ExecutionReceipts(receipts,
+        receipts = ExecutionReceipts(
+            receipts,
             ((binary_id, helper_ids, test) for test in receipts.get(binary_id, [])),
-            ((binary_id, helper_ids, test) for test in required_ids) if required_ids is not None else None)
+            ((binary_id, helper_ids, test) for test in required_ids)
+            if required_ids is not None
+            else None,
+        )
         missing = sorted(set(required_ids or ()) - set(passed))
-        if failure is None and completeness != [True]:
+        if failure is None and not parsed.complete:
             failure = RunnerError(
                 f"target {name!r} has incomplete or inconsistent nextest reporter evidence",
-                outcome="evidence_incomplete", result=result)
-        elif failure is None and required_ids is not None and missing:
+                outcome="evidence_incomplete",
+                result=result,
+            )
+        elif failure is None and (
+            unexpected_binary
+            or (
+                required_ids is not None
+                and (missing or set(passed) != set(required_ids))
+            )
+        ):
             failure = RunnerError(
                 f"target {name!r} has unfulfilled exact test IDs: {missing}",
-                outcome="not_executed", result=result)
+                outcome="not_executed",
+                result=result,
+            )
         elif failure is None and (
-            not passed or any(statuses not in (["PASS"], ["LEAK"]) for statuses in outcomes.values())
+            not passed
+            or any(
+                statuses not in (["PASS"], ["LEAK"]) for statuses in outcomes.values()
+            )
         ):
             failure = RunnerError(
                 f"target {name!r} did not report completed tests passed exactly once",
-                outcome="not_executed", result=result)
+                outcome="not_executed",
+                result=result,
+            )
         # These are execution receipts, not a cache or proof after input changes.
         rendered = json.dumps({"completed_tests": receipts}, sort_keys=True)
         path = self._retain_text(rendered, prefix="completed-tests-")
@@ -1856,19 +2349,37 @@ class RustTestRunner:
         )
         if failure is not None:
             failure.completed_tests = receipts
-            failed = sorted(test for test, statuses in outcomes.items()
-                            if any(status not in {"PASS", "LEAK"} for status in statuses))
+            failed = sorted(
+                test
+                for test, statuses in outcomes.items()
+                if any(status not in {"PASS", "LEAK"} for status in statuses)
+            )
             self._report_failed_tests(
-                name, passed, failed, selected if completeness == [True] else None,
-                selected_count=_nextest_selected_count(result)
-                if completeness == [True] and selected is None else None)
+                name,
+                passed if parsed.complete else verified_passed,
+                failed
+                if parsed.complete
+                else sorted(
+                    test
+                    for status, binary, test in parsed.verified_outcomes
+                    if binary == binary_id and status == "FAIL"
+                ),
+                selected if parsed.complete else None,
+                selected_count=parsed.selected_count
+                if parsed.complete and selected is None
+                else None,
+            )
             raise failure
         return receipts
 
     def _report_failed_tests(
-        self, name: str, passed: Sequence[str], failed: Sequence[str],
+        self,
+        name: str,
+        passed: Sequence[str],
+        failed: Sequence[str],
         selected: Sequence[str] | None,
-        *, selected_count: int | None = None,
+        *,
+        selected_count: int | None = None,
         executed: bool | None = None,
     ) -> None:
         """Keep the failure inventory outside the bounded diagnostic excerpt.
@@ -1910,35 +2421,66 @@ class RustTestRunner:
                     file=sys.stderr,
                 )
             return
-        not_run = (len(set(selected) - set(passed) - set(failed)) if selected is not None
-                   else max(0, selected_count - len(set(passed) | set(failed)))
-                   if selected_count is not None else "unknown (selection count unavailable)")
-        print(f"Test results {name}: passed={len(passed)}, failed={len(failed)}, "
-              f"not-run={not_run}", file=sys.stderr)
+        not_run = (
+            len(set(selected) - set(passed) - set(failed))
+            if selected is not None
+            else max(0, selected_count - len(set(passed) | set(failed)))
+            if selected_count is not None
+            else "unknown (selection count unavailable)"
+        )
+        print(
+            f"Test results {name}: passed={len(passed)}, failed={len(failed)}, "
+            f"not-run={not_run}",
+            file=sys.stderr,
+        )
         print("Failed test IDs (complete):", file=sys.stderr)
         for test in sorted(set(failed)):
             print(f"{_nextest_binary_id(self.target(name))} {test}", file=sys.stderr)
         if not failed:
             print("(none reported; no failed-only rerun available)", file=sys.stderr)
             return
-        command = ["python", "scripts/build/rust_test_runner.py", "--manifest",
-                   str(self.manifest_path), "--target-dir", str(self.target_dir)]
+        command = [
+            "python",
+            "scripts/build/rust_test_runner.py",
+            "--manifest",
+            str(self.manifest_path),
+            "--target-dir",
+            str(self.target_dir),
+        ]
         if self.cargo_profile:
             command.extend(["--cargo-profile", self.cargo_profile])
         command.extend(["run-target", "--no-fail-fast"])
         if self.base_env.get("NEXTEST_PROFILE"):
             command.extend(["--profile", self.base_env["NEXTEST_PROFILE"]])
-        command.extend([name, "--run-ignored", "all", "--ignore-default-filter", "-E",
-                        " | ".join(f"test(={test})" for test in sorted(set(failed)))])
+        command.extend(
+            [
+                name,
+                "--run-ignored",
+                "all",
+                "--ignore-default-filter",
+                "-E",
+                " | ".join(f"test(={test})" for test in sorted(set(failed))),
+            ]
+        )
         # Quote every argument: even a single test expression contains shell
         # metacharacters. PowerShell and POSIX shells escape apostrophes differently.
-        quote = (lambda value: "'" + value.replace("'", "''") + "'") if os.name == "nt" else shlex.quote
-        print("Rerun failed only (from repository root):\n"
-              + ("& " if os.name == "nt" else "")
-              + " ".join(quote(arg) for arg in command), file=sys.stderr)
+        quote = (
+            (lambda value: "'" + value.replace("'", "''") + "'")
+            if os.name == "nt"
+            else shlex.quote
+        )
+        print(
+            "Rerun failed only (from repository root):\n"
+            + ("& " if os.name == "nt" else "")
+            + " ".join(quote(arg) for arg in command),
+            file=sys.stderr,
+        )
 
     def check_gates(
-        self, names: Sequence[str], *, include_generated: bool = True,
+        self,
+        names: Sequence[str],
+        *,
+        include_generated: bool = True,
         discovered_builds: dict[str, dict[str, Any]] | None = None,
     ) -> dict[GateStep, tuple[str, ...]]:
         """Verify declared filter/ID parity without running tests or helpers."""
@@ -1967,7 +2509,8 @@ class RustTestRunner:
             if key not in listings:
                 build: dict[str, Any] = {}
                 listed = self._list_tests(
-                    target, filter_args,
+                    target,
+                    filter_args,
                     discovered_build=build if discovered_builds is not None else None,
                 )
                 listings[key] = listed, build
@@ -2018,14 +2561,20 @@ class RustTestRunner:
         discovered_builds: dict[str, dict[str, Any]] = {}
         try:
             resolved_tests = self.check_gates(
-                names, include_generated=discover, discovered_builds=discovered_builds,
+                names,
+                include_generated=discover,
+                discovered_builds=discovered_builds,
             )
         except RunnerError:
             # Gate resolution failed before any gate ran its tests.
             for name in dict.fromkeys(names):
                 for step in self.gate(name).steps:
                     self._report_failed_tests(
-                        step.target, [], [], step.tests or None, executed=False,
+                        step.target,
+                        [],
+                        [],
+                        step.tests or None,
+                        executed=False,
                     )
             raise
         grouped = self._group_gate_steps(names, resolved_tests=resolved_tests)
@@ -2035,6 +2584,7 @@ class RustTestRunner:
             for name in dict.fromkeys(names)
         }
         proved: set[tuple[str, frozenset[str], str]] = set()
+        framed_proof: set[tuple[str, frozenset[str], str]] = set()
 
         def completed_gates() -> dict[str, list[str]]:
             gates = {
@@ -2046,14 +2596,19 @@ class RustTestRunner:
                         frozenset(step.helpers or ()),
                         test,
                     )
-                    in proved
+                    in framed_proof
                     for step in steps
                     for test in step.tests
                 )
             }
             required = {
-                (_nextest_binary_id(self.target(step.target)), frozenset(step.helpers or ()), test)
-                for step in grouped for test in step.tests
+                (
+                    _nextest_binary_id(self.target(step.target)),
+                    frozenset(step.helpers or ()),
+                    test,
+                )
+                for step in grouped
+                for test in step.tests
             }
             return ExecutionReceipts(gates, proved, required, gates=gates)
 
@@ -2075,16 +2630,29 @@ class RustTestRunner:
             helpers = self._active_helper_names(batch[0].helpers or ())
             # A failed shared build proves no helper artifact, but must not
             # suppress independent helper-free tests or trigger a build retry.
-            if any(helper.name not in artifacts for helper in helpers):
+            missing_helpers = [
+                helper.name for helper in helpers if helper.name not in artifacts
+            ]
+            if missing_helpers:
+                print(
+                    "Gate batch remains unstarted: no verified artifacts for helpers "
+                    + ", ".join(missing_helpers),
+                    file=sys.stderr,
+                )
                 continue
             targets = [self.target(step.target) for step in batch]
             # As in run_target, reuse only this invocation's discovered binary,
             # never its test results. Keep multi-target Cargo feature unification
             # intact rather than merging independently compiled build metadata.
-            build = discovered_builds.get(_nextest_binary_id(targets[0])) if len(batch) == 1 else None
+            build = (
+                discovered_builds.get(_nextest_binary_id(targets[0]))
+                if len(batch) == 1
+                else None
+            )
             binaries_metadata = (
                 self._retain_text(json.dumps(build), prefix="discovered-build-")
-                if build else None
+                if build
+                else None
             )
             try:
                 env = self._helper_environment(targets, helpers, artifacts)
@@ -2130,7 +2698,8 @@ class RustTestRunner:
             passed: dict[tuple[str, str], int] = {}
             failed: set[tuple[str, str]] = set()
             unexpected = False
-            for status, binary, test in _nextest_results(result):
+            parsed = _nextest_results(result)
+            for status, binary, test in parsed:
                 if test in expected.get(binary, ()):
                     key = (binary, test)
                     if status in {"PASS", "LEAK"}:
@@ -2144,25 +2713,48 @@ class RustTestRunner:
             }
             for target, step in zip(targets, batch):
                 binary = _nextest_binary_id(target)
-                reports[step] = (step.target,
-                    sorted(test for owner, test in passed if owner == binary and (owner, test) not in failed),
-                    sorted(test for owner, test in failed if owner == binary), step.tests)
+                reports[step] = (
+                    step.target,
+                    sorted(
+                        test
+                        for status, owner, test in parsed.verified_outcomes
+                        if owner == binary
+                        and status == "PASS"
+                        and test in expected[binary]
+                    ),
+                    sorted(
+                        test
+                        for status, owner, test in parsed.verified_outcomes
+                        if owner == binary
+                        and status == "FAIL"
+                        and test in expected[binary]
+                    ),
+                    step.tests if parsed.complete else None,
+                )
             if result.returncode not in {0, 100}:
                 # Preserve observed diagnostics, but abnormal exits cannot
                 # establish per-test proof or missing-result proof failures.
                 continue
+            proved.update(
+                (binary, frozenset(batch[0].helpers or ()), test)
+                for status, binary, test in parsed.verified_outcomes
+                if status == "PASS" and test in expected.get(binary, ())
+            )
             if (
-                not unexpected
+                parsed.complete
+                and not unexpected
                 and all(count == 1 for count in passed.values())
                 and not failed.intersection(passed)
                 and (result.returncode == 0 or set(passed) < required)
             ):
-                proved.update(
+                facts = {
                     (binary, frozenset(batch[0].helpers or ()), test)
                     for binary, test in passed
-                )
+                }
+                framed_proof.update(facts)
             if (
-                unexpected
+                not parsed.complete
+                or unexpected
                 or failed
                 or set(passed) != required
                 or any(count != 1 for count in passed.values())
@@ -2173,13 +2765,19 @@ class RustTestRunner:
                 steps = ", ".join(repr(step.target) for step in batch)
                 failures.append(
                     RunnerError(
-                        f"gate {steps} did not report every required test passed exactly once: "
+                        f"gate {steps} has incomplete/inconsistent reporter evidence or did not report every required test passed exactly once: "
                         + self._gate_failure_summary(required, passed, unexpected)
                         # A test-failure exit already contributed the command,
                         # diagnostic excerpt and retained-log paths above. Add
                         # only the missing proof, not the same failure twice.
-                        + ("\n" + self._failure_detail(result) if result.returncode == 0 else ""),
-                        outcome="not_executed",
+                        + (
+                            "\n" + self._failure_detail(result)
+                            if result.returncode == 0
+                            else ""
+                        ),
+                        outcome="evidence_incomplete"
+                        if not parsed.complete
+                        else "not_executed",
                     )
                 )
             elif not quiet:
@@ -2188,7 +2786,8 @@ class RustTestRunner:
         if failures:
             for step, report in reports.items():
                 self._report_failed_tests(
-                    *report, executed=False if step in not_started else None,
+                    *report,
+                    executed=False if step in not_started else None,
                 )
             outcomes = {error.outcome for error in failures}
             raise RunnerError(
@@ -2254,7 +2853,9 @@ class RustTestRunner:
             colliding_bin = target.selector_kind == "bin" and any(
                 item.get("name") == target.selector_value
                 and any(kind in ("lib", "proc-macro") for kind in item.get("kind", []))
-                for item in self.metadata._targets(self.metadata.packages[target.package])
+                for item in self.metadata._targets(
+                    self.metadata.packages[target.package]
+                )
             )
             key = (
                 target.package,
@@ -2300,7 +2901,10 @@ class RustTestRunner:
         # test cancel another step's tests, least of all in a shared batch.
         return [
             *self._run_command(
-                target, filter_args, no_fail_fast=True, batch=batch,
+                target,
+                filter_args,
+                no_fail_fast=True,
+                batch=batch,
                 binaries_metadata=binaries_metadata,
             ),
             "--color",
@@ -2345,7 +2949,13 @@ class RustTestRunner:
         keep_going = self.no_fail_fast if no_fail_fast is None else no_fail_fast
         return [
             *(
-                ["cargo", "nextest", "run", "--binaries-metadata", str(binaries_metadata)]
+                [
+                    "cargo",
+                    "nextest",
+                    "run",
+                    "--binaries-metadata",
+                    str(binaries_metadata),
+                ]
                 if binaries_metadata is not None
                 else self._selection_command("run", target, *batch)
             ),
@@ -2412,8 +3022,12 @@ class RustTestRunner:
         return [] if command is None else [command]
 
     def _list_tests(
-        self, target: Target, filter_args: Sequence[str],
-        *, discovered_build: dict[str, Any] | None = None,
+        self,
+        target: Target,
+        filter_args: Sequence[str],
+        *,
+        discovered_build: dict[str, Any] | None = None,
+        ignored_inventory: dict[str, set[str]] | None = None,
     ) -> dict[str, bool]:
         args = _list_only_args(validate_filtering_args(filter_args))
         result = self._checked(
@@ -2422,12 +3036,26 @@ class RustTestRunner:
         output = _stdout_text(result)
         root: dict[str, Any] = {}
         tests = parse_nextest_list(
-            output, parsed_payload=root if discovered_build is not None else None
+            output,
+            parsed_payload=root
+            if discovered_build is not None or ignored_inventory is not None
+            else None,
         )
         if not tests:
             raise RunnerError(
                 f"named target {target.name!r} selected zero tests with args {args!r}",
                 outcome="zero_tests",
+            )
+        if ignored_inventory is not None:
+            ignored_inventory.update(
+                {
+                    binary: {
+                        name
+                        for name, case in suite["testcases"].items()
+                        if case.get("ignored", False)
+                    }
+                    for binary, suite in root["rust-suites"].items()
+                }
             )
         if discovered_build is not None:
             suites = root["rust-suites"]
@@ -2437,20 +3065,28 @@ class RustTestRunner:
             # directories), and project only the selected target's binary.
             # Older/incomplete metadata or a failed retention falls back to
             # Cargo, never to an unverified executable or a cached pass.
-            fields = ("binary-id", "binary-name", "package-id", "kind",
-                      "binary-path", "build-platform")
+            fields = (
+                "binary-id",
+                "binary-name",
+                "package-id",
+                "kind",
+                "binary-path",
+                "build-platform",
+            )
             if (
                 isinstance(root.get("rust-build-meta"), dict)
                 and set(suites) == {binary_id}
                 and all(isinstance(suites[binary_id].get(key), str) for key in fields)
                 and suites[binary_id]["binary-id"] == binary_id
             ):
-                discovered_build.update({
-                    "rust-build-meta": root["rust-build-meta"],
-                    "rust-binaries": {
-                        binary_id: {key: suites[binary_id][key] for key in fields}
-                    },
-                })
+                discovered_build.update(
+                    {
+                        "rust-build-meta": root["rust-build-meta"],
+                        "rust-binaries": {
+                            binary_id: {key: suites[binary_id][key] for key in fields}
+                        },
+                    }
+                )
         return tests
 
     def _build_helpers(self, helpers: Sequence[Helper]) -> dict[str, Path]:
@@ -2586,13 +3222,18 @@ class RustTestRunner:
                 executables[package_id, binary].append(Path(message["executable"]))
         artifacts = {}
         for helper in helpers:
-            matches = executables[self.metadata.package_id(helper.package), helper.binary]
+            matches = executables[
+                self.metadata.package_id(helper.package), helper.binary
+            ]
             if len(matches) != 1 or not matches[0].is_file():
                 raise RunnerError(
                     f"helper build did not produce exactly one executable artifact for "
                     f"{helper.package}/{helper.binary}"
                 )
             artifacts[helper.name] = matches[0].resolve()
+        from scripts.build.validation_observations import artifact_observations
+
+        self.execution_artifacts.update(artifact_observations(artifacts))
         return artifacts
 
     def _execute(
@@ -2616,8 +3257,15 @@ class RustTestRunner:
                         tempfile.TemporaryDirectory(prefix="kd4-agent-task-seed-")
                     )
                 return self.executor(
-                    list(args), cwd=self.cwd, env=child_env, capture=capture,
-                    **({"timings": timings} if self.executor is _default_executor else {}),
+                    list(args),
+                    cwd=self.cwd,
+                    env=child_env,
+                    capture=capture,
+                    **(
+                        {"timings": timings}
+                        if self.executor is _default_executor
+                        else {}
+                    ),
                 )
         except CleanupFailed as error:
             (self.target_dir / ".lane-cleanup-unconfirmed").write_text(str(error))
@@ -2631,6 +3279,9 @@ class RustTestRunner:
         capture: str,
     ) -> subprocess.CompletedProcess[str]:
         effective_env = dict(env)
+        from scripts.build.full_suite_dispatch import record_test_dispatch
+
+        record_test_dispatch(args, effective_env)
         if list(args[:3]) == ["cargo", "nextest", "run"]:
             # Per-invocation reporter opt-in; never changes Cargo configuration
             # or suppresses nextest's human diagnostics on stderr.
@@ -2654,7 +3305,8 @@ class RustTestRunner:
             )
             command_metrics = (
                 self.metrics.command(args, phase, attempt + 1)
-                if self.metrics is not None else None
+                if self.metrics is not None
+                else None
             )
             started = time.monotonic()
             result = None
@@ -2664,28 +3316,42 @@ class RustTestRunner:
             )
             try:
                 result = self._execute(
-                    args, env=effective_env, capture=capture, timings=command_metrics,
+                    args,
+                    env=effective_env,
+                    capture=capture,
+                    timings=command_metrics,
                 )
             except BaseException as error:
                 if command_metrics is not None:
                     command_metrics["outcome"] = (
-                        "cancelled" if isinstance(error, KeyboardInterrupt)
+                        "cancelled"
+                        if isinstance(error, KeyboardInterrupt)
                         else getattr(error, "outcome", "failed")
                     )
                 raise
             finally:
                 elapsed = time.monotonic() - started
-                with self.metrics.phase("reconciliation") if self.metrics else nullcontext():
+                with (
+                    self.metrics.phase("reconciliation")
+                    if self.metrics
+                    else nullcontext()
+                ):
                     reported = (
                         self._reported_durations(result) if result is not None else {}
                     )
                 if command_metrics is not None:
                     command_metrics["wall_seconds"] = elapsed
-                    command_metrics["reported_build_seconds"] = reported.get("cargo-reported")
-                    command_metrics["reported_test_seconds"] = reported.get("tests-reported")
+                    command_metrics["reported_build_seconds"] = reported.get(
+                        "cargo-reported"
+                    )
+                    command_metrics["reported_test_seconds"] = reported.get(
+                        "tests-reported"
+                    )
                     if result is not None:
                         command_metrics["exit_code"] = result.returncode
-                        command_metrics["outcome"] = "passed" if result.returncode == 0 else "failed"
+                        command_metrics["outcome"] = (
+                            "passed" if result.returncode == 0 else "failed"
+                        )
                     self.metrics.checkpoint()
                 print(
                     f"Rust phase {phase}: wall={elapsed:.3f}s; "
@@ -2997,7 +3663,9 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
                 raise RunnerError(
                     f"unsupported test filtering option {token!r}: put {token.split('=', 1)[0]} before --"
                 )
-            raise RunnerError(f"unsupported test filtering option {token!r}; {FILTERING_ARGS_HELP}")
+            raise RunnerError(
+                f"unsupported test filtering option {token!r}; {FILTERING_ARGS_HELP}"
+            )
         if token in {"-E", "--filterset", "--run-ignored"}:
             if index + 1 >= len(args) or not args[index + 1].strip():
                 raise RunnerError(f"{token} requires a value")
@@ -3026,9 +3694,14 @@ def validate_filtering_args(raw_args: Sequence[str]) -> list[str]:
         ):
             index += 1
             continue
-        raise RunnerError(f"unsupported test filtering option {token!r}; {FILTERING_ARGS_HELP}")
+        raise RunnerError(
+            f"unsupported test filtering option {token!r}; {FILTERING_ARGS_HELP}"
+        )
     if _required_exact_test_ids(args) == []:
-        raise RunnerError("exact test selection selects zero tests after name/skip filters", outcome="zero_tests")
+        raise RunnerError(
+            "exact test selection selects zero tests after name/skip filters",
+            outcome="zero_tests",
+        )
     return args
 
 
@@ -3161,9 +3834,12 @@ def run_crate_validation(mode: str, package: str, raw_args: Sequence[str]) -> in
         # Start a shared cache outside the outer owned job, not inside a nested
         # lane whose ancestor cleanup would otherwise kill that cache server.
         return run_owned(
-            command, cwd=CODEX_RS_ROOT, env=env,
+            command,
+            cwd=CODEX_RS_ROOT,
+            env=env,
             # CREATE_NO_WINDOW needs explicit handles to preserve diagnostics.
-            stdout=sys.stdout, stderr=sys.stderr,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
             prepare_sccache=command[1] == "test-fast",
         )
 
@@ -3173,10 +3849,7 @@ def run_crate_validation(mode: str, package: str, raw_args: Sequence[str]) -> in
     # Exceptions/cancellation still stop and reap descendants through the shared
     # process owner. Preserve deterministic recipe-order failure precedence.
     with OwnedThreadPoolExecutor(max_workers=len(commands)) as executor:
-        futures = [
-            executor.submit(run, command)
-            for command in commands
-        ]
+        futures = [executor.submit(run, command) for command in commands]
         codes = [future.result().returncode for future in futures]
     return next((code for code in codes if code), 0)
 
@@ -3223,7 +3896,19 @@ def load_metadata(
         raise RunnerError(
             f"cargo metadata returned invalid JSON: {exc}\n{log_paths}"
         ) from exc
-    return MetadataIndex.from_json(payload)
+    try:
+        metadata = MetadataIndex.from_json(payload)
+    except RunnerError as exc:
+        raise RunnerError(f"{exc}\n{log_paths}") from exc
+    for path in getattr(result, "owned_probe_paths", ()):
+        try:
+            path.unlink()
+        except OSError as error:
+            print(
+                f"warning: successful metadata probe cleanup pending: {path}: {error}",
+                file=sys.stderr,
+            )
+    return metadata
 
 
 def _resolve_target_dir(
@@ -3236,9 +3921,8 @@ def _resolve_target_dir(
         path = Path(value)
         return path if path.is_absolute() else Path.cwd() / path
     # Inherited Cargo environment paths keep Cargo's working-directory rules.
-    configured = (
-        os.environ.get("CODEX_CARGO_LANE_TARGET_DIR")
-        or os.environ.get("CARGO_TARGET_DIR")
+    configured = os.environ.get("CODEX_CARGO_LANE_TARGET_DIR") or os.environ.get(
+        "CARGO_TARGET_DIR"
     )
     if configured is None:
         return metadata.target_directory
@@ -3249,10 +3933,14 @@ def _resolve_target_dir(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
-    target_dir_help = "Cargo target directory; relative paths use the caller's working directory."
+    target_dir_help = (
+        "Cargo target directory; relative paths use the caller's working directory."
+    )
     parser.add_argument("--target-dir", help=target_dir_help)
     parser.add_argument(
-        "--admission-timeout-seconds", type=float, default=0.0,
+        "--admission-timeout-seconds",
+        type=float,
+        default=0.0,
         help="Opt into waiting for the exact target directory (default 0: report busy immediately). Place before the subcommand.",
     )
     parser.add_argument(
@@ -3269,7 +3957,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_options.add_argument(
         "--command-timeout-seconds",
         type=float,
-        help="Deadline for each child command, including process-tree cleanup; unlimited by default.",
+        help="Timeout for waiting on each child command; process-tree cleanup and output draining have separate bounds. The child wait is unlimited by default.",
     )
     run_options.add_argument(
         "--target-dir", default=argparse.SUPPRESS, help=target_dir_help
@@ -3292,6 +3980,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="List gates and declared named-target ownership for these Rust files; no tests run.",
     )
     gates_for.add_argument("paths", nargs="+")
+    required_for = subparsers.add_parser(
+        "required-for",
+        help="Resolve explicit consumer obligations without Cargo metadata, builds, or test execution.",
+    )
+    required_for.add_argument("paths", nargs="+")
     run_target = subparsers.add_parser("run-target", parents=[run_options])
     run_target.add_argument(
         "--all",
@@ -3303,6 +3996,13 @@ def build_parser() -> argparse.ArgumentParser:
         "filter_args", nargs=argparse.REMAINDER, help=FILTERING_ARGS_HELP
     )
     run_gate = subparsers.add_parser("run-gate", parents=[run_options])
+    run_gate.add_argument(
+        "--changed-path",
+        action="append",
+        default=[],
+        help="Include every declared required consumer gate triggered by this repository-relative "
+        "(or absolute) changed path; repeat for multiple paths.",
+    )
     run_gate.add_argument("names", nargs="+")
     guard = subparsers.add_parser(
         "_guard-generic", aliases=["guard-args"], help=argparse.SUPPRESS
@@ -3398,7 +4098,10 @@ def _split_runner_owned_options(
 
 def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) -> int:
     try:
-        if not math.isfinite(args.admission_timeout_seconds) or args.admission_timeout_seconds < 0:
+        if (
+            not math.isfinite(args.admission_timeout_seconds)
+            or args.admission_timeout_seconds < 0
+        ):
             raise RunnerError("admission timeout must be a finite nonnegative number")
         if args.command in {"_guard-generic", "guard-args"}:
             # This runs on every generic recipe invocation: never read the
@@ -3440,6 +4143,27 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
             validate_filtering_args(filter_args)
 
         manifest = Manifest.load(args.manifest)
+        # Changed paths are repository-relative by contract; `just` recipes run
+        # from codex-rs, where cwd-relative resolution silently matches nothing.
+        if args.command == "required-for":
+            print(
+                json.dumps(
+                    manifest.required_contracts(args.paths, cwd=REPO_ROOT), indent=2
+                )
+            )
+            return 0
+        if args.command == "run-gate" and getattr(args, "changed_path", None):
+            required = manifest.required_contracts(args.changed_path, cwd=REPO_ROOT)
+            if required["unresolved_contract_paths"]:
+                raise RunnerError(
+                    "changed paths outside the repository have unresolved consumer obligations"
+                )
+            args.names = list(dict.fromkeys([*args.names, *required["required_gates"]]))
+            print(
+                "Required consumer obligations: "
+                + json.dumps(required, sort_keys=True),
+                file=sys.stderr,
+            )
         # Resolve the complete selection before metadata, provenance, or waiting
         # for a lane. Admission still rechecks the manifest and runner inputs.
         if args.command == "run-target":
@@ -3449,10 +4173,15 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
         elif args.command in {"run-gate", "check-gates"}:
             for name in args.names:
                 manifest.gate(name)
-        elif args.command == "plan" and args.name not in manifest.targets and args.name not in manifest.gates:
+        elif (
+            args.command == "plan"
+            and args.name not in manifest.targets
+            and args.name not in manifest.gates
+        ):
             raise RunnerError(f"unknown named Rust test target or gate {args.name!r}")
         execution_fingerprint = None
         if args.command in {"run-target", "run-gate"}:
+            # Disk observation only: imports may already execute older bytes.
             inputs = Path(__file__).read_bytes() + Path(args.manifest).read_bytes()
             execution_fingerprint = hashlib.sha256(inputs).hexdigest()
         if args.command == "list-targets":
@@ -3499,22 +4228,38 @@ def _main(args: argparse.Namespace, metrics: ValidationMetrics | None = None) ->
     except RunnerError as exc:
         if metrics is not None:
             metrics.record["outcome"] = (
-                exc.outcome if metrics.record["commands"]
-                or exc.outcome in {"busy", "cancelled", "timed_out", "cleanup_failed"} else "blocked"
+                exc.outcome
+                if metrics.record["commands"]
+                or exc.outcome in {"busy", "cancelled", "timed_out", "cleanup_failed"}
+                else "blocked"
             )
-            partial = exc.completed_tests if isinstance(exc.completed_tests, ExecutionReceipts) else exc.completed_gates
+            partial = (
+                exc.completed_tests
+                if isinstance(exc.completed_tests, ExecutionReceipts)
+                else exc.completed_gates
+            )
             metrics.record["proof"]["completed_tests"] = (
-                partial.completed_tests() if isinstance(partial, ExecutionReceipts) else partial)
+                partial.completed_tests()
+                if isinstance(partial, ExecutionReceipts)
+                else partial
+            )
             if isinstance(partial, ExecutionReceipts):
-                metrics.record["proof"]["executions"] = partial.identities(partial.executed)
+                metrics.record["proof"]["executions"] = partial.identities(
+                    partial.executed
+                )
                 metrics.record["proof"]["required_executions"] = (
-                    partial.identities(partial.required) if partial.required is not None else None)
+                    partial.identities(partial.required)
+                    if partial.required is not None
+                    else None
+                )
                 metrics.record["proof"]["satisfied_gates"] = partial.gates
         print(f"rust_test_runner: {exc}", file=sys.stderr)
         if exc.admission_status is not None:
             if metrics is not None:
                 exc.admission_status["invocation"] = [
-                    sys.executable, str(Path(__file__).resolve()), *metrics.record["argv"]
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    *metrics.record["argv"],
                 ]
                 metrics.record["admission"] = exc.admission_status
             print(json.dumps(exc.admission_status, sort_keys=True), file=sys.stderr)
@@ -3527,20 +4272,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(actual_argv)
     metrics = (
         ValidationMetrics(actual_argv)
-        if args.command in {"run-target", "run-gate", "check-gates"} else None
+        if args.command in {"run-target", "run-gate", "check-gates"}
+        else None
     )
     outcome = "blocked"
     try:
         result = _main(args, metrics)
-        outcome = "passed" if result == 0 else (
-            metrics.record["outcome"] if metrics is not None else "failed"
+        outcome = (
+            "passed"
+            if result == 0
+            else (metrics.record["outcome"] if metrics is not None else "failed")
         )
         return result
     except KeyboardInterrupt:
         outcome = "cancelled"
         raise
     except Exception:
-        outcome = "failed" if metrics is not None and metrics.record["commands"] else "blocked"
+        outcome = (
+            "failed"
+            if metrics is not None and metrics.record["commands"]
+            else "blocked"
+        )
         raise
     finally:
         if metrics is not None:
@@ -3551,20 +4303,36 @@ def _selected_definitions(
     manifest: Manifest, command: str, names: Sequence[str]
 ) -> tuple[Any, ...]:
     """Manifest definitions an admitted launch executes: gates, targets, helpers."""
-    gates = () if command == "run-target" else tuple(manifest.gates.get(name) for name in names)
-    target_names = names if command == "run-target" else [
-        step.target for gate in gates if gate is not None for step in gate.steps
-    ]
+    gates = (
+        ()
+        if command == "run-target"
+        else tuple(manifest.gates.get(name) for name in names)
+    )
+    target_names = (
+        names
+        if command == "run-target"
+        else [step.target for gate in gates if gate is not None for step in gate.steps]
+    )
     targets = tuple(manifest.targets.get(name) for name in dict.fromkeys(target_names))
-    helpers = tuple(manifest.helpers.get(name) for name in dict.fromkeys(
-        helper for target in targets if target is not None for helper in target.all_helpers
-    ))
-    return manifest.version, gates, targets, helpers
+    helpers = tuple(
+        manifest.helpers.get(name)
+        for name in dict.fromkeys(
+            helper
+            for target in targets
+            if target is not None
+            for helper in target.all_helpers
+        )
+    )
+    return manifest.version, gates, targets, helpers, manifest.contracts
 
 
 def _dispatch_with_admission(
-    args: argparse.Namespace, runner: RustTestRunner, metadata: MetadataIndex,
-    execution_fingerprint: str | None, filter_args: Sequence[str], allow_all: bool,
+    args: argparse.Namespace,
+    runner: RustTestRunner,
+    metadata: MetadataIndex,
+    execution_fingerprint: str | None,
+    filter_args: Sequence[str],
+    allow_all: bool,
 ) -> int:
     # Keep imports off the generic guard and planning path. This uses the same
     # lease primitive as the existing lane owner, not a result-sharing service.
@@ -3573,48 +4341,127 @@ def _dispatch_with_admission(
         if args.command in {"run-target", "run-gate", "check-gates"}:
             try:
                 if __package__:
-                    from scripts.build.rust_build_status import RustAdmissionBusy, reserve_rust_test_target
+                    from scripts.build.rust_build_status import (
+                        RustAdmissionBusy,
+                        reserve_rust_test_target,
+                    )
                 else:
-                    from scripts.build.rust_build_status import RustAdmissionBusy, reserve_rust_test_target
+                    from scripts.build.rust_build_status import (
+                        RustAdmissionBusy,
+                        reserve_rust_test_target,
+                    )
 
-                with runner.metrics.phase("admission") if runner.metrics else nullcontext():
-                    admission = cleanup.enter_context(reserve_rust_test_target(
-                        runner.target_dir, timeout_seconds=args.admission_timeout_seconds,
-                        cargo_profile=runner.cargo_profile or "test",
-                    ))
+                with (
+                    runner.metrics.phase("admission")
+                    if runner.metrics
+                    else nullcontext()
+                ):
+                    admission = cleanup.enter_context(
+                        reserve_rust_test_target(
+                            runner.target_dir,
+                            timeout_seconds=args.admission_timeout_seconds,
+                            cargo_profile=runner.cargo_profile or "test",
+                            holder={
+                                "run_id": runner.metrics.record["run_id"],
+                                "ledger": str(runner.metrics.path.resolve()),
+                            }
+                            if runner.metrics is not None
+                            and runner.metrics.path is not None
+                            and runner.metrics._owner is not None
+                            else None,
+                        )
+                    )
             except KeyboardInterrupt as exc:
-                raise RunnerError("Rust admission cancelled before dispatch", outcome="cancelled") from exc
+                raise RunnerError(
+                    "Rust admission cancelled before dispatch", outcome="cancelled"
+                ) from exc
             except (RustAdmissionBusy, TimeoutError) as exc:
-                busy = exc if isinstance(exc, RustAdmissionBusy) else RustAdmissionBusy(
-                    str(exc), resource=runner.target_dir, wait_option="--admission-timeout-seconds",
+                busy = (
+                    exc
+                    if isinstance(exc, RustAdmissionBusy)
+                    else RustAdmissionBusy(
+                        str(exc),
+                        resource=runner.target_dir,
+                        wait_option="--admission-timeout-seconds",
+                    )
                 )
-                status = {**busy.report(), "selected_targets": (
-                    [args.name] if args.command == "run-target" else list(args.names)
-                )}
-                raise RunnerError(str(busy), outcome="busy", admission_status=status) from exc
+                status = {
+                    **busy.report(),
+                    "selected_targets": (
+                        [args.name]
+                        if args.command == "run-target"
+                        else list(args.names)
+                    ),
+                }
+                from scripts.build.full_suite_dispatch import record_dispatch
+
+                record_dispatch("not_started", runner.base_env)
+                raise RunnerError(
+                    str(busy), outcome="busy", admission_status=status
+                ) from exc
             except (OSError, RuntimeError, ValueError) as exc:
                 raise RunnerError(f"Rust admission failed: {exc}") from exc
-            print(f"Rust admission: wait={admission['wait_seconds']:.3f}s; target={runner.target_dir}", file=sys.stderr)
+            print(
+                f"Rust admission: wait={admission['wait_seconds']:.3f}s; target={runner.target_dir}",
+                file=sys.stderr,
+            )
             if runner.metrics is not None:
                 # Busy reports name this holder from its admitted ledger.
                 runner.metrics.checkpoint()
             # Definitions this launch selects must not silently become obsolete
             # while it waits; fail closed rather than auto-retrying changed work.
             # Unrelated manifest entries and runner edits cannot change it: this
-            # process executes the code and definitions it loaded, which the
-            # receipt's launch-time runner_input_fingerprint identifies.
+            # process executes the definitions it loaded. The receipt's
+            # runner_input_fingerprint observes disk inputs, not loaded code;
+            # executed implementation identity remains explicitly unknown.
             names = [args.name] if args.command == "run-target" else list(args.names)
-            if (_selected_definitions(Manifest.load(args.manifest), args.command, names)
-                    != _selected_definitions(runner.manifest, args.command, names)):
-                raise RunnerError("Rust test manifest changed this launch's selected definitions while waiting for admission; rerun with current inputs")
+            if _selected_definitions(
+                Manifest.load(args.manifest), args.command, names
+            ) != _selected_definitions(runner.manifest, args.command, names):
+                raise RunnerError(
+                    "Rust test manifest changed this launch's selected definitions while waiting for admission; rerun with current inputs"
+                )
+        observation_roots = []
         with runner.metrics.phase("provenance") if runner.metrics else nullcontext():
             dependencies = (
                 execution_dependency_manifest(metadata, Path(args.manifest))
                 if args.command in {"run-target", "run-gate"}
                 else None
             )
-            if runner.metrics is not None and dependencies is not None:
-                runner.metrics.dependencies(dependencies)
+            if dependencies is not None:
+                from scripts.build.validation_observations import source_observations
+
+                targets = (
+                    [args.name]
+                    if args.command == "run-target"
+                    else [
+                        step.target
+                        for name in args.names
+                        for step in runner.gate(name).steps
+                    ]
+                )
+                packages = {runner.target(name).package for name in targets}
+                packages.update(
+                    helper.package for helper in runner.active_helpers(targets)
+                )
+                observation_roots = [
+                    Path(package["manifest_path"]).parent
+                    for package in metadata.packages.values()
+                    if package.get("name") in packages
+                    and isinstance(package.get("manifest_path"), str)
+                ]
+                dependencies["execution_observation"] = {
+                    "version": 1,
+                    "scope": "selected_package_trees_not_dependency_closure",
+                    "launch_sources": source_observations(observation_roots),
+                    "terminal_sources": None,
+                    "source_comparison": "unknown",
+                    "compiler_read_correspondence": "unverified",
+                    "automatic_replay_allowed": False,
+                    "test_binary_identity": "unavailable_from_reporter",
+                }
+                if runner.metrics is not None:
+                    runner.metrics.dependencies(dependencies)
         if dependencies is not None:
             # Keep bulk provenance out of every model-visible validation result.
             # The full pre-execution observation remains hash-bound and locally
@@ -3623,7 +4470,9 @@ def _dispatch_with_admission(
             rendered = json.dumps(dependencies, sort_keys=True, ensure_ascii=False)
             encoded = rendered.encode("utf-8")
             if len(encoded) > 4096:
-                retained = runner._retain_text(rendered, prefix="execution-dependencies-")
+                retained = runner._retain_text(
+                    rendered, prefix="execution-dependencies-"
+                )
                 if retained is not None:
                     dependencies = {
                         **dependencies,
@@ -3660,17 +4509,29 @@ def _dispatch_with_admission(
             print(json.dumps(runner.gates_for(args.paths), indent=2))
         elif args.command == "run-target":
             try:
-                receipts = runner.run_target(args.name, filter_args, allow_all=allow_all)
+                receipts = runner.run_target(
+                    args.name, filter_args, allow_all=allow_all
+                )
             except RunnerError as error:
+                _finish_execution_observation(runner, dependencies, observation_roots)
                 if isinstance(error.completed_tests, ExecutionReceipts):
-                    emit_execution_receipt(execution_fingerprint, error.completed_tests,
-                        [args.name], skipped=None, exit_code=2,
+                    emit_execution_receipt(
+                        execution_fingerprint,
+                        error.completed_tests,
+                        [args.name],
+                        skipped=None,
+                        exit_code=2,
                         selected_packages=[runner.target(args.name).package],
                         dependency_manifest=dependencies,
-                        execution_configuration=execution_configuration)
+                        execution_configuration=execution_configuration,
+                    )
                 raise
+            _finish_execution_observation(runner, dependencies, observation_roots)
             emit_execution_receipt(
-                execution_fingerprint, receipts, [args.name], skipped=None,
+                execution_fingerprint,
+                receipts,
+                [args.name],
+                skipped=None,
                 execution_configuration=execution_configuration,
                 selected_packages=[runner.target(args.name).package],
                 dependency_manifest=dependencies,
@@ -3681,19 +4542,39 @@ def _dispatch_with_admission(
             try:
                 receipts = runner.run_gates(args.names)
             except RunnerError as error:
+                _finish_execution_observation(runner, dependencies, observation_roots)
                 if isinstance(error.completed_gates, ExecutionReceipts):
-                    emit_execution_receipt(execution_fingerprint, error.completed_gates,
-                        args.names, skipped=0, exit_code=2,
-                        selected_packages=sorted({runner.target(step.target).package
-                            for name in args.names for step in runner.gate(name).steps}),
+                    emit_execution_receipt(
+                        execution_fingerprint,
+                        error.completed_gates,
+                        args.names,
+                        skipped=0,
+                        exit_code=2,
+                        selected_packages=sorted(
+                            {
+                                runner.target(step.target).package
+                                for name in args.names
+                                for step in runner.gate(name).steps
+                            }
+                        ),
                         dependency_manifest=dependencies,
-                        execution_configuration=execution_configuration)
+                        execution_configuration=execution_configuration,
+                    )
                 raise
+            _finish_execution_observation(runner, dependencies, observation_roots)
             emit_execution_receipt(
-                execution_fingerprint, receipts, args.names, skipped=0,
+                execution_fingerprint,
+                receipts,
+                args.names,
+                skipped=0,
                 execution_configuration=execution_configuration,
-                selected_packages=sorted({runner.target(step.target).package
-                    for name in args.names for step in runner.gate(name).steps}),
+                selected_packages=sorted(
+                    {
+                        runner.target(step.target).package
+                        for name in args.names
+                        for step in runner.gate(name).steps
+                    }
+                ),
                 dependency_manifest=dependencies,
                 admission=admission,
                 metrics=runner.metrics,
@@ -3703,8 +4584,37 @@ def _dispatch_with_admission(
     return 0
 
 
+def _finish_execution_observation(runner, dependencies, roots):
+    if dependencies is None:
+        return
+    from scripts.build.validation_observations import (
+        artifact_observations,
+        comparison,
+        source_observations,
+    )
+
+    # A retained summary shares the launch record with the hash-bound
+    # pre-execution manifest; publish terminal state without mutating it.
+    observation = dependencies["execution_observation"] = dict(
+        dependencies["execution_observation"]
+    )
+    observation["terminal_sources"] = source_observations(roots)
+    observation["source_comparison"] = comparison(
+        observation["launch_sources"], observation["terminal_sources"]
+    )
+    observation["helper_artifacts_at_build"] = runner.execution_artifacts
+    observation["helper_artifacts_at_terminal"] = artifact_observations(
+        {name: record["path"] for name, record in runner.execution_artifacts.items()}
+    )
+    observation["helper_comparison"] = comparison(
+        observation["helper_artifacts_at_build"],
+        observation["helper_artifacts_at_terminal"],
+    )
+
+
 def execution_dependency_manifest(
-    metadata: MetadataIndex, manifest: Path,
+    metadata: MetadataIndex,
+    manifest: Path,
 ) -> dict[str, Any]:
     """Record known inputs without claiming arbitrary test effects are hermetic.
 
@@ -3714,7 +4624,8 @@ def execution_dependency_manifest(
     """
     roots = {str(REPO_ROOT.resolve())}
     inputs = {
-        Path(__file__).resolve(), manifest.resolve(),
+        Path(__file__).resolve(),
+        manifest.resolve(),
         (Path(__file__).resolve().parents[1] / "common" / "process_owner.py").resolve(),
         Path(__file__).with_name("rust_tool_env.py").resolve(),
         Path(__file__).with_name("cargo_child_diagnostics.py").resolve(),
@@ -3722,8 +4633,10 @@ def execution_dependency_manifest(
         Path(__file__).with_name("rust_build_status_support.py").resolve(),
         (Path(__file__).resolve().parents[1] / "common" / "tool_versions.py").resolve(),
         Path(__file__).with_name("validation_metrics.py").resolve(),
+        Path(__file__).with_name("validation_observations.py").resolve(),
         (Path(__file__).resolve().parents[1] / "common" / "atomic_json.py").resolve(),
-        CODEX_RS_ROOT / "Cargo.toml", CODEX_RS_ROOT / "Cargo.lock",
+        CODEX_RS_ROOT / "Cargo.toml",
+        CODEX_RS_ROOT / "Cargo.lock",
     }
     for package in metadata.packages.values():
         path = package.get("manifest_path")
@@ -3732,10 +4645,15 @@ def execution_dependency_manifest(
             inputs.add(path)
             roots.add(str(path.parent))
     for directory in (CODEX_RS_ROOT, *CODEX_RS_ROOT.parents):
-        inputs.update(directory / name for name in (
-            ".cargo/config", ".cargo/config.toml",
-            "rust-toolchain", "rust-toolchain.toml",
-        ))
+        inputs.update(
+            directory / name
+            for name in (
+                ".cargo/config",
+                ".cargo/config.toml",
+                "rust-toolchain",
+                "rust-toolchain.toml",
+            )
+        )
     records = []
     for path in sorted(inputs, key=str)[:256]:
         record: dict[str, Any] = {"path": str(path)}
@@ -3753,11 +4671,15 @@ def execution_dependency_manifest(
         except OSError:
             record["state"] = "unavailable"
         records.append(record)
-    context = json.dumps({
-        "environment": dict(os.environ),
-        "python": str(Path(sys.executable).resolve()),
-        "platform": sys.platform,
-    }, sort_keys=True, ensure_ascii=True).encode()
+    context = json.dumps(
+        {
+            "environment": dict(os.environ),
+            "python": str(Path(sys.executable).resolve()),
+            "platform": sys.platform,
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    ).encode()
     return {
         "version": 1,
         "producer": "rust_test_runner",
@@ -3769,7 +4691,8 @@ def execution_dependency_manifest(
         "execution_context_sha256": hashlib.sha256(context).hexdigest(),
         "coverage": "declared_not_exhaustive",
         "unresolved_dependencies": [
-            "transitive_and_generated_inputs", "resolved_toolchain",
+            "transitive_and_generated_inputs",
+            "resolved_toolchain",
             "test_owned_services_network_and_time",
         ],
         "automatic_replay_allowed": False,
@@ -3792,25 +4715,35 @@ def emit_execution_receipt(
     """Publish the runner's completed-test ledger, not a parsed success slogan.
 
     Source dependency freshness remains the invoking harness's obligation.
+    runner_input_fingerprint observes on-disk inputs, not executed code. Without
+    a frozen loader/import snapshot, executed implementation identity is unknown.
     A target run does not count ignored tests; report that count as unknown.
     """
     receipt = {
         "kind": "codex_test_execution_v1",
         "runner": "rust_test_runner",
         "runner_input_fingerprint": fingerprint,
+        "runner_input_fingerprint_scope": "observed_disk_inputs",
+        "executed_implementation_identity": None,
         "selected_targets": list(selected_targets),
         "selected_packages": sorted(set(selected_packages)),
         "workspace_root": str(CODEX_RS_ROOT),
-        "completed_tests": receipts.completed_tests() if isinstance(receipts, ExecutionReceipts) else receipts,
-        "executed_tests": len(receipts.executed) if isinstance(receipts, ExecutionReceipts)
-            else sum(len(set(tests)) for tests in receipts.values()),
+        "completed_tests": receipts.completed_tests()
+        if isinstance(receipts, ExecutionReceipts)
+        else receipts,
+        "executed_tests": len(receipts.executed)
+        if isinstance(receipts, ExecutionReceipts)
+        else sum(len(set(tests)) for tests in receipts.values()),
         "skipped_tests": skipped,
         "exit_code": exit_code,
     }
     if isinstance(receipts, ExecutionReceipts):
         receipt["executions"] = receipts.identities(receipts.executed)
         receipt["required_executions"] = (
-            receipts.identities(receipts.required) if receipts.required is not None else None)
+            receipts.identities(receipts.required)
+            if receipts.required is not None
+            else None
+        )
         receipt["satisfied_gates"] = receipts.gates
     if dependency_manifest is not None:
         receipt["dependency_manifest"] = dependency_manifest
@@ -3821,7 +4754,9 @@ def emit_execution_receipt(
     if metrics is not None:
         metrics.completed(receipt["completed_tests"], selected_targets)
         metrics.record["proof"]["executions"] = receipt.get("executions")
-        metrics.record["proof"]["required_executions"] = receipt.get("required_executions")
+        metrics.record["proof"]["required_executions"] = receipt.get(
+            "required_executions"
+        )
         metrics.record["proof"]["satisfied_gates"] = receipt.get("satisfied_gates")
         receipt["validation_run_id"] = metrics.record["run_id"]
     print(json.dumps(receipt, sort_keys=True))

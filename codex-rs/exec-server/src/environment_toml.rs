@@ -851,10 +851,16 @@ include_local = false
                 .env_remove(crate::environment::CODEX_EXEC_SERVER_URL_ENV_VAR)
                 .output()
                 .expect("isolated local fallback test");
-            assert!(output.status.success(), "isolated fallback failed: {}\n{}",
-                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
-                "isolated fallback must execute its assertions");
+            assert!(
+                output.status.success(),
+                "isolated fallback failed: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "isolated fallback must execute its assertions"
+            );
             return;
         }
         let codex_home = tempdir().expect("tempdir");

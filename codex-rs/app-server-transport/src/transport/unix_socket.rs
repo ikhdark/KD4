@@ -27,9 +27,28 @@ pub async fn start_control_socket_acceptor(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
 ) -> IoResult<JoinHandle<()>> {
+    // Endpoint admission is independent of CODEX_HOME. Lock ordering is home
+    // (caller), then endpoint; no path takes these in the opposite order.
+    let parent = socket_path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("socket has no parent"))?;
+    codex_uds::prepare_private_socket_directory(parent.clone()).await?;
+    let mut lock_name = socket_path
+        .as_path()
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("socket has no filename"))?
+        .to_os_string();
+    lock_name.push(".startup.lock");
+    let endpoint_lock_path =
+        AbsolutePathBuf::from_absolute_path(parent.canonicalize()?.join(lock_name))?;
+    let _endpoint_lock = acquire_app_server_startup_lock(endpoint_lock_path).await?;
     prepare_control_socket_path(socket_path.as_path()).await?;
     let listener = UnixListener::bind(socket_path.as_path()).await?;
-    let socket_guard = ControlSocketFileGuard { socket_path };
+    let endpoint = codex_uds::SocketFile::open(socket_path.as_path())?;
+    let socket_guard = ControlSocketFileGuard {
+        socket_path,
+        endpoint: Some(endpoint),
+    };
     set_control_socket_permissions(socket_guard.socket_path.as_path()).await?;
     info!(
         socket_path = %socket_guard.socket_path.display(),
@@ -86,6 +105,7 @@ async fn run_control_socket_acceptor(
     }
     connection_tasks.close();
     connection_tasks.wait().await;
+    drop(listener);
     info!("control socket acceptor shutting down");
 }
 
@@ -149,16 +169,21 @@ pub async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
         return Ok(());
     }
 
-    if !codex_uds::is_stale_socket_path(socket_path).await? {
-        return Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            format!(
-                "app-server control socket path exists and is not a socket: {}",
-                socket_path.display()
-            ),
-        ));
+    let endpoint = match codex_uds::SocketFile::open(socket_path) {
+        Ok(endpoint) => endpoint,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    // Recheck liveness while the inspected generation is protected. The first
+    // probe alone cannot authorize deletion: its pathname may have changed.
+    match UnixStream::connect(socket_path).await {
+        Ok(_) => Err(std::io::Error::new(
+            ErrorKind::AddrInUse,
+            "control socket became active during stale recovery",
+        )),
+        Err(err) if err.kind() == ErrorKind::ConnectionRefused => endpoint.remove(),
+        Err(err) => Err(err),
     }
-    tokio::fs::remove_file(socket_path).await
 }
 
 pub struct AppServerStartupLock {
@@ -181,10 +206,17 @@ pub async fn acquire_app_server_startup_lock(
     })
     .await
     .map_err(|err| std::io::Error::other(format!("startup lock task failed: {err}")))??;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(AppServerStartupLock { _file: file }),
             Err(std::fs::TryLockError::WouldBlock) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "app-server startup lock contention exceeded 10 seconds",
+                    ));
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(std::fs::TryLockError::Error(err)) => return Err(err),
@@ -198,11 +230,13 @@ async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {
 
 struct ControlSocketFileGuard {
     socket_path: AbsolutePathBuf,
+    endpoint: Option<codex_uds::SocketFile>,
 }
 
 impl Drop for ControlSocketFileGuard {
     fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_file(self.socket_path.as_path())
+        if let Some(endpoint) = self.endpoint.take()
+            && let Err(err) = endpoint.remove()
             && err.kind() != ErrorKind::NotFound
         {
             warn!(

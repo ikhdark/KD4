@@ -113,9 +113,20 @@ async fn turn_start_forwards_client_metadata_to_responses_request_v2() -> Result
     assert_eq!(metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(metadata["thread_source"].as_str(), Some("automation"));
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
-    assert!(metadata["installation_id"].as_str().is_some_and(|id| !id.is_empty()));
-    assert_eq!(metadata["session_id"].as_str(), Some(thread.session_id.as_str()));
-    assert!(metadata["window_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(
+        metadata["installation_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    assert_eq!(
+        metadata["session_id"].as_str(),
+        Some(thread.session_id.as_str())
+    );
+    assert!(
+        metadata["window_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
     assert_eq!(
         metadata["window_id"].as_str(),
         request.header("x-codex-window-id").as_deref()
@@ -540,8 +551,15 @@ async fn turn_start_forwards_client_metadata_to_responses_websocket_request_body
     assert_eq!(metadata["origin"].as_str(), Some("gaas"));
     assert_eq!(metadata["thread_source"].as_str(), Some("automation"));
     assert_eq!(metadata["turn_id"].as_str(), Some(turn.id.as_str()));
-    assert_eq!(metadata["session_id"].as_str(), Some(thread.session_id.as_str()));
-    assert!(metadata["window_id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert_eq!(
+        metadata["session_id"].as_str(),
+        Some(thread.session_id.as_str())
+    );
+    assert!(
+        metadata["window_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
     assert_eq!(
         metadata["window_id"].as_str(),
         request["client_metadata"]["x-codex-window-id"].as_str()

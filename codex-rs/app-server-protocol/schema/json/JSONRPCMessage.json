@@ -2,16 +2,110 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "anyOf": [
     {
-      "$ref": "#/definitions/JSONRPCRequest"
+      "allOf": [
+        {
+          "$ref": "#/definitions/JSONRPCRequest"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "result"
+                ],
+                "title": "ResultJSONRPCMessage"
+              },
+              {
+                "required": [
+                  "error"
+                ],
+                "title": "ErrorJSONRPCMessage"
+              }
+            ]
+          }
+        }
+      ]
     },
     {
-      "$ref": "#/definitions/JSONRPCNotification"
+      "allOf": [
+        {
+          "$ref": "#/definitions/JSONRPCNotification"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "id"
+                ],
+                "title": "IdJSONRPCMessage"
+              },
+              {
+                "required": [
+                  "result"
+                ],
+                "title": "ResultJSONRPCMessage"
+              },
+              {
+                "required": [
+                  "error"
+                ],
+                "title": "ErrorJSONRPCMessage"
+              }
+            ]
+          }
+        }
+      ]
     },
     {
-      "$ref": "#/definitions/JSONRPCResponse"
+      "allOf": [
+        {
+          "$ref": "#/definitions/JSONRPCResponse"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "method"
+                ],
+                "title": "MethodJSONRPCMessage"
+              },
+              {
+                "required": [
+                  "error"
+                ],
+                "title": "ErrorJSONRPCMessage"
+              }
+            ]
+          }
+        }
+      ]
     },
     {
-      "$ref": "#/definitions/JSONRPCError"
+      "allOf": [
+        {
+          "$ref": "#/definitions/JSONRPCError"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "method"
+                ],
+                "title": "MethodJSONRPCMessage"
+              },
+              {
+                "required": [
+                  "result"
+                ],
+                "title": "ResultJSONRPCMessage"
+              }
+            ]
+          }
+        }
+      ]
     }
   ],
   "definitions": {

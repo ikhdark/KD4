@@ -18,21 +18,40 @@ fn affordance_projection_preserves_contract_and_positive_clauses() {
         assert!(!activation.contains(absent), "{activation}");
         assert!(info.entry.search_text.to_lowercase().contains(absent));
     }
-    for present in ["Preview drafts", "can list folders", "Read labels", "Not only read metadata", "search records", "include archived", "Filter records"] {
+    for present in [
+        "Preview drafts",
+        "can list folders",
+        "Read labels",
+        "Not only read metadata",
+        "search records",
+        "include archived",
+        "Filter records",
+    ] {
         assert!(activation.contains(present), "{activation}");
     }
-    let LoadableToolSpec::Function(output) = info.entry.output.as_ref() else { panic!("function") };
-    let ToolSpec::Function(original) = &spec else { panic!("function") };
+    let LoadableToolSpec::Function(output) = info.entry.output.as_ref() else {
+        panic!("function")
+    };
+    let ToolSpec::Function(original) = &spec else {
+        panic!("function")
+    };
     assert_eq!(output.description, original.description);
     assert_eq!(output.parameters, original.parameters);
 }
 
 #[test]
 fn affordance_not_only_keeps_positive_capabilities() {
-    for prefix in ["Does not only", "Do not only", "Doesn't only", "DOES NOT   ONLY"] {
+    for prefix in [
+        "Does not only",
+        "Do not only",
+        "Doesn't only",
+        "DOES NOT   ONLY",
+    ] {
         let tool = ResponsesApiTool {
             name: "lookup".into(),
-            description: format!("{prefix} read documents but also search records; do not delete files."),
+            description: format!(
+                "{prefix} read documents but also search records; do not delete files."
+            ),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::default(),
@@ -43,9 +62,18 @@ fn affordance_not_only_keeps_positive_capabilities() {
             info.entry.callable_search_text(),
             ToolSearchEntry::callable_function_search_text(&tool),
         ] {
-            assert!(activation.contains("read documents"), "{prefix}: {activation}");
-            assert!(activation.contains("search records"), "{prefix}: {activation}");
-            assert!(!activation.contains("delete files"), "{prefix}: {activation}");
+            assert!(
+                activation.contains("read documents"),
+                "{prefix}: {activation}"
+            );
+            assert!(
+                activation.contains("search records"),
+                "{prefix}: {activation}"
+            );
+            assert!(
+                !activation.contains("delete files"),
+                "{prefix}: {activation}"
+            );
         }
     }
 }
@@ -55,15 +83,25 @@ fn affordance_output_hints_are_bounded_shared_and_retrieval_only() {
     let schema = serde_json::json!({"type":"object", "properties":{
         "continuationToken":{"type":"string", "description":"Never index output prose"}
     }});
-    for output in [schema.clone().into(), crate::ToolOutputSchema::from_mcp_output_schema(
-        Some(Arc::new(schema.as_object().unwrap().clone())))] {
+    for output in [
+        schema.clone().into(),
+        crate::ToolOutputSchema::from_mcp_output_schema(Some(Arc::new(
+            schema.as_object().unwrap().clone(),
+        ))),
+    ] {
         let function = ResponsesApiTool {
-            name: "lookup".into(), description: "Read records".into(), strict: false,
-            defer_loading: None, parameters: JsonSchema::object(BTreeMap::new(), None, None),
+            name: "lookup".into(),
+            description: "Read records".into(),
+            strict: false,
+            defer_loading: None,
+            parameters: JsonSchema::object(BTreeMap::new(), None, None),
             output_schema: Some(output),
         };
-        let shared = ToolSearchInfo::from_shared_spec("Read records".into(),
-            Arc::new(LoadableToolSpec::Function(function.clone())), None);
+        let shared = ToolSearchInfo::from_shared_spec(
+            "Read records".into(),
+            Arc::new(LoadableToolSpec::Function(function.clone())),
+            None,
+        );
         let owned = ToolSearchInfo::from_tool_spec(&ToolSpec::Function(function), None).unwrap();
         for info in [shared, owned] {
             assert!(info.entry.search_text.contains("continuation token"));
@@ -71,20 +109,40 @@ fn affordance_output_hints_are_bounded_shared_and_retrieval_only() {
             assert!(!info.entry.search_text.contains("output prose"));
         }
     }
-    let properties = (0..1000).map(|i| (format!("field_{i:04}"), serde_json::json!({"type":"string"})))
+    let properties = (0..1000)
+        .map(|i| {
+            (
+                format!("field_{i:04}"),
+                serde_json::json!({"type":"string"}),
+            )
+        })
         .collect::<serde_json::Map<_, _>>();
-    let tool = ResponsesApiTool { name: "lookup".into(), description: String::new(), strict: false,
-        defer_loading: None, parameters: JsonSchema::object(BTreeMap::new(), None, None),
-        output_schema: Some(serde_json::json!({"properties":properties}).into()) };
+    let tool = ResponsesApiTool {
+        name: "lookup".into(),
+        description: String::new(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(BTreeMap::new(), None, None),
+        output_schema: Some(serde_json::json!({"properties":properties}).into()),
+    };
     let mut text = String::new();
     append_output_search_text(&tool, &mut text);
     assert!(text.len() <= 2048);
     assert!(text.contains("field_0063"));
     assert!(!text.contains("field_0064"));
     // Long names exhaust the byte budget before the field-count limit applies.
-    let properties = (0..64).map(|i| (format!("{}_{i:04}", "k".repeat(100)), serde_json::json!({"type":"string"})))
+    let properties = (0..64)
+        .map(|i| {
+            (
+                format!("{}_{i:04}", "k".repeat(100)),
+                serde_json::json!({"type":"string"}),
+            )
+        })
         .collect::<serde_json::Map<_, _>>();
-    let tool = ResponsesApiTool { output_schema: Some(serde_json::json!({"properties":properties}).into()), ..tool };
+    let tool = ResponsesApiTool {
+        output_schema: Some(serde_json::json!({"properties":properties}).into()),
+        ..tool
+    };
     let mut text = String::new();
     append_output_search_text(&tool, &mut text);
     assert!(text.len() <= 2048);
@@ -154,7 +212,10 @@ fn search_results_defer_functions_and_namespace_children_without_output_schemas(
         assert!(std::sync::Arc::ptr_eq(&raw, &shared.entry.output));
         assert!(std::sync::Arc::ptr_eq(&raw, &shared.clone().entry.output));
         let expected = ToolSearchInfo::from_tool_spec(&raw.as_ref().clone().into(), None).unwrap();
-        assert_eq!(shared.entry.to_loadable_spec(), expected.entry.to_loadable_spec());
+        assert_eq!(
+            shared.entry.to_loadable_spec(),
+            expected.entry.to_loadable_spec()
+        );
         let raw_function = match raw.as_ref() {
             LoadableToolSpec::Function(tool) => tool,
             LoadableToolSpec::Namespace(namespace) => {
@@ -207,12 +268,15 @@ fn default_search_text_uses_model_visible_namespace_metadata_once() {
     let search_info = ToolSearchInfo::from_tool_spec(&spec, /*source_info*/ None)
         .expect("namespace should be searchable");
     let callable = crate::code_mode_name_for_tool_name(&crate::ToolName::namespaced(
-        "codex_app", "automation_update",
+        "codex_app",
+        "automation_update",
     ));
 
     assert_eq!(
         search_info.entry.search_text,
-        format!("codex_app Manage Codex automations. {callable} automation_update automation update Create or update automations. Automation options. mode Update mode. schedule Schedule settings. timezone IANA timezone.")
+        format!(
+            "codex_app Manage Codex automations. {callable} automation_update automation update Create or update automations. Automation options. mode Update mode. schedule Schedule settings. timezone IANA timezone."
+        )
     );
     assert_eq!(
         search_info.entry.tool_names,

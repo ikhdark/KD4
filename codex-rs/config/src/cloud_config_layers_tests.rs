@@ -28,7 +28,6 @@ fn base_dir() -> AbsolutePathBuf {
     test_path_buf("/var/lib/codex").abs()
 }
 
-
 #[test]
 fn enterprise_layers_precede_user_and_override_system() {
     let base_dir = base_dir();

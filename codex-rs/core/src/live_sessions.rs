@@ -49,7 +49,12 @@ pub(crate) struct LiveSessionTurn {
 }
 
 impl LiveSessionTurn {
-    pub(crate) fn begin(codex_home: &Path, thread_id: &str, workspace: &Path, intent: &str) -> Self {
+    pub(crate) fn begin(
+        codex_home: &Path,
+        thread_id: &str,
+        workspace: &Path,
+        intent: &str,
+    ) -> Self {
         let directory = codex_home.join(DIRECTORY);
         Self {
             // A late write/delete from this turn must never replace/remove its successor.
@@ -186,7 +191,10 @@ fn read_others(directory: &Path, thread_id: &str, workspace: &Path) -> Vec<LiveS
     let now = now_ms();
     let mut records = Vec::new();
     for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
-        if !path.extension().is_some_and(|extension| extension == "json") {
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
             continue;
         }
         let Some(record) = std::fs::read(&path)
@@ -287,7 +295,10 @@ fn listed_paths(paths: &[String], workspace: &Path) -> String {
         .map(|path| {
             Path::new(path)
                 .strip_prefix(workspace)
-                .map_or_else(|_| path.clone(), |relative| relative.to_string_lossy().into_owned())
+                .map_or_else(
+                    |_| path.clone(),
+                    |relative| relative.to_string_lossy().into_owned(),
+                )
                 .replace('\\', "/")
         })
         .collect::<Vec<_>>()
@@ -369,14 +380,16 @@ mod tests {
             "\n  Optimize the scanner's CPU use.\nDetails follow.",
         );
         assert!(first.publish(vec![edited.clone()]).await);
-        assert!(!first.publish(vec![edited.clone()]).await, "unchanged edits do not rewrite");
+        assert!(
+            !first.publish(vec![edited.clone()]).await,
+            "unchanged edits do not rewrite"
+        );
         let mut elsewhere =
             LiveSessionTurn::begin(home.path(), "elsewhere", &home.path().join("other"), "x");
         elsewhere.publish(Vec::new()).await;
 
         // A session in a subdirectory of the same checkout sees the first one.
-        let mut second =
-            LiveSessionTurn::begin(home.path(), "second", &checkout.join("src"), "y");
+        let mut second = LiveSessionTurn::begin(home.path(), "second", &checkout.join("src"), "y");
         let others = second.others().await;
         assert_eq!(others.len(), 1);
         let notice = concurrent_sessions_notice(&others, second.workspace());
@@ -411,10 +424,12 @@ mod tests {
             let _ = entered.send(());
             let _ = blocked.recv();
             let _ = std::fs::remove_file(old_path);
-        }).unwrap();
+        })
+        .unwrap();
         ready.await.unwrap();
         assert!(schedule_cleanup(slots, || panic!("must not queue")).is_none());
-        let mut successor = LiveSessionTurn::begin(home.path(), "same-thread", home.path(), "second");
+        let mut successor =
+            LiveSessionTurn::begin(home.path(), "same-thread", home.path(), "second");
         successor.publish(Vec::new()).await;
         assert_ne!(first.path, successor.path);
         release.send(()).unwrap();

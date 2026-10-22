@@ -22,7 +22,7 @@ use crate::tools::handlers::command_search::RgSearchBreadth;
 use crate::tools::handlers::command_search::RgSearchNarrowing;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
-const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 4;
+const COMMAND_EXECUTION_CACHE_SCHEMA_VERSION: u32 = 5;
 const COMMAND_FINGERPRINT_VERSION: &str = "v2";
 static NEXT_COMMAND_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -199,6 +199,12 @@ impl CommandAttemptKey {
         let Some(search) = self.search_narrowing.as_mut() else {
             return self;
         };
+        // Both production command routes call this after selecting their actual
+        // environment. A host scope scan cannot identify the image selected by
+        // that runtime (PATH, aliases, wrappers, or replacement at launch).
+        // Until the process owner supplies that proof, keep narrowing advice but
+        // never suppress a new execution using negative evidence.
+        search.scope_state_identity = None;
         // The scope snapshot cannot account for options or further file inputs
         // loaded from external configuration. Run the search instead of caching
         // a negative result based only on the unchanged configuration pathname.
@@ -415,6 +421,14 @@ pub(crate) struct RunningCommand {
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
     completed_exit_code: Option<i32>,
+    terminal_facts: Option<CommandTerminalFacts>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandTerminalFacts {
+    success: bool,
+    search_no_match: bool,
+    failure_cause: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -430,6 +444,7 @@ struct CommandCompletionReceipt {
     incarnation: uuid::Uuid,
     exit_code: Option<i32>,
     artifact: RawOutputArtifact,
+    terminal_facts: Option<CommandTerminalFacts>,
 }
 
 #[derive(Debug, Clone)]
@@ -469,6 +484,8 @@ struct CommandRepositoryState {
 struct UncertainCommandBaseline {
     turn_id: String,
     workspace_identity: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    /// Bounded tree identity of a local workspace outside any Git repository.
+    non_git_tree_identity: Option<String>,
 }
 
 #[derive(Default)]
@@ -486,6 +503,18 @@ struct CommandSearchState {
     allowed_expansions: HashSet<SearchNarrowingScope>,
     misses: HashSet<SearchMissCacheKey>,
     miss_order: VecDeque<SearchMissCacheKey>,
+    /// Exact bounded streams are session-local; persisted set membership alone
+    /// must never be promoted to typed execution evidence.
+    retained_misses: HashMap<SearchMissCacheKey, RetainedSearchMiss>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RetainedSearchMiss {
+    pub(crate) evidence_id: String,
+    pub(crate) original_execution_id: String,
+    pub(crate) validity_scope_fingerprint: String,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 #[derive(Default)]
@@ -602,11 +631,25 @@ impl CommandExecutionLedger {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_uncertain_command_baseline(
         &self,
         call_id: &str,
         turn_id: &str,
         baseline: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+    ) {
+        self.record_uncertain_command_baseline_with_tree(call_id, turn_id, baseline, None)
+            .await;
+    }
+
+    /// A non-Git tree identity accompanies only a `None` workspace identity:
+    /// a completed capture outside any Git repository.
+    pub(crate) async fn record_uncertain_command_baseline_with_tree(
+        &self,
+        call_id: &str,
+        turn_id: &str,
+        baseline: Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+        non_git_tree_identity: Option<String>,
     ) {
         self.state
             .lock()
@@ -618,6 +661,7 @@ impl CommandExecutionLedger {
                 UncertainCommandBaseline {
                     turn_id: turn_id.to_string(),
                     workspace_identity: baseline,
+                    non_git_tree_identity,
                 },
             );
     }
@@ -631,17 +675,22 @@ impl CommandExecutionLedger {
             .contains_key(call_id)
     }
 
+    /// The pre-command workspace identity and, outside any Git repository, the
+    /// bounded tree identity captured with it.
     pub(crate) async fn take_uncertain_command_baseline(
         &self,
         call_id: &str,
-    ) -> Option<Option<crate::git_workspace::WorkspaceEvidenceIdentity>> {
+    ) -> Option<(
+        Option<crate::git_workspace::WorkspaceEvidenceIdentity>,
+        Option<String>,
+    )> {
         self.state
             .lock()
             .await
             .repository
             .uncertain_command_baselines
             .remove(call_id)
-            .map(|baseline| baseline.workspace_identity)
+            .map(|baseline| (baseline.workspace_identity, baseline.non_git_tree_identity))
     }
 
     /// Reuse a snapshot captured under the dispatch workspace lease. The ledger
@@ -788,7 +837,7 @@ impl CommandExecutionLedger {
                     .filter(|document| {
                         matches!(
                             document.schema_version,
-                            3 | COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
+                            COMMAND_EXECUTION_CACHE_SCHEMA_VERSION
                         )
                     }),
                 None => None,
@@ -962,8 +1011,132 @@ impl CommandExecutionLedger {
 
     pub(crate) async fn record_exit(&self, key: &CommandAttemptKey, exit_code: i32) {
         let mut state = self.state.lock().await;
-        record_search_result_locked(&mut state, key, exit_code);
+        // Exit-only observations cannot prove a negative search result.
+        if exit_code != 1 {
+            record_search_result_locked(&mut state, key, false);
+        }
         record_exit_locked(&mut state, key, exit_code);
+    }
+
+    pub(crate) async fn record_verified_search_result(
+        &self,
+        key: &CommandAttemptKey,
+        no_match: bool,
+    ) {
+        record_search_result_locked(&mut *self.state.lock().await, key, no_match);
+    }
+
+    pub(crate) async fn record_retained_search_miss(
+        &self,
+        key: &CommandAttemptKey,
+        original_execution_id: String,
+        stdout: String,
+        stderr: String,
+    ) {
+        if stdout.len().saturating_add(stderr.len()) > 16 * 1024 {
+            return;
+        }
+        let Some(cache_key) = key.search_miss_cache_key() else {
+            return;
+        };
+        let mut state = self.state.lock().await;
+        record_search_result_locked(&mut state, key, true);
+        state.search.retained_misses.insert(
+            cache_key.clone(),
+            RetainedSearchMiss {
+                evidence_id: uuid::Uuid::now_v7().to_string(),
+                original_execution_id,
+                validity_scope_fingerprint: fingerprint_value(&cache_key),
+                stdout,
+                stderr,
+            },
+        );
+    }
+
+    pub(crate) async fn retained_search_miss(
+        &self,
+        key: &CommandAttemptKey,
+    ) -> Option<RetainedSearchMiss> {
+        let cache_key = key.search_miss_cache_key()?;
+        let state = self.state.lock().await;
+        state
+            .search
+            .misses
+            .contains(&cache_key)
+            .then(|| state.search.retained_misses.get(&cache_key).cloned())
+            .flatten()
+    }
+
+    /// Enrich the existing identity even when an exit-only watcher got there
+    /// first. A later failure must never be overwritten by a weaker success.
+    pub(crate) async fn record_terminal_facts(
+        &self,
+        process_id: u32,
+        parent: &str,
+        incarnation: uuid::Uuid,
+        exit_code: Option<i32>,
+        failure_cause: Option<&str>,
+        search_no_match: bool,
+    ) {
+        let mut facts = CommandTerminalFacts {
+            success: failure_cause.is_none() && (exit_code == Some(0) || search_no_match),
+            search_no_match,
+            failure_cause: failure_cause.map(|cause| cause.chars().take(2048).collect()),
+        };
+        let mut state = self.state.lock().await;
+        let mut search = None;
+        let process = &mut state.process;
+        let slot = if let Some(running) = process.running.get_mut(&process_id).filter(|command| {
+            command.parent_tool_execution_id.0 == parent && command.incarnation == incarnation
+        }) {
+            search = Some(running.key.clone());
+            Some(&mut running.terminal_facts)
+        } else if let Some(pending) = process
+            .pending_by_execution_id
+            .values_mut()
+            .find(|pending| {
+                pending.process_id == process_id
+                    && pending.command.parent_tool_execution_id.0 == parent
+                    && pending.command.incarnation == incarnation
+            })
+        {
+            search = Some(pending.command.key.clone());
+            Some(&mut pending.command.terminal_facts)
+        } else {
+            process
+                .completion_receipts
+                .values_mut()
+                .find(|receipt| {
+                    receipt.process_id == process_id
+                        && receipt.parent_tool_execution_id.0 == parent
+                        && receipt.incarnation == incarnation
+                })
+                .map(|receipt| &mut receipt.terminal_facts)
+        };
+        let mut accepted_no_match = false;
+        if let Some(slot) = slot {
+            if let Some(previous) = slot.as_ref() {
+                // Exit-only and duplicate observers must not erase a known
+                // late failure merely because they have no diagnostic of their own.
+                facts.failure_cause = facts
+                    .failure_cause
+                    .or_else(|| previous.failure_cause.clone());
+                facts.success &= previous.success;
+                facts.search_no_match &= facts.success;
+            }
+            if slot
+                .as_ref()
+                .is_none_or(|previous| previous.success || !facts.success)
+            {
+                *slot = Some(facts);
+            }
+            accepted_no_match = slot
+                .as_ref()
+                .is_some_and(|facts| facts.success && facts.search_no_match);
+        }
+        if let Some(key) = search {
+            record_search_result_locked(&mut state, &key, accepted_no_match);
+        }
     }
 
     pub(crate) async fn record_input_state_determined_failure(
@@ -1054,6 +1227,7 @@ impl CommandExecutionLedger {
                 key,
                 artifact,
                 completed_exit_code: None,
+                terminal_facts: None,
             },
         );
         debug_assert_command_execution_invariants(&state);
@@ -1098,7 +1272,7 @@ impl CommandExecutionLedger {
         if state.process.running.contains_key(&process_id) {
             return None;
         }
-        let (exit_code, artifact) = if let Some(pending) = state
+        let (exit_code, artifact, facts) = if let Some(pending) = state
             .process
             .pending_by_execution_id
             .values()
@@ -1110,6 +1284,7 @@ impl CommandExecutionLedger {
             (
                 pending.command.completed_exit_code,
                 &pending.command.artifact,
+                pending.command.terminal_facts.as_ref(),
             )
         } else {
             let receipt = state
@@ -1122,7 +1297,11 @@ impl CommandExecutionLedger {
             if receipt.incarnation != incarnation {
                 return None;
             }
-            (receipt.exit_code, &receipt.artifact)
+            (
+                receipt.exit_code,
+                &receipt.artifact,
+                receipt.terminal_facts.as_ref(),
+            )
         };
         let (artifact_id, bytes, error) = artifact.model_projection();
         let mut result = serde_json::json!({
@@ -1131,6 +1310,12 @@ impl CommandExecutionLedger {
             "output": "", "output_complete": false, "output_reduced": true,
             "raw_output_artifact_retention_limit_hit": artifact.retention_limit_hit(),
             "completion_recovered": true,
+            "success": facts.is_some_and(|facts| facts.success),
+            "search_no_match": facts.is_some_and(|facts| facts.search_no_match),
+            "error": facts.and_then(|facts| facts.failure_cause.as_deref()).or_else(|| {
+                facts.is_none().then_some("Terminal outcome details were not retained; do not infer successful execution from the exit code or replay the command.")
+            }),
+            "terminal_facts_available": facts.is_some(),
             "notice": "Process already completed and was cleaned up. Output is not replayed; recover the retained artifact when needed. Do not restart the command.",
         });
         if let Some(id) = artifact_id {
@@ -1639,6 +1824,7 @@ fn insert_completion_receipt(
             incarnation: command.incarnation,
             exit_code: command.completed_exit_code,
             artifact: command.artifact,
+            terminal_facts: command.terminal_facts,
         },
     );
     state
@@ -1704,7 +1890,9 @@ fn record_running_exit_locked(
     running: &RunningCommand,
     exit_code: i32,
 ) {
-    record_search_result_locked(state, &running.key, exit_code);
+    if exit_code != 1 {
+        record_search_result_locked(state, &running.key, false);
+    }
     record_exit_locked(state, &running.key, exit_code);
 }
 
@@ -1723,30 +1911,30 @@ fn touch_search_miss_locked(search: &mut CommandSearchState, key: &SearchMissCac
 fn record_search_result_locked(
     state: &mut CommandExecutionState,
     key: &CommandAttemptKey,
-    exit_code: i32,
+    verified_no_match: bool,
 ) {
     let Some(search) = key.eligible_search_miss() else {
         return;
     };
-    if exit_code == 1
-        && let Some(parent_scope) = search.parent_scope()
-    {
+    if verified_no_match && let Some(parent_scope) = search.parent_scope() {
         state.search.allowed_expansions.insert(parent_scope);
     }
     let Some(search_miss_key) = key.search_miss_cache_key_for(search) else {
         return;
     };
-    if exit_code == 1 && state.search.misses.insert(search_miss_key.clone()) {
+    if verified_no_match && state.search.misses.insert(search_miss_key.clone()) {
         state.search.revision = state.search.revision.wrapping_add(1);
         state.search.miss_order.push_back(search_miss_key);
         while state.search.misses.len() > MAX_TRACKED_COMMANDS {
             if let Some(oldest) = state.search.miss_order.pop_front() {
                 state.search.misses.remove(&oldest);
+                state.search.retained_misses.remove(&oldest);
             }
         }
-    } else if exit_code == 1 {
+    } else if verified_no_match {
         touch_search_miss_locked(&mut state.search, &search_miss_key);
     } else if state.search.misses.remove(&search_miss_key) {
+        state.search.retained_misses.remove(&search_miss_key);
         // A fresh execution error supersedes an older negative result too.
         // Only an attributable no-match exit can keep that result authoritative.
         state.search.revision = state.search.revision.wrapping_add(1);
@@ -1847,6 +2035,30 @@ fn write_cache_document_blocking(
         return Err(io::Error::other("command cache path has no parent"));
     };
     std::fs::create_dir_all(parent)?;
+    let _residency = if parent
+        .file_name()
+        .is_some_and(|name| name == "command-execution-cache")
+    {
+        let home = parent
+            .parent()
+            .ok_or_else(|| io::Error::other("command cache has no home"))?;
+        let id = cache_path
+            .file_stem()
+            .and_then(|id| id.to_str())
+            .ok_or_else(|| io::Error::other("command cache has no thread identity"))?;
+        let owner =
+            crate::tools::command_output_artifact::artifact_residency_file(home, id, false)?;
+        if home
+            .join("tool-history")
+            .join(format!("{id}.retired"))
+            .try_exists()?
+        {
+            return Err(io::Error::other("thread storage was permanently retired"));
+        }
+        Some(owner)
+    } else {
+        None
+    };
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
@@ -1896,6 +2108,10 @@ pub(crate) fn persist_synced_file(
     temporary.persist(cache_path).map_err(|error| error.error)?;
     std::fs::File::open(parent)?.sync_all()
 }
+
+#[cfg(test)]
+#[path = "command_execution_outcome_tests.rs"]
+mod outcome_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2003,6 +2219,7 @@ mod tests {
             .await
             .expect("narrow search is admitted without prior state");
         ledger.record_exit(&narrow, 1).await;
+        ledger.record_verified_search_result(&narrow, true).await;
         ledger
             .admit_search_narrowing(&broad)
             .await
@@ -2015,6 +2232,47 @@ mod tests {
             .expect("admission remains advisory after narrow-miss state expires");
     }
 
+    #[tokio::test]
+    async fn runtime_without_executable_proof_never_reuses_search_absence() {
+        let ledger = CommandExecutionLedger::default();
+        let search = RgSearchNarrowing {
+            breadth: RgSearchBreadth::Narrow,
+            query_identity: "needle".into(),
+            search_identity: "rg:needle:source.txt".into(),
+            scope_identity: "source.txt".into(),
+            parent_scope_identity: None,
+            scope_state_identity: Some("unchanged-source".into()),
+            state_paths: Vec::new(),
+            can_record_miss: true,
+        };
+        let make = |program: &str| {
+            CommandAttemptKey::new(
+                "exec_command",
+                "local",
+                "/repo",
+                &[program.to_string(), "needle".into(), "source.txt".into()],
+            )
+            .with_search_narrowing("turn", "repo", Some(search.clone()))
+        };
+        // Even a legacy weak entry cannot suppress a request assembled by either
+        // production route, including another image at the same executable path.
+        let weak = make("/tool-a/rg");
+        ledger.record_exit(&weak, 1).await;
+        ledger.record_verified_search_result(&weak, true).await;
+        assert!(ledger.begin_attempt(&weak, false).await.is_err());
+        for program in ["/tool-b/rg", "/tool-a/rg", "rg"] {
+            let current = make(program).with_search_environment(&HashMap::new());
+            assert!(
+                current.is_search_no_match(Some(1)),
+                "preserve real exit attribution"
+            );
+            assert!(current.search_miss_cache_key().is_none());
+            ledger.begin_attempt(&current, false).await.unwrap();
+            ledger.record_exit(&current, 1).await;
+            ledger.record_verified_search_result(&current, true).await;
+            ledger.begin_attempt(&current, false).await.unwrap();
+        }
+    }
     #[tokio::test]
     async fn token_efficiency_different_query_miss_does_not_block_broad_rg() {
         let ledger = CommandExecutionLedger::default();
@@ -2048,6 +2306,7 @@ mod tests {
         );
 
         ledger.record_exit(&narrow, 1).await;
+        ledger.record_verified_search_result(&narrow, true).await;
 
         ledger
             .admit_search_narrowing(&broad)
@@ -2074,6 +2333,7 @@ mod tests {
         );
 
         ledger.record_exit(&compound, 1).await;
+        ledger.record_verified_search_result(&compound, true).await;
 
         let state = ledger.state.lock().await;
         assert!(state.search.allowed_expansions.is_empty());
@@ -2118,6 +2378,22 @@ mod tests {
             .await
             .expect("first search");
         ledger.record_exit(&first, 1).await;
+        ledger.record_verified_search_result(&first, true).await;
+        assert!(
+            ledger.retained_search_miss(&equivalent).await.is_none(),
+            "set membership is not stream evidence"
+        );
+        ledger
+            .record_retained_search_miss(
+                &first,
+                "original-search".into(),
+                String::new(),
+                "warning\n".into(),
+            )
+            .await;
+        let retained = ledger.retained_search_miss(&equivalent).await.unwrap();
+        assert_eq!(retained.original_execution_id, "original-search");
+        assert_eq!(retained.stderr, "warning\n");
         let blocked = ledger
             .begin_attempt(&equivalent, false)
             .await
@@ -2133,6 +2409,7 @@ mod tests {
 
         for exit_code in [0, 2, 130] {
             ledger.record_exit(&first, 1).await;
+            ledger.record_verified_search_result(&first, true).await;
             assert!(
                 ledger
                     .begin_attempt(&equivalent, false)
@@ -2145,6 +2422,7 @@ mod tests {
                 .await
                 .expect("force_fresh bypasses the negative cache");
             ledger.record_exit(&equivalent, exit_code).await;
+            assert!(ledger.retained_search_miss(&equivalent).await.is_none());
             ledger
                 .begin_attempt(&equivalent, false)
                 .await
@@ -2153,6 +2431,7 @@ mod tests {
 
         // Scope changes must be admitted while the original miss is still cached.
         ledger.record_exit(&first, 1).await;
+        ledger.record_verified_search_result(&first, true).await;
         ledger
             .begin_attempt(
                 &key("rg needle tests")
@@ -2222,6 +2501,7 @@ mod tests {
                 for key in keys.iter().take(MAX_TRACKED_COMMANDS) {
                     ledger.begin_attempt(key, false).await.unwrap();
                     ledger.record_exit(key, 1).await;
+                    ledger.record_verified_search_result(key, true).await;
                 }
                 if refresh_by_execution {
                     ledger
@@ -2229,6 +2509,7 @@ mod tests {
                         .await
                         .unwrap();
                     ledger.record_exit(&keys[0], 1).await;
+                    ledger.record_verified_search_result(&keys[0], true).await;
                 } else {
                     assert!(
                         ledger
@@ -2241,6 +2522,9 @@ mod tests {
                 let replacement = &keys[MAX_TRACKED_COMMANDS];
                 ledger.begin_attempt(replacement, false).await.unwrap();
                 ledger.record_exit(replacement, 1).await;
+                ledger
+                    .record_verified_search_result(replacement, true)
+                    .await;
                 assert!(
                     ledger
                         .begin_attempt(&keys[0], false)
@@ -2301,6 +2585,27 @@ mod tests {
                 .await
                 .accepted()
         );
+        let pending = ledger
+            .state
+            .lock()
+            .await
+            .process
+            .pending_by_execution_id
+            .values()
+            .next()
+            .unwrap()
+            .command
+            .clone();
+        ledger
+            .record_terminal_facts(
+                42,
+                &pending.parent_tool_execution_id.0,
+                pending.incarnation,
+                Some(1),
+                None,
+                true,
+            )
+            .await;
         ledger
             .begin_attempt(&equivalent, false)
             .await
@@ -2981,6 +3286,7 @@ mod tests {
             ledger
                 .record_exit(&attempt, miss.status.code().unwrap())
                 .await;
+            ledger.record_verified_search_result(&attempt, true).await;
             ledger
                 .begin_attempt(&attempt, false)
                 .await
@@ -3070,6 +3376,7 @@ mod tests {
                 .record_exit(&attempt, actual.status.code().unwrap())
                 .await;
             if index == 0 {
+                ledger.record_verified_search_result(&attempt, true).await;
                 ledger
                     .begin_attempt(&attempt, false)
                     .await
@@ -3151,6 +3458,7 @@ mod tests {
         .with_search_narrowing("turn-b", "repo-a", Some(equivalent_search));
         let ledger = CommandExecutionLedger::default();
         ledger.record_exit(&narrow, 1).await;
+        ledger.record_verified_search_result(&narrow, true).await;
         ledger
             .begin_attempt(&equivalent, false)
             .await
@@ -3201,6 +3509,9 @@ mod tests {
         .with_search_narrowing("turn-c", "repo-a", Some(classify(&broad_command, None)));
         let compound_ledger = CommandExecutionLedger::default();
         compound_ledger.record_exit(&compound, 1).await;
+        compound_ledger
+            .record_verified_search_result(&compound, true)
+            .await;
         compound_ledger
             .admit_search_narrowing(&broad)
             .await
@@ -3267,9 +3578,8 @@ mod tests {
 
     #[tokio::test]
     async fn implicit_global_ignore_changes_never_replay_negative_searches() {
-        use crate::tools::handlers::command_search::{
-            classify_rg_search_narrowing, observe_rg_search_scope_state,
-        };
+        use crate::tools::handlers::command_search::classify_rg_search_narrowing;
+        use crate::tools::handlers::command_search::observe_rg_search_scope_state;
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("repo");
         let home = fixture.path().join("home");
@@ -3303,6 +3613,7 @@ mod tests {
         let ledger = CommandExecutionLedger::default();
         assert_eq!(run().status.code(), Some(1));
         ledger.record_exit(&key, 1).await;
+        ledger.record_verified_search_result(&key, true).await;
         std::fs::write(&ignore, "").unwrap();
         ledger
             .begin_attempt(&key, false)
@@ -3351,6 +3662,7 @@ mod tests {
             assert_eq!(run().status.code(), Some(1));
             let ledger = CommandExecutionLedger::default();
             ledger.record_exit(&key, 1).await;
+            ledger.record_verified_search_result(&key, true).await;
             std::fs::write(root.join("output.txt"), "needle").unwrap();
             ledger.begin_attempt(&key, false).await.unwrap();
             assert_eq!(run().status.code(), Some(0));
@@ -3405,6 +3717,7 @@ mod tests {
         let miss = run();
         assert_eq!(miss.status.code(), Some(1));
         ledger.record_exit(&first, 1).await;
+        ledger.record_verified_search_result(&first, true).await;
         std::fs::write(&config, "--glob\n*.txt\n").unwrap();
         let second = attempt().await;
         ledger
@@ -3469,6 +3782,9 @@ mod tests {
             .await
             .expect("first search runs");
         producer.record_exit(&first_search, 1).await;
+        producer
+            .record_verified_search_result(&first_search, true)
+            .await;
         producer.finish_turn("turn-a").await;
         assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 1);
         producer.persist_cache_after_terminal().await;
@@ -3605,6 +3921,9 @@ mod tests {
             "successful searches remove persisted misses"
         );
         producer.record_exit(&first_search, 1).await;
+        producer
+            .record_verified_search_result(&first_search, true)
+            .await;
         producer.persist_cache_after_terminal().await;
         assert_eq!(producer.cache_commit_count.load(Ordering::Relaxed), 3);
         let document: CommandExecutionCacheDocument =
@@ -4078,5 +4397,22 @@ mod tests {
         );
         assert!(ledger.snapshot(&keys[0]).await.is_some());
         assert!(ledger.snapshot(&keys[1]).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod audit63_cache_retirement_tests {
+    use super::*;
+
+    #[test]
+    fn permanently_deleted_thread_rejects_a_late_cache_commit() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("command-execution-cache/thread.json");
+        assert!(write_cache_document_blocking(&path, b"original cache").is_ok());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(home.path().join("tool-history")).unwrap();
+        std::fs::write(home.path().join("tool-history/thread.retired"), b"retired").unwrap();
+        assert!(write_cache_document_blocking(&path, b"late detached commit").is_err());
+        assert!(!path.exists());
     }
 }

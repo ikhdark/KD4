@@ -20,7 +20,6 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
-use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
@@ -142,6 +141,7 @@ pub(super) struct RunExecLikeResult {
     pub(super) exit_code: Option<i32>,
     pub(super) validation_execution_outcome: ValidationExecutionOutcome,
     pub(super) canonical_output: Option<Vec<u8>>,
+    pub(super) canonical_complete: bool,
 }
 
 pub(super) fn shell_failure_sampling_signal(
@@ -149,7 +149,7 @@ pub(super) fn shell_failure_sampling_signal(
     command: &str,
     exit_code: Option<i32>,
 ) -> Option<JsonValue> {
-    if exit_code == Some(0) || attempt_key.is_some_and(|key| key.is_search_no_match(exit_code)) {
+    if exit_code == Some(0) {
         return None;
     }
     let action_fingerprint = attempt_key
@@ -175,23 +175,22 @@ pub(super) fn shell_sampling_signal(
     canonical_output: Option<&[u8]>,
 ) -> Option<JsonValue> {
     shell_failure_sampling_signal(attempt_key, command, exit_code).or_else(|| {
-        (exit_code == Some(0) || attempt_key.is_some_and(|key| key.is_search_no_match(exit_code)))
-            .then(|| {
-                let mut signal = crate::tools::context::semantic_evidence_sampling_signal(
-                    serde_json::json!(crate::tools::context::successful_command_evidence(
-                        canonical_output.unwrap_or_default(),
-                        Some(command),
-                    )),
-                );
-                signal["command_evidence"] = json!(true);
-                signal["empty_output"] = json!(canonical_output.unwrap_or_default().is_empty());
-                if let Some(lineage) = crate::tools::context::declared_lineage_evidence(
+        (exit_code == Some(0)).then(|| {
+            let mut signal = crate::tools::context::semantic_evidence_sampling_signal(
+                serde_json::json!(crate::tools::context::successful_command_evidence(
                     canonical_output.unwrap_or_default(),
-                ) {
-                    signal["declared_lineage"] = lineage;
-                }
-                signal
-            })
+                    Some(command),
+                )),
+            );
+            signal["command_evidence"] = json!(true);
+            signal["empty_output"] = json!(canonical_output.unwrap_or_default().is_empty());
+            if let Some(lineage) = crate::tools::context::declared_lineage_evidence(
+                canonical_output.unwrap_or_default(),
+            ) {
+                signal["declared_lineage"] = lineage;
+            }
+            signal
+        })
     })
 }
 
@@ -207,6 +206,7 @@ pub(super) struct LegacyShellToolOutput {
     pub(super) validation: Option<codex_protocol::validation::ValidationCommandContext>,
     pub(super) inner: FunctionToolOutput,
     pub(super) canonical_output: Option<Vec<u8>>,
+    pub(super) canonical_complete: bool,
     pub(super) exit_code: Option<i32>,
     pub(super) call_id: String,
     pub(super) validation_failure: bool,
@@ -245,10 +245,21 @@ impl ToolOutput for LegacyShellToolOutput {
     }
 
     fn canonical_result(&self, payload: &ToolPayload) -> Option<CanonicalToolResult> {
-        self.canonical_output
+        let mut canonical = self
+            .canonical_output
             .clone()
             .map(CanonicalToolResult::bytes)
-            .or_else(|| self.inner.canonical_result(payload))
+            .or_else(|| self.inner.canonical_result(payload))?;
+        canonical.complete = self.canonical_complete;
+        Some(canonical)
+    }
+
+    fn requires_canonical_artifact(&self) -> bool {
+        !self.canonical_complete
+            || self
+                .canonical_output
+                .as_deref()
+                .is_some_and(|bytes| std::str::from_utf8(bytes).is_err())
     }
 
     fn projection_metadata(&self) -> Option<ToolOutputProjectionMetadata> {
@@ -270,6 +281,7 @@ impl ToolOutput for LegacyShellToolOutput {
         }
         metadata.essential_inline["exit_code"] = serde_json::json!(self.exit_code);
         metadata.essential_inline["call_id"] = serde_json::json!(&self.call_id);
+        metadata.essential_inline["capture_complete"] = serde_json::json!(self.canonical_complete);
         if let Some(validation) = self.validation.as_ref() {
             metadata.essential_inline["validation"] =
                 crate::tools::context::declared_validation_metadata(validation);
@@ -383,6 +395,7 @@ pub(super) async fn run_exec_like(
         validation,
         inner: result.output,
         canonical_output: result.canonical_output,
+        canonical_complete: result.canonical_complete,
         exit_code: result.exit_code,
         call_id,
         validation_failure,
@@ -410,15 +423,7 @@ pub(crate) fn validation_diagnostic_range(
             // even when the complete output is too large to keep inline.
             lines
                 .clone()
-                .position(|line| {
-                    let line = line.trim_start();
-                    line.starts_with("error:")
-                        || line.starts_with("error[")
-                        || line.starts_with("error ")
-                        || line.starts_with("fatal:")
-                        || line.starts_with("FAIL [")
-                        || line.contains(" panicked at ")
-                })
+                .position(codex_command_analysis::shell_output_summary::is_critical_output_line)
                 .unwrap_or_else(|| line_count.saturating_sub(MAX_DIAGNOSTIC_LINES))
         };
     let mut bytes = 0_usize;
@@ -647,6 +652,7 @@ async fn run_exec_like_with_exit_code_inner(
                 exit_code: Some(1),
                 validation_execution_outcome: ValidationExecutionOutcome::NotExecuted,
                 canonical_output: Some(Vec::new()),
+                canonical_complete: true,
             });
         }
         return Err(FunctionCallError::RespondToModel(
@@ -699,6 +705,7 @@ async fn run_exec_like_with_exit_code_inner(
             exit_code: Some(0),
             validation_execution_outcome: ValidationExecutionOutcome::ExecutedSuccess,
             canonical_output: None,
+            canonical_complete: false,
         });
     }
 
@@ -710,6 +717,7 @@ async fn run_exec_like_with_exit_code_inner(
         turn_environment.environment_id.clone(),
     )
     .with_model_command_text(hook_command.clone())
+    .with_captured_environment(&turn_environment)
     .with_max_output_tokens(max_output_tokens);
     let event_tracker = track_command_mutations.then_some(&tracker);
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
@@ -843,6 +851,9 @@ async fn run_exec_like_with_exit_code_inner(
         .await
         .map(|result| result.output);
     let retained_validation_attempt = runtime.take_last_validation_attempt_output();
+    let raw_capture = runtime.take_raw_output(
+        matches!(&out, Err(ToolError::Denied(_))) && retained_validation_attempt.is_some(),
+    );
     let runtime_validation_attempt_started = runtime.take_last_validation_attempt_started();
     let validation_attempt_started = is_validation
         && (retained_validation_attempt.is_some()
@@ -869,12 +880,27 @@ async fn run_exec_like_with_exit_code_inner(
         Err(_) => false,
     };
     let exit_code = out.as_ref().ok().map(|output| output.exit_code);
+    let search_no_match = out.as_ref().ok().is_some_and(|output| {
+        attempt_key
+            .as_ref()
+            .is_some_and(|key| key.is_search_no_match(exit_code))
+            && !output.timed_out
+            && output.stderr.text.is_empty()
+            && !output.stdout.truncated
+            && !output.stderr.truncated
+            && !output.aggregated_output.truncated
+    });
     let retry_exit_code = retry_exit_code(&out);
     if let (Some(attempt_key), Some(retry_exit_code)) = (attempt_key.as_ref(), retry_exit_code) {
         session
             .services
             .command_execution
             .record_exit(attempt_key, retry_exit_code)
+            .await;
+        session
+            .services
+            .command_execution
+            .record_verified_search_result(attempt_key, search_no_match)
             .await;
     }
     let execution_output = shell_validation_execution_output(&out, None);
@@ -897,21 +923,36 @@ async fn run_exec_like_with_exit_code_inner(
             &output.aggregated_output.text,
         )
     });
-    let raw_output_artifact = if model_projection
+    let canonical_complete = raw_capture
         .as_ref()
-        .is_some_and(|projection| projection.reduced)
-        && let Some(output) = execution_output
-    {
-        Some(
-            create_raw_output_artifact(
-                turn.config.codex_home.as_path(),
-                &session.thread_id.to_string(),
-                output.aggregated_output.text.as_bytes(),
-            )
-            .await,
-        )
-    } else {
-        None
+        .and_then(|capture| capture.canonical.as_ref())
+        .is_some_and(|canonical| canonical.complete);
+    let canonical_output = raw_capture
+        .as_ref()
+        .and_then(|capture| capture.canonical.as_ref())
+        .map(|canonical| canonical.bytes.clone());
+    let raw_output_artifact = match raw_capture.map(|capture| capture.artifact) {
+        Some(artifact) if !artifact.is_pending() => Some(artifact),
+        // Small complete captures stay inline. A reduced display still needs a
+        // recovery handle, so retain the exact original bytes on demand.
+        _ if canonical_complete
+            && model_projection
+                .as_ref()
+                .is_some_and(|projection| projection.reduced) =>
+        {
+            match canonical_output.as_deref() {
+                Some(bytes) => Some(
+                    crate::tools::command_output_artifact::create_raw_output_artifact(
+                        turn.config.codex_home.as_path(),
+                        &session.thread_id.to_string(),
+                        bytes,
+                    )
+                    .await,
+                ),
+                None => None,
+            }
+        }
+        _ => None,
     };
     let reduction_notice = raw_output_artifact
         .as_ref()
@@ -920,13 +961,8 @@ async fn run_exec_like_with_exit_code_inner(
         .and_then(|((artifact, source), projection)| {
             artifact.reduction_notice(&source.aggregated_output.text, &projection.text)
         });
-    let canonical_output = canonical_exec_output_bytes(&out);
     let output_bearing_result = shell_result_has_execution_output(&out);
-    let tool_outcome = if out.is_ok()
-        && attempt_key
-            .as_ref()
-            .is_some_and(|key| key.is_search_no_match(exit_code))
-    {
+    let tool_outcome = if search_no_match {
         codex_tools::ToolOutputOutcome::Success
     } else {
         shell_tool_outcome(&out)
@@ -956,19 +992,17 @@ async fn run_exec_like_with_exit_code_inner(
         if let Some(id) = raw_output_artifact.model_projection().0 {
             essential_inline.insert("raw_output_artifact_id".to_string(), json!(id.to_string()));
         }
-        insert_metadata_before_output(
-            &mut content,
-            &raw_output_artifact.render_for_model_with_source_truncation(source_capture_truncated),
-        );
+        insert_metadata_before_output(&mut content, &raw_output_artifact.render_for_model());
         if let Some(notice) = reduction_notice {
             content.push('\n');
             content.push_str(&notice);
         }
     }
-    if source_capture_truncated {
-        content.push_str(
-            "\n\n[output capture truncated at execution retained-byte limit; omitted bytes are unavailable]",
-        );
+    if !canonical_complete {
+        content.push_str("\n\n[original-byte capture incomplete or unavailable; recovery does not certify all producer output]");
+    } else if source_capture_truncated {
+        content
+            .push_str("\n\n[display capture reduced; original bytes retained for exact recovery]");
     }
     let validation_execution_outcome = match exit_code {
         Some(0) => ValidationExecutionOutcome::ExecutedSuccess,
@@ -986,7 +1020,7 @@ async fn run_exec_like_with_exit_code_inner(
         sampling_request_signal: shell_sampling_signal(
             attempt_key.as_ref(),
             req.hook_command.as_str(),
-            exit_code,
+            if search_no_match { Some(0) } else { exit_code },
             canonical_output.as_deref(),
         ),
         deterministic_continuation_receipts: Vec::new(),
@@ -998,6 +1032,7 @@ async fn run_exec_like_with_exit_code_inner(
         exit_code,
         validation_execution_outcome,
         canonical_output,
+        canonical_complete,
     })
 }
 
@@ -1063,17 +1098,6 @@ fn shell_validation_execution_output<'a>(
             Some(output.as_ref())
         }
         Err(_) => retained_validation_attempt,
-    }
-}
-
-fn canonical_exec_output_bytes(out: &Result<ExecToolCallOutput, ToolError>) -> Option<Vec<u8>> {
-    match out {
-        Ok(output) => Some(output.aggregated_output.text.as_bytes().to_vec()),
-        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
-        | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
-            Some(output.aggregated_output.text.as_bytes().to_vec())
-        }
-        Err(_) => None,
     }
 }
 

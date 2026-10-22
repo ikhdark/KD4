@@ -508,11 +508,13 @@ async fn collect_mcp_server_status_snapshot_impl(
     // A status request owns this short-lived manager. Unlike prompt discovery,
     // it must wait for the selected servers before reading their ready catalog.
     futures::future::join_all(mcp_servers.iter().map(|(name, server)| {
-        let timeout = server.configured_config()
+        let timeout = server
+            .configured_config()
             .and_then(|config| config.startup_timeout_sec)
             .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
         mcp_connection_manager.wait_for_server_ready(name, timeout)
-    })).await;
+    }))
+    .await;
     let snapshot = collect_mcp_server_status_snapshot_from_manager(
         &mcp_connection_manager,
         auth_status_entries,
@@ -757,10 +759,20 @@ async fn collect_mcp_server_status_snapshot_from_manager(
     McpServerStatusSnapshot {
         server_infos,
         tools_by_server,
-        resources: convert_mcp_resources(resources.results.into_iter()
-            .map(|(server, page)| (server, page.resources)).collect()),
-        resource_templates: convert_mcp_resource_templates(resource_templates.results.into_iter()
-            .map(|(server, page)| (server, page.resource_templates)).collect()),
+        resources: convert_mcp_resources(
+            resources
+                .results
+                .into_iter()
+                .map(|(server, page)| (server, page.resources))
+                .collect(),
+        ),
+        resource_templates: convert_mcp_resource_templates(
+            resource_templates
+                .results
+                .into_iter()
+                .map(|(server, page)| (server, page.resource_templates))
+                .collect(),
+        ),
         resource_errors: resources
             .errors
             .into_iter()

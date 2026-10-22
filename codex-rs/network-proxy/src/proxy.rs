@@ -194,7 +194,7 @@ impl NetworkProxyBuilder {
         let current_cfg = state.current_cfg().await?;
         let codex_home = self.codex_home.map_or_else(find_codex_home, Ok)?;
         let (requested_http_addr, requested_socks_addr, reserved_listeners) =
-            if self.managed_by_codex {
+            if self.managed_by_codex && current_cfg.enabled {
                 let runtime = config::resolve_runtime(&current_cfg)?;
 
                 let (managed_http_addr, managed_socks_addr) =
@@ -309,6 +309,7 @@ fn reserve_loopback_ephemeral_listener() -> Result<StdTcpListener> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetworkProxyRuntimeSettings {
+    enabled: bool,
     allow_local_binding: bool,
     allow_unix_sockets: Arc<[String]>,
     dangerously_allow_all_unix_sockets: bool,
@@ -317,7 +318,7 @@ struct NetworkProxyRuntimeSettings {
 
 impl NetworkProxyRuntimeSettings {
     async fn from_config(config: &config::NetworkProxyConfig, codex_home: &Path) -> Result<Self> {
-        let mitm_ca_trust_bundle = if config.mitm {
+        let mitm_ca_trust_bundle = if config.enabled && config.mitm {
             let env = crate::certs::ca_env_from_process();
             let codex_home = codex_home.to_path_buf();
             // CA initialization locks artifacts and loads native roots and PEM files.
@@ -333,6 +334,7 @@ impl NetworkProxyRuntimeSettings {
             None
         };
         Ok(Self {
+            enabled: config.enabled,
             allow_local_binding: config.allow_local_binding,
             allow_unix_sockets: config.allow_unix_sockets().into(),
             dangerously_allow_all_unix_sockets: config.dangerously_allow_all_unix_sockets,
@@ -562,6 +564,23 @@ fn apply_proxy_env_overrides(
     }
 }
 
+/// Preparation for a disabled proxy. A disabled proxy is inert: it reserves no listener and
+/// publishes no route. Callers still attach it while managed network requirements exist, so the
+/// command keeps managed-network enforcement with no proxy to reach. Remove inherited proxy
+/// routing variables (any case): a child must not route through them, and the Windows offline
+/// sandbox allows exactly the loopback ports those variables name.
+fn route_free_preparation(mut env: HashMap<String, String>) -> PreparedManagedNetwork {
+    env.retain(|key, _| {
+        !PROXY_ENV_KEYS
+            .iter()
+            .any(|proxy_key| proxy_key.eq_ignore_ascii_case(key))
+    });
+    PreparedManagedNetwork {
+        env,
+        sandbox_context: ManagedNetworkSandboxContext::default(),
+    }
+}
+
 impl NetworkProxy {
     pub fn builder() -> NetworkProxyBuilder {
         NetworkProxyBuilder::default()
@@ -616,6 +635,9 @@ impl NetworkProxy {
         addrs: EnvironmentProxyAddrs,
     ) -> PreparedManagedNetwork {
         let runtime_settings = self.runtime_settings();
+        if !runtime_settings.enabled {
+            return route_free_preparation(env);
+        }
         // Enforce proxying for child processes. Proxy endpoint values are always rewritten;
         // managed MITM CA vars all use the merged, sandbox-readable trust bundle.
         apply_proxy_env_overrides(
@@ -679,6 +701,11 @@ impl NetworkProxy {
         env: &mut HashMap<String, String>,
         environment_id: &str,
     ) -> Result<()> {
+        if !self.runtime_settings().enabled {
+            // A disabled proxy never creates per-environment listeners.
+            *env = route_free_preparation(std::mem::take(env)).env;
+            return Ok(());
+        }
         let addrs = self.environment_proxy_addrs(environment_id)?;
         self.apply_to_env_for_addrs(env, addrs);
         Ok(())
@@ -699,12 +726,17 @@ impl NetworkProxy {
     }
 
     /// Applies the environment-specific proxy settings and returns the matching portable sandbox
-    /// projection from the same runtime configuration snapshot.
+    /// projection from the same runtime configuration snapshot. A disabled proxy succeeds without
+    /// creating a listener: the command gets no proxy route and no sandbox loopback port, so
+    /// managed enforcement leaves it without network access instead of failing the launch.
     pub fn prepare_for_optional_environment(
         &self,
         env: HashMap<String, String>,
         environment_id: Option<&str>,
     ) -> Result<PreparedManagedNetwork> {
+        if !self.runtime_settings().enabled {
+            return Ok(route_free_preparation(env));
+        }
         let addrs = match environment_id {
             Some(environment_id) => self.environment_proxy_addrs(environment_id)?,
             None => EnvironmentProxyAddrs {
@@ -1039,19 +1071,32 @@ impl NetworkProxyHandle {
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
-        if let Some(connections) = self.connections.as_mut() { connections.cancel(); }
+        if let Some(connections) = self.connections.as_mut() {
+            connections.cancel();
+        }
         // Signal every runtime before waiting on any listener or accepted task.
         {
-            let mut proxies = self.environment_proxies.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            for proxy in proxies.as_mut().into_iter().flat_map(|proxies| proxies.values_mut()) {
+            let mut proxies = self
+                .environment_proxies
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for proxy in proxies
+                .as_mut()
+                .into_iter()
+                .flat_map(|proxies| proxies.values_mut())
+            {
                 proxy.connections.cancel();
                 proxy.http_task.abort();
-                if let Some(task) = &proxy.socks_task { task.abort(); }
+                if let Some(task) = &proxy.socks_task {
+                    task.abort();
+                }
             }
         }
         abort_tasks(self.http_task.take(), self.socks_task.take()).await;
         abort_environment_proxies(self.environment_proxies.clone()).await;
-        if let Some(connections) = self.connections.take() { connections.shutdown().await; }
+        if let Some(connections) = self.connections.take() {
+            connections.shutdown().await;
+        }
         self.completed = true;
         Ok(())
     }
@@ -1108,7 +1153,9 @@ impl Drop for NetworkProxyHandle {
         if self.completed {
             return;
         }
-        if let Some(connections) = self.connections.as_mut() { connections.cancel(); }
+        if let Some(connections) = self.connections.as_mut() {
+            connections.cancel();
+        }
         if let Some(task) = &self.http_task {
             task.abort();
         }
@@ -1280,6 +1327,77 @@ mod tests {
             assert_eq!(proxy.http_addr, http_addr);
             assert_eq!(proxy.socks_addr, socks_addr);
         }
+    }
+
+    #[tokio::test]
+    async fn disabled_proxy_neither_reserves_listeners_nor_publishes_routes() {
+        let home = tempfile::tempdir().unwrap();
+        let config = NetworkProxyConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let state = crate::state::build_config_state_with_codex_home(
+            config,
+            crate::state::NetworkProxyConstraints::default(),
+            home.path(),
+        )
+        .unwrap();
+        let state = Arc::new(NetworkProxyState::with_reloader(
+            state,
+            Arc::new(crate::runtime::NoopReloader),
+        ));
+        let proxy = NetworkProxy::builder().state(state).build().await.unwrap();
+        assert!(proxy.reserved_listeners.is_none());
+        // Callers keep a disabled proxy attached while managed network requirements exist, so
+        // every preparation entry point must let the command launch without a route: inherited
+        // proxy routing variables are removed in any case, unrelated variables survive, and the
+        // sandbox context grants no loopback port or local binding.
+        let inherited_route = "http://127.0.0.1:8888".to_string();
+        let env = HashMap::from([
+            ("HTTP_PROXY".to_string(), inherited_route.clone()),
+            ("Https_Proxy".to_string(), inherited_route.clone()),
+            ("all_proxy".to_string(), inherited_route),
+            (PROXY_ACTIVE_ENV_KEY.to_string(), "1".to_string()),
+            (ALLOW_LOCAL_BINDING_ENV_KEY.to_string(), "1".to_string()),
+            ("PRESERVED".to_string(), "value".to_string()),
+        ]);
+        let route_free = PreparedManagedNetwork {
+            env: HashMap::from([("PRESERVED".to_string(), "value".to_string())]),
+            sandbox_context: ManagedNetworkSandboxContext::default(),
+        };
+        let mut legacy_env = env.clone();
+        proxy.apply_to_env(&mut legacy_env);
+        assert_eq!(legacy_env, route_free.env);
+        let mut environment_env = env.clone();
+        proxy
+            .apply_to_env_for_optional_environment(&mut environment_env, Some("disabled"))
+            .unwrap();
+        assert_eq!(environment_env, route_free.env);
+        for environment_id in [None, Some("disabled")] {
+            assert_eq!(
+                proxy
+                    .prepare_for_optional_environment(env.clone(), environment_id)
+                    .unwrap(),
+                route_free
+            );
+        }
+        assert_eq!(
+            proxy
+                .prepare_for_optional_environment_async(env, Some("disabled"))
+                .await
+                .unwrap(),
+            route_free
+        );
+        assert!(
+            proxy
+                .environment_proxies
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        proxy.run().await.unwrap().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1479,7 +1597,10 @@ mod tests {
         assert_eq!(env.get(GIT_SSH_COMMAND_ENV_KEY), None);
         assert_eq!(env.get("DOCKER_HTTP_PROXY"), None);
         assert_eq!(env.get("DOCKER_HTTPS_PROXY"), None);
-        assert_eq!(env.get("HTTPS_PROXY").map(String::as_str), Some("http://127.0.0.1:3128"));
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:3128")
+        );
         for key in env.keys() {
             assert!(
                 PROXY_ENV_KEYS.contains(&key.as_str()),

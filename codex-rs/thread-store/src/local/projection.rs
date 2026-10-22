@@ -47,6 +47,7 @@ pub(super) struct LocalThreadProjectionEntry {
     state: Mutex<LocalThreadProjection>,
     operation_gate: Arc<Semaphore>,
     source_version: Mutex<Option<(PathBuf, u64, Option<SystemTime>)>>,
+    payload_versions: Mutex<Vec<codex_rollout::PayloadDependencyVersion>>,
     last_unloaded_read: StdMutex<Option<Instant>>,
 }
 
@@ -71,6 +72,7 @@ struct ProjectedTurn {
 pub(super) struct LocalThreadProjection {
     builder: ThreadHistoryBuilder,
     initialized: bool,
+    source_partial: bool,
     turn_order: Vec<String>,
     turn_positions: HashMap<String, usize>,
     turns: HashMap<String, ProjectedTurn>,
@@ -85,6 +87,7 @@ impl Default for LocalThreadProjection {
         Self {
             builder: ThreadHistoryBuilder::new(),
             initialized: false,
+            source_partial: false,
             turn_order: Vec::new(),
             turn_positions: HashMap::new(),
             turns: HashMap::new(),
@@ -100,11 +103,13 @@ impl LocalThreadProjection {
     fn initialize(&mut self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
         *self = Self::default();
         self.initialized = true;
+        self.source_partial = codex_rollout::ensure_rollout_source_integrity(items).is_err();
         let persisted_items = persisted_rollout_items(items, ThreadHistoryMode::Legacy);
         self.apply_persisted_items(persisted_items.as_slice())
     }
 
     fn apply_persisted_items(&mut self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        self.source_partial |= codex_rollout::ensure_rollout_source_integrity(items).is_err();
         if items.is_empty() {
             return Ok(());
         }
@@ -239,6 +244,12 @@ impl LocalThreadProjection {
     }
 
     fn list_turns(&self, params: &ListTurnsParams) -> ThreadStoreResult<TurnPage> {
+        if self.source_partial {
+            return Err(ThreadStoreError::Conflict {
+                message: "rollout history has known reconstruction gaps; turn view is incomplete"
+                    .into(),
+            });
+        }
         require_positive_page_size(params.page_size)?;
         let anchor = params
             .cursor
@@ -286,6 +297,12 @@ impl LocalThreadProjection {
     }
 
     fn list_items(&self, params: &ListItemsParams) -> ThreadStoreResult<ItemPage> {
+        if self.source_partial {
+            return Err(ThreadStoreError::Conflict {
+                message: "rollout history has known reconstruction gaps; item view is incomplete"
+                    .into(),
+            });
+        }
         require_positive_page_size(params.page_size)?;
         if let Some(turn_id) = params.turn_id.as_ref()
             && !self.turns.contains_key(turn_id)
@@ -483,6 +500,7 @@ impl LocalThreadProjectionEntry {
             state: Mutex::new(LocalThreadProjection::default()),
             operation_gate: Arc::new(Semaphore::new(1)),
             source_version: Mutex::new(None),
+            payload_versions: Mutex::new(Vec::new()),
             last_unloaded_read: StdMutex::new(None),
         }
     }
@@ -578,9 +596,16 @@ pub(super) async fn initialize_from_store(
         };
         // The operation permit serializes initialization; the version lock need
         // not stay held while loading the durable history.
-        let source_changed =
-            source_version.is_none() || *projection.source_version.lock().await != source_version;
+        let dependencies = projection.payload_versions.lock().await.clone();
+        let source_changed = source_version.is_none()
+            || *projection.source_version.lock().await != source_version
+            || !codex_rollout::payload_dependencies_unchanged(&dependencies).await;
         if source_changed {
+            let dependencies = if let Some((path, _, _)) = source_version.as_ref() {
+                codex_rollout::payload_dependency_versions(path).await.ok()
+            } else {
+                None
+            };
             let history = store
                 .load_history(LoadThreadHistoryParams {
                     thread_id,
@@ -588,7 +613,27 @@ pub(super) async fn initialize_from_store(
                 })
                 .await?;
             projection.initialize(history.items.as_slice()).await?;
-            *projection.source_version.lock().await = source_version;
+            let degraded = history.items.iter().any(|item| match item {
+                RolloutItem::ResponseItem(item) => {
+                    codex_rollout::is_rollout_reconstruction_notice(item)
+                }
+                RolloutItem::Compacted(item) => {
+                    item.replacement_history.as_ref().is_some_and(|items| {
+                        items
+                            .iter()
+                            .any(codex_rollout::is_rollout_reconstruction_notice)
+                    })
+                }
+                _ => false,
+            });
+            let cacheable = !degraded
+                && if let Some(versions) = &dependencies {
+                    codex_rollout::payload_dependencies_unchanged(versions).await
+                } else {
+                    false
+                };
+            *projection.payload_versions.lock().await = dependencies.unwrap_or_default();
+            *projection.source_version.lock().await = if cacheable { source_version } else { None };
         }
         projection.mark_unloaded_read();
         evict_least_recent_unloaded_projections(store).await;
@@ -865,6 +910,42 @@ fn serialize_item_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_audit_14_partial_source_blocks_views_but_not_canonical_mutations() {
+        let notice = serde_json::from_value(serde_json::json!({
+            "type": "message", "id": "msg_rollout_gap_1", "role": "developer",
+            "content": [{"type": "input_text", "text": "source history incomplete"}]
+        }))
+        .unwrap();
+        let mut projection = LocalThreadProjection::default();
+        projection
+            .initialize(&[RolloutItem::ResponseItem(notice)])
+            .unwrap();
+        projection.append_pending(vec![RolloutItem::EventMsg(
+            codex_protocol::protocol::EventMsg::TokenCount(
+                codex_protocol::protocol::TokenCountEvent {
+                    info: None,
+                    rate_limits: None,
+                },
+            ),
+        )]);
+        projection.commit_pending().unwrap();
+        let params = ListTurnsParams {
+            thread_id: ThreadId::new(),
+            include_archived: true,
+            cursor: None,
+            page_size: 10,
+            sort_direction: SortDirection::Asc,
+            items_view: StoredTurnItemsView::Full,
+        };
+        assert!(matches!(
+            projection.list_turns(&params),
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        projection.initialize(&[]).unwrap();
+        assert!(projection.list_turns(&params).unwrap().turns.is_empty());
+    }
     use crate::local::test_support::test_config;
     use crate::local::test_support::write_session_file;
 

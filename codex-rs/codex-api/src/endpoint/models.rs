@@ -234,8 +234,16 @@ mod tests {
 
             assert_eq!(models.len(), 0);
             assert_eq!(etag.as_deref(), expected_etag);
-            assert_eq!(transport.last_request.lock().unwrap().as_ref().unwrap().max_response_bytes,
-                Some(32 * 1024 * 1024));
+            assert_eq!(
+                transport
+                    .last_request
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .max_response_bytes,
+                Some(32 * 1024 * 1024)
+            );
 
             let url = transport
                 .last_request

@@ -105,8 +105,7 @@ async fn thread_status_changed_emits_runtime_updates() -> Result<()> {
             JSONRPCMessage::Notification(JSONRPCNotification {
                 method,
                 params: Some(params),
-            }) if method == "turn/completed" =>
-            {
+            }) if method == "turn/completed" => {
                 let notification: TurnCompletedNotification = serde_json::from_value(params)?;
                 assert_eq!(notification.thread_id, thread.id);
                 assert_eq!(notification.turn.id, started.turn.id);

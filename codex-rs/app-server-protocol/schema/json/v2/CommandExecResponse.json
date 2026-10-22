@@ -1,5 +1,27 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProcessOutputCaptureState": {
+      "description": "Per-stream capture facts, independent of the root process exit status. Complete capture requires `reachedEof` and neither limit flag. A closed producer without EOF can indicate read failure or forced reader shutdown.",
+      "properties": {
+        "capReached": {
+          "type": "boolean"
+        },
+        "drainTimedOut": {
+          "type": "boolean"
+        },
+        "reachedEof": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "capReached",
+        "drainTimedOut",
+        "reachedEof"
+      ],
+      "type": "object"
+    }
+  },
   "description": "Final buffered result for `command/exec`.",
   "properties": {
     "exitCode": {
@@ -11,9 +33,44 @@
       "description": "Buffered stderr capture.\n\nEmpty when stderr was streamed via `command/exec/outputDelta`.",
       "type": "string"
     },
+    "stderrBase64": {
+      "description": "Exact undelivered stderr suffix; same contract as `stdoutBase64`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stderrCapture": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProcessOutputCaptureState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "stdout": {
       "description": "Buffered stdout capture.\n\nEmpty when stdout was streamed via `command/exec/outputDelta`.",
       "type": "string"
+    },
+    "stdoutBase64": {
+      "description": "Exact undelivered stdout suffix, appended after streamed raw deltas. When present use these bytes, not the lossy legacy `stdout` projection.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stdoutCapture": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProcessOutputCaptureState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Absent only for peers/backends that cannot report capture facts."
     }
   },
   "required": [

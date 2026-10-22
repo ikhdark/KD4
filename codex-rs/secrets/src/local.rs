@@ -228,7 +228,7 @@ impl LocalSecretsBackend {
         let loaded = self
             .keyring_store
             .load(keyring_service(), &account)
-            .map_err(|err| anyhow::anyhow!(err.message()))
+            .map_err(std::io::Error::from)
             .with_context(|| format!("failed to load secrets key from keyring for {account}"))?;
         Ok(loaded.map(SecretString::from))
     }
@@ -244,7 +244,7 @@ impl LocalSecretsBackend {
                 let account = compute_keyring_account(&self.codex_home);
                 self.keyring_store
                     .save(keyring_service(), &account, generated.expose_secret())
-                    .map_err(|err| anyhow::anyhow!(err.message()))
+                    .map_err(std::io::Error::from)
                     .context("failed to persist secrets key in keyring")?;
                 Ok(generated)
             }
@@ -393,12 +393,18 @@ mod tests {
     fn canonical_keys_preserve_opaque_environment_ids_and_reject_malformed_names() {
         for (key, scope) in [
             ("global/TOKEN", SecretScope::Global),
-            ("env/simple/TOKEN", SecretScope::environment("simple").unwrap()),
+            (
+                "env/simple/TOKEN",
+                SecretScope::environment("simple").unwrap(),
+            ),
             (
                 "env/team/project/TOKEN",
                 SecretScope::environment("team/project").unwrap(),
             ),
-            ("env//team//TOKEN", SecretScope::environment("/team/").unwrap()),
+            (
+                "env//team//TOKEN",
+                SecretScope::environment("/team/").unwrap(),
+            ),
         ] {
             assert_eq!(
                 parse_canonical_key(key),
@@ -542,7 +548,10 @@ mod tests {
         filenames.sort();
         assert_eq!(
             filenames,
-            vec![SECRETS_LOCK_FILENAME.to_string(), LOCAL_SECRETS_FILENAME.to_string()]
+            vec![
+                SECRETS_LOCK_FILENAME.to_string(),
+                LOCAL_SECRETS_FILENAME.to_string()
+            ]
         );
         assert_eq!(backend.get(&scope, &name)?, Some("two".to_string()));
         Ok(())
@@ -576,7 +585,11 @@ mod tests {
         }
 
         impl KeyringStore for PausedFirstLoad {
-            fn load(&self, service: &str, account: &str) -> Result<Option<String>, CredentialStoreError> {
+            fn load(
+                &self,
+                service: &str,
+                account: &str,
+            ) -> Result<Option<String>, CredentialStoreError> {
                 let value = self.inner.load(service, account)?;
                 if self.first.swap(false, Ordering::SeqCst) {
                     assert_eq!(value, None, "first writer must observe an absent key");
@@ -590,7 +603,12 @@ mod tests {
                 Ok(value)
             }
 
-            fn save(&self, service: &str, account: &str, value: &str) -> Result<(), CredentialStoreError> {
+            fn save(
+                &self,
+                service: &str,
+                account: &str,
+                value: &str,
+            ) -> Result<(), CredentialStoreError> {
                 self.inner.save(service, account, value)
             }
 
@@ -652,14 +670,22 @@ mod tests {
         first_result?;
         if let Err(error) = second_result {
             assert_eq!(
-                error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
                 Some(std::io::ErrorKind::WouldBlock),
                 "unexpected concurrent-write error: {error:#}"
             );
             second.set(&SecretScope::Global, &second_name, "second")?;
         }
-        assert_eq!(first.get(&SecretScope::Global, &name)?, Some("first".to_string()));
-        assert_eq!(second.get(&SecretScope::Global, &second_name)?, Some("second".to_string()));
+        assert_eq!(
+            first.get(&SecretScope::Global, &name)?,
+            Some("first".to_string())
+        );
+        assert_eq!(
+            second.get(&SecretScope::Global, &second_name)?,
+            Some("second".to_string())
+        );
         Ok(())
     }
 
@@ -678,7 +704,11 @@ mod tests {
             backend.get(&SecretScope::Global, &name).unwrap_err(),
             backend.list(None).unwrap_err(),
         ] {
-            assert!(error.to_string().contains("secrets key is missing from keyring"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("secrets key is missing from keyring")
+            );
             assert_eq!(keyring.load(keyring_service(), &account)?, None);
         }
         assert_eq!(fs::read(backend.secrets_path())?, ciphertext);
@@ -694,9 +724,13 @@ mod tests {
                 Arc::new(MockKeyringStore::default()),
             );
             let name = SecretName::new("CHILD_TOKEN")?;
-            let error = backend.set(&SecretScope::Global, &name, "blocked").unwrap_err();
+            let error = backend
+                .set(&SecretScope::Global, &name, "blocked")
+                .unwrap_err();
             assert_eq!(
-                error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
                 Some(std::io::ErrorKind::WouldBlock)
             );
             println!("child observed secrets write contention");
@@ -710,17 +744,29 @@ mod tests {
         backend.set(&SecretScope::Global, &name, "retained")?;
         let lock = backend.lock_secrets()?;
         let alias = LocalSecretsBackend::new(home.path().join("."), keyring);
-        assert_eq!(compute_keyring_account(home.path()), compute_keyring_account(&home.path().join(".")));
-        assert_eq!(alias.get(&SecretScope::Global, &name)?, Some("retained".to_string()));
+        assert_eq!(
+            compute_keyring_account(home.path()),
+            compute_keyring_account(&home.path().join("."))
+        );
+        assert_eq!(
+            alias.get(&SecretScope::Global, &name)?,
+            Some("retained".to_string())
+        );
         assert_eq!(alias.list(None)?.len(), 1);
         let error = alias.delete(&SecretScope::Global, &name).unwrap_err();
         assert_eq!(
-            error.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
             Some(std::io::ErrorKind::WouldBlock)
         );
 
         let mut child = std::process::Command::new(std::env::current_exe()?)
-            .args(["--exact", "local::tests::write_lock_is_shared_across_processes_and_home_path_aliases", "--nocapture"])
+            .args([
+                "--exact",
+                "local::tests::write_lock_is_shared_across_processes_and_home_path_aliases",
+                "--nocapture",
+            ])
             .env(CHILD_HOME, home.path().join("."))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -748,10 +794,20 @@ mod tests {
         let output = child.wait_with_output()?;
         drop(lock);
         assert!(!timed_out, "contending process must not wait for the lock");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("child observed secrets write contention"));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("child observed secrets write contention")
+        );
         alias.set(&SecretScope::Global, &name, "after release")?;
-        assert_eq!(backend.get(&SecretScope::Global, &name)?, Some("after release".to_string()));
+        assert_eq!(
+            backend.get(&SecretScope::Global, &name)?,
+            Some("after release".to_string())
+        );
         assert!(alias.delete(&SecretScope::Global, &name)?);
         assert_eq!(backend.get(&SecretScope::Global, &name)?, None);
         Ok(())

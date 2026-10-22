@@ -37,10 +37,10 @@ use codex_utils_pty::ManagedRootProcess;
 use codex_utils_pty::WINDOWS_CREATE_SUSPENDED;
 use codex_utils_pty::configure_windows_command_args;
 use codex_utils_pty::run_windows_process_operation;
+use futures::FutureExt;
 use tokio::fs;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tokio::time::timeout_at;
@@ -61,6 +61,7 @@ struct ShellSnapshotConfig {
     state_db: Option<StateDbHandle>,
     environment_variables: HashMap<String, String>,
     remote_environment_policy: ExecEnvPolicy,
+    shell_environment_policy: ShellEnvironmentPolicy,
     tasks: tokio_util::task::TaskTracker,
     builder_tasks: tokio_util::task::TaskTracker,
 }
@@ -68,6 +69,13 @@ struct ShellSnapshotConfig {
 pub(crate) struct ShellSnapshotFile {
     location: ShellSnapshotLocation,
     contents: String,
+}
+
+/// Immutable capture identity, kept beside both ready and pending artifacts.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ShellSnapshotOrigin {
+    pub(crate) policy: ShellEnvironmentPolicy,
+    pub(crate) shell: Shell,
 }
 
 enum ShellSnapshotLocation {
@@ -131,6 +139,7 @@ impl ShellSnapshot {
                 remote_environment_policy: exec_env_policy_from_shell_policy(
                     &shell_environment_policy,
                 ),
+                shell_environment_policy,
                 tasks: tasks.clone(),
                 builder_tasks: builder_tasks.clone(),
             })),
@@ -144,6 +153,34 @@ impl ShellSnapshot {
             config: None,
             tasks: tokio_util::task::TaskTracker::new(),
             builder_tasks: tokio_util::task::TaskTracker::new(),
+        }
+    }
+
+    pub(crate) fn origin(&self, environment: &TurnEnvironment) -> Option<ShellSnapshotOrigin> {
+        let config = self.config.as_ref()?;
+        let shell = environment.shell.as_ref()?;
+        (shell.shell_type == ShellType::Cmd).then(|| ShellSnapshotOrigin {
+            policy: config.shell_environment_policy.clone(),
+            shell: shell.clone(),
+        })
+    }
+
+    pub(crate) fn restrict_inherited(
+        &self,
+        environment: &mut TurnEnvironment,
+        local_override: Option<&Shell>,
+    ) {
+        if !environment.environment.is_remote()
+            && let Some(shell) = local_override
+        {
+            environment.shell = Some(shell.clone());
+        }
+        if self.config.is_none()
+            || environment.shell_snapshot_origin.is_none()
+            || environment.shell_snapshot_origin != self.origin(environment)
+        {
+            environment.shell_snapshot = futures::future::ready(None).boxed().shared();
+            environment.shell_snapshot_origin = None;
         }
     }
 
@@ -220,15 +257,22 @@ impl ShellSnapshot {
             let timer = config
                 .session_telemetry
                 .start_timer("codex.shell_snapshot.duration_ms", &[]);
-            let snapshot = ShellSnapshot::try_create(
-                &config.codex_home,
-                config.session_id,
-                &cwd,
-                &shell,
-                &config.environment_variables,
-                config.state_db.clone(),
-            )
-            .await;
+            let owner = Arc::clone(&config);
+            let snapshot = config
+                .builder_tasks
+                .spawn(async move {
+                    ShellSnapshot::try_create(
+                        &owner.codex_home,
+                        owner.session_id,
+                        &cwd,
+                        &shell,
+                        &owner.environment_variables,
+                        owner.state_db.clone(),
+                    )
+                    .await
+                })
+                .await
+                .unwrap_or(Err("write_failed"));
             let success_tag = if snapshot.is_ok() { "true" } else { "false" };
             let _ = timer.map(|timer| timer.finish(&[("success", success_tag)]));
             let mut counter_tags = vec![("success", success_tag)];
@@ -281,10 +325,10 @@ impl ShellSnapshot {
         });
 
         // Make the new snapshot.
-        let contents =
+        let snapshot =
             match write_shell_snapshot(shell, &temp_path, session_cwd, environment_variables).await
             {
-                Ok(contents) => contents,
+                Ok(snapshot) => snapshot,
                 Err(err) => {
                     tracing::warn!(
                         "Failed to create shell snapshot for {}: {err:?}",
@@ -298,10 +342,6 @@ impl ShellSnapshot {
             temp_path.display()
         );
 
-        let snapshot = ShellSnapshotFile {
-            location: ShellSnapshotLocation::Local(temp_path.clone()),
-            contents,
-        };
         if let Err(err) =
             validate_snapshot(shell, &temp_path, session_cwd, environment_variables).await
         {
@@ -512,7 +552,7 @@ async fn write_shell_snapshot(
     output_path: &AbsolutePathBuf,
     cwd: &AbsolutePathBuf,
     environment_variables: &HashMap<String, String>,
-) -> Result<String> {
+) -> Result<ShellSnapshotFile> {
     let raw_snapshot = capture_snapshot(shell, cwd, environment_variables).await?;
     let snapshot = format_snapshot(shell.shell_type, &raw_snapshot)?;
 
@@ -523,21 +563,35 @@ async fn write_shell_snapshot(
             .with_context(|| format!("Failed to create snapshot parent {parent_display}"))?;
     }
 
-    let snapshot_path = output_path.display();
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    let path = output_path.clone();
+    // Native creation and guard installation have no cancellation boundary.
+    // The guard is installed only after create_new succeeds, never for a
+    // pre-existing file, and remains with the actual write/sync owner.
+    tokio::task::spawn_blocking(move || write_local_snapshot_file(path, snapshot, || {}))
+        .await?
+        .map_err(Into::into)
+}
 
-    let mut file = options
-        .open(output_path)
-        .await
-        .with_context(|| format!("Failed to create snapshot at {snapshot_path}"))?;
-    file.write_all(snapshot.as_bytes())
-        .await
-        .with_context(|| format!("Failed to write snapshot to {snapshot_path}"))?;
-    file.sync_all()
-        .await
-        .with_context(|| format!("Failed to persist snapshot to {snapshot_path}"))?;
-
+fn write_local_snapshot_file(
+    path: AbsolutePathBuf,
+    contents: String,
+    after_create: impl FnOnce(),
+) -> std::io::Result<ShellSnapshotFile> {
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let snapshot = ShellSnapshotFile {
+        location: ShellSnapshotLocation::Local(path),
+        contents,
+    };
+    after_create();
+    let result = file
+        .write_all(snapshot.contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    result?;
     Ok(snapshot)
 }
 
@@ -1019,6 +1073,16 @@ async fn run_remote_script_with_timeout(
     environment: &Environment,
     session_id: ThreadId,
 ) -> Result<String> {
+    let runtime = environment
+        .current_runtime()
+        .await?
+        .context("remote snapshot runtime is unavailable")?;
+    let current_shell = Shell::from_environment_shell_info(runtime.info.shell)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if current_shell.shell_type != shell.shell_type || current_shell.shell_path != shell.shell_path
+    {
+        bail!("remote session shell changed before snapshot construction");
+    }
     let args = clean_snapshot_shell_args(
         shell.shell_type,
         shell.derive_exec_args(script, use_login_shell)?,
@@ -1030,7 +1094,7 @@ async fn run_remote_script_with_timeout(
         .unwrap_or(0);
     let deadline = tokio::time::Instant::now() + snapshot_timeout;
     run_remote_snapshot_process_before(
-        environment.get_exec_backend(),
+        runtime.exec_backend,
         ExecParams {
             process_id: format!("{session_id}-shell-snapshot-{nonce}").into(),
             argv: args,

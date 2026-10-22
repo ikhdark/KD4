@@ -132,9 +132,8 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
             let notification = app_server
                 .read_stream_until_notification_message("item/completed")
                 .await?;
-            let completed: ItemCompletedNotification = serde_json::from_value(
-                notification.params.context("item/completed params")?,
-            )?;
+            let completed: ItemCompletedNotification =
+                serde_json::from_value(notification.params.context("item/completed params")?)?;
             if let ThreadItem::CommandExecution {
                 id,
                 status,
@@ -217,11 +216,7 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
         "exec_exit_to_delivery_ms",
         "exec_spawn_to_exit_ms",
         "workspace_evidence_before_ms",
-        "workspace_evidence_after_ms",
-        "pre_tool_hook_ms",
-        "post_tool_hook_ms",
         "output_projection_ms",
-        "history_persistence_ms",
         "post_handler_ms",
     ]
     .map(|field| {
@@ -230,7 +225,24 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
             .and_then(|duration| duration.as_u64())
             .with_context(|| format!("{field} must be a nonnegative integer"))
     });
-    let phase_durations = phase_durations.into_iter().collect::<Result<Vec<_>>>()?;
+    let mut phase_durations = phase_durations.into_iter().collect::<Result<Vec<_>>>()?;
+    // Timing log v2 omits phases that never ran instead of reporting zero: no
+    // hooks are configured, and post-tool evidence capture and history
+    // admission are conditional. A reported phase must still be a duration.
+    for field in [
+        "workspace_evidence_after_ms",
+        "pre_tool_hook_ms",
+        "post_tool_hook_ms",
+        "history_persistence_ms",
+    ] {
+        if let Some(duration) = fields.remove(field) {
+            phase_durations.push(
+                duration
+                    .as_u64()
+                    .with_context(|| format!("{field} must be a nonnegative integer"))?,
+            );
+        }
+    }
     let total_duration_ms = fields
         .remove("total_duration_ms")
         .and_then(|duration| duration.as_u64())
@@ -275,6 +287,8 @@ async fn app_server_emits_structured_tool_call_timing_event() -> Result<()> {
                 "workspace_evidence_before_cache_hit": false,
                 "workspace_evidence_before_timed_out_git_dependencies": "[]",
                 "runtime_tool_call_id": "",
+                "timing_log_version": 2,
+                "parallel_gate_admitted": true,
                 "execution_started": true,
                 "eager": false,
                 "exec_process_alive_at_delivery": false,

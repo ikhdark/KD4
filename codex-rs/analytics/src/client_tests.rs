@@ -131,10 +131,101 @@ fn client_with_receiver() -> (AnalyticsEventsClient, mpsc::Receiver<AnalyticsFac
     let (sender, receiver) = mpsc::channel(8);
     let queue = AnalyticsEventsQueue {
         sender,
+        loss_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         app_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
         plugin_used_emitted_keys: Arc::new(Mutex::new(HashSet::new())),
     };
     (AnalyticsEventsClient { queue: Some(queue) }, receiver)
+}
+
+#[tokio::test]
+async fn audit_observability_queue_loss_does_not_publish_zero_tool_counts() {
+    use crate::analytics_client_tests::ingest_turn_prerequisites;
+    use crate::analytics_client_tests::sample_command_execution_item;
+    use crate::analytics_client_tests::sample_turn_completed_notification;
+    use crate::analytics_client_tests::sample_turn_started_notification;
+    use codex_app_server_protocol::CommandExecutionStatus;
+    use codex_app_server_protocol::ItemCompletedNotification;
+    use codex_app_server_protocol::ItemStartedNotification;
+    for (lost_tool_start, baseline) in [(false, true), (true, true), (true, false)] {
+        let (client, mut receiver) = client_with_receiver();
+        let queue = client.queue.as_ref().unwrap();
+        let mut reducer = crate::reducer::AnalyticsReducer::default();
+        let mut out = Vec::new();
+        ingest_turn_prerequisites(&mut reducer, &mut out, true, true, baseline, true).await;
+        let started = ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-2".into(),
+            turn_id: "turn-2".into(),
+            started_at_ms: 1,
+            item: sample_command_execution_item(CommandExecutionStatus::InProgress, None, None),
+        });
+        if !lost_tool_start {
+            client.track_notification(&started);
+            reducer.ingest(receiver.try_recv().unwrap(), &mut out).await;
+        }
+        for id in 0..8 {
+            queue
+                .sender
+                .try_send(AnalyticsFact::ServerRequestAborted {
+                    completed_at_ms: 1,
+                    request_id: RequestId::Integer(id),
+                })
+                .unwrap();
+        }
+        if !baseline {
+            client.track_notification(&sample_turn_started_notification("thread-2", "turn-2"));
+        }
+        if lost_tool_start {
+            client.track_notification(&started);
+        }
+        client.track_notification(&ServerNotification::ItemCompleted(
+            ItemCompletedNotification {
+                thread_id: "thread-2".into(),
+                turn_id: "turn-2".into(),
+                completed_at_ms: 2,
+                item: sample_command_execution_item(
+                    CommandExecutionStatus::Completed,
+                    Some(0),
+                    Some(1),
+                ),
+            },
+        ));
+        let epoch = queue.loss_epoch.load(std::sync::atomic::Ordering::Acquire);
+        assert!(epoch > 0);
+        while let Ok(fact) = receiver.try_recv() {
+            reducer.observe_delivery_loss(epoch);
+            reducer.ingest(fact, &mut out).await;
+        }
+        reducer.delivery_queue_drained(epoch);
+        client.track_notification(&sample_turn_completed_notification(
+            "thread-2",
+            "turn-2",
+            AppServerTurnStatus::Completed,
+            None,
+        ));
+        reducer.ingest(receiver.try_recv().unwrap(), &mut out).await;
+        let event = out
+            .iter()
+            .find(|event| matches!(event, TrackEventRequest::TurnEvent(_)))
+            .unwrap();
+        let event = serde_json::to_value(event).unwrap();
+        for key in [
+            "total_tool_call_count",
+            "shell_command_count",
+            "file_change_count",
+            "mcp_tool_call_count",
+            "dynamic_tool_call_count",
+            "subagent_tool_call_count",
+            "web_search_count",
+            "image_generation_count",
+        ] {
+            assert!(
+                event["event_params"][key].is_null(),
+                "{key}: lost_start={lost_tool_start}, baseline={baseline}"
+            );
+        }
+        assert_eq!(event["event_params"]["input_tokens"], 123);
+    }
 }
 
 #[tokio::test]
@@ -327,7 +418,6 @@ fn analytics_destination_ignores_capture_file_in_release() {
         }
     );
 }
-
 
 #[tokio::test]
 #[cfg(debug_assertions)]
@@ -528,12 +618,20 @@ fn track_request_only_enqueues_analytics_relevant_requests() {
         (RequestId::Integer(2), sample_turn_steer_request()),
     ] {
         client.track_request(/*connection_id*/ 7, request_id.clone(), &request);
-        let Ok(AnalyticsFact::ClientRequest { connection_id, request_id: queued_id, request: queued }) = receiver.try_recv() else {
+        let Ok(AnalyticsFact::ClientRequest {
+            connection_id,
+            request_id: queued_id,
+            request: queued,
+        }) = receiver.try_recv()
+        else {
             panic!("relevant request should be queued");
         };
         assert_eq!(connection_id, 7);
         assert_eq!(queued_id, request_id);
-        assert_eq!(serde_json::to_value(queued).unwrap(), serde_json::to_value(request).unwrap());
+        assert_eq!(
+            serde_json::to_value(queued).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
     }
 
     let ignored_request = sample_thread_archive_request();
@@ -563,7 +661,13 @@ fn track_response_only_enqueues_analytics_relevant_responses() {
             .expect("serialize original response")
             .1;
         client.track_response(/*connection_id*/ 7, request_id.clone(), response);
-        let Ok(AnalyticsFact::ClientResponse { connection_id, request_id: queued_id, response, thread_originator }) = receiver.try_recv() else {
+        let Ok(AnalyticsFact::ClientResponse {
+            connection_id,
+            request_id: queued_id,
+            response,
+            thread_originator,
+        }) = receiver.try_recv()
+        else {
             panic!("relevant response should be queued");
         };
         assert_eq!(connection_id, 7);
@@ -815,29 +919,30 @@ fn usage_deduplication_is_scoped_to_thread_and_turn() {
     let (client, mut receiver) = client_with_receiver();
     for thread in ["parent", "child"] {
         for turn in ["shared-turn-id", "next-turn"] {
-        let tracking = test_tracking_context(thread, turn);
-        for connector in ["calendar", "drive"] {
-        for _ in 0..2 {
-            client.track_app_used(
-                tracking.clone(),
-                AppInvocation {
-                    connector_id: Some(connector.to_string()),
-                    app_name: None,
-                    invocation_type: None,
-                },
-            );
-            let mut plugin = sample_plugin_metadata();
-            plugin.plugin_id = Some(codex_plugin::PluginId::parse(&format!("{connector}@test")).unwrap());
-            client.track_plugin_used(tracking.clone(), plugin);
-        }
-        assert!(
-            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input))) if input.tracking.thread_id == thread && input.tracking.turn_id == turn && input.app.connector_id.as_deref() == Some(connector))
-        );
-        assert!(
-            matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(input))) if input.tracking.thread_id == thread && input.tracking.turn_id == turn && input.plugin.plugin_id.as_ref().unwrap().as_key() == format!("{connector}@test"))
-        );
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
-        }
+            let tracking = test_tracking_context(thread, turn);
+            for connector in ["calendar", "drive"] {
+                for _ in 0..2 {
+                    client.track_app_used(
+                        tracking.clone(),
+                        AppInvocation {
+                            connector_id: Some(connector.to_string()),
+                            app_name: None,
+                            invocation_type: None,
+                        },
+                    );
+                    let mut plugin = sample_plugin_metadata();
+                    plugin.plugin_id =
+                        Some(codex_plugin::PluginId::parse(&format!("{connector}@test")).unwrap());
+                    client.track_plugin_used(tracking.clone(), plugin);
+                }
+                assert!(
+                    matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::AppUsed(input))) if input.tracking.thread_id == thread && input.tracking.turn_id == turn && input.app.connector_id.as_deref() == Some(connector))
+                );
+                assert!(
+                    matches!(receiver.try_recv(), Ok(AnalyticsFact::Custom(CustomAnalyticsFact::PluginUsed(input))) if input.tracking.thread_id == thread && input.tracking.turn_id == turn && input.plugin.plugin_id.as_ref().unwrap().as_key() == format!("{connector}@test"))
+                );
+                assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+            }
         }
     }
 }

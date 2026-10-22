@@ -138,3 +138,39 @@ fn behavior_identical_instruction_templates_are_removed() {
         assert!(!model.supports_personality());
     }
 }
+
+#[test]
+fn catalog_guidance_fields_have_typed_owners() {
+    let catalog: serde_json::Value = serde_json::from_str(include_str!("../models.json")).unwrap();
+    for model in catalog["models"].as_array().unwrap() {
+        if let Some(messages) = model["model_messages"].as_object() {
+            for key in messages.keys() {
+                assert!(
+                    [
+                        "instructions_template",
+                        "instructions_variables",
+                        "approvals"
+                    ]
+                    .contains(&key.as_str()),
+                    "{} has unsupported guidance key {key}",
+                    model["slug"]
+                );
+            }
+            if let Some(approvals) = messages
+                .get("approvals")
+                .and_then(serde_json::Value::as_object)
+            {
+                assert!(approvals.keys().all(|key| key == "on_request"));
+            }
+        }
+    }
+    for model in crate::bundled_models_response().unwrap().models {
+        assert!(
+            model
+                .get_model_instructions(None)
+                .contains("change files only when the request calls for implementation"),
+            "{} must preserve investigation-only intent",
+            model.slug
+        );
+    }
+}

@@ -325,9 +325,14 @@ async fn expect_request_permissions_event(
     }
 }
 
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn with_additional_permissions_requires_approval_under_on_request() -> Result<()> {
     require_network!();
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -336,6 +341,7 @@ async fn with_additional_permissions_requires_approval_under_on_request() -> Res
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.set_windows_elevated_sandbox_enabled(true);
         config
             .permissions
             .set_permission_profile(permission_profile_for_config)
@@ -520,11 +526,16 @@ enum AdditionalPermissionsCommandTool {
 
 #[test_case(AdditionalPermissionsCommandTool::ShellCommand ; "shell_command")]
 #[test_case(AdditionalPermissionsCommandTool::ExecCommand ; "exec_command")]
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn relative_additional_permissions_resolve_against_tool_workdir(
     command_tool: AdditionalPermissionsCommandTool,
 ) -> Result<()> {
     require_network!();
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -533,6 +544,7 @@ async fn relative_additional_permissions_resolve_against_tool_workdir(
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.set_windows_elevated_sandbox_enabled(true);
         config
             .permissions
             .set_permission_profile(permission_profile_for_config)
@@ -842,9 +854,14 @@ async fn with_additional_permissions_denied_approval_blocks_execution() -> Resul
     Ok(())
 }
 
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Result<()> {
     require_network!();
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -853,6 +870,7 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.set_windows_elevated_sandbox_enabled(true);
         config
             .permissions
             .set_permission_profile(permission_profile_for_config)
@@ -965,9 +983,14 @@ async fn request_permissions_grants_apply_to_later_exec_command_calls() -> Resul
     Ok(())
 }
 
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Result<()> {
     require_network!();
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -976,6 +999,7 @@ async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Resu
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.set_windows_elevated_sandbox_enabled(true);
         config
             .permissions
             .set_permission_profile(permission_profile_for_config)
@@ -1086,11 +1110,16 @@ async fn request_permissions_grants_apply_to_explicit_exec_permissions() -> Resu
 
 #[test_case(true; "inline_feature_enabled")]
 #[test_case(false; "inline_feature_disabled")]
+#[cfg_attr(target_os = "windows", serial_test::serial(codex_home))]
 #[tokio::test(flavor = "current_thread")]
 async fn request_permissions_grants_apply_to_later_shell_command_calls(
     inline_permission_feature: bool,
 ) -> Result<()> {
     require_network!();
+    #[cfg(target_os = "windows")]
+    let _windows_sandbox_test_lock = super::lock_windows_sandbox_tests()?;
+    #[cfg(target_os = "windows")]
+    super::stage_windows_sandbox_helpers()?;
 
     let server = start_mock_server().await;
     let approval_policy = AskForApproval::OnRequest;
@@ -1099,6 +1128,7 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls(
 
     let mut builder = test_codex().with_config(move |config| {
         config.permissions.approval_policy = Constrained::allow_any(approval_policy);
+        config.set_windows_elevated_sandbox_enabled(true);
         config
             .permissions
             .set_permission_profile(permission_profile_for_config)
@@ -1171,21 +1201,10 @@ async fn request_permissions_grants_apply_to_later_shell_command_calls(
         })
         .await?;
 
-    // Without a Windows sandbox backend this write always prompts and then runs
-    // unsandboxed, so the sticky grant is only visible on the approval itself.
-    let approval = expect_exec_approval(&test, &command).await;
-    assert_eq!(
-        approval.additional_permissions,
-        Some(native_permissions(normalized_requested_permissions)?)
+    assert!(
+        wait_for_exec_approval_or_completion(&test).await.is_none(),
+        "the granted permissions should allow the sandboxed command without another approval"
     );
-    test.codex
-        .submit(Op::ExecApproval {
-            id: approval.effective_approval_id(),
-            turn_id: None,
-            decision: ReviewDecision::Approved,
-        })
-        .await?;
-    wait_for_completion(&test).await;
 
     let shell_output = responses
         .function_call_output_text("shell-call")

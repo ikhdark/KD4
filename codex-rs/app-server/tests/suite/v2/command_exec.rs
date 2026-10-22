@@ -143,6 +143,18 @@ async fn command_exec_without_process_id_keeps_buffered_compatibility() -> Resul
         response,
         CommandExecResponse {
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
+            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
             stdout: "legacy-out".to_string(),
             stderr: "legacy-err".to_string(),
         }
@@ -205,6 +217,18 @@ async fn command_exec_env_overrides_merge_with_server_environment_and_support_un
         response,
         CommandExecResponse {
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
+            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
             stdout: format!("request|added|unset|unset|{}", codex_home.path().display()),
             stderr: String::new(),
         }
@@ -275,6 +299,22 @@ async fn command_exec_permission_profile_runs_sandboxed_or_fails_closed() -> Res
         response,
         CommandExecResponse {
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: (!cfg!(windows)).then_some(
+                codex_app_server_protocol::ProcessOutputCaptureState {
+                    reached_eof: true,
+                    cap_reached: false,
+                    drain_timed_out: false
+                }
+            ),
+            stderr_capture: (!cfg!(windows)).then_some(
+                codex_app_server_protocol::ProcessOutputCaptureState {
+                    reached_eof: true,
+                    cap_reached: false,
+                    drain_timed_out: false
+                }
+            ),
             stdout: "profile".to_string(),
             stderr: String::new(),
         }
@@ -326,6 +366,18 @@ async fn command_exec_legacy_policy_danger_full_access_does_not_reuse_default_ne
         response,
         CommandExecResponse {
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
+            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
             stdout: "unset".to_string(),
             stderr: String::new(),
         }
@@ -500,6 +552,18 @@ async fn command_exec_non_streaming_respects_output_cap() -> Result<()> {
         response,
         CommandExecResponse {
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: true,
+                drain_timed_out: false
+            }),
+            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: true,
+                drain_timed_out: false
+            }),
             stdout: "abcde".to_string(),
             stderr: "uvwxy".to_string(),
         }
@@ -642,6 +706,18 @@ async fn command_exec_pipe_streams_output_and_accepts_write() -> Result<()> {
         response,
         CommandExecResponse {
             exit_code: 0,
+            stdout_base64: None,
+            stderr_base64: None,
+            stdout_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
+            stderr_capture: Some(codex_app_server_protocol::ProcessOutputCaptureState {
+                reached_eof: true,
+                cap_reached: false,
+                drain_timed_out: false
+            }),
             stdout: String::new(),
             stderr: String::new(),
         }

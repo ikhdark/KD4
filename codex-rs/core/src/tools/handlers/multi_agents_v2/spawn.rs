@@ -97,6 +97,53 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 }
 
+struct AdmittedLaunchGuard {
+    session: Arc<crate::session::session::Session>,
+    telemetry: SessionTelemetry,
+    assignment_id: AssignmentId,
+    armed: bool,
+}
+
+impl Drop for AdmittedLaunchGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let session = Arc::clone(&self.session);
+        let assignment_id = self.assignment_id;
+        let telemetry = self.telemetry.clone();
+        self.session.terminal_tasks.spawn(async move {
+            let control = &session.services.agent_control;
+            let coordinator = control.task_coordinator();
+            if let Some(binding) = coordinator.binding_for_assignment(assignment_id)
+                && let Some(thread) = binding
+                    .thread_id
+                    .as_deref()
+                    .and_then(|id| ThreadId::from_string(id).ok())
+            {
+                // The existing runtime construction guard owns shutdown. Do not
+                // erase a binding while its original worker can still report.
+                if control.wait_for_agent_termination(thread).await.is_err() {
+                    return;
+                }
+            }
+            if let (Some(store), Ok(actor)) = (coordinator.store(), coordinator.root_actor()) {
+                let _ = store
+                    .abandon_agent_task(
+                        actor,
+                        assignment_id,
+                        "spawn observer ended before launch committed; no work was replayed".into(),
+                    )
+                    .await;
+                let _ = coordinator.remove_agent_task_binding(assignment_id).await;
+                coordinator
+                    .maybe_emit_terminal_metrics(assignment_id, &telemetry)
+                    .await;
+            }
+        });
+    }
+}
+
 async fn handle_spawn_agent(
     invocation: ToolInvocation,
 ) -> Result<SpawnAgentResult, FunctionCallError> {
@@ -132,6 +179,11 @@ async fn handle_spawn_agent(
         .as_deref()
         .map(str::trim)
         .filter(|role| !role.is_empty());
+    if args.assignment.is_none() && role_name == Some("reviewer") {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent: reviewer requires a typed assignment with a review relation; the compatibility message form cannot establish independent review".to_string(),
+        ));
+    }
 
     let legacy_message = match (args.message.take(), args.assignment.is_some()) {
         (Some(_), true) => {
@@ -177,9 +229,36 @@ async fn handle_spawn_agent(
     };
     let session_source = turn.session_source.clone();
     let child_depth = next_thread_spawn_depth(&session_source);
-    let mut config = build_agent_spawn_config(turn.as_ref())?;
+    let mut config = build_agent_spawn_config_for_step(&step_context)?;
     let parent_service_tier = inherit_live_service_tier(&session, &mut config).await;
-    let mut spawn_environments = Some(turn.environments.to_selections());
+    // Admission and worktree allocation are host-only. Resolve the same step
+    // authority used by native tools before touching the local task store.
+    let primary = crate::tools::handlers::wait_for_observed_tool_environment(
+        &step_context.environments,
+        None,
+        &cancellation_token,
+    )
+    .await?
+    .ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "spawn_agent: durable assignments require a selected local environment".to_string(),
+        )
+    })?;
+    if cancellation_token.is_cancelled() {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent cancelled".to_string(),
+        ));
+    }
+    if primary.environment.is_remote() {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agent: durable assignments and isolated worktrees require a local primary environment; remote native tools remain available".to_string(),
+        ));
+    }
+    let admission_cwd = primary
+        .cwd()
+        .to_abs_path()
+        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let mut spawn_environments = Some(step_context.environments.to_selections());
     let mut isolated_workspace: Option<IsolatedWorkspace> = None;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
@@ -216,10 +295,12 @@ async fn handle_spawn_agent(
     )
     .await?;
     let runtime_role_locks = AgentRoleLocks {
-        permissions: typed_role == AgentRole::Reviewer && role_locks.permissions,
+        permissions: (args.assignment.is_none() || typed_role == AgentRole::Reviewer)
+            && role_locks.permissions,
         ..role_locks
     };
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), runtime_role_locks)?;
+    config.cwd = admission_cwd.clone();
 
     // Every V2 spawn becomes a durable typed assignment. Legacy message-shaped
     // calls have no explicit agent_type, but their durable role is Worker, so
@@ -258,14 +339,7 @@ async fn handle_spawn_agent(
                 .map_err(typed_task_store_error)?;
         }
         if let (Some(store), Some(root)) = (coordinator.store(), coordinator.root_session_id()) {
-            let cwd = match turn.environments.primary() {
-                Some(environment) => environment
-                    .cwd()
-                    .to_abs_path()
-                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?
-                    .to_path_buf(),
-                None => turn.config.cwd.to_path_buf(),
-            };
+            let cwd = admission_cwd.to_path_buf();
             let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
             if let Some(existing) = store
                 .reusable_explorer_assignment(
@@ -320,6 +394,7 @@ async fn handle_spawn_agent(
         typed_role_metric,
     ));
     let mut consumed_typed_spawn = None;
+    let mut admitted_launch_guard = None;
     let typed_task = if args.assignment.is_some() || legacy_message.is_some() {
         let role = typed_role;
         let coordinator = session.services.agent_control.task_coordinator();
@@ -351,21 +426,71 @@ async fn handle_spawn_agent(
             .reconcile_live_typed_actor_heartbeats()
             .await
             .map_err(typed_task_store_error)?;
-        let cwd = match turn.environments.primary() {
-            Some(environment) => environment.cwd().to_abs_path().map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "spawn_agent: durable typed assignments require a local filesystem environment: {error}"
-                ))
-            })?.to_path_buf(),
-            None => turn.config.cwd.to_path_buf(),
-        };
+        let cwd = admission_cwd.to_path_buf();
         let main_repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
         let workspace_strategy = args
             .assignment
             .as_ref()
             .map(|assignment| assignment.workspace_strategy)
             .unwrap_or(WorkspaceStrategy::Shared);
-        let repo_root = if workspace_strategy == WorkspaceStrategy::Isolated {
+        let evaluation_root = if matches!(role, AgentRole::Reviewer | AgentRole::Verifier) {
+            let relation = args
+                .assignment
+                .as_ref()
+                .and_then(|assignment| assignment.relation.as_ref())
+                .ok_or_else(|| {
+                    FunctionCallError::RespondToModel(
+                        "spawn_agent: evaluator requires one target relation".to_string(),
+                    )
+                })?;
+            let expected = if role == AgentRole::Reviewer {
+                codex_agent_task_store::RelationKind::Review
+            } else {
+                codex_agent_task_store::RelationKind::Verification
+            };
+            if relation.kind != expected || relation.target_assignment_ids.len() != 1 {
+                return Err(FunctionCallError::RespondToModel(
+                    "spawn_agent: evaluator requires one matching target relation".to_string(),
+                ));
+            }
+            if workspace_strategy == WorkspaceStrategy::Isolated {
+                return Err(FunctionCallError::RespondToModel("spawn_agent: evaluators must share their target's existing workspace; isolated would review different source".to_string()));
+            }
+            Some(
+                store
+                    .evaluation_target_workspace(
+                        &main_repo_root,
+                        &root_session_id,
+                        relation.target_assignment_ids[0],
+                    )
+                    .await
+                    .map_err(typed_task_store_error)?,
+            )
+        } else {
+            None
+        };
+        let repo_root = if let Some(repo_root) = evaluation_root {
+            let previous_cwd = config.cwd.clone();
+            config.cwd = AbsolutePathBuf::from_absolute_path(&repo_root)
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+            let mut roots = config.workspace_roots.clone();
+            for root in &mut roots {
+                if root == &previous_cwd {
+                    *root = config.cwd.clone();
+                }
+            }
+            if !roots.contains(&config.cwd) {
+                roots.push(config.cwd.clone());
+            }
+            config.workspace_roots = roots.clone();
+            config.permissions.set_workspace_roots(roots);
+            if let Some(environments) = &mut spawn_environments
+                && let Some(primary) = environments.first_mut()
+            {
+                primary.cwd = codex_utils_path_uri::PathUri::from_abs_path(&config.cwd);
+            }
+            repo_root
+        } else if workspace_strategy == WorkspaceStrategy::Isolated {
             let workspace = Box::pin(create_isolated_worktree(
                 &main_repo_root,
                 config.codex_home.as_path(),
@@ -374,6 +499,7 @@ async fn handle_spawn_agent(
                 &session.terminal_tasks,
             ))
             .await?;
+            let previous_cwd = config.cwd.clone();
             config.cwd = match AbsolutePathBuf::from_absolute_path(&workspace.path) {
                 Ok(path) => path,
                 Err(error) => {
@@ -389,7 +515,22 @@ async fn handle_spawn_agent(
                     )));
                 }
             };
-            spawn_environments = None;
+            let mut roots = config.workspace_roots.clone();
+            for root in &mut roots {
+                if root == &previous_cwd {
+                    *root = config.cwd.clone();
+                }
+            }
+            let mut seen = HashSet::new();
+            roots.retain(|root| seen.insert(root.clone()));
+            config.workspace_roots = roots.clone();
+            config.permissions.set_workspace_roots(roots);
+            if let Some(environments) = &mut spawn_environments {
+                // Retarget only the local primary, never remote secondaries.
+                if let Some(primary) = environments.first_mut() {
+                    primary.cwd = codex_utils_path_uri::PathUri::from_abs_path(&config.cwd);
+                }
+            }
             let repo_root = workspace.path.clone();
             isolated_workspace = Some(workspace);
             repo_root
@@ -454,7 +595,13 @@ async fn handle_spawn_agent(
             }
         };
         let admitted = match coordinator
-            .create_admitted_assignment(&repo_root, draft, isolated_integrator_available)
+            .create_admitted_assignment(
+                &repo_root,
+                draft,
+                isolated_integrator_available,
+                new_agent_path.to_string(),
+                args.task_name.clone(),
+            )
             .await
         {
             Ok(task) => task,
@@ -492,6 +639,12 @@ async fn handle_spawn_agent(
         emit_admission_overlap_metrics(&turn.session_telemetry, admitted.overlaps);
         let assignment = admitted.assignment;
         let attempt = admitted.attempt;
+        admitted_launch_guard = Some(AdmittedLaunchGuard {
+            session: Arc::clone(&session),
+            telemetry: turn.session_telemetry.clone(),
+            assignment_id: assignment.assignment_id,
+            armed: true,
+        });
         let task_capsule = if matches!(fork_mode, Some(SpawnAgentForkMode::TaskCapsule)) {
             match construct_and_attach_task_capsule(
                 store.as_ref(),
@@ -506,7 +659,7 @@ async fn handle_spawn_agent(
                 Err(error) => {
                     if let Err(rollback_error) = store
                         .abandon_agent_task(
-                            TaskActor::Root,
+                            TaskActor::RootSession(assignment.root_session_id.clone()),
                             assignment.assignment_id,
                             format!("TaskCapsule construction failed before launch: {error}"),
                         )
@@ -559,6 +712,7 @@ async fn handle_spawn_agent(
         fork_mode,
         parent_thread_id: Some(session.thread_id),
         environments: spawn_environments,
+        captured_environments: Some(step_context.environments.clone()),
         typed_task_binding: typed_task.as_ref().map(|(assignment, attempt, _)| {
             AgentTaskBindingDraft {
                 assignment_id: assignment.assignment_id,
@@ -677,7 +831,7 @@ async fn handle_spawn_agent(
                     if let Some(store) = coordinator.store() {
                         if let Err(rollback_error) = store
                             .abandon_agent_task(
-                                TaskActor::Root,
+                                TaskActor::RootSession(control.session_id().to_string()),
                                 assignment_id,
                                 format!(
                                     "spawn failed before the typed agent was returned: {failure_reason}"
@@ -731,6 +885,9 @@ async fn handle_spawn_agent(
             return Err(collab_spawn_error(error));
         }
     };
+    if let Some(guard) = admitted_launch_guard.as_mut() {
+        guard.armed = false;
+    }
     if let Some(workspace) = &isolated_workspace {
         // The successfully started agent now owns the worktree lifetime.
         workspace.cleanup_required.store(false, Ordering::Release);
@@ -1665,6 +1822,7 @@ fn legacy_message_draft(
         capability_profile: AgentRole::Worker.capability_profile(),
         objective: message.to_string(),
         acceptance_criteria: vec![AcceptanceCriterion {
+            evidence_policy: None,
             id: "legacy-message-result".to_string(),
             text: "Return a final response for the requested task to the parent agent.".to_string(),
         }],
@@ -1933,6 +2091,7 @@ mod tests {
         TypedAssignmentArgs {
             objective: "inspect the bounded path".to_string(),
             acceptance_criteria: vec![AcceptanceCriterion {
+                evidence_policy: None,
                 id: "criterion-1".to_string(),
                 text: "report evidence".to_string(),
             }],

@@ -29,9 +29,11 @@ pub use model::ProjectSortKey;
 pub use model::ProjectsPage;
 /// Preferred entrypoint: owns configuration and metrics.
 pub use runtime::StateRuntime;
+pub use runtime::connect_sqlite_pool_with_retry;
 
 pub use audit::ThreadStateAuditRow;
 pub use audit::read_thread_state_audit_rows;
+pub use bugs::BugAttemptReceipt;
 pub use bugs::BugClaim;
 pub use bugs::BugClassification;
 pub use bugs::BugCreateParams;
@@ -46,6 +48,7 @@ pub use extract::apply_rollout_item;
 pub use extract::apply_rollout_items;
 pub use extract::latest_rollout_recency_at;
 pub use extract::rollout_item_affects_thread_metadata;
+pub use migrations::migrate_tolerating_concurrent_initializers;
 pub use model::AgentJob;
 pub use model::AgentJobCreateParams;
 pub use model::AgentJobItem;
@@ -73,6 +76,8 @@ pub use runtime::ExternalAgentConfigImportSuccessRecord;
 pub use runtime::GoalAccountingMode;
 pub use runtime::GoalAccountingOutcome;
 pub use runtime::GoalStore;
+pub use runtime::GoalTerminalTransition;
+pub use runtime::GoalTerminalTransitionOutcome;
 pub use runtime::GoalUpdate;
 pub use runtime::LogReader;
 pub use runtime::RemoteControlEnrollmentRecord;

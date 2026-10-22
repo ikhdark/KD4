@@ -356,7 +356,8 @@ fn bounded_runner_lookup(
     input: &[u8],
     timeout: std::time::Duration,
 ) -> Option<(bool, Vec<u8>)> {
-    use std::io::{Read, Write};
+    use std::io::Read;
+    use std::io::Write;
     use std::process::Stdio;
     struct ChildGuard(std::process::Child);
     impl Drop for ChildGuard {
@@ -505,7 +506,22 @@ pub async fn resolve_command_validation_with_shell(
                 codex_shell_command::validation::standalone_argv(script)
             }
             CommandInvocation::PowerShellScript(script) => {
-                codex_shell_command::validation::standalone_powershell_argv(script)
+                codex_shell_command::validation::standalone_powershell_argv(script).or_else(|| {
+                    // Canonical numeric --set values are not direct-execution
+                    // proof. Admit them for receipts only through an exact,
+                    // committed just runner's constrained variable grammar.
+                    let argv =
+                        codex_shell_command::powershell::standalone_powershell_inspection_argv(
+                            script,
+                        )?;
+                    let (program, args) = argv.split_first()?;
+                    (matches!(program.as_str(), "just" | "just.exe")
+                        && runners.iter().any(|runner| {
+                            !runner.just_numeric_variables.is_empty()
+                                && runner.matches(program, args)
+                        }))
+                    .then_some(argv)
+                })
             }
         };
         // Classification and receipt matching must describe the same literal
@@ -1384,3 +1400,91 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod audit36_validation_regressions {
+    use super::*;
+
+    fn proof(invocation: CommandInvocation) -> bool {
+        CommandValidation {
+            execution_context: None,
+            declared: None,
+            receipt_runner: None,
+            classification: classify_validation(&invocation),
+        }
+        .signal()["proof"]
+            == true
+    }
+
+    #[test]
+    fn nonexecuting_or_exit_masking_commands_never_emit_proof() {
+        for (program, args) in [
+            ("bash", vec!["-c", "# no execution && cargo test"]),
+            ("bash", vec!["-c", "python -I -B -m unittest $OPTIONS"]),
+            ("bash", vec!["-c", "python -m unittest \"$OPTIONS\""]),
+            ("command", vec!["-v", "cargo", "test"]),
+            ("env", vec!["--version", "cargo", "test"]),
+            ("env", vec!["--split-string=echo", "cargo", "test"]),
+            (
+                "powershell.exe",
+                vec!["-File", "noop.ps1", "-Command", "cargo test"],
+            ),
+            (
+                "python",
+                vec!["-I", "-B", "-i", "-m", "unittest", "discover"],
+            ),
+            ("python", vec!["-IBi", "-m", "unittest"]),
+            ("npm", vec!["test", "--help"]),
+            ("go", vec!["test", "-list", "."]),
+            ("go", vec!["test", "-n"]),
+            ("gradle", vec!["test", "-x", "test"]),
+            ("gradle", vec!["--version", "test"]),
+        ] {
+            assert!(
+                !proof(CommandInvocation::Argv {
+                    program: program.into(),
+                    args: args.iter().map(|arg| (*arg).into()).collect(),
+                }),
+                "{program} {args:?}"
+            );
+        }
+        assert!(!proof(CommandInvocation::PowerShellScript(
+            "cargo test; if ($LASTEXITCODE -ne 0) { exit 0 }".into(),
+        )));
+    }
+
+    #[test]
+    fn supported_literal_executions_keep_proof_and_file_args_never_grant_fmt_exemption() {
+        for (program, args) in [
+            ("cargo", vec!["test"]),
+            ("env", vec!["NAME=value", "cargo", "test"]),
+            ("env", vec!["-u", "NAME", "cargo", "test"]),
+            ("command", vec!["-p", "cargo", "test"]),
+            ("python", vec!["-I", "-B", "-m", "unittest"]),
+            ("go", vec!["test"]),
+            ("gradle", vec!["--show-version", "test"]),
+            ("npm", vec!["test", "--", "--help"]),
+            ("bash", vec!["-c", "cargo test && cargo check"]),
+            ("bash", vec!["-c", "cargo test 'literal$#'"]),
+        ] {
+            assert!(
+                proof(CommandInvocation::Argv {
+                    program: program.into(),
+                    args: args.iter().map(|arg| (*arg).into()).collect(),
+                }),
+                "{program} {args:?}"
+            );
+        }
+        let args = ["-File", "noop.ps1", "-Command", "cargo fmt --check"].map(str::to_owned);
+        assert!(
+            !codex_shell_command::validation::is_standalone_cargo_fmt_check(
+                "powershell.exe",
+                &args
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "validation_audit120_tests.rs"]
+mod audit120_tests;

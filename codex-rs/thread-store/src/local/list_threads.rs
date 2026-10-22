@@ -30,15 +30,15 @@ const THREAD_LIST_CURSOR_PREFIX: &str = "thread-list-v1:";
 const STATE_DB_CURSOR_PREFIX: &str = "state-db:";
 const SCAN_AND_REPAIR_CURSOR_PREFIX: &str = "scan-and-repair:";
 
-struct BoundThreadListCursor {
-    storage_path: ThreadListStoragePath,
-    position: codex_rollout::Cursor,
+pub(super) struct BoundThreadListCursor {
+    pub(super) storage_path: ThreadListStoragePath,
+    pub(super) position: codex_rollout::Cursor,
 }
 
-struct SelectedRolloutThreads {
-    page: codex_rollout::ThreadsPage,
+pub(super) struct SelectedRolloutThreads {
+    pub(super) page: codex_rollout::ThreadsPage,
     storage_path: ThreadListStoragePath,
-    state_metadata: HashMap<codex_protocol::ThreadId, codex_state::ThreadMetadata>,
+    pub(super) state_metadata: HashMap<codex_protocol::ThreadId, codex_state::ThreadMetadata>,
     state_db_reads: usize,
 }
 
@@ -87,6 +87,21 @@ async fn list_threads_with_state_db_read_count(
         .map(|cursor| encode_rollout_cursor(storage_path, cursor))
         .transpose()?;
     let (mut names, mut resolved_title_ids) = thread_item_titles(&page.items);
+    let scan_backwards_timestamp = if storage_path == ThreadListStoragePath::ScanAndRepair {
+        page.items
+            .first()
+            .and_then(|item| match params.sort_key {
+                ThreadSortKey::CreatedAt => codex_rollout::rollout_created_at_key(&item.path),
+                ThreadSortKey::UpdatedAt => item.updated_at.clone(),
+                ThreadSortKey::RecencyAt => {
+                    item.recency_at.clone().or_else(|| item.updated_at.clone())
+                }
+            })
+            .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(&timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+    } else {
+        None
+    };
     let mut items = Vec::with_capacity(page.items.len());
     for item in page.items {
         let Some(mut thread) = stored_thread_from_rollout_item(
@@ -127,6 +142,8 @@ async fn list_threads_with_state_db_read_count(
                     // SQLite fields when repair succeeded. Do not replace its filesystem
                     // evidence with a readable but stale row after a failed repair.
                     thread.project_id = authoritative_thread.project_id;
+                    thread.parent_thread_id = authoritative_thread.parent_thread_id;
+                    thread.session_id = authoritative_thread.session_id;
                     thread.extra_config = authoritative_thread.extra_config;
                     thread.forked_from_id = authoritative_thread.forked_from_id;
                     thread.model = authoritative_thread.model;
@@ -141,6 +158,15 @@ async fn list_threads_with_state_db_read_count(
                     thread.parent_thread_id = relation_parent_thread_id;
                 }
             }
+        }
+        if thread.session_id.is_none()
+            && let Some(path) = thread.rollout_path.as_deref()
+            && let Ok(header) = codex_rollout::read_session_meta_line(path).await
+            && header.meta.id == thread.thread_id
+        {
+            thread.session_id = Some(header.meta.session_id);
+            thread.forked_from_id = header.meta.forked_from_id;
+            thread.thread_source = header.meta.thread_source;
         }
         items.push(thread);
     }
@@ -171,7 +197,15 @@ async fn list_threads_with_state_db_read_count(
     let backwards_cursor = items
         .first()
         .and_then(|thread| {
-            backwards_cursor_position(thread, params.sort_key, params.sort_direction)
+            let mut anchor = thread.clone();
+            if let Some(timestamp) = scan_backwards_timestamp {
+                match params.sort_key {
+                    ThreadSortKey::CreatedAt => anchor.created_at = timestamp,
+                    ThreadSortKey::UpdatedAt => anchor.updated_at = timestamp,
+                    ThreadSortKey::RecencyAt => anchor.recency_at = timestamp,
+                }
+            }
+            backwards_cursor_position(&anchor, params.sort_key, params.sort_direction)
         })
         .map(|position| bind_cursor(storage_path, &position));
 
@@ -185,7 +219,7 @@ async fn list_threads_with_state_db_read_count(
     ))
 }
 
-async fn select_rollout_threads(
+pub(super) async fn select_rollout_threads(
     state_db: Option<codex_rollout::StateDbHandle>,
     config: &RolloutConfig,
     default_model_provider_id: &str,
@@ -453,13 +487,17 @@ fn storage_path_for_request(
         return Ok(Some(ThreadListStoragePath::StateDb));
     }
     Ok(match params.storage_mode {
-        ThreadListStorageMode::PreferStateDb => None,
+        // A completed one-time backfill is not a current root-coverage proof:
+        // another writer can publish or move a rollout without updating SQL.
+        // Reuse canonical scan/repair until the index has a durable freshness
+        // contract. Explicit DB views and already-bound cursors stay DB-only.
+        ThreadListStorageMode::PreferStateDb => Some(ThreadListStoragePath::ScanAndRepair),
         ThreadListStorageMode::StateDbOnly => Some(ThreadListStoragePath::StateDb),
         ThreadListStorageMode::ScanAndRepair => Some(ThreadListStoragePath::ScanAndRepair),
     })
 }
 
-fn parse_bound_cursor(token: &str) -> ThreadStoreResult<BoundThreadListCursor> {
+pub(super) fn parse_bound_cursor(token: &str) -> ThreadStoreResult<BoundThreadListCursor> {
     let payload = token
         .strip_prefix(THREAD_LIST_CURSOR_PREFIX)
         .ok_or_else(|| ThreadStoreError::InvalidRequest {
@@ -484,7 +522,7 @@ fn parse_bound_cursor(token: &str) -> ThreadStoreResult<BoundThreadListCursor> {
     })
 }
 
-fn encode_rollout_cursor(
+pub(super) fn encode_rollout_cursor(
     storage_path: ThreadListStoragePath,
     cursor: &codex_rollout::Cursor,
 ) -> ThreadStoreResult<String> {
@@ -603,7 +641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefer_state_db_binds_and_resumes_sqlite_pagination() {
+    async fn preferred_listing_without_a_coverage_proof_binds_scan_pagination() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(201))
@@ -616,14 +654,14 @@ mod tests {
         let first = store
             .list_threads(list_params(1, None, ThreadListStorageMode::PreferStateDb))
             .await
-            .expect("first DB page");
-        let cursor = first.next_cursor.clone().expect("DB cursor");
-        assert!(cursor.starts_with("thread-list-v1:state-db:"));
+            .expect("first canonical page");
+        let cursor = first.next_cursor.clone().expect("scan cursor");
+        assert!(cursor.starts_with("thread-list-v1:scan-and-repair:"));
         assert!(
             first
                 .backwards_cursor
                 .as_deref()
-                .is_some_and(|cursor| cursor.starts_with("thread-list-v1:state-db:"))
+                .is_some_and(|cursor| cursor.starts_with("thread-list-v1:scan-and-repair:"))
         );
 
         let second = store
@@ -633,17 +671,23 @@ mod tests {
                 ThreadListStorageMode::PreferStateDb,
             ))
             .await
-            .expect("second DB page");
+            .expect("second canonical page");
         assert_eq!(first.items.len(), 1);
         assert_eq!(second.items.len(), 1);
-        assert_eq!(first.items[0].thread_id.to_string(), Uuid::from_u128(201).to_string());
-        assert_eq!(second.items[0].thread_id.to_string(), Uuid::from_u128(202).to_string());
+        assert_eq!(
+            first.items[0].thread_id.to_string(),
+            Uuid::from_u128(201).to_string()
+        );
+        assert_eq!(
+            second.items[0].thread_id.to_string(),
+            Uuid::from_u128(202).to_string()
+        );
         assert!(second.next_cursor.is_none());
         assert!(
             second
                 .backwards_cursor
                 .as_deref()
-                .is_some_and(|cursor| cursor.starts_with("thread-list-v1:state-db:"))
+                .is_some_and(|cursor| cursor.starts_with("thread-list-v1:scan-and-repair:"))
         );
     }
 
@@ -658,7 +702,7 @@ mod tests {
         let runtime = backfilled_runtime(&home, &config).await;
         let store = LocalThreadStore::new(config, Some(runtime.clone()));
         let first = store
-            .list_threads(list_params(1, None, ThreadListStorageMode::PreferStateDb))
+            .list_threads(list_params(1, None, ThreadListStorageMode::StateDbOnly))
             .await
             .expect("first DB page");
         let cursor = first.next_cursor.expect("DB cursor");
@@ -715,13 +759,19 @@ mod tests {
             .expect("scan cursor should remain scan-backed");
         assert_eq!(second.items.len(), 1);
         assert_eq!(first.items.len(), 1);
-        assert_eq!(first.items[0].thread_id.to_string(), Uuid::from_u128(221).to_string());
-        assert_eq!(second.items[0].thread_id.to_string(), Uuid::from_u128(222).to_string());
+        assert_eq!(
+            first.items[0].thread_id.to_string(),
+            Uuid::from_u128(221).to_string()
+        );
+        assert_eq!(
+            second.items[0].thread_id.to_string(),
+            Uuid::from_u128(222).to_string()
+        );
         assert!(second.next_cursor.is_none());
     }
 
     #[tokio::test]
-    async fn successful_empty_db_page_does_not_trigger_scan_fallback() {
+    async fn completed_backfill_cannot_hide_a_durable_unindexed_rollout() {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::from_u128(231))
@@ -741,8 +791,14 @@ mod tests {
         let page = store
             .list_threads(list_params(10, None, ThreadListStorageMode::PreferStateDb))
             .await
-            .expect("empty DB listing");
-        assert!(page.items.is_empty());
+            .expect("canonical listing");
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.thread_id.to_string())
+                .collect::<Vec<_>>(),
+            vec![Uuid::from_u128(231).to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1035,6 +1091,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_listing_search_matches_sqlite_only_title() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(105);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        write_session_file(home.path(), "2025-01-03T13-00-00", uuid).expect("session file");
+        let runtime = backfilled_runtime(&home, &config).await;
+        // SQLite owns explicit titles; the compatibility name index can lack a committed rename.
+        assert!(
+            runtime
+                .update_thread_title(thread_id, "SQLite only title")
+                .await
+                .expect("title update")
+        );
+        assert_eq!(
+            codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+                .await
+                .expect("name index read"),
+            None
+        );
+        let store = LocalThreadStore::new(config, Some(runtime));
+
+        // PreferStateDb is the app-server `thread/list` default (`useStateDbOnly` omitted).
+        for sort_direction in [SortDirection::Desc, SortDirection::Asc] {
+            let mut params = list_params(10, None, ThreadListStorageMode::PreferStateDb);
+            params.sort_direction = sort_direction;
+            params.search_term = Some("only title".to_string());
+            let page = store.list_threads(params).await.expect("title search");
+            let ids = page
+                .items
+                .iter()
+                .map(|thread| thread.thread_id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                ids,
+                vec![thread_id],
+                "{sort_direction:?} search must match the listed title"
+            );
+            assert_eq!(page.items[0].name.as_deref(), Some("SQLite only title"));
+        }
+    }
+
+    #[tokio::test]
     async fn list_threads_selects_active_or_archived_collection() {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
@@ -1156,22 +1255,33 @@ mod tests {
         let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("rollout");
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("id");
         let runtime = backfilled_runtime(&home, &config).await;
-        let mut stale = runtime.get_thread(thread_id).await.expect("read").expect("metadata");
+        let mut stale = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read")
+            .expect("metadata");
         stale.cwd = home.path().join("stale-cwd");
         stale.model_provider = "stale-provider".into();
         stale.first_user_message = Some("stale message".into());
         stale.preview = Some("stale preview".into());
         stale.title = "Custom title".into();
         runtime.upsert_thread(&stale).await.expect("seed stale row");
-        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
-            .connect_with(sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME))
-                .create_if_missing(false)).await.expect("open SQLite");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME))
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open SQLite");
         sqlx::query("CREATE TRIGGER fail_scan_repair BEFORE UPDATE ON threads BEGIN SELECT RAISE(FAIL, 'forced repair failure'); END")
             .execute(&pool).await.expect("install failing update trigger");
         let store = LocalThreadStore::new(config, Some(runtime.clone()));
-        let page = store.list_threads(list_params(10, None, ThreadListStorageMode::ScanAndRepair))
-            .await.expect("public scan fallback");
+        let page = store
+            .list_threads(list_params(10, None, ThreadListStorageMode::ScanAndRepair))
+            .await
+            .expect("public scan fallback");
         assert_eq!(page.items.len(), 1);
         let actual = &page.items[0];
         assert_eq!(actual.thread_id, thread_id);
@@ -1179,10 +1289,21 @@ mod tests {
         assert_eq!(actual.cwd, home.path());
         assert_eq!(actual.model_provider, "test-provider");
         assert_eq!(actual.preview, "Hello from user");
-        assert_eq!(actual.first_user_message.as_deref(), Some("Hello from user"));
+        assert_eq!(
+            actual.first_user_message.as_deref(),
+            Some("Hello from user")
+        );
         assert_eq!(actual.name.as_deref(), Some("Custom title"));
-        assert_eq!(runtime.get_thread(thread_id).await.expect("still readable").expect("row").model_provider, "stale-provider",
-            "the test must actually exercise a failed reconciliation, not a repaired row");
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("still readable")
+                .expect("row")
+                .model_provider,
+            "stale-provider",
+            "the test must actually exercise a failed reconciliation, not a repaired row"
+        );
         pool.close().await;
         runtime.close().await;
     }

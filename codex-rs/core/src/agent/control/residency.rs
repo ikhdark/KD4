@@ -138,6 +138,11 @@ impl V2Residency {
         protected_thread_id: Option<ThreadId>,
         shutdown_timeout: Duration,
     ) -> CodexResult<V2ResidencySlot> {
+        if capacity == 0 {
+            return Err(CodexErr::AgentLimitReached {
+                max_threads: capacity,
+            });
+        }
         timeout(RESIDENCY_ACQUISITION_TIMEOUT, async {
         let mut attempted = HashSet::new();
         loop {
@@ -156,7 +161,17 @@ impl V2Residency {
                 )
                 .await
             {
-                UnloadOneResult::Reserved(slot) => return Ok(slot),
+                UnloadOneResult::Reserved(slot) => {
+                    // An eviction transfers its charge atomically, but a role
+                    // may now request less capacity than existing occupancy.
+                    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let fits = state.residents.len().saturating_add(state.pending_slots)
+                        .saturating_add(state.evicting.len()) <= capacity;
+                    drop(state);
+                    if fits { return Ok(slot); }
+                    drop(slot);
+                    return Err(CodexErr::AgentLimitReached { max_threads: capacity });
+                }
                 UnloadOneResult::WaitingForLateShutdown(completion) => {
                     // Cleanup retains occupancy. An undelivered slot releases itself on drop.
                     drop(completion);
@@ -221,6 +236,12 @@ impl V2Residency {
                 claim.discard();
                 return UnloadOneResult::Retry;
             };
+            // Idleness alone is not ownership: exclude newly accepted input
+            // through materialization, irreversible shutdown and exact removal.
+            let Some(residency_pin) = candidate_thread.try_pin_for_eviction() else {
+                claim.restore();
+                continue;
+            };
             if !is_unloadable(candidate_thread.as_ref()).await {
                 claim.restore();
                 continue;
@@ -248,6 +269,7 @@ impl V2Residency {
             // Transfer the claim before shutdown can be accepted. Cancellation of the
             // requester must never restore a runtime whose shutdown is underway.
             tokio::spawn(async move {
+                let _residency_pin = residency_pin;
                 if let Err(err) = candidate_thread.request_shutdown().await {
                     warn!(
                         "failed to submit shutdown for v2 resident thread {candidate_thread_id}: {err}"
@@ -256,7 +278,14 @@ impl V2Residency {
                     let _ = completion_tx.send(CompletedUnloadResult::Retry);
                     return;
                 }
-                candidate_thread.wait_until_terminated().await;
+                if let Err(err) = candidate_thread.wait_until_drained().await {
+                    warn!(
+                        "v2 resident thread {candidate_thread_id} did not shut down orderly: {err}"
+                    );
+                    claim.restore();
+                    let _ = completion_tx.send(CompletedUnloadResult::Retry);
+                    return;
+                }
                 let result = finish_completed_unload(
                     &manager,
                     candidate_thread_id,
@@ -395,12 +424,23 @@ async fn finish_completed_unload(
     candidate_thread: &Arc<CodexThread>,
     claim: V2EvictionClaim,
 ) -> CompletedUnloadResult {
+    let mut claim = Some(claim);
+    let mut slot = None;
     if manager
-        .remove_thread_if_same(&candidate_thread_id, candidate_thread)
+        .remove_thread_if_same_with_cleanup(&candidate_thread_id, candidate_thread, || {
+            slot = claim.take().map(V2EvictionClaim::into_pending_slot);
+        })
         .await
+        && let Some(slot) = slot
     {
-        return CompletedUnloadResult::Reserved(claim.into_pending_slot());
+        return CompletedUnloadResult::Reserved(slot);
     }
+    let Some(claim) = claim else {
+        return CompletedUnloadResult::Retry;
+    };
+    let _lease = manager
+        .acquire_thread_registry_lease(candidate_thread_id)
+        .await;
     if manager
         .get_thread(candidate_thread_id)
         .await
@@ -460,19 +500,25 @@ pub(super) fn is_v2_resident_session_source(session_source: &SessionSource) -> b
 }
 
 async fn is_unloadable(thread: &CodexThread) -> bool {
-    matches!(
+    let session = &thread.codex.session;
+    if !matches!(
         thread.agent_status().await,
         AgentStatus::Completed(_)
             | AgentStatus::CompletedWithSurface { .. }
+            | AgentStatus::Stopped { .. }
             | AgentStatus::Errored(_)
             | AgentStatus::Interrupted
-    ) && thread.codex.session.active_turn.lock().await.is_none()
-        && !thread
-            .codex
-            .session
-            .input_queue
-            .has_pending_mailbox_items()
-            .await
+    ) || session.active_turn.lock().await.is_some()
+    {
+        return false;
+    }
+    // Drop the active-turn observation before the queue's atomic recheck takes
+    // that lock. Recovered user input is work too, not just mailbox traffic.
+    !session
+        .input_queue
+        .has_pending_input(&session.active_turn)
+        .await
+        && !session.input_queue.has_pending_mailbox_items().await
 }
 
 #[cfg(test)]

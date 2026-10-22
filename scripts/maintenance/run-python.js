@@ -65,6 +65,6 @@ for (const [command, prefixArgs] of candidates) {
 }
 
 console.error(
-  "Python 3 was not found. Set PYTHON or install a python3/python/py launcher.",
+  "No Python 3.11 or newer interpreter passed the capability check. Set PYTHON to a compatible executable or install Python 3.11+ and expose python3/python/py.",
 );
 process.exit(127);

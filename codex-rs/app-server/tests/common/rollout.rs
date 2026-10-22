@@ -86,6 +86,7 @@ pub fn create_fake_rollout_with_token_usage(
                 output_tokens: 30,
                 reasoning_output_tokens: 10,
                 total_tokens: 150,
+                coverage: None,
             },
             last_token_usage: TokenUsage {
                 input_tokens: 70,
@@ -93,6 +94,7 @@ pub fn create_fake_rollout_with_token_usage(
                 output_tokens: 20,
                 reasoning_output_tokens: 5,
                 total_tokens: 90,
+                coverage: None,
             },
             model_context_window: Some(200_000),
         }),

@@ -39,8 +39,13 @@ pub fn write_mock_responses_config_toml(
     } else {
         "Mock provider for test"
     };
-    let provider_block = format!(
-        r#"
+    // Built-in provider IDs cannot be redefined under `[model_providers]`, so
+    // `openai` selects the built-in provider, routed through `openai_base_url`.
+    let provider_block = if model_provider_id == "openai" {
+        String::new()
+    } else {
+        format!(
+            r#"
 [model_providers.{model_provider_id}]
 name = "{provider_name}"
 base_url = "{server_uri}/v1"
@@ -50,7 +55,8 @@ stream_max_retries = 0
 supports_websockets = false
 {requires_line}
 "#
-    );
+        )
+    };
     let openai_base_url_line = if model_provider_id == "openai" {
         format!("openai_base_url = \"{server_uri}/v1\"\n")
     } else {

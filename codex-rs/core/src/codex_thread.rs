@@ -52,7 +52,6 @@ use rmcp::model::ReadResourceRequestParams;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use codex_rollout::state_integration::StateDbHandle;
@@ -196,6 +195,7 @@ pub struct CodexThread {
     session_configured: SessionConfiguredEvent,
     rollout_path: Option<PathBuf>,
     out_of_band_elicitations: OutOfBandElicitationLeases,
+    residency_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -223,11 +223,16 @@ impl CodexThread {
             session_configured,
             rollout_path,
             out_of_band_elicitations,
+            residency_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(op, /*trace*/ None).await
+    }
+
+    pub(crate) fn try_pin_for_eviction(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        Arc::clone(&self.residency_gate).try_write_owned().ok()
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -248,7 +253,35 @@ impl CodexThread {
 
     /// Wait until the underlying session loop has terminated.
     pub async fn wait_until_terminated(&self) {
-        self.codex.session_loop_termination.clone().await;
+        let _ = self.codex.session_loop_termination.clone().await;
+    }
+
+    /// Wait for actual accepted owners, not just the bounded loop observer.
+    /// Callers retiring a runtime must retain its identity/capacity until this
+    /// completes. Cancelling this observer does not cancel any of the owners.
+    pub async fn wait_until_drained(&self) -> CodexResult<()> {
+        self.codex
+            .session_loop_termination
+            .clone()
+            .await
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        self.codex.session.terminal_tasks.wait().await;
+        self.codex.session.wait_for_ordered_history_commits().await;
+        self.codex.session.persistence_tasks.wait().await;
+        match self
+            .codex
+            .session
+            .persistence_retirement_result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            Some(result) => result.map_err(CodexErr::Fatal),
+            None if self.codex.session.live_thread().is_some() => Err(CodexErr::Fatal(
+                "thread persistence retirement was not confirmed".to_string(),
+            )),
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn emit_thread_resume_lifecycle(&self) {
@@ -325,6 +358,10 @@ impl CodexThread {
         self.codex.reserve_turn_id()
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The residency pin must exclude idle eviction until start admission completes"
+    )]
     pub async fn submit_user_input_with_reserved_turn_id(
         &self,
         turn_id: String,
@@ -333,62 +370,19 @@ impl CodexThread {
         client_user_message_id: Option<String>,
     ) -> CodexResult<()> {
         debug_assert!(matches!(op, Op::UserInput { .. }));
-        let execution_guard = self.reserve_execution_guard(&op).await?;
-        let (admission_tx, admission_rx) = oneshot::channel();
-        {
-            let mut task_start = self.codex.session.task_start_state.lock().await;
-            match task_start
-                .pending_start_only_admissions
-                .entry(turn_id.clone())
-            {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(admission_tx);
-                }
-                std::collections::hash_map::Entry::Occupied(_) => {
-                    return Err(CodexErr::InvalidRequest(format!(
-                        "turn id {turn_id} already has a pending start admission"
-                    )));
-                }
-            }
-        }
-
-        if let Err(err) = self
-            .submit_submission_with_execution_guard(
+        let guard = self.reserve_execution_guard(&op).await?;
+        let _residency_pin = self.residency_gate.read().await;
+        self.codex
+            .submit_with_start_admission(
                 Submission {
-                    id: turn_id.clone(),
+                    id: turn_id,
                     op,
-                    client_user_message_id,
                     trace,
+                    client_user_message_id,
                 },
-                execution_guard,
+                guard,
             )
             .await
-        {
-            self.codex
-                .session
-                .task_start_state
-                .lock()
-                .await
-                .pending_start_only_admissions
-                .remove(&turn_id);
-            return Err(err);
-        }
-
-        match admission_rx.await {
-            Ok(result) => result,
-            Err(_) => {
-                self.codex
-                    .session
-                    .task_start_state
-                    .lock()
-                    .await
-                    .pending_start_only_admissions
-                    .remove(&turn_id);
-                Err(CodexErr::Fatal(format!(
-                    "turn start admission acknowledgement was dropped for {turn_id}"
-                )))
-            }
-        }
     }
 
     pub async fn steer_input(
@@ -464,6 +458,12 @@ impl CodexThread {
     /// raw events enabled.
     pub fn request_raw_response_items(&self) {
         self.codex.session.request_raw_response_items();
+    }
+
+    /// Internal history indexes need raw input boundaries without opting into
+    /// cloning all tool outputs or exposing raw events to ordinary clients.
+    pub fn request_raw_user_turn_boundaries(&self) {
+        self.codex.session.request_raw_user_turn_boundaries();
     }
 
     pub async fn set_openai_form_elicitation_support(&self, supported: bool) -> anyhow::Result<()> {
@@ -594,11 +594,18 @@ impl CodexThread {
         Ok(id)
     }
 
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "The residency pin must exclude idle eviction until the receiver owns the input"
+    )]
     async fn submit_submission_with_execution_guard(
         &self,
         sub: Submission,
         execution_guard: Option<AgentExecutionGuard>,
     ) -> CodexResult<()> {
+        // Keep idle selection out until the receiver owns the pending input.
+        // Capacity is reserved by the caller before taking this pin.
+        let _residency_pin = self.residency_gate.read().await;
         let registration = self
             .codex
             .session

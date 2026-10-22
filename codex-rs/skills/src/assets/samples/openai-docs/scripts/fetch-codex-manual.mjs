@@ -28,6 +28,7 @@ class ManualFetchError extends Error {
   constructor(message, options) {
     super(message, options);
     this.name = "ManualFetchError";
+    this.kind = options?.kind ?? "local";
   }
 }
 
@@ -217,6 +218,7 @@ const requestManual = async (url, { cacheDir, method, timeoutMs }) => {
 
   throw new ManualFetchError(`${method} ${url} could not be fetched.`, {
     cause: lastError,
+    kind: "transport",
   });
 };
 
@@ -420,7 +422,8 @@ const fetchCodexManual = async ({
   const resolvedCacheDir = await resolveCacheDir(cacheDir);
   if (!resolvedCacheDir) {
     throw new ManualFetchError(
-      "Manual cache directory is unavailable; pass --cache-dir to override or use OpenAI Docs MCP fallback."
+      "Manual cache directory is unavailable; pass --cache-dir to override or use OpenAI Docs MCP fallback.",
+      { kind: "cache" }
     );
   }
   await mkdir(resolvedCacheDir, { recursive: true });
@@ -547,15 +550,16 @@ const main = async () => {
   }
 };
 
-const envProxyHint = () => {
+const envProxyHint = (error) => {
+  if (error?.kind === "cache" || ["EACCES", "EPERM", "EROFS", "ENOSPC", "ENOENT"].includes(error?.code)) {
+    return "Hint: choose an available, writable --cache-dir (on Windows, under %TEMP% or %TMP%).";
+  }
+  if (error?.kind !== "transport") return null;
   if (proxyConfigured()) {
     return "Hint: proxy env vars are present. This helper prefers `curl` in proxied sessions; if requests still fail, verify `curl` is installed and the proxy configuration is valid.";
   }
   if (typeof fetch !== "function") {
     return "Hint: native fetch is unavailable in this Node runtime. Install `curl` or use a newer Node version to fetch the manual.";
-  }
-  if (process.platform === "win32") {
-    return "Hint: on Windows, pass a cache dir under `%TEMP%` or `%TMP%`.";
   }
   return null;
 };
@@ -591,7 +595,7 @@ const isCliEntrypoint = () => {
 if (isCliEntrypoint()) {
   main().catch((error) => {
     console.error(`Error: ${error.message}`);
-    const hint = envProxyHint();
+    const hint = envProxyHint(error);
     if (hint) {
       console.error(hint);
     }

@@ -27,7 +27,6 @@ pub const MULTI_AGENT_DEFAULT_WAIT_TIMEOUT_MS: i64 = MULTI_AGENT_MIN_WAIT_TIMEOU
 
 mod feature_configs;
 pub use feature_configs::CodeModeConfigToml;
-pub use feature_configs::ContextManagementConfigToml;
 pub use feature_configs::CurrentTimeReminderConfigToml;
 pub use feature_configs::CurrentTimeReminderDeliveryMode;
 pub use feature_configs::CurrentTimeSource;
@@ -37,7 +36,6 @@ pub use feature_configs::NetworkProxyDomainPermissionToml;
 pub use feature_configs::NetworkProxyModeToml;
 pub use feature_configs::NetworkProxyUnixSocketPermissionToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
-pub use feature_configs::TokenBudgetConfigToml;
 
 /// High-level lifecycle stage for a feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +112,6 @@ pub enum Feature {
     // Experimental
     /// Show the optional consumer plan-limit history analytics report.
     AnalyticsPlanHistory,
-    ContextManagement,
-    TokenBudget,
     /// Enable JavaScript code mode.
     CodeMode,
     /// Run code mode cells in the standalone `codex-code-mode-host` process.
@@ -547,10 +543,6 @@ pub fn is_known_feature_key(key: &str) -> bool {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_management: Option<FeatureToml<ContextManagementConfigToml>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_budget: Option<FeatureToml<TokenBudgetConfigToml>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<FeatureToml<CodeModeConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
@@ -613,16 +605,6 @@ impl FeaturesToml {
 
     pub fn entries(&self) -> BTreeMap<String, bool> {
         let mut entries = self.entries.clone();
-        if let Some(enabled) = self
-            .context_management
-            .as_ref()
-            .and_then(FeatureToml::enabled)
-        {
-            entries.insert(Feature::ContextManagement.key().to_string(), enabled);
-        }
-        if let Some(enabled) = self.token_budget.as_ref().and_then(FeatureToml::enabled) {
-            entries.insert(Feature::TokenBudget.key().to_string(), enabled);
-        }
         if let Some(enabled) = self.code_mode.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::CodeMode.key().to_string(), enabled);
         }
@@ -645,8 +627,6 @@ impl FeaturesToml {
     pub fn materialize_resolved_enabled(&mut self, features: &Features) {
         self.clear_removed_compatibility_entries();
         let Self {
-            context_management,
-            token_budget,
             code_mode,
             multi_agent_v2,
             current_time_reminder,
@@ -660,13 +640,7 @@ impl FeaturesToml {
                 continue;
             }
             let enabled = features.enabled(spec.id);
-            if spec.id == Feature::ContextManagement {
-                entries.remove(spec.key);
-                materialize_resolved_feature_enabled(context_management, enabled);
-            } else if spec.id == Feature::TokenBudget {
-                entries.remove(spec.key);
-                materialize_resolved_feature_enabled(token_budget, enabled);
-            } else if spec.id == Feature::CodeMode {
+            if spec.id == Feature::CodeMode {
                 entries.remove(spec.key);
                 materialize_resolved_feature_enabled(code_mode, enabled);
             } else if spec.id == Feature::MultiAgentV2 {
@@ -698,12 +672,6 @@ fn materialize_resolved_feature_enabled<T: FeatureConfig>(
 impl From<BTreeMap<String, bool>> for FeaturesToml {
     fn from(mut entries: BTreeMap<String, bool>) -> Self {
         Self {
-            context_management: entries
-                .remove(Feature::ContextManagement.key())
-                .map(FeatureToml::Enabled),
-            token_budget: entries
-                .remove(Feature::TokenBudget.key())
-                .map(FeatureToml::Enabled),
             code_mode: entries
                 .remove(Feature::CodeMode.key())
                 .map(FeatureToml::Enabled),
@@ -831,18 +799,6 @@ macro_rules! define_features {
 }
 
 define_features! {
-    FeatureSpec {
-        id: Feature::ContextManagement,
-        key: "context_management",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
-    FeatureSpec {
-        id: Feature::TokenBudget,
-        key: "token_budget",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
-    },
     FeatureSpec {
         id: Feature::AnalyticsPlanHistory,
         key: "analytics_plan_history",
@@ -1253,7 +1209,7 @@ pub fn unknown_features_warning_event_with_origins(
         // the user to check their spelling for a key the parser recognizes.
         let removed = matches!(key.as_str(), "memories" | "memory_tool" | "auto_review"
             | "guardian_approval" | "artifact" | "enable_mcp_apps" | "realtime_conversation"
-            | "apps_mcp_path_override");
+            | "apps_mcp_path_override" | "token_budget" | "context_management");
         let origin = origins.get(key).and_then(Option::as_deref);
         serde_json::json!({
             "key": key,
@@ -1303,7 +1259,7 @@ pub fn unstable_features_warning_event(
     }
 
     // Resolve each configured value with its feature's own toggle field (for example
-    // `context_management.experimental_mode`), exactly as feature resolution does.
+    // `current_time_reminder.enabled`), exactly as feature resolution does.
     let configured_entries = effective_features
         .and_then(|table| {
             toml::Value::Table(table.clone())

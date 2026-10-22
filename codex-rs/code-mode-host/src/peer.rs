@@ -38,7 +38,9 @@ pub(super) struct OutgoingFrame {
 
 impl std::ops::Deref for OutgoingFrame {
     type Target = EncodedFrame;
-    fn deref(&self) -> &Self::Target { &self.frame }
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
 }
 
 pub(super) struct HostPeer {
@@ -130,7 +132,11 @@ impl HostPeer {
             outgoing_bytes: Arc::new(Semaphore::new(OUTGOING_DATA_BYTES)),
             failure_bytes: Arc::new(Semaphore::new(OUTGOING_FAILURE_BYTES)),
             control_bytes: Arc::new(Semaphore::new(OUTGOING_CONTROL_BYTES)),
-            outgoing_slots: Arc::new(Semaphore::new(super::OUTGOING_FRAME_CAPACITY - MAX_PENDING_DELEGATE_REQUESTS - super::MAX_ACTIVE_CELLS)),
+            outgoing_slots: Arc::new(Semaphore::new(
+                super::OUTGOING_FRAME_CAPACITY
+                    - MAX_PENDING_DELEGATE_REQUESTS
+                    - super::MAX_ACTIVE_CELLS,
+            )),
             pending: StdMutex::new(HashMap::new()),
             delegate_permits: Arc::new(Semaphore::new(MAX_PENDING_DELEGATE_REQUESTS)),
             cell_routes: StdMutex::new(HashMap::new()),
@@ -147,11 +153,20 @@ impl HostPeer {
     }
 
     fn prepare_frame(&self, message: &HostToClient) -> Result<OutgoingFrame, PeerSendError> {
-        let control = matches!(message,
-            HostToClient::CancelDelegateRequest { .. } | HostToClient::CellClosed { .. });
-        let failure = matches!(message,
-            HostToClient::Response { result: WireResult::Err { .. }, .. }
-            | HostToClient::InitialResponse { result: WireResult::Err { .. }, .. });
+        let control = matches!(
+            message,
+            HostToClient::CancelDelegateRequest { .. } | HostToClient::CellClosed { .. }
+        );
+        let failure = matches!(
+            message,
+            HostToClient::Response {
+                result: WireResult::Err { .. },
+                ..
+            } | HostToClient::InitialResponse {
+                result: WireResult::Err { .. },
+                ..
+            }
+        );
         let bytes = EncodedFrame::encoded_len(message)
             .map_err(|err| PeerSendError::Payload(err.to_string()))?;
         // Vec growth may retain up to twice the encoded length. Admission is
@@ -165,14 +180,31 @@ impl HostPeer {
         } else {
             &self.outgoing_bytes
         };
-        let permit = Arc::clone(budget).try_acquire_many_owned(bytes.saturating_mul(2).max(256) as u32)
-            .map_err(|_| PeerSendError::Payload("outgoing IPC byte budget exhausted; result was not delivered".into()))?;
-        let slot = if control { None } else {
-            Some(Arc::clone(&self.outgoing_slots).try_acquire_owned()
-                .map_err(|_| PeerSendError::Payload("outgoing IPC data slots exhausted".into()))?)
+        let permit = Arc::clone(budget)
+            .try_acquire_many_owned(bytes.saturating_mul(2).max(256) as u32)
+            .map_err(|_| {
+                PeerSendError::Payload(
+                    "outgoing IPC byte budget exhausted; result was not delivered".into(),
+                )
+            })?;
+        let slot = if control {
+            None
+        } else {
+            Some(
+                Arc::clone(&self.outgoing_slots)
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        PeerSendError::Payload("outgoing IPC data slots exhausted".into())
+                    })?,
+            )
         };
-        let frame = EncodedFrame::encode(message).map_err(|err| PeerSendError::Payload(err.to_string()))?;
-        Ok(OutgoingFrame { frame, _bytes: permit, _slot: slot })
+        let frame =
+            EncodedFrame::encode(message).map_err(|err| PeerSendError::Payload(err.to_string()))?;
+        Ok(OutgoingFrame {
+            frame,
+            _bytes: permit,
+            _slot: slot,
+        })
     }
 
     pub(super) fn respond(
@@ -192,7 +224,9 @@ impl HostPeer {
                 },
             })
         {
-            self.fail(format!("cannot deliver code-mode response failure: {error}"));
+            self.fail(format!(
+                "cannot deliver code-mode response failure: {error}"
+            ));
         }
     }
 
@@ -215,7 +249,9 @@ impl HostPeer {
                 },
             })
         {
-            self.fail(format!("cannot deliver code-mode initial response failure: {error}"));
+            self.fail(format!(
+                "cannot deliver code-mode initial response failure: {error}"
+            ));
         }
     }
 

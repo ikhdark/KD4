@@ -212,8 +212,8 @@ mod tests {
         assert_eq!(env.get(OsStr::new(custom_var)), Some(&expected));
 
         // The same host variable stays out of the child environment unless it is listed.
-        let unlisted = create_env_for_mcp_server(/*extra_env*/ None, &[])
-            .expect("local MCP env should build");
+        let unlisted =
+            create_env_for_mcp_server(/*extra_env*/ None, &[]).expect("local MCP env should build");
         assert_eq!(unlisted.get(OsStr::new(custom_var)), None);
     }
 

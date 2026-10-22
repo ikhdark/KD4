@@ -7,13 +7,13 @@ use std::path::PathBuf;
 
 #[derive(Args, Clone, Debug, Default)]
 pub struct SharedCliOptions {
-    /// Optional image(s) to attach to the initial prompt.
+    /// Image(s) to attach to the initial prompt. Repeat -i or use comma-separated paths.
     #[arg(
         long = "image",
         short = 'i',
         value_name = "FILE",
         value_delimiter = ',',
-        num_args = 1..
+        num_args = 1
     )]
     pub images: Vec<PathBuf>,
 
@@ -257,7 +257,9 @@ mod tests {
                 expected_bypass
             );
             assert_eq!(
-                child.sandbox_mode.map(codex_protocol::config_types::SandboxMode::from),
+                child
+                    .sandbox_mode
+                    .map(codex_protocol::config_types::SandboxMode::from),
                 (!expected_bypass).then_some(codex_protocol::config_types::SandboxMode::ReadOnly)
             );
         }

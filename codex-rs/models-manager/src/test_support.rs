@@ -16,7 +16,11 @@ pub fn test_models_response() -> Result<ModelsResponse, serde_json::Error> {
     let mut retired: ModelsResponse = serde_json::from_str(include_str!("test_models.json"))?;
     crate::prompt_resolver::apply_prompt_policy(&mut retired.models);
     for model in retired.models {
-        if !response.models.iter().any(|current| current.slug == model.slug) {
+        if !response
+            .models
+            .iter()
+            .any(|current| current.slug == model.slug)
+        {
             response.models.push(model);
         }
     }

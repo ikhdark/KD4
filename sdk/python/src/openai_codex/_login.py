@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
+from ._limits import _NotificationQueue
 from .async_client import AsyncCodexClient
 from .client import CodexClient
+from .errors import TransportClosedError
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
     CancelLoginAccountResponse,
@@ -105,6 +107,10 @@ class ChatgptLoginHandle:
     _client: CodexClient
     login_id: str
     auth_url: str
+    _notifications: _NotificationQueue = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._notifications = self._client._router.retain_login(self.login_id)
 
     def wait(self) -> AccountLoginCompletedNotification:
         """Wait for this browser login attempt's completion notification."""
@@ -113,6 +119,11 @@ class ChatgptLoginHandle:
     def cancel(self) -> CancelLoginAccountResponse:
         """Cancel this browser login attempt."""
         return self._client.account_login_cancel(self.login_id)
+
+    def close(self) -> None:
+        """Discard this handle's notifications without changing server login state."""
+        self._client._router.unregister_login(self.login_id, expected=self._notifications)
+        self._notifications.fail(TransportClosedError("login handle closed"))
 
 
 @dataclass(slots=True)
@@ -123,6 +134,10 @@ class DeviceCodeLoginHandle:
     login_id: str
     verification_url: str
     user_code: str
+    _notifications: _NotificationQueue = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._notifications = self._client._router.retain_login(self.login_id)
 
     def wait(self) -> AccountLoginCompletedNotification:
         """Wait for this device-code login attempt's completion notification."""
@@ -132,6 +147,11 @@ class DeviceCodeLoginHandle:
         """Cancel this device-code login attempt."""
         return self._client.account_login_cancel(self.login_id)
 
+    def close(self) -> None:
+        """Discard this handle's notifications without changing server login state."""
+        self._client._router.unregister_login(self.login_id, expected=self._notifications)
+        self._notifications.fail(TransportClosedError("login handle closed"))
+
 
 @dataclass(slots=True)
 class AsyncChatgptLoginHandle:
@@ -140,6 +160,10 @@ class AsyncChatgptLoginHandle:
     _codex: _AsyncLoginOwner
     login_id: str
     auth_url: str
+    _notifications: _NotificationQueue = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._notifications = self._codex._client._sync._router.retain_login(self.login_id)
 
     async def wait(self) -> AccountLoginCompletedNotification:
         """Wait for this browser login attempt's completion notification."""
@@ -151,6 +175,13 @@ class AsyncChatgptLoginHandle:
         await self._codex._ensure_initialized()
         return await self._codex._client.account_login_cancel(self.login_id)
 
+    def close(self) -> None:
+        """Discard this handle's notifications without changing server login state."""
+        self._codex._client._sync._router.unregister_login(
+            self.login_id, expected=self._notifications
+        )
+        self._notifications.fail(TransportClosedError("login handle closed"))
+
 
 @dataclass(slots=True)
 class AsyncDeviceCodeLoginHandle:
@@ -160,6 +191,10 @@ class AsyncDeviceCodeLoginHandle:
     login_id: str
     verification_url: str
     user_code: str
+    _notifications: _NotificationQueue = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._notifications = self._codex._client._sync._router.retain_login(self.login_id)
 
     async def wait(self) -> AccountLoginCompletedNotification:
         """Wait for this device-code login attempt's completion notification."""
@@ -170,3 +205,10 @@ class AsyncDeviceCodeLoginHandle:
         """Cancel this device-code login attempt."""
         await self._codex._ensure_initialized()
         return await self._codex._client.account_login_cancel(self.login_id)
+
+    def close(self) -> None:
+        """Discard this handle's notifications without changing server login state."""
+        self._codex._client._sync._router.unregister_login(
+            self.login_id, expected=self._notifications
+        )
+        self._notifications.fail(TransportClosedError("login handle closed"))

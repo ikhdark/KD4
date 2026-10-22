@@ -3,10 +3,273 @@ use codex_utils_string::approx_token_count;
 use std::time::Duration;
 
 #[tokio::test]
+async fn all_raw_producers_reject_equal_length_substituted_bytes_after_reopen() {
+    let home = tempfile::tempdir().unwrap();
+    for producer in ["create", "replace", "stream"] {
+        let artifact = match producer {
+            "create" => create_raw_output_artifact(home.path(), producer, b"VERDICT=FAIL\n").await,
+            "replace" => {
+                let original =
+                    create_raw_output_artifact(home.path(), producer, b"previous\n").await;
+                replace_raw_output_artifact(&original, b"VERDICT=FAIL\n").await
+            }
+            _ => {
+                let original = create_raw_output_artifact(home.path(), producer, b"VERDICT=").await;
+                let state = Arc::new(Mutex::new(original));
+                let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+                writer.write_chunk(Some(&state), b"FAIL\n").await;
+                writer.finish(Some(&state)).await;
+
+                state.lock().await.clone()
+            }
+        };
+        let RawOutputArtifact::Stored { path, id, .. } = artifact else {
+            panic!("stored raw capture")
+        };
+        let snapshot = load_tool_output_snapshot(home.path(), producer, &id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(snapshot.historical_authenticity(), "authenticated");
+        let output = snapshot
+            .select(vec![ToolOutputSelector::Lines { start: 1, end: 1 }], 4096)
+            .await
+            .unwrap();
+        assert_eq!(output.results[0].text.as_deref(), Some("VERDICT=FAIL\n"));
+        // A new transaction must compare against the producer's digest, not a
+        // hash calculated only after the equal-length substitution.
+        std::fs::write(path, b"VERDICT=PASS\n").unwrap();
+        assert!(
+            load_tool_output_snapshot(home.path(), producer, &id.to_string())
+                .await
+                .is_err(),
+            "{producer}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_raw_bytes_need_an_independent_receipt_to_certify_original_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let raw = create_raw_output_artifact(home.path(), "legacy-proof", b"prefix\n").await;
+    let RawOutputArtifact::Stored { path, id, .. } = &raw else {
+        panic!("stored raw output");
+    };
+    let metadata_path = logical_metadata_path(path);
+    let mut legacy: Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    legacy["raw_capture_version"] = serde_json::json!(1);
+    legacy.as_object_mut().unwrap().remove("retained_sha256");
+    std::fs::write(metadata_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let result = read_tool_output_selectors(
+        home.path(),
+        "legacy-proof",
+        &id.to_string(),
+        vec![ToolOutputSelector::Bytes { start: 0, end: 7 }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.results[0].text.as_deref(), Some("prefix\n"));
+    assert!(!result.capture_complete);
+    assert!(
+        read_complete_canonical_snapshot(home.path(), "legacy-proof", &id.to_string(), 7)
+            .await
+            .is_err()
+    );
+    let expected = hex::encode(Sha256::digest(b"prefix\n"));
+    verify_tool_history_artifact(home.path(), "legacy-proof", &id.to_string(), 7, &expected)
+        .await
+        .expect("an independent original receipt still authenticates a valid legacy artifact");
+    std::fs::write(path, b"tamper\n").unwrap();
+    assert!(
+        verify_tool_history_artifact(home.path(), "legacy-proof", &id.to_string(), 7, &expected)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn raw_finalization_authenticates_bytes_and_survives_append_without_rehashing_prefix() {
+    let home = tempfile::tempdir().unwrap();
+    let original = create_raw_output_artifact(home.path(), "raw-digest", b"ALLOW=0\n").await;
+    assert!(original.capture_finalized_complete());
+    let id = original.artifact_id().unwrap().to_string();
+    let state = Arc::new(Mutex::new(original));
+    let mut writer = RawOutputArtifactWriter::open(Some(&state)).await.unwrap();
+    assert!(!state.lock().await.capture_finalized_complete());
+    writer.write_chunk(Some(&state), b"suffix\n").await;
+    assert!(!state.lock().await.capture_finalized_complete());
+    writer.finish(Some(&state)).await;
+    assert!(state.lock().await.capture_finalized_complete());
+    let recovered = read_tool_output_selectors(
+        home.path(),
+        "raw-digest",
+        &id,
+        vec![ToolOutputSelector::Bytes { start: 0, end: 15 }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered.results[0].text.as_deref(),
+        Some("ALLOW=0\nsuffix\n")
+    );
+    let path = match &*state.lock().await {
+        RawOutputArtifact::Stored { path, .. } => path.clone(),
+        _ => panic!("stored output"),
+    };
+    std::fs::write(&path, b"ALLOW=1\nsuffix\n").unwrap();
+    assert!(
+        read_tool_output_selectors(
+            home.path(),
+            "raw-digest",
+            &id,
+            vec![ToolOutputSelector::Bytes { start: 0, end: 15 }]
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn complete_artifact_rejects_an_inconsistent_canonical_digest() {
+    let home = tempfile::tempdir().unwrap();
+    let artifact = create_canonical_output_artifact(
+        home.path(),
+        "digest-check",
+        &CanonicalToolResult::text("ALLOW=0\n"),
+    )
+    .await;
+    let id = artifact.artifact_id().unwrap();
+    let path = home
+        .path()
+        .join("tool-output/digest-check")
+        .join(format!("{id}.log"));
+    let sidecar = logical_metadata_path(&path);
+    let mut metadata: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+    metadata["canonical_sha256"] = Value::String("f".repeat(64));
+    std::fs::write(sidecar, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(
+        read_tool_output_selectors(
+            home.path(),
+            "digest-check",
+            &id,
+            vec![ToolOutputSelector::Bytes { start: 0, end: 8 }]
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn semantic_pointer_cache_cannot_redirect_a_valid_lexical_value() {
+    let home = tempfile::tempdir().unwrap();
+    let canonical = CanonicalToolResult::json(serde_json::json!({"left":"ALLOW","right":"DENY!"}));
+    let artifact = create_canonical_output_artifact(home.path(), "pointer-check", &canonical).await;
+    let id = artifact.artifact_id().unwrap();
+    let path = home
+        .path()
+        .join("tool-output/pointer-check")
+        .join(format!("{id}.log"));
+    let sidecar = logical_metadata_path(&path);
+    let mut metadata: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+    metadata["json_pointers"]["/left"]["range"] =
+        metadata["json_pointers"]["/right"]["range"].clone();
+    std::fs::write(sidecar, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let result = read_tool_output_selectors(
+        home.path(),
+        "pointer-check",
+        &id,
+        vec![
+            ToolOutputSelector::JsonPointer {
+                pointer: "/left".into(),
+            },
+            ToolOutputSelector::Bytes {
+                start: 0,
+                end: canonical.exact_bytes,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    let pointer = result
+        .results
+        .iter()
+        .find(|result| {
+            matches!(&result.selector,
+        ToolOutputSelector::JsonPointer { pointer } if pointer == "/left")
+        })
+        .unwrap();
+    assert_eq!(pointer.status, ToolOutputSelectorStatus::Invalid);
+    assert_eq!(pointer.value, None);
+    let bytes = result
+        .results
+        .iter()
+        .find(|result| matches!(result.selector, ToolOutputSelector::Bytes { .. }))
+        .unwrap();
+    assert_eq!(
+        bytes.text.as_deref(),
+        std::str::from_utf8(&canonical.bytes).ok()
+    );
+}
+
+#[tokio::test]
+async fn duplicate_decoded_json_keys_are_ambiguous_but_unique_siblings_survive() {
+    for text in [
+        r#"{"x":1,"x":2,"safe":3}"#,
+        r#"{"x":1,"\u0078":2,"safe":3}"#,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let artifact = create_canonical_output_artifact(
+            home.path(),
+            "duplicates",
+            &CanonicalToolResult::text(text),
+        )
+        .await;
+        let id = artifact.artifact_id().unwrap();
+        let result = read_tool_output_selectors(
+            home.path(),
+            "duplicates",
+            &id,
+            vec![
+                ToolOutputSelector::JsonPointer {
+                    pointer: "/x".into(),
+                },
+                ToolOutputSelector::JsonPointer {
+                    pointer: "/safe".into(),
+                },
+                ToolOutputSelector::JsonPointer {
+                    pointer: String::new(),
+                },
+                ToolOutputSelector::Bytes {
+                    start: 0,
+                    end: text.len() as u64,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        for row in &result.results {
+            match &row.selector {
+                ToolOutputSelector::JsonPointer { pointer } if pointer == "/safe" => {
+                    assert_eq!(row.value, Some(serde_json::json!(3)));
+                }
+                ToolOutputSelector::JsonPointer { .. } => {
+                    assert_eq!(row.status, ToolOutputSelectorStatus::Invalid)
+                }
+                ToolOutputSelector::Bytes { .. } => assert_eq!(row.text.as_deref(), Some(text)),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[tokio::test]
 #[serial_test::serial(command_output_artifact)]
 async fn indexed_eviction_rechecks_new_or_invalid_protection_before_deleting() {
     for global in [false, true] {
-        for marker_bytes in [ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES, b"invalid".as_slice()] {
+        for marker_bytes in [
+            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
+            b"invalid".as_slice(),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("tool-output");
             let directory = root.join("thread");
@@ -22,20 +285,32 @@ async fn indexed_eviction_rechecks_new_or_invalid_protection_before_deleting() {
             // Simulate a protection publication absent from this process's
             // cached index. Neither a valid pin nor an unreadable/invalid pin
             // permits deletion of exact bytes promised to retained history.
-            let _permit = retention_sweep_permit_for_directory(&directory).await.unwrap();
+            let _permit = retention_sweep_permit_for_directory(&directory)
+                .await
+                .unwrap();
             std::fs::write(active_tool_history_protection_path(&path), marker_bytes).unwrap();
             let token = capture_retention_token(&directory);
             let keep = directory.join("not-the-candidate.log");
             let completed = if global {
                 enforce_indexed_global_retention_blocking(
-                    &token.root, &keep, 0, max_retained_artifacts_total(),
+                    &token.root,
+                    &keep,
+                    0,
+                    max_retained_artifacts_total(),
                 )
             } else {
                 enforce_indexed_thread_retention_blocking(
-                    &token.root, &directory, &keep, 0, max_retained_artifacts_per_thread(),
+                    &token.root,
+                    &directory,
+                    &keep,
+                    0,
+                    max_retained_artifacts_per_thread(),
                 )
             };
-            assert!(!completed, "stale protection accounting must stop the sweep");
+            assert!(
+                !completed,
+                "stale protection accounting must stop the sweep"
+            );
             assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Dirty);
             assert_eq!(std::fs::read(&path).unwrap(), b"original");
             assert_eq!(std::fs::read(&segment).unwrap(), b"continuation");
@@ -167,9 +442,9 @@ async fn unavailable_retention_index_scans_exact_usage_and_fails_closed() {
                     RetentionRootMode::Dirty
                 };
             }
-            // Count all family bytes locally, but protected bytes are exempt globally.
+            // Count complete cache families; protected bytes are exempt from both quotas.
             let usage = retention_usage_locked_blocking(&directory);
-            assert_eq!(usage.thread_bytes, 3 + 7 + 5);
+            assert_eq!(usage.thread_bytes, if protected { 0 } else { 3 + 7 + 5 });
             assert_eq!(usage.global_bytes, if protected { 0 } else { 3 + 7 + 5 });
 
             // Neither a missing thread directory nor an unreadable protection
@@ -184,6 +459,10 @@ async fn unavailable_retention_index_scans_exact_usage_and_fails_closed() {
             }
             std::fs::create_dir(&marker).unwrap();
             assert_eq!(
+                retention_usage_locked_blocking(&directory).thread_bytes,
+                u64::MAX
+            );
+            assert_eq!(
                 retention_usage_locked_blocking(&directory).global_bytes,
                 u64::MAX
             );
@@ -193,7 +472,7 @@ async fn unavailable_retention_index_scans_exact_usage_and_fails_closed() {
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn context_retention_survives_invalidated_reconciliation_without_ignoring_quota() {
+async fn context_retention_survives_invalidated_reconciliation_above_protected_thread_quota() {
     for full in [false, true] {
         let (session, _) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
@@ -206,7 +485,7 @@ async fn context_retention_survives_invalidated_reconciliation_without_ignoring_
         std::fs::File::create(&path)
             .unwrap()
             .set_len(if full {
-                MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+                MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD + 1
             } else {
                 3
             })
@@ -245,25 +524,16 @@ async fn context_retention_survives_invalidated_reconciliation_without_ignoring_
             .expect("retention must settle without a reconciliation retry loop")
             .unwrap();
         assert_eq!(retention_mode_for_test(&root), RetentionModeKind::Dirty);
-        if full {
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("context was not admitted")
-            );
-        } else {
-            let recovery = result.expect("dirty index must not reject available capacity");
-            let recovered = read_exact_tool_output_artifact(
-                home.as_path(),
-                &thread,
-                recovery["artifact_id"].as_str().unwrap(),
-            )
-            .await
-            .unwrap();
-            let recovered: serde_json::Value = serde_json::from_slice(&recovered).unwrap();
-            assert_eq!(recovered["items"], items);
-        }
+        let recovery = result.expect("protected history must not exhaust recovery capacity");
+        let recovered = read_exact_tool_output_artifact(
+            home.as_path(),
+            &thread,
+            recovery["artifact_id"].as_str().unwrap(),
+        )
+        .await
+        .unwrap();
+        let recovered: serde_json::Value = serde_json::from_slice(&recovered).unwrap();
+        assert_eq!(recovered["items"], items);
         assert!(
             path.exists(),
             "protected history must survive both outcomes"
@@ -300,7 +570,7 @@ async fn scan_only_retention_counts_segment_and_metadata_bytes() {
             );
             // Independent byte oracle: 3 base + 7 tail + 5 sidecar + 4 kept.
             let usage = retention_usage_locked_blocking(&directory);
-            assert_eq!(usage.thread_bytes, 19);
+            assert_eq!(usage.thread_bytes, if protected { 4 } else { 19 });
             assert_eq!(usage.global_bytes, if protected { 4 } else { 19 });
             let _permit = retention_sweep_permit_for_directory(&directory).await;
             // Reserve all but 18 bytes, so the 19-byte family set exceeds the
@@ -348,6 +618,11 @@ async fn canonical_segment_failure_reports_only_the_surviving_prefix() {
             let canonical = CanonicalToolResult::text(body.clone());
             let id = ToolOutputArtifactId::new();
             let path = directory.join(format!("{id}.log"));
+            let tag = uuid::Uuid::new_v4();
+            stage_tag_overrides()
+                .lock()
+                .unwrap()
+                .insert(path.clone(), tag);
             if attach {
                 std::fs::write(&path, &body.as_bytes()[..prefix]).unwrap();
             }
@@ -355,7 +630,7 @@ async fn canonical_segment_failure_reports_only_the_surviving_prefix() {
             let blocked = if installing {
                 logical_segment_path(&path, failed_index)
             } else {
-                staged_logical_segment_path(&directory, id, failed_index)
+                staged_segment_path_for_tag(&directory, id, tag, failed_index)
             };
             std::fs::create_dir(&blocked).unwrap();
             let result = if attach {
@@ -389,7 +664,8 @@ async fn canonical_segment_failure_reports_only_the_surviving_prefix() {
                 assert!(!path.exists());
             }
             assert!(
-                !staged_logical_segment_path(&directory, id, if attach { 1 } else { 0 }).exists()
+                !staged_segment_path_for_tag(&directory, id, tag, if attach { 1 } else { 0 })
+                    .exists()
             );
             assert!(blocked.is_dir(), "failure fixture must not be deleted");
         }
@@ -398,19 +674,20 @@ async fn canonical_segment_failure_reports_only_the_surviving_prefix() {
 
 #[test]
 #[serial_test::serial(command_output_artifact)]
-fn protected_history_global_budget_tracks_protection_and_streaming_changes() {
+fn protected_history_cache_budgets_track_protection_and_streaming_changes() {
     let mut index = RetentionIndex::default();
+    let protected_bytes = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD + 1;
     for thread in 0..32 {
         let directory = PathBuf::from(format!("thread-{thread}"));
         assert!(index.insert(ArtifactRetentionRecord {
             path: directory.join("output.log"),
             thread_directory: directory,
-            bytes: MAX_RETAINED_ARTIFACT_BYTES_TOTAL / 16,
+            bytes: protected_bytes,
             modified: SystemTime::UNIX_EPOCH,
             protected: true,
         }));
     }
-    assert_eq!(index.total_bytes, 2 * MAX_RETAINED_ARTIFACT_BYTES_TOTAL);
+    assert_eq!(index.total_bytes, 32 * protected_bytes);
     assert_eq!(index.unprotected_bytes, 0);
     assert!(!index.is_near_limit());
 
@@ -419,29 +696,35 @@ fn protected_history_global_budget_tracks_protection_and_streaming_changes() {
     record.protected = false;
     assert!(index.insert(record.clone()));
     assert_eq!(index.unprotected_bytes, record.bytes);
+    assert_eq!(
+        index.thread_cache_totals(Path::new("thread-0")).0,
+        record.bytes
+    );
+    assert!(index.is_near_limit());
     assert!(index.update_streaming_size(&path, 42, SystemTime::UNIX_EPOCH));
     assert_eq!(index.unprotected_bytes, 42);
+    assert_eq!(index.thread_cache_totals(Path::new("thread-0")).0, 42);
+    assert!(!index.is_near_limit());
     record.bytes = 42;
     record.protected = true;
     assert!(index.insert(record));
     assert_eq!(index.unprotected_bytes, 0);
-    assert_eq!(index.thread_totals(Path::new("thread-0")).0, 42);
+    assert_eq!(index.thread_cache_totals(Path::new("thread-0")).0, 0);
+    assert_eq!(index.threads[Path::new("thread-0")].bytes, 42);
     index.remove(&path).unwrap();
     assert_eq!(index.unprotected_bytes, 0);
-    assert_eq!(
-        index.total_bytes,
-        31 * (MAX_RETAINED_ARTIFACT_BYTES_TOTAL / 16)
-    );
+    assert_eq!(index.total_bytes, 31 * protected_bytes);
 }
 
 #[tokio::test]
 #[serial_test::serial(command_output_artifact)]
-async fn protected_history_global_budget_does_not_block_context_retention() {
-    for scan_only in [false, true] {
+async fn protected_history_cache_budgets_do_not_block_context_retention() {
+    for (same_thread, scan_only) in [(false, false), (false, true), (true, false), (true, true)] {
         let (session, _) = crate::session::tests::make_session_and_context().await;
         let home = session.codex_home().await;
         let root = home.join("tool-output");
-        let foreign_directory = root.join("older-thread");
+        let thread = session.thread_id().to_string();
+        let foreign_directory = root.join(if same_thread { &thread } else { "older-thread" });
         std::fs::create_dir_all(&foreign_directory).unwrap();
         // A length-only fixture reproduces accumulated protected history without
         // constructing a multi-GiB buffer or reading/hashing its contents.
@@ -471,9 +754,8 @@ async fn protected_history_global_budget_does_not_block_context_retention() {
         let recovery = session
             .retain_context_source("artifact_directory", items.clone())
             .await
-            .expect("protected history in other threads must not block compaction");
+            .expect("protected history must not block compaction in any thread");
         let id = recovery["artifact_id"].as_str().unwrap();
-        let thread = session.thread_id().to_string();
         let recovered = read_exact_tool_output_artifact(home.as_path(), &thread, id)
             .await
             .unwrap();
@@ -491,11 +773,15 @@ async fn protected_history_global_budget_does_not_block_context_retention() {
             .unwrap();
         assert_eq!(reused, recovery);
 
-        // Releasing protection puts those bytes back under the global limit.
+        // Releasing protection puts those bytes back under the cache limits.
         std::fs::remove_file(marker).unwrap();
         force_retention_reconciliation_for_test(&root).await;
         let context_path = root.join(&thread).join(format!("{id}.log"));
-        enforce_global_retention(&root, &context_path).await;
+        if same_thread {
+            enforce_retention(&foreign_directory, &context_path).await;
+        } else {
+            enforce_global_retention(&root, &context_path).await;
+        }
         assert!(!occupied.exists());
         assert!(context_path.exists());
         assert!(
@@ -524,6 +810,34 @@ async fn context_retention_failure_reports_storage_cause_without_admitting_conte
     assert!(error.contains("Retained 0 of"), "{error}");
     assert!(error.contains("failed to create"), "{error}");
     assert_eq!(std::fs::read(blocked).unwrap(), b"not a directory");
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn context_retention_rejects_active_unprotected_bytes_at_thread_quota() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let home = session.codex_home().await;
+    let directory = home
+        .join("tool-output")
+        .join(session.thread_id().to_string());
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+    let active = std::fs::File::create(&path).unwrap();
+    active
+        .set_len(MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD)
+        .unwrap();
+    active.try_lock().unwrap();
+    let error = session
+        .retain_context_source("artifact_directory", serde_json::json!([]))
+        .await
+        .expect_err("active cache bytes still consume the thread quota")
+        .to_string();
+    assert!(error.contains("context was not admitted"), "{error}");
+    assert!(error.contains("Retained 0 of"), "{error}");
+    assert_eq!(
+        std::fs::metadata(path).unwrap().len(),
+        MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+    );
 }
 
 #[tokio::test]
@@ -777,7 +1091,9 @@ async fn verified10_batch_protection_keeps_healthy_siblings() {
         (uuid::Uuid::now_v7().to_string(), (7, "0".repeat(64))),
     ]);
     assert_eq!(
-        protect_retrievable_tool_history_artifacts(home.path(), "thread", references).await,
+        protect_retrievable_tool_history_artifacts(home.path(), "thread", references)
+            .await
+            .unwrap(),
         BTreeSet::from([id])
     );
 }
@@ -785,7 +1101,8 @@ async fn verified10_batch_protection_keeps_healthy_siblings() {
 #[test]
 fn selector_response_cost_matches_serialization_at_every_boundary() {
     let canonical = CanonicalToolResult::text("λ😀\u{0000}\"\\\n".repeat(100));
-    let mut metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string());
+    let mut metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string())
+        .expect("bounded snapshot fixture");
     metadata
         .unavailable_ranges
         .push(CanonicalByteRange::new(7, 11));
@@ -846,7 +1163,9 @@ fn script_selector_sizing_reuses_prefix_without_changing_admission() {
     // metadata and repeated selections. Different source bytes must recompute it.
     for text in [
         "a".repeat(20_000),
-        "\"\\\n".repeat(20_000),
+        // Still over the 1 MiB encoded payload cap across 64 selections, but
+        // below the admitted line-index workspace limit.
+        "\"\\\n".repeat(10_000),
         "λ😀\u{0000}\"\\\n".repeat(10_000),
     ] {
         // Keep selections disjoint so normalization does not collapse this
@@ -859,7 +1178,8 @@ fn script_selector_sizing_reuses_prefix_without_changing_admission() {
                 end: (index * stride + text.len()) as u64,
             })
             .collect::<Vec<_>>();
-        let metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string());
+        let metadata = producer_snapshot_metadata(&canonical, uuid::Uuid::nil().to_string())
+            .expect("bounded snapshot fixture");
         let (mut expected, _) =
             select_file_snapshot_for_script(&canonical, Some(Vec::new())).unwrap();
         for selector in &selectors {
@@ -1160,7 +1480,7 @@ async fn logical_artifact_for_test(
         .join("tool-output")
         .join("thread")
         .join(format!("{id}.log"));
-    let metadata = load_logical_metadata(
+    let (metadata, _family_lease) = load_logical_metadata(
         &path,
         id.parse::<ToolOutputArtifactId>().expect("artifact id"),
     )
@@ -1950,8 +2270,10 @@ async fn cancelled_canonical_creation_finishes_owned_family_and_releases_retenti
                 .expect("staged directory");
             while let Some(entry) = entries.next_entry().await.expect("staged entry") {
                 let name = entry.file_name().to_string_lossy().into_owned();
+                // Staged segments are `.{id}.stage-{tag}.segment-{index}.pending`.
                 if let Some(staged) = name.strip_prefix('.')
-                    && let Some((id, _)) = staged.split_once(".segment-")
+                    && let Some((owner, _)) = staged.split_once(".segment-")
+                    && let Some((id, _)) = owner.split_once(".stage-")
                 {
                     return id.to_string();
                 }
@@ -2006,15 +2328,6 @@ async fn cancelled_canonical_creation_finishes_owned_family_and_releases_retenti
         );
     }
     drop(permit);
-}
-
-#[test]
-fn artifact_metadata_discloses_source_capture_truncation() {
-    let artifact = RawOutputArtifact::unavailable("test artifact");
-    let rendered = artifact.render_for_model_with_source_truncation(true);
-
-    assert!(rendered.contains("source capture truncated"));
-    assert!(rendered.contains("omitted bytes unavailable"));
 }
 
 #[tokio::test]
@@ -2963,7 +3276,7 @@ async fn retained_prefix_recovery_reports_the_unavailable_canonical_suffix() {
         retained.len() as u64,
         canonical.exact_bytes,
     )];
-    metadata.line_starts = canonical_line_starts(retained);
+    metadata.line_starts = canonical_line_starts(retained).expect("one retained fixture line");
     metadata.segments[0].range = CanonicalByteRange::new(0, retained.len() as u64);
     std::fs::write(
         &metadata_path,
@@ -3243,7 +3556,9 @@ async fn active_tool_history_reconciliation_verifies_complete_bytes_before_prote
     }
 
     let live =
-        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references).await;
+        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references)
+            .await
+            .unwrap();
 
     assert_eq!(live, BTreeSet::from([artifacts[0].0.clone()]));
     assert!(active_tool_history_protection_path(&artifacts[0].1).exists());
@@ -3450,6 +3765,41 @@ async fn artifact_creation_fails_open_when_retention_lock_fails() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn raw_retention_admission_failure_preserves_a_live_transaction_and_pin() {
+    for failure in [1, 2] {
+        let (_owner, home) = unindexed_home_for_test().await;
+        let root = home.join("tool-output");
+        let directory = root.join("thread");
+        std::fs::create_dir_all(&directory).unwrap();
+        let running = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
+        std::fs::write(&running, b"live prefix").unwrap();
+        let marker = logical_transaction_path(&running);
+        std::fs::write(&marker, LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES).unwrap();
+        let pin = active_tool_history_protection_path(&running);
+        std::fs::write(&pin, ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES).unwrap();
+        let lock_root = root.clone();
+        let external =
+            tokio::task::spawn_blocking(move || begin_commit_as_another_process(&lock_root))
+                .await
+                .unwrap();
+        inject_retention_sweep_permit_failure_for_test(failure);
+        let raw = create_raw_output_artifact(&home, "thread", b"new output").await;
+        assert!(matches!(raw, RawOutputArtifact::Stored { .. }));
+        assert_eq!(std::fs::read(&running).unwrap(), b"live prefix");
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            LOGICAL_ARTIFACT_CREATE_TRANSACTION_BYTES
+        );
+        assert_eq!(
+            std::fs::read(&pin).unwrap(),
+            ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+        );
+        drop(external);
+    }
+}
+
 #[test]
 #[serial_test::serial(command_output_artifact)]
 fn audit_output_artifact_creation_reconciles_uncommitted_family() {
@@ -3463,9 +3813,11 @@ fn audit_output_artifact_creation_reconciles_uncommitted_family() {
         .expect("uncommitted tail segment");
     begin_logical_artifact_transaction(&path, false).expect("creation transaction");
 
-    assert_eq!(
-        load_logical_metadata(&path, id),
-        Err(ReadToolOutputError::StillWriting),
+    assert!(
+        matches!(
+            load_logical_metadata(&path, id),
+            Err(ReadToolOutputError::StillWriting)
+        ),
         "a family with an active transaction must never fall back to a complete raw artifact"
     );
     reconcile_logical_artifact_transactions(&directory).expect("reconcile transactions");
@@ -3789,7 +4141,7 @@ async fn streaming_chunks_batch_disk_updates_and_preserve_exact_output() {
     let usage = retention_usage_locked_blocking(path.parent().expect("artifact directory"));
     let metadata_bytes = std::fs::read(logical_metadata_path(&path)).expect("raw capture metadata");
     let metadata: RawCaptureMetadata = serde_json::from_slice(&metadata_bytes).unwrap();
-    assert_eq!(metadata.raw_capture_version, 1);
+    assert_eq!(metadata.raw_capture_version, 2);
     assert_eq!(
         metadata.artifact_id,
         artifact_id_from_path(&path).unwrap().to_string()
@@ -3913,6 +4265,40 @@ async fn artifact_durability_barrier_reports_sync_failure_and_can_retry() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn abandoned_reopen_retires_invalidated_raw_status_from_durability_barrier() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = create_raw_output_artifact(temp.path(), "thread", b"observed").await;
+    let RawOutputArtifact::Stored { path, .. } = &artifact else {
+        panic!("stored raw capture");
+    };
+    let metadata = logical_metadata_path(path);
+    // The completed status sidecar has not reached its first barrier yet.
+    assert!(
+        lock_retention_registry()
+            .pending_sync
+            .contains_key(&metadata)
+    );
+    let state = Arc::new(Mutex::new(artifact));
+    let writer = RawOutputArtifactWriter::open(Some(&state))
+        .await
+        .expect("streaming writer");
+    // Cancellation drops the reopened writer before it publishes new status.
+    drop(writer);
+    assert!(!metadata.exists());
+    sync_tool_output_artifacts(temp.path(), "thread")
+        .await
+        .expect("an owner-removed status sidecar must not poison the barrier");
+    let directory = temp.path().join("tool-output/thread");
+    assert!(
+        !lock_retention_registry()
+            .pending_sync
+            .keys()
+            .any(|pending| pending.starts_with(&directory))
+    );
+}
+
 #[test]
 fn artifact_file_sync_is_parallel_and_bounded() {
     let pending = (0..16)
@@ -3964,8 +4350,9 @@ async fn artifact_durability_parallel_failure_retains_batch_for_retry() {
         std::fs::write(&path, b"durable output").unwrap();
         defer_artifact_sync(&path);
     }
-    // Missing, already-retained-away files are benign; other open failures are not.
-    std::fs::remove_file(directory.join("0.log")).unwrap();
+    // Owner-confirmed retention removal is benign; open failures are not. A
+    // merely missing pending file is also a failure (lost referenced evidence).
+    remove_logical_artifact_files(&directory.join("0.log")).unwrap();
     let broken = directory.join("broken.log");
     std::fs::create_dir(&broken).unwrap();
     defer_artifact_sync(&broken);
@@ -3988,7 +4375,9 @@ async fn artifact_durability_parallel_failure_retains_batch_for_retry() {
             .is_err()
     );
     assert_eq!(pending_for_thread(), before);
+    // Repair the failing entry in place; the retry must then acknowledge it.
     std::fs::remove_dir(&broken).unwrap();
+    std::fs::write(&broken, b"durable output").unwrap();
     sync_tool_output_artifacts(temp.path(), "thread")
         .await
         .unwrap();
@@ -4628,8 +5017,7 @@ async fn startup_scan_leaves_the_shared_lock_to_another_processes_commit() {
     let root = home.join("tool-output");
     // Another process's create transaction, listed while its commit still runs.
     let running = root.join("other").join("running.log");
-    std::fs::create_dir_all(running.parent().expect("thread directory"))
-        .expect("thread directory");
+    std::fs::create_dir_all(running.parent().expect("thread directory")).expect("thread directory");
     std::fs::write(&running, b"partial").expect("running artifact");
     std::fs::write(
         logical_transaction_path(&running),
@@ -4890,7 +5278,9 @@ async fn protection_reconciliation_relists_its_thread_without_a_full_rescan() {
     )]);
 
     let live =
-        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references).await;
+        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references)
+            .await
+            .unwrap();
 
     assert_eq!(live, BTreeSet::from([kept_id.to_string()]));
     let after = retention_diagnostics_for_test(&root);
@@ -5154,7 +5544,9 @@ async fn cancelled_history_protection_retains_admission_until_protection_is_visi
     assert!(recovered.complete);
     assert_eq!(recovered.results[0].text.as_deref(), Some(body));
     let live =
-        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references).await;
+        reconcile_active_tool_history_artifact_protection(temp.path(), "thread", &references)
+            .await
+            .unwrap();
     assert_eq!(
         live,
         BTreeSet::from([id]),
@@ -5695,11 +6087,16 @@ async fn cancelled_canonical_attachment_finishes_owned_family_and_releases_reten
         .acquire_owned()
         .await
         .expect("hold admission");
+    let tag = uuid::Uuid::new_v4();
+    stage_tag_overrides()
+        .lock()
+        .unwrap()
+        .insert(directory.join(format!("{id}.log")), tag);
     let home = temp.path().to_path_buf();
     let operation = tokio::spawn(async move {
         attach_canonical_output_artifact(&home, "thread", &id.to_string(), &canonical).await
     });
-    let pending = staged_logical_segment_path(&directory, id, 1);
+    let pending = staged_segment_path_for_tag(&directory, id, tag, 1);
     tokio::time::timeout(Duration::from_secs(5), async {
         while !pending.exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5715,28 +6112,34 @@ async fn cancelled_canonical_attachment_finishes_owned_family_and_releases_reten
             .is_cancelled()
     );
     drop(permit);
-    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(recovered) = read_tool_output_selectors(
-                temp.path(),
-                "thread",
-                &id.to_string(),
-                vec![ToolOutputSelector::Bytes {
-                    start: MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64,
-                    end: body.len() as u64,
-                }],
-            )
-            .await
-                && recovered.complete
-                && recovered.results[0].text.as_deref() == Some("attached tail\n")
-            {
-                break recovered;
-            }
+    // Snapshot reads lease the base family. Do not make this cancellation test
+    // race the attachment's deliberately nonblocking exclusive-lock handoff.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pending.exists() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .expect("owned attachment commits after caller cancellation");
+    // Segment installation precedes metadata publication; join the owning
+    // retention critical section before taking the recovery snapshot.
+    drop(
+        retention_sweep_permit_for_directory(&directory)
+            .await
+            .unwrap(),
+    );
+    let recovered = read_tool_output_selectors(
+        temp.path(),
+        "thread",
+        &id.to_string(),
+        vec![ToolOutputSelector::Bytes {
+            start: MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64,
+            end: body.len() as u64,
+        }],
+    )
+    .await
+    .expect("read committed attachment");
+    assert!(recovered.complete);
     assert_eq!(
         recovered.results[0].text.as_deref(),
         Some("attached tail\n")
@@ -6024,26 +6427,21 @@ async fn incomplete_remint_cleanup_survives_cancellation_while_registry_is_locke
     tokio::fs::create_dir_all(&directory)
         .await
         .expect("target directory");
-    // An existing protected sparse artifact legitimately exhausts the target's
-    // retention budget without allocating or writing a 256 MiB test buffer.
+    // A locked, unprotected sparse artifact consumes cache capacity but cannot
+    // be evicted. Leave room only for metadata so remint commits an empty family.
     let occupied_path = directory.join(format!("{}.log", ToolOutputArtifactId::new()));
-    tokio::fs::File::create(&occupied_path)
-        .await
-        .expect("budget fixture")
-        .set_len(MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD)
-        .await
+    let metadata_budget = canonical_metadata_budget(&CanonicalToolResult::bytes(body.to_vec()), 1)
+        .expect("metadata budget");
+    let occupied_bytes = MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD - metadata_budget;
+    let occupied = std::fs::File::create(&occupied_path).expect("budget fixture");
+    occupied
+        .set_len(occupied_bytes)
         .expect("occupy target budget");
-    let occupied_marker = active_tool_history_protection_path(&occupied_path);
-    tokio::fs::write(
-        &occupied_marker,
-        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES,
-    )
-    .await
-    .expect("protect budget fixture");
+    occupied.try_lock().expect("keep budget fixture active");
     assert_eq!(
         force_retention_reconciliation_for_test(&temp.path().join("tool-output")).await,
         RetentionModeKind::Indexed,
-        "observe the external protected budget fixture through the actual filesystem reconciler"
+        "observe the external active budget fixture through the actual filesystem reconciler"
     );
     let target_path = directory.join(format!("{id}.log"));
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -6125,15 +6523,9 @@ async fn incomplete_remint_cleanup_survives_cancellation_while_registry_is_locke
     assert_eq!(
         tokio::fs::metadata(&occupied_path)
             .await
-            .expect("unrelated protected artifact retained")
+            .expect("unrelated active artifact retained")
             .len(),
-        MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
-    );
-    assert_eq!(
-        tokio::fs::read(&occupied_marker)
-            .await
-            .expect("unrelated marker retained"),
-        ACTIVE_TOOL_HISTORY_PROTECTION_MARKER_BYTES
+        occupied_bytes
     );
     assert_eq!(
         tokio::fs::read(
@@ -6145,9 +6537,7 @@ async fn incomplete_remint_cleanup_survives_cancellation_while_registry_is_locke
         .expect("source retained"),
         body
     );
-    tokio::fs::remove_file(&occupied_marker)
-        .await
-        .expect("release fixture protection");
+    drop(occupied);
     tokio::fs::remove_file(&occupied_path)
         .await
         .expect("release fixture budget");
@@ -6447,14 +6837,23 @@ async fn session_reclaim_removes_aged_artifacts_of_a_deleted_thread() {
     let deleted = codex_protocol::ThreadId::new().to_string();
     let artifact = protected_artifact_for_thread(&home, &deleted).await;
     let directory = artifact.parent().expect("thread directory").to_path_buf();
+    let aged = SystemTime::now() - UNRESUMABLE_THREAD_ARTIFACT_GRACE - Duration::from_secs(60);
+    // Reclaim also requires the thread's newest output to be past the grace
+    // period; an aged directory entry alone does not prove that.
+    for entry in std::fs::read_dir(&directory).expect("thread directory entries") {
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(entry.expect("thread directory entry").path())
+            .expect("open thread artifact file")
+            .set_modified(aged)
+            .expect("age thread artifact file");
+    }
     std::fs::OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(&directory)
         .expect("open thread directory")
-        .set_modified(
-            SystemTime::now() - UNRESUMABLE_THREAD_ARTIFACT_GRACE - Duration::from_secs(60),
-        )
+        .set_modified(aged)
         .expect("age thread directory");
 
     spawn_unresumable_thread_artifact_reclaim(home, codex_protocol::ThreadId::new().to_string());
@@ -6962,7 +7361,7 @@ async fn raw_capture_status_rejects_corruption_and_missing_status_stays_unknown(
         serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
     let mut invalid = Vec::new();
     for (field, value) in [
-        ("raw_capture_version", serde_json::json!(2)),
+        ("raw_capture_version", serde_json::json!(3)),
         (
             "artifact_id",
             serde_json::json!(ToolOutputArtifactId::new().to_string()),
@@ -7198,4 +7597,117 @@ async fn binary_continuation_bytes_recover_without_zero_progress() {
         wall_us = %started.elapsed().as_micros(),
         "binary_recovery"
     );
+}
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn literal_json_hydration_cannot_claim_native_source_delivery() {
+    let temp = tempfile::tempdir().unwrap();
+    let literal = serde_json::json!({"hydrated_ranges":[{
+        "canonical_range":{"start":0,"end":2792},"text":"", "shared":true
+    }]});
+    let text = serde_json::json!({"payload":literal, "unread": "required evidence ".repeat(200)})
+        .to_string();
+    let (metadata, snapshot) = logical_artifact_for_test(temp.path(), &text).await;
+    let selected = select_tool_output_snapshot(
+        &metadata,
+        &snapshot,
+        vec![ToolOutputSelector::JsonPointer {
+            pointer: "/payload".into(),
+        }],
+        6000,
+    )
+    .unwrap();
+    assert_eq!(selected.results[0].value.as_ref(), Some(&literal));
+    assert!(selected.delivered_ranges().is_empty());
+    let full = select_tool_output_snapshot(
+        &metadata,
+        &snapshot,
+        vec![ToolOutputSelector::Bytes {
+            start: 0,
+            end: text.len() as u64,
+        }],
+        6000,
+    )
+    .unwrap();
+    assert_eq!(full.delivered_ranges(), vec![(0, text.len() as u64)]);
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn audit63_unverified_protection_does_not_prune_healthy_sibling_markers() {
+    let home = tempfile::tempdir().unwrap();
+    let mut references = BTreeMap::new();
+    let mut paths = Vec::new();
+    for text in ["first exact evidence", "second exact evidence"] {
+        let canonical = CanonicalToolResult::text(text);
+        let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+        let id = artifact.artifact_id().unwrap();
+        paths.push(
+            home.path()
+                .join("tool-output/thread")
+                .join(format!("{id}.log")),
+        );
+        references.insert(id, (canonical.exact_bytes, canonical.sha256));
+    }
+    protect_active_tool_history_artifacts(home.path(), "thread", references.clone())
+        .await
+        .unwrap();
+    let metadata = logical_metadata_path(&paths[0]);
+    let saved = metadata.with_extension("saved");
+    std::fs::rename(&metadata, &saved).unwrap();
+    std::fs::create_dir(&metadata).unwrap();
+    assert!(
+        reconcile_active_tool_history_artifact_protection(home.path(), "thread", &references)
+            .await
+            .is_err()
+    );
+    for path in &paths {
+        assert!(active_tool_history_protection_path(path).exists());
+        assert!(path.exists());
+    }
+    std::fs::remove_dir(&metadata).unwrap();
+    std::fs::rename(saved, metadata).unwrap();
+    assert_eq!(
+        reconcile_active_tool_history_artifact_protection(home.path(), "thread", &references)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(command_output_artifact)]
+async fn audit63_segmented_snapshot_owns_the_whole_family_until_copy_finishes() {
+    let home = tempfile::tempdir().unwrap();
+    let bytes = vec![b'x'; 2 * MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1];
+    let canonical = CanonicalToolResult::bytes(bytes.clone());
+    let artifact = create_canonical_output_artifact(home.path(), "thread", &canonical).await;
+    assert!(artifact.complete);
+    let id = artifact
+        .artifact_id()
+        .unwrap()
+        .parse::<ToolOutputArtifactId>()
+        .unwrap();
+    let path = home
+        .path()
+        .join("tool-output/thread")
+        .join(format!("{id}.log"));
+    let (metadata, raw, lease) = load_logical_metadata_with_snapshot(&path, id).unwrap();
+    assert!(raw.is_none());
+    assert!(metadata.segments.len() >= 3);
+    assert!(matches!(
+        remove_inactive_output_path_blocking(path.clone()),
+        InactiveRemovalOutcome::Active
+    ));
+    assert_eq!(
+        load_validated_logical_snapshot(&path, &metadata).unwrap(),
+        bytes
+    );
+    drop(lease);
+    assert!(matches!(
+        remove_inactive_output_path_blocking(path.clone()),
+        InactiveRemovalOutcome::RemovedOrAbsent
+    ));
+    assert!(!path.exists());
 }

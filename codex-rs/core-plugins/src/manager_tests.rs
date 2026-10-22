@@ -995,6 +995,93 @@ fn remote_installed_linear_plugin() -> RemoteInstalledPlugin {
     remote_installed_plugin("linear")
 }
 
+#[test]
+fn installed_catalog_rejects_older_observations_and_mutation_predecessors() {
+    let home = tempfile::tempdir().unwrap();
+    let manager = PluginsManager::new(home.path().to_path_buf());
+    let generation = manager
+        .remote_installed_plugins_cache_generation
+        .load(Ordering::Acquire);
+    let old = manager.begin_remote_installed_plugins_fetch();
+    let new = manager.begin_remote_installed_plugins_fetch();
+    let installed = vec![remote_installed_linear_plugin()];
+    assert_eq!(
+        manager.write_remote_installed_plugins_cache_if_generation(
+            installed.clone(),
+            generation,
+            new
+        ),
+        Some(true)
+    );
+    let loaded_generation = manager.loaded_plugins_cache_generation();
+    assert_eq!(
+        manager.write_remote_installed_plugins_cache_if_generation(Vec::new(), generation, old),
+        None
+    );
+    assert_eq!(
+        *manager.remote_installed_plugins_cache.read().unwrap(),
+        Some(installed.clone())
+    );
+    assert!(
+        manager
+            .build_remote_installed_plugin_marketplaces_from_cache(&[
+                REMOTE_GLOBAL_MARKETPLACE_NAME
+            ])
+            .is_some()
+    );
+
+    let stale = manager.begin_remote_installed_plugins_fetch();
+    let equal = manager.begin_remote_installed_plugins_fetch();
+    assert_eq!(
+        manager.write_remote_installed_plugins_cache_if_generation(
+            installed.clone(),
+            generation,
+            equal
+        ),
+        Some(false)
+    );
+    assert_eq!(
+        manager.write_remote_installed_plugins_cache_if_generation(Vec::new(), generation, stale),
+        None
+    );
+    assert_eq!(
+        manager.loaded_plugins_cache_generation(),
+        loaded_generation,
+        "equal observations and rejected responses must not invalidate loaded plugins"
+    );
+
+    let pre_mutation = manager.begin_remote_installed_plugins_fetch();
+    assert!(manager.fence_remote_installed_plugins_fetches(generation));
+    assert_eq!(
+        manager.write_remote_installed_plugins_cache_if_generation(
+            Vec::new(),
+            generation,
+            pre_mutation
+        ),
+        None
+    );
+    assert_eq!(
+        manager.clear_remote_installed_plugins_cache_if_generation(generation, Some(pre_mutation)),
+        None,
+        "an older auth failure cannot clear newer state either"
+    );
+    let removed = manager.begin_remote_installed_plugins_fetch();
+    assert_eq!(
+        manager.write_remote_installed_plugins_cache_if_generation(Vec::new(), generation, removed),
+        Some(true)
+    );
+    let before_account_change = manager.begin_remote_installed_plugins_fetch();
+    manager.clear_remote_installed_plugins_cache();
+    assert_eq!(
+        manager.write_remote_installed_plugins_cache_if_generation(
+            installed,
+            generation,
+            before_account_change
+        ),
+        None
+    );
+}
+
 fn remote_installed_plugin(name: &str) -> RemoteInstalledPlugin {
     remote_installed_plugin_in_marketplace(name, REMOTE_GLOBAL_MARKETPLACE_NAME)
 }
@@ -3587,13 +3674,15 @@ async fn uninstall_plugin_preserves_config_and_files_when_metadata_is_denied() {
         .await;
     denied.restore();
 
+    // Uninstall owns the entry before inspecting it. Its lock file lives in
+    // the same denied cache directory, so the denial surfaces at the lock.
     assert!(
         matches!(
-            result,
+            &result,
             Err(PluginUninstallError::Store(PluginStoreError::Io {
-                context: "failed to inspect plugin cache entry before removal",
-                ..
-            }))
+                context: "plugin cache entry is busy or unavailable",
+                source,
+            })) if source.kind() == std::io::ErrorKind::PermissionDenied
         ),
         "metadata failure must not report successful removal: {result:?}"
     );
@@ -5447,7 +5536,10 @@ plugins = true
 #[tokio::test]
 async fn account_cache_invalidation_rejects_delayed_bundle_callback_refresh() {
     let tmp = tempfile::tempdir().unwrap();
-    write_file(&tmp.path().join(CONFIG_TOML_FILE), "[features]\nplugins = true\n");
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
     let server = MockServer::start().await;
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = server.uri();
@@ -5458,41 +5550,69 @@ async fn account_cache_invalidation_rejects_delayed_bundle_callback_refresh() {
             "plugins": [], "pagination": {"next_page_token": null}
         })))
         .expect(3)
-        .mount(&server).await;
+        .mount(&server)
+        .await;
     let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
     let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = Arc::clone(&notifications);
     // This is the actual callback passed to bundle synchronization, held before
     // invalidation rather than an already scheduled cache request.
     let callback = manager.remote_installed_plugin_bundle_sync_callback(
-        &config, Some(backend_header_auth("Bearer account-a")),
-        Some(Arc::new(move || { count.fetch_add(1, Ordering::SeqCst); })),
+        &config,
+        Some(backend_header_auth("Bearer account-a")),
+        Some(Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        })),
     );
     callback();
     wait_for_remote_installed_refresh_to_finish(&manager).await;
-    assert!(manager.build_remote_installed_plugin_marketplaces_from_cache(&[REMOTE_GLOBAL_MARKETPLACE_NAME]).is_some(),
-        "current-account callback must still publish successful refreshes");
+    assert!(
+        manager
+            .build_remote_installed_plugin_marketplaces_from_cache(&[
+                REMOTE_GLOBAL_MARKETPLACE_NAME
+            ])
+            .is_some(),
+        "current-account callback must still publish successful refreshes"
+    );
     assert_eq!(notifications.load(Ordering::SeqCst), 1);
     manager.invalidate_account_scoped_remote_plugin_caches();
     callback();
     wait_for_remote_installed_refresh_to_finish(&manager).await;
-    assert_eq!(server.received_requests().await.unwrap().len(), 3,
-        "a callback already known to be obsolete must not schedule account I/O");
-    assert!(manager.build_remote_installed_plugin_marketplaces_from_cache(&[REMOTE_GLOBAL_MARKETPLACE_NAME]).is_none(),
-        "the delayed old-auth callback must not repopulate cleared account state");
-    assert_eq!(notifications.load(Ordering::SeqCst), 1, "stale work must not notify effective-plugin consumers");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        3,
+        "a callback already known to be obsolete must not schedule account I/O"
+    );
+    assert!(
+        manager
+            .build_remote_installed_plugin_marketplaces_from_cache(&[
+                REMOTE_GLOBAL_MARKETPLACE_NAME
+            ])
+            .is_none(),
+        "the delayed old-auth callback must not repopulate cleared account state"
+    );
+    assert_eq!(
+        notifications.load(Ordering::SeqCst),
+        1,
+        "stale work must not notify effective-plugin consumers"
+    );
 }
 
 #[tokio::test]
 async fn delayed_bundle_callback_cannot_evict_current_account_refresh() {
     let tmp = tempfile::tempdir().unwrap();
-    write_file(&tmp.path().join(CONFIG_TOML_FILE), "[features]\nplugins = true\n");
+    write_file(
+        &tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nplugins = true\n",
+    );
     let server = MockServer::start().await;
     let mut config = load_config(tmp.path(), tmp.path()).await;
     config.chatgpt_base_url = server.uri();
     let manager = Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
     let old_callback = manager.remote_installed_plugin_bundle_sync_callback(
-        &config, Some(backend_header_auth("Bearer account-a")), None,
+        &config,
+        Some(backend_header_auth("Bearer account-a")),
+        None,
     );
     let late_callback = Arc::clone(&old_callback);
     let response_manager = Arc::clone(&manager);
@@ -5507,22 +5627,35 @@ async fn delayed_bundle_callback_cannot_evict_current_account_refresh() {
             if first_request.swap(false, Ordering::SeqCst) {
                 response_manager.invalidate_account_scoped_remote_plugin_caches();
                 response_manager.maybe_start_remote_installed_plugins_cache_refresh_after_mutation(
-                    &response_config, Some(backend_header_auth("Bearer account-b")), None,
+                    &response_config,
+                    Some(backend_header_auth("Bearer account-b")),
+                    None,
                 );
                 // The current-account request is queued behind this in-flight A request.
                 late_callback();
             }
             ResponseTemplate::new(200).set_body_json(&old_response)
-        }).expect(3).mount(&server).await;
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/ps/plugins/installed"))
         .and(header("authorization", "Bearer account-b"))
         .respond_with(ResponseTemplate::new(200).set_body_json(empty))
-        .expect(3).mount(&server).await;
+        .expect(3)
+        .mount(&server)
+        .await;
     old_callback();
     wait_for_remote_installed_refresh_to_finish(&manager).await;
-    assert!(manager.build_remote_installed_plugin_marketplaces_from_cache(&[REMOTE_GLOBAL_MARKETPLACE_NAME]).is_some(),
-        "obsolete callbacks must not suppress the queued current-account refresh");
+    assert!(
+        manager
+            .build_remote_installed_plugin_marketplaces_from_cache(&[
+                REMOTE_GLOBAL_MARKETPLACE_NAME
+            ])
+            .is_some(),
+        "obsolete callbacks must not suppress the queued current-account refresh"
+    );
 }
 
 #[tokio::test]
@@ -5726,7 +5859,8 @@ plugins = true
         }],
     };
 
-    let mut request_a = Box::pin(manager.recommended_plugins_mode_for_config(&config, Some(&auth_a)));
+    let mut request_a =
+        Box::pin(manager.recommended_plugins_mode_for_config(&config, Some(&auth_a)));
     // The responder cannot return before this selection finishes, so A must
     // remain pending even if its poll races with the request-observed signal.
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -5740,7 +5874,9 @@ plugins = true
     .expect("account A request must reach the server");
     // Release Wiremock before asking it to handle B. A's owning future remains
     // unpolled until B publishes, so receiving the response cannot publish A yet.
-    response_release_tx.send(()).expect("release HTTP responder");
+    response_release_tx
+        .send(())
+        .expect("release HTTP responder");
 
     manager.invalidate_account_scoped_remote_plugin_caches();
     assert_eq!(

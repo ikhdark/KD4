@@ -241,49 +241,6 @@ pub(crate) fn jsonrpc_payload(message: &JSONRPCMessage) -> Result<Vec<u8>, ExecS
     serde_json::to_vec(message).map_err(ExecServerError::Json)
 }
 
-enum RelayEventSendError {
-    IncomingClosed,
-    WebSocketClosed,
-}
-
-// A timed-out sink write may have partially sent the frame. Callers must
-// terminate the transport on error rather than retrying it.
-async fn send_with_deadline<T, E>(
-    websocket: &mut T,
-    message: Message,
-) -> Result<(), RelayEventSendError>
-where
-    T: Sink<Message, Error = E> + Unpin,
-{
-    timeout(WEBSOCKET_PONG_TIMEOUT, websocket.send(message))
-        .await
-        .map_err(|_| RelayEventSendError::WebSocketClosed)?
-        .map_err(|_| RelayEventSendError::WebSocketClosed)
-}
-
-async fn send_event_with_keepalive<T, E>(
-    websocket: &mut T,
-    keepalive: &mut tokio::time::Interval,
-    incoming_tx: &mpsc::Sender<JsonRpcConnectionEvent>,
-    event: JsonRpcConnectionEvent,
-) -> Result<(), RelayEventSendError>
-where
-    T: Sink<Message, Error = E> + Unpin,
-{
-    let send = incoming_tx.send(event);
-    tokio::pin!(send);
-    loop {
-        tokio::select! {
-            result = &mut send => {
-                return result.map_err(|_| RelayEventSendError::IncomingClosed);
-            }
-            _ = keepalive.tick() => {
-                send_with_deadline(websocket, Message::Ping(Vec::new().into())).await?;
-            }
-        }
-    }
-}
-
 pub(crate) fn harness_connection_from_websocket<T, E>(
     stream: T,
     connection_label: String,
@@ -296,163 +253,140 @@ where
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (incoming_tx, incoming_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (disconnected_tx, disconnected_rx) = watch::channel(false);
-
     let websocket_task = tokio::spawn(async move {
-        let mut websocket = stream;
-        let reader_label = connection_label;
-        let reader_stream_id = stream_id.clone();
+        let budget = crate::connection::WEBSOCKET_MESSAGE_TIMEOUT;
+        let (mut writer, mut reader) = stream.split();
         let resume = RelayMessageFrame::resume(stream_id.clone());
-        if send_with_deadline(
-            &mut websocket,
-            Message::Binary(encode_relay_message_frame(&resume).into()),
-        )
-        .await
-        .is_err()
-        {
+        if !matches!(
+            timeout(
+                budget,
+                writer.send(Message::Binary(encode_relay_message_frame(&resume).into()))
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
             let _ = disconnected_tx.send(true);
             return;
         }
-
-        let mut keepalive = tokio::time::interval_at(
-            tokio::time::Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
-            WEBSOCKET_KEEPALIVE_INTERVAL,
-        );
-        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut next_seq = 0u32;
-        loop {
-            tokio::select! {
-                maybe_message = outgoing_rx.recv() => {
-                    let Some(message) = maybe_message else {
-                        break;
-                    };
-                    let payload = match jsonrpc_payload(&message) {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            warn!("failed to serialize JSON-RPC payload for relay transport: {err}");
-                            break;
-                        }
-                    };
-                    let frame = RelayMessageFrame::data(stream_id.clone(), next_seq, payload);
-                    next_seq = next_seq.wrapping_add(1);
-                    if send_with_deadline(&mut websocket, Message::Binary(encode_relay_message_frame(&frame).into()))
-                        .await
-                        .is_err()
-                    {
-                        let _ = disconnected_tx.send(true);
-                        break;
+        let liveness = crate::websocket_pong_watchdog::WebSocketLiveness::new(budget);
+        // Frames read ahead of a busy consumer live outside `read`: a reset,
+        // close, or liveness verdict must not drop already received messages.
+        let mut pending: std::collections::VecDeque<JsonRpcConnectionEvent> =
+            std::collections::VecDeque::new();
+        let read = async {
+            loop {
+                let incoming = tokio::select! {
+                    permit = incoming_tx.reserve(), if !pending.is_empty() => {
+                        let Ok(permit) = permit else { return None; };
+                        if let Some(event) = pending.pop_front() { permit.send(event); }
+                        continue;
                     }
-                }
-                _ = keepalive.tick() => {
-                    if send_with_deadline(&mut websocket, Message::Ping(Vec::new().into())).await.is_err() {
-                        let _ = disconnected_tx.send(true);
-                        break;
-                    }
-                }
-                incoming_message = websocket.next() => {
-                    match incoming_message {
-                        Some(Ok(Message::Binary(payload))) => {
-                            let frame = match decode_relay_message_frame(payload.as_ref()) {
-                                Ok(frame) => frame,
-                                Err(err) => {
-                                    let _ = incoming_tx
-                                        .send(JsonRpcConnectionEvent::MalformedMessage {
-                                            reason: format!(
-                                                "failed to parse relay message frame from {reader_label}: {err}"
-                                            ),
-                                        })
-                                        .await;
-                                    continue;
-                                }
-                            };
-                            if frame.stream_id != reader_stream_id {
+                    incoming = reader.next(), if pending.len() < crate::connection::WEBSOCKET_CONTROL_BACKLOG => incoming,
+                };
+                match incoming {
+                    Some(Ok(Message::Binary(payload))) => {
+                        let frame = match decode_relay_message_frame(payload.as_ref()) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                pending.push_back(JsonRpcConnectionEvent::MalformedMessage {
+                                    reason: error.to_string(),
+                                });
                                 continue;
                             }
-                            let kind = match frame.validate() {
-                                Ok(kind) => kind,
-                                Err(err) => {
-                                    let _ = incoming_tx
-                                        .send(JsonRpcConnectionEvent::MalformedMessage {
-                                            reason: err.to_string(),
-                                        })
-                                        .await;
-                                    continue;
+                        };
+                        if frame.stream_id != stream_id {
+                            continue;
+                        }
+                        match frame.validate() {
+                            Ok(RelayFrameBodyKind::Data) => match frame.into_jsonrpc_message() {
+                                Ok(message) => {
+                                    pending.push_back(JsonRpcConnectionEvent::Message(message))
                                 }
-                            };
-                            match kind {
-                                RelayFrameBodyKind::Data => match frame.into_jsonrpc_message() {
-                                    Ok(message) => {
-                                        match send_event_with_keepalive(
-                                            &mut websocket,
-                                            &mut keepalive,
-                                            &incoming_tx,
-                                            JsonRpcConnectionEvent::Message(message),
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {}
-                                            Err(RelayEventSendError::IncomingClosed) => break,
-                                            Err(RelayEventSendError::WebSocketClosed) => {
-                                                let _ = disconnected_tx.send(true);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        let _ = incoming_tx
-                                            .send(JsonRpcConnectionEvent::MalformedMessage {
-                                                reason: err.to_string(),
-                                            })
-                                            .await;
-                                    }
-                                },
-                                RelayFrameBodyKind::Reset => {
-                                    let _ = disconnected_tx.send(true);
-                                    let _ = incoming_tx
-                                        .send(JsonRpcConnectionEvent::Disconnected {
-                                            reason: frame.into_reset_reason(),
-                                        })
-                                        .await;
-                                    break;
+                                Err(error) => {
+                                    pending.push_back(JsonRpcConnectionEvent::MalformedMessage {
+                                        reason: error.to_string(),
+                                    })
                                 }
-                                RelayFrameBodyKind::Ack
-                                | RelayFrameBodyKind::Resume
-                                | RelayFrameBodyKind::Heartbeat
-                                | RelayFrameBodyKind::Handshake => {}
+                            },
+                            Ok(RelayFrameBodyKind::Reset) => return frame.into_reset_reason(),
+                            Ok(_) => {}
+                            Err(error) => {
+                                pending.push_back(JsonRpcConnectionEvent::MalformedMessage {
+                                    reason: error.to_string(),
+                                })
                             }
                         }
-                        Some(Ok(Message::Close(_))) | None => {
-                            let _ = disconnected_tx.send(true);
-                            let _ = incoming_tx
-                                .send(JsonRpcConnectionEvent::Disconnected { reason: None })
-                                .await;
-                            break;
+                    }
+                    Some(Ok(Message::Pong(_))) => liveness.received_pong(),
+                    Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
+                    Some(Ok(Message::Text(_))) => {
+                        pending.push_back(JsonRpcConnectionEvent::MalformedMessage {
+                            reason: "relay exec-server transport expects binary protobuf frames"
+                                .into(),
+                        })
+                    }
+                    Some(Ok(Message::Close(_))) | None => return None,
+                    Some(Err(error)) => {
+                        return Some(format!(
+                            "failed to read relay websocket from {connection_label}: {error}"
+                        ));
+                    }
+                }
+            }
+        };
+        let write = async {
+            let mut keepalive = tokio::time::interval_at(
+                tokio::time::Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
+                WEBSOCKET_KEEPALIVE_INTERVAL,
+            );
+            keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut next_seq = 0u32;
+            loop {
+                tokio::select! {
+                    message = outgoing_rx.recv() => {
+                        let message = message?;
+                        let payload = match jsonrpc_payload(&message) {
+                            Ok(payload) => payload,
+                            Err(error) => return Some(error.to_string()),
+                        };
+                        let frame = RelayMessageFrame::data(stream_id.clone(), next_seq, payload);
+                        next_seq = next_seq.wrapping_add(1);
+                        match timeout(budget, writer.send(Message::Binary(encode_relay_message_frame(&frame).into()))).await {
+                            Ok(Ok(())) => {},
+                            Ok(Err(error)) => return Some(error.to_string()),
+                            Err(_) => return Some("relay websocket write deadline expired".into()),
                         }
-                        Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
-                        Some(Ok(Message::Text(_))) => {
-                            let _ = incoming_tx
-                                .send(JsonRpcConnectionEvent::MalformedMessage {
-                                    reason: "relay exec-server transport expects binary protobuf frames"
-                                        .to_string(),
-                                })
-                                .await;
-                        }
-                        Some(Err(err)) => {
-                            let _ = disconnected_tx.send(true);
-                            let _ = incoming_tx
-                                .send(JsonRpcConnectionEvent::Disconnected {
-                                    reason: Some(format!(
-                                        "failed to read relay websocket frame from {reader_label}: {err}"
-                                    )),
-                                })
-                                .await;
-                            break;
+                    }
+                    _ = keepalive.tick() => {
+                        let generation = liveness.pong_generation();
+                        match timeout(budget, writer.send(Message::Ping(Vec::new().into()))).await {
+                            Ok(Ok(())) => liveness.ping_flushed(generation),
+                            Ok(Err(error)) => return Some(error.to_string()),
+                            Err(_) => return Some("relay websocket ping write deadline expired".into()),
                         }
                     }
                 }
             }
+        };
+        // Retain sends across inbound activity and keep controls independent of
+        // application delivery. A stopped consumer is bounded by the watchdog.
+        let reason = tokio::select! {
+            biased;
+            reason = read => reason,
+            reason = write => reason,
+            _ = liveness.expired() => Some("relay websocket Pong deadline expired".into()),
+        };
+        let _ = disconnected_tx.send(true);
+        // Deliver received frames in order ahead of the terminal event.
+        for event in pending.drain(..) {
+            if incoming_tx.send(event).await.is_err() {
+                break;
+            }
         }
+        let _ = incoming_tx
+            .send(JsonRpcConnectionEvent::Disconnected { reason })
+            .await;
     });
-
     JsonRpcConnection {
         outgoing_tx,
         incoming_rx,
@@ -600,6 +534,10 @@ where
             .min();
         // Registry calls run separately so a slow check does not block the relay.
         let frame = tokio::select! {
+            _ = processor.wait_for_shutdown() => {
+                disconnect_reason = RendezvousDisconnectReason::LocalShutdown;
+                break;
+            }
             _ = async {
                 match gap_deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -1003,7 +941,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn harness_connection_preserves_relay_lifecycle_after_malformed_text() -> anyhow::Result<()> {
+    async fn harness_connection_preserves_relay_lifecycle_after_malformed_text()
+    -> anyhow::Result<()> {
         let (client_websocket, mut server_websocket) = websocket_pair().await?;
         let mut connection =
             harness_connection_from_websocket(client_websocket, "test".to_string());
@@ -1045,50 +984,86 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn send_event_with_keepalive_pings_while_incoming_queue_is_full() -> anyhow::Result<()> {
-        let (mut websocket, _control, mut outbound_rx) =
-            ControlledWebSocket::new(/*write_ready*/ true);
-        let (incoming_tx, mut incoming_rx) = mpsc::channel(/*buffer*/ 1);
+    #[tokio::test(start_paused = true)]
+    async fn legacy_harness_keeps_pongs_progressing_while_application_delivery_is_full()
+    -> anyhow::Result<()> {
+        let (socket, control, mut outbound) = ControlledWebSocket::new(true);
+        let mut connection = harness_connection_from_websocket(socket, "legacy-control".into());
+        let Some(Message::Binary(resume)) = outbound.next().await else {
+            panic!("resume frame required")
+        };
+        let resume = decode_relay_message_frame(&resume)?;
         let message = test_jsonrpc_message();
-        let expected_message = message.clone();
-        incoming_tx
-            .send(JsonRpcConnectionEvent::MalformedMessage {
-                reason: "first".to_string(),
+        for seq in 0..CHANNEL_CAPACITY + 4 {
+            let frame = RelayMessageFrame::data(
+                resume.stream_id.clone(),
+                seq as u32,
+                jsonrpc_payload(&message)?,
+            );
+            control.send_inbound(Message::Binary(encode_relay_message_frame(&frame).into()))?;
+        }
+        for _ in 0..12 {
+            assert!(matches!(outbound.next().await, Some(Message::Ping(_))));
+            control.send_inbound(Message::Pong(Vec::new().into()))?;
+            tokio::task::yield_now().await;
+            assert!(!*connection.disconnected_rx.borrow());
+        }
+        for _ in 0..CHANNEL_CAPACITY + 4 {
+            assert!(
+                matches!(connection.incoming_rx.recv().await, Some(JsonRpcConnectionEvent::Message(actual)) if actual == message)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_harness_silent_peer_and_blocked_flush_fail_boundedly() {
+        for ready in [true, false] {
+            let (socket, _control, _outbound) = ControlledWebSocket::new(ready);
+            let mut connection = harness_connection_from_websocket(socket, "legacy-silent".into());
+            timeout(Duration::from_secs(1), async {
+                while !*connection.disconnected_rx.borrow_and_update() {
+                    connection.disconnected_rx.changed().await.unwrap();
+                }
             })
-            .await?;
-        let mut keepalive = tokio::time::interval_at(
-            tokio::time::Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
-            WEBSOCKET_KEEPALIVE_INTERVAL,
-        );
-        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        let send_task = tokio::spawn(async move {
-            send_event_with_keepalive(
-                &mut websocket,
-                &mut keepalive,
-                &incoming_tx,
-                JsonRpcConnectionEvent::Message(message),
-            )
             .await
-        });
+            .expect("legacy liveness must release pending work");
+        }
+    }
 
-        assert!(matches!(
-            timeout(Duration::from_secs(1), outbound_rx.next()).await?,
-            Some(Message::Ping(_))
-        ));
-        assert!(matches!(
-            incoming_rx.recv().await,
-            Some(JsonRpcConnectionEvent::MalformedMessage { reason }) if reason == "first"
-        ));
-        assert!(matches!(
-            timeout(Duration::from_secs(1), send_task).await??,
-            Ok(())
-        ));
-        assert!(matches!(
-            incoming_rx.recv().await,
-            Some(JsonRpcConnectionEvent::Message(actual)) if actual == expected_message
-        ));
+    #[tokio::test]
+    async fn legacy_harness_close_after_read_ahead_delivers_every_received_message()
+    -> anyhow::Result<()> {
+        // The reader races delivery against the next frame. Repeat so a close
+        // read while messages are still staged cannot pass by chance.
+        let message = test_jsonrpc_message();
+        for _ in 0..32 {
+            let (socket, control, mut outbound) = ControlledWebSocket::new(true);
+            let mut connection = harness_connection_from_websocket(socket, "legacy-close".into());
+            let Some(Message::Binary(resume)) = outbound.next().await else {
+                anyhow::bail!("resume frame required");
+            };
+            let resume = decode_relay_message_frame(&resume)?;
+            for seq in 0..4 {
+                let frame = RelayMessageFrame::data(
+                    resume.stream_id.clone(),
+                    seq,
+                    jsonrpc_payload(&message)?,
+                );
+                control.send_inbound(Message::Binary(encode_relay_message_frame(&frame).into()))?;
+            }
+            control.send_inbound(Message::Close(None))?;
+            for _ in 0..4 {
+                assert!(matches!(
+                    timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+                    Some(JsonRpcConnectionEvent::Message(actual)) if actual == message
+                ));
+            }
+            assert!(matches!(
+                timeout(Duration::from_secs(1), connection.incoming_rx.recv()).await?,
+                Some(JsonRpcConnectionEvent::Disconnected { reason: None })
+            ));
+        }
         Ok(())
     }
 

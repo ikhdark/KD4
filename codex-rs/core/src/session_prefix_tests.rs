@@ -206,3 +206,50 @@ fn completion_preserves_exact_receipt_and_attempt_under_truncation() {
     assert!(!message.contains("returned by spawn_agent"));
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
 }
+#[test]
+fn protected_completion_diagnostics_survive_middle_echo_and_multibyte_truncation() {
+    use codex_protocol::protocol::TurnCompletionAssessment;
+    let receipt = "Receipt: get_agent_task({\"assignment_id\":\"assignment-123\"})\nProducer attempt: attempt-456";
+    for entry in ["validation failed".to_string(), "🦀".repeat(192)] {
+        let assessment = TurnCompletionAssessment {
+            failed_checks: vec![entry.clone(); 4],
+            verification_gaps: vec![entry.clone(); 4],
+            advisories: vec![entry; 4],
+            ..Default::default()
+        };
+        let summary = assessment.bounded_summary("turn-123").unwrap();
+        let event = codex_protocol::protocol::TurnCompleteEvent {
+            turn_id: "turn-123".into(),
+            last_agent_message: Some(format!(
+                "{}\n{summary}\n{}",
+                "a".repeat(45_000),
+                "z".repeat(45_000)
+            )),
+            surfaced_result: None,
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: Some(codex_protocol::protocol::TurnTiming {
+                completion_assessment: Some(assessment),
+                ..Default::default()
+            }),
+        };
+        let status = crate::agent::agent_status_from_event(
+            &codex_protocol::protocol::EventMsg::TurnComplete(event),
+        )
+        .unwrap();
+        let communication = super::inter_agent_completion_communication_with_diagnostics(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").unwrap(),
+            codex_protocol::ThreadId::new(),
+            &status,
+            Some(receipt),
+            Some(&summary),
+        )
+        .unwrap();
+        assert!(communication.content.contains(&summary));
+        assert!(communication.content.contains(receipt));
+        assert!(approx_token_count(&communication.content) < COMPLETION_MESSAGE_MAX_TOKENS);
+    }
+}

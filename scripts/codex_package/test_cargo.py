@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import hashlib
 import json
 import struct
 import subprocess
@@ -25,15 +26,93 @@ from codex_package.targets import TARGET_SPECS
 
 
 class SourceBinariesForTargetTest(unittest.TestCase):
+    def test_selected_native_content_changes_partition_the_real_build_target(self):
+        for selector in ("RUSTY_V8_ARCHIVE", "RUSTY_V8_SRC_BINDING_PATH"):
+            with self.subTest(selector=selector), self.package_fixture() as fixture:
+                spec, variant, kwargs, run, _, _ = fixture
+                selected = cargo_module.CODEX_RS_ROOT / "native-input"
+                selected.write_bytes(b"native A")
+                os.environ[selector] = str(selected)
+                first = build_source_binaries(spec, variant, **kwargs)
+                build_source_binaries(spec, variant, **kwargs)
+                self.assertEqual(run.call_count, 1)
+                timestamp = selected.stat()
+                selected.write_bytes(b"native B")
+                os.utime(selected, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+                second = build_source_binaries(spec, variant, **kwargs)
+                self.assertEqual(run.call_count, 2)
+                self.assertNotEqual(first.code_mode_host_bin, second.code_mode_host_bin)
+                target = Path(
+                    run.call_args.args[0][
+                        run.call_args.args[0].index("--target-dir") + 1
+                    ]
+                )
+                recipe = json.loads(source_build_stamp_path(target).read_text())[
+                    "build_recipe"
+                ]
+                digest = hashlib.sha256(b"native B").hexdigest()
+                self.assertEqual(
+                    recipe["external_inputs"]["inputs"][selector]["sha256"], digest
+                )
+                if selector == "RUSTY_V8_ARCHIVE":
+                    self.assertEqual(
+                        run.call_args.kwargs["env"]["RUSTY_V8_ARCHIVE_SHA256"], digest
+                    )
+
+    def test_external_cargo_patch_content_partitions_the_real_build_target(self):
+        with tempfile.TemporaryDirectory() as temp, self.package_fixture() as fixture:
+            spec, variant, kwargs, run, _, _ = fixture
+            external = Path(temp) / "patched"
+            external.mkdir()
+            (external / "Cargo.toml").write_text(
+                '[package]\nname="patched"\nversion="0.1.0"\n'
+            )
+            source = external / "lib.rs"
+            source.write_bytes(b"source A")
+            config = cargo_module.CODEX_RS_ROOT / ".cargo/config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                f'[patch.crates-io]\npatched={{path="{external.as_posix()}"}}\n'
+            )
+            first = build_source_binaries(spec, variant, **kwargs)
+            build_source_binaries(spec, variant, **kwargs)
+            self.assertEqual(run.call_count, 1)
+            timestamp = source.stat()
+            source.write_bytes(b"source B")
+            os.utime(source, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+            second = build_source_binaries(spec, variant, **kwargs)
+            self.assertEqual(run.call_count, 2)
+            self.assertNotEqual(first.entrypoint_bin, second.entrypoint_bin)
+
+    def test_unavailable_external_input_cannot_stamp_reused_native_outputs(self):
+        with self.package_fixture() as fixture:
+            spec, variant, kwargs, run, _, _ = fixture
+            os.environ["RUSTY_V8_SRC_BINDING_PATH"] = str(
+                cargo_module.CODEX_RS_ROOT / "missing.rs"
+            )
+            build_source_binaries(spec, variant, **kwargs)
+            self.assertEqual(run.call_args_list[0].args[0][1], "clean")
+            self.assertEqual(run.call_args_list[1].args[0][1], "build")
+            self.assertFalse(
+                source_build_stamp_path(
+                    cargo_package_target_dir(spec, "release")
+                ).exists()
+            )
+
     def test_nested_lease_reuses_target_but_proof_boundaries_reobserve_tools(self):
         with self.package_fixture() as fixture:
             spec, variant, kwargs, _, _, _ = fixture
-            with mock.patch.object(cargo_module, "effective_tool_contents",
-                                   return_value={"rustc": {"sha256": "fixture"}}) as tools:
+            with mock.patch.object(
+                cargo_module,
+                "effective_tool_contents",
+                return_value={"rustc": {"sha256": "fixture"}},
+            ) as tools:
                 with cargo_module.package_build_lease(spec, "release") as target:
                     with cargo_module.package_build_lease(spec, "release") as nested:
                         self.assertEqual(target, nested)
-                        self.assertEqual(cargo_package_target_dir(spec, "release"), target)
+                        self.assertEqual(
+                            cargo_package_target_dir(spec, "release"), target
+                        )
                         self.assertEqual(tools.call_count, 1)
                     build_source_binaries(spec, variant, **kwargs)
                     # One target observation, plus independent before/after proofs.
@@ -43,12 +122,20 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         with self.package_fixture() as fixture:
             spec, variant, kwargs, _, _, _ = fixture
             explicit = {
-                name: touch_file(cargo_module.CODEX_RS_ROOT / "prebuilt" / f"{name}.exe")
+                name: touch_file(
+                    cargo_module.CODEX_RS_ROOT / "prebuilt" / f"{name}.exe"
+                )
                 for name in cargo_module.SourceBuildOutputs.__dataclass_fields__
             }
-            with mock.patch.object(cargo_module, "effective_tool_contents",
-                                   side_effect=AssertionError("unneeded tool hashing")):
-                self.assertEqual(vars(build_source_binaries(spec, variant, **(kwargs | explicit))), explicit)
+            with mock.patch.object(
+                cargo_module,
+                "effective_tool_contents",
+                side_effect=AssertionError("unneeded tool hashing"),
+            ):
+                self.assertEqual(
+                    vars(build_source_binaries(spec, variant, **(kwargs | explicit))),
+                    explicit,
+                )
 
     @contextmanager
     def package_fixture(self):
@@ -551,7 +638,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         command_identity.start()
         self.addCleanup(command_identity.stop)
 
-
     def test_missing_code_mode_host_is_built_for_every_variant(self) -> None:
         for variant in PACKAGE_VARIANTS.values():
             with self.subTest(variant=variant.name):
@@ -685,7 +771,8 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                     with (
                         mock.patch("shutil.which", side_effect=fake_which),
                         mock.patch.object(
-                            cargo_module, "source_tree_fingerprint",
+                            cargo_module,
+                            "source_tree_fingerprint",
                             return_value=fixed_source_fingerprint(),
                         ),
                     ):
@@ -712,9 +799,15 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         self.assertEqual(
             [
                 calls[0].cmd[i + 1]
-                for i, arg in enumerate(calls[0].cmd) if arg == "--bin"
+                for i, arg in enumerate(calls[0].cmd)
+                if arg == "--bin"
             ],
-            ["codex", "codex-code-mode-host", "codex-command-runner", "codex-windows-sandbox-setup"],
+            [
+                "codex",
+                "codex-code-mode-host",
+                "codex-command-runner",
+                "codex-windows-sandbox-setup",
+            ],
         )
         for call in calls:
             self.assertEqual(call.cwd, codex_rs)
@@ -1271,7 +1364,6 @@ class SourceBinariesForTargetTest(unittest.TestCase):
             )
             self.assertEqual(run.call_count, 2)
 
-
     def test_reused_entrypoint_builds_only_missing_windows_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1309,7 +1401,8 @@ class SourceBinariesForTargetTest(unittest.TestCase):
         self.assertEqual(
             [
                 calls[0].cmd[i + 1]
-                for i, arg in enumerate(calls[0].cmd) if arg == "--bin"
+                for i, arg in enumerate(calls[0].cmd)
+                if arg == "--bin"
             ],
             ["codex-command-runner", "codex-windows-sandbox-setup"],
         )
@@ -1337,12 +1430,20 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                             )
 
     def test_cargo_failure_names_build_context(self) -> None:
-        for failure in (subprocess.CalledProcessError(101, ["cargo"]), KeyboardInterrupt()):
-            with self.subTest(failure=type(failure).__name__), self.package_fixture() as fixture:
+        for failure in (
+            subprocess.CalledProcessError(101, ["cargo"]),
+            KeyboardInterrupt(),
+        ):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                self.package_fixture() as fixture,
+            ):
                 spec, variant, kwargs, run, _, _ = fixture
                 compile = run.side_effect
                 outputs = build_source_binaries(spec, variant, **kwargs)
-                stamp = source_build_stamp_path(cargo_package_target_dir(spec, "release"))
+                stamp = source_build_stamp_path(
+                    cargo_package_target_dir(spec, "release")
+                )
                 self.assertTrue(stamp.is_file())
                 previous = {path: path.read_bytes() for path in vars(outputs).values()}
                 run.side_effect = failure
@@ -1360,13 +1461,21 @@ class SourceBinariesForTargetTest(unittest.TestCase):
                 with expected:
                     build_source_binaries(spec, variant, **kwargs, force_rebuild=True)
                 self.assertEqual(run.call_count, 2)
-                self.assertFalse(stamp.exists(), "failed rebuild must revoke the old proof")
-                self.assertEqual({path: path.read_bytes() for path in previous}, previous)
+                self.assertFalse(
+                    stamp.exists(), "failed rebuild must revoke the old proof"
+                )
+                self.assertEqual(
+                    {path: path.read_bytes() for path in previous}, previous
+                )
                 run.side_effect = compile
-                self.assertEqual(build_source_binaries(spec, variant, **kwargs), outputs)
+                self.assertEqual(
+                    build_source_binaries(spec, variant, **kwargs), outputs
+                )
                 self.assertEqual(run.call_count, 3)
                 self.assertTrue(stamp.is_file())
-                self.assertEqual(build_source_binaries(spec, variant, **kwargs), outputs)
+                self.assertEqual(
+                    build_source_binaries(spec, variant, **kwargs), outputs
+                )
                 self.assertEqual(run.call_count, 3)
 
     def test_invalid_explicit_output_path_fails_before_cargo(self) -> None:

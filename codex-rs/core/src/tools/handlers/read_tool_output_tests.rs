@@ -1,4 +1,91 @@
 #[tokio::test]
+async fn nested_raw_recovery_preserves_producer_integrity_or_marks_it_unverified() {
+    use crate::tools::command_output_artifact::create_raw_output_artifact;
+
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let session = std::sync::Arc::new(session);
+    let turn = std::sync::Arc::new(turn);
+    for status in ["intact", "legacy", "missing", "tampered", "missing-digest"] {
+        let thread = session.thread_id.to_string();
+        let artifact =
+            create_raw_output_artifact(&turn.config.codex_home, &thread, b"VERDICT=FAIL\n").await;
+        let id = artifact.artifact_id().unwrap();
+        let path = turn
+            .config
+            .codex_home
+            .join("tool-output")
+            .join(&thread)
+            .join(format!("{id}.log"));
+        let sidecar = path.with_extension("meta.json");
+        if status == "missing" {
+            std::fs::remove_file(&sidecar).unwrap();
+        } else if matches!(status, "legacy" | "missing-digest") {
+            let mut metadata: Value =
+                serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
+            if status == "legacy" {
+                metadata["raw_capture_version"] = serde_json::json!(1);
+            }
+            metadata.as_object_mut().unwrap().remove("retained_sha256");
+            std::fs::write(&sidecar, metadata.to_string()).unwrap();
+        } else if status == "tampered" {
+            std::fs::write(&path, b"VERDICT=PASS\n").unwrap();
+        }
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({"artifact_id":id.to_string(),
+                "selectors":[{"kind":"lines","start":1,"end":1}]})
+            .to_string(),
+        };
+        let result = ReadToolOutputHandler
+            .handle(ToolInvocation {
+                session: std::sync::Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(
+                    std::sync::Arc::clone(&turn),
+                ),
+                cancellation_token: Default::default(),
+                tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: format!("recover-{status}"),
+                tool_name: ToolName::plain("read_tool_output"),
+                source: ToolCallSource::CodeMode {
+                    cell_id: "raw-integrity".into(),
+                    parent_call_id: Some("exec".into()),
+                    runtime_tool_call_id: format!("recover-{status}"),
+                    nested_deadline: None,
+                    cancellation_cause: None,
+                },
+                payload: payload.clone(),
+            })
+            .await;
+        if matches!(status, "tampered" | "missing-digest") {
+            assert!(
+                result.is_err(),
+                "{status} cannot become historical evidence"
+            );
+            continue;
+        }
+        let output = result.unwrap();
+        let value = output.code_mode_result(&payload);
+        assert_eq!(value["results"][0]["text"], "VERDICT=FAIL\n");
+        assert_eq!(
+            value["historical_authenticity"],
+            if status == "intact" {
+                "authenticated"
+            } else {
+                "unverified"
+            }
+        );
+        let schema = super::super::read_tool_output_spec::read_tool_output_output_schema(
+            super::super::read_tool_output_spec::tool_output_selector_schema(),
+        );
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .validate(&value)
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn explicit_nested_recovery_does_not_hide_a_model_handoff() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let session = std::sync::Arc::new(session);
@@ -2031,4 +2118,88 @@ fn legacy_ranges_are_sorted_merged_and_capped_at_the_declared_limit() {
         },
     ]);
     assert!(resolved_selectors(&args).is_err());
+}
+#[tokio::test]
+async fn audit132_direct_recovery_fits_history_without_changing_exact_ranges() {
+    use codex_protocol::openai_models::TruncationMode;
+    use codex_protocol::openai_models::TruncationPolicyConfig;
+    use codex_protocol::protocol::TruncationPolicy;
+    let raw = format!(
+        "{}MIDDLE_ANSWER=418{}",
+        "quote=\";slash=\\;λ\r\n".repeat(300),
+        "tail".repeat(1500)
+    );
+    for (mode, limit) in [
+        (TruncationMode::Bytes, 4000),
+        (TruncationMode::Bytes, 10001),
+        (TruncationMode::Bytes, 20000),
+        (TruncationMode::Tokens, 1000),
+    ] {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        turn.model_info.truncation_policy = TruncationPolicyConfig { mode, limit };
+        let policy: TruncationPolicy = turn.model_info.truncation_policy.into();
+        let session = std::sync::Arc::new(session);
+        let turn = std::sync::Arc::new(turn);
+        let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+            &turn.config.codex_home,
+            &session.thread_id.to_string(),
+            &CanonicalToolResult::text(&raw),
+        )
+        .await;
+        let payload = ToolPayload::Function {
+            arguments: serde_json::json!({
+                "artifact_id":artifact.artifact_id().unwrap(),
+                "selectors":[{"kind":"bytes","start":0,"end":raw.len()}],
+            })
+            .to_string(),
+        };
+        let output = ReadToolOutputHandler
+            .handle(ToolInvocation {
+                session: std::sync::Arc::clone(&session),
+                step_context: crate::session::step_context::StepContext::for_test(turn),
+                cancellation_token: Default::default(),
+                tracker: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "direct-recovery".into(),
+                tool_name: ToolName::plain("read_tool_output"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap();
+        let ResponseInputItem::FunctionCallOutput {
+            output: visible, ..
+        } = output.to_response_item("direct-recovery", &payload)
+        else {
+            panic!("function output")
+        };
+        let text = visible.body.to_text().unwrap();
+        assert!(
+            text.len() <= policy.byte_budget(),
+            "{} > {}",
+            text.len(),
+            policy.byte_budget()
+        );
+        assert_eq!(
+            crate::context_manager::truncate_function_output_payload(&visible, policy),
+            visible
+        );
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let mut delivered = 0;
+        for row in value["results"].as_array().unwrap() {
+            if let Some(text) = row["text"].as_str() {
+                let start = row["canonical_range"]["start"].as_u64().unwrap() as usize;
+                let end = row["canonical_range"]["end"].as_u64().unwrap() as usize;
+                assert_eq!(text.as_bytes(), &raw.as_bytes()[start..end]);
+                delivered += text.len();
+            }
+        }
+        assert!(delivered > 0);
+        if value["complete"] == true {
+            assert_eq!(delivered, raw.len());
+        } else {
+            assert!(value.get("continuation_stop").is_some());
+        }
+    }
 }

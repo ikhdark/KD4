@@ -9,8 +9,10 @@ use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
+use app_test_support::write_rotated_chatgpt_auth;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RemoteControlClient;
 use codex_app_server_protocol::RemoteControlClientsListOrder;
@@ -42,6 +44,12 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::header;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -231,6 +239,200 @@ async fn explicit_remote_control_startup_fails_when_disabled_by_requirements() -
         std::fs::read(state_db_path)?,
         corrupt_state,
         "managed-policy rejection must not touch or recover the state database"
+    );
+    Ok(())
+}
+
+const ACCOUNT_REQUIREMENTS_REQUEST: &str = "GET /backend-api/wham/config/bundle account=account_id";
+const ENROLL_REQUEST_PREFIX: &str = "POST /backend-api/wham/remote/control/server/enroll ";
+
+/// A business login whose account id becomes known only after login.
+fn business_login_without_account_id() -> ChatGptAuthFixture {
+    ChatGptAuthFixture::new("chatgpt-token")
+        .plan_type("business")
+        .chatgpt_user_id("user-123")
+        .chatgpt_account_id("account_id")
+}
+
+/// Serves cloud config bundles and remote-control enrollment. Managed requirements are fetched
+/// per account: `account_requirements` applies only to `account_id`, and none apply before the
+/// account id is known. Enrollment fails, so an attempt surfaces as an errored status.
+async fn account_requirements_backend(account_requirements: &str) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/config/bundle"))
+        .and(header("chatgpt-account-id", "account_id"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requirements_toml": {
+                "enterprise_managed": [{
+                    "id": "account-requirements",
+                    "name": "account requirements",
+                    "contents": account_requirements,
+                }],
+            },
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/config/bundle"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/backend-api/wham/remote/control/server/enroll"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Backend requests in arrival order, as `METHOD path account=<chatgpt-account-id>`.
+async fn backend_requests(server: &MockServer) -> Result<Vec<String>> {
+    Ok(server
+        .received_requests()
+        .await
+        .context("the backend should record requests")?
+        .into_iter()
+        .map(|request| {
+            let account_id = request
+                .headers
+                .get("chatgpt-account-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_string();
+            format!(
+                "{} {} account={account_id}",
+                request.method,
+                request.url.path()
+            )
+        })
+        .collect())
+}
+
+fn remote_control_status_is(
+    notification: &JSONRPCNotification,
+    status: RemoteControlConnectionStatus,
+) -> bool {
+    notification.method == "remoteControl/status/changed"
+        && notification
+            .params
+            .clone()
+            .and_then(|params| {
+                serde_json::from_value::<RemoteControlStatusChangedNotification>(params).ok()
+            })
+            .is_some_and(|changed| changed.status == status)
+}
+
+/// Enables remote control for a business login that has no account id yet, then supplies the
+/// account id within the same login, as a token refresh written by another process does.
+async fn complete_account_id_with_remote_control_enabled(
+    server: &MockServer,
+    codex_home: &std::path::Path,
+) -> Result<TestAppServer> {
+    let chatgpt_base_url = format!("{}/backend-api", server.uri());
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        codex_home,
+        &server.uri(),
+        &chatgpt_base_url,
+    )?;
+    write_chatgpt_auth(
+        codex_home,
+        business_login_without_account_id(),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    // Consume the status reported at initialization, so later status notifications are fresh.
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_notification_message("remoteControl/status/changed"),
+    )
+    .await??;
+    let request_id = mcp.send_remote_control_ephemeral_enable_request().await?;
+    let enabled: RemoteControlEnableResponse =
+        to_response(wait_for_response(&mut mcp, request_id).await?)?;
+    assert_eq!(enabled.0.status, RemoteControlConnectionStatus::Connecting);
+
+    write_rotated_chatgpt_auth(
+        codex_home,
+        business_login_without_account_id().account_id("account_id"),
+    )?;
+    Ok(mcp)
+}
+
+#[tokio::test]
+async fn account_requirements_denial_after_account_id_completion_disables_remote_control()
+-> Result<()> {
+    let server = account_requirements_backend("allow_remote_control = false").await;
+    let codex_home = TempDir::new()?;
+    let mut mcp =
+        complete_account_id_with_remote_control_enabled(&server, codex_home.path()).await?;
+
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "remoteControl/status/changed disabled",
+            |notification| {
+                remote_control_status_is(notification, RemoteControlConnectionStatus::Disabled)
+            },
+        ),
+    )
+    .await??;
+    let requests = backend_requests(&server).await?;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request == ACCOUNT_REQUIREMENTS_REQUEST),
+        "the completed account's requirements should be fetched: {requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.starts_with(ENROLL_REQUEST_PREFIX)),
+        "remote control enrolled before its account's requirements denied it: {requests:?}"
+    );
+    let request_id = mcp.send_remote_control_ephemeral_enable_request().await?;
+    assert_remote_control_disabled_by_requirements(&mut mcp, request_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_control_enrolls_after_account_requirements_allow_the_completed_account()
+-> Result<()> {
+    let server = account_requirements_backend("allow_remote_control = true").await;
+    let codex_home = TempDir::new()?;
+    let mut mcp =
+        complete_account_id_with_remote_control_enabled(&server, codex_home.path()).await?;
+
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_matching_notification(
+            "remoteControl/status/changed errored",
+            |notification| {
+                remote_control_status_is(notification, RemoteControlConnectionStatus::Errored)
+            },
+        ),
+    )
+    .await??;
+    let requests = backend_requests(&server).await?;
+    let recheck = requests
+        .iter()
+        .position(|request| request == ACCOUNT_REQUIREMENTS_REQUEST)
+        .with_context(|| {
+            format!("the completed account's requirements were not fetched: {requests:?}")
+        })?;
+    let enroll = requests
+        .iter()
+        .position(|request| request.starts_with(ENROLL_REQUEST_PREFIX))
+        .with_context(|| format!("remote control did not enroll: {requests:?}"))?;
+    assert!(
+        recheck < enroll,
+        "remote control enrolled before its account's requirements were re-checked: {requests:?}"
     );
     Ok(())
 }
@@ -626,8 +828,6 @@ async fn rpc_updates_durable_preference_but_ephemeral_does_not() -> Result<()> {
 
     Ok(())
 }
-
-
 
 #[tokio::test]
 async fn remote_control_pairing_rejects_invalid_requests_without_backend_requests() -> Result<()> {

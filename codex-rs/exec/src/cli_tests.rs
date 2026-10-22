@@ -2,6 +2,15 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 #[test]
+fn exec_version_uses_executable_release_metadata() {
+    use clap::CommandFactory;
+    assert_eq!(
+        Cli::command().get_version(),
+        Some(codex_utils_build_info::CODEX_VERSION)
+    );
+}
+
+#[test]
 fn resume_parses_prompt_after_global_flags() {
     const PROMPT: &str = "echo resume-with-global-flags-after-subcommand";
     let cli = Cli::parse_from([

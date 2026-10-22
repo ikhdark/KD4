@@ -30,6 +30,8 @@ const MAX_QUEUED_DISPATCHES: usize = 128;
 
 struct CellDispatchState {
     ready: watch::Sender<bool>,
+    user_intent_epoch: u64,
+    environment_scope: Option<(u64, Vec<codex_protocol::protocol::TurnEnvironmentSelection>)>,
     terminal: bool,
     pending_continuations: Vec<PendingOwnerDrainedContinuation>,
 }
@@ -56,6 +58,33 @@ impl CodeModeDispatchBroker {
 
     pub(super) fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId) {
         dispatch_gate(&self.cells, cell_id).send_replace(true);
+    }
+
+    pub(super) fn bind_cell_environments(
+        &self,
+        cell_id: &CellId,
+        environments: &crate::environment_selection::TurnEnvironmentSnapshot,
+    ) {
+        dispatch_gate(&self.cells, cell_id);
+        let mut cells = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cell) = cells.get_mut(cell_id) {
+            cell.environment_scope = Some((environments.generation, environments.to_selections()));
+        }
+    }
+
+    pub(super) fn bind_cell_user_intent(&self, cell_id: &CellId, epoch: u64) {
+        dispatch_gate(&self.cells, cell_id);
+        if let Some(cell) = self
+            .cells
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(cell_id)
+        {
+            cell.user_intent_epoch = epoch;
+        }
     }
 
     pub(super) fn close_cell(&self, cell_id: &CellId) {
@@ -142,6 +171,31 @@ impl CodeModeDispatchBroker {
             .any(|cell| !cell.terminal)
     }
 
+    #[cfg(test)]
+    async fn call(
+        &self,
+        parent: String,
+        cell_id: CellId,
+        name: String,
+        input: JsonValue,
+        token: CancellationToken,
+    ) -> Result<JsonValue, String> {
+        self.invoke_tool(
+            CodeModeNestedToolCall {
+                cell_id,
+                parent_tool_call_id: Some(parent),
+                runtime_tool_call_id: "test-call".into(),
+                buffered_output_bytes: 0,
+                tool_name: codex_protocol::ToolName::plain(name),
+                tool_kind: codex_code_mode::CodeModeToolKind::Function,
+                input: Some(input),
+                nested_deadline: None,
+            },
+            NestedCancellation::new(token),
+        )
+        .await
+    }
+
     pub(super) fn start_turn_worker(
         &self,
         exec: ExecContext,
@@ -161,6 +215,10 @@ impl CodeModeDispatchBroker {
             cleanup_terminal_cells(&self.cells);
             *current = Some(Arc::clone(&owner));
         }
+        let environment_scope = (
+            step_context.environments.generation,
+            step_context.environments.to_selections(),
+        );
         let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker)
             .with_sampling_request_signals(request_signals);
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
@@ -222,7 +280,6 @@ impl CodeModeDispatchBroker {
                                     response = host.notify(call_id, cell_id.clone(), text) => response,
                                 }
                             } else {
-                                close_cell(&cells, &cell_id);
                                 Err("code mode notification cancelled".to_string())
                             };
                             let _ = response_tx.send(response);
@@ -236,6 +293,7 @@ impl CodeModeDispatchBroker {
                     } => {
                         let host = Arc::clone(&host);
                         let cells = Arc::clone(&cells);
+                        let environment_scope = environment_scope.clone();
                         tokio::spawn(async move {
                             let cancellation_token = cancellation.token().clone();
                             let dequeued_at = Instant::now();
@@ -260,9 +318,20 @@ impl CodeModeDispatchBroker {
                             )
                             .await;
                             if !ready {
-                                close_cell(&cells, &cell_id);
                                 let _ = response_tx
                                     .send(Err("code mode nested tool call cancelled".to_string()));
+                                return;
+                            }
+                            let scope_matches = cells
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&cell_id)
+                                .and_then(|cell| cell.environment_scope.as_ref())
+                                .is_none_or(|scope| scope == &environment_scope);
+                            if !scope_matches {
+                                let _ = response_tx.send(Err(
+                                    "code mode cell environment selection changed; start a new cell for the current scope".to_string(),
+                                ));
                                 return;
                             }
                             let child_started_at = Instant::now();
@@ -277,7 +346,18 @@ impl CodeModeDispatchBroker {
                                 ),
                                 "code mode nested tool child started"
                             );
-                            let invocation = host.invoke_tool(invocation, cancellation.clone());
+                            let authoring_epoch = cells
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get(&cell_id)
+                                .map(|cell| cell.user_intent_epoch)
+                                .unwrap_or(u64::MAX);
+                            let invocation = invoke_with_user_intent(
+                                &host.exec.session.input_queue,
+                                &cell_id,
+                                authoring_epoch,
+                                host.invoke_tool(invocation, cancellation.clone(), authoring_epoch),
+                            );
                             tokio::pin!(invocation);
                             let response = tokio::select! {
                                 biased;
@@ -371,6 +451,8 @@ fn dispatch_gate(
         .entry(cell_id.clone())
         .or_insert_with(|| CellDispatchState {
             ready: watch::channel(false).0,
+            user_intent_epoch: 0,
+            environment_scope: None,
             terminal: false,
             pending_continuations: Vec::new(),
         })
@@ -401,6 +483,33 @@ fn cleanup_terminal_cells(cells: &Mutex<HashMap<CellId, CellDispatchState>>) {
 
 fn duration_ms(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+async fn invoke_with_user_intent(
+    input_queue: &crate::session::InputQueue,
+    cell_id: &CellId,
+    authoring_epoch: u64,
+    invocation: impl std::future::Future<Output = Result<JsonValue, String>>,
+) -> Result<JsonValue, String> {
+    tokio::pin!(invocation);
+    let mut admitted = false;
+    std::future::poll_fn(|cx| {
+        if admitted {
+            return std::future::Future::poll(invocation.as_mut(), cx);
+        }
+        match input_queue.admit_code_mode_tool(authoring_epoch, || {
+            admitted = true;
+            std::future::Future::poll(invocation.as_mut(), cx)
+        }) {
+            Ok(result) => result,
+            Err(current_epoch) => std::task::Poll::Ready(Err(serde_json::json!({
+                "type": "plan_invalidated", "started": false,
+                "cell_id": cell_id.to_string(), "authoring_epoch": authoring_epoch,
+                "current_epoch": current_epoch,
+                "message": "User intent changed; author a new cell after incorporating the accepted input."
+            }).to_string())),
+        }
+    }).await
 }
 
 async fn wait_until_cell_ready_for_dispatch(
@@ -566,15 +675,15 @@ impl CoreTurnHost {
         &self,
         invocation: CodeModeNestedToolCall,
         cancellation: NestedCancellation,
+        authoring_epoch: u64,
     ) -> Result<JsonValue, String> {
-        call_nested_tool(
-            self.exec.clone(),
-            self.tool_runtime.clone(),
-            invocation,
-            cancellation,
-        )
-        .await
-        .map_err(|error| error.to_string())
+        let tool_runtime = self
+            .tool_runtime
+            .clone()
+            .with_code_mode_user_intent(invocation.cell_id.as_str(), authoring_epoch);
+        call_nested_tool(self.exec.clone(), tool_runtime, invocation, cancellation)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn notify(&self, call_id: String, _cell_id: CellId, text: String) -> Result<(), String> {
@@ -711,17 +820,21 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_returns_buffered_cell_output_and_nested_receipts() -> anyhow::Result<()> {
+        use crate::tools::code_mode::CodeModeNestedResultEvidence;
+        use crate::tools::code_mode::CodeModeService;
         use crate::tools::code_mode::execute_handler::CodeModeExecuteHandler;
         use crate::tools::code_mode::wait_handler::CodeModeWaitHandler;
-        use crate::tools::code_mode::{CodeModeNestedResultEvidence, CodeModeService};
         use crate::tools::context::ToolPayload;
-        use crate::tools::registry::{CoreToolRuntime, ToolRegistry};
-        use crate::tools::router::{ToolCall, ToolRouter};
+        use crate::tools::registry::CoreToolRuntime;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolRouter;
         use codex_tools::ToolName;
         for use_wait in [false, true] {
             let (mut session, turn) = crate::session::tests::make_session_and_context().await;
-            session.services.code_mode_service =
-                CodeModeService::new(Arc::new(codex_code_mode_runtime::InProcessCodeModeSessionProvider));
+            session.services.code_mode_service = CodeModeService::new(Arc::new(
+                codex_code_mode_runtime::InProcessCodeModeSessionProvider,
+            ));
             let session = Arc::new(session);
             let step = StepContext::for_test(Arc::new(turn));
             let execute = CodeModeExecuteHandler::new(
@@ -1173,5 +1286,250 @@ mod tests {
         broker.close_cell(&cell);
         drop(worker);
         Ok(())
+    }
+}
+#[cfg(test)]
+mod environment_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn surviving_cell_rejects_a_new_sampling_environment_scope() -> anyhow::Result<()> {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        let original_scope = turn.environments.clone();
+        turn.environments.generation = turn.environments.generation.wrapping_add(1);
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let broker = CodeModeDispatchBroker::new();
+        let cell = CellId::new("environment-bound-cell".into());
+        broker.bind_cell_environments(&cell, &original_scope);
+        broker.mark_cell_ready_for_dispatch(&cell);
+        let worker = broker.start_turn_worker(
+            ExecContext {
+                session,
+                turn: Arc::clone(&turn),
+            },
+            StepContext::for_test(turn),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+            Default::default(),
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            broker.call(
+                "scope-parent".into(),
+                cell,
+                "read_file".into(),
+                serde_json::json!({"path":"AGENTS.md"}),
+                CancellationToken::new(),
+            ),
+        )
+        .await?;
+        let error = match response {
+            Err(error) => error,
+            Ok(_) => panic!("old cells must not dispatch through the replacement scope"),
+        };
+        assert!(error.contains("environment selection changed"), "{error}");
+        drop(worker);
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod readiness_cancellation_regression {
+    use super::*;
+
+    #[tokio::test]
+    async fn steering_rejects_queued_and_late_old_response_cells_across_worker_replacement() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let old_step = session
+            .capture_step_context(Arc::clone(&turn))
+            .await
+            .unwrap();
+        let retry = Arc::new(old_step.for_retry_attempt());
+        let broker = Arc::new(CodeModeDispatchBroker::new());
+        let tracker = Arc::new(tokio::sync::Mutex::new(
+            crate::turn_diff_tracker::TurnDiffTracker::new(),
+        ));
+        let first = broker.start_turn_worker(
+            ExecContext {
+                session: Arc::clone(&session),
+                turn: Arc::clone(&turn),
+            },
+            Arc::clone(&old_step),
+            Arc::clone(&tracker),
+            Default::default(),
+        );
+        let cell = CellId::new("queued-old-plan".to_string());
+        broker.bind_cell_user_intent(&cell, old_step.user_intent_epoch);
+        let gate = dispatch_gate(&broker.cells, &cell);
+        let pending = {
+            let broker = Arc::clone(&broker);
+            let cell = cell.clone();
+            tokio::spawn(async move {
+                broker
+                    .call(
+                        "old".into(),
+                        cell,
+                        "must_not_run".into(),
+                        serde_json::json!({}),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let state = tokio::sync::Mutex::new(crate::state::TurnState::default());
+        session
+            .input_queue
+            .extend_pending_input_for_turn_state(
+                &state,
+                &[crate::session::TurnInput::AdditionalContext(
+                    Default::default(),
+                )],
+            )
+            .await
+            .unwrap();
+        session
+            .input_queue
+            .take_pending_for_state(Some(&state), true)
+            .await;
+        let current = session
+            .capture_step_context(Arc::clone(&turn))
+            .await
+            .unwrap();
+        assert_eq!(retry.user_intent_epoch, old_step.user_intent_epoch);
+        assert_ne!(current.user_intent_epoch, old_step.user_intent_epoch);
+        let replacement = broker.start_turn_worker(
+            ExecContext {
+                session: Arc::clone(&session),
+                turn: Arc::clone(&turn),
+            },
+            current,
+            tracker,
+            Default::default(),
+        );
+        drop(first);
+        broker.mark_cell_ready_for_dispatch(&cell);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let receipt: JsonValue = serde_json::from_str(&error).unwrap();
+        assert_eq!(receipt["type"], "plan_invalidated");
+        assert_eq!(receipt["started"], false);
+        assert_eq!(receipt["authoring_epoch"], 0);
+        assert_eq!(receipt["current_epoch"], 1);
+        // A response produced after steering still carries its old request,
+        // including a physical retry; opening its ready gate is not authority.
+        let late = CellId::new("late-old-response".to_string());
+        broker.bind_cell_user_intent(&late, retry.user_intent_epoch);
+        broker.mark_cell_ready_for_dispatch(&late);
+        let error = broker
+            .call(
+                "late".into(),
+                late,
+                "must_not_run".into(),
+                serde_json::json!({}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            serde_json::from_str::<JsonValue>(&error).unwrap()["started"],
+            false
+        );
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn already_admitted_callback_settles_after_steering_without_replay() {
+        let queue = crate::session::InputQueue::new();
+        let state = tokio::sync::Mutex::new(crate::state::TurnState::default());
+        let (release, held) = oneshot::channel();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let cell = CellId::new("admitted".to_string());
+        let invocation = invoke_with_user_intent(&queue, &cell, 0, async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.await.unwrap();
+            Ok(
+                serde_json::json!({"session_id": 42, "session_capabilities":{"incarnation":"original"}}),
+            )
+        });
+        tokio::pin!(invocation);
+        assert!(futures::poll!(&mut invocation).is_pending());
+        queue
+            .extend_pending_input_for_turn_state(
+                &state,
+                &[crate::session::TurnInput::AdditionalContext(
+                    Default::default(),
+                )],
+            )
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        assert_eq!(invocation.await.unwrap()["session_id"], 42);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_pre_ready_notification_does_not_close_a_siblings_gate() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let broker = CodeModeDispatchBroker::new();
+        let cell = CellId::new("pre-ready-siblings".into());
+        let gate = dispatch_gate(&broker.cells, &cell);
+        let worker = broker.start_turn_worker(
+            ExecContext {
+                session,
+                turn: Arc::clone(&turn),
+            },
+            StepContext::for_test(turn),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+            Default::default(),
+        );
+        let token = CancellationToken::new();
+        let (response_tx, response_rx) = oneshot::channel();
+        broker
+            .dispatch_tx
+            .send(DispatchMessage::Notify {
+                call_id: "a".into(),
+                cell_id: cell.clone(),
+                text: "must not dispatch".into(),
+                cancellation_token: token.clone(),
+                response_tx,
+            })
+            .await
+            .unwrap();
+        let sibling_token = CancellationToken::new();
+        let sibling = wait_until_cell_ready_for_dispatch(&broker.cells, &cell, &sibling_token);
+        tokio::pin!(sibling);
+        assert!(futures::poll!(sibling.as_mut()).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gate.receiver_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        token.cancel();
+        assert!(response_rx.await.unwrap().is_err());
+        assert!(broker.cells.lock().unwrap().contains_key(&cell));
+        broker.mark_cell_ready_for_dispatch(&cell);
+        assert!(sibling.await);
+        assert!(*gate.borrow());
+        broker.close_cell(&cell);
+        drop(worker);
     }
 }

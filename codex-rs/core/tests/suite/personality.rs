@@ -20,9 +20,13 @@ use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::load_default_config_for_test;
 use core_test_support::require_network;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
+use core_test_support::responses::sse;
 use core_test_support::responses::sse_completed;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::TestCodex;
@@ -42,6 +46,17 @@ const LOCAL_FRIENDLY_TEMPLATE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 const PERSONALITY_RESET_TEXT: &str = "The previous personality no longer applies. No personality-specific communication style is currently active.";
+
+/// A completed turn that delivers a final answer. A response without one now
+/// triggers the turn's single missing-answer repair request, which would
+/// consume the next turn's scripted response.
+fn sse_answered(id: &str) -> String {
+    sse(vec![
+        ev_response_created(id),
+        ev_assistant_message(&format!("msg-{id}"), "done"),
+        ev_completed(id),
+    ])
+}
 
 fn read_only_text_turn(
     test: &TestCodex,
@@ -207,7 +222,11 @@ async fn config_personality_some_adds_developer_personality_spec() -> anyhow::Re
         instructions_text.as_str(),
         codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.trim()
     );
-    assert!(instructions_text.contains("Add tests only for concrete behavioral failures through the real owning path"));
+    assert!(
+        instructions_text.contains(
+            "Add tests only for concrete behavioral failures through the real owning path"
+        )
+    );
     assert!(!instructions_text.contains("{{ personality }}"));
 
     assert!(
@@ -337,9 +356,9 @@ async fn user_turn_personality_none_replaces_previous_update_message() -> anyhow
     let resp_mock = mount_sse_sequence(
         &server,
         vec![
-            sse_completed("resp-1"),
-            sse_completed("resp-2"),
-            sse_completed("resp-3"),
+            sse_answered("resp-1"),
+            sse_answered("resp-2"),
+            sse_answered("resp-3"),
         ],
     )
     .await;
@@ -654,8 +673,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: Some(ModelMessages {
-            token_budget: None,
-            instructions_template: Some("Base instructions\n{{ personality }}\n".to_string()),
+            instructions_template: Some("TEMPLATE_ONLY_POLICY\n{{ personality }}\n".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: Some(default_personality_message.to_string()),
                 personality_friendly: Some(friendly_personality_message.to_string()),
@@ -676,7 +694,6 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
-        supports_experimental_context: false,
         context_window: Some(128_000),
         max_context_window: None,
         auto_compact_token_limit: None,
@@ -729,6 +746,7 @@ async fn remote_model_friendly_personality_instructions_with_feature() -> anyhow
 
     let request = resp_mock.single_request();
     let instructions_text = request.instructions_text();
+    assert_eq!(instructions_text.matches("TEMPLATE_ONLY_POLICY").count(), 1);
 
     assert!(
         !instructions_text.contains(friendly_personality_message),
@@ -781,7 +799,6 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: Some(ModelMessages {
-            token_budget: None,
             instructions_template: Some("Base instructions\n{{ personality }}\n".to_string()),
             instructions_variables: Some(ModelInstructionsVariables {
                 personality_default: None,
@@ -803,7 +820,6 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
-        supports_experimental_context: false,
         context_window: Some(128_000),
         max_context_window: None,
         auto_compact_token_limit: None,
@@ -828,7 +844,7 @@ async fn user_turn_personality_remote_model_template_includes_update_message() -
 
     let resp_mock = mount_sse_sequence(
         &server,
-        vec![sse_completed("resp-1"), sse_completed("resp-2")],
+        vec![sse_answered("resp-1"), sse_answered("resp-2")],
     )
     .await;
 

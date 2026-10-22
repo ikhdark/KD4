@@ -10,9 +10,10 @@ async fn audit21_real_hook_policy_is_exact_or_wholly_omitted() {
             .with_test_writer()
             .finish(),
     );
-    use codex_config::{
-        ConfigLayerEntry, ConfigLayerSource, ConfigRequirements, ConfigRequirementsToml,
-    };
+    use codex_config::ConfigLayerEntry;
+    use codex_config::ConfigLayerSource;
+    use codex_config::ConfigRequirements;
+    use codex_config::ConfigRequirementsToml;
     for oversized in [false, true] {
         let (session, turn, events) = make_session_and_context_with_rx().await;
         let instruction = if oversized {

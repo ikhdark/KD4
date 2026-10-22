@@ -85,21 +85,47 @@ pub(crate) async fn run_transport(
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_transport_with_shutdown(
+        listen_url,
+        runtime_paths,
+        telemetry,
+        crate::ExecServerShutdown::new(),
+    )
+    .await
+}
+
+pub(crate) async fn run_transport_with_shutdown(
+    listen_url: &str,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    shutdown: crate::ExecServerShutdown,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match parse_listen_url(listen_url)? {
         ExecServerListenTransport::WebSocket(bind_address) => {
-            run_websocket_listener(bind_address, runtime_paths, telemetry).await
+            run_websocket_listener(bind_address, runtime_paths, telemetry, shutdown).await
         }
-        ExecServerListenTransport::Stdio => run_stdio_connection(runtime_paths, telemetry).await,
+        ExecServerListenTransport::Stdio => {
+            run_stdio_connection(runtime_paths, telemetry, shutdown).await
+        }
     }
 }
 
 async fn run_stdio_connection(
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
+    shutdown: crate::ExecServerShutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    run_stdio_connection_with_io(io::stdin(), io::stdout(), runtime_paths, telemetry).await
+    run_stdio_connection_with_io_and_shutdown(
+        io::stdin(),
+        io::stdout(),
+        runtime_paths,
+        telemetry,
+        shutdown,
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn run_stdio_connection_with_io<R, W>(
     reader: R,
     writer: W,
@@ -110,7 +136,29 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let processor = ConnectionProcessor::new_with_telemetry(runtime_paths, telemetry);
+    run_stdio_connection_with_io_and_shutdown(
+        reader,
+        writer,
+        runtime_paths,
+        telemetry,
+        crate::ExecServerShutdown::new(),
+    )
+    .await
+}
+
+async fn run_stdio_connection_with_io_and_shutdown<R, W>(
+    reader: R,
+    writer: W,
+    runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    shutdown: crate::ExecServerShutdown,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let processor =
+        ConnectionProcessor::new_with_telemetry(runtime_paths, telemetry).with_shutdown(shutdown);
     tracing::info!("codex-exec-server listening on stdio");
     processor
         .run_connection(
@@ -127,6 +175,7 @@ async fn run_websocket_listener(
     bind_address: SocketAddr,
     runtime_paths: ExecServerRuntimePaths,
     telemetry: ExecServerTelemetry,
+    shutdown: crate::ExecServerShutdown,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !bind_address.ip().is_loopback() {
         return Err(io::Error::new(
@@ -137,7 +186,8 @@ async fn run_websocket_listener(
     }
     let listener = TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
-    let processor = ConnectionProcessor::new_with_telemetry(runtime_paths, telemetry);
+    let processor = ConnectionProcessor::new_with_telemetry(runtime_paths, telemetry)
+        .with_shutdown(shutdown.clone());
     info!("codex-exec-server listening on ws://{local_addr}");
     println!("ws://{local_addr}");
     std::io::stdout().flush()?;
@@ -146,18 +196,25 @@ async fn run_websocket_listener(
         .route("/", any(websocket_upgrade_handler))
         .route("/readyz", get(readiness_handler))
         .layer(middleware::from_fn(reject_requests_with_origin_header))
-        .with_state(ExecServerWebSocketState { processor });
-    axum::serve(
+        .with_state(ExecServerWebSocketState {
+            processor: processor.clone(),
+            connections: std::sync::Arc::new(tokio::sync::Semaphore::new(128)),
+        });
+    let result = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .await?;
+    .with_graceful_shutdown(async move { shutdown.cancelled().await })
+    .await;
+    processor.shutdown().await;
+    result?;
     Ok(())
 }
 
 #[derive(Clone)]
 struct ExecServerWebSocketState {
     processor: ConnectionProcessor,
+    connections: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 async fn readiness_handler() -> StatusCode {
@@ -185,6 +242,14 @@ async fn websocket_upgrade_handler(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<ExecServerWebSocketState>,
 ) -> impl IntoResponse {
+    let Ok(connection_permit) = state.connections.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            "websocket connection limit reached",
+        )
+            .into_response();
+    };
     info!(%peer_addr, "exec-server websocket client connected");
     // Clients send each JSON-RPC message as one frame; accept the same ceiling
     // as the stdio and Noise transports instead of the 16 MiB frame default.
@@ -192,6 +257,7 @@ async fn websocket_upgrade_handler(
         .max_frame_size(MAX_JSONRPC_MESSAGE_LEN)
         .max_message_size(MAX_JSONRPC_MESSAGE_LEN)
         .on_upgrade(move |stream| async move {
+            let _connection_permit = connection_permit;
             state
                 .processor
                 .run_connection(
@@ -203,6 +269,7 @@ async fn websocket_upgrade_handler(
                 )
                 .await;
         })
+        .into_response()
 }
 
 #[cfg(test)]

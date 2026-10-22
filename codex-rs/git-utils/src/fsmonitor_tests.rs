@@ -67,7 +67,10 @@ async fn detects_supported_builtin_fsmonitor_values() {
             "capability substring is not support",
             vec![
                 response(config_args(), Some(b"true\0")),
-                response(capability_args(), Some(b"feature: fsmonitor--daemon-disabled\n")),
+                response(
+                    capability_args(),
+                    Some(b"feature: fsmonitor--daemon-disabled\n"),
+                ),
             ],
             FsmonitorOverride::Disabled,
         ),

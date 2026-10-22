@@ -38,6 +38,11 @@ pub(crate) fn bundled_models() -> Result<&'static ModelsResponse, serde_json::Er
     }
 
     let mut response: ModelsResponse = serde_json::from_str(include_str!("../models.json"))?;
+    for model in &response.models {
+        model
+            .validate_capabilities()
+            .map_err(<serde_json::Error as serde::de::Error>::custom)?;
+    }
     prompt_resolver::apply_prompt_policy(&mut response.models);
     Ok(BUNDLED_MODELS.get_or_init(|| response))
 }

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 fn test_skill_metadata(skill_doc_path: AbsolutePathBuf) -> SkillMetadata {
     SkillMetadata {
+        source: None,
         name: "test-skill".to_string(),
         description: "test".to_string(),
         short_description: None,
@@ -26,11 +27,17 @@ fn test_skill_metadata(skill_doc_path: AbsolutePathBuf) -> SkillMetadata {
 #[test]
 fn script_run_detection_matches_runner_plus_extension() {
     for (tokens, expected) in [
-        (vec!["python3", "-u", "scripts/fetch_comments.py"], Some("scripts/fetch_comments.py")),
+        (
+            vec!["python3", "-u", "scripts/fetch_comments.py"],
+            Some("scripts/fetch_comments.py"),
+        ),
         (vec!["python3", "-c", "print(1)"], None),
         (vec!["not-python", "scripts/fetch_comments.py"], None),
         (vec!["python3"], None),
-        (vec!["PWSH.exe", "--", "scripts/check.PS1"], Some("scripts/check.PS1")),
+        (
+            vec!["PWSH.exe", "--", "scripts/check.PS1"],
+            Some("scripts/check.PS1"),
+        ),
     ] {
         let tokens = tokens.into_iter().map(str::to_string).collect::<Vec<_>>();
         assert_eq!(script_run_token(&tokens), expected, "{tokens:?}");
@@ -48,17 +55,30 @@ fn command_detection_resolves_script_and_document_paths() {
     };
     let doc = skill.path_to_skills_md.to_string_lossy().replace('\\', "/");
     let script = test_path_buf("/tmp/skill-test/scripts/fetch_comments.py")
-        .to_string_lossy().replace('\\', "/");
+        .to_string_lossy()
+        .replace('\\', "/");
     for (command, cwd, expected) in [
         (format!("cat \"{doc}\" | head"), "/tmp", Some(skill.clone())),
         (format!("nl -ba \"{doc}\""), "/tmp", Some(skill.clone())),
-        ("python3 scripts/fetch_comments.py".to_string(), "/tmp/skill-test", Some(skill.clone())),
+        (
+            "python3 scripts/fetch_comments.py".to_string(),
+            "/tmp/skill-test",
+            Some(skill.clone()),
+        ),
         (format!("python3 \"{script}\""), "/tmp/other", Some(skill)),
-        ("python3 scripts/fetch_comments.py".to_string(), "/tmp/other", None),
+        (
+            "python3 scripts/fetch_comments.py".to_string(),
+            "/tmp/other",
+            None,
+        ),
         ("cat unrelated.md".to_string(), "/tmp/skill-test", None),
     ] {
         assert_eq!(
-            detect_implicit_skill_invocation_for_command(&outcome, &command, &test_path_buf(cwd).abs()),
+            detect_implicit_skill_invocation_for_command(
+                &outcome,
+                &command,
+                &test_path_buf(cwd).abs()
+            ),
             expected,
             "{command} from {cwd}"
         );

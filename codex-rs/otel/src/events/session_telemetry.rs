@@ -327,6 +327,11 @@ impl ModelAttemptTransport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelAttemptTelemetry {
+    /// Details are optional enrichment, not another physical attempt receipt.
+    pub details_only: bool,
+    pub diagnostics_available: bool,
+    pub clock_id: String,
+    pub attempt_started_us: u64,
     pub turn_id: Option<String>,
     pub generation_index: Option<u32>,
     pub generation_purpose: Option<String>,
@@ -382,7 +387,7 @@ pub struct ModelAttemptTelemetry {
     pub queue_us: u64,
     pub connection_setup_us: u64,
     pub transport_us: Option<u64>,
-    pub dispatch_ready_us: u64,
+    pub dispatch_ready_us: Option<u64>,
     pub stream_established_us: Option<u64>,
     pub first_provider_event_us: Option<u64>,
     pub first_model_output_us: Option<u64>,
@@ -973,6 +978,32 @@ impl SessionTelemetry {
         );
     }
 
+    /// Content-free join exported under the same filters as phase records.
+    /// A connection/warmup has no generating request identity.
+    pub fn record_model_transport_identity(
+        &self,
+        logical_request_id: &str,
+        sampling_request_id: Option<&str>,
+        physical_attempt_id: Option<&str>,
+        operation: &str,
+        duration: Option<Duration>,
+    ) {
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.model_transport_identity",
+                logical_request_id = logical_request_id,
+                sampling_request_id = sampling_request_id,
+                physical_attempt_id = physical_attempt_id,
+                operation = operation,
+                generating = physical_attempt_id.is_some(),
+                duration_ms = duration.map(|value| value.as_millis()),
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_transport_phase(
         &self,
@@ -1198,6 +1229,25 @@ impl SessionTelemetry {
         >,
         duration: Duration,
     ) {
+        self.record_websocket_event_with_transport(result, duration, None);
+    }
+
+    /// Connection-correlated provider observations do not establish the
+    /// generating attempt of a timing frame without provider identity.
+    pub fn record_websocket_event_with_transport(
+        &self,
+        result: &Result<
+            Option<
+                Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            >,
+            ApiError,
+        >,
+        duration: Duration,
+        logical_request_id: Option<&str>,
+    ) {
         if self.metrics.is_none() {
             return;
         }
@@ -1214,6 +1264,10 @@ impl SessionTelemetry {
                                 .and_then(|value| value.as_str())
                                 .map(std::string::ToString::to_string);
                             if kind.as_deref() == Some(RESPONSES_WEBSOCKET_TIMING_KIND) {
+                                self.record_responses_websocket_timing_receipt(
+                                    &value,
+                                    logical_request_id,
+                                );
                                 self.record_responses_websocket_timing_metrics(&value);
                             }
                             if kind.as_deref() == Some("response.failed") {
@@ -1431,7 +1485,12 @@ impl SessionTelemetry {
         tracing::event!(
                 target: crate::targets::OTEL_LOG_ONLY_TARGET,
                 tracing::Level::INFO,
-                event.name = "codex.model_attempt",
+                event.name = if record.details_only { "codex.model_attempt_details" } else { "codex.model_attempt" },
+                schema_version = 2_u32,
+                diagnostics_available = record.diagnostics_available,
+                clock_id = %record.clock_id,
+                attempt_started_us = record.attempt_started_us,
+                dispatch_boundary = "client_transport_submission",
                 turn_id = record.turn_id.as_deref(),
                 generation_index = record.generation_index,
                 generation_purpose = record.generation_purpose.as_deref(),
@@ -1771,6 +1830,36 @@ impl SessionTelemetry {
             /*inc*/ 1,
             duration,
             &tags,
+        );
+    }
+
+    fn record_responses_websocket_timing_receipt(
+        &self,
+        value: &serde_json::Value,
+        logical_request_id: Option<&str>,
+    ) {
+        let timing = value.get(RESPONSES_WEBSOCKET_TIMING_METRICS_FIELD);
+        let field = |name: &str| {
+            let raw = timing.and_then(|value| value.get(name));
+            duration_from_ms_value(raw)?;
+            raw?.as_f64()
+        };
+        // Preserve provider definitions and fractional milliseconds. IDs are
+        // structured receipt fields, never high-cardinality histogram tags.
+        log_and_trace_event!(self,
+            common: {
+                event.name = "codex.provider_websocket_timing",
+                logical_request_id = logical_request_id,
+                attempt_correlation = "unknown_provider_frame_has_no_attempt_identity",
+                provenance = "provider_reported",
+                responses_duration_excl_engine_and_client_tool_time_ms = field(RESPONSES_API_OVERHEAD_FIELD),
+                engine_service_total_ms = field(RESPONSES_API_INFERENCE_FIELD),
+                engine_iapi_ttft_total_ms = field(RESPONSES_API_ENGINE_IAPI_TTFT_FIELD),
+                engine_service_ttft_total_ms = field(RESPONSES_API_ENGINE_SERVICE_TTFT_FIELD),
+                engine_iapi_tbt_across_engine_calls_ms = field(RESPONSES_API_ENGINE_IAPI_TBT_FIELD),
+                engine_service_tbt_across_engine_calls_ms = field(RESPONSES_API_ENGINE_SERVICE_TBT_FIELD),
+            },
+            log: {}, trace: {},
         );
     }
 

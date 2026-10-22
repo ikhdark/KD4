@@ -17,6 +17,7 @@ fn assignment_draft() -> AssignmentDraft {
         capability_profile: CapabilityProfile::ScopedSourceWrite,
         objective: "complete the task".to_string(),
         acceptance_criteria: vec![AcceptanceCriterion {
+            evidence_policy: None,
             id: "criterion".to_string(),
             text: "criterion passes".to_string(),
         }],
@@ -96,12 +97,12 @@ async fn missing_receipt_for_amended_attempt_uses_effective_criteria() {
             .await
             .unwrap();
         let revised_criteria = vec![AcceptanceCriterion {
+            evidence_policy: None,
             id: "corrected-criterion".to_string(),
             text: "the amended requirement is satisfied".to_string(),
         }];
-        let amended_attempt = store
+        let amended_attempt = coordinator
             .amend_agent_task(
-                TaskActor::Root,
                 assignment.assignment_id,
                 codex_agent_task_store::AttemptAmendment {
                     reason: "apply the review correction".to_string(),
@@ -112,10 +113,17 @@ async fn missing_receipt_for_amended_attempt_uses_effective_criteria() {
             )
             .await
             .unwrap();
-        coordinator
-            .refresh_binding(assignment.assignment_id)
-            .await
+        let cached = coordinator
+            .binding_for_assignment(assignment.assignment_id)
             .unwrap();
+        assert_eq!(cached.attempt_id, amended_attempt.attempt_id);
+        assert_eq!(
+            store
+                .get_agent_task_binding(assignment.assignment_id)
+                .await
+                .unwrap(),
+            Some(cached)
+        );
         assert!(
             coordinator
                 .seal_missing_receipt_for_attempt(
@@ -372,7 +380,7 @@ async fn terminal_emission_exports_once_after_diagnostic_event_saturation() {
         )
         .await
         .expect("receipt seals the attempt");
-    coordinator.mark_task_inactive(assignment.assignment_id);
+    coordinator.mark_host_terminal(assignment.assignment_id, attempt.attempt_id);
 
     let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
     let telemetry = test_session_telemetry()
@@ -567,9 +575,14 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
         agent_role: None,
     });
     let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
-    let telemetry = test_session_telemetry().with_metrics_config(codex_otel::MetricsConfig::in_memory(
-        "test", "codex", "test", exporter.clone(),
-    )).unwrap();
+    let telemetry = test_session_telemetry()
+        .with_metrics_config(codex_otel::MetricsConfig::in_memory(
+            "test",
+            "codex",
+            "test",
+            exporter.clone(),
+        ))
+        .unwrap();
     for ordinal in 0..3 {
         let binding = coordinator.binding_for_source(&source).unwrap();
         coordinator
@@ -580,8 +593,20 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
             coordinator.binding_for_source(&source).unwrap().attempt_id,
             binding.attempt_id
         );
-        assert!(coordinator.record_task_usage_for_source(&source,
-            crate::agent::task_metrics::TokenClassTotals { total: 7, ..Default::default() }, 1));
+        assert!(coordinator.record_task_usage_for_source(
+            &source,
+            crate::agent::task_metrics::TokenClassTotals {
+                total: 7,
+                coverage: Some(codex_protocol::protocol::TokenUsageCoverage {
+                    receipts: 1,
+                    reported_receipts: Some(1),
+                    total_tokens: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            1
+        ));
         coordinator
             .seal_missing_receipt(
                 &path,
@@ -591,8 +616,13 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
             .await
             .unwrap()
             .unwrap();
-        coordinator.maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry).await;
-        coordinator.maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry).await;
+        coordinator.mark_host_terminal(assignment.assignment_id, binding.attempt_id);
+        coordinator
+            .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
+            .await;
+        coordinator
+            .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
+            .await;
         assert!(!coordinator.has_task_metric_runtime(assignment.assignment_id));
         // Delivery alone never starts a new attempt; entering the next turn does.
         coordinator
@@ -639,11 +669,34 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
         assert_eq!(persisted.attempt_id, next.attempt_id);
     }
     // Simulate lost process-local counters while the durable attempt stays active.
-    coordinator.metrics.lock().unwrap().runtimes.remove(&assignment.assignment_id);
-    coordinator.prepare_legacy_agent_turn(&source, thread_id).await.unwrap();
-    assert!(coordinator.metrics.lock().unwrap().runtimes[&assignment.assignment_id].usage_history_partial);
-    assert!(coordinator.record_task_usage_for_source(&source,
-        crate::agent::task_metrics::TokenClassTotals { total: 11, ..Default::default() }, 1));
+    coordinator
+        .metrics
+        .lock()
+        .unwrap()
+        .runtimes
+        .remove(&assignment.assignment_id);
+    coordinator
+        .prepare_legacy_agent_turn(&source, thread_id)
+        .await
+        .unwrap();
+    assert!(
+        coordinator.metrics.lock().unwrap().runtimes[&assignment.assignment_id]
+            .usage_history_partial
+    );
+    assert!(coordinator.record_task_usage_for_source(
+        &source,
+        crate::agent::task_metrics::TokenClassTotals {
+            total: 11,
+            coverage: Some(codex_protocol::protocol::TokenUsageCoverage {
+                receipts: 1,
+                reported_receipts: Some(1),
+                total_tokens: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        1
+    ));
     let final_receipt = coordinator
         .seal_missing_receipt(
             &path,
@@ -655,15 +708,35 @@ async fn plain_message_followup_refreshes_binding_and_rejects_old_completion_wat
         .unwrap();
     assert_eq!(final_receipt.summary, "latest followup");
     assert!(final_receipt.validation_call_ids.is_empty());
-    coordinator.maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry).await;
+    coordinator.mark_host_terminal(assignment.assignment_id, final_receipt.attempt_id);
+    coordinator
+        .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
+        .await;
     telemetry.shutdown_metrics().unwrap();
     let exports = exporter.get_finished_metrics().unwrap();
-    let metrics = exports.last().unwrap().scope_metrics()
-        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics).collect::<Vec<_>>();
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
-    let usage = metrics.iter().find(|metric| metric.name() == "codex.multi_agent.task.token_usage").unwrap();
-    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = usage.data() else { panic!("token histogram"); };
-    let totals = histogram.data_points().filter(|point| !point.attributes().any(|attribute| attribute.key.as_str() == "token_class")).collect::<Vec<_>>();
+    let metrics = exports
+        .last()
+        .unwrap()
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .collect::<Vec<_>>();
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    let usage = metrics
+        .iter()
+        .find(|metric| metric.name() == "codex.multi_agent.task.token_usage")
+        .unwrap();
+    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = usage.data() else {
+        panic!("token histogram");
+    };
+    let totals = histogram
+        .data_points()
+        .filter(|point| {
+            !point
+                .attributes()
+                .any(|attribute| attribute.key.as_str() == "token_class")
+        })
+        .collect::<Vec<_>>();
     assert_eq!(totals.iter().map(|point| point.sum()).sum::<f64>(), 32.0);
     assert_eq!(totals.iter().map(|point| point.count()).sum::<u64>(), 4);
 }
@@ -1014,4 +1087,269 @@ async fn missing_typed_receipt_preserves_recorded_validation_without_claiming_ac
             .unwrap()
             .contains(&attempt.attempt_id.to_string())
     );
+}
+#[tokio::test]
+async fn ma001_coordinator_rejects_foreign_reads_and_binding_cache_refresh() {
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".into())
+        .await
+        .unwrap();
+    let owner = AgentTaskCoordinator::default();
+    owner
+        .initialize(Arc::clone(&state), "root-session".into())
+        .await
+        .unwrap();
+    let foreign = AgentTaskCoordinator::default();
+    foreign.initialize(state, "foreign".into()).await.unwrap();
+    let (assignment, attempt) = owner
+        .create_assignment(repo.path(), assignment_draft())
+        .await
+        .unwrap();
+    owner
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: "/root/worker".into(),
+            task_name: "worker".into(),
+            thread_id: Some(ThreadId::new().to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        foreign
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await,
+        Err(StoreError::RootSessionMismatch { .. })
+    ));
+    assert!(matches!(
+        foreign.refresh_binding(assignment.assignment_id).await,
+        Err(StoreError::RootSessionMismatch { .. })
+    ));
+    assert!(
+        foreign
+            .binding_for_assignment(assignment.assignment_id)
+            .is_none()
+    );
+    assert_eq!(
+        owner
+            .get_agent_task(assignment.assignment_id, Some(0))
+            .await
+            .unwrap()
+            .current_attempt
+            .attempt_id,
+        attempt.attempt_id
+    );
+}
+
+#[tokio::test]
+async fn ma008_restart_reconciles_the_retained_exact_terminal_attempt() {
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::TurnCompleteEvent;
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".into())
+        .await
+        .unwrap();
+    let owner = AgentTaskCoordinator::default();
+    owner
+        .initialize(Arc::clone(&state), "root-session".into())
+        .await
+        .unwrap();
+    let (assignment, attempt) = owner
+        .create_assignment(repo.path(), assignment_draft())
+        .await
+        .unwrap();
+    let thread = ThreadId::new();
+    let binding = owner
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: "/root/worker".into(),
+            task_name: "worker".into(),
+            thread_id: Some(thread.to_string()),
+        })
+        .await
+        .unwrap();
+    let event = EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "original-turn".into(),
+        last_agent_message: Some("original result".into()),
+        surfaced_result: None,
+        error: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        timing: None,
+    });
+    owner
+        .retain_terminal_outcome(
+            binding,
+            "original-turn".into(),
+            &AgentStatus::Completed(Some("original result".into())),
+            &event,
+        )
+        .await
+        .unwrap();
+    drop(owner);
+    let restored = AgentTaskCoordinator::default();
+    restored
+        .initialize(Arc::clone(&state), "root-session".into())
+        .await
+        .unwrap();
+    let task = restored
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .unwrap();
+    assert_eq!(task.current_attempt.attempt_id, attempt.attempt_id);
+    assert_eq!(
+        task.receipt.as_ref().unwrap().status,
+        AgentStatusClaim::NeedsMain
+    );
+    assert!(task.receipt.unwrap().summary.contains("original result"));
+    assert!(
+        restored
+            .required_store()
+            .unwrap()
+            .pending_terminal_outcomes("root-session")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn ma013_receipt_does_not_retire_usage_before_the_host_terminal_boundary() {
+    use crate::agent::task_metrics::TokenClassTotals;
+    let home = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    let state = StateRuntime::init(home.path().to_path_buf(), "test-provider".into())
+        .await
+        .unwrap();
+    let coordinator = AgentTaskCoordinator::default();
+    coordinator
+        .initialize(state, "root-session".into())
+        .await
+        .unwrap();
+    let mut draft = assignment_draft();
+    draft.role = AgentRole::Explorer;
+    draft.capability_profile = CapabilityProfile::ReadSearch;
+    draft.required_evidence.clear();
+    let (assignment, attempt) = coordinator
+        .create_assignment(repo.path(), draft)
+        .await
+        .unwrap();
+    let path = AgentPath::try_from("/root/explorer").unwrap();
+    coordinator
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: path.to_string(),
+            task_name: "explorer".into(),
+            thread_id: Some(ThreadId::new().to_string()),
+        })
+        .await
+        .unwrap();
+    let source = SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+        parent_thread_id: ThreadId::new(),
+        depth: 1,
+        agent_path: Some(path),
+        agent_nickname: None,
+        agent_role: None,
+    });
+    assert!(coordinator.record_task_usage_for_source(
+        &source,
+        TokenClassTotals {
+            total: 100,
+            coverage: Some(codex_protocol::protocol::TokenUsageCoverage {
+                receipts: 1,
+                reported_receipts: Some(1),
+                total_tokens: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        1
+    ));
+    coordinator
+        .required_store()
+        .unwrap()
+        .submit_agent_receipt(
+            attempt.attempt_id,
+            ReceiptDraft {
+                status: AgentStatusClaim::Completed,
+                summary: "receipt before final report".into(),
+                criterion_results: vec![CriterionResult {
+                    criterion_id: "criterion".into(),
+                    status: CriterionStatus::Passed,
+                    evidence: None,
+                    evidence_ref: None,
+                }],
+                declared_changes: Vec::new(),
+                validation_call_ids: Vec::new(),
+                blockers: Vec::new(),
+                risks: Vec::new(),
+                next_action: None,
+                architecture_contract: None,
+            },
+        )
+        .await
+        .unwrap();
+    let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+    let telemetry = test_session_telemetry()
+        .with_metrics_config(codex_otel::MetricsConfig::in_memory(
+            "test",
+            "codex",
+            "test",
+            exporter.clone(),
+        ))
+        .unwrap();
+    coordinator
+        .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
+        .await;
+    assert!(coordinator.has_task_metric_runtime(assignment.assignment_id));
+    assert!(coordinator.record_task_usage_for_source(
+        &source,
+        TokenClassTotals {
+            total: 50,
+            coverage: Some(codex_protocol::protocol::TokenUsageCoverage {
+                receipts: 1,
+                reported_receipts: Some(1),
+                total_tokens: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        1
+    ));
+    coordinator.mark_host_terminal(assignment.assignment_id, attempt.attempt_id);
+    coordinator
+        .maybe_emit_terminal_metrics(assignment.assignment_id, &telemetry)
+        .await;
+    assert!(!coordinator.has_task_metric_runtime(assignment.assignment_id));
+    telemetry.shutdown_metrics().unwrap();
+    let exports = exporter.get_finished_metrics().unwrap();
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+    let metrics = exports
+        .last()
+        .unwrap()
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        .collect::<Vec<_>>();
+    let usage = metrics
+        .iter()
+        .find(|metric| metric.name() == "codex.multi_agent.task.token_usage")
+        .unwrap();
+    let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = usage.data() else {
+        panic!("token histogram");
+    };
+    let totals = histogram
+        .data_points()
+        .filter(|point| {
+            !point
+                .attributes()
+                .any(|attribute| attribute.key.as_str() == "token_class")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(totals.iter().map(|point| point.sum()).sum::<f64>(), 150.0);
 }

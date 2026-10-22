@@ -36,12 +36,6 @@ impl RevokeTokenKind {
         }
     }
 
-    fn client_id(self) -> Option<String> {
-        match self {
-            Self::Access => None,
-            Self::Refresh => Some(oauth_client_id()),
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -60,9 +54,29 @@ pub(super) async fn revoke_auth_tokens(
         return Ok(());
     };
 
-    let endpoint = revoke_token_endpoint();
+    let context = auth_dot_json.and_then(|auth| auth.oauth_context.as_ref());
+    let endpoint = match context {
+        Some(context) => context.endpoint("/oauth/revoke")?,
+        None => revoke_token_endpoint(),
+    };
+    let client_id = match kind {
+        RevokeTokenKind::Refresh => Some(
+            context
+                .map(|context| context.client_id.clone())
+                .unwrap_or_else(oauth_client_id),
+        ),
+        RevokeTokenKind::Access => None,
+    };
     let client = create_default_auth_client(&endpoint, auth_route_config).await?;
-    revoke_oauth_token(&client, endpoint.as_str(), token, kind, REVOKE_HTTP_TIMEOUT).await
+    revoke_oauth_token(
+        &client,
+        endpoint.as_str(),
+        token,
+        kind,
+        REVOKE_HTTP_TIMEOUT,
+        client_id,
+    )
+    .await
 }
 
 fn revocable_token(auth_dot_json: &AuthDotJson) -> Option<(&str, RevokeTokenKind)> {
@@ -100,11 +114,12 @@ async fn revoke_oauth_token(
     token: &str,
     kind: RevokeTokenKind,
     timeout: Duration,
+    client_id: Option<String>,
 ) -> Result<(), std::io::Error> {
     let request = RevokeTokenRequest {
         token,
         token_type_hint: kind.as_str(),
-        client_id: kind.client_id(),
+        client_id,
     };
 
     let response = client
@@ -194,6 +209,7 @@ mod tests {
             "refresh-token",
             RevokeTokenKind::Refresh,
             Duration::from_millis(20),
+            Some(oauth_client_id()),
         )
         .await
         .expect_err("stalled revoke request should time out");

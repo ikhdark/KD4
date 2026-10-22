@@ -42,6 +42,20 @@ pub(crate) fn parse_agent_id_target(target: &str) -> Result<ThreadId, FunctionCa
     })
 }
 
+async fn admit_agent_target(
+    session: &std::sync::Arc<crate::session::session::Session>,
+    turn: &crate::session::turn_context::TurnContext,
+    agent_id: ThreadId,
+) -> Result<(), FunctionCallError> {
+    let control = &session.services.agent_control;
+    control.register_session_root(session.thread_id, turn.parent_thread_id);
+    match control.ensure_agent_in_tree(agent_id).await {
+        // An ID that names no thread reaches nothing; each tool reports it as not found.
+        Ok(()) | Err(codex_protocol::error::CodexErr::ThreadNotFound(_)) => Ok(()),
+        Err(error) => Err(FunctionCallError::RespondToModel(error.to_string())),
+    }
+}
+
 pub(crate) fn parse_agent_id_targets(
     targets: Vec<String>,
 ) -> Result<Vec<ThreadId>, FunctionCallError> {

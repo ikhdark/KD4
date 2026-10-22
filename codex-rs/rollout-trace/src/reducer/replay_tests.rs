@@ -26,7 +26,7 @@ fn replay_rejects_invalid_event_envelopes_without_rewriting_evidence() -> anyhow
         ("seq", json!(1), "sequence 1, expected 2"),
         ("seq", json!(3), "sequence 3, expected 2"),
         ("rollout_id", json!("other"), "belongs to rollout other"),
-        ("schema_version", json!(2), "unsupported trace event schema"),
+        ("schema_version", json!(4), "unsupported trace event schema"),
     ] {
         let mut invalid = ended.clone();
         invalid[field] = value;
@@ -77,7 +77,7 @@ fn replay_rejects_manifest_schema_and_conflicting_start_identity() -> anyhow::Re
     std::fs::write(&log, format!("{}\n", serde_json::to_string(&event)?))?;
     let manifest_path = temp.path().join("manifest.json");
     let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
-    manifest["schema_version"] = json!(2);
+    manifest["schema_version"] = json!(3);
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
     let error = replay_bundle(temp.path()).expect_err("unknown schema must fail");
     assert!(
@@ -85,5 +85,28 @@ fn replay_rejects_manifest_schema_and_conflicting_start_identity() -> anyhow::Re
             .to_string()
             .contains("unsupported trace manifest schema")
     );
+    Ok(())
+}
+
+#[test]
+fn legacy_capture_coverage_remains_unknown() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = TraceWriter::create(temp.path(), "trace".into(), "rollout".into(), "root".into())?;
+    let event = writer.append(RawTraceEventPayload::RolloutStarted {
+        trace_id: "trace".into(),
+        root_thread_id: "root".into(),
+    })?;
+    let mut event = serde_json::to_value(event)?;
+    event["schema_version"] = json!(1);
+    event
+        .as_object_mut()
+        .unwrap()
+        .remove("payload_capture_gap_count");
+    std::fs::write(temp.path().join("trace.jsonl"), format!("{event}\n"))?;
+    let manifest_path = temp.path().join("manifest.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    manifest["schema_version"] = json!(1);
+    std::fs::write(manifest_path, serde_json::to_vec(&manifest)?)?;
+    assert_eq!(replay_bundle(temp.path())?.payload_capture_gap_count, None);
     Ok(())
 }

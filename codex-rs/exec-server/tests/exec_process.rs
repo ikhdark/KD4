@@ -355,7 +355,10 @@ async fn assert_exec_process_pushes_events(use_remote: bool) -> Result<()> {
                 }
                 *seq
             }
-            ProcessEventSnapshot::Exited { seq, exit_code: code } => {
+            ProcessEventSnapshot::Exited {
+                seq,
+                exit_code: code,
+            } => {
                 assert!(exit_code.replace(*code).is_none(), "only one exit event");
                 *seq
             }

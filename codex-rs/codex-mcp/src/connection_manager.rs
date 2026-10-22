@@ -108,9 +108,13 @@ where
     let mut seen = HashSet::new();
     let mut completed_pages = 0;
     let failure = loop {
-        if completed_pages == MAX_MCP_COLLECTION_PAGES { break "collection page limit reached".to_string(); }
+        if completed_pages == MAX_MCP_COLLECTION_PAGES {
+            break "collection page limit reached".to_string();
+        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() { break "collection deadline expired".to_string(); }
+        if remaining.is_zero() {
+            break "collection deadline expired".to_string();
+        }
         let page = tokio::time::timeout_at(deadline, fetch(cursor.clone(), remaining)).await;
         let (page_items, next) = match page {
             Ok(Ok(page)) => page,
@@ -123,10 +127,16 @@ where
         items.extend(page_items);
         completed_pages += 1;
         cursor = next;
-        let Some(next) = cursor.as_ref() else { return Ok((items, None, None)); };
-        if !seen.insert(next.clone()) { break "server returned a repeated continuation cursor".to_string(); }
+        let Some(next) = cursor.as_ref() else {
+            return Ok((items, None, None));
+        };
+        if !seen.insert(next.clone()) {
+            break "server returned a repeated continuation cursor".to_string();
+        }
     };
-    if completed_pages == 0 { return Err(anyhow!(failure)); }
+    if completed_pages == 0 {
+        return Err(anyhow!(failure));
+    }
     let message = format!("incomplete collection after {completed_pages} page(s): {failure}");
     let mut meta = rmcp::model::MetaObject::new();
     meta.insert("codex/collectionError".into(), JsonValue::String(message));
@@ -358,6 +368,23 @@ impl McpConnectionManager {
         Some(client)
     }
 
+    /// Availability for the same revision-checked ready/cached catalog. Never
+    /// wait for optional startup just to describe what has not become ready.
+    pub async fn catalog_availability(&self) -> (Vec<String>, Vec<String>) {
+        let mut pending = Vec::new();
+        let mut failed = Vec::new();
+        for (name, client) in &self.clients {
+            if !client.startup_complete.load(Ordering::Acquire) {
+                pending.push(name.clone());
+            } else if client.client().await.is_err() {
+                failed.push(name.clone());
+            }
+        }
+        pending.sort();
+        failed.sort();
+        (pending, failed)
+    }
+
     /// Returns the coarse negotiated resources capability for fully started servers.
     pub async fn has_ready_server_with_resources(&self) -> bool {
         for client in self.clients.values() {
@@ -490,7 +517,20 @@ impl McpConnectionManager {
                 .server_metadata
                 .insert(server_name.clone(), McpServerMetadata::from(&server));
             let reusable_client = match reusable_previous_manager {
-                Some(previous) => previous.reusable_client(&server_name, &server).await,
+                Some(previous)
+                    if server.configured_config().is_none_or(|config| {
+                        previous
+                            .client_reuse_context
+                            .runtime_context
+                            .server_scope_matches(
+                                &manager.client_reuse_context.runtime_context,
+                                config,
+                            )
+                    }) =>
+                {
+                    previous.reusable_client(&server_name, &server).await
+                }
+                Some(_) => None,
                 None => None,
             };
             if let Some(client) = reusable_client {
@@ -598,7 +638,10 @@ impl McpConnectionManager {
                 // authentication. Healthy servers need no extra OAuth request,
                 // and a slow provider must not block session initialization.
                 let auth_entry = if auth_entry.is_none()
-                    && outcome.as_ref().err().is_some_and(StartupOutcomeError::is_authentication_required)
+                    && outcome
+                        .as_ref()
+                        .err()
+                        .is_some_and(StartupOutcomeError::is_authentication_required)
                 {
                     tokio::select! {
                         _ = cancel_token.cancelled() => None,
@@ -668,12 +711,14 @@ impl McpConnectionManager {
                     }),
                 }
             }
-            let _ = tx_event
-                .send(Event {
+            let _ = crate::event_queue::send_event(
+                &tx_event,
+                Event {
                     id: startup_submit_id,
                     msg: EventMsg::McpStartupComplete(summary),
-                })
-                .await;
+                },
+            )
+            .await;
         });
         manager
     }
@@ -683,15 +728,21 @@ impl McpConnectionManager {
     /// them concurrently rather than imposing a readiness-dependent short poll.
     pub async fn wait_for_startup(&self) {
         futures::future::join_all(self.clients.iter().map(|(name, client)| {
-            let config = self.server_definitions.get(name).and_then(|server| server.configured_config());
-            let startup = config.and_then(|config| config.startup_timeout_sec)
+            let config = self
+                .server_definitions
+                .get(name)
+                .and_then(|server| server.configured_config());
+            let startup = config
+                .and_then(|config| config.startup_timeout_sec)
                 .unwrap_or(crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT);
-            let discovery = config.and_then(|config| config.tool_timeout_sec)
+            let discovery = config
+                .and_then(|config| config.tool_timeout_sec)
                 .unwrap_or(crate::rmcp_client::DEFAULT_TOOL_TIMEOUT);
             // Bound setup preceding the client's own timers too. Do not cancel
             // shared startup: a late server can enter the next turn's snapshot.
             tokio::time::timeout(startup.saturating_add(discovery), client.client())
-        })).await;
+        }))
+        .await;
     }
 
     /// Waits for every required server and reports their startup failures together.
@@ -883,28 +934,37 @@ impl McpConnectionManager {
         let config = self.server_definitions.get(server)?.configured_config()?;
         let client = self.clients.get(server)?;
         let stable_account = matches!(config.auth, McpServerAuth::ChatGpt)
-            && self.client_reuse_context.codex_apps_tools_cache_key.account_id.is_some()
+            && self
+                .client_reuse_context
+                .codex_apps_tools_cache_key
+                .account_id
+                .is_some()
             && matches!(&config.transport, McpServerTransportConfig::StreamableHttp {
                 bearer_token_env_var: None, env_http_headers: None, http_headers, ..
             } if http_headers.as_ref().is_none_or(|headers|
                 headers.keys().all(|name| !name.eq_ignore_ascii_case("authorization"))))
             && config.is_local_environment();
-        Some((serde_json::json!({
-            "transport": config.transport,
-            "environment": config.environment_id,
-            "auth": config.auth,
-            "oauth": config.oauth,
-            "oauth_resource": config.oauth_resource,
-            "account": self.client_reuse_context.codex_apps_tools_cache_key,
-            "connection": (!stable_account).then_some(client.approval_incarnation),
-        }), stable_account))
+        Some((
+            serde_json::json!({
+                "transport": config.transport,
+                "environment": config.environment_id,
+                "auth": config.auth,
+                "oauth": config.oauth,
+                "oauth_resource": config.oauth_resource,
+                "account": self.client_reuse_context.codex_apps_tools_cache_key,
+                "connection": (!stable_account).then_some(client.approval_incarnation),
+            }),
+            stable_account,
+        ))
     }
 
     pub fn has_scoped_tool_approval(&self, server: &str, policy_key: &str) -> bool {
-        self.server_definitions.get(server)
+        self.server_definitions
+            .get(server)
             .and_then(EffectiveMcpServer::configured_config)
             .and_then(|config| config.tools.get(policy_key))
-            .and_then(|tool| tool.approval_mode) == Some(codex_config::AppToolApproval::Approve)
+            .and_then(|tool| tool.approval_mode)
+            == Some(codex_config::AppToolApproval::Approve)
     }
 
     pub fn server_environment_id(&self, server_name: &str) -> Option<&str> {
@@ -1252,8 +1312,15 @@ impl McpConnectionManager {
                 }
                 Ok((task_id, (server_name, Ok(Some(resources))))) => {
                     task_servers.remove(&task_id);
-                    if let Some(message) = resources.meta.as_ref().and_then(|meta| meta.get("codex/collectionError")).and_then(JsonValue::as_str) {
-                        collection.errors.push(McpServerCollectionError::new(server_name.clone(), message));
+                    if let Some(message) = resources
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("codex/collectionError"))
+                        .and_then(JsonValue::as_str)
+                    {
+                        collection
+                            .errors
+                            .push(McpServerCollectionError::new(server_name.clone(), message));
                     }
                     collection.results.insert(server_name, resources);
                 }
@@ -1431,8 +1498,15 @@ impl McpConnectionManager {
                 }
                 Ok((task_id, (server_name, Ok(Some(templates))))) => {
                     task_servers.remove(&task_id);
-                    if let Some(message) = templates.meta.as_ref().and_then(|meta| meta.get("codex/collectionError")).and_then(JsonValue::as_str) {
-                        collection.errors.push(McpServerCollectionError::new(server_name.clone(), message));
+                    if let Some(message) = templates
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("codex/collectionError"))
+                        .and_then(JsonValue::as_str)
+                    {
+                        collection
+                            .errors
+                            .push(McpServerCollectionError::new(server_name.clone(), message));
                     }
                     collection.results.insert(server_name, templates);
                 }
@@ -1739,13 +1813,14 @@ async fn emit_update(
     tx_event: &Sender<Event>,
     update: McpStartupUpdateEvent,
 ) -> Result<(), Box<async_channel::SendError<Event>>> {
-    tx_event
-        .send(Event {
+    crate::event_queue::send_event(
+        tx_event,
+        Event {
             id: submit_id.to_string(),
             msg: EventMsg::McpStartupUpdate(update),
-        })
-        .await
-        .map_err(Box::new)
+        },
+    )
+    .await
 }
 
 fn mcp_startup_failure_reason(

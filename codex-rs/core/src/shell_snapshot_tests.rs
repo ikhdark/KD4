@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::test_harness::PathExt;
 use base64::Engine;
 use codex_exec_server::ExecBackend;
 use codex_exec_server::ExecBackendFuture;
@@ -12,7 +13,6 @@ use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
-use crate::test_harness::PathExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 
@@ -25,9 +25,185 @@ use tempfile::tempdir;
 use tokio::sync::watch;
 use tokio::time::Duration;
 
+#[tokio::test]
+async fn cancelled_local_snapshot_write_keeps_custody_until_native_settlement() -> Result<()> {
+    let directory = tempdir()?;
+    let path = AbsolutePathBuf::from_absolute_path(directory.path().join("snapshot.tmp.cmd"))?;
+    let (created, ready) = tokio::sync::oneshot::channel();
+    let (resume, release) = std::sync::mpsc::channel();
+    let worker_path = path.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        write_local_snapshot_file(worker_path, "snapshot contents".into(), move || {
+            let _ = created.send(());
+            let _ = release.recv();
+        })
+    });
+    tokio::time::timeout(Duration::from_secs(5), ready).await??;
+    assert!(path.exists());
+    // Abort cannot preempt an admitted blocking write; losing its receipt must
+    // eventually drop the guard returned by the real file transaction.
+    worker.abort();
+    resume.send(())?;
+    drop(worker);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await?;
+    let snapshot = write_local_snapshot_file(path.clone(), "successful snapshot".into(), || {})?;
+    assert_eq!(std::fs::read_to_string(&path)?, "successful snapshot");
+    assert!(write_local_snapshot_file(path.clone(), "must not replace".into(), || {}).is_err());
+    assert_eq!(std::fs::read_to_string(&path)?, "successful snapshot");
+    drop(snapshot);
+    assert!(!path.exists());
+    Ok(())
+}
+
 struct DelayedSnapshotBackend {
     process: Arc<DelayedSnapshotProcess>,
     start_delay: Duration,
+}
+
+#[tokio::test]
+async fn inherited_cmd_snapshot_obeys_current_policy_without_rebuilding() {
+    use crate::environment_selection::ThreadEnvironments;
+    use crate::environment_selection::TurnEnvironmentSnapshot;
+    use codex_features::Feature;
+    use codex_protocol::config_types::EnvironmentVariablePattern;
+    use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+    let (session, turn) = crate::session::tests::make_session_and_context().await;
+    let shell = Shell {
+        shell_type: ShellType::Cmd,
+        shell_path: "cmd.exe".into(),
+    };
+    let mut parent = turn.environments.primary().unwrap().clone();
+    parent.shell = Some(shell.clone());
+    let policy = turn.config.permissions.shell_environment_policy.clone();
+    let capture = |policy| {
+        ShellSnapshot::new(
+            turn.config.codex_home.clone(),
+            session.thread_id,
+            session.services.session_telemetry.clone(),
+            None,
+            HashMap::new(),
+            policy,
+        )
+    };
+    parent.shell_snapshot_origin = capture(policy.clone()).origin(&parent);
+    let directory = tempdir().unwrap();
+    let path = AbsolutePathBuf::try_from(directory.path().join("parent.cmd")).unwrap();
+    std::fs::write(&path, "fixture").unwrap();
+    let file = Arc::new(ShellSnapshotFile {
+        location: ShellSnapshotLocation::Local(path.clone()),
+        contents: format!("{CMD_SNAPSHOT_FORMAT_HEADER}\n@set KD4_AUDIT_MARKER=parent\n"),
+    });
+    let command = vec![
+        "cmd.exe".to_string(),
+        "/d".to_string(),
+        "/c".to_string(),
+        "echo harmless".to_string(),
+    ];
+    for pending in [false, true] {
+        for variant in 0..5 {
+            let mut child_policy = policy.clone();
+            match variant {
+                1 => child_policy
+                    .exclude
+                    .push(EnvironmentVariablePattern::new_case_insensitive(
+                        "KD4_AUDIT_MARKER",
+                    )),
+                2 => child_policy
+                    .include_only
+                    .push(EnvironmentVariablePattern::new_case_insensitive("PATH")),
+                3 => child_policy.inherit = ShellEnvironmentPolicyInherit::None,
+                _ => {}
+            }
+            let mut inherited = parent.clone();
+            inherited.shell_snapshot = if pending {
+                futures::future::pending().boxed().shared()
+            } else {
+                futures::future::ready(Some(Arc::clone(&file)))
+                    .boxed()
+                    .shared()
+            };
+            let manager = if variant == 4 {
+                ShellSnapshot::disabled()
+            } else {
+                capture(child_policy.clone())
+            };
+            let builders = manager.builder_tasks();
+            let environments = ThreadEnvironments::new(
+                session.services.turn_environments.environment_manager(),
+                shell.clone(),
+                manager,
+                TurnEnvironmentSnapshot {
+                    generation: 0,
+                    turn_environments: vec![inherited],
+                    starting: Vec::new(),
+                },
+                true,
+            );
+            let snapshot = environments.snapshot_now().await;
+            let child = snapshot.primary().unwrap();
+            let mut config = turn.config.as_ref().clone();
+            config
+                .features
+                .enable(Feature::ShellSnapshot)
+                .expect("enable shell snapshot");
+            config.permissions.shell_environment_policy = child_policy;
+            if variant == 4 {
+                config
+                    .features
+                    .disable(Feature::ShellSnapshot)
+                    .expect("disable shell snapshot");
+            }
+            let artifact = child.shell_snapshot_for_config(child.cwd(), &config).await;
+            let mut env = HashMap::new();
+            let argv = crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot_file(
+                &command,
+                &shell,
+                artifact.as_deref(),
+                &HashMap::new(),
+                &mut env,
+            );
+            assert_eq!(argv, command);
+            assert_eq!(
+                env.get("KD4_AUDIT_MARKER").map(String::as_str),
+                (variant == 0 && !pending).then_some("parent")
+            );
+            assert_eq!(
+                builders.len(),
+                0,
+                "inheritance must not launch another capture"
+            );
+            if variant != 0 {
+                assert!(
+                    child
+                        .shell_snapshot
+                        .clone()
+                        .now_or_never()
+                        .unwrap()
+                        .is_none()
+                );
+            } else if let Some(artifact) = artifact {
+                assert!(Arc::ptr_eq(&artifact, &file));
+                config.permissions.shell_environment_policy.exclude.push(
+                    EnvironmentVariablePattern::new_case_insensitive("KD4_AUDIT_MARKER"),
+                );
+                assert!(
+                    child
+                        .shell_snapshot_for_config(child.cwd(), &config)
+                        .await
+                        .is_none()
+                );
+            }
+            assert!(
+                path.as_path().exists(),
+                "declining replay must not delete the parent's file"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -262,7 +438,12 @@ async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> R
                         "cwd": "file:///C:/workspace"
                     }),
                     "fs/createDirectory" => json!({}),
-                    "process/start" => {
+                    "process/startOwned" => {
+                        assert!(
+                            request["params"]["incarnation"]
+                                .as_str()
+                                .is_some_and(|id| !id.is_empty())
+                        );
                         process_id = Some(request["params"]["processId"].clone());
                         json!({"processId": process_id})
                     }
@@ -372,7 +553,7 @@ async fn remote_snapshot_build_terminates_failed_capture_before_returning() -> R
                 "initialized",
                 "environment/info",
                 "fs/createDirectory",
-                "process/start",
+                "process/startOwned",
                 "process/read",
                 "process/terminate"
             ],
@@ -794,7 +975,12 @@ async fn assert_cancelled_remote_snapshot_cleanup(
                     "cwd": "file:///C:/workspace"
                 }),
                 "fs/createDirectory" => json!({}),
-                "process/start" => {
+                "process/startOwned" => {
+                    assert!(
+                        request["params"]["incarnation"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                    );
                     process_count += 1;
                     process_id = Some(request["params"]["processId"].clone());
                     json!({"processId": process_id})
@@ -934,7 +1120,7 @@ async fn assert_cancelled_remote_snapshot_cleanup(
         assert_eq!(
             methods
                 .iter()
-                .filter(|method| *method == "process/start")
+                .filter(|method| *method == "process/startOwned")
                 .count(),
             1,
             "cancelled write must not launch validation"
@@ -947,11 +1133,11 @@ async fn assert_cancelled_remote_snapshot_cleanup(
                 "initialized",
                 "environment/info",
                 "fs/createDirectory",
-                "process/start",
+                "process/startOwned",
                 "process/read",
                 "process/read",
                 "fs/writeFile",
-                "process/start",
+                "process/startOwned",
             ]
         );
         assert_eq!(
@@ -983,7 +1169,7 @@ async fn assert_cancelled_remote_snapshot_cleanup(
                 "initialized",
                 "environment/info",
                 "fs/createDirectory",
-                "process/start",
+                "process/startOwned",
                 "process/read",
                 "process/terminate",
             ],
@@ -1345,7 +1531,12 @@ async fn assert_remote_snapshot_shutdown(
                     "cwd":"file:///C:/workspace"
                 }),
                 "fs/createDirectory" => json!({}),
-                "process/start" => {
+                "process/startOwned" => {
+                    assert!(
+                        request["params"]["incarnation"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty())
+                    );
                     process_count += 1;
                     if process_count > 1 {
                         assert!(published_path.is_some(), "validate a published snapshot");
@@ -1377,7 +1568,10 @@ async fn assert_remote_snapshot_shutdown(
                             .context("one write")?
                             .send(())
                             .map_err(|_| anyhow!("write observer dropped"))?;
-                        write_allowed.take().context("one write permission")?.await?;
+                        write_allowed
+                            .take()
+                            .context("one write permission")?
+                            .await?;
                     }
                     json!({})
                 }
@@ -1455,10 +1649,31 @@ async fn assert_remote_snapshot_shutdown(
     let inherited_child = if inherit {
         let starting = parent.snapshot_now().await;
         assert_eq!(starting.starting.len(), 1);
+        // Inherited Cmd snapshots replay only under a matching enabled policy;
+        // a disabled child declines them (see the inherited policy test above).
+        let child_id = ThreadId::new();
         Some(Arc::new(ThreadEnvironments::new(
             manager.clone(),
             shell.clone(),
-            ShellSnapshot::disabled(),
+            ShellSnapshot::new(
+                directory.path().abs(),
+                child_id,
+                SessionTelemetry::new(
+                    child_id,
+                    "test-model",
+                    "test-model",
+                    None,
+                    None,
+                    None,
+                    "test".to_string(),
+                    false,
+                    "unknown".to_string(),
+                    codex_protocol::protocol::SessionSource::Cli,
+                ),
+                None,
+                HashMap::new(),
+                ShellEnvironmentPolicy::default(),
+            ),
             starting,
             false,
         )))

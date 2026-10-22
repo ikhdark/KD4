@@ -1,6 +1,9 @@
 mod additional_context;
 mod budget;
 mod fragment;
+mod user_turn;
+pub use user_turn::LegacyInterAgentMailReader;
+pub use user_turn::is_user_turn_boundary;
 
 pub use additional_context::AdditionalContextDeveloperFragment;
 pub use additional_context::AdditionalContextUserFragment;

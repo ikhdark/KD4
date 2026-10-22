@@ -153,8 +153,9 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             result.stdout,
         )
         proof = json.loads(
-            next(line for line in result.stdout.splitlines() if line.startswith("CHILD="))
-            .removeprefix("CHILD=")
+            next(
+                line for line in result.stdout.splitlines() if line.startswith("CHILD=")
+            ).removeprefix("CHILD=")
         )
         self.assertEqual(
             Path(proof.pop("CODEX_CARGO_LANE_TARGET_DIR")),
@@ -476,8 +477,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
 
-
-
     def test_common_rust_env_restarts_stale_sccache_server_cache_size(self) -> None:
         shell = powershell()
         if shell is None:
@@ -676,8 +675,11 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             "-Stats @('Max cache size 80 GiB'))} | ConvertTo-Json -Depth 4 -Compress"
         )
         result = subprocess.run(
-            [shell, "-NoProfile", "-Command", command], capture_output=True,
-            text=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+            [shell, "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=CREATE_NO_WINDOW,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         proof = json.loads(result.stdout)
@@ -814,13 +816,18 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                             "sccache --start-server failed with exit code 9",
                             result.stderr,
                         )
-                        self.assertEqual(call_lines, ["--stop-server", "--start-server"])
+                        self.assertEqual(
+                            call_lines, ["--stop-server", "--start-server"]
+                        )
                         self.assertNotIn("Max cache size", result.stdout)
                     else:
-                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(
+                            result.returncode, 0, result.stdout + result.stderr
+                        )
                         self.assertIn("Max cache size", result.stdout)
                         self.assertEqual(
-                            call_lines, ["--stop-server", "--start-server", "--show-stats"]
+                            call_lines,
+                            ["--stop-server", "--start-server", "--show-stats"],
                         )
 
     def test_sccache_perf_reset_fails_when_zero_stats_fails(self) -> None:
@@ -1002,8 +1009,6 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 "json_schema_fixtures_match_generated",
             },
         )
-
-
 
 
 if __name__ == "__main__":

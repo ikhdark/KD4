@@ -15,9 +15,12 @@ use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::ACL_SIZE_INFORMATION;
 use windows_sys::Win32::Security::AclSizeInformation;
+use windows_sys::Win32::Security::AddAce;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
+use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
 use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+use windows_sys::Win32::Security::Authorization::SET_ACCESS;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
 use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
@@ -29,25 +32,39 @@ use windows_sys::Win32::Security::EqualSid;
 use windows_sys::Win32::Security::GENERIC_MAPPING;
 use windows_sys::Win32::Security::GetAce;
 use windows_sys::Win32::Security::GetAclInformation;
+use windows_sys::Win32::Security::GetSecurityDescriptorControl;
+use windows_sys::Win32::Security::InitializeSecurityDescriptor;
 use windows_sys::Win32::Security::MapGenericMask;
+use windows_sys::Win32::Security::SE_DACL_AUTO_INHERIT_REQ;
+use windows_sys::Win32::Security::SE_DACL_AUTO_INHERITED;
+use windows_sys::Win32::Security::SE_DACL_PROTECTED;
+use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
+use windows_sys::Win32::Security::SetKernelObjectSecurity;
+use windows_sys::Win32::Security::SetSecurityDescriptorControl;
+use windows_sys::Win32::Security::SetSecurityDescriptorDacl;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 use windows_sys::Win32::Storage::FileSystem::DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 const INHERITED_ACE: u8 = 0x10;
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -370,6 +387,7 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
     allow_mask: u32,
     disallow_mask: u32,
     inheritance: u32,
+    access_mode: i32,
 ) -> Result<bool> {
     let (p_dacl, p_sd) = fetch_dacl_handle(path)?;
     let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
@@ -387,7 +405,7 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
         }
         entries.push(EXPLICIT_ACCESS_W {
             grfAccessPermissions: allow_mask,
-            grfAccessMode: 2, // SET_ACCESS
+            grfAccessMode: access_mode,
             grfInheritance: inheritance,
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
@@ -461,7 +479,177 @@ pub unsafe fn ensure_allow_mask_aces_with_inheritance(
         allow_mask,
         /*disallow_mask*/ 0,
         inheritance,
+        SET_ACCESS,
     )
+}
+
+/// Grant only the non-inheriting rights needed to inspect and pin an ancestor
+/// directory. Existing grants and deny ACEs remain intact; neither directory
+/// enumeration nor file-content access is granted.
+///
+/// # Safety
+/// Each SID pointer must remain valid for this call, and `path` must name an
+/// existing directory.
+pub unsafe fn ensure_directory_traversal_aces(path: &Path, sids: &[*mut c_void]) -> Result<bool> {
+    // MAXIMUM_ALLOWED would also request DELETE and conflict with ordinary
+    // directory readers that do not share deletion. Only ACL access is needed.
+    // Retain one no-follow handle for both the query and the update.
+    let handle = CreateFileW(
+        to_wide(path).as_ptr(),
+        READ_CONTROL | WRITE_DAC,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        std::ptr::null_mut(),
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        std::ptr::null_mut(),
+    );
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("opening traversal ACL for {}", path.display()));
+    }
+    let mut descriptor: *mut c_void = std::ptr::null_mut();
+    let mut replacement: *mut ACL = std::ptr::null_mut();
+    let result = (|| -> Result<bool> {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetSecurityInfo(
+            handle,
+            1, // SE_FILE_OBJECT
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(code as i32))
+                .with_context(|| format!("reading traversal ACL for {}", path.display()));
+        }
+        // A null DACL already grants all access. Replacing it with a narrow
+        // traversal DACL would revoke existing access rather than add rights.
+        if dacl.is_null() {
+            return Ok(false);
+        }
+        // CreateFileW requires SYNCHRONIZE as well as the explicitly requested
+        // attribute/traverse rights, including for a no-follow directory handle.
+        let allow_mask = FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE;
+        let entries: Vec<EXPLICIT_ACCESS_W> = sids
+            .iter()
+            .filter(|sid| !dacl_mask_allows(dacl, &[**sid], allow_mask, true))
+            .map(|sid| EXPLICIT_ACCESS_W {
+                grfAccessPermissions: allow_mask,
+                grfAccessMode: GRANT_ACCESS,
+                grfInheritance: 0,
+                Trustee: TRUSTEE_W {
+                    pMultipleTrustee: std::ptr::null_mut(),
+                    MultipleTrusteeOperation: 0,
+                    TrusteeForm: TRUSTEE_IS_SID,
+                    TrusteeType: TRUSTEE_IS_UNKNOWN,
+                    ptstrName: *sid as *mut u16,
+                },
+            })
+            .collect();
+        if entries.is_empty() {
+            return Ok(false);
+        }
+        // Build only the new ACEs. GRANT_ACCESS against the old DACL would merge
+        // same-SID grants; insert separate ACEs instead to preserve every old ACE.
+        let code = SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            std::ptr::null_mut(),
+            &mut replacement,
+        );
+        if code != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(code as i32))
+                .with_context(|| format!("merging traversal ACL for {}", path.display()));
+        }
+        let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+        if GetAclInformation(
+            replacement,
+            std::ptr::addr_of_mut!(info).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let additions_size = info.AclBytesInUse as usize - std::mem::size_of::<ACL>();
+        let size = usize::from((*dacl).AclSize) + additions_size;
+        let acl_size = u16::try_from(size).context("traversal ACL exceeds native size limit")?;
+        let mut storage = vec![0_u32; size.div_ceil(std::mem::size_of::<u32>())];
+        let combined = storage.as_mut_ptr().cast::<ACL>();
+        std::ptr::copy_nonoverlapping(
+            dacl.cast::<u8>(),
+            combined.cast::<u8>(),
+            usize::from((*dacl).AclSize),
+        );
+        (*combined).AclSize = acl_size;
+        let mut insertion = u32::from((*dacl).AceCount);
+        for index in 0..insertion {
+            let mut ace = std::ptr::null_mut();
+            if GetAce(dacl, index, &mut ace) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if (*ace.cast::<ACE_HEADER>()).AceFlags & INHERITED_ACE != 0 {
+                insertion = index;
+                break;
+            }
+        }
+        if AddAce(
+            combined,
+            u32::from((*dacl).AclRevision),
+            insertion,
+            replacement
+                .cast::<u8>()
+                .add(std::mem::size_of::<ACL>())
+                .cast(),
+            additions_size as u32,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let mut control = 0;
+        let mut revision = 0;
+        let mut update: SECURITY_DESCRIPTOR = std::mem::zeroed();
+        let update_ptr = std::ptr::addr_of_mut!(update).cast();
+        if GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) == 0
+            || InitializeSecurityDescriptor(update_ptr, revision) == 0
+            || SetSecurityDescriptorDacl(update_ptr, 1, combined, 0) == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // The general filesystem APIs propagate even unchanged inheritable ACEs
+        // to existing children. This narrowly additive operation deliberately
+        // uses the legacy handle setter instead, despite its general filesystem
+        // guidance. Preserve protection and auto-inheritance: the legacy setter
+        // requires both AUTO_INHERIT_REQ and AUTO_INHERITED to retain the latter.
+        // No inheritable ACE is added, removed, or modified here.
+        let inheritance_control =
+            SE_DACL_PROTECTED | SE_DACL_AUTO_INHERIT_REQ | SE_DACL_AUTO_INHERITED;
+        let requested_control = (control & inheritance_control)
+            | if control & SE_DACL_AUTO_INHERITED != 0 {
+                SE_DACL_AUTO_INHERIT_REQ
+            } else {
+                0
+            };
+        if SetSecurityDescriptorControl(update_ptr, inheritance_control, requested_control) == 0
+            || SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, update_ptr) == 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("setting traversal ACL for {}", path.display()));
+        }
+        Ok(true)
+    })();
+    if !replacement.is_null() {
+        LocalFree(replacement as HLOCAL);
+    }
+    if !descriptor.is_null() {
+        LocalFree(descriptor as HLOCAL);
+    }
+    CloseHandle(handle);
+    result
 }
 
 /// Ensure all provided SIDs have an allow ACE with the requested mask on the path.
@@ -494,6 +682,7 @@ pub unsafe fn ensure_allow_write_aces(path: &Path, sids: &[*mut c_void]) -> Resu
         WRITE_ALLOW_MASK,
         FILE_DELETE_CHILD,
         CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+        SET_ACCESS,
     )
 }
 
@@ -805,8 +994,13 @@ mod tests {
                 }
                 assert!(narrowed);
                 let code = SetNamedSecurityInfoW(
-                    to_wide(&path).as_ptr().cast_mut(), 1, DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(), std::ptr::null_mut(), dacl, std::ptr::null_mut(),
+                    to_wide(&path).as_ptr().cast_mut(),
+                    1,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    dacl,
+                    std::ptr::null_mut(),
                 );
                 LocalFree(descriptor);
                 assert_eq!(code, ERROR_SUCCESS);
@@ -822,7 +1016,10 @@ mod tests {
                     assert_ne!(GetAce(dacl, index, &mut entry), 0);
                     let ace = &*entry.cast::<ACCESS_DENIED_ACE>();
                     if ace.Header.AceType == ACCESS_DENIED_ACE_TYPE
-                        && EqualSid(std::ptr::addr_of!(ace.SidStart).cast_mut().cast(), sid.as_ptr()) != 0
+                        && EqualSid(
+                            std::ptr::addr_of!(ace.SidStart).cast_mut().cast(),
+                            sid.as_ptr(),
+                        ) != 0
                     {
                         denied |= ace.Mask;
                     }
@@ -830,7 +1027,10 @@ mod tests {
                 LocalFree(descriptor);
                 let required = FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
                 assert_eq!(denied & required, required);
-                assert!(!add_deny_write_ace(&path, sid.as_ptr())?, "complete deny is idempotent");
+                assert!(
+                    !add_deny_write_ace(&path, sid.as_ptr())?,
+                    "complete deny is idempotent"
+                );
             }
             assert_eq!(std::fs::read(&path)?, b"preserved contents");
         }

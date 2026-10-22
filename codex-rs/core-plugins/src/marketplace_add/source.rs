@@ -330,7 +330,8 @@ mod tests {
                 Some("main"),
             ),
         ] {
-            let parsed = parse_marketplace_source(source, explicit_ref.map(str::to_string)).unwrap();
+            let parsed =
+                parse_marketplace_source(source, explicit_ref.map(str::to_string)).unwrap();
             assert_eq!(
                 parsed,
                 MarketplaceSource::Git {
@@ -368,11 +369,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
     #[test]
     fn file_url_source_is_rejected() {
         let err =
@@ -393,7 +389,10 @@ mod tests {
         let MarketplaceSource::Local { path } = source else {
             panic!("expected local path source");
         };
-        assert_eq!(path, std::env::current_dir().unwrap().canonicalize().unwrap());
+        assert_eq!(
+            path,
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -431,5 +430,4 @@ mod tests {
             "unexpected error: {err}"
         );
     }
-
 }

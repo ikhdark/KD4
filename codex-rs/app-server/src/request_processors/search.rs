@@ -22,17 +22,21 @@ use codex_app_server_protocol::FuzzyFileSearchSessionUpdateResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
 use tokio::sync::Mutex;
 
+/// Cancellation flags of in-flight fuzzy searches, keyed by connection and
+/// cancellation token.
+type PendingFuzzySearches = Arc<StdMutex<HashMap<(ConnectionId, String), Arc<AtomicBool>>>>;
+
 #[derive(Clone)]
 pub(crate) struct SearchRequestProcessor {
     outgoing: Arc<OutgoingMessageSender>,
-    pending_fuzzy_searches: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
+    pending_fuzzy_searches: PendingFuzzySearches,
     // Sessions are owned by the connection that started them, like fs watches.
     fuzzy_search_sessions: Arc<Mutex<HashMap<(ConnectionId, String), FuzzyFileSearchSession>>>,
 }
 
 struct PendingFuzzySearch {
-    searches: Arc<StdMutex<HashMap<String, Arc<AtomicBool>>>>,
-    token: Option<String>,
+    searches: PendingFuzzySearches,
+    token: Option<(ConnectionId, String)>,
     flag: Arc<AtomicBool>,
 }
 
@@ -65,6 +69,7 @@ impl SearchRequestProcessor {
 
     pub(crate) async fn fuzzy_file_search(
         &self,
+        connection_id: ConnectionId,
         params: FuzzyFileSearchParams,
     ) -> Result<FuzzyFileSearchResponse, JSONRPCErrorError> {
         let FuzzyFileSearchParams {
@@ -73,6 +78,7 @@ impl SearchRequestProcessor {
             cancellation_token,
         } = params;
 
+        let cancellation_token = cancellation_token.map(|token| (connection_id, token));
         let cancel_flag = match cancellation_token.clone() {
             Some(token) => {
                 let mut pending_fuzzy_searches = self
@@ -276,22 +282,36 @@ mod tests {
             roots: vec![directory.path().to_string_lossy().into_owned()],
             cancellation_token: Some("same-search".to_string()),
         };
-        let mut first = Box::pin(processor.fuzzy_file_search(params()));
+        let owner = ConnectionId(1);
+        let key = (owner, "same-search".to_string());
+        let mut first = Box::pin(processor.fuzzy_file_search(owner, params()));
         runtime.block_on(std::future::poll_fn(|cx| {
             assert!(first.as_mut().poll(cx).is_pending());
             Poll::Ready(())
         }));
-        let first_flag =
-            processor.pending_fuzzy_searches.lock().expect("registry")["same-search"].clone();
+        let first_flag = processor.pending_fuzzy_searches.lock().expect("registry")[&key].clone();
         assert!(!first_flag.load(Ordering::Relaxed));
 
-        let mut replacement = Box::pin(processor.fuzzy_file_search(params()));
+        let other_owner = ConnectionId(2);
+        let other_key = (other_owner, "same-search".to_string());
+        let mut independent = Box::pin(processor.fuzzy_file_search(other_owner, params()));
+        runtime.block_on(std::future::poll_fn(|cx| {
+            assert!(independent.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        let independent_flag =
+            processor.pending_fuzzy_searches.lock().expect("registry")[&other_key].clone();
+        assert!(
+            !first_flag.load(Ordering::Relaxed),
+            "another connection must not cancel this search"
+        );
+        let mut replacement = Box::pin(processor.fuzzy_file_search(owner, params()));
         runtime.block_on(std::future::poll_fn(|cx| {
             assert!(replacement.as_mut().poll(cx).is_pending());
             Poll::Ready(())
         }));
         let replacement_flag =
-            processor.pending_fuzzy_searches.lock().expect("registry")["same-search"].clone();
+            processor.pending_fuzzy_searches.lock().expect("registry")[&key].clone();
         assert!(first_flag.load(Ordering::Relaxed));
         assert!(!replacement_flag.load(Ordering::Relaxed));
 
@@ -299,11 +319,14 @@ mod tests {
         // request must not erase the replacement's cancellation registration.
         drop(first);
         assert!(Arc::ptr_eq(
-            &processor.pending_fuzzy_searches.lock().expect("registry")["same-search"],
+            &processor.pending_fuzzy_searches.lock().expect("registry")[&key],
             &replacement_flag,
         ));
         drop(replacement);
         assert!(replacement_flag.load(Ordering::Relaxed));
+        assert!(!independent_flag.load(Ordering::Relaxed));
+        drop(independent);
+        assert!(independent_flag.load(Ordering::Relaxed));
         assert!(
             processor
                 .pending_fuzzy_searches

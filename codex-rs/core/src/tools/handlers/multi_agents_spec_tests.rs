@@ -46,22 +46,36 @@ fn v1_structured_input_schemas_require_decodable_variant_payloads() {
         create_spawn_agent_tool_v1(SpawnAgentToolOptions::default()),
         create_send_input_tool_v1(),
     ] {
-        let ToolSpec::Namespace(namespace) = tool else { panic!("V1 namespace"); };
+        let ToolSpec::Namespace(namespace) = tool else {
+            panic!("V1 namespace");
+        };
         let ResponsesApiNamespaceTool::Function(function) = &namespace.tools[0];
         let schema = serde_json::to_value(&function.parameters).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for mut arguments in [
-            json!({}), json!({"items":[]}),
+            json!({}),
+            json!({"items":[]}),
             json!({"message":"task","items":[{"type":"text","text":"task"}]}),
         ] {
-            if function.name == "send_input" { arguments["target"] = json!("agent"); }
-            let message = arguments.get("message").map(|value| value.as_str().unwrap().to_string());
-            let items = arguments.get("items").map(|value| serde_json::from_value::<Vec<UserInput>>(value.clone()).unwrap());
+            if function.name == "send_input" {
+                arguments["target"] = json!("agent");
+            }
+            let message = arguments
+                .get("message")
+                .map(|value| value.as_str().unwrap().to_string());
+            let items = arguments
+                .get("items")
+                .map(|value| serde_json::from_value::<Vec<UserInput>>(value.clone()).unwrap());
             assert!(super::super::multi_agents_common::parse_collab_input(message, items).is_err());
-            assert!(!validator.is_valid(&arguments), "schema admits invalid input choice {arguments}");
+            assert!(
+                !validator.is_valid(&arguments),
+                "schema admits invalid input choice {arguments}"
+            );
         }
         let mut message = json!({"message":"task"});
-        if function.name == "send_input" { message["target"] = json!("agent"); }
+        if function.name == "send_input" {
+            message["target"] = json!("agent");
+        }
         assert!(validator.is_valid(&message));
         for item in [
             json!({"type":"text","text":"task"}),
@@ -73,22 +87,35 @@ fn v1_structured_input_schemas_require_decodable_variant_payloads() {
             json!({"type":"text","text":"task","name":"label"}),
         ] {
             let mut arguments = json!({"items":[item]});
-            if function.name == "send_input" { arguments["target"] = json!("agent"); }
+            if function.name == "send_input" {
+                arguments["target"] = json!("agent");
+            }
             assert!(validator.is_valid(&arguments), "{arguments}");
             let items: Vec<UserInput> = serde_json::from_value(arguments["items"].clone()).unwrap();
-            assert!(super::super::multi_agents_common::parse_collab_input(None, Some(items)).is_ok());
+            assert!(
+                super::super::multi_agents_common::parse_collab_input(None, Some(items)).is_ok()
+            );
         }
         for item in [
-            json!({}), json!({"text":"missing tag"}), json!({"type":"unknown"}),
-            json!({"type":"text"}), json!({"type":"text","text":42}),
-            json!({"type":"image"}), json!({"type":"local_image"}),
+            json!({}),
+            json!({"text":"missing tag"}),
+            json!({"type":"unknown"}),
+            json!({"type":"text"}),
+            json!({"type":"text","text":42}),
+            json!({"type":"image"}),
+            json!({"type":"local_image"}),
             json!({"type":"skill","path":"SKILL.md"}),
             json!({"type":"mention","name":"app"}),
         ] {
             assert!(serde_json::from_value::<UserInput>(item.clone()).is_err());
             let mut arguments = json!({"items":[item]});
-            if function.name == "send_input" { arguments["target"] = json!("agent"); }
-            assert!(!validator.is_valid(&arguments), "schema admits undecodable {arguments}");
+            if function.name == "send_input" {
+                arguments["target"] = json!("agent");
+            }
+            assert!(
+                !validator.is_valid(&arguments),
+                "schema admits undecodable {arguments}"
+            );
         }
     }
 }
@@ -118,7 +145,10 @@ fn spawn_agent_descriptions_require_report_reconciliation() {
             "record the evidence instead of making unnecessary edits",
             "Respect review-only/no-write scope and do not blindly implement recommendations",
         ] {
-            assert!(description.contains(required), "missing report policy: {required}");
+            assert!(
+                description.contains(required),
+                "missing report policy: {required}"
+            );
         }
     }
 }
@@ -197,7 +227,9 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         .expect("typed assignment properties");
     assert_eq!(
         assignment_properties["write_scope"].description.as_deref(),
-        Some("Intended repository write scopes; overlaps are advisory and require coordination. Use an empty array for read-only roles.")
+        Some(
+            "Intended repository write scopes; overlaps are advisory and require coordination. Use an empty array for read-only roles."
+        )
     );
     let relevant_handles = assignment_properties
         .get("relevant_handles")
@@ -216,8 +248,11 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
             .as_deref()
             .is_some_and(|description| {
                 description.contains("replaces the plaintext typed bootstrap message")
-                    && description.contains("worker needs non-empty write_scope and required_evidence")
-                    && description.contains("architect/explorer need non-empty read_scope and empty required_evidence")
+                    && description
+                        .contains("worker needs non-empty write_scope and required_evidence")
+                    && description.contains(
+                        "architect/explorer need non-empty read_scope and empty required_evidence",
+                    )
                     && description.contains("reviewer needs empty required_evidence")
                     && description.contains("verifier/integrator need non-empty required_evidence")
             })
@@ -250,7 +285,10 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
         parameters.required.as_ref(),
         Some(&vec!["task_name".to_string()])
     );
-    let output_schema = output_schema.expect("spawn_agent output schema").into_value()["oneOf"][0].clone();
+    let output_schema = output_schema
+        .expect("spawn_agent output schema")
+        .into_value()["oneOf"][0]
+        .clone();
     assert_eq!(
         output_schema["required"],
         json!(["assignment_id", "integration_plan", "nickname", "task_name"])
@@ -709,7 +747,9 @@ fn list_agents_tool_includes_path_prefix_and_agent_fields() {
         )
     );
     assert_eq!(
-        output_schema.expect("list_agents output schema").into_value()["properties"]["agents"]["items"]["required"],
+        output_schema
+            .expect("list_agents output schema")
+            .into_value()["properties"]["agents"]["items"]["required"],
         json!([
             "agent_name",
             "agent_status",
@@ -755,7 +795,10 @@ fn agent_status_schema_accepts_every_serialized_status() {
         json!({"completed": "done", "errored": "failed"}),
         json!({"completed_with_surface": {"last_agent_message": null}}),
     ] {
-        assert!(!validator.is_valid(&value), "schema accepts invalid status {value}");
+        assert!(
+            !validator.is_valid(&value),
+            "schema accepts invalid status {value}"
+        );
     }
 }
 
@@ -767,8 +810,10 @@ fn list_agents_tool_status_schema_includes_interrupted() {
     };
 
     assert_eq!(
-        output_schema.expect("list_agents output schema").into_value()["properties"]["agents"]["items"]["properties"]
-            ["agent_status"]["allOf"][0]["oneOf"][0]["enum"],
+        output_schema
+            .expect("list_agents output schema")
+            .into_value()["properties"]["agents"]["items"]["properties"]["agent_status"]["allOf"]
+            [0]["oneOf"][0]["enum"],
         json!([
             "pending_init",
             "running",
@@ -777,4 +822,59 @@ fn list_agents_tool_status_schema_includes_interrupted() {
             "not_found"
         ])
     );
+}
+#[test]
+fn v2_argument_groups_match_required_runtime_choices() {
+    let ToolSpec::Function(spawn) = create_spawn_agent_tool_v2(SpawnAgentToolOptions::default())
+    else {
+        panic!("spawn");
+    };
+    let schema = serde_json::to_value(&spawn.parameters).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let assignment = json!({
+        "objective":"inspect", "acceptance_criteria":[{"id":"read","text":"inspect file"}],
+        "read_scope":[{"path":"src","recursive":true}], "write_scope":[], "stop_condition":"report"
+    });
+    for (args, valid) in [
+        (json!({"task_name":"audit"}), false),
+        (json!({"task_name":"audit","message":"inspect"}), true),
+        (json!({"task_name":"audit","assignment":assignment}), false),
+        (
+            json!({"task_name":"audit","assignment":assignment,"agent_type":"explorer"}),
+            true,
+        ),
+        (
+            json!({"task_name":"audit","assignment":assignment,"message":"inspect"}),
+            false,
+        ),
+        (
+            json!({"task_name":"audit","assignment":assignment,"message":"inspect","agent_type":"explorer"}),
+            false,
+        ),
+    ] {
+        assert_eq!(validator.is_valid(&args), valid, "{args}");
+    }
+    let declaration = codex_code_mode::render_json_schema_to_typescript(&schema);
+    assert!(declaration.contains("message: unknown"), "{declaration}");
+    assert!(declaration.contains("assignment: unknown"), "{declaration}");
+
+    let ToolSpec::Function(send) = create_send_message_tool() else {
+        panic!("send");
+    };
+    let schema = serde_json::to_value(&send.parameters).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for (recipient, valid) in [
+        (json!({}), false),
+        (json!({"targets":[]}), false),
+        (json!({"target":"worker"}), true),
+        (json!({"task_name":"worker"}), true),
+        (json!({"target":"worker","task_name":"worker"}), true),
+        (json!({"targets":["worker","other"]}), true),
+        (json!({"target":"worker","targets":["worker"]}), false),
+        (json!({"task_name":"worker","targets":["worker"]}), false),
+    ] {
+        let mut args = recipient;
+        args["message"] = json!("status");
+        assert_eq!(validator.is_valid(&args), valid, "{args}");
+    }
 }

@@ -4,10 +4,10 @@ mod chatgpt_hosts;
 mod client;
 mod client_builder;
 mod custom_ca;
+mod dispatch;
 mod error;
 mod outbound_proxy;
 mod request;
-mod retry_after;
 mod route_aware_client_pool;
 mod route_aware_redirect;
 mod transport;
@@ -35,6 +35,11 @@ pub use crate::custom_ca::build_reqwest_client_for_subprocess_tests;
 pub use crate::custom_ca::build_reqwest_client_with_custom_ca;
 pub use crate::custom_ca::build_rustls_client_config_with_custom_ca;
 pub use crate::custom_ca::maybe_build_rustls_client_config_with_custom_ca;
+pub use crate::dispatch::RequestDispatchGuard;
+pub use crate::dispatch::admit_dispatch;
+pub use crate::dispatch::bind_dispatch_guard;
+pub use crate::dispatch::with_dispatch_guard;
+pub use crate::dispatch::with_request_dispatch_scope;
 pub use crate::error::StreamError;
 pub use crate::error::TransportError;
 pub use crate::outbound_proxy::BuildRouteAwareHttpClientError;
@@ -51,15 +56,32 @@ pub use crate::request::Request;
 pub use crate::request::RequestBody;
 pub use crate::request::RequestCompression;
 pub use crate::request::Response;
-pub use crate::retry_after::RetryAfter;
 pub use crate::route_aware_client_pool::RouteAwareClientPool;
 pub use crate::route_aware_client_pool::RouteAwareClientPoolError;
 pub use crate::route_aware_client_pool::RouteAwareRequestBuilder;
 pub use crate::route_aware_client_pool::RouteAwareRequestError;
 pub use crate::transport::ByteStream;
-pub use crate::transport::capture_transport_timing;
-pub use crate::transport::TransportTiming;
 pub use crate::transport::HttpTransport;
 pub use crate::transport::ReqwestTransport;
 pub use crate::transport::StreamResponse;
+pub use crate::transport::TransportTiming;
+pub use crate::transport::capture_transport_timing;
+pub use crate::transport::collect_response_body;
 pub use crate::transport::is_permanent_connection_error;
+pub use codex_network_types::RetryAfter;
+
+#[cfg(test)]
+mod network_type_compatibility_tests {
+    use super::RetryAfter;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarding_legacy_retry_advice_preserves_its_absolute_deadline() {
+        let original = RetryAfter::from_delay(Duration::from_secs(10)).unwrap();
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let forwarded: codex_network_types::RetryAfter = original;
+        let legacy: RetryAfter = forwarded;
+        assert_eq!(legacy.deadline(), original.deadline());
+        assert_eq!(legacy.remaining_delay(), Duration::from_secs(6));
+    }
+}

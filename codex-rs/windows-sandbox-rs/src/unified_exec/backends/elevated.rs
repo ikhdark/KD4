@@ -264,7 +264,10 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     let transport = spawn_runner_transport_task(sandbox_creds, request).await?;
     let (pipe_write, pipe_read) = transport.into_files();
 
-    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    // One queued caller-owned buffer, plus the current buffer being segmented.
+    // The protocol itself admits only 128 KiB of outstanding raw stdin, not an
+    // unbounded stream of base64 frames. Caller buffer sizes remain caller-owned.
+    let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(1);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let stderr_rx = if tty {
         None
@@ -300,6 +303,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
         stdout_tx,
         stderr_rx.as_ref().map(|(tx, _rx)| tx.clone()),
         exit_tx,
+        Some(outbound_tx.clone()),
     );
 
     Ok(finish_driver_spawn(

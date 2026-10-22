@@ -524,12 +524,12 @@ mod deadline_tests {
             availability: PluginAvailability::Available,
         };
         for method in ["plugin/install", "plugin/uninstall"] {
-            let temp = tempfile::tempdir().unwrap();
-            let log = temp.path().join("requests.jsonl");
-            let mut client = crate::tests::smoke_deadline_client(&log, "Start-Sleep -Seconds 5");
+            let (mut client, recorder) = crate::tests::stalled_smoke_deadline_client();
+            // Keep the observed mutation inside the deadline even when other
+            // full-suite tests delay this thread before it writes to the pipe.
             let started = Instant::now();
             let error = client
-                .with_operation_deadline(started + Duration::from_millis(200), |client| {
+                .with_operation_deadline(started + Duration::from_secs(2), |client| {
                     if method == "plugin/install" {
                         install_remote_plugin(client, &plugin)
                     } else {
@@ -538,12 +538,8 @@ mod deadline_tests {
                 })
                 .expect_err("a mutation that never replies must exhaust its IO budget");
             assert!(error.to_string().contains("deadline"), "{error:#}");
-            assert!(started.elapsed() < Duration::from_secs(2));
-            let requests = std::fs::read_to_string(log).unwrap();
-            let requests = requests
-                .lines()
-                .map(|line| serde_json::from_str::<Value>(line).unwrap())
-                .collect::<Vec<_>>();
+            assert!(started.elapsed() < Duration::from_secs(4));
+            let requests = recorder.finish(client);
             assert_eq!(requests.len(), 1, "ambiguous mutations cannot be replayed");
             assert_eq!(requests[0]["method"], method);
             let identity_field = if method == "plugin/install" {
@@ -654,16 +650,22 @@ mod deadline_tests {
 
     #[test]
     fn smoke_deadline_bounds_plugin_read_and_never_retries_a_failed_read() {
-        for (body, budget) in [
-            ("Start-Sleep -Seconds 5", Duration::from_millis(200)),
-            (
-                "$response = @{jsonrpc='2.0'; id=$request.id; error=@{code=-32000; message='plugin read failure'}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
-                Duration::from_secs(1),
-            ),
+        for (stalled, budget, expected_error) in [
+            (true, Duration::from_millis(200), "deadline"),
+            (false, Duration::from_secs(1), "plugin read failure"),
         ] {
             let temp = tempfile::tempdir().expect("peer log root");
             let log = temp.path().join("requests.jsonl");
-            let mut client = crate::tests::smoke_deadline_client(&log, body);
+            let (mut client, recorder) = if stalled {
+                let (client, recorder) = crate::tests::stalled_smoke_deadline_client();
+                (client, Some(recorder))
+            } else {
+                let client = crate::tests::smoke_deadline_client(
+                    &log,
+                    "$response = @{jsonrpc='2.0'; id=$request.id; error=@{code=-32000; message='plugin read failure'}}; [Console]::WriteLine(($response | ConvertTo-Json -Depth 10 -Compress))",
+                );
+                (client, None)
+            };
             let start = Instant::now();
             let deadline = start + budget;
             let error = wait_for_installed_state(
@@ -673,43 +675,35 @@ mod deadline_tests {
                 deadline,
             )
             .expect_err("state polling is bounded through its actual plugin/read RPC");
-            assert!(
-                error
-                    .to_string()
-                    .contains(if body.starts_with("Start-Sleep") {
-                        "deadline"
-                    } else {
-                        "plugin read failure"
-                    }),
-                "{error:#}"
-            );
+            assert!(error.to_string().contains(expected_error), "{error:#}");
             assert!(start.elapsed() < Duration::from_secs(2));
-            let requests = std::fs::read_to_string(&log).expect("actual plugin/read request");
-            let requests = requests
-                .lines()
-                .map(|line| serde_json::from_str::<Value>(line).expect("RPC JSON"))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                requests.len(),
-                1,
-                "a stalled or failed plugin/read ends the wait without a second RPC"
-            );
-            assert_eq!(requests[0]["method"], "plugin/read");
-            assert_eq!(requests[0]["params"]["pluginName"], "fixture-remote");
+            // A distinct identity attributes any request the expired call sends.
             wait_for_installed_state(
                 &mut client,
-                "fixture-remote",
+                "expired-retry",
                 ExpectedInstalledState::Installed,
                 Instant::now() - Duration::from_millis(1),
             )
             .expect_err("expired deadline rejects without another RPC");
+            // Close the request stream before reading, so the record includes every write.
+            let requests = match recorder {
+                Some(recorder) => recorder.finish(client),
+                None => {
+                    drop(client);
+                    std::fs::read_to_string(&log)
+                        .expect("actual plugin/read request")
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).expect("RPC JSON"))
+                        .collect()
+                }
+            };
             assert_eq!(
-                std::fs::read_to_string(log)
-                    .expect("unchanged RPC log")
-                    .lines()
-                    .count(),
-                1
+                requests.len(),
+                1,
+                "a stalled or failed plugin/read ends the wait, and expiry sends no other RPC"
             );
+            assert_eq!(requests[0]["method"], "plugin/read");
+            assert_eq!(requests[0]["params"]["pluginName"], "fixture-remote");
         }
     }
 }

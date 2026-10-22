@@ -1315,7 +1315,10 @@ mod tests {
         expected.install_url = Some("https://chatgpt.com/apps/calendar/calendar".to_string());
         assert_eq!(connectors, vec![expected.clone()]);
         clear_directory_memory_cache();
-        assert_eq!(cached_directory_connectors(&context), Some(vec![expected.clone()]));
+        assert_eq!(
+            cached_directory_connectors(&context),
+            Some(vec![expected.clone()])
+        );
 
         // Older cache files may predate canonical IDs. Reject them rather than
         // resurrecting invalid IDs without the directory merge metadata.
@@ -1325,7 +1328,10 @@ mod tests {
             directory_cache::write_cached_directory_connectors_to_disk(&context, &[legacy]);
             clear_directory_memory_cache();
             assert_eq!(cached_directory_connectors(&context), None);
-            assert!(context.cache_path().exists(), "invalid caches are not deleted");
+            assert!(
+                context.cache_path().exists(),
+                "invalid caches are not deleted"
+            );
         }
         Ok(())
     }
@@ -1410,7 +1416,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(first.unwrap_err().to_string(), "transient workspace failure");
+        assert_eq!(
+            first.unwrap_err().to_string(),
+            "transient workspace failure"
+        );
 
         let second_workspace_calls = Arc::clone(&workspace_calls);
         let second = list_all_connectors_with_options(
@@ -1478,7 +1487,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(refresh.unwrap_err().to_string(), "transient workspace failure");
+        assert_eq!(
+            refresh.unwrap_err().to_string(),
+            "transient workspace failure"
+        );
 
         let cached = list_all_connectors_with_options(
             cache_context,
@@ -1586,7 +1598,10 @@ mod tests {
                 "connectors": [],
             }))?,
         )?;
-        assert_eq!(cached_directory_connectors(&cache_context), Some(Vec::new()));
+        assert_eq!(
+            cached_directory_connectors(&cache_context),
+            Some(Vec::new())
+        );
         Ok(())
     }
 

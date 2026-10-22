@@ -33,12 +33,23 @@ fn cached_state_consumes_the_stable_rendering() {
     );
     let mut world_state = WorldState::default();
     world_state.add_section(state);
+    let messages = render_fragments(world_state.render_full());
+    assert_eq!(messages.len(), 2);
     assert_eq!(
-        render_fragments(world_state.render_full()),
-        vec![user_message(
+        messages[0],
+        user_message(
             "# AGENTS.md instructions\n\n<INSTRUCTIONS>\ndistinct supplied rendering\n</INSTRUCTIONS>"
-        )]
+        )
     );
+    let ResponseItem::Message { role, content, .. } = &messages[1] else {
+        panic!("observation message")
+    };
+    assert_eq!(role, "developer");
+    let ContentItem::InputText { text } = &content[0] else {
+        panic!("observation text")
+    };
+    assert!(text.contains("freshness: cached_may_be_stale"));
+    assert!(text.starts_with("<repository_observation>"));
 }
 
 #[test]
@@ -261,7 +272,7 @@ fn freshness_notice_alone_does_not_prove_instruction_body_retention() {
             .is_empty()
     );
     let restored = cached.render_history_diff(Some(&accepted), &notice);
-    assert_eq!(restored.len(), 1);
+    assert_eq!(restored.len(), 2);
     assert!(restored[0].render().contains("binding instruction"));
 }
 
@@ -520,6 +531,264 @@ fn survivability_unavailable_observation_does_not_revoke_saved_instructions() {
         .with_unavailable_fallback(|| panic!("successful observation must not consult fallback"));
     assert!(verified_empty.snapshot().text.is_none());
     let current = AgentsMdState::new_cached(Some(&loaded), None, AgentsMdFreshness::CachedFallback)
-        .with_unavailable_fallback(|| panic!("existing body must not consult fallback"));
+        .with_unavailable_fallback(|| None);
     assert!(current.snapshot().text.is_some());
+}
+#[test]
+fn audit_instruction_authority_incomplete_nonempty_and_legacy_recovery() {
+    let old = LoadedAgentsMd::from_text_for_testing("Never edit protected.txt.");
+    let saved = serde_json::to_value(AgentsMdState::new(Some(&old)).snapshot()).unwrap();
+    let global = LoadedAgentsMd::from_text_for_testing("Current global correction.");
+    let mut previous = saved;
+    let mut first = None;
+    for _ in 0..3 {
+        let state =
+            AgentsMdState::new_cached(Some(&global), None, AgentsMdFreshness::IncompleteRead)
+                .with_unavailable_fallback(|| Some(previous));
+        let fragments = WorldStateSection::render_fragments(&state, PreviousSectionState::Absent);
+        assert_eq!(fragments[0].role(), "user");
+        assert_eq!(fragments[1].role(), "developer");
+        let text = fragments[0].render();
+        assert!(
+            fragments[1]
+                .render()
+                .contains("freshness: cached_may_be_stale")
+        );
+        assert!(text.contains("Never edit protected.txt."));
+        assert!(text.contains("Current global correction."));
+        if let Some(first) = &first {
+            assert_eq!(&text, first);
+        } else {
+            first = Some(text);
+        }
+        previous = serde_json::to_value(state.snapshot()).unwrap();
+    }
+    let direct = AgentsMdState::new_cached(Some(&global), None, AgentsMdFreshness::IncompleteRead);
+    let fragments = WorldStateSection::render_fragments(&direct, PreviousSectionState::Absent);
+    assert_eq!(fragments[1].role(), "developer");
+    assert!(fragments[1].render().contains("freshness: incomplete_read"));
+}
+
+#[test]
+fn every_unverified_body_delivery_has_a_following_developer_observation() {
+    let old = LoadedAgentsMd::from_text_for_testing("old rule");
+    let mut previous = WorldState::default();
+    previous.add_section(AgentsMdState::new(Some(&old)));
+    for freshness in [
+        AgentsMdFreshness::IncompleteRead,
+        AgentsMdFreshness::CachedFallback,
+    ] {
+        let current = LoadedAgentsMd::from_text_for_testing("current binding rule");
+        let mut world = WorldState::default();
+        world.add_section(AgentsMdState::new_cached(Some(&current), None, freshness));
+        for (fragments, snapshot) in [
+            world.render_full_with_snapshot(),
+            world.render_diff_with_snapshot(&previous.snapshot()),
+        ] {
+            assert_eq!(fragments.len(), 2);
+            assert_eq!(fragments[0].role(), "user");
+            assert_eq!(fragments[1].role(), "developer");
+            assert!(fragments[0].render().contains("current binding rule"));
+            assert!(!fragments[1].render().contains("current binding rule"));
+            assert!(
+                fragments[1]
+                    .render()
+                    .contains(freshness.model_visible_description())
+            );
+            let retained = render_fragments(fragments);
+            assert!(
+                world
+                    .render_history_diff(Some(&snapshot), &retained)
+                    .is_empty()
+            );
+            // Losing the warning must not certify the retained body as current.
+            let replay = world.render_history_diff(Some(&snapshot), &retained[..1]);
+            assert!(replay.iter().any(|fragment| {
+                fragment.role() == "developer"
+                    && fragment
+                        .render()
+                        .contains(freshness.model_visible_description())
+            }));
+            let mut reversed = retained.clone();
+            reversed.reverse();
+            assert!(
+                !world
+                    .render_history_diff(Some(&snapshot), &reversed)
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_resume_preserves_plain_unversioned_rules_alongside_current_global_text() {
+    let saved = json!({"directory": "/original", "text": "Never modify protected.txt."});
+    let current = LoadedAgentsMd::from_text_for_testing("New global instructions.");
+    let state = AgentsMdState::new_cached(Some(&current), None, AgentsMdFreshness::IncompleteRead)
+        .with_unavailable_fallback(|| Some(saved));
+    let mut world = WorldState::default();
+    world.add_section(state);
+    let fragments = world.render_full();
+    assert!(
+        fragments[0]
+            .render()
+            .contains("Never modify protected.txt.")
+    );
+    assert!(fragments[0].render().contains("/original"));
+    assert!(fragments[0].render().contains("New global instructions"));
+    assert!(
+        fragments[0]
+            .render()
+            .contains("current host/global snapshot supersedes")
+    );
+    assert_eq!(fragments[1].role(), "developer");
+}
+
+#[test]
+fn alternating_partial_resume_preserves_legacy_scope_without_nesting_bodies() {
+    let mut saved = json!({
+        "directory": "/original",
+        "text": "Old global policy.\n\nNever modify protected.txt."
+    });
+    let current = LoadedAgentsMd::from_text_for_testing("Current global correction.");
+    let mut first_body = None;
+    for index in 0..100 {
+        let state = AgentsMdState::new_cached(
+            (index % 2 == 0).then_some(&current),
+            None,
+            AgentsMdFreshness::IncompleteRead,
+        )
+        .with_unavailable_fallback(|| Some(saved));
+        let mut world = WorldState::default();
+        world.add_section(state);
+        let (fragments, snapshot) = world.render_full_with_snapshot();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[0].role(), "user");
+        assert_eq!(fragments[1].role(), "developer");
+        let body = fragments[0].render();
+        assert_eq!(body.matches("Never modify protected.txt.").count(), 1);
+        assert!(body.contains("/original"));
+        assert!(
+            fragments[1]
+                .render()
+                .contains("current host/global snapshot supersedes")
+        );
+        if let Some(first) = &first_body {
+            assert_eq!(
+                &body, first,
+                "identical recovery must not nest rendered aggregates"
+            );
+        } else {
+            first_body = Some(body);
+        }
+        saved = snapshot.section("agents_md").unwrap().clone();
+    }
+}
+
+#[test]
+fn recovered_global_supersession_is_delivered_even_when_body_and_freshness_match() {
+    let accepted = AgentsMdState::from_instructions(
+        Some(UserInstructions {
+            directory: Some("/original".into()),
+            text: "Never modify protected.txt.".into(),
+        }),
+        AgentsMdFreshness::CachedFallback,
+    )
+    .snapshot();
+    let state = AgentsMdState::new_cached(None, None, AgentsMdFreshness::CachedFallback)
+        .with_unavailable_fallback(|| Some(serde_json::to_value(&accepted).unwrap()));
+    let fragments = state.render_fragments(PreviousSectionState::Known(&accepted));
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].role(), "developer");
+    assert!(
+        fragments[0]
+            .render()
+            .contains("current host/global snapshot supersedes")
+    );
+}
+
+#[test]
+fn empty_unavailable_observation_is_reintroduced_after_history_loss() {
+    let mut world = WorldState::default();
+    world.add_section(AgentsMdState::new_cached(
+        None,
+        None,
+        AgentsMdFreshness::IncompleteRead,
+    ));
+    let (fragments, snapshot) = world.render_full_with_snapshot();
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].role(), "developer");
+    let retained = render_fragments(fragments);
+    assert!(
+        world
+            .render_history_diff(Some(&snapshot), &retained)
+            .is_empty()
+    );
+    let replay = world.render_history_diff(Some(&snapshot), &[]);
+    assert_eq!(replay.len(), 1);
+    assert!(replay[0].render().contains("observation unavailable"));
+}
+
+#[test]
+fn body_and_observation_survive_role_merging_and_compaction_projection() {
+    let mut history = Vec::new();
+    for rule in ["old rule", "changed rule"] {
+        let loaded = LoadedAgentsMd::from_text_for_testing(rule);
+        let mut world = WorldState::default();
+        world.add_section(AgentsMdState::new_cached(
+            Some(&loaded),
+            None,
+            AgentsMdFreshness::CachedFallback,
+        ));
+        let (fragments, snapshot) = world.render_full_with_snapshot();
+        history.extend(crate::context_manager::updates::merge_contextual_fragments(
+            fragments,
+        ));
+        history = crate::stable_context::project_compaction_context(history.into());
+        assert_eq!(history.len(), 2);
+        let ResponseItem::Message {
+            role: body_role,
+            content: body,
+            ..
+        } = &history[0]
+        else {
+            panic!("body message")
+        };
+        let ResponseItem::Message {
+            role: observation_role,
+            content: observation,
+            ..
+        } = &history[1]
+        else {
+            panic!("observation message")
+        };
+        assert_eq!(body_role, "user");
+        assert_eq!(observation_role, "developer");
+        let ContentItem::InputText { text } = &body[0] else {
+            panic!("body text")
+        };
+        assert!(text.contains(rule));
+        let ContentItem::InputText { text } = &observation[0] else {
+            panic!("observation text")
+        };
+        assert!(text.contains("freshness: cached_may_be_stale"));
+        assert!(
+            world
+                .render_history_diff(Some(&snapshot), &history)
+                .is_empty()
+        );
+    }
+    let mut refreshed = WorldState::default();
+    refreshed.add_section(AgentsMdState::new(Some(
+        &LoadedAgentsMd::from_text_for_testing("fresh rule"),
+    )));
+    history.extend(crate::context_manager::updates::merge_contextual_fragments(
+        refreshed.render_full(),
+    ));
+    let projected = crate::stable_context::project_compaction_context(history.into());
+    assert_eq!(
+        projected.len(),
+        1,
+        "a fresh replacement retires the old cached observation"
+    );
 }

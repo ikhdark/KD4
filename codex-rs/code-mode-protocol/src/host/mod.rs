@@ -31,8 +31,8 @@ pub use payload::WireExecuteRequest;
 pub use payload::WireImageDetail;
 pub use payload::WireNestedToolCall;
 pub use payload::WireRuntimeResponse;
-pub use payload::WireToolDefinition;
 pub use payload::WireToolCatalog;
+pub use payload::WireToolDefinition;
 pub use payload::WireToolKind;
 pub use payload::WireToolName;
 pub use payload::WireWaitOutcome;
@@ -56,6 +56,11 @@ pub const MAX_PENDING_DELEGATE_REQUESTS: usize = 256;
 pub const TOOL_CATALOG_CAPABILITY: &str = "tool-catalog-v1";
 pub const NAMED_STATE_CAPABILITY: &str = "named-state-v1";
 pub const RECEIPT_RECOVERY_CAPABILITY: &str = "terminal-receipt-recovery-v1";
+
+/// A close observation expired while storage remains owned. Unlike a terminal
+/// host error, this response permits observing the same session's close again.
+pub const SESSION_SHUTDOWN_PENDING: &str =
+    "code-mode session shutdown pending; storage remains owned";
 
 #[cfg(test)]
 #[path = "host_tests.rs"]

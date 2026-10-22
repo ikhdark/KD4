@@ -41,6 +41,124 @@ def wait_until(predicate, timeout: float = 3.0) -> None:
         time.sleep(0.005)
 
 
+LOGIN_PEER = r"""
+import json, sys, uuid
+active = set()
+def send(value): print(json.dumps(value), flush=True)
+def completed(login_id, success):
+    send({"method":"account/login/completed", "params":{
+        "loginId":login_id, "success":success, "error":None if success else "Canceled"}})
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request: continue
+    method, params = request["method"], request.get("params") or {}
+    if method == "initialize": result = {"userAgent":"login-fixture/1.0"}
+    elif method == "account/login/start":
+        login_id = str(uuid.uuid4()); active.add(login_id)
+        if params.get("type") == "chatgptDeviceCode":
+            result = {"type":"chatgptDeviceCode", "loginId":login_id,
+                      "verificationUrl":"https://example.invalid", "userCode":"CODE"}
+        else: result = {"type":"chatgpt", "loginId":login_id, "authUrl":"https://example.invalid"}
+    elif method == "account/login/cancel":
+        result = {"status":"canceled" if params["loginId"] in active else "notFound"}
+        active.discard(params["loginId"])
+    elif method == "fixture/finish":
+        active.discard(params["loginId"])
+        completed(params["loginId"], params.get("success", True)); result = {}
+    else: result = {}
+    send({"id":request["id"], "result":result})
+    if method == "account/login/cancel" and result["status"] == "canceled":
+        completed(params["loginId"], False)
+    if method == "fixture/finish" and params.get("eof"): break
+"""
+
+
+@pytest.mark.parametrize("device", [False, True])
+def test_cancel_without_wait_releases_live_login_routes(device) -> None:
+    with Codex(config(LOGIN_PEER, max_notification_routes=2)) as codex:
+        for _ in range(6):
+            handle = codex.login_chatgpt_device_code() if device else codex.login_chatgpt()
+            assert handle.cancel().status.value == "canceled"
+        router = codex._client._router
+        assert not router._login_notifications
+        assert not router._pending_login_notifications
+        assert len(router._recent_cancelled_logins) <= 2
+        completion = handle.wait()
+        assert completion.login_id == handle.login_id and not completion.success
+
+
+@pytest.mark.parametrize("success", [False, True])
+def test_actual_login_completion_survives_acknowledged_eof(success) -> None:
+    with Codex(config(LOGIN_PEER)) as codex:
+        handle = codex.login_chatgpt()
+        codex._client._request_raw(
+            "fixture/finish",
+            {
+                "loginId": handle.login_id,
+                "success": success,
+                "eof": True,
+            },
+        )
+        codex._client._reader_thread.join(2)
+        assert not codex._client._reader_thread.is_alive()
+        completion = handle.wait()
+        assert completion.login_id == handle.login_id
+        assert completion.success is success
+        assert codex._client._router._budget.items == 0
+        with pytest.raises(TransportClosedError):
+            codex._client._request_raw("new/request", {})
+
+
+def test_cancel_not_found_does_not_replace_admitted_success() -> None:
+    with Codex(config(LOGIN_PEER)) as codex:
+        handle = codex.login_chatgpt()
+        codex._client._request_raw("fixture/finish", {"loginId": handle.login_id})
+        assert handle.cancel().status.value == "notFound"
+        assert handle.wait().success
+
+
+@pytest.mark.parametrize("code", [0, 7])
+def test_root_exit_is_not_an_rpc_timeout_when_a_descendant_holds_stdout(code, tmp_path) -> None:
+    release = tmp_path / "release-holder"
+    holder = (
+        "import time; from pathlib import Path; deadline=time.monotonic()+30\n"
+        f"while not Path({str(release)!r}).exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+    )
+    script = f"""
+import subprocess,sys
+sys.stdin.readline()
+subprocess.Popen([sys.executable, '-c', {holder!r}],
+                 stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr)
+sys.exit({code})
+"""
+    client = CodexClient(config(script, operation_timeout_s=5, shutdown_timeout_s=0.1))
+    try:
+        client.start()
+        with pytest.raises(TransportClosedError, match=f"exited with code {code}.*incomplete"):
+            client._request_raw("fixture/no-response")
+        assert client._proc.poll() == code
+        # Do not drop blocked read ownership or admit a new generation over it.
+        client.close()
+        with pytest.raises(TransportClosedError, match="workers have not stopped"):
+            client.start()
+    finally:
+        release.touch()
+        client.close()
+        for thread in (client._reader_thread, client._stderr_thread, client._exit_thread):
+            if thread is not None:
+                thread.join(3)
+                assert not thread.is_alive()
+
+
+def test_disposed_login_late_notification_does_not_recreate_a_route() -> None:
+    router = MessageRouter(max_routes=1)
+    router.register_login("discarded")
+    router.unregister_login("discarded")
+    router.route_notification(event("account/login/completed", loginId="discarded"))
+    assert not router._pending_login_notifications
+    assert router._budget.items == 0
+
+
 @pytest.mark.parametrize("register_late", [False, True])
 def test_received_terminal_survives_transport_failure(register_late) -> None:
     router = MessageRouter(max_notifications=2)
@@ -292,6 +410,7 @@ def test_notification_budget_covers_all_routes_and_releases_on_failure(route) ->
         if route == "turn":
             router.register_turn("turn")
     elif route in {"login", "early-login"}:
+        router.begin_login_start()
         notification = event("account/login/completed", loginId="login")
         if route == "login":
             router.register_login("login")
@@ -323,6 +442,7 @@ def test_notification_bytes_are_bounded_and_consumption_releases_budget() -> Non
 def test_notification_item_budget_is_shared_across_routes() -> None:
     # Six independently usable routes still share one configured item limit.
     router = MessageRouter(max_notifications=6)
+    router.begin_login_start()
     router.register_turn("turn")
     router.register_login("login")
     goal = router.register_goal("thread")
@@ -368,6 +488,7 @@ def test_early_replay_transfers_budget_without_duplicate_charges() -> None:
 
 def test_login_registration_replays_before_concurrent_delivery() -> None:
     router = MessageRouter()
+    router.begin_login_start()
     first = event("account/login/completed", loginId="login", order=1)
     second = event("account/login/completed", loginId="login", order=2)
     router.route_notification(first)
@@ -534,7 +655,7 @@ def test_sync_initialization_preserves_failure_when_cleanup_also_fails(
         def start(self):
             calls.append("start")
 
-        def initialize(self):
+        def initialize(self, **kwargs):
             raise failure
 
         def close(self):

@@ -498,7 +498,11 @@ mod tests {
             ("[fe80::1%25lo0]", "fe80::1%lo0"),
         ] {
             assert_eq!(normalize_host(input), expected, "{input}");
-            assert_eq!(normalize_host(expected), expected, "normalization is idempotent");
+            assert_eq!(
+                normalize_host(expected),
+                expected,
+                "normalization is idempotent"
+            );
         }
     }
 }

@@ -12,10 +12,13 @@ export type {
   ThreadErrorEvent,
   Usage,
   SurfacedToolResult,
+  AcceptedFinalMessage,
+  TurnTiming,
 } from "./events";
 export type {
   ThreadItem,
   AgentMessageItem,
+  PlanItem,
   ReasoningItem,
   ContextCompactionItem,
   CommandExecutionItem,

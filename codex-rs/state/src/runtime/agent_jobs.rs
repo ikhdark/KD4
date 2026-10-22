@@ -76,6 +76,12 @@ impl StateRuntime {
         self.agent_job_runner_instance_id.as_str()
     }
 
+    pub async fn agent_job_runner_instance_is_live(&self, owner: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM agent_job_runner_instances WHERE runner_instance_id = ? AND heartbeat_at >= ?)")
+            .bind(owner).bind(Utc::now().timestamp().saturating_sub(AGENT_JOB_RUNNER_LEASE_TIMEOUT_SECONDS))
+            .fetch_one(self.pool.as_ref()).await? != 0)
+    }
+
     pub async fn create_agent_job(
         &self,
         params: &AgentJobCreateParams,
@@ -176,7 +182,10 @@ FROM agent_jobs AS jobs
 LEFT JOIN agent_job_runner_instances AS runners
     ON runners.runner_instance_id = jobs.runner_instance_id
 WHERE
-    jobs.status = ?
+    (jobs.status IN (?, ?) OR EXISTS (
+        SELECT 1 FROM agent_job_items AS items
+        WHERE items.job_id = jobs.id AND items.status = 'running'
+    ))
     AND jobs.runner_instance_id IS NOT NULL
     AND jobs.runner_instance_id <> ?
     AND (runners.runner_instance_id IS NULL OR runners.heartbeat_at < ?)
@@ -184,6 +193,7 @@ ORDER BY jobs.created_at ASC, jobs.id ASC
             "#,
         )
         .bind(AgentJobStatus::Running.as_str())
+        .bind(AgentJobStatus::Pending.as_str())
         .bind(self.agent_job_runner_instance_id())
         .bind(stale_before)
         .fetch_all(&mut *tx)
@@ -203,10 +213,14 @@ ORDER BY jobs.created_at ASC, jobs.id ASC
             let updated = sqlx::query(
                 r#"
 UPDATE agent_jobs
-SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
+SET status = CASE WHEN status IN ('pending', 'running') THEN ? ELSE status END,
+    updated_at = ?, completed_at = COALESCE(completed_at, ?),
+    last_error = CASE WHEN status IN ('pending', 'running') THEN ? ELSE last_error END
 WHERE
     id = ?
-    AND status = ?
+    AND (status IN (?, ?) OR EXISTS (
+        SELECT 1 FROM agent_job_items WHERE job_id = agent_jobs.id AND status = 'running'
+    ))
     AND runner_instance_id = ?
     AND runner_instance_id <> ?
     AND NOT EXISTS (
@@ -222,6 +236,7 @@ WHERE
             .bind(Self::AGENT_JOB_RESTART_ERROR)
             .bind(job_id.as_str())
             .bind(AgentJobStatus::Running.as_str())
+            .bind(AgentJobStatus::Pending.as_str())
             .bind(owner_runner_instance_id.as_str())
             .bind(self.agent_job_runner_instance_id())
             .bind(owner_runner_instance_id.as_str())
@@ -240,7 +255,10 @@ SET
     updated_at = ?,
     completed_at = ?,
     last_error = ?
-WHERE job_id = ? AND status IN (?, ?)
+WHERE job_id = ? AND (status = ? OR (status = ? AND EXISTS (
+    SELECT 1 FROM agent_jobs WHERE id = agent_job_items.job_id AND status = 'failed'
+    AND last_error = ?
+)))
                 "#,
             )
             .bind(AgentJobItemStatus::Failed.as_str())
@@ -248,10 +266,13 @@ WHERE job_id = ? AND status IN (?, ?)
             .bind(now)
             .bind(Self::AGENT_JOB_RESTART_ERROR)
             .bind(job_id.as_str())
-            .bind(AgentJobItemStatus::Pending.as_str())
             .bind(AgentJobItemStatus::Running.as_str())
+            .bind(AgentJobItemStatus::Pending.as_str())
+            .bind(Self::AGENT_JOB_RESTART_ERROR)
             .execute(&mut *tx)
             .await?;
+            sqlx::query("INSERT INTO agent_job_recovery_exports (job_id) VALUES (?) ON CONFLICT(job_id) DO NOTHING")
+                .bind(&job_id).execute(&mut *tx).await?;
             job_ids.push(job_id);
         }
         tx.commit().await?;
@@ -266,6 +287,134 @@ WHERE job_id = ? AND status IN (?, ?)
             jobs.push(job);
         }
         Ok(jobs)
+    }
+
+    /// Claim a bounded batch. The token fences acknowledgment after cancellation,
+    /// restart or a lease takeover; failed exports are retried by the existing timer.
+    pub async fn claim_agent_job_recovery_exports(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let now = Utc::now().timestamp();
+        let token = uuid::Uuid::now_v7().to_string();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let ids = sqlx::query_scalar::<_, String>("SELECT job_id FROM agent_job_recovery_exports AS exports WHERE retry_at <= ? AND revision > published_revision AND EXISTS (SELECT 1 FROM agent_jobs WHERE id = exports.job_id AND status IN ('completed', 'failed', 'cancelled')) ORDER BY retry_at, job_id LIMIT 32")
+            .bind(now).fetch_all(&mut *tx).await?;
+        for id in &ids {
+            sqlx::query("UPDATE agent_job_recovery_exports SET claim_token = ?, claim_revision = revision, retry_at = ? WHERE job_id = ?")
+                .bind(&token).bind(now + 300).bind(id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(ids.into_iter().map(|id| (id, token.clone())).collect())
+    }
+
+    pub async fn finish_agent_job_recovery_export(
+        &self,
+        job_id: &str,
+        token: &str,
+        succeeded: bool,
+    ) -> anyhow::Result<()> {
+        if succeeded {
+            sqlx::query(
+                "UPDATE agent_job_recovery_exports SET published_revision = MAX(published_revision, claim_revision), claim_token = NULL, claim_revision = NULL, retry_at = 0 WHERE job_id = ? AND claim_token = ?",
+            )
+            .bind(job_id)
+            .bind(token)
+            .execute(self.pool.as_ref())
+            .await?;
+        } else {
+            sqlx::query("UPDATE agent_job_recovery_exports SET claim_token = NULL, retry_at = ? WHERE job_id = ? AND claim_token = ?")
+                .bind(Utc::now().timestamp() + 30).bind(job_id).bind(token).execute(self.pool.as_ref()).await?;
+        }
+        Ok(())
+    }
+
+    /// Call only while holding the destination publication lock. A read
+    /// transaction pairs the exact revision with the rows it describes.
+    pub async fn agent_job_export_snapshot(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<(i64, Vec<AgentJobItem>)> {
+        let mut tx = self.pool.begin().await?;
+        let revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM agent_job_recovery_exports WHERE job_id = ?")
+                .bind(job_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .unwrap_or(0);
+        let rows = sqlx::query_as::<_, AgentJobItemRow>(
+            "SELECT * FROM agent_job_items WHERE job_id = ? ORDER BY row_index",
+        )
+        .bind(job_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((
+            revision,
+            rows.into_iter()
+                .map(AgentJobItem::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    pub async fn acknowledge_agent_job_export(
+        &self,
+        job_id: &str,
+        revision: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE agent_job_recovery_exports SET published_revision = MAX(published_revision, ?) WHERE job_id = ? AND revision >= ?")
+            .bind(revision).bind(job_id).bind(revision).execute(self.pool.as_ref()).await?;
+        Ok(())
+    }
+
+    pub async fn agent_job_export_is_published(&self, job_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM agent_job_recovery_exports WHERE job_id = ? AND revision = published_revision)")
+            .bind(job_id).fetch_one(self.pool.as_ref()).await? != 0)
+    }
+
+    pub async fn agent_job_is_owned_running(&self, job_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM agent_jobs WHERE id = ? AND status = 'running' AND runner_instance_id = ?)")
+            .bind(job_id).bind(self.agent_job_runner_instance_id()).fetch_one(self.pool.as_ref()).await? != 0)
+    }
+
+    pub async fn agent_job_is_owned(&self, job_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM agent_jobs WHERE id = ? AND runner_instance_id = ?)",
+        )
+        .bind(job_id)
+        .bind(self.agent_job_runner_instance_id())
+        .fetch_one(self.pool.as_ref())
+        .await?
+            != 0)
+    }
+
+    pub async fn agent_job_has_unfinished_items(&self, job_id: &str) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT EXISTS(SELECT 1 FROM agent_job_items WHERE job_id = ? AND status IN ('pending', 'running'))")
+            .bind(job_id).fetch_one(self.pool.as_ref()).await? != 0)
+    }
+
+    /// Worker-event authority is narrower than job-wide administrative failure.
+    /// `None` fences a malformed legacy row with no assigned worker.
+    pub async fn settle_agent_job_item_for_thread(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        thread_id: Option<&str>,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query("UPDATE agent_job_items SET status = CASE WHEN result_json IS NOT NULL THEN 'completed' ELSE 'failed' END, completed_at = ?, updated_at = ?, last_error = CASE WHEN result_json IS NOT NULL THEN NULL ELSE ? END, assigned_thread_id = NULL WHERE job_id = ? AND item_id = ? AND status = 'running' AND assigned_thread_id IS ?")
+            .bind(now).bind(now).bind(reason).bind(job_id).bind(item_id).bind(thread_id).execute(self.pool.as_ref()).await?;
+        if result.rows_affected() > 0 {
+            self.notify_agent_job_change();
+        }
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_agent_job_attempts(
+        &self,
+        job_id: &str,
+        item_id: &str,
+    ) -> anyhow::Result<Vec<(i64, String)>> {
+        Ok(sqlx::query_as("SELECT attempt_count, thread_id FROM agent_job_attempts WHERE job_id = ? AND item_id = ? ORDER BY attempt_count")
+            .bind(job_id).bind(item_id).fetch_all(self.pool.as_ref()).await?)
     }
 
     pub async fn get_agent_job(&self, job_id: &str) -> anyhow::Result<Option<AgentJob>> {
@@ -834,7 +983,8 @@ WHERE
     }
 
     fn notify_agent_job_change(&self) {
-        self.agent_job_updates.send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.agent_job_updates
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     pub async fn get_agent_job_progress(&self, job_id: &str) -> anyhow::Result<AgentJobProgress> {
@@ -886,7 +1036,7 @@ mod tests {
     ) -> anyhow::Result<(String, String, String)> {
         let job_id = "job-1".to_string();
         let item_id = "item-1".to_string();
-        let thread_id = "thread-1".to_string();
+        let thread_id = ThreadId::new().to_string();
         runtime
             .create_agent_job(
                 &AgentJobCreateParams {
@@ -918,6 +1068,198 @@ mod tests {
             .await?;
         assert!(marked_running);
         Ok((job_id, item_id, thread_id))
+    }
+
+    #[tokio::test]
+    async fn deletion_replacement_fences_old_settlement_and_retains_attempts() -> anyhow::Result<()>
+    {
+        let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".into()).await?;
+        let (job, item, old) = create_running_single_item_job(&runtime).await?;
+        assert!(runtime.agent_job_has_unfinished_items(&job).await?);
+        runtime.delete_thread(ThreadId::from_string(&old)?).await?;
+        assert!(runtime.agent_job_has_unfinished_items(&job).await?);
+        assert_eq!(
+            runtime
+                .get_agent_job_item(&job, &item)
+                .await?
+                .unwrap()
+                .status,
+            AgentJobItemStatus::Pending
+        );
+        let replacement = ThreadId::new().to_string();
+        assert!(
+            runtime
+                .mark_agent_job_item_running_with_thread(&job, &item, &replacement)
+                .await?
+        );
+        let before = runtime.get_agent_job_item(&job, &item).await?;
+        assert!(
+            !runtime
+                .settle_agent_job_item_for_thread(&job, &item, Some(&old), "stale timeout")
+                .await?
+        );
+        assert_eq!(runtime.get_agent_job_item(&job, &item).await?, before);
+        assert!(
+            !runtime
+                .report_agent_job_item_result(&job, &item, &old, &json!({"stale":true}))
+                .await?
+        );
+        assert!(
+            runtime
+                .report_agent_job_item_result(&job, &item, &replacement, &json!({"kept":true}))
+                .await?
+        );
+        assert!(
+            !runtime
+                .settle_agent_job_item_for_thread(&job, &item, Some(&replacement), "late cleanup")
+                .await?
+        );
+        assert_eq!(
+            runtime.list_agent_job_attempts(&job, &item).await?,
+            vec![(1, old), (2, replacement)]
+        );
+        assert!(!runtime.agent_job_has_unfinished_items(&job).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_settles_terminal_parent_workers_without_rewriting_outcomes()
+    -> anyhow::Result<()> {
+        for cancelled in [true, false] {
+            let home = unique_temp_dir();
+            let owner = StateRuntime::init(home.clone(), "test-provider".into()).await?;
+            let (job, item, _) = create_running_single_item_job(&owner).await?;
+            for (id, index) in [("never-started", 1_i64), ("accepted", 2)] {
+                sqlx::query("INSERT INTO agent_job_items (job_id,item_id,row_index,row_json,status,created_at,updated_at) VALUES (?,?,?,'{}','pending',0,0)")
+                    .bind(&job).bind(id).bind(index).execute(owner.pool.as_ref()).await?;
+            }
+            assert!(
+                owner
+                    .mark_agent_job_item_running_with_thread(&job, "accepted", "accepted-worker")
+                    .await?
+            );
+            assert!(
+                owner
+                    .report_agent_job_item_result(
+                        &job,
+                        "accepted",
+                        "accepted-worker",
+                        &json!({"kept":7})
+                    )
+                    .await?
+            );
+            let accepted = owner.get_agent_job_item(&job, "accepted").await?;
+            if cancelled {
+                owner
+                    .mark_agent_job_cancelled(&job, "original reason")
+                    .await?;
+            } else {
+                owner.mark_agent_job_failed(&job, "original reason").await?;
+            }
+            let observer = StateRuntime::init(home, "test-provider".into()).await?;
+            assert!(
+                observer
+                    .reconcile_orphaned_agent_jobs_after_restart()
+                    .await?
+                    .is_empty()
+            );
+            owner.close().await;
+            assert_eq!(
+                observer
+                    .reconcile_orphaned_agent_jobs_after_restart()
+                    .await?
+                    .len(),
+                1
+            );
+            let parent = observer.get_agent_job(&job).await?.unwrap();
+            assert_eq!(
+                parent.status,
+                if cancelled {
+                    AgentJobStatus::Cancelled
+                } else {
+                    AgentJobStatus::Failed
+                }
+            );
+            assert_eq!(parent.last_error.as_deref(), Some("original reason"));
+            assert_eq!(
+                observer.get_agent_job_item(&job, "accepted").await?,
+                accepted
+            );
+            assert_eq!(
+                observer
+                    .get_agent_job_item(&job, "never-started")
+                    .await?
+                    .unwrap()
+                    .status,
+                AgentJobItemStatus::Pending
+            );
+            assert_eq!(
+                observer
+                    .get_agent_job_item(&job, &item)
+                    .await?
+                    .unwrap()
+                    .status,
+                AgentJobItemStatus::Failed
+            );
+            assert!(
+                observer
+                    .reconcile_orphaned_agent_jobs_after_restart()
+                    .await?
+                    .is_empty()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publication_acknowledges_only_the_rendered_revision() -> anyhow::Result<()> {
+        let runtime = StateRuntime::init(unique_temp_dir(), "test-provider".into()).await?;
+        let (job, item, thread) = create_running_single_item_job(&runtime).await?;
+        assert!(runtime.agent_job_is_owned_running(&job).await?);
+        runtime.mark_agent_job_failed(&job, "owner stopped").await?;
+        assert!(!runtime.agent_job_is_owned_running(&job).await?);
+        let claims = runtime.claim_agent_job_recovery_exports().await?;
+        assert_eq!(claims.len(), 1);
+        let (revision, _) = runtime.agent_job_export_snapshot(&job).await?;
+        assert!(
+            runtime
+                .settle_agent_job_item_for_thread(&job, &item, Some(&thread), "stopped")
+                .await?
+        );
+        runtime.acknowledge_agent_job_export(&job, revision).await?;
+        runtime
+            .finish_agent_job_recovery_export(&job, &claims[0].1, true)
+            .await?;
+        let next = runtime.claim_agent_job_recovery_exports().await?;
+        assert_eq!(
+            next.len(),
+            1,
+            "a ledger update during render remains pending"
+        );
+        let (new_revision, rows) = runtime.agent_job_export_snapshot(&job).await?;
+        assert!(new_revision > revision);
+        assert_eq!(rows[0].status, AgentJobItemStatus::Failed);
+        runtime
+            .finish_agent_job_recovery_export(&job, &claims[0].1, true)
+            .await?;
+        let published: i64 = sqlx::query_scalar(
+            "SELECT published_revision FROM agent_job_recovery_exports WHERE job_id = ?",
+        )
+        .bind(&job)
+        .fetch_one(runtime.pool.as_ref())
+        .await?;
+        assert_eq!(
+            published, revision,
+            "a stale claim cannot acknowledge a newer snapshot"
+        );
+        runtime
+            .acknowledge_agent_job_export(&job, new_revision)
+            .await?;
+        runtime
+            .finish_agent_job_recovery_export(&job, &next[0].1, true)
+            .await?;
+        assert!(runtime.claim_agent_job_recovery_exports().await?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -987,6 +1329,107 @@ mod tests {
             0
         );
         runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn ma014_pending_restart_and_ma015_export_retry_are_durable() -> anyhow::Result<()> {
+        let home = unique_temp_dir();
+        let owner = StateRuntime::init(home.clone(), "test-provider".into()).await?;
+        owner
+            .create_agent_job(
+                &AgentJobCreateParams {
+                    id: "pending-recovery".into(),
+                    name: "pending".into(),
+                    instruction: "report".into(),
+                    auto_export: true,
+                    max_runtime_seconds: None,
+                    output_schema_json: None,
+                    input_headers: vec!["path".into()],
+                    input_csv_path: "in.csv".into(),
+                    output_csv_path: "out.csv".into(),
+                },
+                &[AgentJobItemCreateParams {
+                    item_id: "item".into(),
+                    row_index: 0,
+                    source_id: None,
+                    row_json: json!({"path":"src/lib.rs"}),
+                }],
+            )
+            .await?;
+        let observer = StateRuntime::init(home, "test-provider".into()).await?;
+        assert!(
+            observer
+                .reconcile_orphaned_agent_jobs_after_restart()
+                .await?
+                .is_empty(),
+            "live Pending owner is protected"
+        );
+        owner.close().await;
+        let jobs = observer
+            .reconcile_orphaned_agent_jobs_after_restart()
+            .await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, AgentJobStatus::Failed);
+        let item = observer
+            .get_agent_job_item("pending-recovery", "item")
+            .await?
+            .unwrap();
+        assert_eq!(item.status, AgentJobItemStatus::Failed);
+        assert_eq!(item.assigned_thread_id, None);
+        let first = observer.claim_agent_job_recovery_exports().await?;
+        assert_eq!(first.len(), 1);
+        assert!(
+            observer
+                .claim_agent_job_recovery_exports()
+                .await?
+                .is_empty(),
+            "active export claim is exclusive"
+        );
+        observer
+            .finish_agent_job_recovery_export(&first[0].0, &first[0].1, false)
+            .await?;
+        assert!(
+            observer
+                .claim_agent_job_recovery_exports()
+                .await?
+                .is_empty(),
+            "failed export is backoff-bound"
+        );
+        // Advance only the durable retry clock, not any worker/job state.
+        sqlx::query("UPDATE agent_job_recovery_exports SET retry_at = 0")
+            .execute(observer.pool.as_ref())
+            .await?;
+        let second = observer.claim_agent_job_recovery_exports().await?;
+        assert_eq!(second.len(), 1);
+        assert_ne!(first[0].1, second[0].1);
+        observer
+            .finish_agent_job_recovery_export(&first[0].0, &first[0].1, true)
+            .await?;
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_job_recovery_exports")
+            .fetch_one(observer.pool.as_ref())
+            .await?;
+        assert_eq!(
+            retained, 1,
+            "a stale exporter cannot acknowledge the successor claim"
+        );
+        observer
+            .finish_agent_job_recovery_export(&second[0].0, &second[0].1, true)
+            .await?;
+        assert!(
+            observer
+                .claim_agent_job_recovery_exports()
+                .await?
+                .is_empty()
+        );
+        assert_eq!(
+            observer
+                .get_agent_job("pending-recovery")
+                .await?
+                .unwrap()
+                .status,
+            AgentJobStatus::Failed
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1087,14 +1530,28 @@ mod tests {
             .await?
             .expect("running item");
         assert_eq!(before.status, AgentJobItemStatus::Running);
-        assert_eq!(before.assigned_thread_id.as_deref(), Some(thread_id.as_str()));
         assert_eq!(
-            runtime.get_agent_job(&job_id).await?.expect("running job").status,
+            before.assigned_thread_id.as_deref(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(
+            runtime
+                .get_agent_job(&job_id)
+                .await?
+                .expect("running job")
+                .status,
             AgentJobStatus::Running,
         );
-        assert!(!runtime
-            .report_agent_job_item_result(&job_id, &item_id, "wrong-thread", &json!({"wrong": true}))
-            .await?);
+        assert!(
+            !runtime
+                .report_agent_job_item_result(
+                    &job_id,
+                    &item_id,
+                    "wrong-thread",
+                    &json!({"wrong": true})
+                )
+                .await?
+        );
         assert_eq!(
             runtime.get_agent_job_item(&job_id, &item_id).await?,
             Some(before),

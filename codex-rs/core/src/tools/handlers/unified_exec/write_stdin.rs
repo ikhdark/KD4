@@ -83,6 +83,21 @@ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
     }
 }
 
+fn completed_process_output(
+    result: serde_json::Value,
+) -> Box<dyn crate::tools::context::ToolOutput> {
+    let success = result["success"].as_bool().unwrap_or(false);
+    let output = codex_tools::JsonToolOutput::with_success(result, Some(success));
+    if success {
+        boxed_tool_output(output)
+    } else {
+        boxed_tool_output(output.with_sampling_request_signal(serde_json::json!({
+            "outcome": "failure",
+            "failure": {"fingerprint": "unified_exec.completed_process_recovery"}
+        })))
+    }
+}
+
 impl WriteStdinHandler {
     async fn handle_call(
         &self,
@@ -123,7 +138,7 @@ impl WriteStdinHandler {
                 .completed_process_result(args.session_id, incarnation)
                 .await
         {
-            return Ok(boxed_tool_output(codex_tools::JsonToolOutput::new(result)));
+            return Ok(completed_process_output(result));
         }
         // Legacy numeric-only handles are readable history, not live authority.
         // IDs are not reused inside a manager; the creation token additionally
@@ -230,7 +245,7 @@ impl WriteStdinHandler {
                     .completed_process_result(process_id, incarnation)
                     .await
                 {
-                    return Ok(boxed_tool_output(codex_tools::JsonToolOutput::new(result)));
+                    return Ok(completed_process_output(result));
                 }
                 Err(crate::unified_exec::UnifiedExecError::UnknownProcessId { process_id })
             }

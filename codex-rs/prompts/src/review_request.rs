@@ -13,6 +13,7 @@ pub struct ResolvedReviewRequest {
     pub target: ReviewTarget,
     pub prompt: String,
     pub user_facing_hint: String,
+    pub source_scope: codex_git_utils::ReviewSourceScope,
 }
 
 const UNCOMMITTED_PROMPT: &str = "Review the current code changes (staged, unstaged, and untracked files) and provide prioritized findings. Run `git --no-optional-locks status --short --untracked-files=all`, `git diff`, and `git diff --cached` to establish the scope. Read relevant untracked files directly; git diff does not include their contents.";
@@ -38,8 +39,13 @@ pub fn resolve_review_request(
     request: ReviewRequest,
     cwd: &AbsolutePathBuf,
 ) -> anyhow::Result<ResolvedReviewRequest> {
-    let target = request.target;
+    let mut target = request.target;
+    if let ReviewTarget::Commit { sha, .. } = &mut target {
+        *sha = codex_git_utils::resolve_commit(cwd, sha)?;
+    }
     let prompt = review_prompt(&target, cwd)?;
+    let source_scope =
+        codex_git_utils::ReviewSourceScope::capture(cwd, &target).map_err(anyhow::Error::msg)?;
     let user_facing_hint = request
         .user_facing_hint
         .unwrap_or_else(|| user_facing_hint(&target));
@@ -48,6 +54,7 @@ pub fn resolve_review_request(
         target,
         prompt,
         user_facing_hint,
+        source_scope,
     })
 }
 

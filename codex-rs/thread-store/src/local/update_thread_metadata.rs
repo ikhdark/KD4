@@ -31,15 +31,29 @@ use crate::UpdateThreadMetadataParams;
 use crate::error::reject_paginated_history_mode;
 use crate::local::read_thread;
 
+#[cfg(test)]
+tokio::task_local! {
+    static METADATA_APPEND_PAUSE: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+}
+
 pub(super) async fn update_thread_metadata_ack(
     store: &LocalThreadStore,
     params: UpdateThreadMetadataParams,
 ) -> ThreadStoreResult<()> {
+    update_thread_metadata_applied(store, params)
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn update_thread_metadata_applied(
+    store: &LocalThreadStore,
+    params: UpdateThreadMetadataParams,
+) -> ThreadStoreResult<bool> {
     if params.patch.is_empty()
         || needs_rollout_compatibility_update(&params.patch)
         || (params.patch.project_id.is_some() && !store.supports_projects())
     {
-        return update_thread_metadata(store, params).await.map(|_| ());
+        return update_thread_metadata(store, params).await.map(|_| true);
     }
 
     let require_sqlite_write = sqlite_write_failure_should_block(&params.patch);
@@ -54,7 +68,7 @@ pub(super) async fn update_thread_metadata_ack(
     if updated.is_some() {
         // The commit is complete. Live callers discard the summary, so do not reread the
         // rollout or legacy name index solely to construct it while holding their mutex.
-        return Ok(());
+        return Ok(true);
     }
 
     // No SQLite row was committed (including best-effort failures). Preserve the returning
@@ -68,10 +82,77 @@ pub(super) async fn update_thread_metadata_ack(
         },
     )
     .await
-    .map(|_| ())
+    .map(|_| store.state_db.is_none())
 }
 
 pub(super) async fn update_thread_metadata(
+    store: &LocalThreadStore,
+    params: UpdateThreadMetadataParams,
+) -> ThreadStoreResult<StoredThread> {
+    if params.patch.is_empty() {
+        return update_thread_metadata_owned(store, params).await;
+    }
+    let permit = std::sync::Arc::clone(&store.metadata_update_slots)
+        .try_acquire_owned()
+        .map_err(|_| ThreadStoreError::Conflict {
+            message: "metadata update capacity reached; retry after pending updates settle".into(),
+        })?;
+    let thread_id = params.thread_id;
+    // A live recorder shares its file lease with metadata maintenance. It does
+    // not serialize two logical updates, so retain a per-thread ordering owner
+    // through both projections. Weak entries cannot retain abandoned threads.
+    let order = {
+        let mut orders = store
+            .metadata_update_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        orders.retain(|_, order| order.strong_count() > 0);
+        match orders.get(&thread_id).and_then(std::sync::Weak::upgrade) {
+            Some(order) => order,
+            None => {
+                let order = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                orders.insert(thread_id, std::sync::Arc::downgrade(&order));
+                order
+            }
+        }
+    };
+    let store = store.clone();
+    #[cfg(test)]
+    let pause = METADATA_APPEND_PAUSE.try_with(std::sync::Arc::clone).ok();
+    // The logical owner, not just the physical append, survives observer loss.
+    // It retains the writer lease through the SQLite/name-index finalizers.
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = tokio::spawn(async move {
+            let _order = order.lock_owned().await;
+            #[cfg(test)]
+            if let Some(pause) = pause {
+                return METADATA_APPEND_PAUSE
+                    .scope(pause, update_thread_metadata_owned(&store, params))
+                    .await;
+            }
+            update_thread_metadata_owned(&store, params).await
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(ThreadStoreError::Internal {
+                message: format!(
+                    "metadata update owner failed for {thread_id}: {error}; reconciliation required"
+                ),
+            })
+        });
+        if let Err(error) = &result {
+            warn!(%thread_id, %error, "metadata update did not settle successfully");
+        }
+        result
+    })
+    .await
+    .map_err(|error| ThreadStoreError::Internal {
+        message: format!("metadata update owner failed for {thread_id}: {error}"),
+    })?
+}
+
+async fn update_thread_metadata_owned(
     store: &LocalThreadStore,
     params: UpdateThreadMetadataParams,
 ) -> ThreadStoreResult<StoredThread> {
@@ -152,9 +233,13 @@ pub(super) async fn update_thread_metadata(
     // Reconciliation establishes only a missing baseline. Never reload older
     // rollout facts over an existing explicit SQLite patch.
     if let Some(state_db) = state_db_ctx.as_ref()
-        && state_db.get_thread(thread_id).await.map_err(|err| ThreadStoreError::Internal {
-            message: format!("failed to read thread metadata for {thread_id}: {err}"),
-        })?.is_none()
+        && state_db
+            .get_thread(thread_id)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to read thread metadata for {thread_id}: {err}"),
+            })?
+            .is_none()
     {
         codex_rollout::state_integration::reconcile_rollout(
             Some(state_db.as_ref()),
@@ -163,7 +248,8 @@ pub(super) async fn update_thread_metadata(
             None,
             &[],
             resolved_rollout_path.archived.then_some(true),
-        ).await;
+        )
+        .await;
     }
 
     let resolved_git_info = match git_info {
@@ -214,6 +300,11 @@ pub(super) async fn update_thread_metadata(
             origin_url,
         )
         .await?;
+        #[cfg(test)]
+        if let Ok(pause) = METADATA_APPEND_PAUSE.try_with(std::sync::Arc::clone) {
+            pause.0.notify_one();
+            pause.1.notified().await;
+        }
         refresh_resolved_rollout_path(&mut resolved_rollout_path).await;
     }
 
@@ -226,7 +317,13 @@ pub(super) async fn update_thread_metadata(
     )
     .await?;
     if let Some(name) = name {
-        apply_thread_name(store, thread_id, name.unwrap_or_default(), updated.is_some()).await?;
+        apply_thread_name(
+            store,
+            thread_id,
+            name.unwrap_or_default(),
+            updated.is_some(),
+        )
+        .await?;
     }
     // Prefer the committed projection; reading compatibility state must not
     // reapply an older rollout snapshot after the explicit patch.
@@ -335,101 +432,108 @@ async fn apply_metadata_update(
             }
             let fallback = metadata;
             let name_update = patch.name.is_some();
-            let mut metadata = state_db.patch_thread_metadata(&fallback, |metadata| {
-                if !include_archived && metadata.archived_at.is_some() {
-                    return Err(format!("thread {thread_id} is archived"));
-                }
-                if let Some(rollout_path) = rollout_path {
-                    metadata.rollout_path = rollout_path;
-                }
-                if let Some(preview) = patch.preview {
-                    metadata.preview = Some(preview);
-                }
-                if let Some(name) = patch.name {
-                    metadata.title = name.unwrap_or_default();
-                }
-                if let Some(title) = patch.title {
-                    metadata.title = title;
-                }
-                if let Some(model_provider) = patch.model_provider {
-                    metadata.model_provider = model_provider;
-                }
-                if let Some(model) = patch.model {
-                    metadata.model = Some(model);
-                }
-                if let Some(reasoning_effort) = patch.reasoning_effort {
-                    metadata.reasoning_effort = reasoning_effort;
-                }
-                if let Some(created_at) = patch.created_at {
-                    metadata.created_at = created_at;
-                }
-                if let Some(updated_at) = patch.updated_at {
-                    metadata.updated_at = updated_at;
-                }
-                if existing.is_none()
-                    && let Some(recency_at) = advance_recency_at
-                {
-                    metadata.recency_at = recency_at;
-                }
-                if let Some(source) = patch.source {
-                    metadata.source = enum_to_string(&source);
-                }
-                if let Some(thread_source) = patch.thread_source {
-                    metadata.thread_source = thread_source;
-                }
-                if let Some(agent_nickname) = patch.agent_nickname {
-                    metadata.agent_nickname = agent_nickname;
-                }
-                if let Some(agent_role) = patch.agent_role {
-                    metadata.agent_role = agent_role;
-                }
-                if let Some(agent_path) = patch.agent_path {
-                    metadata.agent_path = agent_path;
-                }
-                if let Some(cwd) = patch.cwd {
-                    metadata.cwd = normalize_cwd(cwd);
-                }
-                if let Some(cli_version) = patch.cli_version {
-                    metadata.cli_version = cli_version;
-                }
-                if let Some(approval_mode) = patch.approval_mode {
-                    metadata.approval_mode = enum_to_string(&approval_mode);
-                }
-                if let Some(permission_profile) = patch.permission_profile {
-                    metadata.sandbox_policy = permission_profile_to_metadata_value(&permission_profile);
-                }
-                if let Some(token_usage) = patch.token_usage {
-                    metadata.tokens_used = token_usage.total_tokens.max(0);
-                }
-                if let Some(first_user_message) = patch.first_user_message {
-                    metadata.first_user_message = Some(first_user_message);
-                }
-                if let Some(git_info) = patch.git_info {
-                    let existing_git_info = git_info_from_parts(
-                        metadata.git_sha.clone(),
-                        metadata.git_branch.clone(),
-                        metadata.git_origin_url.clone(),
-                    );
-                    let (sha, branch, origin_url) = resolve_git_info_patch(existing_git_info, git_info);
-                    metadata.git_sha = sha;
-                    metadata.git_branch = branch;
-                    metadata.git_origin_url = origin_url;
-                }
-                if let Some(project_id) = patch.project_id {
-                    metadata.project_id = project_id;
-                }
-    
-                Ok(())
-            }).await.map_err(|err| {
-                let message = err.to_string();
-                if message.contains("project not found") || message.contains("is archived") {
-                    ThreadStoreError::InvalidRequest { message }
-                } else if name_update {
-                    ThreadStoreError::Internal { message: format!("failed to set thread name: {message}") }
-                } else {
-                    ThreadStoreError::Internal { message }
-                }
-            })?;
+            let mut metadata = state_db
+                .patch_thread_metadata(&fallback, |metadata| {
+                    if !include_archived && metadata.archived_at.is_some() {
+                        return Err(format!("thread {thread_id} is archived"));
+                    }
+                    if let Some(rollout_path) = rollout_path {
+                        metadata.rollout_path = rollout_path;
+                    }
+                    if let Some(preview) = patch.preview {
+                        metadata.preview = Some(preview);
+                    }
+                    if let Some(name) = patch.name {
+                        metadata.title = name.unwrap_or_default();
+                    }
+                    if let Some(title) = patch.title {
+                        metadata.title = title;
+                    }
+                    if let Some(model_provider) = patch.model_provider {
+                        metadata.model_provider = model_provider;
+                    }
+                    if let Some(model) = patch.model {
+                        metadata.model = Some(model);
+                    }
+                    if let Some(reasoning_effort) = patch.reasoning_effort {
+                        metadata.reasoning_effort = reasoning_effort;
+                    }
+                    if let Some(created_at) = patch.created_at {
+                        metadata.created_at = created_at;
+                    }
+                    if let Some(updated_at) = patch.updated_at {
+                        metadata.updated_at = updated_at;
+                    }
+                    if existing.is_none()
+                        && let Some(recency_at) = advance_recency_at
+                    {
+                        metadata.recency_at = recency_at;
+                    }
+                    if let Some(source) = patch.source {
+                        metadata.source = enum_to_string(&source);
+                    }
+                    if let Some(thread_source) = patch.thread_source {
+                        metadata.thread_source = thread_source;
+                    }
+                    if let Some(agent_nickname) = patch.agent_nickname {
+                        metadata.agent_nickname = agent_nickname;
+                    }
+                    if let Some(agent_role) = patch.agent_role {
+                        metadata.agent_role = agent_role;
+                    }
+                    if let Some(agent_path) = patch.agent_path {
+                        metadata.agent_path = agent_path;
+                    }
+                    if let Some(cwd) = patch.cwd {
+                        metadata.cwd = normalize_cwd(cwd);
+                    }
+                    if let Some(cli_version) = patch.cli_version {
+                        metadata.cli_version = cli_version;
+                    }
+                    if let Some(approval_mode) = patch.approval_mode {
+                        metadata.approval_mode = enum_to_string(&approval_mode);
+                    }
+                    if let Some(permission_profile) = patch.permission_profile {
+                        metadata.sandbox_policy =
+                            permission_profile_to_metadata_value(&permission_profile);
+                    }
+                    if let Some(token_usage) = patch.token_usage {
+                        metadata.tokens_used = token_usage.total_tokens.max(0);
+                    }
+                    if let Some(first_user_message) = patch.first_user_message {
+                        metadata.first_user_message = Some(first_user_message);
+                    }
+                    if let Some(git_info) = patch.git_info {
+                        let existing_git_info = git_info_from_parts(
+                            metadata.git_sha.clone(),
+                            metadata.git_branch.clone(),
+                            metadata.git_origin_url.clone(),
+                        );
+                        let (sha, branch, origin_url) =
+                            resolve_git_info_patch(existing_git_info, git_info);
+                        metadata.git_sha = sha;
+                        metadata.git_branch = branch;
+                        metadata.git_origin_url = origin_url;
+                    }
+                    if let Some(project_id) = patch.project_id {
+                        metadata.project_id = project_id;
+                    }
+
+                    Ok(())
+                })
+                .await
+                .map_err(|err| {
+                    let message = err.to_string();
+                    if message.contains("project not found") || message.contains("is archived") {
+                        ThreadStoreError::InvalidRequest { message }
+                    } else if name_update {
+                        ThreadStoreError::Internal {
+                            message: format!("failed to set thread name: {message}"),
+                        }
+                    } else {
+                        ThreadStoreError::Internal { message }
+                    }
+                })?;
             if existing.is_some()
                 && let Some(recency_at) = advance_recency_at
             {
@@ -609,7 +713,9 @@ fn sqlite_write_failure_should_block(patch: &ThreadMetadataPatch) -> bool {
     // look broken. Explicit git-only updates still require SQLite because partial git patches need
     // the existing SQLite value to preserve unspecified fields. Name compatibility writes still
     // require their targeted SQLite update to succeed before writing the legacy name index.
-    patch.name.is_some() || patch.project_id.is_some() || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
+    patch.name.is_some()
+        || patch.project_id.is_some()
+        || (patch.git_info.is_some() && !has_observed_metadata_facts(patch))
 }
 
 fn sqlite_write_error_is_best_effort(err: &ThreadStoreError) -> bool {
@@ -750,20 +856,45 @@ mod tests {
     async fn explicit_name_and_model_patch_survives_reopen() {
         let home = TempDir::new().unwrap();
         let config = test_config(home.path());
-        let runtime = codex_state::StateRuntime::init(home.path().to_path_buf(), config.default_model_provider_id.clone()).await.unwrap();
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
         let store = LocalThreadStore::new(config.clone(), Some(runtime));
         let uuid = Uuid::from_u128(9997);
         let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
         write_session_file(home.path(), "2025-02-04T16-00-00", uuid).unwrap();
-        let updated = store.update_thread_metadata(UpdateThreadMetadataParams {
-            thread_id, include_archived: false,
-            patch: ThreadMetadataPatch { name: Some(Some("explicit name".into())), model: Some("explicit model".into()), ..Default::default() },
-        }).await.unwrap();
+        let updated = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                include_archived: false,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("explicit name".into())),
+                    model: Some("explicit model".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
         assert_eq!(updated.model.as_deref(), Some("explicit model"));
         drop(store);
-        let runtime = codex_state::StateRuntime::init(home.path().to_path_buf(), config.default_model_provider_id.clone()).await.unwrap();
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
         let reopened = LocalThreadStore::new(config, Some(runtime));
-        let thread = reopened.read_thread(ReadThreadParams { thread_id, include_archived: false, include_history: false }).await.unwrap();
+        let thread = reopened
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .unwrap();
         assert_eq!(thread.name.as_deref(), Some("explicit name"));
         assert_eq!(thread.model.as_deref(), Some("explicit model"));
     }
@@ -772,25 +903,76 @@ mod tests {
     async fn initially_absent_git_patch_rebuilds_from_rollout() {
         let home = TempDir::new().unwrap();
         let config = test_config(home.path());
-        let runtime = codex_state::StateRuntime::init(home.path().to_path_buf(), config.default_model_provider_id.clone()).await.unwrap();
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
         let store = LocalThreadStore::new(config, Some(runtime.clone()));
         let uuid = Uuid::from_u128(9998);
         let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
         let path = write_session_file(home.path(), "2025-02-04T16-00-00", uuid).unwrap();
         let bytes = std::fs::read_to_string(&path).unwrap();
-        let mut lines = bytes.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
+        let mut lines = bytes
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
         lines[0]["payload"]["git"] = Value::Null;
-        std::fs::write(&path, lines.iter().map(|line| format!("{line}\n")).collect::<String>()).unwrap();
-        store.update_thread_metadata(UpdateThreadMetadataParams {
-            thread_id, include_archived: false,
-            patch: ThreadMetadataPatch { git_info: Some(GitInfoPatch { sha: Some(Some("new-sha".into())), ..Default::default() }), ..Default::default() },
-        }).await.unwrap();
-        assert_eq!(last_rollout_item(&path)["payload"]["git"]["commit_hash"], "new-sha");
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                include_archived: false,
+                patch: ThreadMetadataPatch {
+                    git_info: Some(GitInfoPatch {
+                        sha: Some(Some("new-sha".into())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            last_rollout_item(&path)["payload"]["git"]["commit_hash"],
+            "new-sha"
+        );
+        // Simulate a missing row, not an explicit deletion: reconciliation
+        // must never clear deletion evidence.
         runtime.delete_thread(thread_id).await.unwrap();
-        assert!(codex_rollout::state_integration::reconcile_rollout(
-            Some(runtime.as_ref()), &path, "test-provider", None, &[], None,
-        ).await);
-        assert_eq!(runtime.get_thread(thread_id).await.unwrap().unwrap().git_sha.as_deref(), Some("new-sha"));
+        runtime
+            .restore_deleted_thread_owners(&[thread_id])
+            .await
+            .unwrap();
+        assert!(
+            codex_rollout::state_integration::reconcile_rollout(
+                Some(runtime.as_ref()),
+                &path,
+                "test-provider",
+                None,
+                &[],
+                None,
+            )
+            .await
+        );
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .git_sha
+                .as_deref(),
+            Some("new-sha")
+        );
     }
 
     #[tokio::test]
@@ -1006,7 +1188,10 @@ mod tests {
             }
         ));
 
-        assert_eq!(std::fs::read(&path).expect("read rejected rollout"), original_rollout);
+        assert_eq!(
+            std::fs::read(&path).expect("read rejected rollout"),
+            original_rollout
+        );
         assert_ne!(
             runtime
                 .get_thread(thread_id)
@@ -1018,7 +1203,8 @@ mod tests {
         );
         assert_eq!(
             codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
-                .await.expect("read name index"),
+                .await
+                .expect("read name index"),
             None
         );
     }
@@ -1060,7 +1246,11 @@ mod tests {
         assert!(thread.rollout_path.is_some());
         assert_eq!(thread.name.as_deref(), Some("updated"));
         assert_eq!(
-            thread.rollout_path.expect("rollout path").canonicalize().expect("canonical rollout"),
+            thread
+                .rollout_path
+                .expect("rollout path")
+                .canonicalize()
+                .expect("canonical rollout"),
             path.canonicalize().expect("canonical external rollout")
         );
     }
@@ -1175,6 +1365,71 @@ mod tests {
             git_info.repository_url.as_deref(),
             Some("https://github.com/openai/codex")
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_metadata_observer_keeps_append_and_sqlite_ordered() {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let db = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
+        let store = LocalThreadStore::new(config, Some(db));
+        let uuid = Uuid::from_u128(661);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).unwrap();
+        let path = write_session_file(home.path(), "2025-01-03T17-00-00", uuid).unwrap();
+        let params = |branch: &str| UpdateThreadMetadataParams {
+            thread_id,
+            patch: ThreadMetadataPatch {
+                git_info: Some(GitInfoPatch {
+                    branch: Some(Some(branch.into())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            include_archived: false,
+        };
+        store.update_thread_metadata(params("main")).await.unwrap();
+        let pause = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let old_store = store.clone();
+        let old_params = params("cancelled-observer");
+        let old = tokio::spawn(
+            METADATA_APPEND_PAUSE.scope(std::sync::Arc::clone(&pause), async move {
+                old_store.update_thread_metadata(old_params).await
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.0.notified())
+            .await
+            .unwrap();
+        old.abort();
+        assert!(old.await.unwrap_err().is_cancelled());
+        pause.1.notify_one();
+        let settled = store.update_thread_metadata(params("main")).await.unwrap();
+        assert_eq!(settled.git_info.unwrap().branch.as_deref(), Some("main"));
+        let latest = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<codex_protocol::protocol::RolloutLine>(line).unwrap()
+            })
+            .filter_map(|line| match line.item {
+                RolloutItem::SessionMeta(meta) => meta.git,
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        assert_eq!(latest.branch.as_deref(), Some("main"));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.metadata_update_slots.available_permits() != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.metadata_update_slots.available_permits(), 32);
     }
 
     #[tokio::test]
@@ -1354,6 +1609,12 @@ mod tests {
                 .expect("delete sqlite thread row"),
             1
         );
+        // A missing row, not an explicit deletion: clear the deletion evidence
+        // so the rollout can rebuild the row.
+        runtime
+            .restore_deleted_thread_owners(&[thread_id])
+            .await
+            .expect("clear deletion evidence");
         let thread = store
             .update_thread_metadata(UpdateThreadMetadataParams {
                 thread_id,
@@ -1461,39 +1722,61 @@ mod tests {
     #[test]
     fn sqlite_failure_policy_distinguishes_explicit_and_observed_updates() {
         for (patch, blocks) in [
-            (ThreadMetadataPatch {
-                name: Some(Some("User chosen name".to_string())),
-                ..Default::default()
-            }, true),
-            (ThreadMetadataPatch {
-                name: Some(None),
-                ..Default::default()
-            }, true),
-            (ThreadMetadataPatch {
-                project_id: Some(None),
-                ..Default::default()
-            }, true),
-            (ThreadMetadataPatch {
-                updated_at: Some(Utc::now()),
-                ..Default::default()
-            }, false),
-            (ThreadMetadataPatch {
-                preview: Some("Observed preview".to_string()),
-                git_info: Some(GitInfoPatch {
-                    branch: Some(Some("main".to_string())),
+            (
+                ThreadMetadataPatch {
+                    name: Some(Some("User chosen name".to_string())),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }, false),
-            (ThreadMetadataPatch {
-                git_info: Some(GitInfoPatch {
-                    branch: Some(Some("main".to_string())),
+                },
+                true,
+            ),
+            (
+                ThreadMetadataPatch {
+                    name: Some(None),
                     ..Default::default()
-                }),
-                ..Default::default()
-            }, true),
+                },
+                true,
+            ),
+            (
+                ThreadMetadataPatch {
+                    project_id: Some(None),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                ThreadMetadataPatch {
+                    updated_at: Some(Utc::now()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                ThreadMetadataPatch {
+                    preview: Some("Observed preview".to_string()),
+                    git_info: Some(GitInfoPatch {
+                        branch: Some(Some("main".to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                ThreadMetadataPatch {
+                    git_info: Some(GitInfoPatch {
+                        branch: Some(Some("main".to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                true,
+            ),
         ] {
-            assert_eq!(sqlite_write_failure_should_block(&patch), blocks, "{patch:?}");
+            assert_eq!(
+                sqlite_write_failure_should_block(&patch),
+                blocks,
+                "{patch:?}"
+            );
         }
     }
 

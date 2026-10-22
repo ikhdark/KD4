@@ -8,8 +8,7 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 
-use crate::image_url::REMOTE_IMAGE_URL_ERROR;
-use crate::image_url::is_remote_image_url;
+use crate::image_url::image_url_error;
 use crate::outgoing_message::ClientRequestResult;
 use crate::server_request_error::is_turn_transition_server_request_error;
 
@@ -69,8 +68,18 @@ fn decode_response(value: serde_json::Value) -> (DynamicToolCallResponse, Option
     match serde_json::from_value::<DynamicToolCallResponse>(value) {
         Ok(mut response) => {
             let mut omitted = 0;
+            let mut reason = "unsupported image representation";
             response.content_items.retain(|item| {
-                let invalid = matches!(item, DynamicToolCallOutputContentItem::InputImage { image_url } if is_remote_image_url(image_url));
+                let error = match item {
+                    DynamicToolCallOutputContentItem::InputImage { image_url } => {
+                        image_url_error(image_url)
+                    }
+                    _ => None,
+                };
+                if let Some(error) = error {
+                    reason = error;
+                }
+                let invalid = error.is_some();
                 omitted += usize::from(invalid);
                 !invalid
             });
@@ -78,7 +87,7 @@ fn decode_response(value: serde_json::Value) -> (DynamicToolCallResponse, Option
                 return (response, None);
             }
             let message = format!(
-                "Partial dynamic tool output: omitted {omitted} unsupported image item(s). {REMOTE_IMAGE_URL_ERROR}. The success flag describes the client's reported execution outcome; output delivery is incomplete."
+                "Partial dynamic tool output: omitted {omitted} unsupported image item(s). {reason}. The success flag describes the client's reported execution outcome; output delivery is incomplete."
             );
             response
                 .content_items

@@ -89,11 +89,14 @@ fn releases_large_reassembly_capacity_after_delivery() {
 fn rejects_invalid_declared_message_lengths_without_payload() {
     for length in [0, MAX_JSONRPC_MESSAGE_LEN as u32 + 1] {
         let mut decoder = JsonRpcMessageDecoder::default();
-        assert!(matches!(
-            decoder.push(&length.to_be_bytes()),
-            Err(ExecServerError::Protocol(message))
-                if message == "Noise relay JSON-RPC message has invalid length"
-        ), "declared length {length}");
+        assert!(
+            matches!(
+                decoder.push(&length.to_be_bytes()),
+                Err(ExecServerError::Protocol(message))
+                    if message == "Noise relay JSON-RPC message has invalid length"
+            ),
+            "declared length {length}"
+        );
     }
 }
 

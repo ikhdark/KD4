@@ -68,7 +68,6 @@ const WORKSPACE_ID_SECOND_ALLOWED: &str = "123e4567-e89b-42d3-a456-426614174001"
 const WORKSPACE_ID_DISALLOWED: &str = "123e4567-e89b-42d3-a456-426614174002";
 const WORKSPACE_ID_EMBEDDED: &str = "123e4567-e89b-42d3-a456-426614174010";
 const WORKSPACE_ID_INITIAL: &str = "123e4567-e89b-42d3-a456-426614174011";
-const WORKSPACE_ID_REFRESHED: &str = "123e4567-e89b-42d3-a456-426614174012";
 const WORKSPACE_ID_DEVICE: &str = "123e4567-e89b-42d3-a456-426614174013";
 const WORKSPACE_ID_STALE: &str = "123e4567-e89b-42d3-a456-426614174014";
 
@@ -345,9 +344,7 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
 
     for refresh_token in [false, true] {
         let get_id = mcp
-            .send_get_account_request(GetAccountParams {
-                refresh_token,
-            })
+            .send_get_account_request(GetAccountParams { refresh_token })
             .await?;
         let get_resp: JSONRPCResponse = timeout(
             DEFAULT_READ_TIMEOUT,
@@ -366,7 +363,6 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
                 requires_openai_auth: true,
             }
         );
-
     }
 
     let refresh_request = timeout(
@@ -402,8 +398,6 @@ async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
 
     Ok(())
 }
-
-
 
 async fn respond_to_refresh_request(
     mcp: &mut TestAppServer,
@@ -465,11 +459,13 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
             .plan_type("pro")
             .chatgpt_account_id(WORKSPACE_ID_INITIAL),
     )?;
+    // An external refresh rotates tokens for the same workspace; a different
+    // account id requires an explicit login instead.
     let refreshed_access_token = encode_id_token(
         &ChatGptIdTokenClaims::new()
             .email("refreshed@example.com")
             .plan_type("pro")
-            .chatgpt_account_id(WORKSPACE_ID_REFRESHED),
+            .chatgpt_account_id(WORKSPACE_ID_INITIAL),
     )?;
 
     let mut mcp = TestAppServer::builder()
@@ -526,7 +522,7 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     respond_to_refresh_request(
         &mut mcp,
         &refreshed_access_token,
-        WORKSPACE_ID_REFRESHED,
+        WORKSPACE_ID_INITIAL,
         Some("pro"),
     )
     .await?;
@@ -543,7 +539,9 @@ async fn external_auth_refreshes_on_unauthorized() -> Result<()> {
     .await??;
 
     let completed: TurnCompletedNotification = serde_json::from_value(
-        turn_completed.params.expect("turn/completed params must be present"),
+        turn_completed
+            .params
+            .expect("turn/completed params must be present"),
     )?;
     assert_eq!(completed.thread_id, thread.thread.id);
     assert_eq!(completed.turn.id, started.turn.id);
@@ -975,7 +973,9 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let get_id = mcp
-        .send_get_account_request(GetAccountParams { refresh_token: false })
+        .send_get_account_request(GetAccountParams {
+            refresh_token: false,
+        })
         .await?;
     let response = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1029,7 +1029,9 @@ async fn login_account_api_key_succeeds_and_notifies() -> Result<()> {
 
     assert!(codex_home.path().join("auth.json").exists());
     let get_id = mcp
-        .send_get_account_request(GetAccountParams { refresh_token: false })
+        .send_get_account_request(GetAccountParams {
+            refresh_token: false,
+        })
         .await?;
     let response = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1462,7 +1464,10 @@ async fn login_account_chatgpt_start_can_be_cancelled() -> Result<()> {
     pretty_assertions::assert_eq!(payload.login_id, Some(login_id));
     pretty_assertions::assert_eq!(payload.success, false);
     assert!(
-        payload.error.as_ref().is_some_and(|error| !error.is_empty()),
+        payload
+            .error
+            .as_ref()
+            .is_some_and(|error| !error.is_empty()),
         "expected a non-empty error on cancel"
     );
 
@@ -1526,8 +1531,6 @@ async fn ephemeral_login_callbacks_do_not_cancel_another_server() -> Result<()> 
     }
     Ok(())
 }
-
-
 
 #[tokio::test]
 async fn login_account_chatgpt_uses_debug_oauth_overrides() -> Result<()> {
@@ -1809,10 +1812,6 @@ async fn login_account_chatgpt_includes_forced_workspace_allowlist_query_param()
     );
     Ok(())
 }
-
-
-
-
 
 #[tokio::test]
 async fn get_account_when_auth_not_required() -> Result<()> {

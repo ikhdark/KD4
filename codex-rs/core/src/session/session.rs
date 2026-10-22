@@ -10,7 +10,6 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::startup_timing::StartupTimingState;
 use crate::state::ActiveTurn;
-use anyhow::Context;
 use codex_extension_api::ExtensionDataInit;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_protocol::SessionId;
@@ -121,6 +120,7 @@ struct ToolHistoryPersistenceProgress {
 
 struct ToolHistoryPersistenceWorker {
     shutdown: tokio_util::sync::CancellationToken,
+    stopped: tokio_util::sync::CancellationToken,
     // Retain the worker with the queue. Shutdown interrupts idle/gate waits, but
     // an active file write keeps its permit until the actual operation completes.
     _task: tokio::task::JoinHandle<()>,
@@ -143,12 +143,174 @@ pub(super) struct ToolHistoryPersistenceQueue {
     persisted_batch_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
+pub(super) struct SessionStorageOwnership {
+    _ledger: codex_file_system::AtomicWriteLock,
+    _artifacts: Arc<std::fs::File>,
+}
+
+async fn acquire_session_storage_ownership(
+    home: &std::path::Path,
+    thread_id: ThreadId,
+) -> std::io::Result<Arc<SessionStorageOwnership>> {
+    let artifacts = crate::tools::command_output_artifact::acquire_artifact_residency(
+        home,
+        &thread_id.to_string(),
+    )
+    .await?;
+    if tokio::fs::try_exists(
+        home.join("tool-history")
+            .join(format!("{thread_id}.retired")),
+    )
+    .await?
+    {
+        return Err(std::io::Error::other(
+            "thread storage was permanently retired",
+        ));
+    }
+    // Separate lifecycle ownership from the short checkpoint transaction lock.
+    let owner_path = home.join("tool-history").join(format!("{thread_id}.owner"));
+    let ledger = tokio::task::spawn_blocking(move || {
+        codex_file_system::try_acquire_atomic_write_lock(&owner_path)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "completed-tool history has another live owner; retry after it closes",
+            )
+        })
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    Ok(Arc::new(SessionStorageOwnership {
+        _ledger: ledger,
+        _artifacts: artifacts,
+    }))
+}
+
+#[cfg(test)]
+mod durable_storage_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn audit63_retired_thread_cannot_reacquire_session_storage() {
+        let home = tempfile::tempdir().unwrap();
+        let id = ThreadId::new();
+        drop(
+            acquire_session_storage_ownership(home.path(), id)
+                .await
+                .unwrap(),
+        );
+        std::fs::write(
+            home.path()
+                .join("tool-history")
+                .join(format!("{id}.retired")),
+            b"retired",
+        )
+        .unwrap();
+        assert!(
+            acquire_session_storage_ownership(home.path(), id)
+                .await
+                .is_err()
+        );
+        assert!(
+            acquire_session_storage_ownership(home.path(), ThreadId::new())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_audit_11_owner_survives_the_last_worker_clone() {
+        let home = tempfile::tempdir().unwrap();
+        let id = ThreadId::new();
+        let owner = acquire_session_storage_ownership(home.path(), id)
+            .await
+            .unwrap();
+        let worker = Arc::clone(&owner);
+        assert!(
+            acquire_session_storage_ownership(home.path(), id)
+                .await
+                .is_err()
+        );
+        drop(owner);
+        assert!(
+            acquire_session_storage_ownership(home.path(), id)
+                .await
+                .is_err()
+        );
+        assert!(
+            acquire_session_storage_ownership(home.path(), ThreadId::new())
+                .await
+                .is_ok()
+        );
+        drop(worker);
+        assert!(
+            acquire_session_storage_ownership(home.path(), id)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_queue_shutdown_retains_storage_until_writer_stops() {
+        let home = tempfile::tempdir().unwrap();
+        let id = ThreadId::new();
+        let owner = acquire_session_storage_ownership(home.path(), id)
+            .await
+            .unwrap();
+        let gate = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&gate).acquire_owned().await.unwrap();
+        let queue = ToolHistoryPersistenceQueue::new_with_owner(
+            gate,
+            home.path().to_path_buf(),
+            id,
+            crate::tool_history::ToolHistoryState::default(),
+            Some(owner),
+        );
+        let mut shutdown = Box::pin(queue.shutdown());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), shutdown.as_mut())
+                .await
+                .is_err(),
+            "shutdown cannot bypass a blocked ledger checkpoint"
+        );
+        drop(shutdown);
+        assert!(
+            acquire_session_storage_ownership(home.path(), id)
+                .await
+                .is_err(),
+            "cancelling the observer must not release the live writer's lease"
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), queue.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            acquire_session_storage_ownership(home.path(), id)
+                .await
+                .is_ok(),
+            "a stopped queue must release ownership even while its handle survives"
+        );
+        assert!(queue._worker.stopped.is_cancelled());
+    }
+}
+
 impl ToolHistoryPersistenceQueue {
+    #[cfg(test)]
     pub(super) fn new(
         io_gate: Arc<Semaphore>,
         codex_home: PathBuf,
         thread_id: ThreadId,
         initial_state: crate::tool_history::ToolHistoryState,
+    ) -> Self {
+        Self::new_with_owner(io_gate, codex_home, thread_id, initial_state, None)
+    }
+
+    fn new_with_owner(
+        io_gate: Arc<Semaphore>,
+        codex_home: PathBuf,
+        thread_id: ThreadId,
+        initial_state: crate::tool_history::ToolHistoryState,
+        owner: Option<Arc<SessionStorageOwnership>>,
     ) -> Self {
         let state = Arc::new(tokio::sync::Mutex::new(
             ToolHistoryPersistenceState::default(),
@@ -166,11 +328,19 @@ impl ToolHistoryPersistenceQueue {
         let (progress_tx, progress) = watch::channel(ToolHistoryPersistenceProgress::default());
         let shutdown = tokio_util::sync::CancellationToken::new();
         let worker_shutdown = shutdown.clone();
+        let stopped = tokio_util::sync::CancellationToken::new();
+        let worker_stopped = stopped.clone();
         #[cfg(test)]
         let persisted_batch_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(test)]
         let worker_persisted_batch_count = Arc::clone(&persisted_batch_count);
         let task = tokio::spawn(async move {
+            // Declared before the owner so completion is signalled only after
+            // the worker has released its storage lease, including on unwind.
+            let _stopped = worker_stopped.drop_guard();
+            // Includes an in-flight blocking checkpoint after Session/caller
+            // cancellation. A successor must not load a stale private mirror.
+            let _owner = owner;
             let mut journal_records = 0_u64;
             let mut journal_bytes = 0_u64;
             let mut journal_sequence = 0_u64;
@@ -377,6 +547,7 @@ impl ToolHistoryPersistenceQueue {
             mirror,
             _worker: Arc::new(ToolHistoryPersistenceWorker {
                 shutdown,
+                stopped,
                 _task: task,
             }),
             #[cfg(test)]
@@ -422,6 +593,17 @@ impl ToolHistoryPersistenceQueue {
             "completed-tool history checkpoint",
         )?;
         self.wait_for_sequence(target_sequence).await
+    }
+
+    /// Called after turn/ordered-commit admission has drained. A cancelled
+    /// shutdown observer must not cancel an in-flight blocking ledger write.
+    pub(super) async fn shutdown(&self) -> Result<(), ToolHistoryPersistenceError> {
+        if !self._worker.shutdown.is_cancelled() {
+            self.checkpoint().await?;
+            self._worker.shutdown.cancel();
+        }
+        self._worker.stopped.cancelled().await;
+        Ok(())
     }
 
     async fn wait_for_sequence(
@@ -582,6 +764,7 @@ pub(super) fn next_tool_history_persistence_sequence(current: u64) -> Option<u64
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
 pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
+    pub(super) _storage_ownership: std::sync::Mutex<Option<Arc<SessionStorageOwnership>>>,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
@@ -616,6 +799,8 @@ pub(crate) struct Session {
     /// Serializes turn replacement/startup and rollback history publication.
     /// Owned permits keep rollback admission protected after observer cancellation.
     pub(crate) task_start_gate: Arc<Semaphore>,
+    /// At most one capacity waiter for this session's retained trigger mail.
+    pub(crate) pending_work_retry: Arc<std::sync::atomic::AtomicBool>,
     /// Bounds ordinary submissions across channels and deferred preparation,
     /// without preventing controls from reaching a blocked preparation.
     pub(crate) submission_preparation_slots: Arc<Semaphore>,
@@ -624,6 +809,7 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     /// Correlated pre-turn startup phases, frozen at the first model send.
     pub(crate) startup_timing: Arc<StartupTimingState>,
+    pub(crate) startup_cancellation: CancellationToken,
     /// One-shot startup-prepared router handoff to the first pending-turn plan.
     pub(crate) startup_prepared_router: crate::session_startup_prewarm::StartupPreparedRouterCache,
     /// Stable request artifacts retained across turns and invalidated by their exact owners.
@@ -635,6 +821,14 @@ pub(crate) struct Session {
     pub(super) queued_tool_manifest_hash: std::sync::Mutex<Option<String>>,
     /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
+    /// Writer retirement can outlive the loop's bounded shutdown observation.
+    pub(crate) persistence_tasks: tokio_util::task::TaskTracker,
+    pub(crate) persistence_retirement_result: std::sync::Mutex<Option<Result<(), String>>>,
+    /// Mandatory result, read only after session-loop termination. A successful
+    /// shutdown barrier covers the already accepted terminal record as well.
+    pub(crate) persistence_shutdown_result: std::sync::Mutex<Option<Result<(), String>>>,
+    /// Only another real durable barrier may clear a failed checkpoint.
+    pub(crate) rollout_durability_error: tokio::sync::Mutex<Option<String>>,
     /// Admission stays closed while the prior turn is between terminal claim and the
     /// interaction-released milestone, even if its raw active-turn slot is being detached.
     pub(crate) terminal_interaction_pending: std::sync::atomic::AtomicBool,
@@ -647,7 +841,10 @@ pub(crate) struct Session {
     /// flag is monotonic for the thread's lifetime, matching the app-server's own
     /// `experimental_raw_events` semantics.
     pub(crate) raw_response_items_requested: std::sync::atomic::AtomicBool,
-    pub(crate) input_queue: InputQueue,
+    /// Internal history consumers need accepted-input provenance, not every
+    /// potentially large tool result. This opt-in is also lifetime-monotonic.
+    pub(crate) raw_user_turn_boundaries_requested: std::sync::atomic::AtomicBool,
+    pub(crate) input_queue: Arc<InputQueue>,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -1079,6 +1276,98 @@ impl SessionSettingsUpdate {
     }
 }
 
+/// Owns cancellation outside the unpublished session/task Arc cycle. Dropping
+/// construction leaves one explicit cleanup task, never unowned speculation.
+#[derive(Default)]
+struct SessionRuntimeInitGuard(Option<Arc<Session>>);
+
+impl SessionRuntimeInitGuard {
+    fn cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        let session = self.0.take()?;
+        session.startup_cancellation.cancel();
+        session
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+        session.services.turn_environments.shutdown();
+        Some(tokio::spawn(async move {
+            super::handlers::shutdown_unpublished_session(&session).await;
+        }))
+    }
+
+    async fn rollback(&mut self) {
+        if let Some(mut cleanup) = self.cleanup() {
+            // The task remains the owner if observation expires; dropping the
+            // JoinHandle must not cancel accepted storage or host cleanup.
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut cleanup).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "unpublished session cleanup task failed"),
+                Err(_) => tracing::warn!("unpublished session cleanup remains pending"),
+            }
+        }
+    }
+}
+
+impl Drop for SessionRuntimeInitGuard {
+    fn drop(&mut self) {
+        drop(self.cleanup());
+    }
+}
+
+#[cfg(test)]
+mod initialization_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn abandoned_constructor_breaks_a_pending_prewarm_session_cycle() {
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (session, _) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let weak = Arc::downgrade(&session);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let retained = Arc::clone(&session);
+        let task = tokio::spawn(async move {
+            let _session = retained;
+            let _drop = OnDrop(Some(dropped_tx));
+            let _ = entered_tx.send(());
+            futures::future::pending::<CodexResult<Option<crate::client::ModelClientSession>>>()
+                .await
+        });
+        session
+            .set_session_startup_prewarm(
+                crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
+                    task,
+                    std::time::Instant::now(),
+                ),
+            )
+            .await;
+        entered_rx.await.unwrap();
+        let cancellation = session.startup_cancellation.clone();
+        let guard = SessionRuntimeInitGuard(Some(Arc::clone(&session)));
+        drop(session);
+        drop(guard);
+        assert!(cancellation.is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must release the unpublished session");
+    }
+}
+
 pub(crate) struct AppServerClientMetadata {
     pub(crate) client_name: Option<String>,
     pub(crate) client_version: Option<String>,
@@ -1145,7 +1434,7 @@ impl Session {
         exec_policy: Arc<ExecPolicyManager>,
         tx_event: Sender<Event>,
         agent_status: watch::Sender<AgentStatus>,
-        mut initial_history: InitialHistory,
+        initial_history: InitialHistory,
         session_source: SessionSource,
         skills_service: Arc<SkillsService>,
         plugins_manager: Arc<PluginsManager>,
@@ -1193,6 +1482,10 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
         };
+        // One live canonical ledger owner, matching local rollout writer
+        // admission. This also fences mutating startup recovery before loading.
+        let storage_ownership =
+            acquire_session_storage_ownership(config.codex_home.as_path(), thread_id).await?;
         let rollback_created_persistence_on_error = !config.ephemeral
             && matches!(
                 &initial_history,
@@ -1221,21 +1514,6 @@ impl Session {
             }
         });
         let initial_auto_compact_window_ids = AutoCompactWindowIds::new_initial();
-        if session_configuration.session_source.is_non_root_agent()
-            && config.features.enabled(Feature::TokenBudget)
-            && let InitialHistory::Forked(items) = &mut initial_history
-        {
-            // A history fork retains content, but must not adopt its parent's window identity.
-            let child_window_id = initial_auto_compact_window_ids.window_id.to_string();
-            for item in items {
-                if let RolloutItem::Compacted(checkpoint) = item {
-                    checkpoint.window_number = Some(0);
-                    checkpoint.first_window_id = Some(child_window_id.clone());
-                    checkpoint.previous_window_id = None;
-                    checkpoint.window_id = Some(child_window_id.clone());
-                }
-            }
-        }
         let agent_control = agent_control.with_session_id(
             session_id,
             config
@@ -1265,7 +1543,7 @@ impl Session {
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
         // - initialize thread persistence with new or resumed session info
-        // - perform default shell discovery
+        // Host shell discovery is lazy: remote-only/empty selections do not need it.
         // - load history metadata (skipped for subagents)
         #[cfg(test)]
         let (persistence_ready, startup_release) = {
@@ -1365,24 +1643,8 @@ impl Session {
             session_init.ephemeral = config.ephemeral,
         ));
 
-        let default_shell_fut = async {
-            let default_shell = if let Some(user_shell_override) =
-                session_configuration.user_shell_override.clone()
-            {
-                user_shell_override
-            } else {
-                tokio::task::spawn_blocking(shell::default_user_shell)
-                    .await
-                    .context("default shell discovery task failed")?
-            };
-            if default_shell.shell_type == shell::ShellType::PowerShell {
-                let executable = default_shell.shell_path.to_string_lossy().into_owned();
-                drop(tokio::task::spawn_blocking(move || {
-                    codex_shell_command::prewarm_powershell_parser(&executable);
-                }));
-            }
-            Ok::<_, anyhow::Error>(default_shell)
-        };
+        let default_shell =
+            shell::LocalShell::new(session_configuration.user_shell_override.clone());
         let tool_history_fut = async {
             if !config.completed_tool_history_projection || !restores_initial_tool_history {
                 return None;
@@ -1410,10 +1672,17 @@ impl Session {
         let mcp_originator = session_configuration.originator.clone();
         let mcp_runtime_cwd = session_configuration
             .environment_selections()
-            .first()
+            .iter()
+            .find(|selection| {
+                environment_manager
+                    .get_environment(&selection.environment_id)
+                    .is_some_and(|environment| !environment.is_remote())
+            })
             .and_then(|environment| environment.cwd.to_abs_path().ok())
             .map(|cwd| cwd.to_path_buf())
-            .unwrap_or_else(|| session_configuration.cwd().to_path_buf());
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| config.codex_home.to_path_buf())
+            });
         let mcp_runtime_context =
             McpRuntimeContext::new(Arc::clone(&environment_manager), mcp_runtime_cwd);
         let mcp_runtime_context_for_auth = mcp_runtime_context.clone();
@@ -1457,20 +1726,27 @@ impl Session {
             otel.name = "session_init.auth_mcp",
         ));
 
-        // Join all independent futures.
+        // Ledger loading can checkpoint/quarantine during recovery. It is not
+        // independent of target persistence: acquire the existing writer lease
+        // first, retaining its initialization guard through history installation.
+        let persistence_and_history_fut = async {
+            let persistence = thread_persistence_fut.await;
+            let history = if persistence.is_ok() {
+                tool_history_fut.await
+            } else {
+                None
+            };
+            (persistence, history)
+        };
         let (
-            thread_persistence_result,
+            (thread_persistence_result, initial_tool_history),
             state_db_ctx,
             (auth, mcp_projection, mcp_servers, auth_statuses, tool_plugin_provenance),
-            default_shell_result,
-            initial_tool_history,
             config_validation,
         ) = tokio::join!(
-            thread_persistence_fut,
+            persistence_and_history_fut,
             state_db_fut,
             auth_and_mcp_fut,
-            default_shell_fut,
-            tool_history_fut,
             validate_config_lock_if_configured(&session_configuration),
         );
 
@@ -1491,6 +1767,7 @@ impl Session {
                 state_runtime,
             ));
         }
+        let mut runtime_init = SessionRuntimeInitGuard::default();
         let session_result: anyhow::Result<Arc<Self>> = async {
             if initial_multi_agent_version == Some(MultiAgentVersion::V2)
                 && let Some(state_runtime) = state_db_ctx.as_ref()
@@ -1503,11 +1780,59 @@ impl Session {
                         anyhow::anyhow!("failed to initialize typed agent task store: {error}")
                     })?;
             }
+            if config.features.enabled(Feature::Kd4Runtime) {
+                let coordinator = agent_control.task_coordinator();
+                coordinator
+                    .initialize_for_workspace_coordination(
+                        state_db_ctx.clone(),
+                        config.sqlite_home.clone(),
+                        config.model_provider_id.clone(),
+                        session_id.to_string(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to initialize validation task budgets: {error}")
+                    })?;
+                let parent = parent_thread_id
+                    .or(session_configuration.forked_from_thread_id)
+                    .map(|id| id.to_string());
+                let store = coordinator
+                    .store()
+                    .ok_or_else(|| anyhow::anyhow!("validation task store is unavailable"))?;
+                if let Some((task, grant)) = agent_control.inherited_validation_task_scope.as_ref()
+                {
+                    store
+                        .inherit_validation_task_scope(&thread_id.to_string(), task, grant)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to inherit validation task budget: {error}")
+                        })?;
+                } else {
+                    store
+                        .initialize_validation_task(
+                            &thread_id.to_string(),
+                            parent.as_deref(),
+                            matches!(&initial_history, InitialHistory::New) && parent.is_none(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("failed to bind validation task budget: {error}")
+                        })?;
+                }
+            }
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
                 None
             };
+            if let Some(path) = rollout_path.as_ref() {
+                crate::tools::command_output_artifact::retain_external_rollout_ownership(
+                    config.codex_home.as_path(),
+                    &thread_id.to_string(),
+                    path,
+                )
+                .await?;
+            }
             let trace_agent_path = session_configuration
                 .session_source
                 .get_agent_path()
@@ -1535,7 +1860,12 @@ impl Session {
                 // Spawned child threads are part of their root rollout tree. If the
                 // parent had no trace bundle, do not create an orphan child bundle
                 // that looks like an independent rollout.
-                parent_rollout_thread_trace.start_child_thread_trace_or_disabled(trace_metadata)
+                if matches!(&initial_history, InitialHistory::Resumed(_)) {
+                    parent_rollout_thread_trace
+                        .resume_child_thread_trace_or_disabled(trace_metadata)
+                } else {
+                    parent_rollout_thread_trace.start_child_thread_trace_or_disabled(trace_metadata)
+                }
             } else {
                 ThreadTraceContext::start_root_or_disabled(trace_metadata)
             };
@@ -1653,7 +1983,6 @@ impl Session {
                 mcp_servers.keys().map(String::as_str).collect(),
             );
 
-            let default_shell = default_shell_result?;
             let shell_snapshot = if config.features.enabled(Feature::ShellSnapshot) {
                 ShellSnapshot::new(
                     config.codex_home.clone(),
@@ -1669,6 +1998,28 @@ impl Session {
             } else {
                 ShellSnapshot::disabled()
             };
+            // Host shell discovery is lazy only so remote-only, empty and inherited
+            // selections skip it. A newly selected local environment demands it:
+            // finish discovery before that selection is first resolved, so the
+            // environment attaches at creation (instruction sources, Git, skills)
+            // instead of racing its background resolution. A discovery failure is
+            // reported by that environment's own resolution.
+            let inherited_selections = inherited_environments
+                .as_ref()
+                .map(TurnEnvironmentSnapshot::to_selections)
+                .unwrap_or_default();
+            if session_configuration
+                .environment_selections()
+                .iter()
+                .any(|selection| {
+                    !inherited_selections.contains(selection)
+                        && environment_manager
+                            .get_environment(&selection.environment_id)
+                            .is_some_and(|environment| !environment.is_remote())
+                })
+            {
+                let _ = default_shell.resolve().await;
+            }
             let turn_environments = Arc::new(ThreadEnvironments::new(
                 environment_manager,
                 default_shell.clone(),
@@ -1681,7 +2032,7 @@ impl Session {
             // sessions still wait for their selected executor, while deferred sessions
             // retain a `starting` entry and finish initializing without blocking on it.
             let (resolved_environments, thread_name) = tokio::join!(
-                turn_environments.snapshot(),
+                turn_environments.snapshot_for_startup(Arc::clone(&startup_timing)),
                 thread_title_from_thread_store(live_thread_init.as_ref(), &thread_store, thread_id)
                     .instrument(info_span!(
                         "session_init.thread_name_lookup",
@@ -1882,11 +2233,8 @@ impl Session {
                     })
                     .await;
             }
-            let executor_readiness_timing_guard =
-                startup_timing.begin_phase(crate::startup_timing::StartupPhase::ExecutorReadiness);
             let unified_exec_manager =
                 UnifiedExecProcessManager::new(config.background_terminal_max_timeout);
-            drop(executor_readiness_timing_guard);
             let command_execution =
                 crate::tools::command_execution::CommandExecutionLedger::load_or_new(
                     config.codex_home.to_path_buf(),
@@ -1919,7 +2267,7 @@ impl Session {
                 analytics_events_client,
                 hooks: arc_swap::ArcSwap::from_pointee(hooks),
                 rollout_thread_trace,
-                user_shell: Arc::new(default_shell),
+                user_shell: default_shell,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
                 exec_policy,
                 auth_manager: Arc::clone(&auth_manager),
@@ -1973,7 +2321,8 @@ impl Session {
                     attestation_provider,
                     config.http_client_factory(),
                 )
-                .with_shared_http_clients(shared_model_http_clients.as_deref()),
+                .with_shared_http_clients(shared_model_http_clients.as_deref())
+                .with_startup_timing(Arc::clone(&startup_timing)),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::clone(
                     &code_mode_session_provider,
                 ))
@@ -1988,14 +2337,16 @@ impl Session {
                 git_workspace,
             };
             let tool_history_io_gate = Arc::new(Semaphore::new(/*permits*/ 1));
-            let tool_history_persistence = ToolHistoryPersistenceQueue::new(
+            let tool_history_persistence = ToolHistoryPersistenceQueue::new_with_owner(
                 Arc::clone(&tool_history_io_gate),
                 config.codex_home.to_path_buf(),
                 thread_id,
                 state.tool_history_state(),
+                Some(Arc::clone(&storage_ownership)),
             );
             let sess = Arc::new(Session {
                 thread_id,
+                _storage_ownership: std::sync::Mutex::new(Some(storage_ownership)),
                 installation_id,
                 tx_event: tx_event.clone(),
                 agent_status,
@@ -2016,23 +2367,34 @@ impl Session {
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
                 task_start_gate: Arc::new(Semaphore::new(/*permits*/ 1)),
+                pending_work_retry: Default::default(),
                 submission_preparation_slots: Arc::new(Semaphore::new(SUBMISSION_CHANNEL_CAPACITY)),
                 task_start_state: Mutex::new(TaskStartState::default()),
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
+                startup_cancellation: CancellationToken::new(),
                 startup_prepared_router: Default::default(),
                 prepared_tool_router: Default::default(),
                 request_scaffold_cache: Default::default(),
                 turn_config_cache: Default::default(),
                 queued_tool_manifest_hash: Default::default(),
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
+                persistence_tasks: tokio_util::task::TaskTracker::new(),
+                persistence_retirement_result: Default::default(),
+                persistence_shutdown_result: Default::default(),
+                rollout_durability_error: Default::default(),
                 terminal_interaction_pending: std::sync::atomic::AtomicBool::new(false),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 raw_response_items_requested: std::sync::atomic::AtomicBool::new(false),
-                input_queue: InputQueue::new(),
+                raw_user_turn_boundaries_requested: std::sync::atomic::AtomicBool::new(false),
+                input_queue: services
+                    .agent_control
+                    .retained_input_queue(thread_id)
+                    .unwrap_or_else(|| Arc::new(InputQueue::new())),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
             });
+            runtime_init.0 = Some(Arc::clone(&sess));
             if let Some(network_policy_decider_session) = network_policy_decider_session {
                 let mut guard = network_policy_decider_session.write().await;
                 *guard = Arc::downgrade(&sess);
@@ -2094,6 +2456,8 @@ impl Session {
             let codex_apps_auth_manager =
                 codex_mcp::host_owned_codex_apps_enabled(&mcp_projection.config, auth)
                     .then(|| Arc::clone(&sess.services.auth_manager));
+            let elicitation_router = codex_mcp::ElicitationRequestRouter::default();
+            let _startup_route = elicitation_router.startup_route(thread_id);
             let mcp_connection_manager = McpConnectionManager::new(
                 &mcp_servers,
                 config.mcp_oauth_credentials_store_mode,
@@ -2121,7 +2485,7 @@ impl Session {
                 auth,
                 codex_apps_auth_manager,
                 Some(sess.mcp_elicitation_lifecycle()),
-                codex_mcp::ElicitationRequestRouter::default(),
+                elicitation_router,
                 /*previous_manager*/ None,
             )
             .instrument(info_span!(
@@ -2140,7 +2504,6 @@ impl Session {
                 .await?;
             sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
                 .await;
-            sess.schedule_code_mode_prewarm(config.as_ref());
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
                 InitialHistory::New | InitialHistory::Forked(_) => {
@@ -2153,7 +2516,7 @@ impl Session {
             Box::pin(
                 sess.record_initial_history_with_facts(initial_history, startup_rollout_facts),
             )
-            .await;
+            .await?;
             if config.completed_tool_history_projection && restores_initial_tool_history {
                 sess.finalize_initial_tool_history_state(
                     config.codex_home.as_path(),
@@ -2171,10 +2534,12 @@ impl Session {
         .await;
         match session_result {
             Ok(sess) => {
+                runtime_init.0 = None;
                 live_thread_init.commit();
                 Ok(sess)
             }
             Err(err) => {
+                runtime_init.rollback().await;
                 live_thread_init.discard().await;
                 if rollback_created_persistence_on_error {
                     crate::thread_manager::rollback_created_thread_persistence(

@@ -299,32 +299,62 @@ async fn cell_handles_are_isolated_across_local_and_process_sessions_and_restart
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
     let local = InProcessCodeModeSessionProvider;
-    for provider in [&local as &dyn CodeModeSessionProvider, &remote as &dyn CodeModeSessionProvider] {
-        let original = provider.create_session(Arc::new(RecordingDelegate::default())).await.unwrap();
-        let mut request = execute_request("await yield_control(); await new Promise(resolve => setTimeout(resolve, 3_600_000));");
+    for provider in [
+        &local as &dyn CodeModeSessionProvider,
+        &remote as &dyn CodeModeSessionProvider,
+    ] {
+        let original = provider
+            .create_session(Arc::new(RecordingDelegate::default()))
+            .await
+            .unwrap();
+        let mut request = execute_request(
+            "await yield_control(); await new Promise(resolve => setTimeout(resolve, 3_600_000));",
+        );
         request.yield_time_ms = Some(60_000);
         let started = original.execute(request.clone()).await.unwrap();
         let old_id = started.cell_id.clone();
-        assert!(matches!(started.initial_response().await.unwrap(), RuntimeResponse::ExplicitYield { .. }));
+        assert!(matches!(
+            started.initial_response().await.unwrap(),
+            RuntimeResponse::ExplicitYield { .. }
+        ));
         for restarted in [false, true] {
             if restarted {
                 original.shutdown().await.unwrap();
             }
-            let other = provider.create_session(Arc::new(RecordingDelegate::default())).await.unwrap();
+            let other = provider
+                .create_session(Arc::new(RecordingDelegate::default()))
+                .await
+                .unwrap();
             let started = other.execute(request.clone()).await.unwrap();
             let own_id = started.cell_id.clone();
-            assert_ne!(old_id, own_id, "runtime incarnation must survive neither fork nor nondurable restart");
-            assert!(matches!(started.initial_response().await.unwrap(), RuntimeResponse::ExplicitYield { .. }));
-            let foreign = other.wait(WaitRequest {
-                cell_id: old_id.clone(), yield_time_ms: 1, recovery: None,
-            }).await;
-            assert!(matches!(foreign, Err(_) | Ok(WaitOutcome::MissingCell(_))),
-                "foreign wait must not observe another live cell: {foreign:?}");
+            assert_ne!(
+                old_id, own_id,
+                "runtime incarnation must survive neither fork nor nondurable restart"
+            );
+            assert!(matches!(
+                started.initial_response().await.unwrap(),
+                RuntimeResponse::ExplicitYield { .. }
+            ));
+            let foreign = other
+                .wait(WaitRequest {
+                    cell_id: old_id.clone(),
+                    yield_time_ms: 1,
+                    recovery: None,
+                })
+                .await;
+            assert!(
+                matches!(foreign, Err(_) | Ok(WaitOutcome::MissingCell(_))),
+                "foreign wait must not observe another live cell: {foreign:?}"
+            );
             let foreign = other.terminate(old_id.clone()).await;
-            assert!(matches!(foreign, Err(_) | Ok(WaitOutcome::MissingCell(_))),
-                "foreign terminate must not terminate another live cell: {foreign:?}");
-            assert!(matches!(other.terminate(own_id).await.unwrap(),
-                WaitOutcome::LiveCell(RuntimeResponse::Terminated { .. })));
+            assert!(
+                matches!(foreign, Err(_) | Ok(WaitOutcome::MissingCell(_))),
+                "foreign terminate must not terminate another live cell: {foreign:?}"
+            );
+            assert!(matches!(
+                other.terminate(own_id).await.unwrap(),
+                WaitOutcome::LiveCell(RuntimeResponse::Terminated { .. })
+            ));
             other.shutdown().await.unwrap();
         }
     }
@@ -347,7 +377,8 @@ async fn first_wait_in_replacement_host_recovers_original_receipt() {
             input_schema: None,
             default_timeout_ms: None,
             output_schema: None,
-        }].into(),
+        }]
+        .into(),
         ..execute_request(
             r#"await tools.echo({}); store("kept", 1); text("original host receipt");"#,
         )
@@ -363,10 +394,20 @@ async fn first_wait_in_replacement_host_recovers_original_receipt() {
     drop(provider);
     let replacement = ProcessOwnedCodeModeSessionProvider::with_host_program(program);
     let session = replacement.create_session(delegate.clone()).await.unwrap();
-    assert_eq!(session.wait(WaitRequest {
-        cell_id: id, yield_time_ms: 1,
-        recovery: Some(codex_code_mode::ReceiptRecovery { path, terminal_only: false }),
-    }).await.unwrap(), WaitOutcome::LiveCell(original));
+    assert_eq!(
+        session
+            .wait(WaitRequest {
+                cell_id: id,
+                yield_time_ms: 1,
+                recovery: Some(codex_code_mode::ReceiptRecovery {
+                    path,
+                    terminal_only: false
+                }),
+            })
+            .await
+            .unwrap(),
+        WaitOutcome::LiveCell(original)
+    );
     assert_eq!(delegate.invocations.lock().unwrap().len(), 1);
     session.shutdown().await.unwrap();
 }
@@ -454,7 +495,8 @@ async fn nested_tool_input_presence_reaches_local_and_remote_delegates() {
                     input_schema: None,
                     default_timeout_ms: None,
                     output_schema: None,
-                }].into(),
+                }]
+                .into(),
                 ..execute_request(
                     r#"
 const absent = await tools.echo();
@@ -577,7 +619,8 @@ async fn remote_dropped_initial_response_keeps_the_cell_available_for_terminatio
                 input_schema: None,
                 default_timeout_ms: None,
                 output_schema: None,
-            }].into(),
+            }]
+            .into(),
             yield_time_ms: Some(60_000),
             ..execute_request("await tools.tool_call_slow({});")
         })
@@ -625,7 +668,7 @@ async fn remote_session_persists_values_forwards_delegates_and_controls_cells() 
         .await
         .expect("create remote session");
 
-    let stored = execute(&session, execute_request(r#"store("key", "persisted");"#),).await;
+    let stored = execute(&session, execute_request(r#"store("key", "persisted");"#)).await;
     let stored_id = response_cell_id(&stored);
     assert_eq!(
         stored,
@@ -653,7 +696,8 @@ text(result.value);
         input_schema: None,
         default_timeout_ms: None,
         output_schema: None,
-    }].into();
+    }]
+    .into();
     let callback = execute(&session, callback_request).await;
     let callback_id = response_cell_id(&callback);
     assert_eq!(
@@ -706,10 +750,15 @@ text(result.value);
     );
     assert_eq!(
         *delegate.notifications.lock().expect("notifications lock"),
-        vec![("call-2".to_string(), callback_id.clone(), "notice".to_string())]
+        vec![(
+            "call-2".to_string(),
+            callback_id.clone(),
+            "notice".to_string()
+        )]
     );
 
-    let mut pending_request = execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
+    let mut pending_request =
+        execute_request("await new Promise(resolve => setTimeout(resolve, 60_000));");
     pending_request.tool_call_id = "call-3".to_string();
     pending_request.yield_time_ms = Some(1);
     let pending = execute(&session, pending_request).await;
@@ -761,21 +810,43 @@ async fn nested_poll_deadlines_survive_stdio_with_and_without_explicit_options()
     let delegate = Arc::new(RecordingDelegate::default());
     let session = provider.create_session(delegate.clone()).await.unwrap();
     for (source, expected_ms) in [
-        ("await tools.write_stdin({session_id: 7, yield_time_ms: 300000});", Some(315_000)),
-        ("await tools.write_stdin({session_id: 7, yield_time_ms: 300000}, {timeout_ms: 15000});", Some(15_000)),
+        (
+            "await tools.write_stdin({session_id: 7, yield_time_ms: 300000});",
+            Some(315_000),
+        ),
+        (
+            "await tools.write_stdin({session_id: 7, yield_time_ms: 300000}, {timeout_ms: 15000});",
+            Some(15_000),
+        ),
         // Passive observation deliberately has no wrapper deadline; the cell idle bound owns it.
-        ("await tools.write_stdin({session_id: 7, wait_for_output: true});", None),
-        ("await tools.write_stdin({session_id: 7, wait_for_output: true}, {timeout_ms: 15000});", Some(15_000)),
+        (
+            "await tools.write_stdin({session_id: 7, wait_for_output: true});",
+            None,
+        ),
+        (
+            "await tools.write_stdin({session_id: 7, wait_for_output: true}, {timeout_ms: 15000});",
+            Some(15_000),
+        ),
     ] {
         let mut request = execute_request(source);
         request.enabled_tools = vec![ToolDefinition {
-            name: "write_stdin".to_string(), tool_name: ToolName::plain("write_stdin"),
-            description: "".into(), kind: CodeModeToolKind::Function,
-            input_schema: None, default_timeout_ms: Some(315_000), output_schema: None,
-        }].into();
+            name: "write_stdin".to_string(),
+            tool_name: ToolName::plain("write_stdin"),
+            description: "".into(),
+            kind: CodeModeToolKind::Function,
+            input_schema: None,
+            default_timeout_ms: Some(315_000),
+            output_schema: None,
+        }]
+        .into();
         let before_execute = std::time::Instant::now();
-        assert!(matches!(execute_to_terminal(&session, request).await,
-            RuntimeResponse::Result { error_text: None, .. }));
+        assert!(matches!(
+            execute_to_terminal(&session, request).await,
+            RuntimeResponse::Result {
+                error_text: None,
+                ..
+            }
+        ));
         let calls = delegate.invocations.lock().unwrap();
         let deadline = calls.last().unwrap().nested_deadline;
         match expected_ms {

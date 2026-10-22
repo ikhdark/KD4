@@ -384,6 +384,20 @@ async fn concurrent_patch_note(
     crate::live_sessions::overlapping_edits(&others, &paths, turn.cwd().as_path())
 }
 
+fn hunk_endpoints(hunks: &[Hunk]) -> Vec<PathBuf> {
+    hunks
+        .iter()
+        .flat_map(|hunk| match hunk {
+            Hunk::AddFile { path, .. } | Hunk::DeleteFile { path } => vec![path.clone()],
+            Hunk::UpdateFile {
+                path, move_path, ..
+            } => std::iter::once(path.clone())
+                .chain(move_path.iter().cloned())
+                .collect(),
+        })
+        .collect()
+}
+
 async fn effective_patch_permissions(
     session: &Session,
     turn: &TurnContext,
@@ -541,7 +555,7 @@ impl ApplyPatchHandler {
         let (retry_id, retry_scope, parsed) = match retry {
             Some(retry) => (
                 Some(retry.id),
-                Some((retry.environment_id, retry.cwd)),
+                Some((retry.environment_id, retry.environment_instance, retry.cwd)),
                 Ok(retry.args),
             ),
             None => (None, None, codex_apply_patch::parse_patch(&patch_input)),
@@ -579,22 +593,14 @@ impl ApplyPatchHandler {
             })
             .sum();
         let retained_input = args.patch.clone();
-        let hunk_paths = args
-            .hunks
-            .iter()
-            .map(|hunk| match hunk {
-                Hunk::AddFile { path, .. }
-                | Hunk::DeleteFile { path }
-                | Hunk::UpdateFile { path, .. } => path.clone(),
-            })
-            .collect::<Vec<_>>();
+        let hunk_paths = hunk_endpoints(&args.hunks);
         let cancellation = cancellation_token.clone();
         let result = async {
             let selected_environment_id =
                 require_environment_id(args.environment_id.as_deref(), self.multi_environment)?;
 
             // Verify the parsed patch against the selected environment filesystem.
-            let turn_environment = crate::tools::handlers::wait_for_tool_environment(
+            let turn_environment = crate::tools::handlers::wait_for_observed_tool_environment(
                 &step_context.environments,
                 selected_environment_id.as_deref(),
                 &cancellation_token,
@@ -605,8 +611,11 @@ impl ApplyPatchHandler {
                     "apply_patch requires a selected execution environment.".to_string(),
                 ));
             };
-            if retry_scope.as_ref().is_some_and(|(id, cwd)| {
-                id != &turn_environment.environment_id || cwd != turn_environment.cwd()
+            tracker.lock().await.observe_environment_scope(&step_context.environments, turn_environment);
+            if retry_scope.as_ref().is_some_and(|(id, instance, cwd)| {
+                id != &turn_environment.environment_id
+                    || instance != &turn_environment.owner_id()
+                    || cwd != turn_environment.cwd()
             }) {
                 return Err(FunctionCallError::RespondToModel(
                     "retained patch belongs to a different execution environment or working directory".into(),
@@ -667,7 +676,7 @@ impl ApplyPatchHandler {
                                 changes.clone(),
                                 apply.auto_approved,
                                 turn_environment.environment_id.clone(),
-                            );
+                            ).with_captured_environment(turn_environment);
                             let req = ApplyPatchRequest {
                                 cancellation_token,
                                 turn_environment: turn_environment.clone(),
@@ -741,6 +750,7 @@ impl ApplyPatchHandler {
                     let retry = session.services.retained_patches.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .retain(&retained_input, &turn_environment.environment_id,
+                            &turn_environment.owner_id(),
                             turn_environment.cwd(), &Default::default(), observed_source);
                     let note =
                         concurrent_patch_note(&session, &turn, turn_environment, &hunk_paths).await;
@@ -896,9 +906,11 @@ impl CoreToolRuntime for ApplyPatchHandler {
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel("retained patch environment is not ready".into())
             })?;
-            if environment.cwd() != &retry.cwd {
+            if environment.cwd() != &retry.cwd
+                || environment.owner_id() != retry.environment_instance
+            {
                 return Err(FunctionCallError::RespondToModel(
-                    "retained patch working directory changed".into(),
+                    "retained patch environment owner or working directory changed".into(),
                 ));
             }
             let receipt = retained
@@ -1108,6 +1120,7 @@ async fn run_owned_patch(
                             .retain(
                                 &req.action.patch,
                                 &req.turn_environment.environment_id,
+                                &req.turn_environment.owner_id(),
                                 &req.action.cwd,
                                 runtime.committed_delta(),
                                 None,
@@ -1215,7 +1228,8 @@ pub(crate) async fn intercept_apply_patch(
                         changes.clone(),
                         apply.auto_approved,
                         turn_environment.environment_id.clone(),
-                    );
+                    )
+                    .with_captured_environment(&turn_environment);
                     let req = ApplyPatchRequest {
                         cancellation_token,
                         turn_environment,

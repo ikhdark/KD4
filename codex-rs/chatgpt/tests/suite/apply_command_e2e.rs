@@ -238,8 +238,7 @@ console.log(fib(10));
         .await
         .expect_err("Expected apply to fail due to merge conflicts");
     assert!(
-        error.to_string().contains("Git apply failed")
-            && error.to_string().contains("conflicts=1"),
+        error.to_string().contains("Git apply failed") && error.to_string().contains("conflicts=1"),
         "expected a reported patch conflict, got: {error}"
     );
 

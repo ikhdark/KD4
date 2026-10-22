@@ -606,6 +606,7 @@ pub(crate) async fn inspect_pending_input(
             .await
         }
         TurnInput::ResponseItem(_)
+        | TurnInput::AdditionalContext(_)
         | TurnInput::InternalResponseItem(_)
         | TurnInput::InterAgentCommunication(_) => HookRuntimeOutcome::default(),
     }
@@ -618,6 +619,10 @@ pub(crate) async fn record_pending_input(
     additional_contexts: Vec<String>,
 ) -> std::io::Result<()> {
     match pending_input {
+        TurnInput::AdditionalContext(values) => {
+            sess.record_additional_context_snapshot(turn_context, values)
+                .await?;
+        }
         TurnInput::UserInput { content, client_id } => {
             sess.record_user_prompt_and_emit_turn_item(turn_context, content.as_slice(), client_id)
                 .await?;
@@ -862,11 +867,32 @@ pub(crate) async fn prepare_additional_context_items(
     if additional_contexts.is_empty() {
         return Vec::new();
     }
-    let (messages, omitted) = {
+    let (mut messages, omitted_contexts) = {
         let mut budget = turn_context.hook_context_budget.lock().await;
         additional_context_messages_with_budget(additional_contexts, &mut budget)
     };
+    let omitted = omitted_contexts.len();
     if omitted > 0 {
+        // Retain outside the shared budget lock. A blocked/failed store must not hold
+        // admission hostage, and failure must still leave model-visible disclosure.
+        let recovery = sess
+            .retain_context_source(
+                "hook_additional_context",
+                serde_json::json!(
+                    omitted_contexts
+                        .into_iter()
+                        .map(|text| { serde_json::json!({"role": "developer", "text": text}) })
+                        .collect::<Vec<_>>()
+                ),
+            )
+            .await;
+        if let Err(error) = &recovery {
+            tracing::warn!(%error, "could not retain omitted hook context");
+        }
+        messages.push(hook_context_omission_notice(
+            omitted,
+            recovery.as_ref().ok(),
+        ));
         sess.send_event(
             turn_context,
             EventMsg::Warning(WarningEvent {
@@ -882,22 +908,47 @@ pub(crate) async fn prepare_additional_context_items(
 
 #[cfg(test)]
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {
-    additional_context_messages_with_budget(additional_contexts, &mut ModelContextBudget::default())
-        .0
+    let (mut messages, omitted) = additional_context_messages_with_budget(
+        additional_contexts,
+        &mut ModelContextBudget::default(),
+    );
+    if !omitted.is_empty() {
+        messages.push(hook_context_omission_notice(omitted.len(), None));
+    }
+    messages
+}
+
+// A separate bounded control envelope cannot be consumed by optional hook bodies.
+const HOOK_CONTEXT_CONTROL_BYTES: usize = 1024;
+
+fn hook_context_omission_notice(omitted: usize, recovery: Option<&Value>) -> ResponseItem {
+    let prefix = format!(
+        "Omitted {omitted} whole hook context fragment(s) due to the context budget; no partial instructions were admitted. "
+    );
+    let mut notice = match recovery {
+        Some(recovery) => format!(
+            "{prefix}Recover the exact source before acting on it; preserve its original role/authority, not fresh verification. Recovery: {recovery}"
+        ),
+        None => format!("{prefix}Recovery unavailable; the missing context remains unresolved."),
+    };
+    if notice.len() > HOOK_CONTEXT_CONTROL_BYTES {
+        notice = format!("{prefix}Recovery unavailable: source locator exceeds the control limit.");
+    }
+    ContextualUserFragment::into(RenderedContextFragment::new("developer", notice))
 }
 
 fn additional_context_messages_with_budget(
     additional_contexts: Vec<String>,
     budget: &mut ModelContextBudget,
-) -> (Vec<ResponseItem>, usize) {
-    let mut omitted = 0;
-    let mut messages = additional_contexts
+) -> (Vec<ResponseItem>, Vec<String>) {
+    let mut omitted = Vec::new();
+    let messages = additional_contexts
         .into_iter()
         .map(HookAdditionalContext::new)
         .filter_map(|fragment| {
             let text = fragment.render();
             if !budget.try_take(&text) {
-                omitted += 1;
+                omitted.push(text);
                 return None;
             }
             Some(ContextualUserFragment::into(RenderedContextFragment::new(
@@ -906,17 +957,6 @@ fn additional_context_messages_with_budget(
             )))
         })
         .collect::<Vec<_>>();
-    if omitted > 0 {
-        let notice = format!(
-            "Omitted {omitted} whole hook context fragment(s) due to the context budget; no partial instructions were admitted."
-        );
-        if budget.try_take(&notice) {
-            messages.push(ContextualUserFragment::into(RenderedContextFragment::new(
-                "developer",
-                notice,
-            )));
-        }
-    }
     (messages, omitted)
 }
 
@@ -1210,11 +1250,15 @@ mod tests {
             vec![admitted.clone(), "omitted context".to_string()],
         )
         .await;
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
         assert_eq!(
             super::single_developer_input_text(&messages[0]),
             Some(admitted.as_str())
         );
+        let notice = super::single_developer_input_text(&messages[1]).unwrap();
+        assert!(notice.starts_with("Omitted 1 whole hook context fragment"));
+        assert!(notice.contains("read_tool_output"));
+        assert!(notice.len() <= super::HOOK_CONTEXT_CONTROL_BYTES);
         let codex_protocol::protocol::EventMsg::Warning(warning) =
             events.try_recv().expect("omitted context warning").msg
         else {
@@ -1233,14 +1277,103 @@ mod tests {
         let messages =
             prepare_additional_context_items(&session, &turn, vec!["small context".to_string()])
                 .await;
-        assert!(
-            messages.is_empty(),
-            "later contributions share the turn allowance"
+        assert_eq!(
+            messages.len(),
+            1,
+            "only the control envelope bypasses the allowance"
         );
+        let notice = super::single_developer_input_text(&messages[0]).unwrap();
+        assert!(notice.starts_with("Omitted 1 whole hook context fragment"));
+        assert!(notice.contains("read_tool_output"));
+        assert_eq!(turn.hook_context_budget.lock().await.remaining_bytes(), 0);
         assert!(matches!(
             events.try_recv().expect("budget warning").msg,
             EventMsg::Warning(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn exhausted_hook_budget_retains_late_constraint_and_upstream_locator() {
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_rx().await;
+        let leading = ['A', 'B', 'C', 'D'].map(|c| c.to_string().repeat(10_000));
+        let admitted = prepare_additional_context_items(&session, &turn, leading.to_vec()).await;
+        assert_eq!(admitted.len(), 4);
+        assert_eq!(turn.hook_context_budget.lock().await.remaining_bytes(), 0);
+        let missing = vec![
+            "For this task, preserve the existing API compatibility.".to_string(),
+            "Full hook output saved to: C:\\temp\\hook_outputs\\source.txt".to_string(),
+            "Keep Unicode qualifiers intact: 日本語 — café.".to_string(),
+        ];
+        let messages = prepare_additional_context_items(&session, &turn, missing.clone()).await;
+        assert_eq!(messages.len(), 1);
+        let notice = super::single_developer_input_text(&messages[0]).unwrap();
+        assert!(notice.starts_with("Omitted 3 whole"));
+        assert!(notice.len() <= super::HOOK_CONTEXT_CONTROL_BYTES);
+        let (_, recovery) = notice
+            .split_once("Recovery: ")
+            .expect("real source recovery");
+        let recovery: serde_json::Value = serde_json::from_str(recovery).unwrap();
+        let source = crate::tools::command_output_artifact::read_complete_canonical_snapshot(
+            &session.codex_home().await,
+            &session.thread_id().to_string(),
+            recovery["artifact_id"].as_str().unwrap(),
+            16_384,
+        )
+        .await
+        .unwrap();
+        let source: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        assert_eq!(
+            source["items"],
+            serde_json::json!(
+                missing
+                    .iter()
+                    .map(|text| { serde_json::json!({"role": "developer", "text": text}) })
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert!(
+            prepare_additional_context_items(&session, &turn, Vec::new())
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_omission_discloses_retention_failure() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("tool-output"), "not a directory").unwrap();
+        let (session, turn, _events) =
+            crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
+                |_| {},
+            )
+            .await;
+        *turn.hook_context_budget.lock().await = ModelContextBudget::new(0);
+        let messages =
+            prepare_additional_context_items(&session, &turn, vec!["missing constraint".into()])
+                .await;
+        assert_eq!(messages.len(), 1);
+        let notice = super::single_developer_input_text(&messages[0]).unwrap();
+        assert!(notice.contains("Recovery unavailable"));
+        assert!(notice.contains("unresolved"));
+        assert!(!notice.contains("artifact_id"));
+    }
+
+    #[test]
+    fn hook_omission_control_is_bounded_and_honest_without_recovery() {
+        for recovery in [
+            None,
+            Some(serde_json::json!({"artifact_id": "x".repeat(2000)})),
+        ] {
+            let item = super::hook_context_omission_notice(usize::MAX, recovery.as_ref());
+            let notice = super::single_developer_input_text(&item).unwrap();
+            assert!(notice.len() <= super::HOOK_CONTEXT_CONTROL_BYTES);
+            assert!(notice.contains("Recovery unavailable"));
+            assert!(!notice.contains("Recovery: "));
+        }
     }
 
     #[tokio::test]

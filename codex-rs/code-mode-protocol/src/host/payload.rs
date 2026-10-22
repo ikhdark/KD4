@@ -182,7 +182,12 @@ impl TryFrom<ExecuteRequest> for WireExecuteRequest {
             catalog: None,
             state_path: value.state_path,
             tool_call_id: value.tool_call_id,
-            enabled_tools: value.enabled_tools.iter().cloned().map(Into::into).collect(),
+            enabled_tools: value
+                .enabled_tools
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
             source: value.source,
             yield_time_ms: value.yield_time_ms,
             max_output_tokens,

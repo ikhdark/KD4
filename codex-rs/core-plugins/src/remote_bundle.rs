@@ -1176,9 +1176,15 @@ mod tests {
 
         assert!(matches!(
             err,
-            RemotePluginBundleInstallError::ExtractedBundleTooLarge { bytes: 8, max_bytes: 6 }
+            RemotePluginBundleInstallError::ExtractedBundleTooLarge {
+                bytes: 8,
+                max_bytes: 6
+            }
         ));
-        assert_eq!(std::fs::read(destination.path().join("a.txt")).unwrap(), b"1234");
+        assert_eq!(
+            std::fs::read(destination.path().join("a.txt")).unwrap(),
+            b"1234"
+        );
         assert!(!destination.path().join("b.txt").exists());
     }
 

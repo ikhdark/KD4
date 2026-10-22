@@ -199,6 +199,10 @@ export class CodexExec {
 
     let spawnError: unknown | null = null;
     let processExited = false;
+    let processStarted = child.pid !== undefined;
+    child.once("spawn", () => {
+      processStarted = true;
+    });
     child.once("error", (err) => (spawnError = err));
 
     if (!child.stdin) {
@@ -234,12 +238,14 @@ export class CodexExec {
 
     let stdoutDrainTimer: ReturnType<typeof setTimeout> | undefined;
     let stdoutClosed = false;
+    let stdoutDrainStopped = false;
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolve) => {
         child.once("exit", (code, signal) => {
           processExited = true;
           if (!stdoutClosed) {
             stdoutDrainTimer = setTimeout(() => {
+              stdoutDrainStopped = true;
               rl.close();
               child.stdout?.destroy();
             }, STDOUT_DRAIN_GRACE_MS);
@@ -257,30 +263,64 @@ export class CodexExec {
       stdoutClosed = true;
       clearTimeout(stdoutDrainTimer);
     });
+    const abortReading = () => {
+      spawnError ??= Object.assign(new Error("The operation was aborted"), {
+        name: "AbortError",
+        code: "ABORT_ERR",
+        cause: args.signal?.reason,
+      });
+      rl.close();
+      child.stdout?.destroy();
+    };
+    const stopOnSpawnError = () => {
+      rl.close();
+      child.stdout?.destroy();
+    };
+    child.on("error", stopOnSpawnError);
+    args.signal?.addEventListener("abort", abortReading, { once: true });
+    if (args.signal?.aborted) abortReading();
 
     try {
-      for await (const line of rl) {
-        // `line` is a string (Node sets default encoding to utf8 for readline)
-        yield line as string;
+      // A pre-aborted signal closes the interface before iteration starts, and
+      // async iteration over an already closed readline interface never ends.
+      if (!stdoutClosed) {
+        for await (const line of rl) {
+          // `line` is a string (Node sets default encoding to utf8 for readline)
+          yield line as string;
+        }
       }
 
       if (spawnError) throw spawnError;
       const { code, signal } = await exitPromise;
+      const stderrComplete = await resolvesBeforeDeadline(
+        stderrDrainedPromise,
+        STDERR_DRAIN_GRACE_MS,
+      );
       if (code !== 0 || signal) {
-        await resolvesBeforeDeadline(stderrDrainedPromise, STDERR_DRAIN_GRACE_MS);
         const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`;
         throw new Error(`Codex Exec exited with ${detail}: ${stderrTail.render()}`);
       }
+      if (stdoutDrainStopped || !stderrComplete) {
+        throw new Error(
+          `Codex Exec exited with code 0, but output capture did not reach EOF: ${stderrTail.render()}`,
+        );
+      }
       if (stdinError) throw stdinError;
     } finally {
+      args.signal?.removeEventListener("abort", abortReading);
+      child.off("error", stopOnSpawnError);
       clearTimeout(stdoutDrainTimer);
       rl.close();
       try {
-        if (!processExited) child.kill("SIGTERM");
+        if (!processExited && (!spawnError || processStarted) && !child.killed)
+          child.kill("SIGTERM");
       } catch {
         // ignore
       }
-      if (!spawnError && !processExited) {
+      // Abort emits an error even for an already spawned root. It still needs
+      // the same bounded escalation as iterator cancellation; only a genuine
+      // pre-spawn failure has no process to reap.
+      if ((!spawnError || processStarted) && !processExited) {
         const exitedGracefully = await resolvesBeforeDeadline(
           exitPromise,
           CHILD_TERMINATION_GRACE_MS,
@@ -401,7 +441,8 @@ function flattenConfigOverrides(
     if (child === undefined) {
       continue;
     }
-    const path = prefix ? `${prefix}.${key}` : key;
+    const segment = formatTomlKey(key);
+    const path = prefix ? `${prefix}.${segment}` : segment;
     if (isPlainObject(child)) {
       flattenConfigOverrides(child, path, overrides);
     } else {
@@ -485,9 +526,10 @@ function findCodexPath(): CodexPathResolution {
   }
 
   const dependency = manifest.optionalDependencies?.[nativeTarget.package];
-  const expectedVersion = typeof dependency === "string" && dependency.startsWith("npm:")
-    ? dependency.slice(dependency.lastIndexOf("@") + 1)
-    : dependency;
+  const expectedVersion =
+    typeof dependency === "string" && dependency.startsWith("npm:")
+      ? dependency.slice(dependency.lastIndexOf("@") + 1)
+      : dependency;
   if (typeof expectedVersion !== "string" || !expectedVersion) {
     throw new Error(`Invalid native dependency metadata for ${nativeTarget.package}`);
   }

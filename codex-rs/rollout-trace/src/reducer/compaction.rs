@@ -52,6 +52,8 @@ impl TraceReducer {
             );
         }
 
+        let owner = turn.execution.clone();
+        let codex_turn_id = started.codex_turn_id.clone();
         self.rollout.compaction_requests.insert(
             started.compaction_request_id.clone(),
             CompactionRequest {
@@ -67,11 +69,23 @@ impl TraceReducer {
                     status: ExecutionStatus::Running,
                 },
                 model: started.model,
+                observed_terminal_status: None,
+                owner_end: None,
                 provider_name: started.provider_name,
-                raw_request_payload_id: started.request_payload.raw_payload_id,
+                raw_request_payload_id: started
+                    .request_payload
+                    .map(|payload| payload.raw_payload_id),
                 raw_response_payload_id: None,
             },
         );
+        if let Some((end_seq, end_time)) = owner.ended_seq.zip(owner.ended_at_unix_ms) {
+            self.close_running_compaction_requests_for_turn_end(
+                end_seq,
+                end_time,
+                &codex_turn_id,
+                &owner.status,
+            );
+        }
         Ok(())
     }
 
@@ -103,11 +117,40 @@ impl TraceReducer {
                 request.compaction_id
             );
         }
+        if request.observed_terminal_status.is_some() {
+            return Ok(());
+        }
+        request.observed_terminal_status = Some(status.clone());
         request.execution.ended_at_unix_ms = Some(wall_time_unix_ms);
         request.execution.ended_seq = Some(seq);
         request.execution.status = status;
         request.raw_response_payload_id = response_payload.map(|payload| payload.raw_payload_id);
         Ok(())
+    }
+
+    /// Bound abandoned observations without claiming a provider terminal.
+    pub(super) fn close_running_compaction_requests_for_turn_end(
+        &mut self,
+        seq: RawEventSeq,
+        wall_time_unix_ms: i64,
+        codex_turn_id: &str,
+        turn_status: &ExecutionStatus,
+    ) {
+        let status = match turn_status {
+            ExecutionStatus::Running => return,
+            ExecutionStatus::Completed | ExecutionStatus::Cancelled => ExecutionStatus::Cancelled,
+            other => other.clone(),
+        };
+        for request in self.rollout.compaction_requests.values_mut() {
+            if request.codex_turn_id == codex_turn_id
+                && request.execution.status == ExecutionStatus::Running
+            {
+                request.execution.ended_at_unix_ms = Some(wall_time_unix_ms);
+                request.execution.ended_seq = Some(seq);
+                request.execution.status = status.clone();
+                request.owner_end = Some(request.execution.clone());
+            }
+        }
     }
 
     /// Installs a compaction checkpoint into the reduced conversation graph.
@@ -186,5 +229,66 @@ pub(super) struct StartedCompactionRequest {
     pub(super) codex_turn_id: String,
     pub(super) model: String,
     pub(super) provider_name: String,
-    pub(super) request_payload: RawPayloadRef,
+    pub(super) request_payload: Option<RawPayloadRef>,
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::raw_event::RawTraceEventPayload;
+    use crate::reducer::test_support::ROOT_THREAD_ID;
+    use crate::reducer::test_support::create_started_writer;
+    use crate::reducer::test_support::start_turn;
+
+    #[test]
+    fn abandoned_compaction_is_bounded_and_late_success_refines_only_the_request() -> Result<()> {
+        for delayed_start in [false, true] {
+            let temp = tempfile::TempDir::new()?;
+            let writer = std::sync::Arc::new(create_started_writer(&temp)?);
+            start_turn(&writer, "turn")?;
+            let context = crate::CompactionTraceContext::enabled(
+                std::sync::Arc::clone(&writer),
+                ROOT_THREAD_ID.into(),
+                "turn".into(),
+                "compaction".into(),
+                "model".into(),
+                "provider".into(),
+            );
+            let start = || context.start_attempt(&serde_json::json!({"input": []}));
+            let early = (!delayed_start).then(start);
+            let owner_end = writer.append(RawTraceEventPayload::CodexTurnEnded {
+                codex_turn_id: "turn".into(),
+                status: ExecutionStatus::Cancelled,
+            })?;
+            let attempt = early.unwrap_or_else(start);
+            // An enrichment clone is not the owner and must not close a request.
+            drop(attempt.clone());
+            let partial = crate::replay_bundle(temp.path())?;
+            let request = partial.compaction_requests.values().next().unwrap();
+            assert_eq!(request.execution.status, ExecutionStatus::Cancelled);
+            assert_eq!(request.observed_terminal_status, None);
+            assert_eq!(
+                request.owner_end.as_ref().unwrap().ended_seq,
+                Some(owner_end.seq)
+            );
+            attempt.record_completed(&[]);
+            attempt.record_failed("duplicate cannot override physical success");
+            let rollout = crate::replay_bundle(temp.path())?;
+            let request = rollout.compaction_requests.values().next().unwrap();
+            assert_eq!(
+                request.observed_terminal_status,
+                Some(ExecutionStatus::Completed)
+            );
+            assert_eq!(request.execution.status, ExecutionStatus::Completed);
+            assert_eq!(
+                rollout.codex_turns["turn"].execution.status,
+                ExecutionStatus::Cancelled
+            );
+            assert!(
+                rollout.compactions.is_empty(),
+                "request success cannot install history"
+            );
+        }
+        Ok(())
+    }
 }

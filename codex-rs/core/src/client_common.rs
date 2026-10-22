@@ -2,6 +2,7 @@ use crate::context::PromptProvenanceSidecar;
 use crate::stable_context::StableContextManifest;
 use crate::tool_history::ToolHistorySubstitution;
 pub use codex_api::ResponseEvent;
+use codex_api::response_event_channel::ResponseEventReceiver;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -22,7 +23,6 @@ use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Stable identities of the three model-visible prompt domains that dominate
@@ -230,6 +230,47 @@ impl Default for Prompt {
 }
 
 impl Prompt {
+    /// One content-based recipe for admission and calibration. Images use the
+    /// shared modality estimator, never the size of their wire base64 strings.
+    pub(crate) fn budget_tokens_for_input(&self, input: &[ResponseItem]) -> i64 {
+        let history = input
+            .iter()
+            .map(crate::context_manager::estimate_item_token_count)
+            .fold(0i64, i64::saturating_add);
+        history
+            .saturating_add(
+                i64::try_from(self.base_instructions.text.len().div_ceil(4)).unwrap_or(i64::MAX),
+            )
+            .saturating_add(
+                i64::try_from(self.tools.serialized().len().div_ceil(4)).unwrap_or(i64::MAX),
+            )
+            .saturating_add(output_schema_tokens(
+                self.output_schema.as_ref(),
+                self.output_schema_strict,
+            ))
+    }
+
+    pub(crate) fn calibration_basis(&self, input: Arc<[ResponseItem]>) -> PromptCalibrationBasis {
+        self.calibration_basis_with_prefix(input, 0)
+    }
+
+    pub(crate) fn calibration_basis_with_prefix(
+        &self,
+        input: Arc<[ResponseItem]>,
+        input_start: usize,
+    ) -> PromptCalibrationBasis {
+        let input_start = input_start.min(input.len());
+        PromptCalibrationBasis {
+            local_tokens: self.budget_tokens_for_input(&input[input_start..]),
+            input,
+            input_start,
+            tools: self.tools.digest(),
+            base_instructions: self.base_instructions.clone(),
+            output_schema: self.output_schema.clone(),
+            strict: self.output_schema_strict,
+        }
+    }
+
     pub(crate) fn measured_stable_context_manifest(&self) -> StableContextManifest {
         self.deferred_dynamic_history.as_ref().map_or_else(
             || self.stable_context_manifest.clone(),
@@ -291,6 +332,36 @@ impl Prompt {
         } else {
             &self.tool_history_substitutions
         }
+    }
+}
+
+/// Final response format is prompt input, unlike internal tool output metadata.
+pub(crate) fn output_schema_tokens(schema: Option<&Value>, strict: bool) -> i64 {
+    let text = codex_api::create_text_param_for_request(None, &schema.cloned(), strict);
+    text.and_then(|text| serde_json::to_vec(&text).ok())
+        .map_or(0, |bytes| {
+            i64::try_from(bytes.len().div_ceil(4)).unwrap_or(i64::MAX)
+        })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PromptCalibrationBasis {
+    pub(crate) local_tokens: i64,
+    input: Arc<[ResponseItem]>,
+    input_start: usize,
+    tools: [u8; 32],
+    base_instructions: BaseInstructions,
+    output_schema: Option<Value>,
+    strict: bool,
+}
+
+impl PromptCalibrationBasis {
+    pub(crate) fn extends(&self, previous: &Self) -> bool {
+        self.tools == previous.tools
+            && self.base_instructions == previous.base_instructions
+            && self.output_schema == previous.output_schema
+            && self.strict == previous.strict
+            && self.input[self.input_start..].starts_with(&previous.input[previous.input_start..])
     }
 }
 
@@ -364,7 +435,7 @@ fn strip_image_details(items: &mut [ResponseItem]) {
 }
 
 pub struct ResponseStream {
-    pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+    pub(crate) rx_event: ResponseEventReceiver<codex_protocol::error::CodexErr>,
     pub(crate) attempt_identity: Option<ResponseAttemptIdentity>,
     /// Signals the mapper task that the consumer stopped polling before the
     /// provider stream reached its own terminal event.

@@ -387,17 +387,25 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create cwd");
         let workspace_roots = workspace_roots_for(cwd.as_path());
         for (profile, expected) in [
-            (PermissionProfile::read_only(), WindowsSandboxTokenMode::ReadOnlyCapability),
-            (PermissionProfile::workspace_write(), WindowsSandboxTokenMode::WritableRootsCapability),
+            (
+                PermissionProfile::read_only(),
+                WindowsSandboxTokenMode::ReadOnlyCapability,
+            ),
+            (
+                PermissionProfile::workspace_write(),
+                WindowsSandboxTokenMode::WritableRootsCapability,
+            ),
         ] {
             let token_mode = token_mode_for_permission_profile(
-                &profile, workspace_roots.as_slice(), &cwd, &HashMap::new(),
-            ).expect("token mode");
+                &profile,
+                workspace_roots.as_slice(),
+                &cwd,
+                &HashMap::new(),
+            )
+            .expect("token mode");
             assert_eq!(token_mode, expected);
         }
     }
-
-
 
     #[test]
     fn permission_profile_rejects_disabled_profiles() {

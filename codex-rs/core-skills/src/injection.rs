@@ -135,7 +135,8 @@ impl InjectedHostSkillPrompts {
     /// Final aggregate admission may reject a fragment admitted by its producer.
     /// Runtime consumers must see exactly the same accepted body, never reread it.
     pub fn retain_admitted_items(&mut self, items: &[codex_protocol::models::ResponseItem]) {
-        use codex_protocol::models::{ContentItem, ResponseItem};
+        use codex_protocol::models::ContentItem;
+        use codex_protocol::models::ResponseItem;
         let retained = |role: &str, text: &str| {
             items.iter().any(|item| {
                 matches!(item,
@@ -581,70 +582,27 @@ pub fn extract_tool_mentions_with_sigil(text: &str, sigil: char) -> ToolMentions
 /// Syntactic Markdown literals are examples, not invocations. Keep offsets into
 /// the original text so selection still borrows names and qualified locators.
 fn markdown_literal_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut fence: Option<(u8, usize, usize)> = None;
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start_matches(' ');
-        let indent = line.len() - trimmed.len();
-        let marker = trimmed.as_bytes().first().copied().unwrap_or_default();
-        let width = trimmed.bytes().take_while(|byte| *byte == marker).count();
-        if let Some((open, count, start)) = fence {
-            if indent <= 3 && marker == open && width >= count && trimmed[width..].trim().is_empty()
-            {
-                ranges.push(start..offset + line.len());
-                fence = None;
-            }
-        } else if indent <= 3 && matches!(marker, b'`' | b'~') && width >= 3 {
-            fence = Some((marker, width, offset));
-        } else if indent >= 4 || line.starts_with('\t') || trimmed.starts_with('>') {
-            ranges.push(offset..offset + line.len());
+    use pulldown_cmark::Event;
+    use pulldown_cmark::Tag;
+
+    // CommonMark owns lazy blockquote continuation, nested lists and fences.
+    // Its source ranges preserve the exact bytes needed by linked locators.
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for (event, range) in pulldown_cmark::Parser::new(text).into_offset_iter() {
+        if !matches!(
+            event,
+            Event::Start(Tag::BlockQuote(_) | Tag::CodeBlock(_)) | Event::Code(_)
+        ) {
+            continue;
         }
-        offset += line.len();
-    }
-    if let Some((_, _, start)) = fence {
-        ranges.push(start..text.len());
-    }
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if let Some(range) = ranges.iter().find(|range| range.contains(&index)) {
-            index = range.end;
-        } else if bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-        } else if bytes[index] == b'`' {
-            let width = bytes[index..]
-                .iter()
-                .take_while(|byte| **byte == b'`')
-                .count();
-            let mut end = index + width;
-            let mut close = None;
-            while end < bytes.len() {
-                if bytes[end] == b'`' {
-                    let count = bytes[end..]
-                        .iter()
-                        .take_while(|byte| **byte == b'`')
-                        .count();
-                    if count == width {
-                        close = Some(end + count);
-                        break;
-                    }
-                    end += count;
-                } else {
-                    end += 1;
-                }
-            }
-            if let Some(end) = close {
-                ranges.push(index..end);
-                index = end;
-            } else {
-                index += width;
-            }
+        if let Some(previous) = ranges.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
         } else {
-            index += 1;
+            ranges.push(range);
         }
     }
-    ranges.sort_by_key(|range| range.start);
     ranges
 }
 

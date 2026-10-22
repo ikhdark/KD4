@@ -49,6 +49,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 #[derive(Clone)]
 pub(crate) struct ProjectRequestProcessor {
     thread_store: Arc<dyn ThreadStore>,
+    thread_state_manager: crate::thread_state::ThreadStateManager,
     outgoing: Arc<OutgoingMessageSender>,
     thread_list_state_permit: Arc<Semaphore>,
 }
@@ -56,11 +57,13 @@ pub(crate) struct ProjectRequestProcessor {
 impl ProjectRequestProcessor {
     pub(crate) fn new(
         thread_store: Arc<dyn ThreadStore>,
+        thread_state_manager: crate::thread_state::ThreadStateManager,
         outgoing: Arc<OutgoingMessageSender>,
         thread_list_state_permit: Arc<Semaphore>,
     ) -> Self {
         Self {
             thread_store,
+            thread_state_manager,
             outgoing,
             thread_list_state_permit,
         }
@@ -226,12 +229,19 @@ impl ProjectRequestProcessor {
         params: ProjectDeleteParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
-        let deleted = self
+        let mut deleted = self
             .thread_store
             .delete_project(params.project_id.clone())
             .await
             .map_err(|error| project_store_error("project/delete", error))?
             .ok_or_else(|| invalid_params(format!("project not found: {}", params.project_id)))?;
+        deleted.affected_active_thread_ids.extend(
+            self.thread_state_manager
+                .clear_volatile_project(&params.project_id)
+                .await,
+        );
+        deleted.affected_active_thread_ids.sort();
+        deleted.affected_active_thread_ids.dedup();
         self.notify_project_changed(&params.project_id, ProjectChangeType::Deleted)
             .await;
         self.notify_thread_projects(deleted.affected_active_thread_ids, /*project_id*/ None)

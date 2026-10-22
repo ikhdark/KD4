@@ -27,6 +27,7 @@ use crate::protocol::FsCanonicalizeParams;
 use crate::protocol::FsCopyParams;
 use crate::protocol::FsCreateDirectoryParams;
 use crate::protocol::FsGetMetadataParams;
+use crate::protocol::FsMutateFileIfMatchesParams;
 use crate::protocol::FsReadDirectoryParams;
 use crate::protocol::FsReadFileBoundedParams;
 use crate::protocol::FsReadFileParams;
@@ -111,6 +112,30 @@ impl SandboxedFileSystem {
         })
     }
 
+    pub(crate) async fn read_file_capped(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Vec<u8>> {
+        let sandbox = require_platform_sandbox(sandbox)?;
+        validate_native_path(path)?;
+        let response = self
+            .run_sandboxed(
+                sandbox,
+                FsHelperRequest::ReadFileCapped {
+                    path: path.clone(),
+                    max_bytes,
+                },
+            )
+            .await?
+            .expect_read_file()
+            .map_err(map_sandbox_error)?;
+        STANDARD
+            .decode(response.data_base64)
+            .map_err(io::Error::other)
+    }
+
     async fn read_file_bounded(
         &self,
         path: &PathUri,
@@ -119,6 +144,42 @@ impl SandboxedFileSystem {
     ) -> FileSystemResult<Option<Vec<u8>>> {
         self.read_file_bounded_request(path, None, max_bytes, sandbox)
             .await
+    }
+
+    async fn read_file_bounded_with_source(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<(Vec<u8>, Option<std::path::PathBuf>)>> {
+        let sandbox = require_platform_sandbox(sandbox)?;
+        validate_native_path(path)?;
+        let (data_base64, source) = self
+            .run_sandboxed(
+                sandbox,
+                FsHelperRequest::ReadFileBoundedWithSource(FsReadFileBoundedParams {
+                    path: path.clone(),
+                    max_bytes,
+                    confined_root: None,
+                    sandbox: None,
+                }),
+            )
+            .await?
+            .expect_read_file_bounded_with_source()
+            .map_err(map_sandbox_error)?;
+        data_base64
+            .map(|data| {
+                STANDARD
+                    .decode(data)
+                    .map(|bytes| (bytes, source))
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid bounded source bytes: {error}"),
+                        )
+                    })
+            })
+            .transpose()
     }
 
     async fn read_file_bounded_confined(
@@ -192,6 +253,33 @@ impl SandboxedFileSystem {
         Ok(())
     }
 
+    async fn mutate_file_if_matches(
+        &self,
+        path: &PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<codex_file_system::FileMutationOutcome> {
+        let sandbox = require_platform_sandbox(sandbox)?;
+        validate_native_path(path)?;
+        // The helper compares and mutates under the sandbox, keeping the
+        // preimage check at the mutation boundary instead of in this process.
+        let response = self
+            .run_sandboxed(
+                sandbox,
+                FsHelperRequest::MutateFileIfMatches(FsMutateFileIfMatchesParams {
+                    path: path.clone(),
+                    expected_base64: expected.map(|bytes| STANDARD.encode(bytes)),
+                    replacement_base64: replacement.map(|bytes| STANDARD.encode(bytes)),
+                    sandbox: None,
+                }),
+            )
+            .await?
+            .expect_mutate_file_if_matches()
+            .map_err(map_sandbox_error)?;
+        Ok(response.outcome.into())
+    }
+
     async fn create_directory(
         &self,
         path: &PathUri,
@@ -227,6 +315,7 @@ impl SandboxedFileSystem {
                 FsHelperRequest::GetMetadata(FsGetMetadataParams {
                     path: path.clone(),
                     sandbox: None,
+                    include_directory_case_sensitivity: None,
                 }),
             )
             .await?
@@ -326,9 +415,19 @@ impl SandboxedFileSystem {
             .await?
             .expect_walk()
             .map_err(map_sandbox_error)?;
-        if !options.filters.is_empty() && response.applied_filters.as_ref() != Some(&options.filters) {
-            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
-                "filesystem helper did not apply requested walk filters; update the helper or use an unfiltered audit"));
+        if !options.follow_directory_symlinks && !response.no_follow_enforced {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem helper did not enforce no-follow enumeration; update the helper",
+            ));
+        }
+        if !options.filters.is_empty()
+            && response.applied_filters.as_ref() != Some(&options.filters)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "filesystem helper did not apply requested walk filters; update the helper or use an unfiltered audit",
+            ));
         }
         Ok(response)
     }
@@ -383,6 +482,50 @@ impl SandboxedFileSystem {
 }
 
 impl ExecutorFileSystem for SandboxedFileSystem {
+    fn mutate_file_if_matches<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(SandboxedFileSystem::mutate_file_if_matches(
+            self,
+            path,
+            expected,
+            replacement,
+            sandbox,
+        ))
+    }
+
+    fn uses_host_native_paths(&self) -> bool {
+        true
+    }
+
+    fn directory_case_sensitive<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            let sandbox = require_platform_sandbox(sandbox)?;
+            validate_native_path(path)?;
+            let response = self
+                .run_sandboxed(
+                    sandbox,
+                    FsHelperRequest::GetMetadata(FsGetMetadataParams {
+                        path: path.clone(),
+                        sandbox: None,
+                        include_directory_case_sensitivity: Some(true),
+                    }),
+                )
+                .await?
+                .expect_get_metadata()
+                .map_err(map_sandbox_error)?;
+            Ok(response.directory_case_sensitive)
+        })
+    }
+
     fn canonicalize<'a>(
         &'a self,
         path: &'a PathUri,
@@ -419,6 +562,17 @@ impl ExecutorFileSystem for SandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
         Box::pin(SandboxedFileSystem::read_file_bounded(
+            self, path, max_bytes, sandbox,
+        ))
+    }
+
+    fn read_file_bounded_with_source<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<(Vec<u8>, Option<std::path::PathBuf>)>> {
+        Box::pin(SandboxedFileSystem::read_file_bounded_with_source(
             self, path, max_bytes, sandbox,
         ))
     }
@@ -545,7 +699,21 @@ fn require_platform_sandbox(
 }
 
 fn map_sandbox_error(error: JSONRPCErrorError) -> io::Error {
+    if let Some(kind) = codex_exec_server_protocol::file_system_error_kind(error.data.as_ref()) {
+        if let Some(copy) = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("copy"))
+            .and_then(|copy| {
+                serde_json::from_value::<codex_file_system::CopyFailure>(copy.clone()).ok()
+            })
+        {
+            return io::Error::new(kind, copy);
+        }
+        return io::Error::new(kind, error.message);
+    }
     match error.code {
+        -32601 => io::Error::new(io::ErrorKind::Unsupported, error.message),
         -32004 => io::Error::new(io::ErrorKind::NotFound, error.message),
         FS_PERMISSION_DENIED_ERROR_CODE => {
             io::Error::new(io::ErrorKind::PermissionDenied, error.message)

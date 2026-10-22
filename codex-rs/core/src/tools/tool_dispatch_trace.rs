@@ -97,8 +97,16 @@ pub(crate) struct ToolDispatchTimingSnapshot {
     pub eager: bool,
 }
 
+/// A tentative replay lease is not admission unless its result is selected.
+/// Retain the observation, rather than sampling again after hash validation.
+pub(crate) struct ToolDispatchGateAdmission {
+    at: Instant,
+    event: Option<TurnTimingToolLifecycleEvent>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolDispatchTiming {
+    process_observations: Arc<codex_utils_pty::process_observation::ProcessStartRecorder>,
     turn_timing: Option<Arc<TurnTimingState>>,
     execution_id: ToolExecutionId,
     sampling_generation_id: SamplingGenerationId,
@@ -161,6 +169,7 @@ impl ToolDispatchTiming {
                 .unwrap_or_else(|| "generation-pending".to_string()),
         );
         let timing = Self {
+            process_observations: Arc::default(),
             turn_timing,
             execution_id,
             sampling_generation_id,
@@ -198,6 +207,14 @@ impl ToolDispatchTiming {
 
     pub(crate) fn execution_id(&self) -> &ToolExecutionId {
         &self.execution_id
+    }
+
+    pub(crate) fn sampling_generation_index(&self) -> Option<u32> {
+        self.sampling_generation_id
+            .0
+            .strip_prefix("generation-")?
+            .parse()
+            .ok()
     }
 
     pub(crate) fn turn_timing_state(&self) -> Option<Arc<TurnTimingState>> {
@@ -259,8 +276,34 @@ impl ToolDispatchTiming {
     }
 
     pub(crate) fn mark_parallel_gate_admitted(&self) {
-        let _ = self.parallel_gate_admitted_at.set(Instant::now());
-        self.record_boundary(ToolLifecycleBoundary::Admitted);
+        self.mark_captured_gate_admission(self.capture_gate_admission());
+    }
+
+    pub(crate) fn capture_gate_admission(&self) -> ToolDispatchGateAdmission {
+        ToolDispatchGateAdmission {
+            at: Instant::now(),
+            event: self
+                .turn_timing
+                .as_ref()
+                .map(|turn| TurnTimingToolLifecycleEvent {
+                    boundary: ToolLifecycleBoundary::Admitted,
+                    at_ms: turn.monotonic_offset_ms(),
+                    context: turn.lifecycle_context(),
+                    retry_count: self.retry_count.load(Ordering::Acquire),
+                    reentry_count: self.reentry_count.load(Ordering::Acquire),
+                }),
+        }
+    }
+
+    pub(crate) fn mark_captured_gate_admission(&self, admission: ToolDispatchGateAdmission) {
+        if self.parallel_gate_admitted_at.set(admission.at).is_ok()
+            && let Some(event) = admission.event
+        {
+            self.lifecycle_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
+        }
     }
 
     pub(crate) fn record_authorization_state_coordination(&self, duration: Duration) {
@@ -331,12 +374,21 @@ impl ToolDispatchTiming {
     }
 
     pub(crate) fn mark_exec_process_spawned(&self) {
-        let _ = self.exec_process_spawned_at.set(Instant::now());
+        if self.exec_process_spawned_at.set(Instant::now()).is_ok()
+            && let Some(timing) = &self.turn_timing
+        {
+            timing.record_process_spawned();
+        }
         self.record_boundary(ToolLifecycleBoundary::ProcessSpawn);
     }
 
     pub(crate) fn mark_exec_process_exited(&self) {
         if self.exec_process_exited_at.set(Instant::now()).is_ok() {
+            if self.exec_process_spawned_at.get().is_some()
+                && let Some(timing) = &self.turn_timing
+            {
+                timing.record_process_exited();
+            }
             self.record_boundary(ToolLifecycleBoundary::ProcessExit);
         }
     }
@@ -469,13 +521,11 @@ impl ToolDispatchTiming {
             first_poll_at_ms: self.first_poll_at_ms.get().copied(),
             item_to_first_poll_ms: first_poll_at
                 .and_then(|at| duration_ms(at.saturating_duration_since(self.item_accepted_at))),
-            parallel_gate_wait_ms: first_poll_at.and_then(|first_poll_at| {
-                duration_ms(
-                    parallel_gate_admitted_at
-                        .unwrap_or(completed_at)
-                        .saturating_duration_since(first_poll_at),
-                )
-            }),
+            parallel_gate_wait_ms: first_poll_at.zip(parallel_gate_admitted_at).and_then(
+                |(first_poll_at, admitted_at)| {
+                    duration_ms(admitted_at.saturating_duration_since(first_poll_at))
+                },
+            ),
             authorization_state_coordination_ms: self
                 .authorization_state_coordination
                 .get()
@@ -612,7 +662,13 @@ pub(crate) async fn scope_tool_dispatch_timing<F>(
 where
     F: Future,
 {
-    ACTIVE_TOOL_DISPATCH_TIMING.scope(timing, future).await
+    let observation = codex_utils_pty::process_observation::ProcessObservationContext::new(
+        Arc::clone(&timing.process_observations),
+        timing.execution_id.0.clone(),
+    );
+    observation
+        .scope(ACTIVE_TOOL_DISPATCH_TIMING.scope(timing, future))
+        .await
 }
 
 pub(crate) fn record_authorization_state_coordination(duration: Duration) {
@@ -707,9 +763,11 @@ pub(crate) struct ToolDispatchTrace {
 
 #[derive(Debug)]
 struct EnabledToolDispatchTrace {
+    process_observations: Option<Arc<codex_utils_pty::process_observation::ProcessStartRecorder>>,
     context: tokio::sync::watch::Receiver<Option<ToolDispatchTraceContext>>,
     terminal_tasks: tokio_util::task::TaskTracker,
     terminal_recording: Arc<Once>,
+    _permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl ToolDispatchTrace {
@@ -718,18 +776,36 @@ impl ToolDispatchTrace {
         if !thread_trace.is_enabled() {
             return Self { state: None };
         }
+        if !trace_invocation_fits(invocation) {
+            thread_trace.note_capture_gap();
+            return Self { state: None };
+        }
+        // Admission must precede copying invocation/result bodies. Keep the
+        // lease through both tracked writes, even if the caller is cancelled.
+        static CONTEXTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(16)));
+        let Ok(permit) = Arc::clone(&CONTEXTS).try_acquire_owned() else {
+            thread_trace.note_capture_gap();
+            tracing::warn!(call_id = %invocation.call_id, "tool trace detail omitted: capacity exhausted");
+            return Self { state: None };
+        };
+        let permit = Arc::new(permit);
+        let start_permit = Arc::clone(&permit);
         let terminal_tasks = invocation.session.terminal_tasks.clone();
         let (sender, context) = tokio::sync::watch::channel(None);
-        let invocation = invocation.clone();
+        let trace_invocation = tool_dispatch_invocation(invocation);
         // Publish a handle before awaiting the accepted write. Cancellation
         // owns the same initialization and terminal ordering.
         drop(terminal_tasks.spawn_blocking(move || {
-            let context =
-                thread_trace.start_tool_dispatch_trace(|| tool_dispatch_invocation(&invocation));
+            let _permit = start_permit;
+            let context = thread_trace.start_tool_dispatch_trace(|| trace_invocation);
             sender.send_replace(Some(context));
         }));
         Self {
             state: Some(Arc::new(EnabledToolDispatchTrace {
+                process_observations: active_tool_dispatch_timing()
+                    .map(|timing| Arc::clone(&timing.process_observations)),
+                _permit: permit,
                 context,
                 terminal_tasks,
                 terminal_recording: Arc::new(Once::new()),
@@ -765,9 +841,30 @@ impl ToolDispatchTrace {
             return Box::pin(async {});
         };
 
-        let Some(result_payload) = tool_dispatch_result(invocation, call_id, payload, result)
-        else {
-            return Box::pin(async {});
+        // Include worst-case JSON string escaping before any result clone.
+        // The context semaphore bounds concurrent ownership; this cap bounds
+        // each owner even when optional trace storage remains blocked.
+        let result_payload = if result
+            .trace_detail_size_bound(MAX_TRACE_DETAIL_BYTES / 6)
+            .and_then(|bytes| bytes.checked_mul(6))
+            .and_then(|bytes| call_id.len().checked_mul(6)?.checked_add(bytes))
+            .and_then(|bytes| bytes.checked_add(512))
+            .is_some_and(|bytes| bytes <= MAX_TRACE_DETAIL_BYTES)
+        {
+            tool_dispatch_result(invocation, call_id, payload, result).unwrap_or(
+                ToolDispatchResult::DetailOmitted {
+                    reason: "unsupported trace result",
+                },
+            )
+        } else {
+            invocation
+                .session
+                .services
+                .rollout_thread_trace
+                .note_capture_gap();
+            ToolDispatchResult::DetailOmitted {
+                reason: "trace detail byte budget or size unavailable",
+            }
         };
         let status = execution_status_for_outcome(result.outcome_context());
         self.enqueue_terminal(move |context| context.record_completed(status, result_payload));
@@ -778,7 +875,22 @@ impl ToolDispatchTrace {
         &self,
         error: &FunctionCallError,
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let error = error.to_string();
+        struct BoundedError(String);
+        impl std::fmt::Write for BoundedError {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                if self.0.len().saturating_add(value.len()) > MAX_TRACE_DETAIL_BYTES / 6 {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push_str(value);
+                Ok(())
+            }
+        }
+        let mut text = BoundedError(String::new());
+        let error = if std::fmt::write(&mut text, format_args!("{error}")).is_ok() {
+            text.0
+        } else {
+            "tool failed; trace error detail omitted: byte budget exceeded".to_string()
+        };
         self.enqueue_terminal(move |context| context.record_failed(error));
         Box::pin(async {})
     }
@@ -798,9 +910,20 @@ impl ToolDispatchTrace {
         state.terminal_recording.call_once(|| {
             let trace = self.clone();
             let tasks = state.terminal_tasks.clone();
+            let permit = Arc::clone(&state._permit);
+            let observations = state.process_observations.clone();
             drop(state.terminal_tasks.spawn(async move {
                 if let Some(context) = trace.started_context().await {
-                    defer_trace_recording(&tasks, move || record(context)).await;
+                    defer_trace_recording(&tasks, move || {
+                        let _permit = permit;
+                        if let Some(observations) = observations
+                            && let Ok(value) = serde_json::to_value(observations.snapshot())
+                        {
+                            context.record_process_observations(value);
+                        }
+                        record(context);
+                    })
+                    .await;
                 }
             }));
         });
@@ -848,6 +971,39 @@ fn execution_status_for_outcome(context: codex_tools::ToolOutputOutcomeContext) 
             }
         }
     }
+}
+
+const MAX_TRACE_DETAIL_BYTES: usize = 1024 * 1024;
+
+fn trace_invocation_fits(invocation: &ToolInvocation) -> bool {
+    let payload_bytes = match &invocation.payload {
+        ToolPayload::Function { arguments } => arguments.len(),
+        ToolPayload::Custom { input } => input.len(),
+        ToolPayload::ToolSearch { arguments } => arguments.query.len().saturating_add(32),
+    };
+    let requester_bytes = match &invocation.source {
+        ToolCallSource::Direct => invocation.call_id.len(),
+        ToolCallSource::CodeMode {
+            cell_id,
+            runtime_tool_call_id,
+            ..
+        } => cell_id.len().saturating_add(runtime_tool_call_id.len()),
+    };
+    [
+        payload_bytes,
+        requester_bytes,
+        invocation.call_id.len(),
+        invocation.tool_name.name.len(),
+        invocation
+            .tool_name
+            .namespace
+            .as_ref()
+            .map_or(0, String::len),
+        invocation.step_context.turn.sub_id.len(),
+    ]
+    .into_iter()
+    .try_fold(512_usize, usize::checked_add)
+    .is_some_and(|bytes| bytes <= MAX_TRACE_DETAIL_BYTES / 6)
 }
 
 fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchInvocation> {

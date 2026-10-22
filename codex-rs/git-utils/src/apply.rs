@@ -975,21 +975,46 @@ mod tests {
     #[test]
     fn extract_paths_preserves_quoted_escaped_and_dev_null_headers() {
         for (diff, expected) in [
-            ("diff --git \"a/hello world.txt\" \"b/hello world.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello world.txt\n@@ -0,0 +1 @@\n+hi\n", "hello world.txt"),
-            ("diff --git a/dev/null b/ok.txt\nnew file mode 100644\n--- /dev/null\n+++ b/ok.txt\n@@ -0,0 +1 @@\n+hi\n", "ok.txt"),
-            ("diff --git \"a/hello\\tworld.txt\" \"b/hello\\tworld.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello\tworld.txt\n@@ -0,0 +1 @@\n+hi\n", "hello\tworld.txt"),
-            ("diff --git \"a/\\303\\251.txt\" \"b/\\303\\251.txt\"\n--- \"a/\\303\\251.txt\"\n+++ \"b/\\303\\251.txt\"\n@@ -1 +1 @@\n-old\n+new\n", "é.txt"),
+            (
+                "diff --git \"a/hello world.txt\" \"b/hello world.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello world.txt\n@@ -0,0 +1 @@\n+hi\n",
+                "hello world.txt",
+            ),
+            (
+                "diff --git a/dev/null b/ok.txt\nnew file mode 100644\n--- /dev/null\n+++ b/ok.txt\n@@ -0,0 +1 @@\n+hi\n",
+                "ok.txt",
+            ),
+            (
+                "diff --git \"a/hello\\tworld.txt\" \"b/hello\\tworld.txt\"\nnew file mode 100644\n--- /dev/null\n+++ b/hello\tworld.txt\n@@ -0,0 +1 @@\n+hi\n",
+                "hello\tworld.txt",
+            ),
+            (
+                "diff --git \"a/\\303\\251.txt\" \"b/\\303\\251.txt\"\n--- \"a/\\303\\251.txt\"\n+++ \"b/\\303\\251.txt\"\n@@ -1 +1 @@\n-old\n+new\n",
+                "é.txt",
+            ),
         ] {
-            assert_eq!(extract_paths_from_patch(diff), vec![expected.to_string()], "{diff}");
+            assert_eq!(
+                extract_paths_from_patch(diff),
+                vec![expected.to_string()],
+                "{diff}"
+            );
         }
     }
 
     #[test]
     fn parse_output_unescapes_quoted_paths() {
         for (stderr, expected) in [
-            ("error: patch failed: hello world.txt:1\n", "hello world.txt"),
-            ("error: patch failed: \"hello world.txt\":1\n", "hello world.txt"),
-            ("error: patch failed: \"hello\\tworld.txt\":1\n", "hello\tworld.txt"),
+            (
+                "error: patch failed: hello world.txt:1\n",
+                "hello world.txt",
+            ),
+            (
+                "error: patch failed: \"hello world.txt\":1\n",
+                "hello world.txt",
+            ),
+            (
+                "error: patch failed: \"hello\\tworld.txt\":1\n",
+                "hello\tworld.txt",
+            ),
             ("error: patch failed: \"\\303\\251.txt\":1\n", "é.txt"),
         ] {
             let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
@@ -1185,7 +1210,10 @@ mod tests {
         };
         let r = apply_git_patch(&req).expect("run apply");
         assert_eq!(r.exit_code, 0, "exit code 0");
-        assert_eq!(read_file_normalized(&root.join("hello.txt")), "hello\nworld\n");
+        assert_eq!(
+            read_file_normalized(&root.join("hello.txt")),
+            "hello\nworld\n"
+        );
     }
 
     #[test]
@@ -1211,7 +1239,10 @@ mod tests {
         assert_ne!(r.exit_code, 0, "non-zero exit on conflict");
         assert_eq!(r.skipped_paths, vec!["file.txt"]);
         assert!(r.applied_paths.is_empty());
-        assert_eq!(read_file_normalized(&root.join("file.txt")), "line1\nlocal2\nline3\n");
+        assert_eq!(
+            read_file_normalized(&root.join("file.txt")),
+            "line1\nlocal2\nline3\n"
+        );
     }
 
     #[test]
@@ -1238,7 +1269,10 @@ mod tests {
         assert_eq!(result.skipped_paths, vec![name]);
         assert!(result.applied_paths.is_empty());
         assert!(result.conflicted_paths.is_empty());
-        assert_eq!(read_file_normalized(&root.join(name)), "one\nlocal\nthree\n");
+        assert_eq!(
+            read_file_normalized(&root.join(name)),
+            "one\nlocal\nthree\n"
+        );
     }
 
     #[test]
@@ -1321,7 +1355,11 @@ mod tests {
 
         std::fs::write(root.join("prepared.txt"), "prepared commit contents\n").unwrap();
         let _ = run(root, &["git", "add", "prepared.txt"]);
-        std::fs::write(root.join("prepared.txt"), "unstaged work must stay separate\n").unwrap();
+        std::fs::write(
+            root.join("prepared.txt"),
+            "unstaged work must stay separate\n",
+        )
+        .unwrap();
         let (_code_before, staged_before, _stderr_before) =
             run(root, &["git", "diff", "--cached", "--binary"]);
         assert!(staged_before.contains("+prepared commit contents"));
@@ -1337,8 +1375,7 @@ mod tests {
         let (_code_after, staged_after, _stderr_after) =
             run(root, &["git", "diff", "--cached", "--binary"]);
         assert_eq!(
-            staged_after,
-            staged_before,
+            staged_after, staged_before,
             "preflight must preserve staged paths and their contents",
         );
         assert_eq!(

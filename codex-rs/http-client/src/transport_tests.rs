@@ -13,9 +13,15 @@ async fn unary_success_limits_reject_headers_and_chunked_overflow_without_eof() 
     use tokio::io::AsyncWriteExt;
     for (body, accepted) in [
         ("Content-Length: 9\r\n\r\n", false),
-        ("Transfer-Encoding: chunked\r\n\r\n9\r\nabcdefghi\r\n", false),
+        (
+            "Transfer-Encoding: chunked\r\n\r\n9\r\nabcdefghi\r\n",
+            false,
+        ),
         ("Content-Length: 8\r\n\r\nabcdefgh", true),
-        ("Transfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n", true),
+        (
+            "Transfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n",
+            true,
+        ),
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -26,10 +32,14 @@ async fn unary_success_limits_reject_headers_and_chunked_overflow_without_eof() 
             while !request.ends_with(b"\r\n\r\n") {
                 request.push(socket.read_u8().await.unwrap());
             }
-            socket.write_all(format!("HTTP/1.1 200 OK\r\n{body}").as_bytes()).await.unwrap();
+            socket
+                .write_all(format!("HTTP/1.1 200 OK\r\n{body}").as_bytes())
+                .await
+                .unwrap();
             let _ = tokio::time::timeout(Duration::from_secs(5), held).await;
         });
-        let transport = ReqwestTransport::new(reqwest::Client::builder().no_proxy().build().unwrap());
+        let transport =
+            ReqwestTransport::new(reqwest::Client::builder().no_proxy().build().unwrap());
         let mut request = Request::new(Method::GET, format!("http://{address}/"));
         request.max_response_bytes = Some(8);
         let result = tokio::time::timeout(Duration::from_secs(2), transport.execute(request)).await;
@@ -39,21 +49,27 @@ async fn unary_success_limits_reject_headers_and_chunked_overflow_without_eof() 
         if accepted {
             assert_eq!(result.unwrap().body, Bytes::from_static(b"abcdefgh"));
         } else {
-            assert!(matches!(result, Err(TransportError::ResponseTooLarge { limit: 8 })));
+            assert!(matches!(
+                result,
+                Err(TransportError::ResponseTooLarge { limit: 8 })
+            ));
         }
     }
 }
 
 #[tokio::test]
 async fn bounded_success_collector_stops_polling_at_first_excess_chunk() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     let polls = AtomicUsize::new(0);
     let stream = futures::stream::iter((0..100).map(|_| {
         polls.fetch_add(1, Ordering::SeqCst);
         Ok(Bytes::from_static(b"abcd"))
     }));
-    assert!(matches!(collect_success_body(stream, 8).await,
-        Err(TransportError::ResponseTooLarge { limit: 8 })));
+    assert!(matches!(
+        collect_success_body(stream, 8).await,
+        Err(TransportError::ResponseTooLarge { limit: 8 })
+    ));
     assert_eq!(polls.load(Ordering::SeqCst), 3);
 }
 
@@ -70,12 +86,22 @@ async fn transport_timing_scopes_are_isolated_and_cancel_safe() {
     let (first, second) = tokio::join!(first, second);
     assert_eq!(first.1.response_headers, Some(Duration::from_secs(2)));
     assert_eq!(second.1.response_headers, Some(Duration::from_secs(7)));
-    let cancelled = tokio::time::timeout(Duration::from_millis(1), capture_transport_timing(async {
-        record_response_header_time(Duration::from_secs(99));
-        std::future::pending::<()>().await;
-    })).await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(1),
+        capture_transport_timing(async {
+            record_response_header_time(Duration::from_secs(99));
+            std::future::pending::<()>().await;
+        }),
+    )
+    .await;
     assert!(cancelled.is_err());
-    assert!(capture_transport_timing(async {}).await.1.response_headers.is_none());
+    assert!(
+        capture_transport_timing(async {})
+            .await
+            .1
+            .response_headers
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -101,17 +127,23 @@ fn request_body_trace_contains_only_sizes_for_all_body_representations() {
         .with_json(&json!({"token": "body-secret"}));
     assert_eq!(request_body_for_trace(&request), "<JSON body: 23 bytes>");
     let encoded = request.clone().into_prepared().unwrap();
-    assert_eq!(request_body_for_trace(&encoded), "<encoded JSON body: 23 bytes>");
+    assert_eq!(
+        request_body_for_trace(&encoded),
+        "<encoded JSON body: 23 bytes>"
+    );
     let compressed = request
         .with_compression(crate::request::RequestCompression::Zstd)
         .into_prepared()
         .unwrap();
     assert_eq!(
         request_body_for_trace(&compressed),
-        format!("<encoded JSON body: {} bytes>", compressed.prepared_body_len().unwrap())
+        format!(
+            "<encoded JSON body: {} bytes>",
+            compressed.prepared_body_len().unwrap()
+        )
     );
-    let mut raw = Request::new(Method::POST, "https://example.com".into())
-        .with_raw_body("body-secret");
+    let mut raw =
+        Request::new(Method::POST, "https://example.com".into()).with_raw_body("body-secret");
     assert_eq!(request_body_for_trace(&raw), "<raw body: 11 bytes>");
     raw.body = Some(RequestBody::InvalidJson("body-secret".into()));
     assert_eq!(request_body_for_trace(&raw), "<invalid JSON body>");
@@ -151,9 +183,13 @@ async fn connection_failures_are_classified_without_exposing_request_urls() {
 async fn permanent_certificate_failure_is_not_connection_recovery() {
     codex_utils_rustls_provider::ensure_rustls_crypto_provider();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let config = rustls::ServerConfig::builder().with_no_client_auth()
-        .with_single_cert(vec![certified.cert.der().clone()],
-            rustls_pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into())).unwrap();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into()),
+        )
+        .unwrap();
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -163,7 +199,10 @@ async fn permanent_certificate_failure_is_not_connection_recovery() {
             match listener.accept() {
                 Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(std::time::Instant::now() < deadline, "TLS request must arrive");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "TLS request must arrive"
+                    );
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => panic!("accept TLS request: {error}"),
@@ -171,16 +210,31 @@ async fn permanent_certificate_failure_is_not_connection_recovery() {
         };
         // Accepted Windows sockets can inherit the listener's nonblocking mode.
         socket.set_nonblocking(false).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut tls = rustls::ServerConnection::new(Arc::new(config)).unwrap();
         while tls.is_handshaking() {
-            if tls.complete_io(&mut socket).is_err() { break; }
+            if tls.complete_io(&mut socket).is_err() {
+                break;
+            }
         }
     });
-    let client = reqwest::Client::builder().no_proxy().use_rustls_tls().timeout(Duration::from_secs(5)).build().unwrap();
-    let result = ReqwestTransport::new(client).stream(Request::new(Method::GET,
-        format!("https://{address}/?secret=hidden"))).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let result = ReqwestTransport::new(client)
+        .stream(Request::new(
+            Method::GET,
+            format!("https://{address}/?secret=hidden"),
+        ))
+        .await;
     server.join().unwrap();
     let error = result.err().expect("self-signed certificate must fail");
     assert!(matches!(&error, TransportError::Build(_)), "{error:?}");
@@ -189,15 +243,15 @@ async fn permanent_certificate_failure_is_not_connection_recovery() {
 
 #[test]
 fn remote_tls_alerts_and_socket_outages_remain_recoverable() {
-    assert!(!is_permanent_connection_error(&rustls::Error::AlertReceived(
-        rustls::AlertDescription::InternalError,
-    )));
+    assert!(!is_permanent_connection_error(
+        &rustls::Error::AlertReceived(rustls::AlertDescription::InternalError,)
+    ));
     assert!(!is_permanent_connection_error(&std::io::Error::from(
         std::io::ErrorKind::ConnectionRefused,
     )));
-    assert!(is_permanent_connection_error(&rustls::Error::InvalidCertificate(
-        rustls::CertificateError::UnknownIssuer,
-    )));
+    assert!(is_permanent_connection_error(
+        &rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer,)
+    ));
 }
 
 #[tokio::test]
@@ -439,8 +493,12 @@ async fn stalled_failure_body_preserves_status_headers_and_retry_after() {
                 }
             };
             stream.set_nonblocking(false).unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
                 let mut byte = [0];
@@ -448,7 +506,8 @@ async fn stalled_failure_body_preserves_status_headers_and_retry_after() {
                 request.push(byte[0]);
             }
             write!(stream, "HTTP/1.1 {status} Failure\r\nContent-Length: 100000\r\nRetry-After: 7\r\nConnection: close\r\n\r\nprefix").unwrap();
-            held.recv_timeout(Duration::from_secs(5)).expect("client must finish before server closes");
+            held.recv_timeout(Duration::from_secs(5))
+                .expect("client must finish before server closes");
         });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let transport = ReqwestTransport::new(client);
@@ -462,9 +521,18 @@ async fn stalled_failure_body_preserves_status_headers_and_retry_after() {
         let elapsed = started.elapsed();
         release.send(()).unwrap();
         server.join().unwrap();
-        assert!(elapsed < Duration::from_secs(4), "diagnostic wait: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "diagnostic wait: {elapsed:?}"
+        );
         assert!(error.retry_after().is_some());
-        let TransportError::Http { status: actual, headers, body, .. } = error else {
+        let TransportError::Http {
+            status: actual,
+            headers,
+            body,
+            ..
+        } = error
+        else {
             panic!("status lost: {error}");
         };
         assert_eq!(actual.as_u16(), status);

@@ -89,8 +89,12 @@ async fn read_only_completion_does_not_wait_on_unrelated_transaction() {
     }]);
     let expected = CellEvent::Completed {
         content_items: vec![
-            OutputItem::Text { text: "before\r\n".into() },
-            OutputItem::Text { text: "after λ".into() },
+            OutputItem::Text {
+                text: "before\r\n".into(),
+            },
+            OutputItem::Text {
+                text: "after λ".into(),
+            },
         ],
         error_text: None,
         output_loss: None,

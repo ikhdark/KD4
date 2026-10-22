@@ -49,6 +49,7 @@ impl RetirementCause {
 struct RetainedPatch {
     patch: String,
     environment_id: String,
+    environment_instance: String,
     cwd: PathUri,
     hook_recovery: Option<(String, Value)>,
 }
@@ -57,6 +58,7 @@ pub(super) struct PreparedRetry {
     pub(super) id: String,
     pub(super) args: ApplyPatchArgs,
     pub(super) environment_id: String,
+    pub(super) environment_instance: String,
     pub(super) cwd: PathUri,
 }
 
@@ -185,6 +187,7 @@ impl RetainedPatches {
         let receipt = self.retain(
             patch,
             &saved.environment_id,
+            &saved.environment_instance,
             &saved.cwd,
             &Default::default(),
             None,
@@ -256,6 +259,7 @@ impl RetainedPatches {
             id,
             args,
             environment_id: saved.environment_id.clone(),
+            environment_instance: saved.environment_instance.clone(),
             cwd: saved.cwd.clone(),
         })
     }
@@ -303,6 +307,7 @@ impl RetainedPatches {
         &mut self,
         patch: &str,
         environment_id: &str,
+        environment_instance: &str,
         cwd: &PathUri,
         committed: &AppliedPatchDelta,
         observed_source: Option<Value>,
@@ -367,6 +372,7 @@ impl RetainedPatches {
             RetainedPatch {
                 patch,
                 environment_id: environment_id.into(),
+                environment_instance: environment_instance.into(),
                 cwd: cwd.clone(),
                 hook_recovery: None,
             },
@@ -442,7 +448,14 @@ mod tests {
 
     fn retained(store: &mut RetainedPatches, cwd: &PathUri, patch: &str) -> String {
         store
-            .retain(patch, "local", cwd, &Default::default(), None)
+            .retain(
+                patch,
+                "local",
+                "test-instance",
+                cwd,
+                &Default::default(),
+                None,
+            )
             .unwrap()["patch_id"]
             .as_str()
             .unwrap()
@@ -475,6 +488,34 @@ mod tests {
                 .hunks,
             prepared.args.hunks
         );
+    }
+
+    #[test]
+    fn hook_rotation_preserves_the_concrete_environment_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let mut store = RetainedPatches::default();
+        let patch = "*** Begin Patch\n*** Add File: a\n+x\n*** End Patch";
+        let receipt = store
+            .retain(
+                patch,
+                "alias",
+                "instance-A",
+                &cwd,
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+        let id = receipt["patch_id"].as_str().unwrap();
+        let replacement = store.replace_after_hook(id, patch, "hook").unwrap();
+        let retry = format!(
+            "*** Begin Patch\n*** Retry Patch: {}\n*** End Patch",
+            replacement["patch_id"].as_str().unwrap()
+        );
+        let prepared = store.prepare(&retry).unwrap();
+        assert_eq!(prepared.environment_id, "alias");
+        assert_eq!(prepared.environment_instance, "instance-A");
+        assert_eq!(prepared.cwd, cwd);
     }
 
     #[test]
@@ -589,7 +630,7 @@ mod tests {
         assert_eq!(failure.delta().changes().len(), 1);
         let mut store = RetainedPatches::default();
         let receipt = store
-            .retain(patch, "local", &cwd, failure.delta(), None)
+            .retain(patch, "local", "test-instance", &cwd, failure.delta(), None)
             .unwrap();
         assert_eq!(receipt["committed_hunks_excluded"], 1);
         std::fs::write(dir.path().join("committed"), "later independent edit\n").unwrap();
@@ -668,7 +709,7 @@ mod tests {
         assert!(failure.delta().is_exact());
         let mut store = RetainedPatches::default();
         let receipt = store
-            .retain(patch, "local", &cwd, failure.delta(), None)
+            .retain(patch, "local", "test-instance", &cwd, failure.delta(), None)
             .unwrap();
         assert_eq!(receipt["committed_hunks_excluded"], 0);
         let retry = store

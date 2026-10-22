@@ -37,11 +37,17 @@ const MAX_WAKE_EVENT_DRAIN_PAGES: usize =
 #[derive(Default)]
 pub(crate) struct Handler {
     options: WaitAgentTimeoutOptions,
+    #[cfg(test)]
+    owner_hydrations: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Handler {
     pub(crate) fn new(options: WaitAgentTimeoutOptions) -> Self {
-        Self { options }
+        Self {
+            options,
+            #[cfg(test)]
+            owner_hydrations: None,
+        }
     }
 }
 
@@ -62,6 +68,14 @@ impl ToolExecutor<ToolInvocation> for Handler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        #[cfg(test)]
+        if let Some(count) = &self.owner_hydrations {
+            // ToolCallRuntime owns a spawned dispatch task; a task-local on the
+            // test's caller is not inherited by that task.
+            return Box::pin(
+                TEST_OWNER_HYDRATIONS.scope(Arc::clone(count), self.handle_call(invocation)),
+            );
+        }
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -98,10 +112,17 @@ impl Handler {
             .input_queue
             .turn_state_for_sub_id(&session.active_turn, &turn.sub_id)
             .await;
-        let (mut activity_rx, pending_activity) = session
+        let (activity_rx, _) = session
             .input_queue
-            .subscribe_activity(turn_state.as_deref(), false)
+            .subscribe_agent_activity(turn_state.as_deref())
             .await;
+
+        let mut input = AgentWaitInput {
+            session: &session,
+            turn_state: turn_state.as_deref(),
+            receiver: activity_rx,
+        };
+        let wait_started = Instant::now();
 
         session
             .emit_turn_item_started(
@@ -134,18 +155,33 @@ impl Handler {
                         "wait_agent cursor is invalid or no longer retained: {error}"
                     ))
                 })?;
+            macro_rules! before_delivery {
+                ($future:expr, $cursor:expr) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation_token.cancelled() => return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string())),
+                        outcome = input.next() => return Ok(boxed_tool_output(input_only_result(&turn, outcome, $cursor, wait_started))),
+                        result = $future => result,
+                    }
+                };
+            }
+            if cancellation_token.is_cancelled() {
+                return Err(FunctionCallError::RespondToModel("wait_agent cancelled".to_string()));
+            }
+            if let Some(outcome) = input.current().await {
+                return Ok(boxed_tool_output(input_only_result(&turn, outcome, parsed_cursor, wait_started)));
+            }
             let coordinator = session.services.agent_control.task_coordinator();
             // Already-pending input does not need durable task-store state. Avoid
             // delaying immediate mailbox or steering delivery on store startup.
-            if pending_activity.is_none() && coordinator.store().is_none() {
-                coordinator
+            if coordinator.store().is_none() {
+                before_delivery!(coordinator
                     .initialize_for_workspace_coordination(
                         session.services.state_db.clone(),
                         turn.config.sqlite_home.clone(),
                         turn.config.model_provider_id.clone(),
                         session.services.agent_control.session_id().to_string(),
-                    )
-                    .await
+                    ), parsed_cursor)
                     .map_err(|error| {
                         FunctionCallError::RespondToModel(format!(
                             "wait_agent could not initialize durable typed-task progress: {error}"
@@ -160,9 +196,8 @@ impl Handler {
                 .unwrap_or_else(AgentPath::root)
                 .to_string();
             let cursor = match (explicit_cursor, store.as_ref(), root_session_id.as_deref()) {
-                (false, Some(store), Some(root_session_id)) => store
-                    .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone())
-                    .await
+                (false, Some(store), Some(root_session_id)) => before_delivery!(store
+                    .automatic_wake_cursor(root_session_id.to_string(), consuming_agent_path.clone()), parsed_cursor)
                     .map_err(|error| {
                         FunctionCallError::RespondToModel(format!(
                             "wait_agent could not initialize its automatic cursor: {error}"
@@ -170,46 +205,46 @@ impl Handler {
                     })?,
                 _ => parsed_cursor,
             };
-            let wait_started = Instant::now();
             let deadline = earliest_deadline(
                 explicit_timeout_ms
                     .map(|timeout_ms| wait_started + Duration::from_millis(timeout_ms as u64)),
                 crate::unified_exec::nested_poll_bound(source.nested_deadline()),
             );
             let mut maintenance_deadline = Some(wait_started + maintenance_interval);
-            let mut pending_activity = pending_activity;
-            let mut activity_open = true;
             let mut unchanged_store_polls = 0_u32;
             let mut drained_event_pages = 0_u32;
             let mut nudged_assignment_ids = Vec::new();
-            let (outcome, wake_read, hydrated_assignments) = 'wait_owner: loop {
-                if pending_activity.is_none() {
-                    let current = read_wake_events(store.as_ref(), root_session_id.as_deref(), cursor)
-                        .await
+            let (outcome, wake_read, hydrated_assignments, settled_revision) = 'wait_owner: loop {
+                if let Some(outcome) = input.current().await {
+                    return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+                }
+                {
+                    let current = before_delivery!(read_wake_events(store.as_ref(), root_session_id.as_deref(), cursor), cursor)
                         .map_err(|error| {
                             FunctionCallError::RespondToModel(format!(
                                 "wait_agent could not inspect durable progress before waiting: {error}"
                             ))
                         })?;
                     if current.updated_agents.is_empty() {
-                        let owners = hydrate_wait_owner_assignments(
+                        let revision = match store.as_ref() {
+                            Some(store) => before_delivery!(store.task_state_revision(), cursor).ok(),
+                            None => None,
+                        };
+                        let owners = before_delivery!(hydrate_wait_owner_assignments(
                             coordinator,
                             store.as_ref(),
                             root_session_id.as_deref(),
                             &consuming_agent_path,
-                        )
-                        .await
+                        ), cursor)
                         .map_err(FunctionCallError::RespondToModel)?;
                         if wait_owner_is_settled(&owners) {
-                            break 'wait_owner (WaitOutcome::MaintenanceActivity, current, owners);
+                            break 'wait_owner (WaitOutcome::MaintenanceActivity, current, owners, revision);
                         }
                     }
                 }
                 let boundary_deadline = earliest_deadline(deadline, maintenance_deadline);
                 let wait = wait_for_activity(
-                    &mut activity_rx,
-                    &mut activity_open,
-                    pending_activity.take(),
+                    &mut input,
                     boundary_deadline,
                     store.as_ref(),
                     root_session_id.as_deref(),
@@ -246,6 +281,7 @@ impl Handler {
                                     turn.as_ref(),
                                     store.as_ref(),
                                     root_session_id.as_deref(),
+                                    turn_state.as_deref(),
                                 )
                                 .await
                             } else {
@@ -308,6 +344,12 @@ impl Handler {
                     }
                 }
 
+                if let Some(outcome) = input.current().await {
+                    return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+                }
+                if matches!(outcome, WaitOutcome::Steered | WaitOutcome::MailboxActivity | WaitOutcome::DeferredCompletion) {
+                    return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+                }
                 if !wake_read.updated_agents.is_empty() {
                     prove_durable_forward_progress(cursor, &wake_read).map_err(|message| {
                         turn.turn_timing_state
@@ -317,11 +359,11 @@ impl Handler {
                 }
 
                 if wake_read.updated_agents.is_empty() {
-                    break (outcome, wake_read, HydratedAssignments::default());
+                    break (outcome, wake_read, HydratedAssignments::default(), None);
                 }
                 let (Some(store), Some(root_session_id)) = (store.as_ref(), root_session_id.as_deref())
                 else {
-                    break (outcome, wake_read, HydratedAssignments::default());
+                    break (outcome, wake_read, HydratedAssignments::default(), None);
                 };
 
                 if cancellation_token.is_cancelled() {
@@ -331,8 +373,7 @@ impl Handler {
                 }
                 let first_page = wake_read;
                 let first_assignment_ids = wake_assignment_ids(&first_page);
-                let first_hydration = hydrate_assignments(coordinator, &first_assignment_ids)
-                    .await
+                let first_hydration = before_delivery!(hydrate_assignments(coordinator, &first_assignment_ids), cursor)
                     .map_err(|error| {
                         FunctionCallError::RespondToModel(format!(
                             "wait_agent could not hydrate its first durable event page: {error}"
@@ -352,8 +393,7 @@ impl Handler {
                         store,
                         root_session_id,
                         next_cursor,
-                        &mut activity_rx,
-                        &mut activity_open,
+                        &mut input,
                         &cancellation_token,
                     )
                     .await
@@ -389,14 +429,14 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                    if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
+                    if let Some(activity) = input.current().await
                     {
                         drain_outcome = activity;
                         break;
                     }
 
                     let assignment_ids = wake_assignment_ids(&next_page);
-                    let hydration = match hydrate_assignments(coordinator, &assignment_ids).await {
+                    let hydration = match before_delivery!(hydrate_assignments(coordinator, &assignment_ids), cursor) {
                         Ok(hydration) => hydration,
                         Err(error) => {
                             tracing::debug!(
@@ -416,7 +456,7 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                    if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
+                    if let Some(activity) = input.current().await
                     {
                         drain_outcome = activity;
                         break;
@@ -445,12 +485,12 @@ impl Handler {
                             "wait_agent cancelled".to_string(),
                         ));
                     }
-                    if let Some(activity) = take_pending_activity(&mut activity_rx, &mut activity_open)
+                    if let Some(activity) = input.current().await
                     {
                         drain_outcome = activity;
                     } else if drain.internally_drained_pages() > 0 {
                         let assignment_ids = drain.assignment_ids();
-                        match hydrate_assignments(coordinator, &assignment_ids).await {
+                        match before_delivery!(hydrate_assignments(coordinator, &assignment_ids), cursor) {
                             Ok(hydration) => {
                                 if let Err(message) = drain.replace_if_same_revisions(hydration) {
                                     tracing::debug!(
@@ -472,8 +512,7 @@ impl Handler {
                 }
 
                 if fail_open {
-                    let hydration = hydrate_assignments(coordinator, &first_assignment_ids)
-                        .await
+                    let hydration = before_delivery!(hydrate_assignments(coordinator, &first_assignment_ids), cursor)
                         .map_err(|error| {
                             FunctionCallError::RespondToModel(format!(
                                 "wait_agent could not fail open to its first durable event page: {error}"
@@ -491,20 +530,33 @@ impl Handler {
                 drained_event_pages =
                     u32::try_from(drain.internally_drained_pages()).unwrap_or(u32::MAX);
                 let (wake_read, hydrated_assignments) = drain.finish();
-                break (drain_outcome, wake_read, hydrated_assignments);
+                break (drain_outcome, wake_read, hydrated_assignments, None);
             };
             turn.turn_timing_state
                 .record_internally_drained_waits(drained_event_pages);
             let mut typed_deltas = Vec::with_capacity(wake_read.updated_agents.len());
-            let owner_assignments = hydrate_wait_owner_assignments(
-                coordinator,
-                store.as_ref(),
-                root_session_id.as_deref(),
-                &consuming_agent_path,
-            )
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-            let owner_states = authoritative_wait_states(&owner_assignments).ok_or_else(|| {
+            if let Some(outcome) = input.current().await {
+                return Ok(boxed_tool_output(input_only_result(&turn, outcome, cursor, wait_started)));
+            }
+            // Reuse the settled payload only behind a cross-connection fence.
+            // Active/expiring leases are time-dependent and are never cached.
+            let reusable = hydrated_assignments.tasks.values().all(|task| {
+                !matches!(task.workspace_status.lease_state,
+                    Some(codex_agent_task_store::LeaseState::Active | codex_agent_task_store::LeaseState::Expired))
+            }) && match (settled_revision, store.as_ref()) {
+                (Some(before), Some(store)) => before_delivery!(store.task_state_revision(), cursor).ok() == Some(before),
+                _ => false,
+            };
+            let refreshed_owner_assignments;
+            let owner_assignments = if reusable {
+                &hydrated_assignments
+            } else {
+                refreshed_owner_assignments = before_delivery!(hydrate_wait_owner_assignments(
+                    coordinator, store.as_ref(), root_session_id.as_deref(), &consuming_agent_path,
+                ), cursor).map_err(FunctionCallError::RespondToModel)?;
+                &refreshed_owner_assignments
+            };
+            let owner_states = authoritative_wait_states(owner_assignments).ok_or_else(|| {
                 FunctionCallError::RespondToModel(
                     "wait_agent could not bind its authoritative wait to exact task revisions"
                         .to_string(),
@@ -632,8 +684,7 @@ impl Handler {
             if !explicit_cursor
                 && let (Some(store), Some(root)) = (store.as_ref(), root_session_id.as_deref())
             {
-                result.previous_delivery = store.automatic_wake_delivery(root.to_string(), consuming_agent_path.clone())
-                    .await.map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent could not recover its prior delivery: {error}")))?
+                result.previous_delivery = before_delivery!(store.automatic_wake_delivery(root.to_string(), consuming_agent_path.clone()), cursor).map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent could not recover its prior delivery: {error}")))?
                     .map(|value| serde_json::from_str(&value)).transpose()
                     .map_err(|error| FunctionCallError::RespondToModel(format!("wait_agent prior delivery is invalid: {error}")))?;
                 if let Some(next) = result.cursor.as_deref().map(WakeEventId::parse).transpose()
@@ -934,12 +985,20 @@ fn wake_assignment_ids(wake_read: &WakeRead) -> BTreeSet<AssignmentId> {
         .collect()
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_OWNER_HYDRATIONS: Arc<std::sync::atomic::AtomicUsize>;
+}
+
 async fn hydrate_assignments(
     coordinator: &crate::agent::task_coordinator::AgentTaskCoordinator,
     assignment_ids: &BTreeSet<AssignmentId>,
 ) -> Result<HydratedAssignments, String> {
     let mut hydrated = HydratedAssignments::default();
     for assignment_id in assignment_ids {
+        #[cfg(test)]
+        let _ = TEST_OWNER_HYDRATIONS
+            .try_with(|count| count.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let task = coordinator
             .get_agent_task(*assignment_id, Some(0))
             .await
@@ -980,14 +1039,9 @@ async fn hydrate_wait_owner_assignments(
 fn wait_owner_is_settled(assignments: &HydratedAssignments) -> bool {
     !assignments.tasks.is_empty()
         && assignments.tasks.values().all(|task| {
-            !has_pending_required_gates(task)
-                && matches!(
-                    task.current_attempt.state,
-                    AttemptState::Completed
-                        | AttemptState::Violated
-                        | AttemptState::Abandoned
-                        | AttemptState::NeedsMain
-                )
+            task.current_attempt.state.is_terminal()
+                && (task.current_attempt.state != AttemptState::Completed
+                    || !has_pending_required_gates(task))
         })
 }
 
@@ -1008,61 +1062,96 @@ async fn read_next_wake_page(
     store: &std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>,
     root_session_id: &str,
     cursor: WakeEventId,
-    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
-    activity_open: &mut bool,
+    input: &mut AgentWaitInput<'_>,
     cancellation_token: &CancellationToken,
 ) -> BacklogPageRead {
-    loop {
-        let page = store.read_wake_events(root_session_id.to_string(), Some(cursor));
-        let activity_changed = async {
-            if *activity_open {
-                activity_rx.changed().await
-            } else {
-                std::future::pending().await
-            }
-        };
-        tokio::select! {
-            biased;
-            _ = cancellation_token.cancelled() => return BacklogPageRead::Cancelled,
-            changed = activity_changed => {
-                match changed {
-                    Ok(()) => {
-                        let outcome = match *activity_rx.borrow_and_update() {
-                            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-                            InputQueueActivity::Steer => WaitOutcome::Steered,
-                            InputQueueActivity::InternalCompletion => {
-                                WaitOutcome::DeferredCompletion
-                            }
-                        };
-                        return BacklogPageRead::Activity(outcome);
-                    }
-                    Err(_) => *activity_open = false,
-                }
-            }
-            page = page => return BacklogPageRead::Page(page),
-        }
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => BacklogPageRead::Cancelled,
+        outcome = input.next() => BacklogPageRead::Activity(outcome),
+        page = store.read_wake_events(root_session_id.to_string(), Some(cursor)) => BacklogPageRead::Page(page),
     }
 }
 
-fn take_pending_activity(
-    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
-    activity_open: &mut bool,
-) -> Option<WaitOutcome> {
-    if !*activity_open {
-        return None;
+struct AgentWaitInput<'a> {
+    session: &'a crate::session::session::Session,
+    turn_state: Option<&'a tokio::sync::Mutex<crate::state::TurnState>>,
+    receiver: tokio::sync::watch::Receiver<InputQueueActivity>,
+}
+
+impl AgentWaitInput<'_> {
+    async fn current(&mut self) -> Option<WaitOutcome> {
+        self.receiver.borrow_and_update();
+        self.session
+            .input_queue
+            .pending_agent_activity(self.turn_state)
+            .await
+            .map(input_outcome)
     }
-    match activity_rx.has_changed() {
-        Ok(true) => Some(match *activity_rx.borrow_and_update() {
-            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-            InputQueueActivity::Steer => WaitOutcome::Steered,
-            InputQueueActivity::InternalCompletion => WaitOutcome::DeferredCompletion,
-        }),
-        Ok(false) => None,
-        Err(_) => {
-            *activity_open = false;
-            None
-        }
+
+    async fn next(&mut self) -> WaitOutcome {
+        input_outcome(
+            self.session
+                .input_queue
+                .next_agent_activity(self.turn_state, &mut self.receiver)
+                .await,
+        )
     }
+}
+
+fn input_outcome(activity: InputQueueActivity) -> WaitOutcome {
+    match activity {
+        InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
+        InputQueueActivity::Steer => WaitOutcome::Steered,
+        InputQueueActivity::InternalCompletion => WaitOutcome::DeferredCompletion,
+    }
+}
+
+fn input_only_read(cursor: Option<WakeEventId>) -> WakeRead {
+    WakeRead {
+        status: WakeReadStatus::Unknown,
+        reason: None,
+        updated_agents: Vec::new(),
+        latest_event_id: cursor,
+        lost_to_retention_count: 0,
+        remaining_count: 0,
+        truncated_count: 0,
+        timed_out: false,
+    }
+}
+
+fn input_only_result(
+    turn: &crate::session::turn_context::TurnContext,
+    outcome: WaitOutcome,
+    cursor: Option<WakeEventId>,
+    started: Instant,
+) -> WaitAgentResult {
+    turn.session_telemetry.counter(
+        "codex.multi_agent.root_wait",
+        1,
+        &[(
+            "outcome",
+            match outcome {
+                WaitOutcome::Steered => "steered",
+                WaitOutcome::MailboxActivity => "mailbox",
+                _ => "deferred_completion",
+            },
+        )],
+    );
+    turn.session_telemetry.histogram(
+        "codex.multi_agent.root_wait_duration_ms",
+        i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        &[],
+    );
+    // No durable page has been delivered. The cursor is unchanged (or
+    // uninitialized), and no authoritative completion or delivery receipt exists.
+    WaitAgentResult::from_outcome(
+        outcome,
+        cursor.map(|value| value.to_string()),
+        Vec::new(),
+        0,
+        Vec::new(),
+    )
 }
 
 #[cfg(test)]
@@ -1318,6 +1407,7 @@ mod tests {
                         capability_profile: CapabilityProfile::ScopedSourceWrite,
                         objective: "Verify complete wait ownership".to_string(),
                         acceptance_criteria: vec![AcceptanceCriterion {
+                            evidence_policy: None,
                             id: "wait-owner".to_string(),
                             text: "The descendant remains visible to its waiter".to_string(),
                         }],
@@ -1574,6 +1664,8 @@ mod tests {
         let attempt_id = codex_agent_task_store::AttemptId::new();
         let now = chrono::Utc::now();
         let mut task = AgentTask {
+            dependency_admissions: Vec::new(),
+            criterion_assessments: Vec::new(),
             assignment: codex_agent_task_store::Assignment {
                 assignment_id,
                 root_session_id: "root".to_string(),
@@ -1584,6 +1676,7 @@ mod tests {
                 capability_profile: codex_agent_task_store::CapabilityProfile::ScopedSourceWrite,
                 objective: "complete task".to_string(),
                 acceptance_criteria: vec![codex_agent_task_store::AcceptanceCriterion {
+                    evidence_policy: None,
                     id: "criterion".to_string(),
                     text: "criterion passes".to_string(),
                 }],
@@ -2065,26 +2158,22 @@ mod tests {
 
     #[tokio::test]
     async fn nested_deadline_caps_passive_wait_without_throwing() {
-        let (_activity_tx, mut activity_rx) =
-            tokio::sync::watch::channel(InputQueueActivity::Mailbox);
-        let mut activity_open = true;
+        let (session, _turn) = crate::session::tests::make_session_and_context().await;
+        let (receiver, _) = session.input_queue.subscribe_agent_activity(None).await;
+        let mut input = AgentWaitInput {
+            session: &session,
+            turn_state: None,
+            receiver,
+        };
         // An exhausted wrapper budget must yield normally even without an
         // explicit timeout; it must never become an unbounded passive wait.
         let nested = crate::unified_exec::nested_poll_bound(Some(std::time::Instant::now()));
         for explicit in [None, Some(Instant::now() + Duration::from_secs(300))] {
             let deadline = earliest_deadline(explicit, nested);
             assert_eq!(deadline, nested);
-            let (outcome, _) = wait_for_activity(
-                &mut activity_rx,
-                &mut activity_open,
-                None,
-                deadline,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
+            let (outcome, _) = wait_for_activity(&mut input, deadline, None, None, None)
+                .await
+                .unwrap();
             assert_eq!(outcome, WaitOutcome::BoundaryElapsed);
             let result = WaitAgentResult::from_outcome(
                 WaitOutcome::TimedOut,
@@ -2101,13 +2190,15 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_boundary_is_reported_to_the_wait_owner() {
-        let (activity_tx, mut activity_rx) =
-            tokio::sync::watch::channel(InputQueueActivity::Mailbox);
-        let mut activity_open = true;
+        let (session, _turn) = crate::session::tests::make_session_and_context().await;
+        let (receiver, _) = session.input_queue.subscribe_agent_activity(None).await;
+        let mut input = AgentWaitInput {
+            session: &session,
+            turn_state: None,
+            receiver,
+        };
         let (outcome, _) = wait_for_activity(
-            &mut activity_rx,
-            &mut activity_open,
-            None,
+            &mut input,
             Some(Instant::now() + Duration::from_millis(5)),
             None,
             None,
@@ -2117,18 +2208,29 @@ mod tests {
         .expect("wait result");
 
         assert_eq!(outcome, WaitOutcome::BoundaryElapsed);
-        drop(activity_tx);
     }
 
     #[tokio::test]
     async fn input_activity_wakes_before_owner_boundary() {
-        let (_activity_tx, mut activity_rx) =
-            tokio::sync::watch::channel(InputQueueActivity::Steer);
-        let mut activity_open = true;
+        let (session, _turn) = crate::session::tests::make_session_and_context().await;
+        let (receiver, _) = session.input_queue.subscribe_agent_activity(None).await;
+        let mut input = AgentWaitInput {
+            session: &session,
+            turn_state: None,
+            receiver,
+        };
+        session
+            .input_queue
+            .restore_transferred_startup_input(vec![crate::session::TurnInput::UserInput {
+                content: vec![codex_protocol::user_input::UserInput::Text {
+                    text: "Change direction now".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }])
+            .await;
         let (outcome, wake_read) = wait_for_activity(
-            &mut activity_rx,
-            &mut activity_open,
-            Some(InputQueueActivity::Steer),
+            &mut input,
             Some(Instant::now() + Duration::from_secs(1)),
             None,
             None,
@@ -2139,6 +2241,206 @@ mod tests {
 
         assert_eq!(outcome, WaitOutcome::Steered);
         assert!(!wake_read.timed_out);
+    }
+
+    #[tokio::test]
+    async fn retained_steering_overrides_cached_and_later_mailbox_and_stale_wakes() {
+        use crate::session::TurnInput;
+        use futures::FutureExt;
+        for trigger in [false, true] {
+            for steer_first in [false, true] {
+                let (session, _turn) = crate::session::tests::make_session_and_context().await;
+                let (receiver, _) = session.input_queue.subscribe_agent_activity(None).await;
+                let mut input = AgentWaitInput {
+                    session: &session,
+                    turn_state: None,
+                    receiver,
+                };
+                assert!(Box::pin(input.next()).as_mut().now_or_never().is_none());
+                let steer = TurnInput::UserInput {
+                    content: vec![codex_protocol::user_input::UserInput::Text {
+                        text: "urgent correction".into(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                };
+                let mail = InterAgentCommunication::new(
+                    AgentPath::root().join("worker").unwrap(),
+                    AgentPath::root(),
+                    Vec::new(),
+                    "routine child message".into(),
+                    trigger,
+                );
+                if steer_first {
+                    session
+                        .input_queue
+                        .restore_transferred_startup_input(vec![steer.clone()])
+                        .await;
+                }
+                session
+                    .input_queue
+                    .enqueue_mailbox_communication(mail)
+                    .await
+                    .unwrap();
+                if !steer_first {
+                    session
+                        .input_queue
+                        .restore_transferred_startup_input(vec![steer])
+                        .await;
+                }
+                assert_eq!(input.current().await, Some(WaitOutcome::Steered));
+                assert_eq!(input.next().await, WaitOutcome::Steered);
+                let (outcome, page) = wait_for_activity(&mut input, None, None, None, None)
+                    .await
+                    .unwrap();
+                assert_eq!(outcome, WaitOutcome::Steered);
+                assert!(page.updated_agents.is_empty());
+                session
+                    .input_queue
+                    .get_pending_input(&tokio::sync::Mutex::new(None))
+                    .await;
+                assert!(
+                    Box::pin(input.next()).as_mut().now_or_never().is_none(),
+                    "a stale hint cannot fabricate another wake"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_steering_handler_never_initializes_or_acknowledges_durable_progress() {
+        use crate::session::step_context::StepContext;
+        use crate::tools::context::ToolCallSource;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        session
+            .input_queue
+            .restore_transferred_startup_input(vec![crate::session::TurnInput::UserInput {
+                content: vec![codex_protocol::user_input::UserInput::Text {
+                    text: "Stop waiting and inspect branch B".into(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }])
+            .await;
+        let payload = ToolPayload::Function {
+            arguments: "{}".into(),
+        };
+        let result = Handler::default()
+            .handle_call(ToolInvocation {
+                session: session.clone(),
+                step_context: StepContext::for_test(turn),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "pending-steer".into(),
+                tool_name: ToolName::plain("wait_agent"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap()
+            .code_mode_result(&payload);
+        assert_eq!(result["message"], "Wait interrupted by new input.");
+        assert!(result["cursor"].is_null());
+        assert_eq!(result["typed_deltas"], json!([]));
+        assert!(
+            session
+                .services
+                .agent_control
+                .task_coordinator()
+                .store()
+                .is_none(),
+            "input-only exit has zero durable-store initialization or cursor work"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_steering_returns_while_the_cold_cursor_writer_is_locked() {
+        use crate::session::step_context::StepContext;
+        use crate::tools::context::ToolCallSource;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use sqlx::Connection;
+        let home = tempfile::tempdir().unwrap();
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            turn.config.model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
+        let coordinator = session.services.agent_control.task_coordinator();
+        coordinator
+            .initialize(runtime.clone(), "steering-writer-probe".into())
+            .await
+            .unwrap();
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(
+            runtime
+                .codex_home()
+                .join("agent-task-coordination")
+                .join("agent_tasks.sqlite"),
+        );
+        let mut writer = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM automatic_wake_cursors")
+            .fetch_one(&mut writer)
+            .await
+            .unwrap();
+        assert_eq!(
+            before, 0,
+            "the regression requires an absent automatic cursor"
+        );
+        session
+            .input_queue
+            .restore_transferred_startup_input(vec![crate::session::TurnInput::UserInput {
+                content: vec![codex_protocol::user_input::UserInput::Text {
+                    text: "Stop waiting".into(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }])
+            .await;
+        let payload = ToolPayload::Function {
+            arguments: "{}".into(),
+        };
+        let returned = tokio::time::timeout(
+            Duration::from_secs(1),
+            Handler::default().handle_call(ToolInvocation {
+                session: session.clone(),
+                step_context: StepContext::for_test(turn),
+                cancellation_token: CancellationToken::new(),
+                tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+                call_id: "held-writer-steer".into(),
+                tool_name: ToolName::plain("wait_agent"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            }),
+        )
+        .await;
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM automatic_wake_cursors")
+            .fetch_one(&mut writer)
+            .await
+            .unwrap();
+        sqlx::query("ROLLBACK").execute(&mut writer).await.unwrap();
+        let result = returned
+            .expect("steering must return before the writer is released")
+            .unwrap()
+            .code_mode_result(&payload);
+        assert_eq!(result["message"], "Wait interrupted by new input.");
+        assert!(result["cursor"].is_null());
+        assert_eq!(result["typed_deltas"], json!([]));
+        assert_eq!(
+            after, 0,
+            "the steering return must not initialize or acknowledge a cursor"
+        );
     }
 }
 
@@ -2266,7 +2568,11 @@ fn authoritative_wait_signal(
     states: &[AuthoritativeWaitState],
     surfaceable_message: Option<&str>,
 ) -> Option<JsonValue> {
-    if states.is_empty() || states.iter().any(|state| state.has_pending_gates) {
+    if states.is_empty()
+        || states
+            .iter()
+            .any(|state| state.state == AttemptState::Completed && state.has_pending_gates)
+    {
         return None;
     }
     let disposition = if states
@@ -2389,7 +2695,7 @@ pub(crate) async fn inspect_authoritative_wait_snapshot(
         .map(|assignment_id| AssignmentId::parse(assignment_id).ok())
         .collect::<Option<BTreeSet<_>>>()?;
     let store = coordinator.store()?;
-    let mut assignments = hydrate_wait_owner_assignments(
+    let assignments = hydrate_wait_owner_assignments(
         coordinator,
         Some(&store),
         Some(&root_session_id),
@@ -2397,13 +2703,12 @@ pub(crate) async fn inspect_authoritative_wait_snapshot(
     )
     .await
     .ok()?;
-    assignments
-        .tasks
-        .retain(|assignment_id, _| guarded_assignment_ids.contains(assignment_id));
-    assignments
-        .revisions
-        .retain(|assignment_id, _| guarded_assignment_ids.contains(assignment_id));
-    if assignments.tasks.len() != guarded_assignment_ids.len() {
+    // The saved revision describes the complete owner set, not just the last
+    // delivered deltas. Never discard new recovery children before comparing it.
+    if !guarded_assignment_ids
+        .iter()
+        .all(|id| assignments.tasks.contains_key(id))
+    {
         return None;
     }
     let states = authoritative_wait_states(&assignments)?;
@@ -2415,10 +2720,20 @@ async fn nudge_stalled_assignments(
     turn: &crate::session::turn_context::TurnContext,
     store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
+    turn_state: Option<&tokio::sync::Mutex<crate::state::TurnState>>,
 ) -> Vec<String> {
     let (Some(store), Some(root_session_id)) = (store, root_session_id) else {
         return Vec::new();
     };
+    if let Err(error) = session
+        .services
+        .agent_control
+        .task_coordinator()
+        .recover_unstarted_assignments()
+        .await
+    {
+        tracing::warn!(%error, "failed to reconcile interrupted task launches");
+    }
     let author = turn
         .session_source
         .get_agent_path()
@@ -2433,6 +2748,14 @@ async fn nudge_stalled_assignments(
         - chrono::Duration::seconds(codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS);
     let mut nudged = Vec::new();
     for binding in bindings {
+        if session
+            .input_queue
+            .pending_agent_activity(turn_state)
+            .await
+            .is_some()
+        {
+            break;
+        }
         if !is_strict_agent_descendant(&author, &binding.agent_path) {
             continue;
         }
@@ -2446,6 +2769,14 @@ async fn nudge_stalled_assignments(
         let status = session.services.agent_control.get_status(thread_id).await;
         if !runtime_status_allows_nonproductive_recovery(&status) {
             continue;
+        }
+        if session
+            .input_queue
+            .pending_agent_activity(turn_state)
+            .await
+            .is_some()
+        {
+            break;
         }
         match store
             .recover_nonproductive_assignment(binding.assignment_id, no_progress_before)
@@ -2488,6 +2819,16 @@ async fn nudge_stalled_assignments(
                 );
                 continue;
             }
+        }
+        // Finish any accepted recovery/nudge before observing input, but do
+        // not admit a new mutation after the passive wait has been steered.
+        if session
+            .input_queue
+            .pending_agent_activity(turn_state)
+            .await
+            .is_some()
+        {
+            break;
         }
         let Ok(true) = store
             .reserve_stalled_nudge(binding.assignment_id, no_progress_before)
@@ -2648,57 +2989,32 @@ async fn wait_wake_events(
 
 // The explicit activity, deadline, durable-store, and cursor inputs document
 // every wake source participating in this private wait state machine.
-#[allow(clippy::too_many_arguments)]
+// The explicit input, deadline, durable-store, and cursor owners document
+// every wake source participating in this private wait state machine.
 async fn wait_for_activity(
-    activity_rx: &mut tokio::sync::watch::Receiver<InputQueueActivity>,
-    activity_open: &mut bool,
-    pending_activity: Option<InputQueueActivity>,
+    input: &mut AgentWaitInput<'_>,
     boundary_deadline: Option<Instant>,
     store: Option<&std::sync::Arc<codex_agent_task_store::LocalAgentTaskStore>>,
     root_session_id: Option<&str>,
     cursor: Option<WakeEventId>,
 ) -> codex_agent_task_store::StoreResult<(WaitOutcome, WakeRead)> {
-    if let Some(activity) = pending_activity {
-        let outcome = match activity {
-            InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-            InputQueueActivity::Steer => WaitOutcome::Steered,
-            InputQueueActivity::InternalCompletion => WaitOutcome::DeferredCompletion,
-        };
-        return Ok((
-            outcome,
-            WakeRead {
-                status: WakeReadStatus::Unknown,
-                reason: None,
-                updated_agents: Vec::new(),
-                latest_event_id: cursor,
-                lost_to_retention_count: 0,
-                remaining_count: 0,
-                truncated_count: 0,
-                timed_out: false,
-            },
-        ));
+    if let Some(outcome) = input.current().await {
+        return Ok((outcome, input_only_read(cursor)));
     }
     if boundary_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        let current = read_wake_events(store, root_session_id, cursor).await?;
-        return Ok(if current.updated_agents.is_empty() {
-            (WaitOutcome::BoundaryElapsed, current)
-        } else {
-            (WaitOutcome::DurableActivity, current)
-        });
-    }
-    let durable_activity = wait_wake_events(store, root_session_id, cursor);
-    let input_activity = async {
-        if !*activity_open {
-            return std::future::pending::<InputQueueActivity>().await;
-        }
-        match activity_rx.changed().await {
-            Ok(()) => *activity_rx.borrow_and_update(),
-            Err(_) => {
-                *activity_open = false;
-                std::future::pending::<InputQueueActivity>().await
+        return tokio::select! {
+            biased;
+            outcome = input.next() => Ok((outcome, input_only_read(cursor))),
+            current = read_wake_events(store, root_session_id, cursor) => {
+                let current = current?;
+                Ok(if current.updated_agents.is_empty() {
+                    (WaitOutcome::BoundaryElapsed, current)
+                } else {
+                    (WaitOutcome::DurableActivity, current)
+                })
             }
-        }
-    };
+        };
+    }
     let boundary = async {
         match boundary_deadline {
             Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -2707,25 +3023,241 @@ async fn wait_for_activity(
     };
     tokio::select! {
         biased;
-        activity = input_activity => {
-            let outcome = match activity {
-                InputQueueActivity::Mailbox => WaitOutcome::MailboxActivity,
-                InputQueueActivity::Steer => WaitOutcome::Steered,
-                            InputQueueActivity::InternalCompletion => {
-                                WaitOutcome::DeferredCompletion
-                            }
-            };
-            let wake_read = read_wake_events(store, root_session_id, cursor).await?;
-            Ok((outcome, wake_read))
-        }
-        durable = durable_activity => Ok((WaitOutcome::DurableActivity, durable?)),
+        outcome = input.next() => Ok((outcome, input_only_read(cursor))),
+        durable = wait_wake_events(store, root_session_id, cursor) => Ok((WaitOutcome::DurableActivity, durable?)),
         _ = boundary => {
-            let current = read_wake_events(store, root_session_id, cursor).await?;
-            Ok(if current.updated_agents.is_empty() {
-                (WaitOutcome::BoundaryElapsed, current)
-            } else {
-                (WaitOutcome::DurableActivity, current)
-            })
+            tokio::select! {
+                biased;
+                outcome = input.next() => Ok((outcome, input_only_read(cursor))),
+                current = read_wake_events(store, root_session_id, cursor) => {
+                    let current = current?;
+                    Ok(if current.updated_agents.is_empty() {
+                        (WaitOutcome::BoundaryElapsed, current)
+                    } else {
+                        (WaitOutcome::DurableActivity, current)
+                    })
+                }
+            }
         }
+    }
+}
+#[cfg(test)]
+mod multi_agent_regressions {
+    use super::*;
+    use codex_agent_task_store::*;
+
+    async fn add_task(
+        session: &crate::session::session::Session,
+        repo: &std::path::Path,
+        name: &str,
+    ) -> (Assignment, Attempt) {
+        let coordinator = session.services.agent_control.task_coordinator();
+        let root = coordinator.root_session_id().unwrap();
+        let (assignment, attempt) = coordinator
+            .create_assignment(
+                repo,
+                AssignmentDraft {
+                    root_session_id: root,
+                    admission_origin: AssignmentAdmissionOrigin::Typed,
+                    role: AgentRole::Worker,
+                    capability_profile: CapabilityProfile::ScopedSourceWrite,
+                    objective: "wait regression".into(),
+                    acceptance_criteria: vec![AcceptanceCriterion {
+                        evidence_policy: None,
+                        id: "done".into(),
+                        text: "done".into(),
+                    }],
+                    read_scope: Vec::new(),
+                    write_scope: Vec::new(),
+                    stop_condition: "stop".into(),
+                    dependencies: Vec::new(),
+                    risk_hints: Vec::new(),
+                    required_evidence: Vec::new(),
+                    prohibited_changes: Vec::new(),
+                    contract_claims: Vec::new(),
+                    workspace_strategy: WorkspaceStrategy::Shared,
+                    relation: None,
+                    architecture_contract_ref: None,
+                },
+            )
+            .await
+            .unwrap();
+        coordinator
+            .bind_agent_task(AgentTaskBindingDraft {
+                assignment_id: assignment.assignment_id,
+                attempt_id: attempt.attempt_id,
+                agent_path: format!("/root/{name}"),
+                task_name: name.into(),
+                thread_id: None,
+            })
+            .await
+            .unwrap();
+        (assignment, attempt)
+    }
+
+    async fn run_registered_wait(
+        session: Arc<crate::session::session::Session>,
+        turn: Arc<crate::session::turn_context::TurnContext>,
+        cursor: Option<WakeEventId>,
+        owner_hydrations: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> anyhow::Result<(JsonValue, Option<JsonValue>)> {
+        use crate::agent::task_capabilities::TypedToolClass;
+        use crate::session::step_context::StepContext;
+        use crate::tools::parallel::ToolCallRuntime;
+        use crate::tools::registry::RegisteredTool;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::router::ToolCall;
+        use crate::tools::router::ToolCallSource;
+        use crate::tools::router::ToolRouter;
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_unique_registered_tools([RegisteredTool::new(
+                Arc::new(Handler {
+                    owner_hydrations: Some(owner_hydrations),
+                    ..Default::default()
+                }) as Arc<dyn CoreToolRuntime>,
+                TypedToolClass::AgentCommunication,
+            )]),
+            Vec::new(),
+        ));
+        let step = StepContext::for_test(turn).with_tool_router_for_test(router);
+        let runtime = ToolCallRuntime::new(
+            session,
+            step,
+            Arc::new(tokio::sync::Mutex::new(
+                crate::turn_diff_tracker::TurnDiffTracker::new(),
+            )),
+        );
+        let result = runtime
+            .handle_tool_call_with_source(
+                ToolCall {
+                    tool_name: ToolName::plain("wait_agent"),
+                    call_id: "terminal-gate-regression".into(),
+                    payload: ToolPayload::Function {
+                        arguments: json!({"cursor": cursor.map(|id| id.to_string())}).to_string(),
+                    },
+                },
+                ToolCallSource::Direct,
+                CancellationToken::new(),
+            )
+            .await?;
+        let signal = result
+            .sampling_request_signal()
+            .map(|signal| serde_json::to_value(signal).unwrap());
+        Ok((result.code_mode_result(), signal))
+    }
+
+    #[tokio::test]
+    async fn ma010_snapshot_includes_new_owners_outside_the_delivered_delta_set()
+    -> anyhow::Result<()> {
+        let repo = tempfile::tempdir()?;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let coordinator = session.services.agent_control.task_coordinator();
+        coordinator
+            .initialize_for_workspace_coordination(
+                None,
+                repo.path().join("state"),
+                turn.config.model_provider_id.clone(),
+                session.services.agent_control.session_id().to_string(),
+            )
+            .await?;
+        let (a, attempt) = add_task(&session, repo.path(), "blocked").await;
+        coordinator
+            .store()
+            .unwrap()
+            .submit_agent_receipt(
+                attempt.attempt_id,
+                ReceiptDraft {
+                    status: AgentStatusClaim::NeedsMain,
+                    summary: "root action needed".into(),
+                    criterion_results: vec![CriterionResult {
+                        criterion_id: "done".into(),
+                        status: CriterionStatus::NotRun,
+                        evidence: None,
+                        evidence_ref: None,
+                    }],
+                    declared_changes: Vec::new(),
+                    validation_call_ids: Vec::new(),
+                    blockers: vec!["blocked".into()],
+                    risks: Vec::new(),
+                    next_action: None,
+                    architecture_contract: None,
+                },
+            )
+            .await?;
+        let delivered = vec![a.assignment_id.to_string()];
+        let before = inspect_authoritative_wait_snapshot(&session, &turn, &delivered)
+            .await
+            .unwrap();
+        add_task(&session, repo.path(), "recovery").await;
+        let after = inspect_authoritative_wait_snapshot(&session, &turn, &delivered)
+            .await
+            .unwrap();
+        assert_ne!(
+            before.state_revision, after.state_revision,
+            "new recovery work must invalidate the blocked guard"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ma012_abandoned_pending_gate_settles_and_ma016_hydrates_once() -> anyhow::Result<()> {
+        let repo = tempfile::tempdir()?;
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let coordinator = session.services.agent_control.task_coordinator();
+        let root = session.services.agent_control.session_id().to_string();
+        coordinator
+            .initialize_for_workspace_coordination(
+                None,
+                repo.path().join("state"),
+                turn.config.model_provider_id.clone(),
+                root.clone(),
+            )
+            .await?;
+        let (assignment, attempt) = add_task(&session, repo.path(), "abandoned").await;
+        let store = coordinator.store().unwrap();
+        store
+            .set_agent_gate(
+                TaskActor::RootSession(root.clone()),
+                assignment.assignment_id,
+                attempt.attempt_id,
+                GateKind::Review,
+                GateStatus::Pending,
+                "obsolete review".into(),
+            )
+            .await?;
+        store
+            .abandon_agent_task(
+                TaskActor::RootSession(root.clone()),
+                assignment.assignment_id,
+                "cancelled".into(),
+            )
+            .await?;
+        let mut cursor = None;
+        loop {
+            let page = store.read_wake_events(root.clone(), cursor).await?;
+            cursor = page.latest_event_id;
+            if page.remaining_count == 0 {
+                break;
+            }
+        }
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let owner_hydrations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (output, signal) = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_registered_wait(session, turn, cursor, Arc::clone(&owner_hydrations)),
+        )
+        .await??;
+        assert_eq!(output["timed_out"], false);
+        assert_eq!(
+            signal.unwrap()["authoritative_wait_owner_v1"]["disposition"],
+            "terminal"
+        );
+        assert_eq!(
+            owner_hydrations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "unchanged settled owners must not be fully hydrated twice"
+        );
+        Ok(())
     }
 }

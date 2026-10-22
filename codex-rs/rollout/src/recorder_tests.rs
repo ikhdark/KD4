@@ -1,6 +1,41 @@
 #![allow(warnings, clippy::all)]
 
 use super::*;
+
+#[test]
+fn media_preflight_uses_the_same_complete_batch_charge_as_recording() {
+    use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ImageDetail;
+    use codex_protocol::models::ResponseItem;
+    let image = |size| ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputImage {
+            image_url: format!("data:image/png;base64,{}", "A".repeat(size)),
+            detail: Some(ImageDetail::Original),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    for items in [
+        vec![image(1024)],
+        vec![image(19_368_924)],
+        vec![image(9_000_000), image(9_000_000)],
+    ] {
+        let recorded = items
+            .iter()
+            .cloned()
+            .map(RolloutItem::ResponseItem)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            RolloutRecorder::validate_response_items(&items).is_ok(),
+            rollout_admission_bytes(&recorded).is_ok()
+        );
+    }
+    let error = RolloutRecorder::validate_response_items(&[image(19_368_924)]).unwrap_err();
+    assert!(error.to_string().contains("64 MiB"));
+    assert!(error.to_string().contains("no items accepted"));
+}
 use crate::ToolManifestDictionary;
 use crate::config::RolloutConfig;
 use chrono::TimeZone;
@@ -52,7 +87,10 @@ async fn failed_rollout_backlog_is_bounded_and_only_barriers_retry() -> std::io:
     let blocked = home.path().join("blocked");
     fs::write(&blocked, "not a directory")?;
     let path = blocked.join("rollout.jsonl");
-    let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent { message: "retained evidence".into(), phase: None }));
+    let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        message: "retained evidence".into(),
+        phase: None,
+    }));
     let charge = rollout_admission_bytes(std::slice::from_ref(&item))? as usize;
     let mut task = RolloutWriterTask::new();
     task.pending_bytes = Arc::new(tokio::sync::Semaphore::new(charge * 2));
@@ -62,34 +100,78 @@ async fn failed_rollout_backlog_is_bounded_and_only_barriers_retry() -> std::io:
     let writer_path = path.clone();
     let cwd = home.path().to_path_buf();
     task.set_handle(tokio::spawn(async move {
-        if let Err(error) = rollout_writer(None, None, rx, None, cwd, Some(None), writer_path, Default::default(), Arc::clone(&owner)).await {
+        if let Err(error) = rollout_writer(
+            None,
+            None,
+            rx,
+            None,
+            cwd,
+            Some(None),
+            writer_path,
+            Default::default(),
+            Arc::clone(&owner),
+        )
+        .await
+        {
             owner.mark_failed(&error);
         }
     }));
-    let recorder = RolloutRecorder { tx, writer_task: Arc::clone(&task), rollout_path: path.clone(), writer_lease: None };
-    recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await?;
-    assert!(recorder.flush().await.is_err(), "durability failure must be observable");
+    let recorder = RolloutRecorder {
+        tx,
+        writer_task: Arc::clone(&task),
+        rollout_path: path.clone(),
+    };
+    recorder
+        .record_canonical_items_ordered(std::slice::from_ref(&item))
+        .await?;
+    assert!(
+        recorder.flush().await.is_err(),
+        "durability failure must be observable"
+    );
     // Repair storage, but additions must not each restart the failed episode.
     fs::remove_file(&blocked)?;
     fs::create_dir(&blocked)?;
-    recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await?;
+    recorder
+        .record_canonical_items_ordered(std::slice::from_ref(&item))
+        .await?;
     for _ in 0..200 {
-        assert!(recorder.record_canonical_items_ordered(std::slice::from_ref(&item)).await.unwrap_err().to_string().contains("no items accepted"));
+        assert!(
+            recorder
+                .record_canonical_items_ordered(std::slice::from_ref(&item))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no items accepted")
+        );
     }
     // Fence on the writer: it has consumed the accepted addition before the retry check.
     let (entered_tx, entered_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();
-    recorder.tx.send(RolloutCmd::Pause { entered: entered_tx, resume: resume_rx }).await
+    recorder
+        .tx
+        .send(RolloutCmd::Pause {
+            entered: entered_tx,
+            resume: resume_rx,
+        })
+        .await
         .expect("writer command channel should be open");
     entered_rx.await.expect("writer should enter pause");
-    assert!(!path.exists(), "ordinary additions must not retry degraded I/O");
+    assert!(
+        !path.exists(),
+        "ordinary additions must not retry degraded I/O"
+    );
     assert_eq!(task.pending_bytes.available_permits(), 0);
-    resume_tx.send(()).expect("writer pause receiver should remain open");
+    resume_tx
+        .send(())
+        .expect("writer pause receiver should remain open");
     recorder.flush().await?;
     assert_eq!(task.pending_bytes.available_permits(), charge * 2);
     let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
     assert_eq!(errors, 0);
-    assert_eq!(serde_json::to_value(items)?, serde_json::to_value(vec![item.clone(), item])?);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value(vec![item.clone(), item])?
+    );
     recorder.shutdown().await?;
     Ok(())
 }
@@ -100,17 +182,29 @@ async fn resume_reuses_canonical_load_dictionary_for_subsequent_appends() -> std
     let uuid = Uuid::new_v4();
     let id = ThreadId::from_string(&uuid.to_string()).unwrap();
     let path = write_session_file(home.path(), "2025-01-03T12-00-00", uuid)?;
-    let manifest = RolloutItem::ToolManifest(ToolManifestItem::full("resume-shared".into(), serde_json::json!({"tools": []})));
+    let manifest = RolloutItem::ToolManifest(ToolManifestItem::full(
+        "resume-shared".into(),
+        serde_json::json!({"tools": []}),
+    ));
     append_rollout_item_to_path(&path, &manifest).await?;
     let (expected, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
-    let (recorder, history) = RolloutRecorder::resume_and_load(&test_config(home.path()), path.clone(), id).await?;
-    assert_eq!(serde_json::to_value(&history)?, serde_json::to_value(expected)?);
+    let (recorder, history) =
+        RolloutRecorder::resume_and_load(&test_config(home.path()), path.clone(), id).await?;
+    assert_eq!(
+        serde_json::to_value(&history)?,
+        serde_json::to_value(expected)?
+    );
     recorder.record_canonical_items_ordered(&[manifest]).await?;
     recorder.shutdown().await?;
     let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await?;
-    let RolloutItem::ToolManifest(last) = items.last().unwrap() else { panic!("manifest") };
+    let RolloutItem::ToolManifest(last) = items.last().unwrap() else {
+        panic!("manifest")
+    };
     assert!(last.is_reference());
-    assert_eq!(serde_json::to_value(&items[..history.len()])?, serde_json::to_value(&history)?);
+    assert_eq!(
+        serde_json::to_value(&items[..history.len()])?,
+        serde_json::to_value(&history)?
+    );
     Ok(())
 }
 
@@ -121,6 +215,166 @@ fn test_config(codex_home: &Path) -> RolloutConfig {
         cwd: codex_home.to_path_buf(),
         model_provider_id: "test-provider".to_string(),
     }
+}
+
+fn durable_audit_settings(home: &Path, instructions: &str, tier: &str) -> RolloutItem {
+    RolloutItem::EventMsg(
+        serde_json::from_value(serde_json::json!({
+            "type": "thread_settings_applied", "thread_settings": {
+                "model": "test-model", "model_provider_id": "test-provider",
+                "service_tier": tier, "developer_instructions": instructions,
+                "approval_policy": "never", "permission_profile": {"type": "disabled"}, "cwd": home,
+                "collaboration_mode": {"mode": "default", "settings": {
+                    "model": "test-model", "reasoning_effort": null, "developer_instructions": null
+                }}
+            }
+        }))
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn durable_audit_22_direct_reads_use_each_physical_files_mtime() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
+    let expected = std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+    File::options()
+        .write(true)
+        .open(&path)?
+        .set_times(std::fs::FileTimes::new().set_modified(expected))?;
+    let direct = crate::list::read_thread_item_from_rollout(path.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(direct.updated_at.as_deref().unwrap())
+            .unwrap()
+            .timestamp_millis(),
+        1_700_000_000_123
+    );
+    let compressed = path.with_extension("jsonl.zst");
+    fs::write(
+        &compressed,
+        zstd::stream::encode_all(fs::read(&path)?.as_slice(), 0)?,
+    )?;
+    fs::remove_file(&path)?;
+    File::options()
+        .write(true)
+        .open(&compressed)?
+        .set_times(std::fs::FileTimes::new().set_modified(expected + Duration::from_secs(1)))?;
+    let compressed_read = crate::list::read_thread_item_from_rollout(path)
+        .await
+        .unwrap();
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(compressed_read.updated_at.as_deref().unwrap())
+            .unwrap()
+            .timestamp_millis(),
+        1_700_000_001_123
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_audit_01_bulk_ordered_history_is_bounded_and_complete() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
+    let recorder = RolloutRecorder::new(
+        &test_config(home.path()),
+        RolloutRecorderParams::resume(path.clone()),
+    )
+    .await?;
+    let items: Vec<_> = (0..257)
+        .map(|index| {
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: format!("{index}:{}", "x".repeat(64 * 1024)),
+                phase: None,
+            }))
+        })
+        .collect();
+    assert!(
+        rollout_admission_bytes(&items).is_err(),
+        "fixture must exceed one admission"
+    );
+    recorder.record_canonical_items_ordered(&items).await?;
+    recorder.shutdown().await?;
+    let (restored, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
+    assert_eq!(errors, 0);
+    let restored: Vec<_> = restored
+        .into_iter()
+        .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::AgentMessage(_))))
+        .collect();
+    assert_eq!(
+        serde_json::to_value(restored)?,
+        serde_json::to_value(items)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_audit_03_settings_rebase_after_an_independent_append() -> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
+    let config = test_config(home.path());
+    let a = RolloutRecorder::new(&config, RolloutRecorderParams::resume(path.clone())).await?;
+    let b = RolloutRecorder::new(&config, RolloutRecorderParams::resume(path.clone())).await?;
+    for (owner, instructions, tier) in [
+        (&a, "A", "default"),
+        (&b, "B", "default"),
+        (&a, "A", "priority"),
+    ] {
+        owner
+            .record_canonical_items_ordered(&[durable_audit_settings(
+                home.path(),
+                instructions,
+                tier,
+            )])
+            .await?;
+        owner.flush().await?;
+    }
+    a.shutdown().await?;
+    b.shutdown().await?;
+    let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
+    assert_eq!(errors, 0);
+    let restored = codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings(
+        &items,
+        Default::default(),
+    );
+    assert_eq!(restored.developer_instructions, Some(Some("A".into())));
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_audit_04_recovery_keeps_residency_and_never_recreates_a_missing_file()
+-> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let path = home.path().join("rollout.jsonl");
+    fs::write(&path, b"preserved prefix\n")?;
+    let writer = open_log_file(&path)?.into_jsonl_writer();
+    let mut state = RolloutWriterState::new(
+        Some(writer),
+        None,
+        None,
+        home.path().into(),
+        None,
+        path.clone(),
+        Default::default(),
+    );
+    state.enter_recovery_mode(&IoError::other("recoverable I/O failure"));
+    assert_eq!(
+        compression::try_lock_rollout_for_maintenance(&path)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::WouldBlock
+    );
+    state.ensure_writer_open().await?;
+    assert_eq!(fs::read(&path)?, b"preserved prefix\n");
+    state.enter_recovery_mode(&IoError::other("recoverable I/O failure"));
+    fs::remove_file(&path)?;
+    assert_eq!(
+        state.ensure_writer_open().await.unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+    assert!(!path.exists());
+    Ok(())
 }
 
 fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<PathBuf> {
@@ -485,7 +739,10 @@ async fn load_rollout_items_defaults_legacy_session_id() -> std::io::Result<()> 
         panic!("expected session metadata");
     };
     assert_eq!(session_meta.meta.session_id, SessionId::from(thread_id));
-    assert!(session_meta.meta.harness_build.is_none(), "legacy rollouts remain readable");
+    assert!(
+        session_meta.meta.harness_build.is_none(),
+        "legacy rollouts remain readable"
+    );
     assert!(matches!(
         items[1],
         RolloutItem::ResponseItem(ResponseItem::Message { .. })
@@ -511,7 +768,10 @@ async fn for_each_rollout_item_streams_items_and_reports_identity() -> std::io::
         .into_iter()
         .map(|line| line.item)
         .collect::<Vec<_>>();
-    assert_eq!(serde_json::to_value(visited)?, serde_json::to_value(expected)?);
+    assert_eq!(
+        serde_json::to_value(visited)?,
+        serde_json::to_value(expected)?
+    );
     Ok(())
 }
 
@@ -599,7 +859,8 @@ fn assert_reconstruction_gap(item: &RolloutItem, count: usize) {
 }
 
 #[tokio::test]
-async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail() -> std::io::Result<()> {
+async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail()
+-> std::io::Result<()> {
     for compressed in [false, true] {
         for partial in [false, true] {
             let home = TempDir::new()?;
@@ -612,9 +873,13 @@ async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail() 
             }
             drop(file);
             if !partial {
-                append_rollout_item_to_path(&path, &RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
-                    codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-                ))).await?;
+                append_rollout_item_to_path(
+                    &path,
+                    &RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+                    )),
+                )
+                .await?;
             }
             if compressed {
                 let bytes = fs::read(&path)?;
@@ -622,7 +887,9 @@ async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail() 
                 fs::write(&path, zstd::stream::encode_all(bytes.as_slice(), 0)?)?;
                 fs::remove_file(path.with_extension(""))?;
             }
-            let InitialHistory::Resumed(history) = RolloutRecorder::get_rollout_history(&path).await? else {
+            let InitialHistory::Resumed(history) =
+                RolloutRecorder::get_rollout_history(&path).await?
+            else {
                 panic!("expected resume");
             };
             assert_reconstruction_gap(history.history.last().unwrap(), 1);
@@ -633,8 +900,11 @@ async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail() 
                 "malformed_records=1, trailing_partial_records=0, complete=false"
             }));
             let (recorder, resumed) = RolloutRecorder::resume_and_load(
-                &test_config(home.path()), path, history.conversation_id,
-            ).await?;
+                &test_config(home.path()),
+                path,
+                history.conversation_id,
+            )
+            .await?;
             assert_reconstruction_gap(resumed.last().unwrap(), 1);
             recorder.shutdown().await?;
         }
@@ -643,7 +913,8 @@ async fn resume_integrity_distinguishes_interior_corruption_from_partial_tail() 
 }
 
 #[tokio::test]
-async fn malformed_middle_records_remain_visible_after_replacement_history() -> std::io::Result<()> {
+async fn malformed_middle_records_remain_visible_after_replacement_history() -> std::io::Result<()>
+{
     let home = TempDir::new()?;
     let path = write_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())?;
     let mut file = fs::OpenOptions::new().append(true).open(&path)?;
@@ -662,7 +933,8 @@ async fn malformed_middle_records_remain_visible_after_replacement_history() -> 
     append_rollout_item_to_path(&path, &replacement).await?;
     let original = fs::read(&path)?;
     for _ in 0..2 {
-        let InitialHistory::Resumed(history) = RolloutRecorder::get_rollout_history(&path).await? else {
+        let InitialHistory::Resumed(history) = RolloutRecorder::get_rollout_history(&path).await?
+        else {
             panic!("expected resumed history");
         };
         assert_eq!(history.history.len(), 4);
@@ -885,27 +1157,70 @@ async fn recorder_discard_waits_for_owned_cleanup_without_materializing() -> std
     let home = TempDir::new()?;
     let recorder = RolloutRecorder::new(
         &test_config(home.path()),
-        RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
-            None, "discard-test".into(), BaseInstructions::default(), Vec::new()),
-    ).await?;
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            None,
+            SessionSource::Exec,
+            None,
+            "discard-test".into(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
     let path = recorder.rollout_path().to_path_buf();
-    recorder.record_canonical_items_ordered(&[agent_message("discarded")]).await?;
+    recorder
+        .record_canonical_items_ordered(&[agent_message("discarded")])
+        .await?;
     let (entered, paused) = oneshot::channel();
     let (resume, resumed) = oneshot::channel();
-    recorder.tx.send(RolloutCmd::Pause { entered, resume: resumed }).await.unwrap();
+    recorder
+        .tx
+        .send(RolloutCmd::Pause {
+            entered,
+            resume: resumed,
+        })
+        .await
+        .unwrap();
     paused.await.unwrap();
     let discard = recorder.discard();
     tokio::pin!(discard);
-    assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(
-        std::future::Future::poll(discard.as_mut(), cx))).await, std::task::Poll::Pending));
-    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUTTING_DOWN);
+    assert!(matches!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+            discard.as_mut(),
+            cx
+        )))
+        .await,
+        std::task::Poll::Pending
+    ));
+    assert_eq!(
+        recorder.writer_task.lifecycle.load(Ordering::Acquire),
+        WRITER_SHUTTING_DOWN
+    );
     assert!(!path.exists());
     resume.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), discard).await.expect("discard completion")?;
-    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUT_DOWN);
-    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
-    assert!(!path.exists(), "acknowledged discard must not run the last-sender drain");
-    assert!(recorder.record_canonical_items_ordered(&[agent_message("too late")]).await.is_err());
+    tokio::time::timeout(Duration::from_secs(5), discard)
+        .await
+        .expect("discard completion")?;
+    assert_eq!(
+        recorder.writer_task.lifecycle.load(Ordering::Acquire),
+        WRITER_SHUT_DOWN
+    );
+    assert_eq!(
+        recorder.writer_task.pending_bytes.available_permits(),
+        MAX_PENDING_ROLLOUT_BYTES
+    );
+    assert!(
+        !path.exists(),
+        "acknowledged discard must not run the last-sender drain"
+    );
+    assert!(
+        recorder
+            .record_canonical_items_ordered(&[agent_message("too late")])
+            .await
+            .is_err()
+    );
     recorder.discard().await?;
     Ok(())
 }
@@ -916,33 +1231,63 @@ async fn maintenance_rollback_preserves_order_and_lazy_records() -> std::io::Res
         let home = TempDir::new()?;
         let recorder = RolloutRecorder::new(
             &test_config(home.path()),
-            RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
-                None, "maintenance-test".into(), BaseInstructions::default(), Vec::new()),
-        ).await?;
+            RolloutRecorderParams::new(
+                ThreadId::new(),
+                None,
+                None,
+                SessionSource::Exec,
+                None,
+                "maintenance-test".into(),
+                BaseInstructions::default(),
+                Vec::new(),
+            ),
+        )
+        .await?;
         let path = recorder.rollout_path().to_path_buf();
-        recorder.record_canonical_items_ordered(&[agent_message("before")]).await?;
-        if materialized { recorder.persist().await?; }
+        recorder
+            .record_canonical_items_ordered(&[agent_message("before")])
+            .await?;
+        if materialized {
+            recorder.persist().await?;
+        }
         let pause = recorder.pause_for_maintenance().await?;
-        assert_eq!(path.is_file(), materialized, "pause must not materialize a lazy rollout");
+        assert_eq!(
+            path.is_file(),
+            materialized,
+            "pause must not materialize a lazy rollout"
+        );
         let lock = compression::try_lock_rollout_for_maintenance(&path)?;
         let staged = home.path().join("staged.jsonl");
-        if materialized { fs::rename(&path, &staged)?; }
+        if materialized {
+            fs::rename(&path, &staged)?;
+        }
         let after = [agent_message("after")];
         let append = recorder.record_canonical_items_ordered(&after);
         tokio::pin!(append);
-        assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(
-            std::future::Future::poll(append.as_mut(), cx))).await, std::task::Poll::Pending));
-        if materialized { fs::rename(&staged, &path)?; }
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                append.as_mut(),
+                cx
+            )))
+            .await,
+            std::task::Poll::Pending
+        ));
+        if materialized {
+            fs::rename(&staged, &path)?;
+        }
         drop(lock);
         drop(pause);
         append.await?;
         recorder.flush().await?;
         let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await?;
         assert_eq!(errors, 0);
-        let messages = items.into_iter().filter_map(|item| match item {
-            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let messages = items
+            .into_iter()
+            .filter_map(|item| match item {
+                RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(messages, vec!["before", "after"]);
         recorder.shutdown().await?;
     }
@@ -954,30 +1299,61 @@ async fn cancelled_maintenance_behind_blocked_writer_resumes_admission() -> std:
     let home = TempDir::new()?;
     let recorder = RolloutRecorder::new(
         &test_config(home.path()),
-        RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
-            None, "maintenance-test".into(), BaseInstructions::default(), Vec::new()),
-    ).await?;
-    recorder.record_canonical_items_ordered(&[agent_message("retained")]).await?;
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            None,
+            None,
+            SessionSource::Exec,
+            None,
+            "maintenance-test".into(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    recorder
+        .record_canonical_items_ordered(&[agent_message("retained")])
+        .await?;
     let (entered, paused) = oneshot::channel();
     let (resume, resumed) = oneshot::channel();
-    recorder.tx.send(RolloutCmd::Pause { entered, resume: resumed }).await.unwrap();
+    recorder
+        .tx
+        .send(RolloutCmd::Pause {
+            entered,
+            resume: resumed,
+        })
+        .await
+        .unwrap();
     paused.await.unwrap();
     {
         let maintenance = recorder.pause_for_maintenance();
         tokio::pin!(maintenance);
-        assert!(matches!(std::future::poll_fn(|cx| std::task::Poll::Ready(
-            std::future::Future::poll(maintenance.as_mut(), cx))).await, std::task::Poll::Pending));
+        assert!(matches!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+                maintenance.as_mut(),
+                cx
+            )))
+            .await,
+            std::task::Poll::Pending
+        ));
     }
     resume.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), recorder.flush()).await.expect("cancelled pause released")?;
-    recorder.record_canonical_items_ordered(&[agent_message("after cancellation")]).await?;
+    tokio::time::timeout(Duration::from_secs(5), recorder.flush())
+        .await
+        .expect("cancelled pause released")?;
+    recorder
+        .record_canonical_items_ordered(&[agent_message("after cancellation")])
+        .await?;
     recorder.flush().await?;
     let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
     assert_eq!(errors, 0);
-    let messages = items.iter().filter_map(|item| match item {
-        RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message.as_str()),
-        _ => None,
-    }).collect::<Vec<_>>();
+    let messages = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(messages, vec!["retained", "after cancellation"]);
     recorder.shutdown().await?;
     Ok(())
@@ -989,32 +1365,70 @@ async fn maintenance_commit_or_failed_restore_never_recreates_rollout() -> std::
         let home = TempDir::new()?;
         let recorder = RolloutRecorder::new(
             &test_config(home.path()),
-            RolloutRecorderParams::new(ThreadId::new(), None, None, SessionSource::Exec,
-                None, "maintenance-test".into(), BaseInstructions::default(), Vec::new()),
-        ).await?;
-        recorder.record_canonical_items_ordered(&[agent_message("pending")]).await?;
-        if materialized { recorder.persist().await?; }
+            RolloutRecorderParams::new(
+                ThreadId::new(),
+                None,
+                None,
+                SessionSource::Exec,
+                None,
+                "maintenance-test".into(),
+                BaseInstructions::default(),
+                Vec::new(),
+            ),
+        )
+        .await?;
+        recorder
+            .record_canonical_items_ordered(&[agent_message("pending")])
+            .await?;
+        if materialized {
+            recorder.persist().await?;
+        }
         let path = recorder.rollout_path().to_path_buf();
         let pause = recorder.pause_for_maintenance().await?;
-        if materialized { fs::remove_file(&path)?; }
-        if committed { pause.commit(); } else { pause.restore_failed(); }
-        assert!(recorder.record_canonical_items_ordered(&[agent_message("rejected")]).await.is_err());
-        tokio::time::timeout(Duration::from_secs(5), recorder.tx.closed()).await.expect("writer exits");
-        assert!(!path.exists(), "terminal maintenance cannot run channel-close draining");
+        if materialized {
+            fs::remove_file(&path)?;
+        }
+        if committed {
+            pause.commit();
+        } else {
+            pause.restore_failed();
+        }
+        assert!(
+            recorder
+                .record_canonical_items_ordered(&[agent_message("rejected")])
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(5), recorder.tx.closed())
+            .await
+            .expect("writer exits");
+        assert!(
+            !path.exists(),
+            "terminal maintenance cannot run channel-close draining"
+        );
     }
     Ok(())
 }
 
 #[tokio::test]
-async fn recorder_discard_preserves_durable_records_and_drops_pending_suffix() -> std::io::Result<()> {
+async fn recorder_discard_preserves_durable_records_and_drops_pending_suffix() -> std::io::Result<()>
+{
     let home = TempDir::new()?;
     let recorder = storage_overlap_recorder(home.path(), 4)?;
-    recorder.record_canonical_items_ordered(&[agent_message("durable")]).await?;
+    recorder
+        .record_canonical_items_ordered(&[agent_message("durable")])
+        .await?;
     recorder.flush_durable().await?;
     let before = fs::read(recorder.rollout_path())?;
-    recorder.record_canonical_items_with_flush(&[agent_message("pending")], false, true).await?;
+    recorder
+        .record_canonical_items_with_flush(&[agent_message("pending")], false, true)
+        .await?;
     recorder.discard().await?;
-    assert_eq!(fs::read(recorder.rollout_path())?, before, "discard must neither flush nor delete durable history");
+    assert_eq!(
+        fs::read(recorder.rollout_path())?,
+        before,
+        "discard must neither flush nor delete durable history"
+    );
     Ok(())
 }
 
@@ -1023,18 +1437,41 @@ async fn recorder_cancelled_discard_remains_owned_behind_blocked_storage() -> st
     let home = TempDir::new()?;
     let recorder = storage_overlap_recorder(home.path(), 4)?;
     let lock = compression::lock_rollout_for_write_blocking(recorder.rollout_path())?;
-    recorder.record_canonical_items_with_flush(&[agent_message("accepted before discard")], true, true).await?;
-    assert!(tokio::time::timeout(Duration::from_millis(20), recorder.discard()).await.is_err());
-    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUTTING_DOWN);
-    assert!(recorder.record_canonical_items_ordered(&[agent_message("too late")]).await.is_err());
+    recorder
+        .record_canonical_items_with_flush(&[agent_message("accepted before discard")], true, true)
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), recorder.discard())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        recorder.writer_task.lifecycle.load(Ordering::Acquire),
+        WRITER_SHUTTING_DOWN
+    );
+    assert!(
+        recorder
+            .record_canonical_items_ordered(&[agent_message("too late")])
+            .await
+            .is_err()
+    );
     drop(lock);
     let worker = recorder.writer_task.handle.lock().unwrap().take().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), worker).await.expect("owned discard completes").expect("writer task");
-    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUT_DOWN);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("owned discard completes")
+        .expect("writer task");
+    assert_eq!(
+        recorder.writer_task.lifecycle.load(Ordering::Acquire),
+        WRITER_SHUT_DOWN
+    );
     recorder.discard().await?;
     let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
     assert_eq!(errors, 0);
-    assert_eq!(serde_json::to_value(items)?, serde_json::to_value(vec![agent_message("accepted before discard")])?);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value(vec![agent_message("accepted before discard")])?
+    );
     Ok(())
 }
 
@@ -1169,28 +1606,42 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
         first_value["format_version"],
         serde_json::json!(codex_protocol::protocol::CURRENT_ROLLOUT_FORMAT_VERSION)
     );
-    let session_meta: RolloutLine = serde_json::from_str(
-        &crate::payload_artifact::hydrate_line(&rollout_path, first_line.to_owned())?,
-    )?;
+    let session_meta: RolloutLine = serde_json::from_str(&crate::payload_artifact::hydrate_line(
+        &rollout_path,
+        first_line.to_owned(),
+    )?)?;
     let RolloutItem::SessionMeta(session_meta) = session_meta.item else {
         panic!("expected session metadata in rollout");
     };
     assert_eq!(session_meta.meta.session_id, session_id);
-    let build = session_meta.meta.harness_build.as_ref().expect("harness provenance is persisted");
+    let build = session_meta
+        .meta
+        .harness_build
+        .as_ref()
+        .expect("harness provenance is persisted");
     let embedded = codex_utils_build_info::BuildInfo::current();
     assert_eq!(build.version, embedded.version);
     assert_eq!(build.commit, embedded.commit);
     assert_eq!(build.dirty, embedded.dirty);
     assert_eq!(build.profile, embedded.profile);
     assert_eq!(build.built, embedded.built);
-    assert_eq!(build.token_accounting["local_input_estimate"].estimator, "utf8_bytes_div4_ceil_v1");
-    assert_eq!(build.token_accounting["projection_text_budget"].estimator, "o200k_base_count_ordinary_v1");
+    assert_eq!(
+        build.token_accounting["local_input_estimate"].estimator,
+        "utf8_bytes_div4_ceil_v1"
+    );
+    assert_eq!(
+        build.token_accounting["projection_text_budget"].estimator,
+        "o200k_base_count_ordinary_v1"
+    );
     assert_ne!(
         build.token_accounting["canonical_tool_tokens"].scope,
         build.token_accounting["model_facing_tool_tokens"].scope,
         "different serialized representations must not be labeled the same accounting scope",
     );
-    assert_eq!(build.token_accounting["provider_input_tokens"].estimator, "provider_reported_tokenizer_unknown");
+    assert_eq!(
+        build.token_accounting["provider_input_tokens"].estimator,
+        "provider_reported_tokenizer_unknown"
+    );
     assert_eq!(
         build.executable_sha256.as_deref(),
         codex_utils_build_info::executable_sha256(),
@@ -1302,7 +1753,10 @@ async fn concurrent_shutdown_never_acknowledges_items_behind_shutdown() -> std::
         })
         .collect::<Vec<_>>();
     persisted.sort();
-    assert_eq!(persisted, accepted, "every accepted item exactly once, no rejected items");
+    assert_eq!(
+        persisted, accepted,
+        "every accepted item exactly once, no rejected items"
+    );
     Ok(())
 }
 
@@ -1360,6 +1814,38 @@ async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::i
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_barrier_retries_namespace_sync_and_then_reuses_the_acknowledgement()
+-> std::io::Result<()> {
+    let home = TempDir::new()?;
+    let directory = home.path().join("new/date");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join("rollout.jsonl");
+    let writer = open_log_file(&path)?.into_jsonl_writer();
+    let mut state = RolloutWriterState::new(
+        Some(writer),
+        None,
+        None,
+        home.path().to_path_buf(),
+        Some(None),
+        path.clone(),
+        Default::default(),
+    );
+    let moved = home.path().join("temporarily-moved");
+    fs::rename(&directory, &moved)?;
+    assert!(
+        state.flush_durable().await.is_err(),
+        "an open file alone cannot acknowledge a missing namespace"
+    );
+    assert!(state.namespace_sync_pending);
+    fs::rename(&moved, &directory)?;
+    state.flush_durable().await?;
+    assert!(!state.namespace_sync_pending);
+    state.flush_durable().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn empty_writer_flush_does_not_wait_for_another_append() -> std::io::Result<()> {
     let home = TempDir::new()?;
@@ -1402,12 +1888,13 @@ async fn empty_writer_flush_does_not_wait_for_another_append() -> std::io::Resul
     assert_eq!(fs::read(&path)?, persisted);
 
     state.retry_blocked_error = Some("unconfirmed append".to_string());
-    let error = state.flush().await.expect_err("empty barriers cannot hide errors");
+    let error = state
+        .flush()
+        .await
+        .expect_err("empty barriers cannot hide errors");
     assert!(error.to_string().contains("unconfirmed append"));
     Ok(())
 }
-
-
 
 #[test]
 fn writer_state_defines_manifests_once_then_references_them() {
@@ -1487,54 +1974,88 @@ fn writer_state_defines_manifests_once_then_references_them() {
     ));
 }
 
-#[test]
-fn identical_settings_are_omitted_but_transitions_are_preserved() {
+#[tokio::test]
+async fn identical_settings_are_omitted_but_transitions_are_preserved() {
     let home = TempDir::new().unwrap();
     let mut state = RolloutWriterState::new(
-        None, None, None, home.path().to_path_buf(), None,
-        home.path().join("rollout.jsonl"), ToolManifestDictionary::default(),
+        None,
+        None,
+        None,
+        home.path().to_path_buf(),
+        None,
+        home.path().join("rollout.jsonl"),
+        ToolManifestDictionary::default(),
     );
     let settings = |tier: &str| {
-        RolloutItem::EventMsg(serde_json::from_value(serde_json::json!({
-            "type": "thread_settings_applied",
-            "thread_settings": {
-                "model": "test-model", "model_provider_id": "test-provider",
-                "service_tier": tier, "developer_instructions": "shared instructions",
-                "approval_policy": "never", "permission_profile": {"type": "disabled"},
-                "cwd": home.path(),
-                "collaboration_mode": {"mode": "default", "settings": {
-                    "model": "test-model", "reasoning_effort": null,
-                    "developer_instructions": null
-                }}
-            }
-        })).unwrap())
+        RolloutItem::EventMsg(
+            serde_json::from_value(serde_json::json!({
+                "type": "thread_settings_applied",
+                "thread_settings": {
+                    "model": "test-model", "model_provider_id": "test-provider",
+                    "service_tier": tier, "developer_instructions": "shared instructions",
+                    "approval_policy": "never", "permission_profile": {"type": "disabled"},
+                    "cwd": home.path(),
+                    "collaboration_mode": {"mode": "default", "settings": {
+                        "model": "test-model", "reasoning_effort": null,
+                        "developer_instructions": null
+                    }}
+                }
+            }))
+            .unwrap(),
+        )
     };
     state.add_items(captured(vec![settings("default"), settings("default")]));
     state.add_items(captured(vec![
-        settings("default"), settings("priority"), settings("priority"), settings("default"),
+        settings("default"),
+        settings("priority"),
+        settings("priority"),
+        settings("default"),
     ]));
-    assert_eq!(state.pending_items.len(), 3);
-    let tiers: Vec<_> = state.pending_items.iter().map(|item| {
-        serde_json::to_value(&item.item).unwrap()["payload"]["thread_settings"]["service_tier"].clone()
-    }).collect();
+    state.flush().await.unwrap();
+    let persisted: Vec<_> = recorded_lines(&state.rollout_path)
+        .unwrap()
+        .into_iter()
+        .map(|line| line.item)
+        .collect();
+    assert_eq!(persisted.len(), 3);
+    let tiers: Vec<_> = persisted
+        .iter()
+        .map(|item| {
+            serde_json::to_value(item).unwrap()["payload"]["thread_settings"]["service_tier"]
+                .clone()
+        })
+        .collect();
     assert_eq!(tiers, vec!["default", "priority", "default"]);
-    for item in &state.pending_items[1..] {
-        let value = serde_json::to_value(&item.item).unwrap();
-        assert!(value["payload"]["thread_settings"].get("developer_instructions").is_none());
+    for item in &persisted[1..] {
+        let value = serde_json::to_value(item).unwrap();
+        assert!(
+            value["payload"]["thread_settings"]
+                .get("developer_instructions")
+                .is_none()
+        );
     }
-    let persisted: Vec<_> = state.pending_items.iter().map(|item| item.item.clone()).collect();
     let restored = codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings(
-        &persisted, Default::default(),
+        &persisted,
+        Default::default(),
     );
-    assert_eq!(restored.developer_instructions, Some(Some("shared instructions".into())));
+    assert_eq!(
+        restored.developer_instructions,
+        Some(Some("shared instructions".into()))
+    );
     let mut cleared = settings("default");
     if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = &mut cleared {
         event.thread_settings.developer_instructions = Some(None);
     }
     state.add_items(captured(vec![cleared]));
-    let persisted: Vec<_> = state.pending_items.iter().map(|item| item.item.clone()).collect();
+    state.flush().await.unwrap();
+    let persisted: Vec<_> = recorded_lines(&state.rollout_path)
+        .unwrap()
+        .into_iter()
+        .map(|line| line.item)
+        .collect();
     let restored = codex_protocol::persisted_thread_settings::reduce_persisted_thread_settings(
-        &persisted, Default::default(),
+        &persisted,
+        Default::default(),
     );
     assert_eq!(restored.developer_instructions, Some(None));
 }
@@ -1543,15 +2064,23 @@ fn identical_settings_are_omitted_but_transitions_are_preserved() {
 fn canonical_messages_omit_only_their_immediate_legacy_mirrors() {
     let home = TempDir::new().unwrap();
     let mut state = RolloutWriterState::new(
-        None, None, None, home.path().to_path_buf(), None,
-        home.path().join("rollout.jsonl"), ToolManifestDictionary::default(),
+        None,
+        None,
+        None,
+        home.path().to_path_buf(),
+        None,
+        home.path().join("rollout.jsonl"),
+        ToolManifestDictionary::default(),
     );
-    let mirror = || RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-        message: "same text".into(), phase: None,
-    }));
+    let mirror = || {
+        RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: "same text".into(),
+            phase: None,
+        }))
+    };
     for id in ["first", "second"] {
-        state.add_items(captured(vec![RolloutItem::EventMsg(EventMsg::ItemCompleted(
-            codex_protocol::protocol::ItemCompletedEvent {
+        state.add_items(captured(vec![RolloutItem::EventMsg(
+            EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
                 thread_id: ThreadId::new(),
                 turn_id: "turn".into(),
                 completed_at_ms: 0,
@@ -1564,18 +2093,23 @@ fn canonical_messages_omit_only_their_immediate_legacy_mirrors() {
                         phase: None,
                     },
                 ),
-            },
-        ))]));
+            }),
+        )]));
         // Core can enqueue the live legacy alias in a separate recorder call.
         state.add_items(captured(vec![mirror()]));
     }
     state.add_items(captured(vec![mirror()]));
     assert_eq!(state.pending_items.len(), 3);
     for (item, id) in state.pending_items.iter().zip(["first", "second"]) {
-        assert!(matches!(&item.item, RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
-            if event.item.id() == id));
+        assert!(
+            matches!(&item.item, RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+            if event.item.id() == id)
+        );
     }
-    assert!(matches!(&state.pending_items[2].item, RolloutItem::EventMsg(EventMsg::AgentMessage(_))));
+    assert!(matches!(
+        &state.pending_items[2].item,
+        RolloutItem::EventMsg(EventMsg::AgentMessage(_))
+    ));
 }
 
 #[tokio::test]
@@ -1702,7 +2236,11 @@ async fn deferred_writer_reuses_existing_session_metadata_and_manifests() -> std
         .collect::<Vec<_>>();
     assert_eq!(
         manifests,
-        vec![("persisted", false), ("persisted", true), ("changed", false)]
+        vec![
+            ("persisted", false),
+            ("persisted", true),
+            ("changed", false)
+        ]
     );
     Ok(())
 }
@@ -1776,7 +2314,9 @@ async fn records_coalesced_into_one_flush_keep_their_own_capture_times() -> std:
 
     let lines = recorded_lines(&rollout_path)?;
     assert!(matches!(lines[0].item, RolloutItem::SessionMeta(_)));
-    assert!(parse_record_timestamp(&lines[0].timestamp) <= parse_record_timestamp(&lines[1].timestamp));
+    assert!(
+        parse_record_timestamp(&lines[0].timestamp) <= parse_record_timestamp(&lines[1].timestamp)
+    );
     let messages = lines
         .iter()
         .filter_map(|line| match &line.item {
@@ -1883,8 +2423,8 @@ async fn retried_records_keep_their_capture_time() -> std::io::Result<()> {
         Some(JsonlWriter {
             path: rollout_path.clone(),
             file: tokio::fs::File::from_std(read_only_file),
-            _append_lock: append_lock,
-            _payload_retention: crate::payload_artifact::lock_publication(&rollout_path)?,
+            _append_lock: Arc::new(append_lock),
+            _payload_retention: Arc::new(crate::payload_artifact::lock_publication(&rollout_path)?),
             write_fault: None,
             append_transaction_count: 0,
         }),
@@ -1897,9 +2437,12 @@ async fn retried_records_keep_their_capture_time() -> std::io::Result<()> {
     );
     let captured_at = OffsetDateTime::now_utc() - Duration::from_secs(3600);
     let messages = ["survives-the-retry", "queued-after-writer-error"];
-    state.add_items(messages.into_iter().map(|message| {
-        CapturedRolloutItem::new(agent_message(message), captured_at)
-    }).collect());
+    state.add_items(
+        messages
+            .into_iter()
+            .map(|message| CapturedRolloutItem::new(agent_message(message), captured_at))
+            .collect(),
+    );
 
     // The first append fails against the read-only handle; the retry reopens
     // and writes the same buffered record.
@@ -1908,7 +2451,10 @@ async fn retried_records_keep_their_capture_time() -> std::io::Result<()> {
     let lines = recorded_lines(&rollout_path)?;
     assert_eq!(lines.len(), messages.len());
     for (line, message) in lines.iter().zip(messages) {
-        assert_eq!(serde_json::to_value(&line.item)?, serde_json::to_value(agent_message(message))?);
+        assert_eq!(
+            serde_json::to_value(&line.item)?,
+            serde_json::to_value(agent_message(message))?
+        );
         assert_eq!(
             parse_record_timestamp(&line.timestamp),
             at_record_resolution(captured_at),
@@ -1986,38 +2532,53 @@ async fn assert_failed_append_is_written_once(
 }
 
 #[tokio::test]
-async fn cancelled_direct_append_finishes_before_releasing_write_ownership() -> std::io::Result<()> {
+async fn cancelled_direct_append_finishes_before_releasing_write_ownership() -> std::io::Result<()>
+{
     let home = TempDir::new()?;
     let path = home.path().join("rollout.jsonl");
     File::create(&path)?;
     let lock = compression::lock_rollout_for_write_blocking(&path)?;
     let first = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-        message: "first".into(), ..Default::default()
+        message: "first".into(),
+        ..Default::default()
     }));
     let mut append = Box::pin(append_rollout_item_to_path(&path, &first));
-    assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
-        std::future::Future::poll(append.as_mut(), cx)
-    )).await.is_pending());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(
+            append.as_mut(),
+            cx
+        )))
+        .await
+        .is_pending()
+    );
     drop(append);
     drop(lock);
     let second = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
-        message: "second".into(), ..Default::default()
+        message: "second".into(),
+        ..Default::default()
     }));
     append_rollout_item_to_path(&path, &second).await?;
     let text = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let text = tokio::fs::read_to_string(&path).await.unwrap();
-            if text.lines().count() == 2 { break text; }
+            if text.lines().count() == 2 {
+                break text;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.expect("the detached append must finish");
-    let mut messages = text.lines().map(|line| {
-        let line: RolloutLine = serde_json::from_str(line).unwrap();
-        match line.item {
-            RolloutItem::EventMsg(EventMsg::UserMessage(event)) => event.message,
-            _ => panic!("unexpected record"),
-        }
-    }).collect::<Vec<_>>();
+    })
+    .await
+    .expect("the detached append must finish");
+    let mut messages = text
+        .lines()
+        .map(|line| {
+            let line: RolloutLine = serde_json::from_str(line).unwrap();
+            match line.item {
+                RolloutItem::EventMsg(EventMsg::UserMessage(event)) => event.message,
+                _ => panic!("unexpected record"),
+            }
+        })
+        .collect::<Vec<_>>();
     messages.sort();
     assert_eq!(messages, vec!["first", "second"]);
     Ok(())
@@ -2090,8 +2651,7 @@ async fn unrecoverable_append_stops_writer_with_live_senders() -> std::io::Resul
 }
 
 #[tokio::test]
-async fn ordered_append_accepts_into_bounded_queue_without_materializing() -> std::io::Result<()>
-{
+async fn ordered_append_accepts_into_bounded_queue_without_materializing() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
     let recorder = RolloutRecorder::new(
@@ -2127,11 +2687,17 @@ async fn ordered_append_accepts_into_bounded_queue_without_materializing() -> st
         phase: None,
     }));
     let items = [item];
-    tokio::time::timeout(Duration::from_secs(1), recorder.record_canonical_items_ordered(&items))
-        .await
-        .expect("queue custody must not wait for a stalled consumer")?;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        recorder.record_canonical_items_ordered(&items),
+    )
+    .await
+    .expect("queue custody must not wait for a stalled consumer")?;
     assert!(recorder.writer_task.pending_bytes.available_permits() < MAX_PENDING_ROLLOUT_BYTES);
-    assert!(!rollout_path.exists(), "queue admission must not materialize the rollout");
+    assert!(
+        !rollout_path.exists(),
+        "queue admission must not materialize the rollout"
+    );
 
     resume_tx
         .send(())
@@ -2147,7 +2713,9 @@ async fn ordered_append_accepts_into_bounded_queue_without_materializing() -> st
         })
         .await
         .expect("writer command channel should be open");
-    consumed_rx.await.expect("writer should consume the queued items");
+    consumed_rx
+        .await
+        .expect("writer should consume the queued items");
     assert!(
         !rollout_path.exists(),
         "in-memory acceptance must not materialize or flush the rollout"
@@ -2159,8 +2727,14 @@ async fn ordered_append_accepts_into_bounded_queue_without_materializing() -> st
     recorder.shutdown().await?;
     let (recovered, _, errors) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
     assert_eq!(errors, 0);
-    assert_eq!(serde_json::to_value(recovered.last())?, serde_json::to_value(items.last())?);
-    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+    assert_eq!(
+        serde_json::to_value(recovered.last())?,
+        serde_json::to_value(items.last())?
+    );
+    assert_eq!(
+        recorder.writer_task.pending_bytes.available_permits(),
+        MAX_PENDING_ROLLOUT_BYTES
+    );
     Ok(())
 }
 
@@ -2222,47 +2796,89 @@ fn storage_overlap_recorder(home: &Path, capacity: usize) -> std::io::Result<Rol
     let cwd = home.to_path_buf();
     let writer_path = path.clone();
     task.set_handle(tokio::spawn(async move {
-        if let Err(error) = rollout_writer(Some(writer), None, rx, None, cwd,
-            Some(None), writer_path, Default::default(), Arc::clone(&owner)).await
+        if let Err(error) = rollout_writer(
+            Some(writer),
+            None,
+            rx,
+            None,
+            cwd,
+            Some(None),
+            writer_path,
+            Default::default(),
+            Arc::clone(&owner),
+        )
+        .await
         {
             owner.mark_failed(&error);
         }
     }));
-    Ok(RolloutRecorder { tx, writer_task: task, rollout_path: path, writer_lease: None })
+    Ok(RolloutRecorder {
+        tx,
+        writer_task: task,
+        rollout_path: path,
+    })
 }
 
 #[tokio::test]
-async fn ordered_append_overlaps_blocked_storage_but_queue_remains_bounded() -> std::io::Result<()> {
+async fn ordered_append_overlaps_blocked_storage_but_queue_remains_bounded() -> std::io::Result<()>
+{
     let home = TempDir::new()?;
     let recorder = storage_overlap_recorder(home.path(), 1)?;
     let lock = compression::lock_rollout_for_write_blocking(recorder.rollout_path())?;
     // The old acceptance path is a deterministic fence: the writer owns this
     // first item and cannot consume another until the OS write lock is released.
-    recorder.record_canonical_items_with_flush(&[agent_message("first")], true, true).await?;
-    tokio::time::timeout(Duration::from_secs(1),
-        recorder.record_canonical_items_ordered(&[agent_message("second")]))
-        .await.expect("independent execution must not wait for the previous write")?;
+    recorder
+        .record_canonical_items_with_flush(&[agent_message("first")], true, true)
+        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        recorder.record_canonical_items_ordered(&[agent_message("second")]),
+    )
+    .await
+    .expect("independent execution must not wait for the previous write")?;
     let permits = recorder.writer_task.pending_bytes.available_permits();
-    assert!(tokio::time::timeout(Duration::from_millis(20),
-        recorder.record_canonical_items_ordered(&[agent_message("cancelled")])).await.is_err());
-    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), permits,
-        "cancelled queue admission must release its byte charge");
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            recorder.record_canonical_items_ordered(&[agent_message("cancelled")])
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        recorder.writer_task.pending_bytes.available_permits(),
+        permits,
+        "cancelled queue admission must release its byte charge"
+    );
     // A cancelled barrier cannot remove either accepted item or unlock storage.
-    assert!(tokio::time::timeout(Duration::from_millis(20), recorder.flush()).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), recorder.flush())
+            .await
+            .is_err()
+    );
     let other_home = TempDir::new()?;
     let other = storage_overlap_recorder(other_home.path(), 1)?;
     tokio::time::timeout(Duration::from_secs(2), async {
-        other.record_canonical_items_ordered(&[agent_message("independent")]).await?;
+        other
+            .record_canonical_items_ordered(&[agent_message("independent")])
+            .await?;
         other.shutdown().await
-    }).await.expect("another writer must remain independent")?;
+    })
+    .await
+    .expect("another writer must remain independent")?;
     drop(lock);
     recorder.flush_durable().await?;
     recorder.shutdown().await?;
     let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
     assert_eq!(errors, 0);
-    assert_eq!(serde_json::to_value(items)?,
-        serde_json::to_value(vec![agent_message("first"), agent_message("second")])?);
-    assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value(vec![agent_message("first"), agent_message("second")])?
+    );
+    assert_eq!(
+        recorder.writer_task.pending_bytes.available_permits(),
+        MAX_PENDING_ROLLOUT_BYTES
+    );
     Ok(())
 }
 
@@ -2271,20 +2887,43 @@ async fn ordered_append_cancelled_shutdown_still_drains_owned_queue() -> std::io
     let home = TempDir::new()?;
     let recorder = storage_overlap_recorder(home.path(), 4)?;
     let lock = compression::lock_rollout_for_write_blocking(recorder.rollout_path())?;
-    recorder.record_canonical_items_with_flush(&[agent_message("first")], true, true).await?;
-    recorder.record_canonical_items_ordered(&[agent_message("second")]).await?;
-    assert!(tokio::time::timeout(Duration::from_millis(20), recorder.shutdown()).await.is_err());
-    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUTTING_DOWN);
-    assert!(recorder.record_canonical_items_ordered(&[agent_message("too-late")]).await.is_err());
+    recorder
+        .record_canonical_items_with_flush(&[agent_message("first")], true, true)
+        .await?;
+    recorder
+        .record_canonical_items_ordered(&[agent_message("second")])
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), recorder.shutdown())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        recorder.writer_task.lifecycle.load(Ordering::Acquire),
+        WRITER_SHUTTING_DOWN
+    );
+    assert!(
+        recorder
+            .record_canonical_items_ordered(&[agent_message("too-late")])
+            .await
+            .is_err()
+    );
     drop(lock);
     let worker = recorder.writer_task.handle.lock().unwrap().take().unwrap();
-    tokio::time::timeout(Duration::from_secs(5), worker).await.expect("owned shutdown drain")
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("owned shutdown drain")
         .expect("writer task");
-    assert_eq!(recorder.writer_task.lifecycle.load(Ordering::Acquire), WRITER_SHUT_DOWN);
+    assert_eq!(
+        recorder.writer_task.lifecycle.load(Ordering::Acquire),
+        WRITER_SHUT_DOWN
+    );
     let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
     assert_eq!(errors, 0);
-    assert_eq!(serde_json::to_value(items)?,
-        serde_json::to_value(vec![agent_message("first"), agent_message("second")])?);
+    assert_eq!(
+        serde_json::to_value(items)?,
+        serde_json::to_value(vec![agent_message("first"), agent_message("second")])?
+    );
     Ok(())
 }
 
@@ -2296,49 +2935,84 @@ async fn ordered_append_cancelled_shutdown_still_drains_owned_queue() -> std::io
 async fn benchmark_ordered_append_storage_overlap() -> std::io::Result<()> {
     for slow_ms in [0, 2_000] {
         for sample in 0..4 {
-            for baseline in if sample % 2 == 0 { [true, false] } else { [false, true] } {
+            for baseline in if sample % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
                 let home = TempDir::new()?;
                 let recorder = storage_overlap_recorder(home.path(), 4)?;
                 let first = RolloutItem::ToolManifest(ToolManifestItem::full(
-                    "storage-overlap".into(), serde_json::json!({
+                    "storage-overlap".into(),
+                    serde_json::json!({
                         "tools":[{"name":"fixture", "description":"EXACT_EVIDENCE\n".repeat(4096)}]
                     }),
                 ));
                 let second = agent_message("next-work");
                 let lock = if slow_ms > 0 {
-                    Some(compression::lock_rollout_for_write_blocking(recorder.rollout_path())?)
-                } else { None };
+                    Some(compression::lock_rollout_for_write_blocking(
+                        recorder.rollout_path(),
+                    )?)
+                } else {
+                    None
+                };
                 let started = std::time::Instant::now();
                 let release = tokio::spawn(async move {
-                    if lock.is_some() { tokio::time::sleep(Duration::from_millis(slow_ms)).await; }
+                    if lock.is_some() {
+                        tokio::time::sleep(Duration::from_millis(slow_ms)).await;
+                    }
                     drop(lock);
                 });
-                recorder.record_canonical_items_with_flush(std::slice::from_ref(&first), true, true).await?;
+                recorder
+                    .record_canonical_items_with_flush(std::slice::from_ref(&first), true, true)
+                    .await?;
                 let append_started = std::time::Instant::now();
                 if baseline {
-                    recorder.record_canonical_items_with_flush(std::slice::from_ref(&second), true, true).await?;
+                    recorder
+                        .record_canonical_items_with_flush(
+                            std::slice::from_ref(&second),
+                            true,
+                            true,
+                        )
+                        .await?;
                 } else {
-                    recorder.record_canonical_items_ordered(std::slice::from_ref(&second)).await?;
+                    recorder
+                        .record_canonical_items_ordered(std::slice::from_ref(&second))
+                        .await?;
                 }
                 let continuation_us = append_started.elapsed().as_micros();
                 // Fixed independent work on both sides, not a removed wait.
-                tokio::time::sleep(Duration::from_millis(if slow_ms == 0 { 5 } else { 2_000 })).await;
+                tokio::time::sleep(Duration::from_millis(if slow_ms == 0 { 5 } else { 2_000 }))
+                    .await;
                 let drain_started = std::time::Instant::now();
                 recorder.flush_durable().await?;
                 recorder.shutdown().await?;
                 release.await.expect("storage release");
                 let drain_us = drain_started.elapsed().as_micros();
-                let (items, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+                let (items, _, errors) =
+                    RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
                 assert_eq!(errors, 0);
-                assert_eq!(serde_json::to_value(items)?, serde_json::to_value(vec![first, second])?);
-                assert!(fs::read_to_string(recorder.rollout_path())?.contains(crate::payload_artifact::KIND));
-                assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
+                assert_eq!(
+                    serde_json::to_value(items)?,
+                    serde_json::to_value(vec![first, second])?
+                );
+                assert!(
+                    fs::read_to_string(recorder.rollout_path())?
+                        .contains(crate::payload_artifact::KIND)
+                );
+                assert_eq!(
+                    recorder.writer_task.pending_bytes.available_permits(),
+                    MAX_PENDING_ROLLOUT_BYTES
+                );
                 if sample > 0 {
-                    println!("{}", serde_json::json!({"benchmark":"ordered_append_storage_overlap",
+                    println!(
+                        "{}",
+                        serde_json::json!({"benchmark":"ordered_append_storage_overlap",
                         "baseline":baseline, "slow_storage_ms":slow_ms, "sample":sample,
                         "continuation_us":continuation_us, "drain_us":drain_us,
                         "end_to_end_us":started.elapsed().as_micros(), "records":2,
-                        "exact_recovery":true, "model_calls":0}));
+                        "exact_recovery":true, "model_calls":0})
+                    );
                 }
             }
         }
@@ -2350,34 +3024,80 @@ async fn benchmark_ordered_append_storage_overlap() -> std::io::Result<()> {
 async fn payload_sync_failure_keeps_durable_barrier_retryable() -> std::io::Result<()> {
     let home = TempDir::new()?;
     let recorder = storage_overlap_recorder(home.path(), 4)?;
-    let items = (0..16).map(|i| RolloutItem::ToolManifest(ToolManifestItem::full(
-        format!("payload-{i}"), serde_json::json!({"index":i,"body":"exact evidence\n".repeat(2048)}),
-    ))).collect::<Vec<_>>();
+    let items = (0..16)
+        .map(|i| {
+            RolloutItem::ToolManifest(ToolManifestItem::full(
+                format!("payload-{i}"),
+                serde_json::json!({"index":i,"body":"exact evidence\n".repeat(2048)}),
+            ))
+        })
+        .collect::<Vec<_>>();
     recorder.record_canonical_items_ordered(&items).await?;
     let calls = Arc::new(AtomicUsize::new(0));
     let failed_calls = Arc::clone(&calls);
-    crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(recorder.rollout_path().to_path_buf(),
-        crate::payload_artifact::SyncTestHook { parallelism:8, before_sync: Arc::new(move |_| {
-            if failed_calls.fetch_add(1, Ordering::SeqCst) == 0 { Err(std::io::Error::other("injected sync failure")) }
-            else { Ok(()) }
-        }) });
-    assert!(recorder.flush_durable().await.is_err(), "must not claim rollout durability after a failed payload sync");
-    assert!(calls.load(Ordering::SeqCst) > 1, "successful workers also ran");
+    crate::payload_artifact::sync_test_hooks()
+        .lock()
+        .unwrap()
+        .insert(
+            recorder.rollout_path().to_path_buf(),
+            crate::payload_artifact::SyncTestHook {
+                parallelism: 8,
+                before_sync: Arc::new(move |_| {
+                    if failed_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(std::io::Error::other("injected sync failure"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+            },
+        );
+    assert!(
+        recorder.flush_durable().await.is_err(),
+        "must not claim rollout durability after a failed payload sync"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > 1,
+        "successful workers also ran"
+    );
     let retry_calls = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&retry_calls);
-    crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(recorder.rollout_path().to_path_buf(),
-        crate::payload_artifact::SyncTestHook { parallelism:8, before_sync: Arc::new(move |_| {
-            counted.fetch_add(1, Ordering::SeqCst); Ok(())
-        }) });
+    crate::payload_artifact::sync_test_hooks()
+        .lock()
+        .unwrap()
+        .insert(
+            recorder.rollout_path().to_path_buf(),
+            crate::payload_artifact::SyncTestHook {
+                parallelism: 8,
+                before_sync: Arc::new(move |_| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            },
+        );
     recorder.flush_durable().await?;
-    assert_eq!(retry_calls.load(Ordering::SeqCst), 16, "failure acknowledges no payloads");
+    assert_eq!(
+        retry_calls.load(Ordering::SeqCst),
+        16,
+        "failure acknowledges no payloads"
+    );
     recorder.flush_durable().await?;
-    assert_eq!(retry_calls.load(Ordering::SeqCst), 16, "successful barrier clears its prefix");
-    crate::payload_artifact::sync_test_hooks().lock().unwrap().remove(recorder.rollout_path());
+    assert_eq!(
+        retry_calls.load(Ordering::SeqCst),
+        16,
+        "successful barrier clears its prefix"
+    );
+    crate::payload_artifact::sync_test_hooks()
+        .lock()
+        .unwrap()
+        .remove(recorder.rollout_path());
     recorder.shutdown().await?;
-    let (reloaded, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    let (reloaded, _, errors) =
+        RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
     assert_eq!(errors, 0);
-    assert_eq!(serde_json::to_value(reloaded)?, serde_json::to_value(items)?);
+    assert_eq!(
+        serde_json::to_value(reloaded)?,
+        serde_json::to_value(items)?
+    );
     Ok(())
 }
 
@@ -2392,39 +3112,69 @@ async fn benchmark_payload_sync_end_to_end() -> std::io::Result<()> {
             for parallelism in if sample % 2 == 0 { [1, 8] } else { [8, 1] } {
                 let home = TempDir::new()?;
                 let recorder = storage_overlap_recorder(home.path(), 4)?;
-                let items = (0..16).map(|i| RolloutItem::ToolManifest(ToolManifestItem::full(
-                    format!("payload-{i}"), serde_json::json!({"index":i,"body":"exact evidence\n".repeat(2048)}),
-                ))).collect::<Vec<_>>();
+                let items = (0..16)
+                    .map(|i| {
+                        RolloutItem::ToolManifest(ToolManifestItem::full(
+                            format!("payload-{i}"),
+                            serde_json::json!({"index":i,"body":"exact evidence\n".repeat(2048)}),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
                 let syncs = Arc::new(AtomicUsize::new(0));
                 let counted = Arc::clone(&syncs);
-                crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(recorder.rollout_path().to_path_buf(),
-                    crate::payload_artifact::SyncTestHook { parallelism, before_sync: Arc::new(move |_| {
-                        counted.fetch_add(1, Ordering::SeqCst);
-                        if slow_ms > 0 { std::thread::sleep(Duration::from_millis(slow_ms)); }
-                        Ok(())
-                    }) });
+                crate::payload_artifact::sync_test_hooks()
+                    .lock()
+                    .unwrap()
+                    .insert(
+                        recorder.rollout_path().to_path_buf(),
+                        crate::payload_artifact::SyncTestHook {
+                            parallelism,
+                            before_sync: Arc::new(move |_| {
+                                counted.fetch_add(1, Ordering::SeqCst);
+                                if slow_ms > 0 {
+                                    std::thread::sleep(Duration::from_millis(slow_ms));
+                                }
+                                Ok(())
+                            }),
+                        },
+                    );
                 let started = std::time::Instant::now();
                 recorder.record_canonical_items_ordered(&items).await?;
                 let admission_us = started.elapsed().as_micros();
                 recorder.flush_durable().await?;
                 let continuation_us = started.elapsed().as_micros();
                 // Same useful subsequent work on both sides, after durability.
-                recorder.record_canonical_items_ordered(&[agent_message("next execution")]).await?;
+                recorder
+                    .record_canonical_items_ordered(&[agent_message("next execution")])
+                    .await?;
                 recorder.shutdown().await?;
-                let (reloaded, _, errors) = RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+                let (reloaded, _, errors) =
+                    RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
                 let mut expected = items;
                 expected.push(agent_message("next execution"));
                 assert_eq!(errors, 0);
-                assert_eq!(serde_json::to_value(reloaded)?, serde_json::to_value(expected)?);
+                assert_eq!(
+                    serde_json::to_value(reloaded)?,
+                    serde_json::to_value(expected)?
+                );
                 assert_eq!(syncs.load(Ordering::SeqCst), 16);
-                assert_eq!(recorder.writer_task.pending_bytes.available_permits(), MAX_PENDING_ROLLOUT_BYTES);
-                crate::payload_artifact::sync_test_hooks().lock().unwrap().remove(recorder.rollout_path());
+                assert_eq!(
+                    recorder.writer_task.pending_bytes.available_permits(),
+                    MAX_PENDING_ROLLOUT_BYTES
+                );
+                crate::payload_artifact::sync_test_hooks()
+                    .lock()
+                    .unwrap()
+                    .remove(recorder.rollout_path());
                 if sample > 0 {
-                    println!("{}", serde_json::json!({"benchmark":"payload_sync_end_to_end",
+                    println!(
+                        "{}",
+                        serde_json::json!({"benchmark":"payload_sync_end_to_end",
                         "parallelism":parallelism,"slow_storage_ms_per_payload":slow_ms,"sample":sample,
                         "admission_us":admission_us,"continuation_us":continuation_us,
                         "end_to_end_us":started.elapsed().as_micros(),"payloads":16,
-                        "exact_recovery":true,"model_calls":0}));
+                        "exact_recovery":true,"model_calls":0})
+                    );
                 }
             }
         }
@@ -2489,65 +3239,107 @@ async fn writer_state_flushes_multi_item_batch_in_one_transaction() -> std::io::
 }
 
 #[tokio::test]
-async fn artifact_selection_preserves_mixed_batch_bytes_and_inline_fallback() -> std::io::Result<()> {
+async fn artifact_selection_preserves_mixed_batch_bytes_and_inline_fallback() -> std::io::Result<()>
+{
     let text = "héllo 🦀 task_complete rollout_payload_artifact\n".repeat(300);
     let cases = vec![
-        (RolloutItem::SessionMeta(SessionMetaLine {
-            meta: SessionMeta { originator: text.clone(), ..Default::default() },
-            git: None,
-        }), true),
-        (RolloutItem::ToolManifest(ToolManifestItem::full(
-            "large".into(), serde_json::json!({"description": text}),
-        )), true),
-        (RolloutItem::ToolManifest(ToolManifestItem::reference("small".into())), true),
-        (serde_json::from_value(serde_json::json!({
-            "type": "sampling_boundary", "payload": {
-                "sampling_request_id": text, "physical_attempt_id": "attempt",
-                "timing_checkpoint": {
-                    "observed_at_unix_ms": 1, "tail_unknown": true,
-                    "timing": codex_protocol::protocol::TurnTiming::default()
+        (
+            RolloutItem::SessionMeta(SessionMetaLine {
+                meta: SessionMeta {
+                    originator: text.clone(),
+                    ..Default::default()
+                },
+                git: None,
+            }),
+            true,
+        ),
+        (
+            RolloutItem::ToolManifest(ToolManifestItem::full(
+                "large".into(),
+                serde_json::json!({"description": text}),
+            )),
+            true,
+        ),
+        (
+            RolloutItem::ToolManifest(ToolManifestItem::reference("small".into())),
+            true,
+        ),
+        (
+            serde_json::from_value(serde_json::json!({
+                "type": "sampling_boundary", "payload": {
+                    "sampling_request_id": text, "physical_attempt_id": "attempt",
+                    "timing_checkpoint": {
+                        "observed_at_unix_ms": 1, "tail_unknown": true,
+                        "timing": codex_protocol::protocol::TurnTiming::default()
+                    }
                 }
-            }
-        }))?, true),
-        (serde_json::from_value(serde_json::json!({
-            "type": "sampling_boundary", "payload": {
-                "sampling_request_id": text, "physical_attempt_id": "attempt"
-            }
-        }))?, false),
-        (serde_json::from_value(serde_json::json!({
-            "type": "event_msg", "payload": {
-                "type": "task_complete", "turn_id": "turn", "last_agent_message": text
-            }
-        }))?, true),
-        (serde_json::from_value(serde_json::json!({
-            "type": "event_msg", "payload": {
-                "type": "turn_aborted", "turn_id": text, "reason": "interrupted"
-            }
-        }))?, true),
-        (serde_json::from_value(serde_json::json!({
-            "type": "event_msg", "payload": {
-                "type": "patch_apply_end", "call_id": "patch", "stdout": text,
-                "stderr": "", "success": true, "status": "completed", "changes": {}
-            }
-        }))?, true),
-        (RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
-            message: text.clone(), phase: None,
-        })), false),
-        (serde_json::from_value(serde_json::json!({
-            "type": "response_item", "payload": {
-                "type": "function_call", "call_id": "call", "name": "tool", "arguments": text
-            }
-        }))?, false),
+            }))?,
+            true,
+        ),
+        (
+            serde_json::from_value(serde_json::json!({
+                "type": "sampling_boundary", "payload": {
+                    "sampling_request_id": text, "physical_attempt_id": "attempt"
+                }
+            }))?,
+            false,
+        ),
+        (
+            serde_json::from_value(serde_json::json!({
+                "type": "event_msg", "payload": {
+                    "type": "task_complete", "turn_id": "turn", "last_agent_message": text
+                }
+            }))?,
+            true,
+        ),
+        (
+            serde_json::from_value(serde_json::json!({
+                "type": "event_msg", "payload": {
+                    "type": "turn_aborted", "turn_id": text, "reason": "interrupted"
+                }
+            }))?,
+            true,
+        ),
+        (
+            serde_json::from_value(serde_json::json!({
+                "type": "event_msg", "payload": {
+                    "type": "patch_apply_end", "call_id": "patch", "stdout": text,
+                    "stderr": "", "success": true, "status": "completed", "changes": {}
+                }
+            }))?,
+            true,
+        ),
+        (
+            RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+                message: text.clone(),
+                phase: None,
+            })),
+            false,
+        ),
+        (
+            serde_json::from_value(serde_json::json!({
+                "type": "response_item", "payload": {
+                    "type": "function_call", "call_id": "call", "name": "tool", "arguments": text
+                }
+            }))?,
+            false,
+        ),
     ];
     for (item, candidate) in &cases {
-        assert_eq!(crate::payload_artifact::is_artifact_candidate(item), *candidate);
+        assert_eq!(
+            crate::payload_artifact::is_artifact_candidate(item),
+            *candidate
+        );
     }
     let items = captured(cases.iter().map(|(item, _)| item.clone()).collect());
-    let expected = items.iter().map(|item| {
-        let mut line = Vec::new();
-        JsonlWriter::serialize_rollout_item(&mut line, &item.item, item.captured_at)?;
-        Ok(line)
-    }).collect::<std::io::Result<Vec<_>>>()?;
+    let expected = items
+        .iter()
+        .map(|item| {
+            let mut line = Vec::new();
+            JsonlWriter::serialize_rollout_item(&mut line, &item.item, item.captured_at)?;
+            Ok(line)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
 
     for fail_artifact_storage in [false, true] {
         let home = TempDir::new()?;
@@ -2557,32 +3349,44 @@ async fn artifact_selection_preserves_mixed_batch_bytes_and_inline_fallback() ->
             // The writer already owns the publication root's retention lock.
             // Block the individual destinations instead of making writer-open fail.
             for ((_, candidate), line) in cases.iter().zip(&expected) {
-                if !candidate || line.len() < crate::payload_artifact::INLINE_BYTES { continue; }
+                if !candidate || line.len() < crate::payload_artifact::INLINE_BYTES {
+                    continue;
+                }
                 let mut value: serde_json::Value = serde_json::from_slice(line)?;
                 let fields = value.as_object_mut().expect("rollout object");
                 fields.remove("timestamp");
                 fields.remove("format_version");
                 let digest = <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&value)?);
                 let digest = hex::encode(digest);
-                fs::create_dir_all(crate::payload_artifact::root(&path).join(format!("{digest}.json")))?;
+                fs::create_dir_all(
+                    crate::payload_artifact::root(&path).join(format!("{digest}.json")),
+                )?;
             }
         }
-        writer.write_rollout_items(&items.iter().collect::<Vec<_>>()).await?;
+        writer
+            .write_rollout_items(&items.iter().collect::<Vec<_>>())
+            .await?;
         assert_eq!(writer.append_transaction_count, 1);
         let bytes = fs::read(&path)?;
-        let lines = bytes.split_inclusive(|byte| *byte == b'\n').collect::<Vec<_>>();
+        let lines = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .collect::<Vec<_>>();
         assert_eq!(lines.len(), cases.len());
         for ((line, expected), (_, candidate)) in lines.iter().zip(&expected).zip(&cases) {
             let stored: serde_json::Value = serde_json::from_slice(line)?;
-            let external = !fail_artifact_storage && *candidate
+            let external = !fail_artifact_storage
+                && *candidate
                 && expected.len() >= crate::payload_artifact::INLINE_BYTES;
             assert_eq!(stored["type"] == "rollout_payload_artifact", external);
             if external {
                 let hydrated = crate::payload_artifact::hydrate_line(
-                    &path, String::from_utf8(line.to_vec()).expect("UTF-8"),
+                    &path,
+                    String::from_utf8(line.to_vec()).expect("UTF-8"),
                 )?;
-                assert_eq!(serde_json::from_str::<serde_json::Value>(&hydrated)?,
-                    serde_json::from_slice::<serde_json::Value>(expected)?);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&hydrated)?,
+                    serde_json::from_slice::<serde_json::Value>(expected)?
+                );
             } else {
                 assert_eq!(*line, expected.as_slice());
             }
@@ -2611,30 +3415,54 @@ fn rollout_write_lock_serializes_append_recovery() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn damaged_payloads_preserve_later_records_and_filename_thread_identity() -> std::io::Result<()> {
+async fn damaged_payloads_preserve_later_records_and_filename_thread_identity()
+-> std::io::Result<()> {
     let home = TempDir::new()?;
     let id = ThreadId::new();
-    let path = home.path().join(format!("rollout-2026-10-07T00-00-00-{id}.jsonl"));
+    let path = home
+        .path()
+        .join(format!("rollout-2026-10-07T00-00-00-{id}.jsonl"));
     let meta = RolloutItem::SessionMeta(SessionMetaLine {
-        meta: SessionMeta { id, originator: "large metadata ".repeat(1000), ..Default::default() }, git: None,
+        meta: SessionMeta {
+            id,
+            originator: "large metadata ".repeat(1000),
+            ..Default::default()
+        },
+        git: None,
     });
-    let later = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent { message: "retained later record".into(), phase: None }));
+    let later = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+        message: "retained later record".into(),
+        phase: None,
+    }));
     let mut writer = open_log_file(&path)?.into_jsonl_writer();
     writer.write_rollout_item(&meta).await?;
     writer.write_rollout_item(&later).await?;
     let text = fs::read_to_string(&path)?;
     let reference: serde_json::Value = serde_json::from_str(text.lines().next().unwrap())?;
-    let blob = crate::payload_artifact::root(&path).join(format!("{}.json", reference["payload"]["sha256"].as_str().unwrap()));
+    let blob = crate::payload_artifact::root(&path).join(format!(
+        "{}.json",
+        reference["payload"]["sha256"].as_str().unwrap()
+    ));
     let bytes = fs::read(&blob)?;
     for missing in [false, true] {
-        if missing { fs::remove_file(&blob)?; } else { fs::write(&blob, b"corrupt")?; }
+        if missing {
+            fs::remove_file(&blob)?;
+        } else {
+            fs::write(&blob, b"corrupt")?;
+        }
         let (items, thread, errors) = RolloutRecorder::load_rollout_items(&path).await?;
-        assert_eq!(serde_json::to_value(&items[..1])?, serde_json::to_value(vec![later.clone()])?);
+        assert_eq!(
+            serde_json::to_value(&items[..1])?,
+            serde_json::to_value(vec![later.clone()])?
+        );
         assert_eq!(items.len(), 2);
         assert_reconstruction_gap(items.last().unwrap(), 1);
         assert_eq!(thread, Some(id));
         assert_eq!(errors, 1);
-        assert!(matches!(RolloutRecorder::get_rollout_history(&path).await?, InitialHistory::Resumed(_)));
+        assert!(matches!(
+            RolloutRecorder::get_rollout_history(&path).await?,
+            InitialHistory::Resumed(_)
+        ));
         assert!(crate::list::read_head_for_summary(&path).await.is_ok());
     }
     fs::write(&blob, bytes)?;
@@ -2643,31 +3471,62 @@ async fn damaged_payloads_preserve_later_records_and_filename_thread_identity() 
 }
 
 #[tokio::test]
-async fn durable_flush_retries_unsynced_payloads_before_acknowledging_rollout() -> std::io::Result<()> {
+async fn durable_flush_retries_unsynced_payloads_before_acknowledging_rollout()
+-> std::io::Result<()> {
     let home = TempDir::new()?;
     let path = home.path().join("rollout.jsonl");
     let writer = open_log_file(&path)?.into_jsonl_writer();
-    let mut state = RolloutWriterState::new(Some(writer), None, None, home.path().into(), None, path.clone(), Default::default());
-    state.add_items(captured(vec![RolloutItem::ToolManifest(ToolManifestItem::full(
-        "payload-sync".into(), serde_json::json!({"large": "x".repeat(10000)}),
-    ))]));
+    let mut state = RolloutWriterState::new(
+        Some(writer),
+        None,
+        None,
+        home.path().into(),
+        None,
+        path.clone(),
+        Default::default(),
+    );
+    state.add_items(captured(vec![RolloutItem::ToolManifest(
+        ToolManifestItem::full(
+            "payload-sync".into(),
+            serde_json::json!({"large": "x".repeat(10000)}),
+        ),
+    )]));
     state.flush().await?;
     let text = fs::read_to_string(&path)?;
     let reference: serde_json::Value = serde_json::from_str(text.lines().next().unwrap())?;
-    let blob = crate::payload_artifact::root(&path).join(format!("{}.json", reference["payload"]["sha256"].as_str().unwrap()));
+    let blob = crate::payload_artifact::root(&path).join(format!(
+        "{}.json",
+        reference["payload"]["sha256"].as_str().unwrap()
+    ));
     let saved = fs::read(&blob)?;
     fs::remove_file(&blob)?;
     assert!(state.flush_durable().await.is_err());
     fs::write(&blob, saved)?;
     let retried = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&retried);
-    crate::payload_artifact::sync_test_hooks().lock().unwrap().insert(path.clone(),
-        crate::payload_artifact::SyncTestHook { parallelism: 8, before_sync: Arc::new(move |_| {
-            counted.fetch_add(1, Ordering::SeqCst); Ok(())
-        }) });
+    crate::payload_artifact::sync_test_hooks()
+        .lock()
+        .unwrap()
+        .insert(
+            path.clone(),
+            crate::payload_artifact::SyncTestHook {
+                parallelism: 8,
+                before_sync: Arc::new(move |_| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+            },
+        );
     state.flush_durable().await?;
-    crate::payload_artifact::sync_test_hooks().lock().unwrap().remove(&path);
-    assert_eq!(retried.load(Ordering::SeqCst), 1, "the failed barrier must leave its payload for the retry to sync");
+    crate::payload_artifact::sync_test_hooks()
+        .lock()
+        .unwrap()
+        .remove(&path);
+    assert_eq!(
+        retried.load(Ordering::SeqCst),
+        1,
+        "the failed barrier must leave its payload for the retry to sync"
+    );
     assert_eq!(fs::read_to_string(&path)?, text);
     Ok(())
 }
@@ -2884,10 +3743,16 @@ async fn list_threads_db_repairs_archived_path_without_deleting_metadata() -> st
     let archived = archive_dir.join(original.file_name().unwrap());
     std::fs::rename(&original, &archived)?;
     let runtime = codex_state::StateRuntime::init(
-        home.path().to_path_buf(), config.model_provider_id.clone(),
-    ).await.unwrap();
+        home.path().to_path_buf(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .unwrap();
     let mut builder = codex_state::ThreadMetadataBuilder::new(
-        thread_id, original, chrono::Utc::now(), SessionSource::Cli,
+        thread_id,
+        original,
+        chrono::Utc::now(),
+        SessionSource::Cli,
     );
     builder.cwd = home.path().to_path_buf();
     let mut metadata = builder.build(&config.model_provider_id);
@@ -2897,18 +3762,47 @@ async fn list_threads_db_repairs_archived_path_without_deleting_metadata() -> st
     runtime.upsert_thread(&metadata).await.unwrap();
 
     let page = crate::state_integration::list_threads_db(
-        Some(&runtime), home.path(), 10, None, ThreadSortKey::CreatedAt,
-        SortDirection::Desc, &[], None, None, None, false, None, None,
-    ).await.unwrap();
-    assert!(page.items.is_empty(), "archived threads must not leak into active results");
+        Some(&runtime),
+        home.path(),
+        10,
+        None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        page.items.is_empty(),
+        "archived threads must not leak into active results"
+    );
     let repaired = runtime.get_thread(thread_id).await.unwrap().unwrap();
     assert_eq!(repaired.rollout_path, archived);
     assert!(repaired.archived_at.is_some());
     assert_eq!(repaired.title, metadata.title);
     let page = crate::state_integration::list_threads_db(
-        Some(&runtime), home.path(), 10, None, ThreadSortKey::CreatedAt,
-        SortDirection::Desc, &[], None, None, None, true, None, None,
-    ).await.unwrap();
+        Some(&runtime),
+        home.path(),
+        10,
+        None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Desc,
+        &[],
+        None,
+        None,
+        None,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].rollout_path, archived);
     Ok(())

@@ -30,6 +30,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 from scripts.common.atomic_json import write_bytes_atomic, write_json_atomic
+from scripts.common.generated_output_lock import GenerationLockError, repository_lock
 
 PRUNE = (
     ".git",
@@ -49,6 +50,9 @@ SUMMARY_PAGE_BYTES = 16 * 1024
 # A short remainder costs less inline than another --remaining call.
 INLINE_REMAINING_RECORDS = 10
 PRIOR_QUERY_LIMIT = 3
+PRIOR_QUERY_MAX_BYTES = 256 * 1024
+PRIOR_QUERY_MAX_RECORDS = 1024
+CACHE_PUBLISH_TIMEOUT = 1.0
 # Leave headroom below CreateProcessW's 32,767 UTF-16 code-unit limit.
 GIT_COMMAND_UNITS = 24_000
 
@@ -58,13 +62,16 @@ def pruned_path(path, prune=PRUNE, *, directory=False):
     parts = PurePosixPath(path).parts
     directories = parts if directory else parts[:-1]
     return any(
-        part in prune and directories[:index + 1] != ("scripts", "build")
+        part in prune and directories[: index + 1] != ("scripts", "build")
         for index, part in enumerate(directories)
     )
 
 
 def repository_source_records(
-    repo_root: Path, *, include_untracked: bool = True, prune: tuple[str, ...] = (),
+    repo_root: Path,
+    *,
+    include_untracked: bool = True,
+    prune: tuple[str, ...] = (),
     paths: tuple[str, ...] = (),
 ) -> dict[str, str]:
     # One listing answers everything the inventory needs: `--deleted` tags
@@ -90,14 +97,20 @@ def repository_source_records(
     if paths:
         batches = []
         batch = []
-        base_units = len(subprocess.list2cmdline([*args, "--"]).encode("utf-16-le")) // 2
+        base_units = (
+            len(subprocess.list2cmdline([*args, "--"]).encode("utf-16-le")) // 2
+        )
         units = base_units
         for path in paths:
-            path_units = len(
-                subprocess.list2cmdline([f":(literal){path}"]).encode("utf-16-le")
-            ) // 2 + 1
+            path_units = (
+                len(subprocess.list2cmdline([f":(literal){path}"]).encode("utf-16-le"))
+                // 2
+                + 1
+            )
             if base_units + path_units > GIT_COMMAND_UNITS:
-                raise ValueError(f"source path exceeds the git command-line budget: {path!r}")
+                raise ValueError(
+                    f"source path exceeds the git command-line budget: {path!r}"
+                )
             if batch and units + path_units > GIT_COMMAND_UNITS:
                 batches.append(tuple(batch))
                 batch = []
@@ -109,10 +122,14 @@ def repository_source_records(
         if len(batches) > 1:
             records = {}
             for batch in batches:
-                records.update(repository_source_records(
-                    repo_root, include_untracked=include_untracked, prune=prune,
-                    paths=batch,
-                ))
+                records.update(
+                    repository_source_records(
+                        repo_root,
+                        include_untracked=include_untracked,
+                        prune=prune,
+                        paths=batch,
+                    )
+                )
             return records
         args.extend(["--", *(f":(literal){path}" for path in paths)])
     result = subprocess.run(
@@ -154,8 +171,10 @@ def repository_source_records(
     for tag, path in entries:
         if pruned_path(path, prune):
             continue
-        records[path] = "deleted" if path in deleted_paths else (
-            "untracked" if tag == "?" else "tracked"
+        records[path] = (
+            "deleted"
+            if path in deleted_paths
+            else ("untracked" if tag == "?" else "tracked")
         )
     return records
 
@@ -172,8 +191,15 @@ def query_profile(query):
                 {
                     **rule,
                     "paths": [normalized_path(path) for path in rule["paths"]],
-                    **({"exclude_paths": [normalized_path(path) for path in rule["exclude_paths"]]}
-                       if "exclude_paths" in rule else {}),
+                    **(
+                        {
+                            "exclude_paths": [
+                                normalized_path(path) for path in rule["exclude_paths"]
+                            ]
+                        }
+                        if "exclude_paths" in rule
+                        else {}
+                    ),
                 }
                 for rule in query["categories"]
             ),
@@ -209,8 +235,11 @@ def json_shape(value, depth=0, budget=None):
     budget = [64] if budget is None else budget
     budget[0] -= 1
     if isinstance(value, str):
-        return {"type": "string", "length": len(value),
-                "sha256": digest(value.encode("utf-8", errors="surrogatepass"))}
+        return {
+            "type": "string",
+            "length": len(value),
+            "sha256": digest(value.encode("utf-8", errors="surrogatepass")),
+        }
     if isinstance(value, (dict, list)):
         result = {
             "type": "object" if isinstance(value, dict) else "array",
@@ -219,11 +248,7 @@ def json_shape(value, depth=0, budget=None):
         if depth >= 4 or budget[0] <= 0:
             result["omitted"] = len(value)
             return result
-        items = (
-            value.items()
-            if isinstance(value, dict)
-            else enumerate(value[:3])
-        )
+        items = value.items() if isinstance(value, dict) else enumerate(value[:3])
         shown = {}
         for index, (key, child) in enumerate(itertools.islice(items, 32)):
             if budget[0] <= 0:
@@ -257,10 +282,10 @@ def normalized_path(value):
 
 
 def matches_path(path, rule):
-    return (
-        any(fnmatch.fnmatchcase(path, pattern) for pattern in rule["paths"])
-        and not any(fnmatch.fnmatchcase(path, pattern)
-                    for pattern in rule.get("exclude_paths", []))
+    return any(
+        fnmatch.fnmatchcase(path, pattern) for pattern in rule["paths"]
+    ) and not any(
+        fnmatch.fnmatchcase(path, pattern) for pattern in rule.get("exclude_paths", [])
     )
 
 
@@ -321,7 +346,9 @@ def compile_categories(query):
             raise ValueError("verification must be path or runtime")
         rule = {**rule, "paths": [normalized_path(path) for path in rule["paths"]]}
         if "exclude_paths" in rule:
-            rule["exclude_paths"] = [normalized_path(path) for path in rule["exclude_paths"]]
+            rule["exclude_paths"] = [
+                normalized_path(path) for path in rule["exclude_paths"]
+            ]
         categories[name] = (
             rule,
             re.compile(rule["contains"]) if rule.get("contains") else None,
@@ -372,9 +399,7 @@ def consumer_evidence(root, references, cache):
                 cache[path] = None
             else:
                 try:
-                    remaining = MAX_SCAN_BYTES - sum(
-                        v[0] for v in cache.values() if v
-                    )
+                    remaining = MAX_SCAN_BYTES - sum(v[0] for v in cache.values() if v)
                     limit = min(MAX_FILE_BYTES, remaining)
                     if full_path.stat().st_size > limit:
                         data = None
@@ -418,14 +443,22 @@ def windows_change_time(path):
     from ctypes import wintypes
 
     class BasicInfo(ctypes.Structure):
-        _fields_ = [(name, ctypes.c_longlong) for name in (
-            "creation", "access", "write", "change"
-        )] + [("attributes", wintypes.DWORD)]
+        _fields_ = [
+            (name, ctypes.c_longlong)
+            for name in ("creation", "access", "write", "change")
+        ] + [("attributes", wintypes.DWORD)]
 
     kernel = ctypes.windll.kernel32
     create = kernel.CreateFileW
-    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
     create.restype = wintypes.HANDLE
     info = kernel.GetFileInformationByHandleEx
     info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
@@ -450,9 +483,14 @@ def source_revision(path):
     """Cheap race/continuation guard; content hashes remain the evidence identity."""
     try:
         stat = path.lstat()
-        return [stat.st_dev, stat.st_ino, stat.st_mode, stat.st_size,
-                stat.st_mtime_ns,
-                windows_change_time(path) if sys.platform == "win32" else stat.st_ctime_ns]
+        return [
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_mode,
+            stat.st_size,
+            stat.st_mtime_ns,
+            windows_change_time(path) if sys.platform == "win32" else stat.st_ctime_ns,
+        ]
     except FileNotFoundError:
         return None
 
@@ -466,7 +504,8 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
         name: (
             re.compile("|".join(fnmatch.translate(p) for p in rule["paths"])),
             re.compile("|".join(fnmatch.translate(p) for p in rule["exclude_paths"]))
-            if rule.get("exclude_paths") else None,
+            if rule.get("exclude_paths")
+            else None,
         )
         for name, (rule, _) in categories.items()
     }
@@ -475,7 +514,8 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
     def matching_categories(path):
         if path not in path_categories:
             path_categories[path] = {
-                name for name, (included, excluded) in path_rules.items()
+                name
+                for name, (included, excluded) in path_rules.items()
                 if included.match(path) and not (excluded and excluded.match(path))
             }
         return path_categories[path]
@@ -532,11 +572,13 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
         decisions[key] = decision
     evidence_cache = {}
     states = repository_source_records(root, prune=PRUNE, paths=discovery_paths(query))
+
     # Freeze the discovered scope as well as each selected file's revision.
     # A pending scan must never silently combine observations from two epochs.
     def selected_sources(sources):
         return {
-            path: tracking for path, tracking in sources.items()
+            path: tracking
+            for path, tracking in sources.items()
             if matching_categories(path)
         }
 
@@ -597,8 +639,14 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
         excluded = pruned_path(path)
         if not excluded:
             source_revisions[path] = source_revision(full_path)
-            if continuing and previous["scan"].get("source_revisions", {}).get(path) != source_revisions[path]:
-                raise ValueError(f"source changed during retained epoch: {path}; use --refresh")
+            if (
+                continuing
+                and previous["scan"].get("source_revisions", {}).get(path)
+                != source_revisions[path]
+            ):
+                raise ValueError(
+                    f"source changed during retained epoch: {path}; use --refresh"
+                )
         # Do not follow symlinks outside the inventory boundary or probe an
         # explicitly excluded candidate inside a pruned tree.
         exists = None if excluded else full_path.is_file()
@@ -710,7 +758,9 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
                             try:
                                 structure = json_shape(json.loads(data))
                             except (ValueError, UnicodeDecodeError):
-                                structure_error = "invalid JSON requires separate inspection"
+                                structure_error = (
+                                    "invalid JSON requires separate inspection"
+                                )
                         if structure_error is not None:
                             reason = structure_error
                         else:
@@ -768,15 +818,25 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
             else:
                 coverage[name]["matched"] += 1
         if content_hash is not None:
-            files[path] = {"sha256": content_hash, "categories": entries,
-                           "bytes": len(data) if data is not None else source_revisions[path][3]}
+            files[path] = {
+                "sha256": content_hash,
+                "categories": entries,
+                "bytes": len(data) if data is not None else source_revisions[path][3],
+            }
 
     for path, revision in source_revisions.items():
         if source_revision(root / path) != revision:
             raise ValueError(f"source changed during scan: {path}; use --refresh")
-    if selected_sources(repository_source_records(
-        root, prune=PRUNE, paths=discovery_paths(query),
-    )) != source_set:
+    if (
+        selected_sources(
+            repository_source_records(
+                root,
+                prune=PRUNE,
+                paths=discovery_paths(query),
+            )
+        )
+        != source_set
+    ):
         raise ValueError("source set changed during scan; use --refresh")
 
     result = list(records.values())
@@ -801,23 +861,32 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
         )
         for name in categories
     }
-    deleted = sorted({record["path"] for record in result if record["status"] == "deleted"})
+    deleted = sorted(
+        {record["path"] for record in result if record["status"] == "deleted"}
+    )
     # Deleted paths are part of the selected scope, so they belong to the
     # snapshot identity; without any, the identity is unchanged.
-    source_hash = digest(json.dumps(
-        sorted(
-            [[path, source_set.get(path), value["sha256"]]
-             for path, value in files.items()]
-            + [[path, "deleted", None] for path in deleted]
-        ),
-        ensure_ascii=False, separators=(",", ":"),
-    ).encode("utf-8"))
+    source_hash = digest(
+        json.dumps(
+            sorted(
+                [
+                    [path, source_set.get(path), value["sha256"]]
+                    for path, value in files.items()
+                ]
+                + [[path, "deleted", None] for path in deleted]
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
     # Partial evidence has its own identity; completing it converges to the
     # same identity as a fresh full scan, regardless of batching or timestamps.
-    epoch = digest(json.dumps(
-        [query_id, source_hash, sorted(pending)],
-        separators=(",", ":"),
-    ).encode("utf-8"))
+    epoch = digest(
+        json.dumps(
+            [query_id, source_hash, sorted(pending)],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
     output = {
         "query_id": query_id,
         "scope_changes": scope_changes,
@@ -871,21 +940,30 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
         "root": str(root),
         "files": files,
         "records": result,
-        "scan": {"epoch": epoch, "pending": pending,
-                 "source_set": source_set, "source_revisions": source_revisions},
+        "scan": {
+            "epoch": epoch,
+            "pending": pending,
+            "source_set": source_set,
+            "source_revisions": source_revisions,
+        },
         "scope_changes": scope_changes,
         "query": query,
         "output": output,
     }
     if "review" in previous:
         state["review"] = {
-            path: record for path, record in previous["review"].items()
+            path: record
+            for path, record in previous["review"].items()
             if path in files and record["sha256"] == files[path]["sha256"]
         }
-        state["stale_review"] = {**previous.get("stale_review", {}), **{
-            f"{path}@{record['sha256']}": record
-            for path, record in previous["review"].items() if path not in state["review"]
-        }}
+        state["stale_review"] = {
+            **previous.get("stale_review", {}),
+            **{
+                f"{path}@{record['sha256']}": record
+                for path, record in previous["review"].items()
+                if path not in state["review"]
+            },
+        }
         if previous.get("query") == query and previous.get("review_observations"):
             state["review_observations"] = previous["review_observations"]
         output["review_progress"] = review_progress(state)
@@ -895,10 +973,15 @@ def inventory(root, query, previous=None, *, refresh=False, source_cache=None):
 def merge_review_ranges(ranges, size):
     merged = []
     for item in ranges:
-        if (not isinstance(item, list) or len(item) != 2
-                or any(type(value) is not int for value in item)
-                or not 0 <= item[0] < item[1] <= size):
-            raise ValueError("review ranges must be nonempty half-open byte ranges within the source")
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or any(type(value) is not int for value in item)
+            or not 0 <= item[0] < item[1] <= size
+        ):
+            raise ValueError(
+                "review ranges must be nonempty half-open byte ranges within the source"
+            )
     for item in sorted(ranges):
         if merged and item[0] <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], item[1])
@@ -912,8 +995,11 @@ def review_progress(state):
     total = read = completed = 0
     next_batch = []
     budget = SUMMARY_PAGE_BYTES
-    unknown = {r["path"] for r in state["records"]
-               if r["status"] != "deleted" and r["path"] not in state["files"]}
+    unknown = {
+        r["path"]
+        for r in state["records"]
+        if r["status"] != "deleted" and r["path"] not in state["files"]
+    }
     for path, source in sorted(state["files"].items()):
         size = source.get("bytes")
         if size is None:
@@ -928,22 +1014,33 @@ def review_progress(state):
         for start, end in [*ranges, [size, size]]:
             if cursor < start and budget and len(next_batch) < PAGE_RECORDS:
                 stop = min(start, cursor + budget)
-                next_batch.append({"path": path, "sha256": source["sha256"],
-                                   "start": cursor, "end": stop})
+                next_batch.append(
+                    {
+                        "path": path,
+                        "sha256": source["sha256"],
+                        "start": cursor,
+                        "end": stop,
+                    }
+                )
                 budget -= stop - cursor
             cursor = end
     progress = {
         "evidence_kind": "reviewer_declared_coverage_not_host_verified_semantics",
-        "inventoried_files": len(state["files"]), "reviewed_files": completed,
+        "inventoried_files": len(state["files"]),
+        "reviewed_files": completed,
         "unresolved_files": len(set(state["files"]) | unknown) - completed,
         "unavailable_files": sorted(unknown),
-        "source_bytes": total, "read_bytes": read, "remaining_bytes": total - read,
-        "minimum_read_batches": (total - read + SUMMARY_PAGE_BYTES - 1) // SUMMARY_PAGE_BYTES,
+        "source_bytes": total,
+        "read_bytes": read,
+        "remaining_bytes": total - read,
+        "minimum_read_batches": (total - read + SUMMARY_PAGE_BYTES - 1)
+        // SUMMARY_PAGE_BYTES,
         "next_batch": next_batch,
         "complete": not unknown and completed == len(state["files"]),
     }
-    observations = sorted(state.get("review_observations", {}).values(),
-                          key=lambda row: row["ordinal"])
+    observations = sorted(
+        state.get("review_observations", {}).values(), key=lambda row: row["ordinal"]
+    )
     if observations:
         measured_bytes = sum(row["new_read_bytes"] for row in observations)
         elapsed_ms = sum(row["elapsed_ms"] for row in observations)
@@ -952,7 +1049,9 @@ def review_progress(state):
             "observed_batches": len(observations),
             "observed_elapsed_ms": elapsed_ms,
             "observed_new_read_bytes": measured_bytes,
-            "observed_reviewed_files": sum(row["new_reviewed_files"] for row in observations),
+            "observed_reviewed_files": sum(
+                row["new_reviewed_files"] for row in observations
+            ),
         }
         if measured_bytes:
             forecast["estimated_remaining_read_ms"] = (
@@ -982,18 +1081,26 @@ def update_review(state, update):
     observation = update.get("observation")
     observation_key = None
     if observation is not None:
-        if not isinstance(observation, dict) or not isinstance(observation.get("id"), str) or not observation["id"].strip():
+        if (
+            not isinstance(observation, dict)
+            or not isinstance(observation.get("id"), str)
+            or not observation["id"].strip()
+        ):
             raise ValueError("review observation requires a nonempty batch id")
         for key in ("elapsed_ms", "model_input_tokens", "model_output_tokens"):
             if key == "elapsed_ms" or key in observation:
                 if type(observation.get(key)) is not int or observation[key] < 0:
                     raise ValueError(f"observation {key} must be a nonnegative integer")
         observation_key = f"{update['scan_epoch']}:{observation['id']}"
-        update_hash = digest(json.dumps(update, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        update_hash = digest(
+            json.dumps(update, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
         prior_observation = state.get("review_observations", {}).get(observation_key)
         if prior_observation is not None:
             if prior_observation["update_sha256"] != update_hash:
-                raise ValueError("review batch id already committed with different contents")
+                raise ValueError(
+                    "review batch id already committed with different contents"
+                )
             return state
     before = review_progress(state)
     # Validate the entire update before changing the caller's retained state.
@@ -1005,26 +1112,48 @@ def update_review(state, update):
         if source is None or source["sha256"] != record.get("sha256"):
             raise ValueError(f"review source is missing or stale: {path}")
         if "bytes" not in source:
-            raise ValueError("legacy inventory lacks source lengths; refresh before recording coverage")
+            raise ValueError(
+                "legacy inventory lacks source lengths; refresh before recording coverage"
+            )
         previous = review.get(path, {})
-        ranges = merge_review_ranges([*previous.get("ranges", []), *record.get("ranges", [])], source["bytes"])
-        disposition = record.get("disposition", previous.get("disposition", "unreviewed"))
+        ranges = merge_review_ranges(
+            [*previous.get("ranges", []), *record.get("ranges", [])], source["bytes"]
+        )
+        disposition = record.get(
+            "disposition", previous.get("disposition", "unreviewed")
+        )
         reason = record.get("reason", previous.get("reason", ""))
         findings = record.get("findings", previous.get("findings", []))
         unresolved = record.get("unresolved", previous.get("unresolved", []))
         if disposition not in ("unreviewed", "reviewed", "unresolved"):
-            raise ValueError("review disposition must be unreviewed, reviewed, or unresolved")
-        if not isinstance(reason, str) or (disposition != "unreviewed" and not reason.strip()):
+            raise ValueError(
+                "review disposition must be unreviewed, reviewed, or unresolved"
+            )
+        if not isinstance(reason, str) or (
+            disposition != "unreviewed" and not reason.strip()
+        ):
             raise ValueError("semantic review dispositions require an explicit reason")
-        if any(not isinstance(values, list) or any(not isinstance(v, str) or not v.strip() for v in values)
-               for values in (findings, unresolved)):
-            raise ValueError("findings and unresolved must be lists of nonempty references")
+        if any(
+            not isinstance(values, list)
+            or any(not isinstance(v, str) or not v.strip() for v in values)
+            for values in (findings, unresolved)
+        ):
+            raise ValueError(
+                "findings and unresolved must be lists of nonempty references"
+            )
         covered = sum(end - start for start, end in ranges)
         if disposition == "reviewed" and (covered != source["bytes"] or unresolved):
-            raise ValueError("reviewed requires complete read coverage and no unresolved obligations")
-        review[path] = {"sha256": source["sha256"], "ranges": ranges,
-                        "disposition": disposition, "reason": reason,
-                        "findings": findings, "unresolved": unresolved}
+            raise ValueError(
+                "reviewed requires complete read coverage and no unresolved obligations"
+            )
+        review[path] = {
+            "sha256": source["sha256"],
+            "ranges": ranges,
+            "disposition": disposition,
+            "reason": reason,
+            "findings": findings,
+            "unresolved": unresolved,
+        }
     if observation_key is not None:
         after = review_progress(state)
         measurement = {
@@ -1032,7 +1161,9 @@ def update_review(state, update):
             "update_sha256": update_hash,
             "elapsed_ms": observation["elapsed_ms"],
             "new_read_bytes": max(0, after["read_bytes"] - before["read_bytes"]),
-            "new_reviewed_files": max(0, after["reviewed_files"] - before["reviewed_files"]),
+            "new_reviewed_files": max(
+                0, after["reviewed_files"] - before["reviewed_files"]
+            ),
         }
         for key in ("model_input_tokens", "model_output_tokens"):
             if key in observation:
@@ -1045,8 +1176,13 @@ def update_review(state, update):
 def evidence_counts(state):
     """Count evidence levels without promoting rule matches into definitions."""
     return {
-        label: len({record["path"] for record in state["records"]
-                    if record["status"] == status})
+        label: len(
+            {
+                record["path"]
+                for record in state["records"]
+                if record["status"] == status
+            }
+        )
         for label, status in (
             ("rule_matched_files", "matched"),
             ("consumer_verified_files", "verified"),
@@ -1088,16 +1224,19 @@ def render_report(state):
         "",
     ]
     counts = evidence_counts(state)
-    lines.extend([
-        "## Evidence levels", "",
-        "Counts are unique files per level (tracked and untracked); levels can overlap.",
-        f"- Rule-matched only: {counts['rule_matched_files']}",
-        f"- Consumer-verified: {counts['consumer_verified_files']}",
-        f"- Unresolved: {counts['unresolved_files']}",
-        "",
-        "File/rule matches are not semantic classifications or proof of runtime use.",
-        "",
-    ])
+    lines.extend(
+        [
+            "## Evidence levels",
+            "",
+            "Counts are unique files per level (tracked and untracked); levels can overlap.",
+            f"- Rule-matched only: {counts['rule_matched_files']}",
+            f"- Consumer-verified: {counts['consumer_verified_files']}",
+            f"- Unresolved: {counts['unresolved_files']}",
+            "",
+            "File/rule matches are not semantic classifications or proof of runtime use.",
+            "",
+        ]
+    )
     for change in state.get("scope_changes", []):
         lines.extend(
             [
@@ -1164,13 +1303,23 @@ def render_report(state):
         )
     if "review_progress" in output:
         progress = output["review_progress"]
-        lines.extend(["", "## Semantic review coverage", "",
-                      "Reviewer declarations, not a host assertion that source semantics are correct.",
-                      f"Reviewed files: {progress['reviewed_files']}; unresolved: {progress['unresolved_files']}; unread bytes: {progress['remaining_bytes']}."])
+        lines.extend(
+            [
+                "",
+                "## Semantic review coverage",
+                "",
+                "Reviewer declarations, not a host assertion that source semantics are correct.",
+                f"Reviewed files: {progress['reviewed_files']}; unresolved: {progress['unresolved_files']}; unread bytes: {progress['remaining_bytes']}.",
+            ]
+        )
         for path, record in sorted(state.get("review", {}).items()):
-            lines.append(f"- {code(path)}: {code(record['disposition'])}; {html.escape(record['reason'])}; findings: {code(', '.join(record['findings']))}; unresolved: {code(', '.join(record['unresolved']))}")
+            lines.append(
+                f"- {code(path)}: {code(record['disposition'])}; {html.escape(record['reason'])}; findings: {code(', '.join(record['findings']))}; unresolved: {code(', '.join(record['unresolved']))}"
+            )
         if state.get("stale_review"):
-            lines.append(f"Stale review records preserved in canonical JSON: {len(state['stale_review'])}.")
+            lines.append(
+                f"Stale review records preserved in canonical JSON: {len(state['stale_review'])}."
+            )
     if output["excluded"]:
         lines.extend(["", "## Reviewed exclusions", ""])
         lines.extend(
@@ -1231,7 +1380,20 @@ def describe_contract():
         "format": RESULT_FORMAT,
         "review": {
             "invocation": "--state STATE --review REVIEW_JSON [--report REPORT]; no source rescan. Serialize updates to a task-owned state.",
-            "input": {"scan_epoch": "exact retained scan_epoch", "records": [{"path": "selected source path", "sha256": "exact source hash", "ranges": "half-open UTF-8 byte ranges explicitly read by the reviewer", "disposition": "unreviewed | unresolved | reviewed", "reason": "required for semantic dispositions", "findings": "finding reference strings", "unresolved": "remaining obligation strings"}]},
+            "input": {
+                "scan_epoch": "exact retained scan_epoch",
+                "records": [
+                    {
+                        "path": "selected source path",
+                        "sha256": "exact source hash",
+                        "ranges": "half-open UTF-8 byte ranges explicitly read by the reviewer",
+                        "disposition": "unreviewed | unresolved | reviewed",
+                        "reason": "required for semantic dispositions",
+                        "findings": "finding reference strings",
+                        "unresolved": "remaining obligation strings",
+                    }
+                ],
+            },
             "semantics": "Send records=[] to initialize coverage and obtain a bounded next_batch. Updates merge ranges idempotently and are persisted atomically before publication. Reviewed requires complete ranges and no unresolved obligations; this is a reviewer declaration, not semantic proof. Inventory readiness never implies review completion. Changed sources invalidate active coverage but preserve stale review records. Legacy states without byte lengths need a refresh.",
             "observation": "Optional input observation={id, elapsed_ms, model_input_tokens?, model_output_tokens?} records measured batch cost, never estimated or cumulative account usage. IDs are unique per scan; identical replays are no-ops and conflicting reuse fails before mutation.",
             "forecast": "review_progress reports remaining_bytes, minimum_read_batches (16 KiB byte budget), next_batch, unavailable_files, and reviewed/unresolved counts. Optional observations add elapsed cost, ms_per_mib, extrapolated remaining read time, and declining throughput. These are historical same-query observations, not semantic completion guarantees or authority to narrow scope. Token counts are request-processing counts, not unique context size or billing.",
@@ -1239,8 +1401,8 @@ def describe_contract():
         "snapshot": "Scans reject source/revision drift within a retained epoch. Complete results include source_snapshot_sha256 over all selected source hashes, including negative matches. This identifies captured evidence, not an atomic filesystem snapshot; --render-only replays it without reading live sources.",
         "invocation": {
             "file": "python -X utf8 scripts/maintenance/source_inventory.py --root . --query QUERY --state STATE --report REPORT",
-            "list_queries": "python -X utf8 scripts/maintenance/source_inventory.py --root . --list-queries; returns each exact profile from retained metadata, without a source scan. Compare paths, exclusions, content rules and verification in profile; do not reopen reports to discover the scope. Legacy index entries load their canonical query metadata. scope_unavailable means no verified profile could be loaded. Select a matching canonical_paths entry and pass it as --query; never assume the latest entry has the same intent.",
-            "powershell_stdin": "& {\n  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n  @'\n{\"categories\":[{\"name\":\"templates\",\"paths\":[\"templates/*.md\",\"*/templates/*.md\"],\"verification\":\"path\"}]}\n'@ | python -X utf8 scripts/maintenance/source_inventory.py --root . --query -\n}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "list_queries": "python -X utf8 scripts/maintenance/source_inventory.py --root . --list-queries; returns newest distinct exact profiles within a bounded retained-history tail, without a source scan. prior_query_lookup reports lookup_complete/history_truncated; an empty partial lookup never proves no older query exists. Compare paths, exclusions, content rules and verification in profile. Legacy entries load bounded canonical query metadata; scope_unavailable means no verified profile could be loaded. Select a matching canonical_paths entry as --query; never assume the latest entry has the same intent.",
+            "powershell_stdin": '& {\n  $OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n  @\'\n{"categories":[{"name":"templates","paths":["templates/*.md","*/templates/*.md"],"verification":"path"}]}\n\'@ | python -X utf8 scripts/maintenance/source_inventory.py --root . --query -\n}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
             "stdin": "--query - reads UTF-8 JSON from stdin (an optional UTF-8 BOM is accepted). The PowerShell example scopes OutputEncoding to the script block; it changes no global setting.",
             "continuation": "Reuse the query with --root ROOT --query QUERY --state ARTIFACT (or pipe it with --query -). Add --report REPORT to deliver the updated report; explicit --state does not imply a report. ARTIFACT is the returned state path. Omitting --state starts a new independent run, not a continuation.",
             "complete": "Scans drain progressing batches locally by default, checkpointing every completed batch. --single-batch opts out; --complete remains compatible. Resume interruptions with the same query and explicit --state. Unresolved evidence still prevents final delivery.",
@@ -1259,6 +1421,8 @@ def describe_contract():
         "budget": {
             "max_file_bytes": MAX_FILE_BYTES,
             "max_scan_bytes": MAX_SCAN_BYTES,
+            "prior_query_max_bytes": PRIOR_QUERY_MAX_BYTES,
+            "prior_query_max_records": PRIOR_QUERY_MAX_RECORDS,
             "continuation": "Default scans drain progressing batches locally. With --single-batch, scan_pending > 0 requires the returned artifact and the same query to continue. Oversized files stay unresolved; continuation never lifts the per-file limit.",
         },
         "query": {
@@ -1266,8 +1430,12 @@ def describe_contract():
             "categories": [
                 {
                     "name": "unique category name",
-                    "paths": ["repository-relative globs; backslash separators and leading ./ are normalized"],
-                    "exclude_paths": ["optional path globs excluded from this category's discovery; same matching semantics as paths. Explicit candidates cannot qualify through excluded rules"],
+                    "paths": [
+                        "repository-relative globs; backslash separators and leading ./ are normalized"
+                    ],
+                    "exclude_paths": [
+                        "optional path globs excluded from this category's discovery; same matching semantics as paths. Explicit candidates cannot qualify through excluded rules"
+                    ],
                     "verification": "path | runtime (default runtime)",
                     "contains": "optional Python regular expression",
                     "json_summary": "optional boolean; omit for file listings. Enable only when JSON structure is needed, in a JSON-only category; TOML/YAML are not JSON. Exposes fields, types and lengths, never string bodies",
@@ -1315,14 +1483,26 @@ def describe_contract():
                 {
                     "name": "guidance_assets",
                     "paths": [
-                        "AGENTS.md", "*/AGENTS.md", "SKILL.md", "*/SKILL.md",
-                        "skills/*.md", "*/skills/*.md",
+                        "AGENTS.md",
+                        "*/AGENTS.md",
+                        "SKILL.md",
+                        "*/SKILL.md",
+                        "skills/*.md",
+                        "*/skills/*.md",
                     ],
                     "verification": "path",
                 },
                 {
                     "name": "related_text_candidates",
-                    "paths": ["*.rs", "*.md", "*.txt", "*.json", "*.toml", "*.yaml", "*.yml"],
+                    "paths": [
+                        "*.rs",
+                        "*.md",
+                        "*.txt",
+                        "*.json",
+                        "*.toml",
+                        "*.yaml",
+                        "*.yml",
+                    ],
                     "contains": "(?i)prompt|instruction|guidance|template",
                     "verification": "path",
                 },
@@ -1349,6 +1529,7 @@ def describe_contract():
             "unresolved_count": "records requiring inspection",
             "deleted_count": "tracked paths git reports deleted in the working tree; listed in the report and canonical JSON, never unresolved; present when nonzero",
             "prior_queries": f"up to {PRIOR_QUERY_LIMIT} earlier delivered queries for this root with a different scope (query_id, categories, count, ready_to_render, canonical_paths); present when any exist. Pass canonical_paths as --query to reproduce that scope exactly",
+            "prior_query_lookup": "bounded history lookup status: lookup_complete, history_truncated, bytes_read and records_examined; always returned by --list-queries and included in delivery hints when incomplete. Missing or out-of-window queries are not evidence of absence",
             "missing_categories": "required undeclared categories",
             "earlier_scope_count": "retained scope changes",
             "ready_to_render": "true only for the declared scope",
@@ -1376,13 +1557,15 @@ def describe_contract():
         },
         "paging": f"Use --state STATE --render-only --offset N without rescanning. Add --paths --category NAME for one retained category. Paths and remaining pages hold {PAGE_RECORDS} records; JSON summaries also have a {SUMMARY_PAGE_BYTES}-byte target. Each next-offset field advances its own list.",
         "control_files": "Without --state, each scan creates a unique task-owned state.json under the system temporary directory. Default reports are permanent under ~/.cache/codex/source-inventory/<scan_epoch>/inventory.md, with the directory derived from query and scanned-file hashes. Reports use repository-relative paths and are identical across isolated copies. State retains the actual source root and is never selected by query hash. Explicit --state preserves explicit-path behavior: no report unless requested. --render-only requires explicit --state and no query. Query files and state must be distinct and outside selected sources; stdin has no query path. Reports must be outside the source tree. Pruned directories are outside discovery scope.",
-        "delivery": "Canonical JSON contains all paths, categories, json_summaries, unresolved/excluded records and prior scope. Deliver sufficient returned counts and report/canonical-path links without another call. When exec direct delivery is available and the scope and answer format are settled before scanning, start the scan cell with // @exec: {\"deliver\": true}. Await all work and check command success and streams_complete before parsing stdout. Deliver only when ready_to_render is true, scan_pending and unresolved_count are zero, missing_categories is empty, next_action is deliver_report, and the returned deliverables satisfy the user's request. Emit only the final answer with counts, report links, and material limitations; do not send the complete result envelope back to the model just to reformat it. If evidence is incomplete or a new decision is required, emit bounded diagnostic evidence and await yield_control() instead of finalizing. State is internal; use --render-only with --paths or --remaining only for newly required evidence, not to re-derive returned counts. A ready result proves only the declared query, not that its scope answers the entire task. When this contract supplies the needed facts, do not read or search source_inventory.py.",
+        "delivery": 'Canonical JSON contains all paths, categories, json_summaries, unresolved/excluded records and prior scope. Deliver sufficient returned counts and report/canonical-path links without another call. When exec direct delivery is available and the scope and answer format are settled before scanning, start the scan cell with // @exec: {"deliver": true}. Await all work and check command success and streams_complete before parsing stdout. Deliver only when ready_to_render is true, scan_pending and unresolved_count are zero, missing_categories is empty, next_action is deliver_report, and the returned deliverables satisfy the user\'s request. Emit only the final answer with counts, report links, and material limitations; do not send the complete result envelope back to the model just to reformat it. If evidence is incomplete or a new decision is required, emit bounded diagnostic evidence and await yield_control() instead of finalizing. State is internal; use --render-only with --paths or --remaining only for newly required evidence, not to re-derive returned counts. A ready result proves only the declared query, not that its scope answers the entire task. When this contract supplies the needed facts, do not read or search source_inventory.py.',
     }
 
 
 def report_directory(state):
     """Permanent content-addressed reports, outside the source checkout."""
-    return Path.home() / ".cache" / "codex" / "source-inventory" / state["scan"]["epoch"]
+    return (
+        Path.home() / ".cache" / "codex" / "source-inventory" / state["scan"]["epoch"]
+    )
 
 
 def recent_index_path():
@@ -1392,7 +1575,8 @@ def recent_index_path():
 
 def source_cache_path(root):
     identity = digest(str(root.resolve()).encode("utf-8"))
-    return recent_index_path().parent / "sources" / f"{identity}.json"
+    # Isolate the coordinated publication protocol from older unlocked writers.
+    return recent_index_path().parent / "sources-v2" / f"{identity}.json"
 
 
 def load_source_cache(root):
@@ -1405,9 +1589,13 @@ def load_source_cache(root):
             and value.get("scanner_sha256") == digest(Path(__file__).read_bytes())
             and isinstance(value.get("files"), dict)
             and isinstance(value.get("source_revisions"), dict)
-            and value.get("sha256") == digest(json.dumps(
-                [value["files"], value["source_revisions"]], sort_keys=True,
-            ).encode())
+            and value.get("sha256")
+            == digest(
+                json.dumps(
+                    [value["files"], value["source_revisions"]],
+                    sort_keys=True,
+                ).encode()
+            )
         ):
             return value
     except (OSError, ValueError, AttributeError, TypeError):
@@ -1416,31 +1604,63 @@ def load_source_cache(root):
 
 
 def save_source_cache(state):
-    # Never publish pending or ambiguous observations as reusable source state.
+    """Optionally publish a per-root load/merge/replace transaction."""
     if state["scan"]["pending"]:
-        return
-    cached = load_source_cache(Path(state["root"]))
-    observed = state["scan"]["source_revisions"]
-    # A different query must not evict unrelated hash-bound rule observations.
-    # Observed failures/deletions do evict old evidence. Reuse still requires
-    # the current full file revision and rule hash in inventory(). No consumer
-    # decisions, review state or delivery authority are merged here.
-    files = {path: value for path, value in cached.get("files", {}).items()
-             if path not in observed}
-    revisions = {path: value for path, value in cached.get("source_revisions", {}).items()
-                 if path not in observed}
-    for path, current in state["files"].items():
-        old = cached.get("files", {}).get(path, {})
-        categories = old.get("categories", {}) if old.get("sha256") == current["sha256"] else {}
-        files[path] = {**current, "categories": {**categories, **current["categories"]}}
-        revisions[path] = observed[path]
-    value = {
-        "version": 1, "root": state["root"], "files": files,
-        "scanner_sha256": digest(Path(__file__).read_bytes()),
-        "source_revisions": revisions,
-        "sha256": digest(json.dumps([files, revisions], sort_keys=True).encode()),
-    }
-    write_json_atomic(source_cache_path(Path(state["root"])), value)
+        return {"status": "skipped_pending"}
+    root = Path(state["root"])
+    path = source_cache_path(root)
+    try:
+        # Lock the stable sidecar, not the JSON inode replaced by publication.
+        # Scanning stays outside this bounded, OS-backed cross-process lock.
+        with repository_lock(
+            path.with_suffix(".json.lock"),
+            "source inventory",
+            "source inventory cache",
+            timeout=CACHE_PUBLISH_TIMEOUT,
+        ):
+            cached = load_source_cache(root)
+            observed = state["scan"]["source_revisions"]
+            # Preserve unrelated hash-bound observations, never reviewer decisions.
+            # Failures/deletions evict their evidence. Reuse still validates the
+            # current file revision and rule hash in inventory().
+            files = {
+                path: value
+                for path, value in cached.get("files", {}).items()
+                if path not in observed
+            }
+            revisions = {
+                path: value
+                for path, value in cached.get("source_revisions", {}).items()
+                if path not in observed
+            }
+            for name, current in state["files"].items():
+                old = cached.get("files", {}).get(name, {})
+                categories = (
+                    old.get("categories", {})
+                    if old.get("sha256") == current["sha256"]
+                    else {}
+                )
+                files[name] = {
+                    **current,
+                    "categories": {**categories, **current["categories"]},
+                }
+                revisions[name] = observed[name]
+            value = {
+                "version": 1,
+                "root": state["root"],
+                "files": files,
+                "scanner_sha256": digest(Path(__file__).read_bytes()),
+                "source_revisions": revisions,
+                "sha256": digest(
+                    json.dumps([files, revisions], sort_keys=True).encode()
+                ),
+            }
+            write_json_atomic(path, value)
+        return {"status": "published", "retained_entries": len(files)}
+    except GenerationLockError:
+        return {"status": "skipped_busy"}
+    except OSError as error:
+        return {"status": "failed", "reason": str(error)}
 
 
 def query_from_delivery(document):
@@ -1456,19 +1676,45 @@ def query_from_delivery(document):
     return query
 
 
-def prior_queries(root, query_id=None, *, include_scope=False):
-    """Pre-scan scope discovery; optionally omit a just-delivered query."""
+def prior_queries(root, query_id=None, *, include_scope=False, lookup_status=None):
+    """Newest distinct scopes within a bounded tail, not exhaustive history."""
+    status = lookup_status if lookup_status is not None else {}
+    status.update(
+        lookup_complete=True, history_truncated=False, bytes_read=0, records_examined=0
+    )
     try:
-        lines = recent_index_path().read_text(encoding="utf-8").splitlines()
+        with recent_index_path().open("rb") as stream:
+            size = stream.seek(0, 2)
+            start = max(0, size - PRIOR_QUERY_MAX_BYTES)
+            stream.seek(start)
+            payload = stream.read(PRIOR_QUERY_MAX_BYTES)
+        status["bytes_read"] = len(payload)
+        if start:
+            # The first row may start before our byte window. Never parse it.
+            payload = payload.partition(b"\n")[2]
+            status.update(lookup_complete=False, history_truncated=True)
+        lines = payload.splitlines()
+        if len(lines) > PRIOR_QUERY_MAX_RECORDS:
+            lines = lines[-PRIOR_QUERY_MAX_RECORDS:]
+            status.update(lookup_complete=False, history_truncated=True)
+    except FileNotFoundError:
+        return []
     except OSError:
+        status.update(lookup_complete=False, history_unavailable=True)
         return []
     prior, seen = [], {query_id}
     for line in reversed(lines):
+        status["records_examined"] += 1
         try:
             entry = json.loads(line)
-        except ValueError:
+        except (ValueError, UnicodeDecodeError):
             continue
-        if not isinstance(entry, dict) or entry.get("root") != root or entry.get("query_id") in seen:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("root") != root
+            or not isinstance(entry.get("query_id"), str)
+            or entry["query_id"] in seen
+        ):
             continue
         seen.add(entry["query_id"])
         projected = {
@@ -1488,13 +1734,24 @@ def prior_queries(root, query_id=None, *, include_scope=False):
                 # model turns to open and interpret whole canonical reports.
                 profile = entry.get("profile")
                 if profile is None:
-                    document = json.loads(Path(entry["canonical_paths"]).read_text(encoding="utf-8"))
+                    with Path(entry["canonical_paths"]).open("rb") as stream:
+                        payload = stream.read(MAX_FILE_BYTES + 1)
+                    if len(payload) > MAX_FILE_BYTES:
+                        raise ValueError(
+                            "retained query metadata exceeds the read limit"
+                        )
+                    document = json.loads(payload)
                     profile = document["profile"]
-                if query_identity(query_from_delivery({"profile": profile})) != entry["query_id"]:
+                if (
+                    query_identity(query_from_delivery({"profile": profile}))
+                    != entry["query_id"]
+                ):
                     raise ValueError("retained query identity mismatch")
                 projected["profile"] = profile
-            except (OSError, ValueError, KeyError, TypeError):
-                projected["scope_unavailable"] = "retained query metadata is missing, invalid, or identity-mismatched"
+            except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+                projected["scope_unavailable"] = (
+                    "retained query metadata is missing, invalid, or identity-mismatched"
+                )
         prior.append(projected)
         if len(prior) == PRIOR_QUERY_LIMIT:
             break
@@ -1532,34 +1789,58 @@ def evidence_lineage(state, kind="retained_projection"):
     result = {
         "query_id": query_id,
         "source_snapshot_sha256": snapshot,
-        "records": sorted(state.get("records", []),
-                          key=lambda row: (row["path"], row["category"])),
-        "output": {key: output[key] for key in (
-            "paths", "untracked_paths", "categories", "unresolved", "excluded",
-            "deleted", "missing_categories", "ready_to_render", "review_progress",
-        ) if key in output},
+        "records": sorted(
+            state.get("records", []), key=lambda row: (row["path"], row["category"])
+        ),
+        "output": {
+            key: output[key]
+            for key in (
+                "paths",
+                "untracked_paths",
+                "categories",
+                "unresolved",
+                "excluded",
+                "deleted",
+                "missing_categories",
+                "ready_to_render",
+                "review_progress",
+            )
+            if key in output
+        },
         "review": state.get("review", {}),
         "stale_review": state.get("stale_review", {}),
         "review_observations": state.get("review_observations", []),
     }
-    return {"evidence_lineage": {
-        "kind": kind,
-        "source": "source_inventory",
-        "identity": digest(json.dumps(result, sort_keys=True, ensure_ascii=False,
-                                      separators=(",", ":")).encode("utf-8"))[:16],
-    }}
+    return {
+        "evidence_lineage": {
+            "kind": kind,
+            "source": "source_inventory",
+            "identity": digest(
+                json.dumps(
+                    result, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8")
+            )[:16],
+        }
+    }
+
 
 def file_lineage_document(document, lineage):
     """Bind a report's attribution to its payload, never to a stale copied header."""
-    payload = {key: value for key, value in document.items() if key != "evidence_lineage"}
+    payload = {
+        key: value for key, value in document.items() if key != "evidence_lineage"
+    }
     if not lineage:
         return payload
-    content = json.dumps(payload, ensure_ascii=False, sort_keys=True,
-                         separators=(",", ":")).encode("utf-8")
-    return {**payload, "evidence_lineage": {
-        **lineage["evidence_lineage"],
-        "content_sha256": hashlib.sha256(content).hexdigest(),
-    }}
+    content = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        **payload,
+        "evidence_lineage": {
+            **lineage["evidence_lineage"],
+            "content_sha256": hashlib.sha256(content).hexdigest(),
+        },
+    }
 
 
 def export_delivery(state, report):
@@ -1607,8 +1888,11 @@ def export_delivery(state, report):
     if "source_snapshot_sha256" in output:
         document["source_snapshot_sha256"] = output["source_snapshot_sha256"]
         document["sources"] = [
-            {"path": path, "tracking": state["scan"]["source_set"].get(path),
-             "sha256": value["sha256"]}
+            {
+                "path": path,
+                "tracking": state["scan"]["source_set"].get(path),
+                "sha256": value["sha256"],
+            }
             for path, value in sorted(state["files"].items())
         ]
     document = file_lineage_document(document, evidence_lineage(state))
@@ -1623,9 +1907,13 @@ def export_delivery(state, report):
         + f"\nCanonical path data: [{canonical.name}]({canonical.name})\n"
     ).encode("utf-8")
     if lineage := evidence_lineage(state):
-        lineage["evidence_lineage"]["content_sha256"] = hashlib.sha256(rendered).hexdigest()
+        lineage["evidence_lineage"]["content_sha256"] = hashlib.sha256(
+            rendered
+        ).hexdigest()
         rendered = (
-            f"<!-- codex-evidence: {json.dumps(lineage, sort_keys=True)} -->\n".encode("utf-8")
+            f"<!-- codex-evidence: {json.dumps(lineage, sort_keys=True)} -->\n".encode(
+                "utf-8"
+            )
             + rendered
         )
     for path, content in ((canonical, data), (readable, rendered)):
@@ -1659,23 +1947,29 @@ def delivery_answer(summary):
         f"[JSON](<{Path(summary['canonical_paths']).as_posix()}>)",
         "",
     ]
-    lines.extend(f"- {html.escape(name)}: {count}"
-                 for name, count in sorted(summary["category_counts"].items()))
+    lines.extend(
+        f"- {html.escape(name)}: {count}"
+        for name, count in sorted(summary["category_counts"].items())
+    )
     if summary["untracked_count"]:
         lines.append(f"- Additional untracked matches: {summary['untracked_count']}")
     if summary.get("deleted_count"):
-        lines.append(f"- Deleted tracked paths (not counted): {summary['deleted_count']}")
+        lines.append(
+            f"- Deleted tracked paths (not counted): {summary['deleted_count']}"
+        )
     counts = summary["evidence_counts"]
-    lines.extend([
-        "",
-        f"Evidence levels (including untracked): {counts['rule_matched_files']} rule-matched; "
-        f"{counts['consumer_verified_files']} consumer-verified; "
-        f"{counts['unresolved_files']} unresolved.",
-        "",
-        "Complete for the declared query only. Categories/evidence levels can overlap. "
-        "These are file matches, not proof of semantic completeness or a complete runtime audit. "
-        "Ignored/build directories are excluded; later workspace changes are not reflected.",
-    ])
+    lines.extend(
+        [
+            "",
+            f"Evidence levels (including untracked): {counts['rule_matched_files']} rule-matched; "
+            f"{counts['consumer_verified_files']} consumer-verified; "
+            f"{counts['unresolved_files']} unresolved.",
+            "",
+            "Complete for the declared query only. Categories/evidence levels can overlap. "
+            "These are file matches, not proof of semantic completeness or a complete runtime audit. "
+            "Ignored/build directories are excluded; later workspace changes are not reflected.",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -1686,19 +1980,36 @@ def main(argv=None):
     )
     parser.add_argument(
         "--describe",
-        nargs="?", const="scan", choices=("full", "scan"),
+        nargs="?",
+        const="scan",
+        choices=("full", "scan"),
         help="Print the compact scan contract (default) or full contract, without reading the repository",
     )
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--query", type=Path, help="Query JSON file, or - for UTF-8 stdin")
-    parser.add_argument("--list-queries", action="store_true",
-                        help="List exact reusable query profiles from retained metadata, without scanning sources")
+    parser.add_argument(
+        "--query", type=Path, help="Query JSON file, or - for UTF-8 stdin"
+    )
+    parser.add_argument(
+        "--list-queries",
+        action="store_true",
+        help="List exact reusable query profiles from retained metadata, without scanning sources",
+    )
     batching = parser.add_mutually_exclusive_group()
-    batching.add_argument("--complete", action="store_true",
-                          help="Compatibility flag: scans already drain progressing batches by default")
-    batching.add_argument("--single-batch", action="store_true",
-                          help="Checkpoint after one bounded scan batch instead of draining locally")
-    parser.add_argument("--review", type=Path, help="Apply hash-bound review coverage JSON to an explicit retained --state, without rescanning")
+    batching.add_argument(
+        "--complete",
+        action="store_true",
+        help="Compatibility flag: scans already drain progressing batches by default",
+    )
+    batching.add_argument(
+        "--single-batch",
+        action="store_true",
+        help="Checkpoint after one bounded scan batch instead of draining locally",
+    )
+    parser.add_argument(
+        "--review",
+        type=Path,
+        help="Apply hash-bound review coverage JSON to an explicit retained --state, without rescanning",
+    )
     parser.add_argument(
         "--state",
         type=Path,
@@ -1715,7 +2026,9 @@ def main(argv=None):
         action="store_true",
         help="Include a bounded page of exact tracked paths in the JSON result",
     )
-    parser.add_argument("--category", help="Restrict a --paths projection to one declared category")
+    parser.add_argument(
+        "--category", help="Restrict a --paths projection to one declared category"
+    )
     parser.add_argument(
         "--report",
         type=Path,
@@ -1743,16 +2056,49 @@ def main(argv=None):
         help="Offset into selected path, unresolved, and JSON-summary pages",
     )
     args = parser.parse_args(argv)
-    if args.review and (not args.state or args.query or args.render_only or args.refresh or args.instructions or args.describe or args.list_queries):
-        parser.error("--review requires --state and cannot scan, refresh, discover, or render-only")
+    if args.review and (
+        not args.state
+        or args.query
+        or args.render_only
+        or args.refresh
+        or args.instructions
+        or args.describe
+        or args.list_queries
+    ):
+        parser.error(
+            "--review requires --state and cannot scan, refresh, discover, or render-only"
+        )
     if args.list_queries:
-        if (args.query or args.state or args.report or args.instructions or args.describe
-                or args.paths or args.category or args.render_only or args.remaining or args.offset or args.refresh or args.complete or args.single_batch):
+        if (
+            args.query
+            or args.state
+            or args.report
+            or args.instructions
+            or args.describe
+            or args.paths
+            or args.category
+            or args.render_only
+            or args.remaining
+            or args.offset
+            or args.refresh
+            or args.complete
+            or args.single_batch
+        ):
             parser.error("--list-queries is a standalone index operation")
-        print(json.dumps({
-            "format": RESULT_FORMAT,
-            "prior_queries": prior_queries(str(args.root.resolve()), include_scope=True),
-        }, ensure_ascii=False))
+        lookup_status = {}
+        prior = prior_queries(
+            str(args.root.resolve()), include_scope=True, lookup_status=lookup_status
+        )
+        print(
+            json.dumps(
+                {
+                    "format": RESULT_FORMAT,
+                    "prior_queries": prior,
+                    "prior_query_lookup": lookup_status,
+                },
+                ensure_ascii=False,
+            )
+        )
         return 0
     if args.describe:
         if (
@@ -1779,17 +2125,30 @@ def main(argv=None):
                 "globs": contract["globs"],
                 "contains": contract["contains"],
                 "budget": contract["budget"],
-                "query": {key: contract["query"][key] for key in (
-                    "categories", "required_categories", "candidates", "reuse",
-                )},
+                "query": {
+                    key: contract["query"][key]
+                    for key in (
+                        "categories",
+                        "required_categories",
+                        "candidates",
+                        "reuse",
+                    )
+                },
                 "example": contract["example"],
                 "control_files": contract["control_files"],
                 "delivery": contract["delivery"],
                 "completion": "Scans drain progressing batches locally by default and checkpoint each batch. --single-batch opts out; --complete remains compatible. Use an explicit --state to resume after interruption. Unresolved evidence prevents final delivery.",
-                "result": {key: contract["result"][key] for key in (
-                    "ready_to_render", "scan_pending", "unresolved_count",
-                    "next_action", "final_answer", "source_bytes_reused",
-                )},
+                "result": {
+                    key: contract["result"][key]
+                    for key in (
+                        "ready_to_render",
+                        "scan_pending",
+                        "unresolved_count",
+                        "next_action",
+                        "final_answer",
+                        "source_bytes_reused",
+                    )
+                },
                 "extensions": "Use --describe full for consumer decisions, review, JSON-summary schemas, and paging. No second inventory tool is needed.",
             }
         print(json.dumps(contract, ensure_ascii=False))
@@ -1865,7 +2224,9 @@ def main(argv=None):
             parser.error("--review requires a version 3 inventory state")
         if args.review.resolve() == args.state.resolve():
             parser.error("review input must not overwrite state")
-        state = update_review(previous, json.loads(args.review.read_text(encoding="utf-8")))
+        state = update_review(
+            previous, json.loads(args.review.read_text(encoding="utf-8"))
+        )
         output = state["output"]
     elif args.render_only:
         if args.query or not previous or previous.get("version") not in (2, 3):
@@ -1878,7 +2239,10 @@ def main(argv=None):
             controls["query"] = query_path
         validate_control_paths(args.root, query, **controls)
         output, state = inventory(
-            args.root, query, previous, refresh=args.refresh,
+            args.root,
+            query,
+            previous,
+            refresh=args.refresh,
             source_cache={} if args.refresh else load_source_cache(args.root),
         )
     if default_report:
@@ -1899,22 +2263,31 @@ def main(argv=None):
             while state["scan"]["pending"]:
                 # Persist only completed batches, after validating all output
                 # destinations. Interrupted work resumes from this checkpoint.
-                write_json_atomic(args.state, file_lineage_document(state, evidence_lineage(state)))
+                write_json_atomic(
+                    args.state, file_lineage_document(state, evidence_lineage(state))
+                )
                 prior_pending = set(state["scan"]["pending"])
                 output, state = inventory(args.root, query, state)
                 if not set(state["scan"]["pending"]) < prior_pending:
-                    raise ValueError("scan made no progress; retained state is resumable")
+                    raise ValueError(
+                        "scan made no progress; retained state is resumable"
+                    )
             if default_report:
                 args.report = report_directory(state) / "inventory.md"
         args.state.parent.mkdir(parents=True, exist_ok=True)
-        write_json_atomic(args.state, file_lineage_document(state, evidence_lineage(state)))
+        write_json_atomic(
+            args.state, file_lineage_document(state, evidence_lineage(state))
+        )
         if not args.review:
-            try:
-                save_source_cache(state)
-            except OSError:
-                # Cache publication cannot make a successful scan fail.
-                pass
+            publication = save_source_cache(state)
+            if publication["status"] in ("skipped_busy", "failed"):
+                # Optional metadata must not change scan readiness or JSON stdout.
+                print(
+                    f"source inventory cache publication: {json.dumps(publication)}",
+                    file=sys.stderr,
+                )
     prior = []
+    lookup_status = {}
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         delivery = export_delivery(state, args.report)
@@ -1924,6 +2297,7 @@ def main(argv=None):
             prior = prior_queries(
                 state["root"],
                 output.get("query_id", query_identity(state["query"])),
+                lookup_status=lookup_status,
             )
             try:
                 record_delivery(state, delivery)
@@ -1966,6 +2340,8 @@ def main(argv=None):
         summary["deleted_count"] = len(output["deleted"])
     if prior:
         summary["prior_queries"] = prior
+    if lookup_status and not lookup_status["lookup_complete"]:
+        summary["prior_query_lookup"] = lookup_status
     summary["artifact"] = str(args.state.resolve())
     summary["query_id"] = output.get("query_id", query_identity(state["query"]))
     summary["earlier_scope_count"] = len(state.get("scope_changes", []))
@@ -1976,7 +2352,9 @@ def main(argv=None):
         }
     )
     if args.paths:
-        paths = output["categories"][args.category] if args.category else output["paths"]
+        paths = (
+            output["categories"][args.category] if args.category else output["paths"]
+        )
         summary["paths"] = paths[args.offset : args.offset + PAGE_RECORDS]
         summary["paths_next_offset"] = (
             args.offset + PAGE_RECORDS
@@ -2009,9 +2387,12 @@ def main(argv=None):
         summary.update(delivery)
         if output["ready_to_render"]:
             summary["next_action"] = "deliver_report"
-    summary.update(evidence_lineage(
-        state, "retained_projection" if args.render_only or args.review else "source_scan",
-    ))
+    summary.update(
+        evidence_lineage(
+            state,
+            "retained_projection" if args.render_only or args.review else "source_scan",
+        )
+    )
     if answer := delivery_answer(summary):
         summary["final_answer"] = answer
     print(json.dumps(summary, ensure_ascii=False))

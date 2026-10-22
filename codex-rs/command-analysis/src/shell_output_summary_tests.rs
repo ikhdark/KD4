@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn audit132_compiler_locations_keep_fatal_and_coded_errors_without_matching_prose() {
+    for line in [
+        "src/main.c:1:10: fatal error: missing_header.h: No such file or directory",
+        "C:\\Project Files\\λ.cpp(7,3): error C2039: 'member': not found",
+        "C:\\Project Files\\λ.cpp(7): fatal error C1083: Cannot open include file",
+        "\x1b[31msrc/main.c:2: fatal error: missing_header.h\x1b[0m\r",
+    ] {
+        assert!(is_critical_output_line(line), "{line}");
+        let raw = format!(
+            "{}\n{line}\n{}",
+            "building item\n".repeat(5000),
+            "cleanup item\n".repeat(5000)
+        );
+        let projected = summarize_shell_output_for_model(
+            &raw,
+            1,
+            false,
+            options(Some("gcc main.c"), Some(4000)),
+        )
+        .unwrap();
+        assert!(projected.contains(line.trim_end()), "{projected}");
+    }
+    for line in [
+        "the compiler reports a fatal error: when configured incorrectly",
+        "let message = \"src/main.c:1: fatal error: text\";",
+        "documentation: fatal error: example",
+        "file.cpp(ten): error C2039: example",
+    ] {
+        assert!(!is_critical_output_line(line), "{line}");
+    }
+}
+
+#[test]
 fn evidence_salience_compiler_summary_keeps_cargo_owner() {
     let mut summaries = Vec::new();
     for owner in ["alpha", "bravo"] {
@@ -1523,20 +1556,19 @@ fn oversized_rg_leads_with_complete_per_file_counts() {
 #[test]
 fn exit_one_means_no_matches_only_when_a_standalone_search_ends_the_sequence() {
     // `;` and line-break sequences report their final statement's status.
-    for command in [
-        "rg -n foo src",
-        "rg.exe -n 'a|b' src",
-        "rg -n match src; rg -n missing src",
-        "Get-Content README.md -TotalCount 40; rg -n 'a|b' src",
-        "Get-ChildItem src\nrg.exe -n foo",
-        "Get-ChildItem src\n# probe\nrg -n foo src # trailing note",
-    ] {
+    for command in ["rg -n foo src", "rg.exe -n 'a|b' src"] {
         assert!(super::ends_with_native_search(command), "{command}");
     }
     // An earlier command can set the status of pipelines, conditional chains,
     // blocks and errexit scripts without writing to stderr.
     for command in [
         "set -e; test -f missing; rg foo src",
+        "exit 1; rg needle input.txt",
+        "exec false; rg needle input.txt",
+        "rg -n match src; rg -n missing src",
+        "Get-Content README.md -TotalCount 40; rg -n 'a|b' src",
+        "Get-ChildItem src\nrg.exe -n foo",
+        "Get-ChildItem src\n# probe\nrg -n foo src # trailing note",
         "set -euo pipefail\ngrep -q x f\nrg foo src",
         "rg foo src; Write-Output done",
         "Get-Content log.txt | findstr ERROR",

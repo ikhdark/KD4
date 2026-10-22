@@ -31,10 +31,20 @@ pub async fn ensure_oss_ready(config: &Config) -> std::io::Result<()> {
     // If the model is not present locally, pull it. A failed listing is not evidence that the
     // model is missing, so it never starts a download.
     match models {
-        Ok(models) => {
+        Ok(mut models) => {
             if !models.iter().any(|listed| is_same_model(listed, model)) {
                 ollama_client.pull_with_cli_progress(model).await?;
+                models.push(model.to_owned());
             }
+            let provider =
+                &config.model_providers[codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID];
+            codex_model_provider::store_discovered_local_models(
+                codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID,
+                provider,
+                config.codex_home.to_path_buf(),
+                models,
+            )
+            .await;
         }
         Err(err) => {
             // Not fatal; higher layers may still proceed and surface errors later.

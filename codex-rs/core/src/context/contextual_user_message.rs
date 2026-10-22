@@ -128,6 +128,9 @@ static ADDITIONAL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<AdditionalCont
     FragmentRegistrationProxy::new();
 static SKILL_INSTRUCTIONS_REGISTRATION: FragmentRegistrationProxy<SkillInjection> =
     FragmentRegistrationProxy::new();
+static AVAILABLE_SKILLS_REGISTRATION: FragmentRegistrationProxy<
+    super::AvailableSkillsInstructions,
+> = FragmentRegistrationProxy::new();
 static USER_SHELL_COMMAND_REGISTRATION: FragmentRegistrationProxy<UserShellCommand> =
     FragmentRegistrationProxy::new();
 static TURN_ABORTED_REGISTRATION: FragmentRegistrationProxy<TurnAborted> =
@@ -159,6 +162,7 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &SUBAGENTS_CONTEXT_REGISTRATION,
     &ADDITIONAL_CONTEXT_REGISTRATION,
     &SKILL_INSTRUCTIONS_REGISTRATION,
+    &AVAILABLE_SKILLS_REGISTRATION,
     &USER_SHELL_COMMAND_REGISTRATION,
     &TURN_ABORTED_REGISTRATION,
     &SUBAGENT_NOTIFICATION_REGISTRATION,
@@ -176,6 +180,7 @@ static STARTUP_CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &ENVIRONMENT_CONTEXT_REGISTRATION,
     &SUBAGENTS_CONTEXT_REGISTRATION,
     &SKILL_INSTRUCTIONS_REGISTRATION,
+    &AVAILABLE_SKILLS_REGISTRATION,
     &RECOMMENDED_PLUGINS_REGISTRATION,
 ];
 

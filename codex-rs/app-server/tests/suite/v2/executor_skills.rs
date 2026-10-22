@@ -143,8 +143,14 @@ stream_max_retries = 0
             .all(|text| !text.starts_with("<skill>")),
         "a name shared by host and executor skills must not select either authority"
     );
-    let skill_path = skill_dir.join("SKILL.md").to_string_lossy().replace('\\', "/");
-    let locator = format!("skill://demo-plugin@1/{}", skill_path.trim_start_matches('/'));
+    let skill_path = skill_dir
+        .join("SKILL.md")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let locator = format!(
+        "skill://demo-plugin@1/{}",
+        skill_path.trim_start_matches('/')
+    );
     assert!(
         request
             .message_input_texts("user")

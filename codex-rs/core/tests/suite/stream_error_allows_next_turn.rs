@@ -80,7 +80,9 @@ async fn continue_after_stream_error() {
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,
         supports_websockets: false,
+        kind: Default::default(),
         supports_standalone_web_search: false,
+        supports_hosted_web_search: false,
     };
 
     let TestCodex { codex, .. } = test_codex()

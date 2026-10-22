@@ -289,14 +289,20 @@ def run_owned(
                 except subprocess.TimeoutExpired:
                     code = process.poll()
                     if code is not None and not (
-                        code == 0 and kwargs.get("preserve_descendants_on_success", False)
+                        code == 0
+                        and kwargs.get("preserve_descendants_on_success", False)
                     ):
                         # communicate waits for pipe EOF, not just primary exit.
                         # Reap the tree before draining inherited pipes; never
                         # replay the command or discard its buffered output.
                         drain_after_cleanup = True
                         break
-    except (subprocess.TimeoutExpired, CancelledError, TimeoutError, KeyboardInterrupt) as error:
+    except (
+        subprocess.TimeoutExpired,
+        CancelledError,
+        TimeoutError,
+        KeyboardInterrupt,
+    ) as error:
         if process is None:
             raise
         # The context has confirmed tree cleanup. Finish the existing readers,
@@ -307,7 +313,9 @@ def run_owned(
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired as error:
-            raise CleanupFailed("owned output pipes did not close after process cleanup") from error
+            raise CleanupFailed(
+                "owned output pipes did not close after process cleanup"
+            ) from error
     if failure is not None:
         failure.output, failure.stderr = stdout, stderr
         raise failure
@@ -359,6 +367,7 @@ def run_finite(
     stop = threading.Event()
     reader = None
     process = None
+    reader_error = None
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     observing = True
 
@@ -376,6 +385,7 @@ def run_finite(
                 raise
 
     def drain(pipe):
+        nonlocal reader_error
         try:
             while not stop.is_set():
                 chunk = pipe.read1(8192)
@@ -387,8 +397,14 @@ def run_finite(
                         pass
                 if not chunk:
                     break
+        except BaseException as error:
+            reader_error = error
         finally:
-            pipe.close()
+            try:
+                pipe.close()
+            except BaseException as error:
+                if reader_error is None:
+                    reader_error = error
 
     try:
         check_operation()
@@ -443,6 +459,13 @@ def run_finite(
                 reader.join(timeout=max(0, drain_deadline - time.monotonic()))
                 if reader.is_alive():
                     raise CleanupFailed("owned output reader did not stop")
+    if reader_error is not None:
+        failure = CleanupFailed(
+            f"output capture failed after {total} bytes: {reader_error}"
+        )
+        failure.stdout = tail.decode("utf-8", "replace")
+        failure.returncode = code
+        raise failure from reader_error
     return FiniteResult(
         tuple(args),
         str(kwargs.get("cwd", os.getcwd())),
@@ -509,7 +532,8 @@ def main(argv=None):
                 prepare_sccache=args.prepare_sccache,
                 creationflags=(
                     getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
-                    if args.below_normal_priority else 0
+                    if args.below_normal_priority
+                    else 0
                 ),
             ).returncode
         except CleanupFailed:

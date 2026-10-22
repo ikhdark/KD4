@@ -1,8 +1,8 @@
 use codex_protocol::ThreadId;
 use codex_protocol::items::EnteredReviewModeItem;
 use codex_protocol::items::ExitedReviewModeItem;
+use codex_protocol::items::ReasoningItem;
 use codex_protocol::items::TurnItem;
-use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EnteredReviewModeEvent;
@@ -122,8 +122,14 @@ fn mixed_batch_reports_exact_policy_counts_and_bytes() {
     assert_eq!(measurement.post_filter.items, 1);
     assert_eq!(measurement.post_filter.payload_bytes, kept_bytes);
     assert_eq!(measurement.items.len(), 2);
-    assert_eq!(measurement.items[0].decision, super::PersistenceDecision::Kept);
-    assert_eq!(measurement.items[1].decision, super::PersistenceDecision::Dropped);
+    assert_eq!(
+        measurement.items[0].decision,
+        super::PersistenceDecision::Kept
+    );
+    assert_eq!(
+        measurement.items[1].decision,
+        super::PersistenceDecision::Dropped
+    );
     assert_eq!(measurement.items[0].payload_bytes, Some(kept_bytes));
     assert_eq!(measurement.items[1].payload_bytes, Some(dropped_bytes));
     assert_eq!(measurement.items[0].rollout_item_type, "response.message");
@@ -246,13 +252,15 @@ fn invalid_turn_boundaries_reset_partial_measurements() {
 
 #[test]
 fn item_completion_persistence_depends_on_history_mode() {
+    // Reasoning keeps raw/legacy equivalents, so only paginated history stores
+    // its canonical item. Legacy user-message completions are now retained.
     let item = RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
         thread_id: ThreadId::default(),
         turn_id: "turn".to_string(),
-        item: TurnItem::UserMessage(UserMessageItem {
+        item: TurnItem::Reasoning(ReasoningItem {
             id: "item".to_string(),
-            client_id: None,
-            content: Vec::new(),
+            summary_text: Vec::new(),
+            raw_content: Vec::new(),
         }),
         completed_at_ms: 0,
     }));
@@ -262,7 +270,7 @@ fn item_completion_persistence_depends_on_history_mode() {
 
     assert_eq!(
         legacy_measurement.items[0].rollout_item_type,
-        "event.item_completed.user_message"
+        "event.item_completed.reasoning"
     );
     assert_eq!(
         legacy_measurement.items[0].decision,

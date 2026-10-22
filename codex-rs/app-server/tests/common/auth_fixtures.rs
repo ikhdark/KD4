@@ -143,11 +143,7 @@ pub fn encode_id_token(claims: &ChatGptIdTokenClaims) -> Result<String> {
     Ok(format!("{header_b64}.{payload_b64}.{signature_b64}"))
 }
 
-pub fn write_chatgpt_auth(
-    codex_home: &Path,
-    fixture: ChatGptAuthFixture,
-    cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
-) -> Result<()> {
+fn chatgpt_auth_dot_json(fixture: ChatGptAuthFixture) -> Result<AuthDotJson> {
     let id_token_raw = encode_id_token(&fixture.claims)?;
     let id_token = parse_chatgpt_jwt_claims(&id_token_raw).context("parse id token")?;
     let tokens = TokenData {
@@ -159,7 +155,8 @@ pub fn write_chatgpt_auth(
 
     let last_refresh = fixture.last_refresh.unwrap_or_else(|| Some(Utc::now()));
 
-    let auth = AuthDotJson {
+    Ok(AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: Some(tokens),
@@ -167,8 +164,17 @@ pub fn write_chatgpt_auth(
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
-    };
+    })
+}
 
+/// Writes credentials as a login does. `save_auth` starts a new login lifecycle,
+/// which deliberately fences auth work that began under earlier credentials.
+pub fn write_chatgpt_auth(
+    codex_home: &Path,
+    fixture: ChatGptAuthFixture,
+    cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> Result<()> {
+    let auth = chatgpt_auth_dot_json(fixture)?;
     save_auth(
         codex_home,
         &auth,
@@ -176,4 +182,15 @@ pub fn write_chatgpt_auth(
         AuthKeyringBackendKind::default(),
     )
     .context("write auth.json")
+}
+
+/// Models another process rotating file-stored tokens within the same login
+/// lifecycle, as a token refresh does, without starting a replacement login.
+pub fn write_rotated_chatgpt_auth(codex_home: &Path, fixture: ChatGptAuthFixture) -> Result<()> {
+    let auth = chatgpt_auth_dot_json(fixture)?;
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::to_vec_pretty(&auth).context("serialize auth.json")?,
+    )
+    .context("rotate auth.json")
 }

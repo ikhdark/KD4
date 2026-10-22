@@ -24,11 +24,19 @@ mod tests {
         for prompt in [SUMMARIZATION_PROMPT, INCREMENTAL_SUMMARIZATION_PROMPT] {
             let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
             assert!(normalized.contains("Separate independent obligations with blank lines"));
-            assert!(normalized.contains("never separate a qualification from the action it limits"));
+            assert!(
+                normalized.contains("never separate a qualification from the action it limits")
+            );
             for budget in [
-                "2,400 tokens total", "250 tokens for Goal", "350 for Current state",
-                "250 for Completed work", "350 for Unresolved work", "500 for Evidence",
-                "250 for Next action", "1,950 body tokens total", "guidance, not hard limits",
+                "2,400 tokens total",
+                "250 tokens for Goal",
+                "350 for Current state",
+                "250 for Completed work",
+                "350 for Unresolved work",
+                "500 for Evidence",
+                "250 for Next action",
+                "1,950 body tokens total",
+                "guidance, not hard limits",
             ] {
                 assert!(normalized.contains(budget), "missing budget: {budget}");
             }

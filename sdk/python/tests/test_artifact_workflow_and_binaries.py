@@ -1,7 +1,9 @@
 import importlib.util
 import io
+import json
 import os
 import shutil
+import struct
 import sys
 import tarfile
 import urllib.error
@@ -13,6 +15,17 @@ import tomllib
 from pydantic import ValidationError
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT.parents[1]) not in sys.path:
+    sys.path.insert(0, str(ROOT.parents[1]))
+
+
+@pytest.fixture(autouse=True)
+def _do_not_execute_inert_native_fixtures(monkeypatch):
+    from scripts.codex_package import layout
+
+    # The native fixtures are PE headers, not executable programs. Inventory,
+    # role, version metadata and machine validation still run unchanged.
+    monkeypatch.setattr(layout, "validate_host_entrypoint_version", lambda *args: None)
 
 
 def _load_update_script_module():
@@ -39,16 +52,31 @@ def _load_runtime_setup_module():
     return module
 
 
-def _write_fake_codex_package(package_dir: Path, script, version: str = "1.2.3") -> Path:
-    (package_dir / "bin").mkdir(parents=True)
-    (package_dir / "codex-resources").mkdir()
-    (package_dir / "codex-path").mkdir()
-    (package_dir / "codex-package.json").write_text(
-        f'{{"variant":"codex","version":"{version}"}}\n'
+def _write_fake_codex_package(
+    package_dir: Path, script, version: str = "1.2.3", *, target: str = "x86_64-pc-windows-msvc"
+) -> Path:
+    from scripts.codex_package.layout import build_package_dir
+    from scripts.codex_package.targets import PACKAGE_VARIANTS, TARGET_SPECS, PackageInputs
+
+    package_dir.mkdir(parents=True)
+    inputs = []
+    for name in ("codex", "host", "rg", "runner", "setup"):
+        path = package_dir.parent / "inputs" / f"{name}.exe"
+        path.parent.mkdir(exist_ok=True)
+        content = bytearray(128)
+        content[:2] = b"MZ"
+        struct.pack_into("<I", content, 0x3C, 64)
+        content[64:68] = b"PE\0\0"
+        struct.pack_into("<H", content, 68, 0xAA64 if target.startswith("aarch64") else 0x8664)
+        path.write_bytes(content + name.encode())
+        inputs.append(path)
+    build_package_dir(
+        package_dir,
+        version,
+        PACKAGE_VARIANTS["codex"],
+        TARGET_SPECS[target],
+        PackageInputs(*inputs),
     )
-    (package_dir / "bin" / script.runtime_binary_name()).write_text("fake codex\n")
-    (package_dir / "bin" / script.runtime_code_mode_host_name()).write_text("fake code mode host\n")
-    (package_dir / "codex-path" / "rg").write_text("fake rg\n")
     return package_dir
 
 
@@ -348,22 +376,17 @@ def test_stage_runtime_release_copies_package_layout_and_sets_version(
         staging_dir,
         "1.2.3",
         package_archive,
+        platform_tag="win_amd64",
     )
     assert staged == staging_dir
     assert not old_file.exists()
     package_root = script.staged_runtime_package_root(staged)
 
-    assert {
-        "metadata": (package_root / "codex-package.json").read_text(),
-        "codex": (package_root / "bin" / script.runtime_binary_name()).read_text(),
-        "code_mode_host": (package_root / "bin" / script.runtime_code_mode_host_name()).read_text(),
-        "rg": (package_root / "codex-path" / "rg").read_text(),
-    } == {
-        "metadata": '{"variant":"codex","version":"1.2.3"}\n',
-        "codex": "fake codex\n",
-        "code_mode_host": "fake code mode host\n",
-        "rg": "fake rg\n",
-    }
+    for original in (tmp_path / "codex-package").rglob("*"):
+        if original.is_file():
+            assert (
+                package_root / original.relative_to(tmp_path / "codex-package")
+            ).read_bytes() == original.read_bytes()
     assert 'name = "openai-codex-cli-bin"' in (staged / "pyproject.toml").read_text()
     assert 'version = "1.2.3"' in (staged / "pyproject.toml").read_text()
     pyproject = tomllib.loads((staged / "pyproject.toml").read_text())
@@ -404,7 +427,9 @@ def test_stage_runtime_release_rejects_archive_built_for_another_version(tmp_pat
     package_archive = _write_fake_codex_package_archive(tmp_path, script, "1.2.4")
 
     with pytest.raises(RuntimeError, match="contains Codex version '1.2.4'; expected 1.2.3"):
-        script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_archive)
+        script.stage_python_runtime_package(
+            tmp_path / "runtime-stage", "1.2.3", package_archive, "win_amd64"
+        )
 
 
 @pytest.mark.parametrize(
@@ -431,9 +456,54 @@ def test_stage_runtime_release_rejects_incomplete_package_layout(
     package_archive = tmp_path / "codex-package.tar.gz"
     _write_package_archive(package_dir, package_archive)
 
-    with pytest.raises(RuntimeError, match="Missing Codex package layout entries") as caught:
-        script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_archive)
-    assert str(Path(missing_entry)) in str(caught.value)
+    with pytest.raises(RuntimeError, match="Missing package|Missing required") as caught:
+        script.stage_python_runtime_package(
+            tmp_path / "runtime-stage", "1.2.3", package_archive, "win_amd64"
+        )
+    assert missing_entry in str(caught.value).replace("\\", "/")
+
+
+@pytest.mark.parametrize(
+    "target,tag",
+    [("x86_64-pc-windows-msvc", "win_amd64"), ("aarch64-pc-windows-msvc", "win_arm64")],
+)
+def test_stage_runtime_preserves_matching_native_identity(tmp_path, target, tag):
+    script = _load_update_script_module()
+    native = _write_fake_codex_package(tmp_path / "native", script, target=target)
+    archive = tmp_path / "native.tar.gz"
+    _write_package_archive(native, archive)
+    staged = script.stage_python_runtime_package(tmp_path / "stage", "1.2.3", archive, tag)
+    manifest = script.staged_runtime_package_root(staged) / "codex-package.json"
+    assert manifest.read_bytes() == (native / manifest.name).read_bytes()
+    assert f'platform-tag = "{tag}"' in (staged / "pyproject.toml").read_text()
+
+
+@pytest.mark.parametrize("mutation", ["tamper", "helper", "extra", "identity", "target"])
+def test_runtime_validation_failure_preserves_prior_stage(tmp_path, mutation):
+    script = _load_update_script_module()
+    target = "aarch64-pc-windows-msvc" if mutation == "target" else "x86_64-pc-windows-msvc"
+    native = _write_fake_codex_package(tmp_path / "native", script, target=target)
+    if mutation == "tamper":
+        with (native / "bin/codex.exe").open("ab") as output:
+            output.write(b"changed")
+    elif mutation == "helper":
+        (native / "codex-resources/codex-command-runner.exe").unlink()
+    elif mutation == "extra":
+        (native / "undeclared.txt").write_bytes(b"extra")
+    elif mutation == "identity":
+        (native / "codex-package.json").write_text(json.dumps({"version": "1.2.3"}))
+    archive = tmp_path / "native.tar.gz"
+    _write_package_archive(native, archive)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / "accepted").write_bytes(b"prior coherent output")
+    with pytest.raises(RuntimeError):
+        script.stage_python_runtime_package(stage, "1.2.3", archive, "win_amd64")
+    assert {
+        str(path.relative_to(stage)): path.read_bytes()
+        for path in stage.rglob("*")
+        if path.is_file()
+    } == {"accepted": b"prior coherent output"}
 
 
 @pytest.mark.parametrize(
@@ -491,6 +561,7 @@ def test_stage_sdk_overlap_rejected_before_generation(tmp_path: Path, monkeypatc
 
     def forbidden(*args):
         raise AssertionError("preflight must precede every mutation")
+
     ops = script.CliOps(forbidden, forbidden, forbidden, forbidden)
     args = SimpleNamespace(command="stage-sdk", staging_dir=tmp_path)
     with pytest.raises(ValueError, match="overlap"):

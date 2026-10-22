@@ -1,8 +1,7 @@
 use crate::attribution::BindConnectionAttribution;
-use crate::connection_lifecycle::CancelOnShutdown;
-use rama_core::graceful::ShutdownGuard;
 use crate::config::NetworkMode;
 use crate::connect_policy::TargetCheckedTcpConnector;
+use crate::connection_lifecycle::CancelOnShutdown;
 use crate::mitm;
 use crate::network_policy::BlockDecisionAuditEventArgs;
 use crate::network_policy::NetworkDecision;
@@ -42,6 +41,7 @@ use rama_core::error::ErrorExt as _;
 use rama_core::error::OpaqueError;
 use rama_core::extensions::ExtensionsMut;
 use rama_core::extensions::ExtensionsRef;
+use rama_core::graceful::ShutdownGuard;
 use rama_core::service::service_fn;
 use rama_core::stream::Stream;
 use rama_http::Body;
@@ -93,6 +93,17 @@ enum ConnectMitmMode {
 struct ConnectDialPolicy {
     allow_upstream_proxy: bool,
     allow_local_binding: bool,
+}
+
+#[derive(Clone)]
+struct PreparedConnect(Arc<std::sync::Mutex<Option<Box<dyn Stream + Unpin>>>>);
+
+impl std::fmt::Debug for PreparedConnect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedConnect")
+            .finish_non_exhaustive()
+    }
 }
 
 pub async fn run_http_proxy(
@@ -181,11 +192,13 @@ async fn run_http_proxy_with_listener(
     info!("HTTP proxy listening on {addr}");
 
     listener
-        .serve_graceful(guard.clone(), CancelOnShutdown::new(BindConnectionAttribution::new(
-            http_service,
-            state,
-            environment_id,
-        ), &guard))
+        .serve_graceful(
+            guard.clone(),
+            CancelOnShutdown::new(
+                BindConnectionAttribution::new(http_service, state, environment_id),
+                &guard,
+            ),
+        )
         .await;
     Ok(())
 }
@@ -360,6 +373,33 @@ async fn http_connect_accept(
         req.extensions_mut().insert(mitm_state);
     }
 
+    if connect_mitm_mode == ConnectMitmMode::Disabled {
+        let target = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            establish_connect_tunnel(req.extensions()),
+        )
+        .await;
+        let target = match target {
+            Ok(Ok(target)) => target,
+            Ok(Err(_)) => {
+                return Err(text_response(
+                    StatusCode::BAD_GATEWAY,
+                    "CONNECT establishment failed",
+                ));
+            }
+            Err(_) => {
+                return Err(text_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "CONNECT establishment timed out",
+                ));
+            }
+        };
+        req.extensions_mut()
+            .insert(PreparedConnect(Arc::new(std::sync::Mutex::new(Some(
+                target,
+            )))));
+    }
+
     Ok((
         Response::builder()
             .status(StatusCode::OK)
@@ -418,17 +458,14 @@ where
         .map_err(|err| OpaqueError::from_display(format!("MITM tunnel error: {err}")))
 }
 
-async fn forward_connect_tunnel<S>(upgraded: S) -> Result<(), OpaqueError>
-where
-    S: Stream + Unpin + ExtensionsMut,
-{
-    let authority = upgraded
-        .extensions()
+async fn establish_connect_tunnel(
+    extensions: &rama_core::extensions::Extensions,
+) -> Result<Box<dyn Stream + Unpin>, OpaqueError> {
+    let authority = extensions
         .get::<ProxyTarget>()
         .map(|target| target.0.clone())
         .ok_or_else(|| OpaqueError::from_display("missing forward authority"))?;
-    let dial_policy = upgraded
-        .extensions()
+    let dial_policy = extensions
         .get::<ConnectDialPolicy>()
         .copied()
         .ok_or_else(|| OpaqueError::from_display("missing CONNECT dial policy"))?;
@@ -448,22 +485,20 @@ where
         ),
     }
 
-    let mut extensions = upgraded.extensions().clone();
+    let mut extensions = extensions.clone();
     if let Some(proxy) = proxy {
         extensions.insert(proxy);
     }
 
     let req = TcpRequest::new_with_extensions(authority.clone(), extensions)
         .with_protocol(Protocol::HTTPS);
-    let proxy_connector = HttpProxyConnector::optional(
-        TargetCheckedTcpConnector::from_allow_local_binding(dial_policy.allow_local_binding),
-    );
-    let tls_config = TlsConnectorDataBuilder::new()
-        .with_alpn_protocols_http_auto()
-        .build();
-    let connector = TlsConnectorLayer::tunnel(None)
+    let tls_config = TlsConnectorDataBuilder::new().build();
+    let proxy_tls = TlsConnectorLayer::tunnel(None)
         .with_connector_data(tls_config)
-        .into_layer(proxy_connector);
+        .into_layer(TargetCheckedTcpConnector::from_allow_local_binding(
+            dial_policy.allow_local_binding,
+        ));
+    let connector = HttpProxyConnector::optional(proxy_tls);
     info!("CONNECT upstream dial started (target={authority})");
     let connect_started_at = Instant::now();
     let EstablishedClientConnection { conn: target, .. } = match connector.connect(req).await {
@@ -484,6 +519,33 @@ where
         }
     };
 
+    Ok(Box::new(target))
+}
+
+async fn forward_connect_tunnel<S>(upgraded: S) -> Result<(), OpaqueError>
+where
+    S: Stream + Unpin + ExtensionsMut,
+{
+    let authority = upgraded
+        .extensions()
+        .get::<ProxyTarget>()
+        .map(|target| target.0.clone())
+        .ok_or_else(|| OpaqueError::from_display("missing forward authority"))?;
+    let prepared = upgraded
+        .extensions()
+        .get::<PreparedConnect>()
+        .map(|prepared| {
+            prepared
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| OpaqueError::from_display("CONNECT stream already consumed"))
+        });
+    let target = match prepared {
+        Some(target) => target?,
+        None => establish_connect_tunnel(upgraded.extensions()).await?,
+    };
     let proxy_req = ProxyRequest {
         source: upgraded,
         target,
@@ -928,7 +990,7 @@ fn json_blocked(host: &str, reason: &str, details: Option<&PolicyDecisionDetails
         message,
     };
     let mut resp = json_response(&response);
-    *resp.status_mut() = StatusCode::FORBIDDEN;
+    *resp.status_mut() = crate::responses::blocked_status(reason);
     resp.headers_mut().insert(
         "x-proxy-error",
         HeaderValue::from_static(blocked_header_value(reason)),
@@ -1274,30 +1336,30 @@ mod tests {
             request.extensions().get::<ConnectMitmMode>().copied(),
             Some(ConnectMitmMode::Enabled)
         );
-        assert!(
-            request
-                .extensions()
-                .get::<Arc<mitm::MitmState>>()
-                .is_some()
-        );
+        assert!(request.extensions().get::<Arc<mitm::MitmState>>().is_some());
     }
 
     #[tokio::test]
     async fn http_connect_accept_allows_allowlisted_host_in_full_mode() {
+        // CONNECT acceptance dials upstream before answering; `run_http_proxy_with_listener`
+        // installs the TLS provider for that dial, so direct callers must do the same.
+        ensure_rustls_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let policy = {
             let mut policy = NetworkProxyConfig {
                 allow_local_binding: true,
                 ..NetworkProxyConfig::default()
             };
-            policy.set_allowed_domains(vec!["example.com".to_string()]);
+            policy.set_allowed_domains(vec!["127.0.0.1".to_string()]);
             policy
         };
         let state = Arc::new(network_proxy_state_for_policy(policy));
 
         let mut req = Request::builder()
             .method(Method::CONNECT)
-            .uri("https://example.com:443")
-            .header("host", "example.com:443")
+            .uri(format!("https://{address}"))
+            .header("host", address.to_string())
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(state);
@@ -1313,12 +1375,40 @@ mod tests {
             Some(ConnectMitmMode::Disabled)
         );
         let target = &request.extensions().get::<ProxyTarget>().unwrap().0;
-        assert_eq!(target.host.to_string(), "example.com");
-        assert_eq!(target.port, 443);
+        assert_eq!(target.host.to_string(), "127.0.0.1");
+        assert_eq!(target.port, address.port());
+        assert!(request.extensions().contains::<PreparedConnect>());
+        let (_stream, _) = listener.accept().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transparent_connect_refusal_never_returns_success() {
+        ensure_rustls_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut config = NetworkProxyConfig {
+            allow_local_binding: true,
+            ..Default::default()
+        };
+        config.set_allowed_domains(vec!["127.0.0.1".to_string()]);
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .uri(format!("https://{address}"))
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(Arc::new(network_proxy_state_for_policy(config)));
+        let response = http_connect_accept(None, None, request).await.unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
     async fn http_connect_accept_passes_environment_id_to_decider() {
+        ensure_rustls_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let state = Arc::new(network_proxy_state_for_policy(NetworkProxyConfig {
             allow_local_binding: true,
             ..NetworkProxyConfig::default()
@@ -1336,8 +1426,8 @@ mod tests {
 
         let mut req = Request::builder()
             .method(Method::CONNECT)
-            .uri("https://example.com:443")
-            .header("host", "example.com:443")
+            .uri(format!("https://{address}"))
+            .header("host", address.to_string())
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(state);
@@ -1401,12 +1491,7 @@ mod tests {
             request.extensions().get::<ConnectMitmMode>().copied(),
             Some(ConnectMitmMode::DetectTls)
         );
-        assert!(
-            request
-                .extensions()
-                .get::<Arc<mitm::MitmState>>()
-                .is_some()
-        );
+        assert!(request.extensions().get::<Arc<mitm::MitmState>>().is_some());
     }
 
     #[tokio::test]
@@ -1555,7 +1640,10 @@ mod tests {
             .expect("proxy listener should expose local addr");
         let connections = crate::connection_lifecycle::ConnectionLifecycle::new();
         let proxy_task = tokio::spawn(run_http_proxy_with_std_listener(
-            state, listener, /*policy_decider*/ None, /*environment_id*/ None,
+            state,
+            listener,
+            /*policy_decider*/ None,
+            /*environment_id*/ None,
             connections.guard(),
         ));
 
@@ -1579,8 +1667,8 @@ mod tests {
             }
             response
         })
-            .await
-            .expect("proxy should respond before timeout");
+        .await
+        .expect("proxy should respond before timeout");
         let response = String::from_utf8_lossy(&response);
         assert!(
             response.starts_with("HTTP/1.1 200 OK\r\n"),
@@ -1595,12 +1683,14 @@ mod tests {
         assert_eq!(buf, server_banner);
 
         let mut upstream = target_task.await.expect("target task should finish");
-        timeout(Duration::from_secs(2), connections.shutdown()).await
+        timeout(Duration::from_secs(2), connections.shutdown())
+            .await
             .expect("shutdown must join the accepted CONNECT tunnel");
         proxy_task.await.unwrap().unwrap();
         for peer in [&mut stream, &mut upstream] {
             let mut byte = [0u8; 1];
-            let result = timeout(Duration::from_secs(2), peer.read(&mut byte)).await
+            let result = timeout(Duration::from_secs(2), peer.read(&mut byte))
+                .await
                 .expect("accepted tunnel peer must close without application traffic");
             assert!(matches!(result, Ok(0) | Err(_)));
         }

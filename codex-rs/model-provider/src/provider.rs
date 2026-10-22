@@ -70,6 +70,7 @@ pub struct ResolvedModelProviderClientSetup {
 /// Error returned when a provider cannot construct its app-visible account state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderAccountError {
+    CredentialsUnavailable(std::io::ErrorKind),
     MissingChatgptAccountDetails,
     UnsupportedBedrockApiKeyAuth,
 }
@@ -77,6 +78,10 @@ pub enum ProviderAccountError {
 impl fmt::Display for ProviderAccountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CredentialsUnavailable(kind) => write!(
+                f,
+                "credentials unavailable ({kind:?}); reload authentication to retry"
+            ),
             Self::MissingChatgptAccountDetails => {
                 write!(f, "plan type is required for chatgpt authentication")
             }
@@ -169,8 +174,21 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     /// configured providers override this to resolve credentials exactly once.
     fn resolve_unscoped_client_setup(
         &self,
-    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<(Provider, SharedAuthProvider)>> {
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<(Provider, SharedAuthProvider)>>
+    {
         Box::pin(async move { Ok((self.api_provider().await?, self.api_auth().await?)) })
+    }
+
+    /// Resolves a Codex-backend-only request from one auth snapshot.
+    /// Custom providers must explicitly implement this binding; the default
+    /// cannot prove that their independent accessors share an auth view.
+    fn resolve_codex_backend_client_setup(
+        &self,
+    ) -> ModelProviderFuture<
+        '_,
+        codex_protocol::error::Result<Option<(Provider, SharedAuthProvider)>>,
+    > {
+        Box::pin(async { Ok(None) })
     }
 
     /// Returns request credentials, optionally scoped to a Codex session task.
@@ -265,7 +283,7 @@ pub(crate) fn request_api_provider(
     Ok(provider)
 }
 
-fn model_provider_cache_identity(
+pub(crate) fn model_provider_cache_identity(
     model_provider_id: &str,
     provider_info: &ModelProviderInfo,
     auth_manager: Option<&AuthManager>,
@@ -428,6 +446,25 @@ impl ModelProvider for ConfiguredModelProvider {
         &self.info
     }
 
+    fn capabilities(&self) -> ProviderCapabilities {
+        use codex_model_provider_info::ProviderKind;
+        if matches!(
+            self.info.kind,
+            ProviderKind::Ollama | ProviderKind::LmStudio
+        ) {
+            ProviderCapabilities {
+                namespace_tools: false,
+                web_search: false,
+                image_generation: false,
+            }
+        } else {
+            ProviderCapabilities {
+                web_search: self.info.supports_hosted_web_search,
+                ..ProviderCapabilities::default()
+            }
+        }
+    }
+
     fn auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.auth_manager.clone()
     }
@@ -459,7 +496,8 @@ impl ModelProvider for ConfiguredModelProvider {
 
     fn resolve_unscoped_client_setup(
         &self,
-    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<(Provider, SharedAuthProvider)>> {
+    ) -> ModelProviderFuture<'_, codex_protocol::error::Result<(Provider, SharedAuthProvider)>>
+    {
         Box::pin(async move {
             let auth = self.auth().await;
             Ok((
@@ -469,13 +507,48 @@ impl ModelProvider for ConfiguredModelProvider {
         })
     }
 
+    fn resolve_codex_backend_client_setup(
+        &self,
+    ) -> ModelProviderFuture<
+        '_,
+        codex_protocol::error::Result<Option<(Provider, SharedAuthProvider)>>,
+    > {
+        Box::pin(async move {
+            let auth = self.auth().await;
+            if !self.info.is_openai() || !auth.as_ref().is_some_and(CodexAuth::uses_codex_backend) {
+                return Ok(None);
+            }
+            Ok(Some((
+                request_api_provider(&self.info, auth.as_ref().map(CodexAuth::auth_mode))?,
+                resolve_provider_auth(auth.as_ref(), &self.info)?,
+            )))
+        })
+    }
+
     fn resolve_client_setup(
         &self,
         scope: ProviderAuthScope,
     ) -> ModelProviderFuture<'_, codex_protocol::error::Result<ResolvedModelProviderClientSetup>>
     {
         Box::pin(async move {
+            let initial = self
+                .auth_manager
+                .as_ref()
+                .map(|manager| manager.policy_auth_snapshot())
+                .transpose()?;
             let auth = self.auth().await;
+            let validate_lifecycle = || -> codex_protocol::error::Result<()> {
+                if let (Some(manager), Some((epoch, Some(_)))) = (&self.auth_manager, &initial)
+                    && manager.policy_auth_snapshot()?.0 != *epoch
+                {
+                    return Err(CodexErr::UnsupportedOperation(
+                        "authentication changed while preparing request; rebuild request state"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            };
+            validate_lifecycle()?;
             let api_provider =
                 request_api_provider(&self.info, auth.as_ref().map(CodexAuth::auth_mode))?;
             let resolved_auth = if provider_uses_first_party_auth_path(&self.info) {
@@ -489,6 +562,7 @@ impl ModelProvider for ConfiguredModelProvider {
             } else {
                 ResolvedProviderAuth::new(resolve_provider_auth(auth.as_ref(), &self.info)?)
             };
+            validate_lifecycle()?;
             Ok(ResolvedModelProviderClientSetup {
                 auth,
                 api_provider,
@@ -498,6 +572,13 @@ impl ModelProvider for ConfiguredModelProvider {
     }
 
     fn account_state(&self) -> ProviderAccountResult {
+        if self.info.requires_openai_auth
+            && let Some(manager) = &self.auth_manager
+        {
+            manager
+                .check_auth_load()
+                .map_err(|err| ProviderAccountError::CredentialsUnavailable(err.kind()))?;
+        }
         let account = if self.info.requires_openai_auth {
             self.auth_manager
                 .as_ref()
@@ -546,6 +627,19 @@ impl ModelProvider for ConfiguredModelProvider {
         codex_home: PathBuf,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
+        if config_model_catalog.is_none()
+            && matches!(
+                self.info.kind,
+                codex_model_provider_info::ProviderKind::Ollama
+                    | codex_model_provider_info::ProviderKind::LmStudio
+            )
+        {
+            return Arc::new(crate::local_models::manager(
+                model_provider_id,
+                self.info.clone(),
+                codex_home,
+            ));
+        }
         match config_model_catalog {
             Some(model_catalog) => Arc::new(StaticModelsManager::new(
                 self.auth_manager.clone(),
@@ -814,7 +908,8 @@ mod tests {
         ] {
             let provider = create_model_provider(
                 ModelProviderInfo::create_openai_provider(Some(format!(
-                    "{}?{query}", server.uri()
+                    "{}?{query}",
+                    server.uri()
                 ))),
                 Some(AuthManager::from_auth_for_testing(
                     CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -829,7 +924,11 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                catalog.models.iter().map(|model| model.slug.as_str()).collect::<Vec<_>>(),
+                catalog
+                    .models
+                    .iter()
+                    .map(|model| model.slug.as_str())
+                    .collect::<Vec<_>>(),
                 vec![expected]
             );
         }
@@ -892,8 +991,34 @@ mod tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: false,
+            kind: Default::default(),
             supports_standalone_web_search: false,
+            supports_hosted_web_search: false,
         }
+    }
+
+    #[test]
+    fn configured_provider_hosted_search_requires_explicit_support() {
+        let mut info = provider_for("https://ollama.com/v1".into());
+        info.name = "Amazon Bedrock Runtime".into();
+        let provider = create_model_provider(info.clone(), None);
+        assert_eq!(provider.info().base_url, info.base_url);
+        assert!(!provider.capabilities().web_search);
+        info.supports_hosted_web_search = true;
+        assert!(create_model_provider(info, None).capabilities().web_search);
+        assert!(
+            create_model_provider(ModelProviderInfo::create_openai_provider(None), None)
+                .capabilities()
+                .web_search
+        );
+        assert!(
+            !create_model_provider(
+                ModelProviderInfo::create_amazon_bedrock_provider(None),
+                None
+            )
+            .capabilities()
+            .web_search
+        );
     }
 
     fn remote_model(slug: &str) -> ModelInfo {
@@ -987,6 +1112,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_backend_setup_checks_eligibility_from_one_auth_snapshot() {
+        for (auth, eligible) in [
+            (CodexAuth::from_api_key("sk-external"), false),
+            (
+                CodexAuth::Headers(codex_login::AuthHeaders::new(http::HeaderMap::new())),
+                true,
+            ),
+        ] {
+            let auth_manager = AuthManager::from_auth_for_testing(auth.clone());
+            let resolves = Arc::new(AtomicUsize::new(0));
+            auth_manager
+                .set_external_auth(Arc::new(CountingExternalAuth {
+                    auth,
+                    resolves: Arc::clone(&resolves),
+                }))
+                .await
+                .unwrap();
+            let baseline = resolves.load(Ordering::SeqCst);
+            let provider = create_model_provider(
+                ModelProviderInfo::create_openai_provider(Some(
+                    "https://example.test/backend".into(),
+                )),
+                Some(auth_manager),
+            );
+            assert_eq!(
+                provider
+                    .resolve_codex_backend_client_setup()
+                    .await
+                    .unwrap()
+                    .is_some(),
+                eligible
+            );
+            assert_eq!(resolves.load(Ordering::SeqCst), baseline + 1);
+        }
+    }
+
+    #[tokio::test]
     async fn configured_client_setup_resolves_external_auth_once() {
         let auth = CodexAuth::from_api_key("sk-external");
         let auth_manager = AuthManager::from_auth_for_testing(auth.clone());
@@ -1021,8 +1183,14 @@ mod tests {
         );
         let (api, auth) = provider.resolve_unscoped_client_setup().await.unwrap();
         assert_eq!(resolves.load(Ordering::SeqCst), baseline + 2);
-        assert_eq!(auth.to_auth_headers()[http::header::AUTHORIZATION], "Bearer sk-external");
-        assert_eq!(api.url_for_path("images/generations"), "https://api.openai.com/v1/images/generations");
+        assert_eq!(
+            auth.to_auth_headers()[http::header::AUTHORIZATION],
+            "Bearer sk-external"
+        );
+        assert_eq!(
+            api.url_for_path("images/generations"),
+            "https://api.openai.com/v1/images/generations"
+        );
     }
 
     #[tokio::test]
@@ -1099,7 +1267,10 @@ mod tests {
                 create_oss_provider_with_base_url("http://localhost:11434/v1", WireApi::Responses),
                 false,
             ),
-            (ModelProviderInfo::create_openai_provider(/*base_url*/ None), true),
+            (
+                ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+                true,
+            ),
         ] {
             let auth = create_model_provider(
                 info,

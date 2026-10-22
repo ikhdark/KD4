@@ -196,16 +196,21 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
     assert!(batch.limit_reached);
     assert_eq!(batch.entries.len(), 4);
     for entry in batch.entries {
-        if entry.file_name == "dangling" {
-            assert!(entry.metadata.is_none(), "retain failed metadata for the walker");
+        let super::WalkDirectoryEntry::Entry {
+            file_name,
+            metadata,
+        } = entry
+        else {
+            anyhow::bail!("ordinary fixture names must be representable");
+        };
+        if file_name == "dangling" {
+            assert!(metadata.is_none(), "retain the link for metadata fallback");
             continue;
         }
-        let metadata = entry
-            .metadata
-            .expect("native enumeration should supply metadata");
-        assert_eq!(metadata.is_symlink, entry.file_name.ends_with("-link"));
-        assert_eq!(metadata.is_directory, entry.file_name == "directory-link");
-        assert_eq!(metadata.is_file, entry.file_name != "directory-link");
+        let metadata = metadata.expect("native enumeration should supply metadata");
+        assert_eq!(metadata.is_symlink, file_name.ends_with("-link"));
+        assert_eq!(metadata.is_directory, file_name == "directory-link");
+        assert_eq!(metadata.is_file, file_name != "directory-link");
     }
     let options = WalkOptions {
         max_depth: 4,
@@ -225,8 +230,10 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
         ["file", "file-link"]
     );
     assert!(!walk.truncated);
-    assert_eq!(walk.errors.len(), 1);
-    assert_eq!(walk.errors[0].path, uri.join("dangling").unwrap());
+    // A missing target is still a known link, not a metadata error. The
+    // metadata contract marks it as neither a file nor a directory, so walks
+    // omit it while counting its raw enumeration slot above.
+    assert!(walk.errors.is_empty());
     let walk = fs
         .walk(
             &uri,
@@ -244,7 +251,6 @@ async fn native_walk_metadata_preserves_link_kinds_and_raw_budgets() -> anyhow::
             .any(|entry| entry.path == uri.join("directory-link/child").unwrap())
     );
     assert!(!walk.truncated);
-    assert_eq!(walk.errors.len(), 1);
-    assert_eq!(walk.errors[0].path, uri.join("dangling").unwrap());
+    assert!(walk.errors.is_empty());
     Ok(())
 }

@@ -60,21 +60,6 @@ pub(crate) async fn run(cmd: SandboxSetupCommand) -> anyhow::Result<()> {
     }
 }
 
-pub(crate) fn parse_setup_command(
-    sandbox_command: &[String],
-) -> anyhow::Result<Option<SandboxSetupCommand>> {
-    if sandbox_command
-        .first()
-        .is_none_or(|command| command != "setup")
-    {
-        return Ok(None);
-    }
-
-    SandboxSetupCommand::try_parse_from(sandbox_command.iter().map(String::as_str))
-        .map(Some)
-        .map_err(anyhow::Error::from)
-}
-
 async fn run_elevated(cmd: SandboxSetupCommand) -> anyhow::Result<()> {
     let identity = resolve_sandbox_setup_identity(&cmd)?;
 
@@ -161,7 +146,7 @@ mod tests {
 
     #[test]
     fn parses_setup_from_sandbox_command_args() {
-        let command = parse_setup_command(&[
+        let command = SandboxSetupCommand::try_parse_from([
             "setup".to_string(),
             "--elevated".to_string(),
             "--user".to_string(),
@@ -169,23 +154,17 @@ mod tests {
             "--codex-home".to_string(),
             r"C:\Users\alice\.codex".to_string(),
         ])
-        .expect("parse")
-        .expect("setup command");
+        .expect("parse");
 
         assert_eq!(command.user.as_deref(), Some(r"DOMAIN\alice"));
         assert!(command.elevated_sandbox_level);
         assert!(!command.current_user);
-        assert_eq!(command.setup_level().expect("elevated setup"), SandboxSetupLevel::Elevated);
+        assert_eq!(
+            command.setup_level().expect("elevated setup"),
+            SandboxSetupLevel::Elevated
+        );
         let identity = resolve_sandbox_setup_identity(&command).expect("managed identity");
         assert_eq!(identity.real_user, r"DOMAIN\alice");
         assert_eq!(identity.codex_home, PathBuf::from(r"C:\Users\alice\.codex"));
-    }
-
-    #[test]
-    fn ignores_non_setup_sandbox_command_args() {
-        let command =
-            parse_setup_command(&["echo".to_string(), "hello".to_string()]).expect("parse");
-
-        assert!(command.is_none());
     }
 }

@@ -51,7 +51,16 @@ pub(crate) struct SpawnChildRequest<'a> {
     pub creation_flags: u32,
 }
 
+#[cfg(test)]
 pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io::Result<Child> {
+    spawn_child_with_observation_async(request)
+        .await
+        .map(|(child, _)| child)
+}
+
+pub(crate) async fn spawn_child_with_observation_async(
+    request: SpawnChildRequest<'_>,
+) -> std::io::Result<(Child, codex_utils_pty::process_observation::ObservedProcess)> {
     let SpawnChildRequest {
         program,
         args,
@@ -102,7 +111,17 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     }
 
     cmd.kill_on_drop(true);
-    run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || cmd.spawn()).await
+    run_windows_process_operation(WINDOWS_PROCESS_OPERATION_TIMEOUT, move || {
+        let child = cmd.spawn()?;
+        let observation = codex_utils_pty::process_observation::observe_process_start(
+            "legacy_shell",
+            codex_utils_pty::process_observation::ProcessRole::RequestedRoot,
+            child.id(),
+            None,
+        );
+        Ok((child, observation))
+    })
+    .await
 }
 
 fn apply_network_sandbox_policy_to_env(

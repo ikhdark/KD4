@@ -239,7 +239,8 @@ async fn hydrate_remote_plugin_local_versions(
                 // Legacy cache entries can omit manifest.version; their validated cache
                 // directory still records the version materialized by the installer.
                 manifest.version.or_else(|| {
-                    (version != codex_core_plugins::store::DEFAULT_PLUGIN_VERSION).then_some(version)
+                    (version != codex_core_plugins::store::DEFAULT_PLUGIN_VERSION)
+                        .then_some(version)
                 })
             })
             .collect::<Vec<_>>()
@@ -1253,8 +1254,11 @@ impl PluginRequestProcessor {
             }
         };
 
-        hydrate_remote_plugin_local_versions(config.codex_home.as_path(), vec![&mut plugin.summary])
-            .await?;
+        hydrate_remote_plugin_local_versions(
+            config.codex_home.as_path(),
+            vec![&mut plugin.summary],
+        )
+        .await?;
         Ok(PluginReadResponse { plugin })
     }
 

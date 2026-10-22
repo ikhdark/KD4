@@ -134,15 +134,23 @@ class AsciiCheckTest(unittest.TestCase):
             for payload, byte_offset, location in cases:
                 for fix in (False, True):
                     for chunk_size in range(1, len(payload) + 1):
-                        with self.subTest(payload=payload, fix=fix, chunk_size=chunk_size):
+                        with self.subTest(
+                            payload=payload, fix=fix, chunk_size=chunk_size
+                        ):
                             path.write_bytes(payload)
                             output = io.StringIO()
                             with (
-                                mock.patch.object(asciicheck, "_READ_CHUNK_SIZE", chunk_size),
+                                mock.patch.object(
+                                    asciicheck, "_READ_CHUNK_SIZE", chunk_size
+                                ),
                                 contextlib.redirect_stdout(output),
                             ):
-                                self.assertTrue(asciicheck.lint_utf8_ascii(path, fix=fix))
-                            self.assertIn(f"byte offset: {byte_offset}\n", output.getvalue())
+                                self.assertTrue(
+                                    asciicheck.lint_utf8_ascii(path, fix=fix)
+                                )
+                            self.assertIn(
+                                f"byte offset: {byte_offset}\n", output.getvalue()
+                            )
                             self.assertIn(f"location: {location}\n", output.getvalue())
                             self.assertEqual(path.read_bytes(), payload)
 

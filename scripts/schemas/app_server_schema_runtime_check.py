@@ -22,7 +22,10 @@ import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
-from scripts.common.generated_output_lock import GenerationLockError, generated_output_lock
+from scripts.common.generated_output_lock import (
+    GenerationLockError,
+    generated_output_lock,
+)
 from scripts.common.process_owner import run_finite
 
 
@@ -52,6 +55,9 @@ SCHEMA_VALUES = frozenset(
     }
 )
 SCHEMA_ARRAYS = frozenset({"oneOf", "anyOf", "allOf", "prefixItems"})
+# A narrower `not` schema accepts more values and `if` selects between `then`
+# and `else`, so additive-looking edits inside them are compared exactly.
+EXACT_SCHEMA_VALUES = frozenset({"not", "if"})
 
 
 def _child_role(role: str, key: str, path: str) -> str:
@@ -235,20 +241,43 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _members_changed_additively(baseline: object, current: object, path: str) -> bool:
+    # Positions identify combinator members: an added, removed or reordered
+    # member changes the union itself and is never additive.
+    return (
+        isinstance(baseline, list)
+        and isinstance(current, list)
+        and len(baseline) == len(current)
+        and not any(
+            stable_schema_compatibility_issues(before, after, f"{path}/{index}")
+            for index, (before, after) in enumerate(zip(baseline, current))
+        )
+    )
+
+
 def stable_schema_compatibility_issues(
     baseline: object,
     current: object,
     path: str = "$",
     *,
     _role: str = "schema",
+    _exact: bool = False,
 ) -> list[str]:
     """Return stable-schema changes that can break generated clients.
 
-    Optional properties and new definitions are additive, except when a named
-    property replaces an explicitly constrained map value. Other schema changes
+    Optional properties and new definitions are additive, except on closed
+    objects or when a named property replaces a constrained map value. Other schema changes
     require an explicit acknowledgement because the bundle describes both
-    client-produced requests and server-produced responses.
+    client-produced requests and server-produced responses. Combinator members
+    are compared position by position under the same rules; any non-annotation
+    change inside `not` or `if` is reported.
     """
+    if _exact:
+        before = _without_annotations(baseline, _role, path)
+        after = _without_annotations(current, _role, path)
+        if _canonical_json(before) != _canonical_json(after):
+            return [f"{path}:changed"]
+        return []
     if type(baseline) is not type(current):
         return [f"{path}:type"]
     if isinstance(baseline, dict):
@@ -257,6 +286,15 @@ def stable_schema_compatibility_issues(
         fallback = baseline.get("additionalProperties")
         previous_properties = baseline.get("properties", {})
         current_properties = current.get("properties", {})
+        if (
+            _role == "schema"
+            and fallback is False
+            and isinstance(previous_properties, dict)
+            and isinstance(current_properties, dict)
+        ):
+            # Old response decoders reject these keys even when optional.
+            for name in sorted(current_properties.keys() - previous_properties.keys()):
+                issues.append(f"{path}/properties/{name}:added")
         if (
             _role == "schema"
             and isinstance(fallback, dict)
@@ -268,9 +306,11 @@ def stable_schema_compatibility_issues(
             # Reuse the conservative checker instead of assuming that an
             # optional name cannot change an existing request/response value.
             for name in sorted(current_properties.keys() - previous_properties.keys()):
-                issues.extend(stable_schema_compatibility_issues(
-                    fallback, current_properties[name], f"{path}/properties/{name}"
-                ))
+                issues.extend(
+                    stable_schema_compatibility_issues(
+                        fallback, current_properties[name], f"{path}/properties/{name}"
+                    )
+                )
         for key, baseline_value in baseline.items():
             child_path = f"{path}/{key}"
             if _role == "schema" and key in IGNORED_SCHEMA_ANNOTATIONS:
@@ -283,7 +323,12 @@ def stable_schema_compatibility_issues(
             if _role == "schema" and key in {"required", "enum", *SCHEMA_ARRAYS}:
                 before = _without_annotations(baseline_value, child_role, child_path)
                 after = _without_annotations(current_value, child_role, child_path)
-                if _canonical_json(before) != _canonical_json(after):
+                if _canonical_json(before) != _canonical_json(after) and not (
+                    key in SCHEMA_ARRAYS
+                    and _members_changed_additively(
+                        baseline_value, current_value, child_path
+                    )
+                ):
                     issues.append(f"{child_path}:changed")
                 continue
             issues.extend(
@@ -292,6 +337,7 @@ def stable_schema_compatibility_issues(
                     current_value,
                     child_path,
                     _role=child_role,
+                    _exact=_role == "schema" and key in EXACT_SCHEMA_VALUES,
                 )
             )
         for key in current.keys() - baseline.keys():
@@ -408,6 +454,7 @@ def snapshot_python_sdk_contract(root: Path, destination: Path) -> None:
     for relative in (
         "sdk/python/pyproject.toml",
         "sdk/python/tests/test_contract_generation.py",
+        "scripts/common/generated_output_lock.py",
     ):
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)

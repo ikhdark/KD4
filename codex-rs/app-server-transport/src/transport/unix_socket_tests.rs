@@ -24,6 +24,36 @@ use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn concurrent_endpoint_launchers_have_one_reachable_owner() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = test_socket_path(dir.path());
+    let (tx, _events) = mpsc::channel(CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
+    let (first, second) = tokio::join!(
+        start_control_socket_acceptor(path.clone(), tx.clone(), shutdown.clone()),
+        start_control_socket_acceptor(path.clone(), tx, shutdown.clone()),
+    );
+    let winner = match (first, second) {
+        (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => {
+            assert_eq!(loser.kind(), std::io::ErrorKind::AddrInUse);
+            winner
+        }
+        other => panic!("one endpoint must have exactly one owner: {other:?}"),
+    };
+    drop(
+        connect_to_socket(path.as_path())
+            .await
+            .expect("loser must not remove winner"),
+    );
+    shutdown.cancel();
+    timeout(Duration::from_secs(2), winner)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_socket_path_removed(path.as_path()).await;
+}
+
 #[test]
 fn listen_unix_socket_parses_as_unix_socket_transport() {
     assert_eq!(

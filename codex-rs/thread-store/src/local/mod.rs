@@ -20,7 +20,14 @@ mod update_thread_metadata;
 pub use delete_thread::StagedThreadDelete;
 
 #[cfg(test)]
+mod audit34_tests;
+#[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_APPEND_HANDOFF_PAUSE: Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+}
 
 use codex_git_utils::RepositoryContext;
 use codex_protocol::ThreadId;
@@ -78,6 +85,9 @@ pub struct LocalThreadStore {
     projections: Arc<Mutex<HashMap<ThreadId, projection::SharedLocalThreadProjection>>>,
     state_db: Option<StateDbHandle>,
     deletion_recovery: Arc<tokio::sync::OnceCell<()>>,
+    metadata_update_slots: Arc<tokio::sync::Semaphore>,
+    metadata_update_order: Arc<std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<Mutex<()>>>>>,
+    compression_worker: Option<Arc<codex_rollout::RolloutCompressionWorker>>,
 }
 
 struct LiveRecorderEntry {
@@ -119,20 +129,32 @@ impl std::fmt::Debug for LocalThreadStore {
 }
 
 impl LocalThreadStore {
-    pub(super) async fn acquire_writer_lease(&self, id: ThreadId, allow_live: bool) -> ThreadStoreResult<Arc<std::fs::File>> {
+    pub(super) async fn acquire_writer_lease(
+        &self,
+        id: ThreadId,
+        allow_live: bool,
+    ) -> ThreadStoreResult<Arc<std::fs::File>> {
         if allow_live
             && let Ok(recorder) = self.live_recorder(id).await
             && let Some(lease) = recorder.writer_lease()
         {
             return Ok(lease);
         }
-        codex_rollout::acquire_thread_writer(&self.config.codex_home, id).await.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                ThreadStoreError::Conflict { message: format!("thread {id} has another live writer or maintenance owner") }
-            } else {
-                ThreadStoreError::Internal { message: format!("thread {id} ownership: {error}") }
-            }
-        })
+        codex_rollout::acquire_thread_writer(&self.config.codex_home, id)
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    ThreadStoreError::Conflict {
+                        message: format!(
+                            "thread {id} has another live writer or maintenance owner"
+                        ),
+                    }
+                } else {
+                    ThreadStoreError::Internal {
+                        message: format!("thread {id} ownership: {error}"),
+                    }
+                }
+            })
     }
 
     /// Create a local store using an already initialized state DB handle.
@@ -143,20 +165,35 @@ impl LocalThreadStore {
             projections: Arc::new(Mutex::new(HashMap::new())),
             state_db,
             deletion_recovery: Arc::new(tokio::sync::OnceCell::new()),
+            metadata_update_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            metadata_update_order: Default::default(),
+            compression_worker: None,
         }
+    }
+
+    /// Retain shared maintenance for exactly this store's lifetime.
+    pub fn with_compression_worker(mut self) -> Self {
+        self.compression_worker =
+            codex_rollout::spawn_rollout_compression_worker(self.config.codex_home.to_path_buf());
+        self
     }
 
     /// Return the state DB handle used by local rollout writers.
     pub async fn state_db(&self) -> Option<StateDbHandle> {
-        if let Err(err) = self.deletion_recovery.get_or_try_init(|| async {
-            if delete_thread::recover_staged_deletes(self).await? {
-                Ok(())
-            } else {
-                Err(ThreadStoreError::Conflict {
-                    message: "rollout maintenance is busy; deletion recovery deferred".to_string(),
-                })
-            }
-        }).await {
+        if let Err(err) = self
+            .deletion_recovery
+            .get_or_try_init(|| async {
+                if delete_thread::recover_staged_deletes(self).await? {
+                    Ok(())
+                } else {
+                    Err(ThreadStoreError::Conflict {
+                        message: "rollout maintenance is busy; deletion recovery deferred"
+                            .to_string(),
+                    })
+                }
+            })
+            .await
+        {
             tracing::warn!(%err, "staged deletion recovery incomplete; unresolved files retained for retry");
         }
         self.state_db.clone()
@@ -339,9 +376,11 @@ impl ThreadStore for LocalThreadStore {
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             let thread_id = params.thread_id;
-            live_writer::create_thread(self, params).await?;
-            projection::initialize_empty(self, thread_id).await?;
-            Ok(())
+            live_writer::initialize(self.clone(), thread_id, |store| async move {
+                live_writer::create_thread(&store, params).await?;
+                Ok(None)
+            })
+            .await
         })
     }
 
@@ -352,19 +391,26 @@ impl ThreadStore for LocalThreadStore {
     ) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             let thread_id = params.thread_id;
-            live_writer::create_thread_with_repository_context(self, params, repository_context)
+            live_writer::initialize(self.clone(), thread_id, |store| async move {
+                live_writer::create_thread_with_repository_context(
+                    &store,
+                    params,
+                    repository_context,
+                )
                 .await?;
-            projection::initialize_empty(self, thread_id).await?;
-            Ok(())
+                Ok(None)
+            })
+            .await
         })
     }
 
     fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             let thread_id = params.thread_id;
-            let history = live_writer::resume_thread(self, params).await?;
-            projection::initialize_from_items(self, thread_id, history.as_slice()).await?;
-            Ok(())
+            live_writer::initialize(self.clone(), thread_id, |store| async move {
+                live_writer::resume_thread(&store, params).await.map(Some)
+            })
+            .await
         })
     }
 
@@ -433,9 +479,27 @@ impl ThreadStore for LocalThreadStore {
             }
             let (projection, _operation) =
                 projection::initialized_entry_for_append(self, thread_id).await?;
-            live_writer::append_persisted_items_ordered(self, thread_id, items).await?;
-            projection.append_pending(items.to_vec()).await;
-            Ok(())
+            let store = self.clone();
+            let items = items.to_vec();
+            #[cfg(test)]
+            let pause = TEST_APPEND_HANDOFF_PAUSE.try_with(Arc::clone).ok();
+            // The operation permit bounds this to one admitted worker per thread.
+            // Cancellation may drop the observer, never the queue/projection handoff.
+            tokio::spawn(async move {
+                let _operation = _operation;
+                live_writer::append_persisted_items_ordered(&store, thread_id, &items).await?;
+                #[cfg(test)]
+                if let Some(pause) = pause {
+                    pause.0.notify_one();
+                    pause.1.notified().await;
+                }
+                projection.append_pending(items).await;
+                Ok(())
+            })
+            .await
+            .map_err(|error| ThreadStoreError::Internal {
+                message: format!("append handoff failed: {error}"),
+            })?
         })
     }
 
@@ -475,11 +539,7 @@ impl ThreadStore for LocalThreadStore {
     }
 
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move {
-            live_writer::discard_thread(self, thread_id).await?;
-            projection::remove(self, thread_id).await;
-            Ok(())
-        })
+        Box::pin(live_writer::discard_thread(self, thread_id))
     }
 
     fn load_history(
@@ -569,7 +629,18 @@ impl ThreadStore for LocalThreadStore {
         &self,
         params: UpdateThreadMetadataParams,
     ) -> ThreadStoreFuture<'_, ()> {
-        Box::pin(async move { update_thread_metadata::update_thread_metadata_ack(self, params).await })
+        Box::pin(
+            async move { update_thread_metadata::update_thread_metadata_ack(self, params).await },
+        )
+    }
+
+    fn update_thread_metadata_applied(
+        &self,
+        params: UpdateThreadMetadataParams,
+    ) -> ThreadStoreFuture<'_, bool> {
+        Box::pin(update_thread_metadata::update_thread_metadata_applied(
+            self, params,
+        ))
     }
 
     fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()> {
@@ -1086,8 +1157,7 @@ mod tests {
         assert!(after_turn_start.recency_at > before_turn_start.recency_at);
         assert_eq!(
             after_turn_start.recency_at,
-            chrono::DateTime::<chrono::Utc>::from_timestamp(started_at, 0)
-                .expect("turn timestamp")
+            chrono::DateTime::<chrono::Utc>::from_timestamp(started_at, 0).expect("turn timestamp")
         );
         after_turn_start.updated_at = baseline;
         runtime
@@ -1400,16 +1470,25 @@ mod tests {
             .live_rollout_path(thread_id)
             .await
             .expect("load rollout path");
-        let recorder = store.live_recorder(thread_id).await.expect("recorder clone");
-        store.append_items_ordered(AppendThreadItemsParams {
-            thread_id,
-            items: vec![user_message_item("accepted but discarded")],
-        }).await.expect("accept buffered item");
+        let recorder = store
+            .live_recorder(thread_id)
+            .await
+            .expect("recorder clone");
+        store
+            .append_items_ordered(AppendThreadItemsParams {
+                thread_id,
+                items: vec![user_message_item("accepted but discarded")],
+            })
+            .await
+            .expect("accept buffered item");
         store
             .discard_thread(thread_id)
             .await
             .expect("discard live thread");
-        assert!(recorder.flush().await.is_err(), "discard must stop the writer, not just drop one handle");
+        assert!(
+            recorder.flush().await.is_err(),
+            "discard must stop the writer, not just drop one handle"
+        );
         drop(recorder);
 
         assert!(
@@ -1814,7 +1893,8 @@ mod tests {
                 .items
                 .iter()
                 .filter_map(|item| match item {
-                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) => Some(event.message.as_str()),
+                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) =>
+                        Some(event.message.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),
@@ -1933,14 +2013,26 @@ mod tests {
                     .await
                     .expect("create live thread");
                 let first = "projection benchmark first user message";
-                live.append_items_ordered(&[user_message_item(first)]).await.expect("initial append");
+                live.append_items_ordered(&[user_message_item(first)])
+                    .await
+                    .expect("initial append");
                 live.flush().await.expect("initial flush");
-                let expected_title = if named { "Explicit benchmark title" } else { first };
+                let expected_title = if named {
+                    "Explicit benchmark title"
+                } else {
+                    first
+                };
                 if named {
-                    let projected = live.update_metadata(crate::ThreadMetadataPatch {
-                        name: Some(Some(expected_title.to_string())),
-                        ..Default::default()
-                    }, true).await.expect("explicit name update");
+                    let projected = live
+                        .update_metadata(
+                            crate::ThreadMetadataPatch {
+                                name: Some(Some(expected_title.to_string())),
+                                ..Default::default()
+                            },
+                            true,
+                        )
+                        .await
+                        .expect("explicit name update");
                     assert_eq!(projected.name.as_deref(), Some(expected_title));
                 }
                 // Deliberately omit this thread: unnamed live commits currently scan the
@@ -1956,8 +2048,12 @@ mod tests {
                     index.push('\n');
                 }
                 let index_bytes = index.len();
-                std::fs::write(home.path().join("session_index.jsonl"), index).expect("fixture index");
-                let path = store.live_rollout_path(thread_id).await.expect("rollout path");
+                std::fs::write(home.path().join("session_index.jsonl"), index)
+                    .expect("fixture index");
+                let path = store
+                    .live_rollout_path(thread_id)
+                    .await
+                    .expect("rollout path");
                 let mut expected_messages = vec![first.to_string()];
                 let mut samples = Vec::new();
                 let case_started = std::time::Instant::now();
@@ -1965,7 +2061,9 @@ mod tests {
                     let message = format!("projection benchmark sample {sample}");
                     let items = [user_message_item(&message)];
                     let started = std::time::Instant::now();
-                    live.append_items_ordered(&items).await.expect("ordered append");
+                    live.append_items_ordered(&items)
+                        .await
+                        .expect("ordered append");
                     let append_ns = started.elapsed().as_nanos();
                     let barrier_started = std::time::Instant::now();
                     live.flush().await.expect("metadata barrier");
@@ -1981,32 +2079,52 @@ mod tests {
                 drop(store);
                 runtime.close().await;
                 let reopened = codex_state::StateRuntime::init(
-                    config.sqlite_home, config.default_model_provider_id,
-                ).await.expect("reopen state db");
-                let metadata = reopened.get_thread(thread_id).await.expect("metadata read").expect("metadata");
+                    config.sqlite_home,
+                    config.default_model_provider_id,
+                )
+                .await
+                .expect("reopen state db");
+                let metadata = reopened
+                    .get_thread(thread_id)
+                    .await
+                    .expect("metadata read")
+                    .expect("metadata");
                 assert_eq!(metadata.first_user_message.as_deref(), Some(first));
                 assert_eq!(metadata.preview.as_deref(), Some(first));
                 assert_eq!(metadata.title, expected_title);
                 assert_eq!(metadata.rollout_path, path);
-                let (items, loaded_id, errors) = RolloutRecorder::load_rollout_items(&path).await.expect("authenticated reload");
+                let (items, loaded_id, errors) = RolloutRecorder::load_rollout_items(&path)
+                    .await
+                    .expect("authenticated reload");
                 assert_eq!(loaded_id, Some(thread_id));
                 assert_eq!(errors, 0);
-                let messages = items.iter().filter_map(|item| match item {
-                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) => Some(event.message.clone()),
-                    _ => None,
-                }).collect::<Vec<_>>();
-                assert_eq!(messages, expected_messages, "no lost, reordered, or duplicate accepted records");
+                let messages = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        RolloutItem::EventMsg(EventMsg::UserMessage(event)) => {
+                            Some(event.message.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    messages, expected_messages,
+                    "no lost, reordered, or duplicate accepted records"
+                );
                 let case_elapsed_ns = case_started.elapsed().as_nanos();
                 reopened.close().await;
                 for (sample, append_ns, flush_ns, elapsed_ns) in samples {
-                    println!("{}", serde_json::json!({
-                        "benchmark": "live_metadata_projection", "named": named,
-                        "executable": executable,
-                        "index_entries": index_entries, "index_bytes": index_bytes,
-                        "sample": sample, "append_ns": append_ns, "flush_ns": flush_ns,
-                        "elapsed_ns": elapsed_ns, "case_elapsed_ns": case_elapsed_ns,
-                        "exact_recovery": true, "model_calls": 0
-                    }));
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "benchmark": "live_metadata_projection", "named": named,
+                            "executable": executable,
+                            "index_entries": index_entries, "index_bytes": index_bytes,
+                            "sample": sample, "append_ns": append_ns, "flush_ns": flush_ns,
+                            "elapsed_ns": elapsed_ns, "case_elapsed_ns": case_elapsed_ns,
+                            "exact_recovery": true, "model_calls": 0
+                        })
+                    );
                 }
             }
         }
@@ -2017,23 +2135,52 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite_home.clone(), config.default_model_provider_id.clone(),
-        ).await.expect("state db");
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db");
         let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
         let thread_id = ThreadId::default();
-        let live = LiveThread::create(store.clone(), create_thread_params(thread_id)).await.expect("create");
-        let path = store.live_rollout_path(thread_id).await.expect("rollout path");
+        let live = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create");
+        let path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("rollout path");
         std::fs::create_dir_all(&path).expect("block rollout file with a directory");
-        live.append_items_ordered(&[user_message_item("retained after failure")]).await.expect("queue");
-        live.flush().await.expect_err("file materialization must fail");
-        assert!(runtime.get_thread(thread_id).await.expect("metadata read").is_none(),
-            "failed rollout barrier must not acknowledge pending metadata");
+        live.append_items_ordered(&[user_message_item("retained after failure")])
+            .await
+            .expect("queue");
+        live.flush()
+            .await
+            .expect_err("file materialization must fail");
+        assert!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("metadata read")
+                .is_none(),
+            "failed rollout barrier must not acknowledge pending metadata"
+        );
         std::fs::remove_dir(&path).expect("remove only the empty fixture blocker");
-        live.flush().await.expect("retry without resubmitting history");
+        live.flush()
+            .await
+            .expect("retry without resubmitting history");
         live.shutdown().await.expect("shutdown");
-        let metadata = runtime.get_thread(thread_id).await.expect("metadata read").expect("metadata");
-        assert_eq!(metadata.first_user_message.as_deref(), Some("retained after failure"));
-        let (items, _, errors) = RolloutRecorder::load_rollout_items(&path).await.expect("reload");
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("metadata read")
+            .expect("metadata");
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("retained after failure")
+        );
+        let (items, _, errors) = RolloutRecorder::load_rollout_items(&path)
+            .await
+            .expect("reload");
         assert_eq!(errors, 0);
         assert_eq!(items.iter().filter(|item| matches!(item,
             RolloutItem::EventMsg(EventMsg::UserMessage(event)) if event.message == "retained after failure"
@@ -2046,12 +2193,25 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let store = Arc::new(LocalThreadStore::new(test_config(home.path()), None));
         let thread_id = ThreadId::default();
-        let live = LiveThread::create(store.clone(), create_thread_params(thread_id)).await.expect("create");
-        live.append_items_ordered(&[user_message_item("filesystem fallback")]).await.expect("queue");
+        let live = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create");
+        live.append_items_ordered(&[user_message_item("filesystem fallback")])
+            .await
+            .expect("queue");
         live.flush().await.expect("flush with no optional SQLite");
-        let thread = live.update_metadata(crate::ThreadMetadataPatch::default(), true).await.expect("explicit projection");
-        assert_eq!(thread.first_user_message.as_deref(), Some("filesystem fallback"));
-        let path = store.live_rollout_path(thread_id).await.expect("rollout path");
+        let thread = live
+            .update_metadata(crate::ThreadMetadataPatch::default(), true)
+            .await
+            .expect("explicit projection");
+        assert_eq!(
+            thread.first_user_message.as_deref(),
+            Some("filesystem fallback")
+        );
+        let path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("rollout path");
         live.shutdown().await.expect("shutdown");
         assert_rollout_contains_message(&path, "filesystem fallback").await;
     }
@@ -2063,63 +2223,109 @@ mod tests {
             let home = TempDir::new().expect("temp dir");
             let config = test_config(home.path());
             let runtime = codex_state::StateRuntime::init(
-                config.sqlite_home.clone(), config.default_model_provider_id.clone(),
-            ).await.expect("state db");
+                config.sqlite_home.clone(),
+                config.default_model_provider_id.clone(),
+            )
+            .await
+            .expect("state db");
             let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
             let thread_id = ThreadId::new();
             let live = LiveThread::create(store.clone(), create_thread_params(thread_id))
-                .await.expect("create");
+                .await
+                .expect("create");
             let path = store.live_rollout_path(thread_id).await.expect("path");
             std::fs::create_dir_all(&path).expect("block file with empty directory");
             let mut items = Vec::new();
             for turn_id in ["recovered-1", "recovered-2"] {
                 items.extend([
                     RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
-                        turn_id: turn_id.into(), trace_id: None, started_at: None,
-                        model_context_window: None, collaboration_mode_kind: Default::default(),
+                        turn_id: turn_id.into(),
+                        trace_id: None,
+                        started_at: None,
+                        model_context_window: None,
+                        collaboration_mode_kind: Default::default(),
                     })),
                     user_message_item(turn_id),
                     RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
-                        surfaced_result: None, turn_id: turn_id.into(), last_agent_message: None,
-                        error: None, completed_at: None, duration_ms: None,
-                        time_to_first_token_ms: None, timing: None,
+                        surfaced_result: None,
+                        turn_id: turn_id.into(),
+                        last_agent_message: None,
+                        error: None,
+                        completed_at: None,
+                        duration_ms: None,
+                        time_to_first_token_ms: None,
+                        timing: None,
                     })),
                 ]);
             }
             let result = match entrypoint {
-                "raw" => store.append_items(AppendThreadItemsParams { thread_id, items: items.clone() }).await,
+                "raw" => {
+                    store
+                        .append_items(AppendThreadItemsParams {
+                            thread_id,
+                            items: items.clone(),
+                        })
+                        .await
+                }
                 "canonical" => store.append_persisted_items(thread_id, &items).await,
                 _ => live.append_items(&items).await,
             };
             result.expect_err("the accepted batch must fail its file barrier");
-            assert!(runtime.get_thread(thread_id).await.expect("metadata read").is_none());
+            assert!(
+                runtime
+                    .get_thread(thread_id)
+                    .await
+                    .expect("metadata read")
+                    .is_none()
+            );
             std::fs::remove_dir(&path).expect("remove only empty fixture blocker");
-            live.flush().await.expect("retry barrier without resubmitting");
+            live.flush()
+                .await
+                .expect("retry barrier without resubmitting");
             let mut cursor = None;
             for turn_id in ["recovered-1", "recovered-2"] {
-                let page = store.list_turns(crate::ListTurnsParams {
-                    thread_id, include_archived: false, cursor, page_size: 1,
-                    sort_direction: crate::SortDirection::Asc,
-                    items_view: crate::StoredTurnItemsView::Full,
-                }).await.expect("page live projection before shutdown");
+                let page = store
+                    .list_turns(crate::ListTurnsParams {
+                        thread_id,
+                        include_archived: false,
+                        cursor,
+                        page_size: 1,
+                        sort_direction: crate::SortDirection::Asc,
+                        items_view: crate::StoredTurnItemsView::Full,
+                    })
+                    .await
+                    .expect("page live projection before shutdown");
                 assert_eq!(page.turns.len(), 1, "{entrypoint}");
                 assert_eq!(page.turns[0].turn_id, turn_id, "{entrypoint}");
                 cursor = page.next_cursor;
-                let page = store.list_items(crate::ListItemsParams {
-                    thread_id, turn_id: Some(turn_id.into()), include_archived: false,
-                    cursor: None, page_size: 1, sort_direction: crate::SortDirection::Asc,
-                }).await.expect("projected user item");
+                let page = store
+                    .list_items(crate::ListItemsParams {
+                        thread_id,
+                        turn_id: Some(turn_id.into()),
+                        include_archived: false,
+                        cursor: None,
+                        page_size: 1,
+                        sort_direction: crate::SortDirection::Asc,
+                    })
+                    .await
+                    .expect("projected user item");
                 assert_eq!(page.items.len(), 1, "{entrypoint}");
                 assert!(page.next_cursor.is_none(), "retry must not duplicate items");
             }
             assert!(cursor.is_none(), "retry must not duplicate turns");
             if entrypoint == "live" {
-                let metadata = runtime.get_thread(thread_id).await.expect("read").expect("metadata");
+                let metadata = runtime
+                    .get_thread(thread_id)
+                    .await
+                    .expect("read")
+                    .expect("metadata");
                 assert_eq!(metadata.first_user_message.as_deref(), Some("recovered-1"));
                 assert_eq!(metadata.preview.as_deref(), Some("recovered-1"));
                 assert_eq!(metadata.title, "recovered-1");
             }
-            let (loaded, _, errors) = RolloutRecorder::load_rollout_items(&path).await.expect("reload");
+            let (loaded, _, errors) = RolloutRecorder::load_rollout_items(&path)
+                .await
+                .expect("reload");
             assert_eq!(errors, 0);
             for turn_id in ["recovered-1", "recovered-2"] {
                 assert_eq!(loaded.iter().filter(|item| matches!(item,
@@ -2136,42 +2342,100 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite_home.clone(), config.default_model_provider_id.clone(),
-        ).await.expect("state db");
-        runtime.mark_backfill_complete(None).await.expect("backfill");
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db");
+        runtime
+            .mark_backfill_complete(None)
+            .await
+            .expect("backfill");
         let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
         let thread_id = ThreadId::new();
-        let live = LiveThread::create(store.clone(), create_thread_params(thread_id)).await.expect("create");
-        live.append_items(&[user_message_item("original first message")]).await.expect("append");
-        live.update_metadata(crate::ThreadMetadataPatch {
-            name: Some(Some("custom searchable title".into())), ..Default::default()
-        }, true).await.expect("rename");
+        let live = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create");
+        live.append_items(&[user_message_item("original first message")])
+            .await
+            .expect("append");
+        live.update_metadata(
+            crate::ThreadMetadataPatch {
+                name: Some(Some("custom searchable title".into())),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("rename");
         let path = store.live_rollout_path(thread_id).await.expect("path");
         live.shutdown().await.expect("shutdown");
-        let resumed = LiveThread::resume(store.clone(), ThreadHistoryMode::Legacy, ResumeThreadParams {
-            thread_id, rollout_path: Some(path), history: None, include_archived: false,
-            metadata: thread_metadata(),
-        }).await.expect("resume");
-        resumed.append_items(&[user_message_item("new message")]).await.expect("append after resume");
-        let metadata = runtime.get_thread(thread_id).await.expect("read").expect("metadata");
-        assert_eq!(metadata.title, "custom searchable title", "legacy name index must not mask SQLite corruption");
+        let resumed = LiveThread::resume(
+            store.clone(),
+            ThreadHistoryMode::Legacy,
+            ResumeThreadParams {
+                thread_id,
+                rollout_path: Some(path),
+                history: None,
+                include_archived: false,
+                metadata: thread_metadata(),
+            },
+        )
+        .await
+        .expect("resume");
+        resumed
+            .append_items(&[user_message_item("new message")])
+            .await
+            .expect("append after resume");
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("read")
+            .expect("metadata");
+        assert_eq!(
+            metadata.title, "custom searchable title",
+            "legacy name index must not mask SQLite corruption"
+        );
         let mut params = crate::ListThreadsParams {
-            project_id: None, page_size: 10, cursor: None,
-            sort_key: crate::ThreadSortKey::CreatedAt, sort_direction: crate::SortDirection::Desc,
-            allowed_sources: Vec::new(), model_providers: None, cwd_filters: None,
-            archived: false, search_term: Some("custom searchable".into()), relation_filter: None,
+            project_id: None,
+            page_size: 10,
+            cursor: None,
+            sort_key: crate::ThreadSortKey::CreatedAt,
+            sort_direction: crate::SortDirection::Desc,
+            allowed_sources: Vec::new(),
+            model_providers: None,
+            cwd_filters: None,
+            archived: false,
+            search_term: Some("custom searchable".into()),
+            relation_filter: None,
             storage_mode: crate::ThreadListStorageMode::StateDbOnly,
         };
-        let page = store.list_threads(params.clone()).await.expect("SQLite title search");
+        let page = store
+            .list_threads(params.clone())
+            .await
+            .expect("SQLite title search");
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].thread_id, thread_id);
-        resumed.update_metadata(crate::ThreadMetadataPatch {
-            title: Some("explicit replacement title".into()), ..Default::default()
-        }, true).await.expect("explicit title remains authoritative");
+        resumed
+            .update_metadata(
+                crate::ThreadMetadataPatch {
+                    title: Some("explicit replacement title".into()),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .expect("explicit title remains authoritative");
         params.search_term = Some("explicit replacement".into());
-        let page = store.list_threads(params).await.expect("replacement title search");
+        let page = store
+            .list_threads(params)
+            .await
+            .expect("replacement title search");
         assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].name.as_deref(), Some("explicit replacement title"));
+        assert_eq!(
+            page.items[0].name.as_deref(),
+            Some("explicit replacement title")
+        );
         resumed.shutdown().await.expect("shutdown");
         runtime.close().await;
     }
@@ -2188,22 +2452,37 @@ mod tests {
             .await
             .expect("durable append");
         assert_eq!(store.calls().await.update_thread_metadata, 1);
-        let thread = store.read_thread(ReadThreadParams {
-            thread_id,
-            include_archived: true,
-            include_history: false,
-        }).await.expect("read committed metadata");
-        assert_eq!(thread.first_user_message.as_deref(), Some("default durable metadata"));
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .expect("read committed metadata");
+        assert_eq!(
+            thread.first_user_message.as_deref(),
+            Some("default durable metadata")
+        );
         live.flush().await.expect("flush acknowledged update");
-        assert_eq!(store.calls().await.update_thread_metadata, 1, "must not replay acknowledged metadata");
+        assert_eq!(
+            store.calls().await.update_thread_metadata,
+            1,
+            "must not replay acknowledged metadata"
+        );
 
         let missing = ThreadId::new();
-        let error = store.update_thread_metadata_ack(UpdateThreadMetadataParams {
-            thread_id: missing,
-            patch: crate::ThreadMetadataPatch::default(),
-            include_archived: true,
-        }).await.expect_err("default must retain returning API errors");
-        assert!(matches!(error, ThreadStoreError::ThreadNotFound { thread_id } if thread_id == missing));
+        let error = store
+            .update_thread_metadata_ack(UpdateThreadMetadataParams {
+                thread_id: missing,
+                patch: crate::ThreadMetadataPatch::default(),
+                include_archived: true,
+            })
+            .await
+            .expect_err("default must retain returning API errors");
+        assert!(
+            matches!(error, ThreadStoreError::ThreadNotFound { thread_id } if thread_id == missing)
+        );
         live.shutdown().await.expect("shutdown");
     }
 
@@ -2214,8 +2493,11 @@ mod tests {
             let config = test_config(home.path());
             let runtime = if failed_sqlite {
                 let runtime = codex_state::StateRuntime::init(
-                    config.sqlite_home.clone(), config.default_model_provider_id.clone(),
-                ).await.expect("state db");
+                    config.sqlite_home.clone(),
+                    config.default_model_provider_id.clone(),
+                )
+                .await
+                .expect("state db");
                 runtime.close().await;
                 Some(runtime)
             } else {
@@ -2225,14 +2507,24 @@ mod tests {
             let thread_id = ThreadId::new();
             for patch in [
                 crate::ThreadMetadataPatch::default(),
-                crate::ThreadMetadataPatch { preview: Some("phantom".into()), ..Default::default() },
+                crate::ThreadMetadataPatch {
+                    preview: Some("phantom".into()),
+                    ..Default::default()
+                },
             ] {
-                let error = store.update_thread_metadata_ack(UpdateThreadMetadataParams {
-                    thread_id,
-                    patch,
-                    include_archived: true,
-                }).await.expect_err("empty or uncommitted updates must still validate canonical existence");
-                assert!(matches!(error, ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id));
+                let error = store
+                    .update_thread_metadata_ack(UpdateThreadMetadataParams {
+                        thread_id,
+                        patch,
+                        include_archived: true,
+                    })
+                    .await
+                    .expect_err(
+                        "empty or uncommitted updates must still validate canonical existence",
+                    );
+                assert!(
+                    matches!(error, ThreadStoreError::ThreadNotFound { thread_id: missing } if missing == thread_id)
+                );
             }
         }
     }
@@ -2242,19 +2534,35 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
-            config.sqlite_home.clone(), config.default_model_provider_id.clone(),
-        ).await.expect("state db");
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db");
         let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
         let thread_id = ThreadId::new();
-        let live = LiveThread::create(store.clone(), create_thread_params(thread_id)).await.expect("create");
+        let live = LiveThread::create(store.clone(), create_thread_params(thread_id))
+            .await
+            .expect("create");
         runtime.close().await;
         live.append_items_ordered(&[user_message_item("survives optional SQLite failure")])
-            .await.expect("queue");
-        live.flush().await.expect("optional SQLite failure must use durable rollout fallback");
-        let thread = live.update_metadata(crate::ThreadMetadataPatch::default(), true)
-            .await.expect("returning API still projects canonical fallback");
-        assert_eq!(thread.first_user_message.as_deref(), Some("survives optional SQLite failure"));
-        let path = store.live_rollout_path(thread_id).await.expect("rollout path");
+            .await
+            .expect("queue");
+        live.flush()
+            .await
+            .expect("optional SQLite failure must use durable rollout fallback");
+        let thread = live
+            .update_metadata(crate::ThreadMetadataPatch::default(), true)
+            .await
+            .expect("returning API still projects canonical fallback");
+        assert_eq!(
+            thread.first_user_message.as_deref(),
+            Some("survives optional SQLite failure")
+        );
+        let path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("rollout path");
         live.shutdown().await.expect("shutdown");
         assert_rollout_contains_message(&path, "survives optional SQLite failure").await;
     }
@@ -2265,41 +2573,82 @@ mod tests {
             let home = TempDir::new().expect("temp dir");
             let config = test_config(home.path());
             let runtime = codex_state::StateRuntime::init(
-                config.sqlite_home.clone(), config.default_model_provider_id.clone(),
-            ).await.expect("state db");
+                config.sqlite_home.clone(),
+                config.default_model_provider_id.clone(),
+            )
+            .await
+            .expect("state db");
             let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
             let thread_id = ThreadId::new();
-            let live = LiveThread::create(store.clone(), create_thread_params(thread_id)).await.expect("create");
-            let path = store.live_rollout_path(thread_id).await.expect("rollout path");
+            let live = LiveThread::create(store.clone(), create_thread_params(thread_id))
+                .await
+                .expect("create");
+            let path = store
+                .live_rollout_path(thread_id)
+                .await
+                .expect("rollout path");
             // Use the metadata tests' SQLite-trigger injection pattern. A validation rejection
             // must propagate (unlike optional Internal errors) after the history barrier succeeds.
-            let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(
-                sqlx::sqlite::SqliteConnectOptions::new()
-                    .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME))
-                    .create_if_missing(false),
-            ).await.expect("open state db");
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(
+                    sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME))
+                        .create_if_missing(false),
+                )
+                .await
+                .expect("open state db");
             sqlx::query("CREATE TRIGGER reject_live_metadata BEFORE INSERT ON threads BEGIN SELECT RAISE(FAIL, 'is archived: injected metadata rejection'); END")
                 .execute(&pool).await.expect("install metadata rejection");
             let items = [user_message_item("committed once before metadata retry")];
             let error = if durable {
-                live.append_items(&items).await.expect_err("metadata rejection after durable append")
+                live.append_items(&items)
+                    .await
+                    .expect_err("metadata rejection after durable append")
             } else {
                 live.append_items_ordered(&items).await.expect("queue");
-                live.flush().await.expect_err("metadata rejection after rollout flush")
+                live.flush()
+                    .await
+                    .expect_err("metadata rejection after rollout flush")
             };
-            assert!(matches!(error, ThreadStoreError::InvalidRequest { message } if message.contains("injected metadata rejection")));
-            assert!(runtime.get_thread(thread_id).await.expect("read rejected metadata").is_none());
+            assert!(
+                matches!(error, ThreadStoreError::InvalidRequest { message } if message.contains("injected metadata rejection"))
+            );
+            assert!(
+                runtime
+                    .get_thread(thread_id)
+                    .await
+                    .expect("read rejected metadata")
+                    .is_none()
+            );
             assert_rollout_contains_message(&path, "committed once before metadata retry").await;
-            sqlx::query("DROP TRIGGER reject_live_metadata").execute(&pool).await.expect("remove rejection");
+            sqlx::query("DROP TRIGGER reject_live_metadata")
+                .execute(&pool)
+                .await
+                .expect("remove rejection");
             pool.close().await;
 
             // Retry only the barrier: replaying the append would duplicate the accepted record.
-            live.flush().await.expect("retry pending metadata without resubmission");
-            let metadata = runtime.get_thread(thread_id).await.expect("metadata read").expect("committed metadata");
-            assert_eq!(metadata.first_user_message.as_deref(), Some("committed once before metadata retry"));
-            assert_eq!(metadata.preview.as_deref(), Some("committed once before metadata retry"));
+            live.flush()
+                .await
+                .expect("retry pending metadata without resubmission");
+            let metadata = runtime
+                .get_thread(thread_id)
+                .await
+                .expect("metadata read")
+                .expect("committed metadata");
+            assert_eq!(
+                metadata.first_user_message.as_deref(),
+                Some("committed once before metadata retry")
+            );
+            assert_eq!(
+                metadata.preview.as_deref(),
+                Some("committed once before metadata retry")
+            );
             live.shutdown().await.expect("shutdown");
-            let (items, loaded_id, errors) = RolloutRecorder::load_rollout_items(&path).await.expect("authenticated reload");
+            let (items, loaded_id, errors) = RolloutRecorder::load_rollout_items(&path)
+                .await
+                .expect("authenticated reload");
             assert_eq!(loaded_id, Some(thread_id));
             assert_eq!(errors, 0);
             assert_eq!(items.iter().filter(|item| matches!(item,
@@ -2307,6 +2656,140 @@ mod tests {
             )).count(), 1, "metadata retry must not lose or duplicate accepted history");
             runtime.close().await;
         }
+    }
+
+    #[tokio::test]
+    async fn durable_audit_cancelled_initialization_discards_only_unclaimed_writer() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let id = ThreadId::new();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let owner = store.clone();
+        let observer = tokio::spawn(async move {
+            live_writer::initialize(owner, id, move |store| async move {
+                live_writer::create_thread(&store, create_thread_params(id)).await?;
+                let _ = started.send(store.live_recorder(id).await?);
+                let _ = wait.await;
+                Ok(None)
+            })
+            .await
+        });
+        let obsolete = ready.await.unwrap();
+        let path = obsolete.rollout_path().to_path_buf();
+        observer.abort();
+        assert!(observer.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        wait_for_recorder_removal(&store, id).await;
+        assert!(
+            !path.exists(),
+            "abandoned lazy startup must not materialize"
+        );
+        assert!(
+            obsolete
+                .record_canonical_items_ordered(&[user_message_item("late")])
+                .await
+                .is_err()
+        );
+        let replacement = LocalThreadStore::new(test_config(home.path()), None);
+        replacement
+            .create_thread(create_thread_params(id))
+            .await
+            .unwrap();
+        replacement.discard_thread(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_audit_cancelled_shutdown_settles_registry_and_obsolete_lease() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let id = ThreadId::new();
+        store.create_thread(create_thread_params(id)).await.unwrap();
+        store
+            .append_items_ordered(AppendThreadItemsParams {
+                thread_id: id,
+                items: vec![user_message_item("accepted exactly once")],
+            })
+            .await
+            .unwrap();
+        let obsolete = store.live_recorder(id).await.unwrap();
+        let mut shutdown = store.shutdown_thread(id);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(shutdown.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(shutdown);
+        wait_for_recorder_removal(&store, id).await;
+        assert!(
+            obsolete
+                .record_canonical_items_ordered(&[user_message_item("late")])
+                .await
+                .is_err()
+        );
+        let replacement = LocalThreadStore::new(test_config(home.path()), None);
+        replacement
+            .resume_thread(ResumeThreadParams {
+                thread_id: id,
+                rollout_path: None,
+                history: None,
+                include_archived: true,
+                metadata: thread_metadata(),
+            })
+            .await
+            .unwrap();
+        let history = replacement
+            .load_history(LoadThreadHistoryParams {
+                thread_id: id,
+                include_archived: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(history.items.iter().filter(|item| matches!(item,
+            RolloutItem::EventMsg(EventMsg::UserMessage(message)) if message.message == "accepted exactly once"
+        )).count(), 1);
+        replacement.shutdown_thread(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_audit_cancelled_discard_settles_without_materializing() {
+        let home = TempDir::new().unwrap();
+        let store = LocalThreadStore::new(test_config(home.path()), None);
+        let id = ThreadId::new();
+        store.create_thread(create_thread_params(id)).await.unwrap();
+        let obsolete = store.live_recorder(id).await.unwrap();
+        let path = obsolete.rollout_path().to_path_buf();
+        let mut discard = store.discard_thread(id);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(discard.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(discard);
+        wait_for_recorder_removal(&store, id).await;
+        assert!(!path.exists());
+        assert!(
+            obsolete
+                .record_canonical_items_ordered(&[user_message_item("late")])
+                .await
+                .is_err()
+        );
+        let replacement = LocalThreadStore::new(test_config(home.path()), None);
+        replacement
+            .create_thread(create_thread_params(id))
+            .await
+            .unwrap();
+        replacement.discard_thread(id).await.unwrap();
+    }
+
+    async fn wait_for_recorder_removal(store: &LocalThreadStore, id: ThreadId) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.live_recorders.lock().await.contains_key(&id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned cleanup completes");
     }
 
     fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {
@@ -2337,19 +2820,43 @@ mod tests {
         let second = LocalThreadStore::new(config, None);
         let id = ThreadId::default();
         first.create_thread(create_thread_params(id)).await.unwrap();
-        assert!(matches!(second.create_thread(create_thread_params(id)).await, Err(ThreadStoreError::Conflict { .. })));
+        assert!(matches!(
+            second.create_thread(create_thread_params(id)).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
         first.persist_thread(id).await.unwrap();
         let path = first.live_rollout_path(id).await.unwrap();
         let before = tokio::fs::read(&path).await.unwrap();
-        assert!(matches!(second.resume_thread(ResumeThreadParams {
-            thread_id: id, rollout_path: None, history: None, include_archived: true, metadata: thread_metadata(),
-        }).await, Err(ThreadStoreError::Conflict { .. })));
-        assert!(second.delete_thread(crate::DeleteThreadParams { thread_id: id }).await.is_err());
+        assert!(matches!(
+            second
+                .resume_thread(ResumeThreadParams {
+                    thread_id: id,
+                    rollout_path: None,
+                    history: None,
+                    include_archived: true,
+                    metadata: thread_metadata(),
+                })
+                .await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert!(
+            second
+                .delete_thread(crate::DeleteThreadParams { thread_id: id })
+                .await
+                .is_err()
+        );
         assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
         first.shutdown_thread(id).await.unwrap();
-        second.resume_thread(ResumeThreadParams {
-            thread_id: id, rollout_path: None, history: None, include_archived: true, metadata: thread_metadata(),
-        }).await.unwrap();
+        second
+            .resume_thread(ResumeThreadParams {
+                thread_id: id,
+                rollout_path: None,
+                history: None,
+                include_archived: true,
+                metadata: thread_metadata(),
+            })
+            .await
+            .unwrap();
         second.shutdown_thread(id).await.unwrap();
     }
 
@@ -2367,6 +2874,110 @@ mod tests {
             cwd: Some(std::env::current_dir().expect("cwd")),
             model_provider: "test-provider".to_string(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_admitted_append_settles_projection_and_metadata() {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        let id = ThreadId::new();
+        let live = LiveThread::create(store.clone(), create_thread_params(id))
+            .await
+            .unwrap();
+        let pause = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let writer = live.clone();
+        let append = tokio::spawn(super::TEST_APPEND_HANDOFF_PAUSE.scope(
+            pause.clone(),
+            async move {
+                writer
+                    .append_items_ordered(&[user_message_item("accepted once")])
+                    .await
+            },
+        ));
+        pause.0.notified().await;
+        append.abort();
+        assert!(append.await.unwrap_err().is_cancelled());
+        pause.1.notify_one();
+        live.flush().await.unwrap();
+        let metadata = runtime.get_thread(id).await.unwrap().unwrap();
+        assert_eq!(
+            metadata.first_user_message.as_deref(),
+            Some("accepted once")
+        );
+        let page = store
+            .list_items(crate::ListItemsParams {
+                thread_id: id,
+                turn_id: None,
+                include_archived: false,
+                cursor: None,
+                page_size: 10,
+                sort_direction: crate::SortDirection::Asc,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let path = store.live_rollout_path(id).await.unwrap();
+        let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+        assert_eq!(items.iter().filter(|item| matches!(item,
+            RolloutItem::EventMsg(EventMsg::UserMessage(event)) if event.message == "accepted once")).count(), 1);
+        live.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_retries_after_optional_insert_failure() {
+        let home = TempDir::new().unwrap();
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        let id = ThreadId::new();
+        let live = LiveThread::create(store.clone(), create_thread_params(id))
+            .await
+            .unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME)),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER transient_metadata BEFORE INSERT ON threads BEGIN SELECT RAISE(FAIL, 'temporary storage failure'); END")
+            .execute(&pool).await.unwrap();
+        live.append_items_ordered(&[user_message_item("repair without replay")])
+            .await
+            .unwrap();
+        live.flush().await.unwrap();
+        assert!(runtime.get_thread(id).await.unwrap().is_none());
+        sqlx::query("DROP TRIGGER transient_metadata")
+            .execute(&pool)
+            .await
+            .unwrap();
+        live.flush().await.unwrap();
+        let metadata = runtime.get_thread(id).await.unwrap().unwrap();
+        assert_eq!(metadata.preview.as_deref(), Some("repair without replay"));
+        let path = store.live_rollout_path(id).await.unwrap();
+        let (items, _, _) = RolloutRecorder::load_rollout_items(&path).await.unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_))))
+                .count(),
+            1
+        );
+        live.shutdown().await.unwrap();
+        pool.close().await;
     }
 
     fn user_message_item(message: &str) -> RolloutItem {

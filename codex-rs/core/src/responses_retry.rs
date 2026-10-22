@@ -266,7 +266,10 @@ impl AccountChangeIdentity {
 
 /// Why a model request waits for the account to change.
 pub(crate) enum AccountChangeWait<'a> {
-    UsageLimit(&'a UsageLimitReachedError, Option<&'a AccountChangeIdentity>),
+    UsageLimit(
+        &'a UsageLimitReachedError,
+        Option<&'a AccountChangeIdentity>,
+    ),
     MissingCredentials,
 }
 
@@ -297,8 +300,11 @@ pub(crate) async fn wait_for_account_change(
     // Subscribe before rechecking the predicate: a login between the caller's
     // observation and this subscription is already seen by a new receiver.
     let mut auth_changes = auth_manager.auth_change_receiver();
-    let current_account = || auth_manager.auth_cached()
-        .and_then(|auth| AccountChangeIdentity::from_auth(&auth));
+    let current_account = || {
+        auth_manager
+            .auth_cached()
+            .and_then(|auth| AccountChangeIdentity::from_auth(&auth))
+    };
     let failed_account = match &reason {
         AccountChangeWait::UsageLimit(_, account) => account.cloned().or_else(current_account),
         AccountChangeWait::MissingCredentials => None,
@@ -325,15 +331,19 @@ pub(crate) async fn wait_for_account_change(
     }
     // A usage limit that resets inside the bound ends the wait at the reset.
     let known_reset_at = match &reason {
-        AccountChangeWait::UsageLimit(error, _) => error
-            .resets_at
-            .map(|resets_at| {
-                let delay = (resets_at - chrono::Utc::now()).to_std().unwrap_or_default();
-                // A due reset is evidence, not an absent timestamp. Only the
-                // first wait gets an immediate retry; repeated stale responses
-                // retain the logical deadline and a cancellable reload backoff.
-                now + if first_wait { delay } else { delay.max(ACCOUNT_CHANGE_RELOAD_INTERVAL) }
-            }),
+        AccountChangeWait::UsageLimit(error, _) => error.resets_at.map(|resets_at| {
+            let delay = (resets_at - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default();
+            // A due reset is evidence, not an absent timestamp. Only the
+            // first wait gets an immediate retry; repeated stale responses
+            // retain the logical deadline and a cancellable reload backoff.
+            now + if first_wait {
+                delay
+            } else {
+                delay.max(ACCOUNT_CHANGE_RELOAD_INTERVAL)
+            }
+        }),
         AccountChangeWait::MissingCredentials => None,
     };
     let reset_at = known_reset_at.filter(|reset_at| *reset_at < deadline);

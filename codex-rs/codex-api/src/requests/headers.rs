@@ -2,6 +2,8 @@ use codex_protocol::protocol::SessionSource;
 use http::HeaderMap;
 use http::HeaderValue;
 
+pub const X_CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+
 pub fn build_session_headers(session_id: Option<String>, thread_id: Option<String>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Some(id) = session_id {

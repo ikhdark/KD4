@@ -66,6 +66,9 @@ pub enum HostBlockReason {
     Denied,
     NotAllowed,
     NotAllowedLocal,
+    DnsFailed,
+    DnsTimeout,
+    DnsEmpty,
 }
 
 impl HostBlockReason {
@@ -74,6 +77,9 @@ impl HostBlockReason {
             Self::Denied => REASON_DENIED,
             Self::NotAllowed => REASON_NOT_ALLOWED,
             Self::NotAllowedLocal => REASON_NOT_ALLOWED_LOCAL,
+            Self::DnsFailed => "dns_failed",
+            Self::DnsTimeout => "dns_timeout",
+            Self::DnsEmpty => "dns_empty",
         }
     }
 }
@@ -640,8 +646,9 @@ impl NetworkProxyState {
             let allow_set =
                 compile_allowlist_globset(&candidate.allowed_domains().unwrap_or_default())
                     .with_context(|| format!("failed to compile updated network {list_name}"))?;
-            let deny_set = compile_denylist_globset(&candidate.denied_domains().unwrap_or_default())
-                .with_context(|| format!("failed to compile updated network {list_name}"))?;
+            let deny_set =
+                compile_denylist_globset(&candidate.denied_domains().unwrap_or_default())
+                    .with_context(|| format!("failed to compile updated network {list_name}"))?;
             let mut guard = self.state.write().await;
             if guard.constraints != constraints || guard.config != previous_cfg {
                 drop(guard);
@@ -778,19 +785,28 @@ impl RequestPolicySnapshot {
                 ) {
                     return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal));
                 }
-            } else if host_resolves_to_non_public_ip(
-                host_str,
-                port,
-                DNS_LOOKUP_TIMEOUT,
-                |host, port| async move {
-                    lookup_host((host.as_str(), port))
-                        .await
-                        .map(Iterator::collect)
-                },
-            )
-            .await
-            {
-                return Ok(HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal));
+            } else {
+                let dns_result = host_resolves_to_non_public_ip(
+                    host_str,
+                    port,
+                    DNS_LOOKUP_TIMEOUT,
+                    |host, port| async move {
+                        lookup_host((host.as_str(), port))
+                            .await
+                            .map(Iterator::collect)
+                    },
+                )
+                .await;
+                let reason = match dns_result {
+                    DnsAddressCheck::Public => None,
+                    DnsAddressCheck::NonPublic => Some(HostBlockReason::NotAllowedLocal),
+                    DnsAddressCheck::Failed => Some(HostBlockReason::DnsFailed),
+                    DnsAddressCheck::Timeout => Some(HostBlockReason::DnsTimeout),
+                    DnsAddressCheck::Empty => Some(HostBlockReason::DnsEmpty),
+                };
+                if let Some(reason) = reason {
+                    return Ok(HostBlockDecision::Blocked(reason));
+                }
             }
         }
 
@@ -954,18 +970,31 @@ where
         .context("policy filesystem task failed")
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DnsAddressCheck {
+    Public,
+    NonPublic,
+    Empty,
+    Failed,
+    Timeout,
+}
+
 async fn host_resolves_to_non_public_ip<F, Fut>(
     host: &str,
     port: u16,
     lookup_timeout: Duration,
     lookup: F,
-) -> bool
+) -> DnsAddressCheck
 where
     F: FnOnce(String, u16) -> Fut,
     Fut: Future<Output = std::io::Result<Vec<SocketAddr>>>,
 {
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_non_public_ip(ip);
+        return if is_non_public_ip(ip) {
+            DnsAddressCheck::NonPublic
+        } else {
+            DnsAddressCheck::Public
+        };
     }
 
     // Block the request if this DNS lookup fails. We resolve the hostname again when we connect,
@@ -976,23 +1005,26 @@ where
             debug!(
                 "blocking host because DNS lookup failed during local/private IP check (host={host}, port={port}): {err}"
             );
-            return true;
+            return DnsAddressCheck::Failed;
         }
         Err(_) => {
             debug!(
                 "blocking host because DNS lookup timed out during local/private IP check (host={host}, port={port})"
             );
-            return true;
+            return DnsAddressCheck::Timeout;
         }
     };
 
+    if addrs.is_empty() {
+        return DnsAddressCheck::Empty;
+    }
     for addr in addrs {
         if is_non_public_ip(addr.ip()) {
-            return true;
+            return DnsAddressCheck::NonPublic;
         }
     }
 
-    false
+    DnsAddressCheck::Public
 }
 
 fn log_policy_changes(previous: &NetworkProxyConfig, next: &NetworkProxyConfig) {
@@ -1096,7 +1128,7 @@ pub(crate) fn network_proxy_state_for_policy(
 }
 
 #[cfg(test)]
-struct NoopReloader;
+pub(crate) struct NoopReloader;
 
 #[cfg(test)]
 impl ConfigReloader for NoopReloader {
@@ -1309,10 +1341,7 @@ mod tests {
             .unwrap();
         assert_eq!(state.state.read().await.config.mode, NetworkMode::Full);
         state.force_reload().await.unwrap();
-        assert_eq!(
-            state.state.read().await.config.mode,
-            NetworkMode::Limited
-        );
+        assert_eq!(state.state.read().await.config.mode, NetworkMode::Limited);
         let blocked = state.drain_blocked().await.unwrap();
         assert_eq!(blocked.len(), 1);
         assert_eq!(blocked[0].host, "blocked.example");
@@ -1610,13 +1639,19 @@ mod tests {
         let blocked = state.drain_blocked().await.expect("drain should succeed");
         assert_eq!(blocked.len(), MAX_BLOCKED_EVENTS);
         assert_eq!(
-            blocked.iter().map(|entry| entry.host.clone()).collect::<Vec<_>>(),
+            blocked
+                .iter()
+                .map(|entry| entry.host.clone())
+                .collect::<Vec<_>>(),
             (5..MAX_BLOCKED_EVENTS + 5)
                 .map(|idx| format!("example{idx}.com"))
                 .collect::<Vec<_>>()
         );
         assert!(state.drain_blocked().await.unwrap().is_empty());
-        assert_eq!(state.state.read().await.blocked_total, (MAX_BLOCKED_EVENTS + 5) as u64);
+        assert_eq!(
+            state.state.read().await.blocked_total,
+            (MAX_BLOCKED_EVENTS + 5) as u64
+        );
     }
 
     #[test]
@@ -1844,7 +1879,9 @@ mod tests {
                 .host_blocked("does-not-resolve.invalid", /*port*/ 80)
                 .await
                 .unwrap(),
-            HostBlockDecision::Blocked(HostBlockReason::NotAllowedLocal)
+            // Still fail-closed; a failed lookup now reports its own evidence rather
+            // than claiming the host resolved to a non-public address.
+            HostBlockDecision::Blocked(HostBlockReason::DnsFailed)
         );
     }
 
@@ -1860,7 +1897,7 @@ mod tests {
         )
         .await;
 
-        assert!(blocked);
+        assert_eq!(blocked, DnsAddressCheck::Timeout);
     }
 
     #[tokio::test]
@@ -1878,7 +1915,7 @@ mod tests {
         )
         .await;
 
-        assert!(blocked);
+        assert_eq!(blocked, DnsAddressCheck::Failed);
     }
 
     #[tokio::test]
@@ -1891,7 +1928,7 @@ mod tests {
         )
         .await;
 
-        assert!(blocked);
+        assert_eq!(blocked, DnsAddressCheck::NonPublic);
     }
 
     #[tokio::test]
@@ -1904,7 +1941,36 @@ mod tests {
         )
         .await;
 
-        assert!(!blocked);
+        assert_eq!(blocked, DnsAddressCheck::Public);
+    }
+
+    #[tokio::test]
+    async fn dns_empty_and_mixed_answers_have_distinct_evidence() {
+        let empty = host_resolves_to_non_public_ip(
+            "empty.example",
+            80,
+            Duration::from_secs(1),
+            |_, _| async { Ok(vec![]) },
+        )
+        .await;
+        assert_eq!(empty, DnsAddressCheck::Empty);
+        let mixed = host_resolves_to_non_public_ip(
+            "mixed.example",
+            80,
+            Duration::from_secs(1),
+            |_, _| async {
+                Ok(vec![
+                    "8.8.8.8:80".parse().unwrap(),
+                    "127.0.0.1:80".parse().unwrap(),
+                ])
+            },
+        )
+        .await;
+        assert_eq!(mixed, DnsAddressCheck::NonPublic);
+        assert_ne!(
+            HostBlockReason::DnsFailed.as_str(),
+            HostBlockReason::NotAllowedLocal.as_str()
+        );
     }
 
     #[test]
@@ -2335,7 +2401,10 @@ mod tests {
             let error = build_config_state(denied, NetworkProxyConstraints::default())
                 .err()
                 .expect("global denylist must be rejected");
-            assert!(error.to_string().contains("network.denied_domains"), "{error}");
+            assert!(
+                error.to_string().contains("network.denied_domains"),
+                "{error}"
+            );
         }
     }
 

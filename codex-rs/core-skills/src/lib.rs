@@ -18,6 +18,7 @@ pub use model::SkillError;
 pub use model::SkillLoadOutcome;
 pub use model::SkillMetadata;
 pub use model::SkillPolicy;
+pub use model::SkillSource;
 pub use model::filter_skill_load_outcome_for_product;
 pub use model::skill_catalog_id;
 pub use model::skill_instruction_role;

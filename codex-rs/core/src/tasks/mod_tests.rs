@@ -46,6 +46,230 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+fn terminal_persistence_fixture(turn_id: &str) -> EventMsg {
+    EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: turn_id.into(),
+        last_agent_message: Some("canonical answer".into()),
+        surfaced_result: None,
+        error: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        timing: Some(Default::default()),
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_parent_interrupt_fanout_bounds_blocked_queues_and_reaches_ready_sibling() {
+    let mut children = [ThreadId::new(), ThreadId::new(), ThreadId::new()];
+    children.sort_unstable_by_key(ToString::to_string);
+    let (blocked, mut blocked_rx) = tokio::sync::mpsc::channel(1);
+    blocked.send(()).await.unwrap();
+    let (ready, mut ready_rx) = tokio::sync::mpsc::channel(1);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(1);
+    let ready_child = children[2];
+    let attempts = AtomicUsize::new(0);
+    let cleanup = super::collect_failed_turn_interrupts(
+        vec![children[2], children[0], children[1], children[0]],
+        deadline,
+        |id| {
+            let sender = if id == ready_child {
+                ready.clone()
+            } else {
+                blocked.clone()
+            };
+            let attempts = &attempts;
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                sender.send(()).await.unwrap();
+                "enqueued"
+            }
+        },
+    );
+    tokio::pin!(cleanup);
+    // Poll the actual fanout owner before advancing time. A serial loop would
+    // leave the ready child's channel empty behind the first full queue.
+    assert!(futures::poll!(cleanup.as_mut()).is_pending());
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "one attempt per unique child"
+    );
+    assert_eq!(ready_rx.try_recv(), Ok(()));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(
+        cleanup.await,
+        vec![
+            (children[0], "timed_out"),
+            (children[1], "timed_out"),
+            (children[2], "enqueued")
+        ]
+    );
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_secs(1)
+    );
+    blocked_rx.recv().await.unwrap();
+    assert!(
+        blocked_rx.try_recv().is_err(),
+        "timed-out sends must be cancelled, not detached"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_failed_parent_fanout_drops_pending_sends() {
+    let child = ThreadId::new();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    sender.send(()).await.unwrap();
+    {
+        let cleanup = super::collect_failed_turn_interrupts(
+            vec![child],
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            |_| async {
+                sender.send(()).await.unwrap();
+                "enqueued"
+            },
+        );
+        tokio::pin!(cleanup);
+        assert!(futures::poll!(cleanup.as_mut()).is_pending());
+    }
+    receiver.recv().await.unwrap();
+    assert!(receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn terminal_durable_only_failure_is_in_required_handoff_and_retry_is_idempotent() {
+    let (mut session, context, events) = make_session_and_context_with_rx().await;
+    attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    session.flush_rollout().await.unwrap(); // earlier ordinary flush succeeds
+    let mut published = None;
+    let terminal = session
+        .publish_terminal_event_with_barrier(
+            &context,
+            terminal_persistence_fixture(&context.sub_id),
+            &mut published,
+            false,
+            async || {
+                assert!(
+                    session
+                        .live_thread()
+                        .unwrap()
+                        .terminal_event(&context.sub_id, false)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the terminal itself must precede the barrier"
+                );
+                Err(std::io::Error::other(
+                    "injected final stable-storage failure",
+                ))
+            },
+        )
+        .await;
+    let EventMsg::TurnComplete(done) = &terminal else {
+        unreachable!()
+    };
+    assert!(
+        done.error.is_none(),
+        "persistence failure is not execution failure"
+    );
+    assert_eq!(done.last_agent_message.as_deref(), Some("canonical answer"));
+    assert!(
+        done.timing
+            .as_ref()
+            .unwrap()
+            .completion_assessment
+            .as_ref()
+            .unwrap()
+            .verification_gaps
+            .iter()
+            .any(|gap| gap.contains("injected final stable-storage failure"))
+    );
+    let mut terminals = 0;
+    let mut warning_seen = false;
+    while let Ok(event) = events.try_recv() {
+        match event.msg {
+            EventMsg::Warning(_) => {
+                assert_eq!(terminals, 0);
+                warning_seen = true;
+            }
+            EventMsg::TurnComplete(_) => {
+                assert!(warning_seen);
+                terminals += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(terminals, 1);
+    let retried = session
+        .publish_terminal_event_with_barrier(
+            &context,
+            terminal_persistence_fixture(&context.sub_id),
+            &mut published,
+            true,
+            async || panic!("a published terminal must not append or flush again"),
+        )
+        .await;
+    assert_eq!(
+        serde_json::to_value(terminal).unwrap(),
+        serde_json::to_value(retried).unwrap()
+    );
+    assert!(events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn blocked_terminal_barrier_reports_uncertainty_without_stranding_completion() {
+    let (mut session, context, _events) = make_session_and_context_with_rx().await;
+    attach_thread_persistence(Arc::get_mut(&mut session).unwrap()).await;
+    let mut published = None;
+    let terminal = session
+        .publish_terminal_event_with_barrier(
+            &context,
+            terminal_persistence_fixture(&context.sub_id),
+            &mut published,
+            false,
+            async || {
+                // Pause only after real ordered I/O has acknowledged the append.
+                tokio::time::pause();
+                std::future::pending().await
+            },
+        )
+        .await;
+    let EventMsg::TurnComplete(done) = terminal else {
+        unreachable!()
+    };
+    assert!(
+        done.timing
+            .unwrap()
+            .completion_assessment
+            .unwrap()
+            .verification_gaps
+            .iter()
+            .any(|gap| gap.contains("not acknowledged within 5 seconds"))
+    );
+    assert!(published.is_some());
+}
+
+#[tokio::test]
+async fn ephemeral_terminal_does_not_claim_or_wait_for_durability() {
+    let (session, context, _events) = make_session_and_context_with_rx().await;
+    let mut published = None;
+    let terminal = session
+        .publish_terminal_event_with_barrier(
+            &context,
+            terminal_persistence_fixture(&context.sub_id),
+            &mut published,
+            false,
+            async || panic!("ephemeral terminal has no durability barrier"),
+        )
+        .await;
+    let EventMsg::TurnComplete(done) = terminal else {
+        unreachable!()
+    };
+    assert!(done.timing.unwrap().completion_assessment.is_none());
+}
+
 #[derive(Clone, Copy)]
 struct FenceBlockingTask;
 
@@ -74,6 +298,60 @@ impl SessionTask for FenceBlockingTask {
 
 #[derive(Clone, Copy)]
 struct ImmediateCompletingTask;
+
+struct CapacityStoppedTask;
+
+impl SessionTask for CapacityStoppedTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "session_task.capacity_stop"
+    }
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async {
+            Ok(super::TurnTaskResult {
+                stop_cause: Some(
+                    codex_protocol::protocol::TurnExecutionStopCause::SubagentContextBudget,
+                ),
+                last_agent_message: Some("Partial coverage; remaining scope retained.".into()),
+                ..Default::default()
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn audit115_finalizer_preserves_capacity_cause_and_authored_report() {
+    let (session, context, events) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(context, Vec::new(), CapacityStoppedTask)
+        .await;
+    let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let EventMsg::TurnComplete(event) = events.recv().await.unwrap().msg {
+                break event;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal.last_agent_message.as_deref(),
+        Some("Partial coverage; remaining scope retained.")
+    );
+    assert!(terminal.error.is_none());
+    assert_eq!(
+        terminal.timing.unwrap().stop_cause,
+        Some(codex_protocol::protocol::TurnExecutionStopCause::SubagentContextBudget)
+    );
+}
 
 #[derive(Debug)]
 struct ReviewStartupFailingModelsManager {
@@ -215,6 +493,7 @@ impl SessionTask for IncompleteClosureTask {
                     &ToolExecutionId("unresolved-execution".to_string()),
                     TurnTimingToolCallSource::Direct,
                     None,
+                    "exec_command",
                 )
             }));
             self.accepted.notify_one();
@@ -253,6 +532,7 @@ impl SessionTask for QueuedToolResultTask {
                     &execution_id,
                     TurnTimingToolCallSource::Direct,
                     None,
+                    "exec_command",
                 )
             }));
             ctx.turn_timing_state.record_tool_dispatch_timing(
@@ -551,11 +831,15 @@ async fn admitted_task_start_retains_recovered_and_steering_input_in_order() {
             })
     );
     assert_eq!(
-        session
-            .input_queue
-            .get_pending_input(&session.active_turn)
-            .await,
-        vec![recovered, steering]
+        turn_state
+            .lock()
+            .await
+            .input_in_flight
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![recovered, steering],
+        "startup now owns recovered input in the initial batch, not a later sampling queue"
     );
     assert!(
         session
@@ -624,6 +908,90 @@ async fn taskless_placeholder_cleanup_is_pointer_identity_guarded() {
             Arc::ptr_eq(&active_turn.turn_state, &replacement_state)
         })
     );
+}
+
+struct CaptureStartupInput {
+    input: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Vec<TurnInput>>>>,
+}
+
+impl SessionTask for CaptureStartupInput {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "session_task.capture_startup_input"
+    }
+    fn run(
+        self: Arc<Self>,
+        _session: Arc<crate::session::session::Session>,
+        _turn: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        cancellation: CancellationToken,
+    ) -> futures::future::BoxFuture<'static, SessionTaskResult> {
+        Box::pin(async move {
+            if let Some(sent) = self.input.lock().unwrap().take() {
+                let _ = sent.send(input);
+            }
+            cancellation.cancelled().await;
+            Ok(super::TurnTaskResult::default())
+        })
+    }
+}
+
+#[tokio::test]
+async fn recovered_input_precedes_nonempty_explicit_prompt_before_later_steering() {
+    let (session, turn, _events) = make_session_and_context_with_rx().await;
+    let user = |text: &str, id: &str| TurnInput::UserInput {
+        content: vec![codex_protocol::user_input::UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: Some(id.to_string()),
+    };
+    let older = user("Use red.", "older-A");
+    let newer = user("Correction: use blue; red is obsolete.", "newer-B");
+    session
+        .input_queue
+        .restore_transferred_startup_input(vec![older.clone()])
+        .await;
+    let (sent, received) = tokio::sync::oneshot::channel();
+    session
+        .spawn_task(
+            turn.clone(),
+            vec![newer.clone()],
+            CaptureStartupInput {
+                input: std::sync::Mutex::new(Some(sent)),
+            },
+        )
+        .await;
+    let initial = received.await.unwrap();
+    assert_eq!(
+        initial,
+        vec![older, newer],
+        "the first task input must be A then B, not B followed by a later A"
+    );
+    let later = user("Use green instead.", "later-C");
+    let state = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .turn_state
+        .clone();
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(&state, std::slice::from_ref(&later))
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .input_queue
+            .get_pending_input(&session.active_turn)
+            .await,
+        vec![later]
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1077,15 +1445,23 @@ async fn assert_failed_turn_preserves_pending_input(mode: FailureMode) {
         let next = session
             .new_default_turn_with_sub_id("explicit-follow-up".into())
             .await;
+        let (sent, received) = tokio::sync::oneshot::channel();
         session
-            .start_task(next, Vec::new(), FenceBlockingTask)
+            .start_task(
+                next,
+                Vec::new(),
+                CaptureStartupInput {
+                    input: std::sync::Mutex::new(Some(sent)),
+                },
+            )
             .await;
         assert_eq!(
-            session
-                .input_queue
-                .get_pending_input(&session.active_turn)
-                .await,
-            pending
+            tokio::time::timeout(Duration::from_secs(5), received)
+                .await
+                .expect("explicit admission starts its task")
+                .expect("startup input is captured"),
+            pending,
+            "startup now owns recovered input in the initial batch, not a later sampling queue"
         );
         assert!(
             session
@@ -1281,7 +1657,13 @@ async fn shutdown_latch_is_linearized_with_task_start_admission() {
     });
     tokio::task::yield_now().await;
 
-    assert!(!session.shutting_down.load(Ordering::Acquire));
+    // `begin_shutdown` publishes the fence before observing an admitted
+    // transaction's permit, then still waits for that permit to settle.
+    assert!(session.shutting_down.load(Ordering::Acquire));
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown waits for the admitted start to release its permit"
+    );
     drop(task_start_guard);
     shutdown.await.expect("shutdown latch task joins");
     assert!(session.shutting_down.load(Ordering::Acquire));
@@ -1831,8 +2213,18 @@ fn emit_compact_metric_records_manual_and_automatic_compaction() {
 #[tokio::test]
 async fn replacement_waits_for_predecessor_terminal_acceptance() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
-    session.spawn_task(Arc::clone(&turn), Vec::new(), FenceBlockingTask).await;
-    let terminal = session.active_turn.lock().await.as_ref().unwrap().terminal.clone().unwrap();
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), FenceBlockingTask)
+        .await;
+    let terminal = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .terminal
+        .clone()
+        .unwrap();
     let (entered, release) = terminal.pause_publication_for_test();
     let (_, mut successor) = crate::session::tests::make_session_and_context().await;
     successor.sub_id = "replacement".into();
@@ -1840,23 +2232,51 @@ async fn replacement_waits_for_predecessor_terminal_acceptance() {
     let owner = Arc::clone(&session);
     let count = Arc::clone(&started);
     let replacement = tokio::spawn(async move {
-        owner.spawn_task(Arc::new(successor), Vec::new(), CountingBlockingTask {
-            started: count, release: CancellationToken::new(),
-        }).await;
+        owner
+            .spawn_task(
+                Arc::new(successor),
+                Vec::new(),
+                CountingBlockingTask {
+                    started: count,
+                    release: CancellationToken::new(),
+                },
+            )
+            .await;
     });
-    tokio::time::timeout(Duration::from_secs(5), entered).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!terminal.interaction_released());
     assert!(session.active_turn.lock().await.is_some());
     assert_eq!(started.load(Ordering::Acquire), 0);
     assert!(!replacement.is_finished());
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), replacement).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), replacement)
+        .await
+        .unwrap()
+        .unwrap();
     let mut terminals = Vec::new();
     while let Ok(event) = events.try_recv() {
-        if let EventMsg::TurnAborted(aborted) = event.msg { terminals.push(aborted); }
+        if let EventMsg::TurnAborted(aborted) = event.msg {
+            terminals.push(aborted);
+        }
     }
     assert_eq!(terminals.len(), 1);
     assert_eq!(terminals[0].turn_id.as_deref(), Some(turn.sub_id.as_str()));
-    assert_eq!(session.active_turn.lock().await.as_ref().unwrap().task.as_ref().unwrap().turn_context.sub_id, "replacement");
+    assert_eq!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .turn_context
+            .sub_id,
+        "replacement"
+    );
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }

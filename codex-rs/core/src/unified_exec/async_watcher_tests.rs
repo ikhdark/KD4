@@ -601,6 +601,11 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
             .expect("tracked execution");
         tokio::time::pause();
         let started = tokio::time::Instant::now() - Duration::from_secs(1);
+        let dispatch_timing = Arc::new(crate::tools::tool_dispatch_trace::ToolDispatchTiming::new(
+            started, false,
+        ));
+        dispatch_timing.mark_first_poll();
+        dispatch_timing.mark_exec_process_spawned();
         super::spawn_exit_watcher(
             Arc::clone(&process),
             Arc::clone(&session),
@@ -616,7 +621,7 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
             started,
             crate::tools::context::ToolCallSource::Direct,
             None,
-            None,
+            Some(Arc::clone(&dispatch_timing)),
             Some(deferred.clone()),
             false,
             false,
@@ -628,6 +633,16 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(10)).await;
         assert!(futures::poll!(Box::pin(process.wait_for_terminal_completion())).is_pending());
+        // Exit is already known while late-network policy/output work is
+        // still blocked. That work must not extend subprocess lifetime.
+        let exit_snapshot = dispatch_timing.snapshot(tokio::time::Instant::now());
+        assert!(exit_snapshot.exec_spawn_to_exit_ms.is_some());
+        assert!(
+            exit_snapshot
+                .timer_waits
+                .iter()
+                .any(|wait| wait.wait_kind == "process_exit")
+        );
         if denied {
             let mut blocked =
                 codex_network_proxy::BlockedRequest::new(codex_network_proxy::BlockedRequestArgs {
@@ -660,6 +675,12 @@ async fn exit_watcher_applies_late_network_denial_before_terminal_event() -> any
         )
         .await?
         .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            dispatch_timing
+                .snapshot(tokio::time::Instant::now())
+                .exec_spawn_to_exit_ms,
+            exit_snapshot.exec_spawn_to_exit_ms,
+        );
         let mut terminal_events = Vec::new();
         while let Ok(event) = events.try_recv() {
             if let EventMsg::ExecCommandEnd(end) = event.msg
@@ -722,6 +743,10 @@ async fn completion_preserves_exit_capture_and_search_facts() -> anyhow::Result<
         } else {
             process.signal_exit_for_test(exit_code);
         }
+        let observed_lifetime = process.observed_lifetime().expect("observed process exit");
+        tokio::task::yield_now().await;
+        process.signal_exit_for_test(exit_code);
+        assert_eq!(process.observed_lifetime(), Some(observed_lifetime));
         let handles = process.output_handles();
         let drained = case != 6;
         handles.output_closed.store(drained, Ordering::Release);
@@ -754,9 +779,12 @@ async fn completion_preserves_exit_capture_and_search_facts() -> anyhow::Result<
             (4..=7).contains(&case),
             failure.clone(),
             false,
-            Duration::ZERO,
+            // Deliberately unrelated collection/reporting interval. A public
+            // completion must retain the first process-owned observation.
+            Duration::from_secs(99),
             crate::tools::context::ToolCallSource::Direct,
             None,
+            Some("original-execution"),
         )
         .await?;
         let mut canonical = None;
@@ -774,7 +802,10 @@ async fn completion_preserves_exit_capture_and_search_facts() -> anyhow::Result<
         }
         let item = canonical.expect("canonical completion");
         let legacy = legacy.expect("legacy completion");
+        assert_eq!(legacy.duration, observed_lifetime);
         let metadata = item.output_metadata.as_ref().expect("capture facts");
+        // This helper runs outside the original tool timing task-local scope.
+        assert_eq!(item.execution_id.as_deref(), Some("original-execution"));
         assert_eq!(item.exit_code, exit_code, "case {case}");
         assert_eq!(legacy.exit_code, exit_code, "case {case}");
         assert_eq!(legacy.output_metadata.as_ref(), Some(metadata));

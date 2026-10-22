@@ -140,7 +140,11 @@ impl LogRetentionTestControl {
                 tokio::pin!(notified);
                 // Register before checking so notify_waiters cannot be lost in between.
                 notified.as_mut().enable();
-                if self.active_deletions.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                if self
+                    .active_deletions
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != 0
+                {
                     break;
                 }
                 notified.await;
@@ -467,7 +471,8 @@ impl StateRuntime {
             over_limit_threads_query.push("estimated_bytes");
             over_limit_threads_query.push(") > ");
             over_limit_threads_query.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-            over_limit_threads_query.push(" OR SUM(target != 'codex_core::tools::execution_phase') > ");
+            over_limit_threads_query
+                .push(" OR SUM(target != 'codex_core::tools::execution_phase') > ");
             over_limit_threads_query.push_bind(LOG_PARTITION_ROW_LIMIT);
             let over_limit_thread_ids: Vec<String> = over_limit_threads_query
                 .build()
@@ -520,7 +525,8 @@ WHERE id IN (
 "#,
                 );
                 prune_threads.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-                prune_threads.push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
+                prune_threads
+                    .push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
                 prune_threads.push_bind(LOG_PARTITION_ROW_LIMIT);
                 prune_threads.push(")\n)");
                 prune_threads.build().execute(&mut *tx).await?;
@@ -548,7 +554,8 @@ WHERE id IN (
             over_limit_processes_query.push("estimated_bytes");
             over_limit_processes_query.push(") > ");
             over_limit_processes_query.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-            over_limit_processes_query.push(" OR SUM(target != 'codex_core::tools::execution_phase') > ");
+            over_limit_processes_query
+                .push(" OR SUM(target != 'codex_core::tools::execution_phase') > ");
             over_limit_processes_query.push_bind(LOG_PARTITION_ROW_LIMIT);
             let over_limit_process_uuids: Vec<String> = over_limit_processes_query
                 .build()
@@ -602,7 +609,8 @@ WHERE id IN (
 "#,
                 );
                 prune_threadless_process_logs.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-                prune_threadless_process_logs.push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
+                prune_threadless_process_logs
+                    .push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
                 prune_threadless_process_logs.push_bind(LOG_PARTITION_ROW_LIMIT);
                 prune_threadless_process_logs.push(")\n)");
                 prune_threadless_process_logs
@@ -658,7 +666,8 @@ WHERE id IN (
 "#,
                 );
                 prune_threadless_null_process_logs.push_bind(LOG_PARTITION_SIZE_LIMIT_BYTES);
-                prune_threadless_null_process_logs.push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
+                prune_threadless_null_process_logs
+                    .push(" OR (target != 'codex_core::tools::execution_phase' AND row_number > ");
                 prune_threadless_null_process_logs.push_bind(LOG_PARTITION_ROW_LIMIT);
                 prune_threadless_null_process_logs.push(")\n)");
                 prune_threadless_null_process_logs
@@ -925,7 +934,12 @@ fn push_like_filters(builder: &mut QueryBuilder<Sqlite>, column: &str, filters: 
         builder
             .push(column)
             .push(" LIKE '%' || ")
-            .push_bind(filter.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+            .push_bind(
+                filter
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_"),
+            )
             .push(" || '%' ESCAPE '\\'");
     }
     builder.push(")");
@@ -1481,7 +1495,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         runtime.insert_logs(&entries).await?;
-        for filters in [vec!["_100%"], vec!["\\done"], vec!["TARGET_100%"], vec!["_100%", "other"]] {
+        for filters in [
+            vec!["_100%"],
+            vec!["\\done"],
+            vec!["TARGET_100%"],
+            vec!["_100%", "other"],
+        ] {
             let expected = if filters.len() == 2 {
                 vec![Some("target_100%\\done"), Some("other")]
             } else {
@@ -1496,7 +1515,12 @@ mod tests {
                     query.file_like = values;
                 }
                 let rows = runtime.query_logs(&query).await?;
-                assert_eq!(rows.iter().map(|row| row.message.as_deref()).collect::<Vec<_>>(), expected);
+                assert_eq!(
+                    rows.iter()
+                        .map(|row| row.message.as_deref())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
             }
         }
         runtime.close().await;
@@ -1504,7 +1528,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_log_insert_waits_for_sqlite_writer_then_preserves_both_commits() -> anyhow::Result<()> {
+    async fn deferred_log_insert_waits_for_sqlite_writer_then_preserves_both_commits()
+    -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
         let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into()).await?;
         let mut writer = runtime.logs_pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1512,12 +1537,18 @@ mod tests {
             .execute(&mut *writer).await?;
         let entries = [test_log("deferred insertion", "thread")];
         let mut insertion = Box::pin(runtime.insert_logs_deferred_retention(&entries));
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut insertion).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut insertion)
+                .await
+                .is_err()
+        );
         writer.commit().await?;
         tokio::time::timeout(Duration::from_secs(5), insertion).await??;
         let rows = runtime.query_logs(&LogQuery::default()).await?;
         assert_eq!(
-            rows.iter().map(|row| row.message.as_deref()).collect::<Vec<_>>(),
+            rows.iter()
+                .map(|row| row.message.as_deref())
+                .collect::<Vec<_>>(),
             vec![Some("held writer"), Some("deferred insertion")]
         );
         runtime.close().await;
@@ -1966,27 +1997,36 @@ mod tests {
         ] {
             let home = tempfile::tempdir().unwrap();
             let runtime = StateRuntime::init(home.path().to_path_buf(), "test-provider".into())
-                .await.unwrap();
+                .await
+                .unwrap();
             let mut phase = test_log("command_setup", "phase-thread");
             phase.thread_id = thread_id.map(str::to_owned);
             phase.process_uuid = process_uuid.map(str::to_owned);
             phase.target = "codex_core::tools::execution_phase".into();
             phase.ts = recent_test_ts(0);
             runtime.insert_logs(&[phase]).await.unwrap();
-            let entries = (1..=1_001).map(|ts| {
-                let mut entry = test_log("noise", "phase-thread");
-                entry.thread_id = thread_id.map(str::to_owned);
-                entry.process_uuid = process_uuid.map(str::to_owned);
-                entry.ts = recent_test_ts(ts);
-                entry
-            }).collect::<Vec<_>>();
+            let entries = (1..=1_001)
+                .map(|ts| {
+                    let mut entry = test_log("noise", "phase-thread");
+                    entry.thread_id = thread_id.map(str::to_owned);
+                    entry.process_uuid = process_uuid.map(str::to_owned);
+                    entry.ts = recent_test_ts(ts);
+                    entry
+                })
+                .collect::<Vec<_>>();
             runtime.insert_logs(&entries).await.unwrap();
             let phase_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM logs WHERE target = 'codex_core::tools::execution_phase'"
-            ).fetch_one(runtime.logs_pool.as_ref()).await.unwrap();
+                "SELECT COUNT(*) FROM logs WHERE target = 'codex_core::tools::execution_phase'",
+            )
+            .fetch_one(runtime.logs_pool.as_ref())
+            .await
+            .unwrap();
             let noise_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM logs WHERE target != 'codex_core::tools::execution_phase'"
-            ).fetch_one(runtime.logs_pool.as_ref()).await.unwrap();
+                "SELECT COUNT(*) FROM logs WHERE target != 'codex_core::tools::execution_phase'",
+            )
+            .fetch_one(runtime.logs_pool.as_ref())
+            .await
+            .unwrap();
             assert_eq!(phase_count, 1);
             assert_eq!(noise_count, 1_000);
         }
@@ -2196,8 +2236,11 @@ mod tests {
             .await
             .expect("insert test logs");
 
-        assert_eq!(log_row_count(&logs_db_path(&codex_home)).await, 2,
-            "query bound must be tested before retention deletes the oversized row");
+        assert_eq!(
+            log_row_count(&logs_db_path(&codex_home)).await,
+            2,
+            "query bound must be tested before retention deletes the oversized row"
+        );
         let bytes = runtime
             .query_feedback_logs_for_threads(&["thread-oversized"])
             .await
@@ -2570,7 +2613,13 @@ mod tests {
             .await
             .expect("insert test logs");
 
-        assert!(runtime.query_feedback_logs_for_threads(&[]).await.expect("empty selection").is_empty());
+        assert!(
+            runtime
+                .query_feedback_logs_for_threads(&[])
+                .await
+                .expect("empty selection")
+                .is_empty()
+        );
         let bytes = runtime
             .query_feedback_logs_for_threads(&["thread-1", "thread-2"])
             .await
@@ -2599,6 +2648,4 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
-
-
 }

@@ -20,5 +20,4 @@ globs:
   - "!codex-rs/protocol/src/prompts/**"
   - "!codex-rs/skills/src/assets/**"
   - "!codex-rs/ext/**/*_description.md"
-  - "!codex-rs/tui/prompt_for_init_command.md"
   - "!codex-rs/apply-patch/tests/fixtures/scenarios/**/expected/**"

@@ -57,6 +57,57 @@ const RESOURCE_URI: &str = "memo://codex/example-note";
 const SIMULATED_NO_RESPONSE_MESSAGE: &str =
     "http/request failed: error sending request for url (simulated no response)";
 
+#[tokio::test]
+async fn wrong_tool_response_retains_completion_uncertainty_without_replay() -> anyhow::Result<()> {
+    let server = wiremock::MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = Arc::clone(&calls);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let result = match body["method"].as_str() {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "outcome-fixture", "version": "1"}
+                }),
+                Some("tools/call") => {
+                    server_calls.fetch_add(1, Ordering::SeqCst);
+                    // An acknowledged provider effect followed by the wrong
+                    // operation's otherwise valid response shape.
+                    serde_json::json!({"resources": []})
+                }
+                _ => return wiremock::ResponseTemplate::new(202),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0", "id": body["id"], "result": result
+            }))
+        })
+        .mount(&server)
+        .await;
+    let client = create_client(&server.uri()).await?;
+    let invalid = client
+        .call_tool("save".into(), Some(serde_json::json!(42)), None, None)
+        .await
+        .expect_err("arguments rejected before transport");
+    assert!(!invalid.to_string().contains("completion unknown"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let error = client
+        .call_tool("save".into(), None, None, Some(Duration::from_secs(2)))
+        .await
+        .expect_err("wrong operation result must fail");
+    assert!(
+        error.to_string().contains("completion unknown"),
+        "{error:#}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("check its state before retrying")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
 // These are the external test server's declared fixtures, not a previous client response.
 fn expected_fixture_tools() -> serde_json::Result<ListToolsResult> {
     serde_json::from_value(serde_json::json!({"tools": [{
@@ -337,6 +388,7 @@ impl HttpClient for FailFirstInitializeHttpClient {
                     return Err(ExecServerError::Server {
                         code: JSON_RPC_INTERNAL_ERROR_CODE,
                         message: SIMULATED_NO_RESPONSE_MESSAGE.to_string(),
+                        data: None,
                     });
                 }
             }

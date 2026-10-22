@@ -92,6 +92,13 @@ pub trait SseTelemetry: Send + Sync {
 
 /// Telemetry for Responses WebSocket transport.
 pub trait WebsocketTelemetry: Send + Sync {
+    /// Fresh parsed response evidence; never called for replayed handshake metadata.
+    fn on_response_event(&self) {}
+    /// Stable local connection correlation, not a provider receipt or credential.
+    fn logical_transport_id(&self) -> Option<&str> {
+        None
+    }
+
     fn on_ws_request(&self, duration: Duration, error: Option<&ApiError>, connection_reused: bool);
 
     fn on_ws_event(
@@ -149,11 +156,17 @@ pub(crate) async fn run_with_request_telemetry_non_idempotent<T, F, Fut>(
 ) -> Result<T, TransportError>
 where
     T: WithStatus,
-    F: Clone + Fn(Request) -> Fut,
+    F: Clone + Fn(Request, u64) -> Fut,
     Fut: Future<Output = Result<T, TransportError>>,
 {
     run_with_retry_non_idempotent(policy, make_request, move |req, attempt| {
-        observe_request_attempt(telemetry.clone(), send.clone(), req, attempt)
+        let send = send.clone();
+        observe_request_attempt(
+            telemetry.clone(),
+            move |req| send(req, attempt),
+            req,
+            attempt,
+        )
     })
     .await
 }
@@ -171,6 +184,23 @@ where
 {
     let prepared_body_len = req.prepared_body_len();
     let start = Instant::now();
+    struct ObservationGuard {
+        telemetry: Option<Arc<dyn RequestTelemetry>>,
+        attempt: u64,
+        start: Instant,
+    }
+    impl Drop for ObservationGuard {
+        fn drop(&mut self) {
+            if let Some(telemetry) = self.telemetry.take() {
+                telemetry.on_request_cancelled(self.attempt, self.start.elapsed());
+            }
+        }
+    }
+    let mut observation = ObservationGuard {
+        telemetry: telemetry.clone(),
+        attempt,
+        start,
+    };
     let (result, timing) = if telemetry.is_some() {
         codex_http_client::capture_transport_timing(send(req)).await
     } else {
@@ -180,6 +210,7 @@ where
         )
     };
     let duration = start.elapsed();
+    observation.telemetry = None;
     if let Some(t) = telemetry.as_ref() {
         emit_transport_phases(t.as_ref(), attempt, &timing);
         t.on_transport_phase(
@@ -306,6 +337,30 @@ mod tests {
                 .expect("telemetry mutex poisoned")
                 .push((attempt, status, error.is_some()));
         }
+    }
+
+    #[tokio::test]
+    async fn audit_observability_http_cancelled_before_headers_is_observed_once() {
+        let recorder = Arc::new(RecordingTelemetry::default());
+        let mut request = Box::pin(observe_request_attempt::<Response, _, _>(
+            Some(recorder.clone()),
+            |_| std::future::pending(),
+            Request::new(Method::POST, "https://example.test/responses".into()),
+            3,
+        ));
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        drop(request);
+        assert_eq!(*recorder.requests.lock().unwrap(), vec![(3, None, true)]);
+        assert!(recorder.observations.lock().unwrap().is_empty());
+
+        let unpolled = observe_request_attempt::<Response, _, _>(
+            Some(recorder.clone()),
+            |_| std::future::pending(),
+            Request::new(Method::POST, "https://example.test/responses".into()),
+            4,
+        );
+        drop(unpolled);
+        assert_eq!(recorder.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -459,7 +514,7 @@ mod tests {
             },
             Some(recorder.clone()),
             || Request::new(Method::POST, "https://example.test/responses".into()),
-            |_| async {
+            |_, _| async {
                 Ok(Response {
                     status: StatusCode::OK,
                     headers: HeaderMap::new(),

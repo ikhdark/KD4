@@ -174,7 +174,8 @@ impl CodeModeWaitHandler {
                                 .wait_for_decision(cell_id.clone())
                         },
                         &cancellation_token,
-                        queued_input_activity(&exec, turn_state.as_deref(), activity_rx),
+                        queued_input_activity(&exec, turn_state.as_deref(), activity_rx.clone()),
+                        queued_steering_activity(&exec, turn_state.as_deref(), activity_rx),
                         "wait cancelled",
                     )
                     .await;
@@ -289,10 +290,11 @@ impl CodeModeWaitHandler {
                         .await;
                 }
                 let response = wait_response.into();
-                exec.session
+                let retention_settled = exec
+                    .session
                     .services
                     .code_mode_service
-                    .flush_packet_retention(&cell_id)
+                    .observe_packet_retention(&cell_id, args.terminate, &cancellation_token)
                     .await;
                 let delivery = exec
                     .session
@@ -306,6 +308,9 @@ impl CodeModeWaitHandler {
                     .services
                     .code_mode_service
                     .elide_bodies_already_in_context(&mut output);
+                if !retention_settled {
+                    super::attach_pending_retention(&mut output, &cell_id, &call_id);
+                }
                 output =
                     attach_drained_wait_evidence(&exec, output, &cell_id, drained_observations);
                 if let Some(signal) = authoritative_wait_signal {
@@ -401,6 +406,7 @@ pub(super) async fn hold_until_state_change<F, Fut>(
     wait_once: F,
     cancellation_token: &tokio_util::sync::CancellationToken,
     input_activity: impl Future<Output = InputQueueActivity>,
+    steering_activity: impl Future<Output = ()>,
     cancellation_message: &'static str,
 ) -> Result<OwnerHeldCodeModeWait, OwnerHeldCodeModeWaitError>
 where
@@ -430,6 +436,7 @@ where
         return Err(cancelled());
     }
     tokio::pin!(input_activity);
+    tokio::pin!(steering_activity);
     // The runtime retains a decision only while no observer holds it; one
     // delivered to an observer that is then dropped is lost. Answer input that
     // is already waiting before starting an observation.
@@ -445,6 +452,7 @@ where
             biased;
             _ = cancellation_token.cancelled() => Err(cancelled()),
             result = wait_once() => decided(result),
+            _ = &mut steering_activity => Ok(steered(InputQueueActivity::Steer)),
             _ = tokio::time::sleep(MAILBOX_PREEMPTION_GRACE) => Ok(steered(activity)),
         };
     }
@@ -463,7 +471,24 @@ where
 pub(super) async fn queued_input_activity(
     exec: &ExecContext,
     turn_state: Option<&tokio::sync::Mutex<crate::state::TurnState>>,
+    activity_rx: tokio::sync::watch::Receiver<InputQueueActivity>,
+) -> InputQueueActivity {
+    queued_activity(exec, turn_state, activity_rx, false).await
+}
+
+pub(super) async fn queued_steering_activity(
+    exec: &ExecContext,
+    turn_state: Option<&tokio::sync::Mutex<crate::state::TurnState>>,
+    activity_rx: tokio::sync::watch::Receiver<InputQueueActivity>,
+) {
+    queued_activity(exec, turn_state, activity_rx, true).await;
+}
+
+async fn queued_activity(
+    exec: &ExecContext,
+    turn_state: Option<&tokio::sync::Mutex<crate::state::TurnState>>,
     mut activity_rx: tokio::sync::watch::Receiver<InputQueueActivity>,
+    steering_only: bool,
 ) -> InputQueueActivity {
     loop {
         // Mark the wake seen before reading retained state: anything arriving
@@ -475,6 +500,7 @@ pub(super) async fn queued_input_activity(
             .input_queue
             .pending_activity(turn_state, internal_completion)
             .await
+            && (!steering_only || activity == InputQueueActivity::Steer)
         {
             return activity;
         }
@@ -568,6 +594,12 @@ pub(super) fn attach_drained_wait_evidence(
 }
 
 impl CoreToolRuntime for CodeModeWaitHandler {
+    fn tool_execution_timing(&self) -> crate::tools::registry::ToolExecutionTiming {
+        // Like exec, this wrapper includes idle cell orchestration. Only the
+        // nested tools own tool-active intervals.
+        crate::tools::registry::ToolExecutionTiming::NestedRuntime
+    }
+
     fn delegates_workspace_admission(&self) -> bool {
         true
     }
@@ -915,6 +947,7 @@ mod tests {
             },
             &tokio_util::sync::CancellationToken::new(),
             next_input_activity(activity_rx, None),
+            std::future::pending(),
             "wait cancelled",
         )
         .await
@@ -937,6 +970,7 @@ mod tests {
             || std::future::ready(Err("runtime failed".to_string())),
             &tokio_util::sync::CancellationToken::new(),
             next_input_activity(activity_rx, None),
+            std::future::pending(),
             "wait cancelled",
         )
         .await;
@@ -956,6 +990,7 @@ mod tests {
             std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
             &cancellation,
             next_input_activity(activity_rx, None),
+            std::future::pending(),
             "wait cancelled",
         )
         .await;
@@ -993,6 +1028,7 @@ mod tests {
                 },
                 &cancellation,
                 next_input_activity(activity_rx, None),
+                std::future::pending(),
                 "wait cancelled",
             )
             .await
@@ -1046,6 +1082,7 @@ mod tests {
                 std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
                 &cancellation,
                 queued_input_activity(&exec, None, activity_rx),
+                std::future::pending(),
                 "wait cancelled",
             ));
             assert!(held.as_mut().now_or_never().is_none());
@@ -1134,6 +1171,7 @@ mod tests {
                 },
                 &tokio_util::sync::CancellationToken::new(),
                 next_input_activity(activity_rx, None),
+                std::future::pending(),
                 "wait cancelled",
             )
             .await
@@ -1191,6 +1229,7 @@ mod tests {
                 },
                 &tokio_util::sync::CancellationToken::new(),
                 next_input_activity(activity_rx, pending_activity),
+                std::future::pending(),
                 "wait cancelled",
             )
             .await
@@ -1228,6 +1267,7 @@ mod tests {
                 },
                 &tokio_util::sync::CancellationToken::new(),
                 next_input_activity(activity_rx, Some(InputQueueActivity::Mailbox)),
+                std::future::pending(),
                 "wait cancelled",
             )
             .await
@@ -1250,6 +1290,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mailbox_grace_upgrades_to_later_steering_with_one_observer() {
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let exec = ExecContext {
+            session: Arc::new(session),
+            turn: Arc::new(turn),
+        };
+        let queue = &exec.session.input_queue;
+        queue
+            .enqueue_mailbox_communication(codex_protocol::protocol::InterAgentCommunication::new(
+                codex_protocol::AgentPath::root().join("worker").unwrap(),
+                codex_protocol::AgentPath::root(),
+                Vec::new(),
+                "already queued".to_string(),
+                true,
+            ))
+            .await
+            .unwrap();
+        let (receiver, _) = queue.subscribe_code_mode_activity(None, false).await;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let observations = std::sync::atomic::AtomicUsize::new(0);
+        let mut held = Box::pin(hold_until_state_change(
+            || {
+                observations.fetch_add(1, Ordering::Relaxed);
+                std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>()
+            },
+            &cancellation,
+            queued_input_activity(&exec, None, receiver.clone()),
+            queued_steering_activity(&exec, None, receiver),
+            "wait cancelled",
+        ));
+        assert!(held.as_mut().now_or_never().is_none());
+        tokio::time::advance(Duration::from_millis(10)).await;
+        queue
+            .restore_transferred_startup_input(vec![crate::session::TurnInput::UserInput {
+                content: vec![codex_protocol::user_input::UserInput::Text {
+                    text: "Change direction now".to_string(),
+                    text_elements: Vec::new(),
+                }],
+                client_id: None,
+            }])
+            .await;
+        let result = held
+            .as_mut()
+            .now_or_never()
+            .expect("later steering must not wait for mailbox grace")
+            .unwrap();
+        assert!(matches!(
+            result.exit,
+            OwnerHeldCodeModeExit::InputActivity(InputQueueActivity::Steer)
+        ));
+        assert_eq!(observations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            queue
+                .get_pending_input(&tokio::sync::Mutex::new(None))
+                .await
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1287,6 +1388,7 @@ mod tests {
                 },
                 &cancellation,
                 queued_input_activity(&exec, Some(turn_state.as_ref()), activity_rx),
+                std::future::pending(),
                 "wait cancelled",
             )
             .await
@@ -1326,6 +1428,7 @@ mod tests {
                 std::future::pending::<Result<codex_code_mode::WaitOutcome, String>>,
                 &cancellation,
                 next_input_activity(activity_rx, None),
+                std::future::pending(),
                 "wait cancelled",
             )
             .await
@@ -1395,6 +1498,7 @@ mod tests {
                 },
                 &cancellation,
                 next_input_activity(activity_rx, None),
+                std::future::pending(),
                 "wait cancelled",
             )
             .await

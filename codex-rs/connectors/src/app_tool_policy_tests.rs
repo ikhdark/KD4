@@ -876,7 +876,9 @@ fn invalid_managed_connector_keys_cannot_bypass_disabled_policy() {
         };
         assert_eq!(error.to_string(), expected_error);
         assert_eq!(
-            apps_config_from_layer_stack(&stack).unwrap_err().to_string(),
+            apps_config_from_layer_stack(&stack)
+                .unwrap_err()
+                .to_string(),
             expected_error
         );
     }

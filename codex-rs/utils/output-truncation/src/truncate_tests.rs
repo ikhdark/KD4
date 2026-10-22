@@ -70,8 +70,8 @@ fn benchmark_output_projection() {
     }
     // The manifest runner suppresses successful test stdout. Windows test
     // isolation clears CODEX_* runtime state, so use a test-only variable.
-    if let Some(path) = std::env::var_os("KD4_PROJECTION_BENCHMARK_OUTPUT")
-        .filter(|path| !path.is_empty())
+    if let Some(path) =
+        std::env::var_os("KD4_PROJECTION_BENCHMARK_OUTPUT").filter(|path| !path.is_empty())
     {
         std::fs::write(path, report).expect("write projection benchmark report");
     }
@@ -116,7 +116,8 @@ fn line_marker_totals_preserve_trailing_newline_semantics() {
         for budget in [100, 300, 1000] {
             let text = crate::truncate_text_with_line_markers(&source, budget);
             assert!(approx_token_count(&text) <= budget);
-            let markers = text.lines()
+            let markers = text
+                .lines()
                 .filter(|line| line.starts_with("[omitted lines "))
                 .collect::<Vec<_>>();
             assert_eq!(markers.len(), 2);
@@ -136,7 +137,10 @@ fn oversized_json_line_is_outlined_instead_of_byte_sliced() {
         .map(|index| serde_json::Value::String(format!("codex-rs/src/module_{index}.rs")))
         .collect::<Vec<_>>();
     let document = serde_json::json!({"count": 2_000, "paths": paths});
-    let names = (0..20).map(|index| format!("field_{index}")).collect::<Vec<_>>().join("\n");
+    let names = (0..20)
+        .map(|index| format!("field_{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let content = format!("{names}\n{document}\ntrailer\n");
     for text in [
         truncate_text_to_token_ceiling(&content, 600),
@@ -144,7 +148,9 @@ fn oversized_json_line_is_outlined_instead_of_byte_sliced() {
     ] {
         assert!(approx_token_count(&text) <= 600, "{text}");
         assert_eq!(text.lines().count(), content.lines().count(), "{text}");
-        assert!(text.contains("field_0\n") && text.contains("field_19\n") && text.contains("trailer"));
+        assert!(
+            text.contains("field_0\n") && text.contains("field_19\n") && text.contains("trailer")
+        );
         assert!(text.contains("[JSON line of"), "{text}");
         assert!(text.contains(r#""count":2000"#), "{text}");
         assert!(text.contains(r#""paths":[2000 items; first "codex-rs/src/module_0.rs"; last "codex-rs/src/module_1999.rs"]"#), "{text}");
@@ -183,7 +189,11 @@ fn zero_projection_budget_preserves_omission_metadata_without_text() {
 #[test]
 fn verified_evidence_json_line_recovery_does_not_promise_document_pointers() {
     let document = serde_json::json!({"payload":"x".repeat(20_000)}).to_string();
-    for content in [document.clone(), format!("{document}\n{document}\n"), format!("log start\n{document}\nlog end")] {
+    for content in [
+        document.clone(),
+        format!("{document}\n{document}\n"),
+        format!("log start\n{document}\nlog end"),
+    ] {
         let outlined = super::outline_oversized_json_lines(&content, 600).unwrap();
         assert!(outlined.contains("line or byte selectors"));
         assert!(!outlined.contains("JSON pointers"));
@@ -258,7 +268,7 @@ fn truncate_bytes_less_than_placeholder_returns_placeholder() {
     let content = "example output";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 4)\nTotal output lines: 1\n\n…13 chars truncated…t",
+        "Warning: truncated output (estimated original tokens: 4)\nTotal output lines: 1\n\n…13 chars truncated…t",
         formatted_truncate_text(content, TruncationPolicy::Bytes(1)),
     );
 }
@@ -284,13 +294,8 @@ fn truncate_tokens_under_limit_returns_original() {
             content,
             formatted_truncate_text(content, TruncationPolicy::Tokens(budget)),
         );
-        let limits = resolve_output_limits(
-            Some(budget),
-            OutputOutcome::Success,
-            None,
-            content,
-            budget,
-        );
+        let limits =
+            resolve_output_limits(Some(budget), OutputOutcome::Success, None, content, budget);
         let output = formatted_truncate_text_with_output_limit(content, limits);
         assert_eq!(output.text, content);
         assert!(!output.was_truncated);
@@ -322,7 +327,7 @@ fn truncate_bytes_over_limit_returns_truncated() {
     let content = "this is an example of a long output that should be truncated";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 15)\nTotal output lines: 1\n\nthis is an exam…30 chars truncated…ld be truncated",
+        "Warning: truncated output (estimated original tokens: 15)\nTotal output lines: 1\n\nthis is an exam…30 chars truncated…ld be truncated",
         formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
     );
 }
@@ -333,7 +338,7 @@ fn truncate_bytes_reports_original_line_count_when_truncated() {
         "this is an example of a long output that should be truncated\nalso some other line";
 
     assert_eq!(
-        "Warning: truncated output (original token count: 21)\nTotal output lines: 2\n\nthis is an exam…51 chars truncated…some other line",
+        "Warning: truncated output (estimated original tokens: 21)\nTotal output lines: 2\n\nthis is an exam…51 chars truncated…some other line",
         formatted_truncate_text(content, TruncationPolicy::Bytes(30)),
     );
 }
@@ -343,7 +348,7 @@ fn truncate_tokens_reports_original_line_count_when_truncated() {
     let content = "this is an example of a long output\n".repeat(200);
     let result = formatted_truncate_text(&content, TruncationPolicy::Tokens(100));
     assert!(approx_token_count(&result) <= 100);
-    assert!(result.starts_with("Warning: truncated output (original token count:"));
+    assert!(result.starts_with("Warning: truncated output (estimated original tokens:"));
     assert!(result.contains("Total output lines: 200\n"));
     assert!(result.contains("this is an example"));
 }
@@ -458,7 +463,7 @@ fn formatted_truncate_text_content_items_with_policy_preserves_empty_leading_tex
     assert_eq!(
         output,
         vec![FunctionCallOutputContentItem::InputText {
-            text: "Warning: truncated output (original token count: 1)\nTotal output lines: 1\n\n…3 chars truncated…".to_string(),
+            text: "Warning: truncated output (estimated original tokens: 1)\nTotal output lines: 1\n\n…3 chars truncated…".to_string(),
         }]
     );
     assert_eq!(original_token_count, Some(1));
@@ -493,14 +498,14 @@ fn formatted_truncate_text_content_items_with_policy_preserves_text_and_image_or
         output,
         vec![
             FunctionCallOutputContentItem::InputText {
-                text: "Warning: truncated output (original token count: 1)\nTotal output lines: 1\n\na…2 chars truncated…d".to_string(),
+                text: "Warning: truncated output (estimated original tokens: 1)\nTotal output lines: 1\n\na…2 chars truncated…d".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
                 image_url: "img:one".to_string(),
                 detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             FunctionCallOutputContentItem::InputText {
-                text: "Warning: truncated output (original token count: 3)\nTotal output lines: 2\n\nefg…3 chars truncated…jkl".to_string(),
+                text: "Warning: truncated output (estimated original tokens: 3)\nTotal output lines: 2\n\nefg…3 chars truncated…jkl".to_string(),
             },
             FunctionCallOutputContentItem::InputImage {
                 image_url: "img:two".to_string(),
@@ -529,7 +534,7 @@ fn formatted_truncate_text_content_items_with_policy_preserves_encrypted_content
         output,
         vec![
             FunctionCallOutputContentItem::InputText {
-                text: "Warning: truncated output (original token count: 2)\nTotal output lines: 1\n\na…6 chars truncated…h".to_string(),
+                text: "Warning: truncated output (estimated original tokens: 2)\nTotal output lines: 1\n\na…6 chars truncated…h".to_string(),
             },
             FunctionCallOutputContentItem::EncryptedContent {
                 encrypted_content: "enc_opaque".to_string(),
@@ -745,7 +750,11 @@ fn fork_validation_routes_receive_the_diagnostic_budget() {
         "npm run lint",
         "pnpm typecheck",
     ] {
-        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::HighSignal, "{command}");
+        assert_eq!(
+            crate::classify_diagnostic(Some(command), "ok"),
+            OutputDiagnosticClass::HighSignal,
+            "{command}"
+        );
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000);
         assert_eq!(
@@ -777,7 +786,11 @@ fn just_non_validation_commands_keep_the_success_budget() {
         "python -I -B -c 'print(1)' scripts/build/rust_test_runner.py",
         "python -I -B other.py scripts/build/rust_test_runner.py",
     ] {
-        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::Normal, "{command}");
+        assert_eq!(
+            crate::classify_diagnostic(Some(command), "ok"),
+            OutputDiagnosticClass::Normal,
+            "{command}"
+        );
         assert_eq!(
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000)
                 .applied_limit,
@@ -828,9 +841,13 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
         OutputOutcome::TimedOut,
         OutputOutcome::Skipped,
     ] {
-        let normal =
-            resolve_projected_output_limits(None, outcome, OutputDiagnosticClass::Normal, usize::MAX)
-                .applied_limit;
+        let normal = resolve_projected_output_limits(
+            None,
+            outcome,
+            OutputDiagnosticClass::Normal,
+            usize::MAX,
+        )
+        .applied_limit;
         let high_signal = resolve_projected_output_limits(
             None,
             outcome,
@@ -840,8 +857,20 @@ fn typed_projection_limits_use_exact_ceilings_and_requested_minimum() {
         .applied_limit;
         assert_eq!(normal, DEFAULT_SUCCESS_OUTPUT_TOKENS, "{outcome:?}");
         assert_eq!(high_signal, DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, "{outcome:?}");
-        assert_eq!(high_signal, normal, "diagnostics must not lose direct-call capacity");
-        assert_eq!(resolve_projected_output_limits(None, outcome, OutputDiagnosticClass::HighSignal, 8_000).applied_limit, 8_000);
+        assert_eq!(
+            high_signal, normal,
+            "diagnostics must not lose direct-call capacity"
+        );
+        assert_eq!(
+            resolve_projected_output_limits(
+                None,
+                outcome,
+                OutputDiagnosticClass::HighSignal,
+                8_000
+            )
+            .applied_limit,
+            8_000
+        );
     }
     assert_eq!(
         resolve_projected_output_limits(
@@ -989,7 +1018,11 @@ fn diagnostic_output_receives_budget_without_command_metadata() {
         "Segmentation fault (core dumped)",
         "project.csproj: error MSB1009: Project file does not exist.",
     ] {
-        assert_eq!(crate::classify_diagnostic(None, diagnostic), OutputDiagnosticClass::HighSignal, "{diagnostic}");
+        assert_eq!(
+            crate::classify_diagnostic(None, diagnostic),
+            OutputDiagnosticClass::HighSignal,
+            "{diagnostic}"
+        );
         let limits = resolve_output_limits(None, OutputOutcome::Success, None, diagnostic, 20_000);
         assert_eq!(limits.applied_limit, 10_000, "{diagnostic}");
     }
@@ -1177,8 +1210,15 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
     ] {
         let limits =
             resolve_output_limits(None, OutputOutcome::Success, Some(command), "ok", 20_000);
-        assert_eq!(limits.applied_limit, DEFAULT_SUCCESS_OUTPUT_TOKENS, "{command}");
-        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::Normal, "{command}");
+        assert_eq!(
+            limits.applied_limit, DEFAULT_SUCCESS_OUTPUT_TOKENS,
+            "{command}"
+        );
+        assert_eq!(
+            crate::classify_diagnostic(Some(command), "ok"),
+            OutputDiagnosticClass::Normal,
+            "{command}"
+        );
     }
     for command in [
         "cargo +stable test",
@@ -1193,7 +1233,11 @@ fn validation_mentions_in_command_arguments_do_not_raise_output_budget() {
             DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
             "{command}"
         );
-        assert_eq!(crate::classify_diagnostic(Some(command), "ok"), OutputDiagnosticClass::HighSignal, "{command}");
+        assert_eq!(
+            crate::classify_diagnostic(Some(command), "ok"),
+            OutputDiagnosticClass::HighSignal,
+            "{command}"
+        );
     }
 }
 
@@ -1215,7 +1259,11 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
             DEFAULT_SUCCESS_OUTPUT_TOKENS,
             "{output}"
         );
-        assert_eq!(crate::classify_diagnostic(None, output), OutputDiagnosticClass::Normal, "{output}");
+        assert_eq!(
+            crate::classify_diagnostic(None, output),
+            OutputDiagnosticClass::Normal,
+            "{output}"
+        );
     }
     for output in [
         "error[E0308]: mismatched types",
@@ -1228,7 +1276,11 @@ fn diagnostic_mentions_in_prose_do_not_raise_output_budget() {
             DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS,
             "{output}"
         );
-        assert_eq!(crate::classify_diagnostic(None, output), OutputDiagnosticClass::HighSignal, "{output}");
+        assert_eq!(
+            crate::classify_diagnostic(None, output),
+            OutputDiagnosticClass::HighSignal,
+            "{output}"
+        );
     }
 }
 
@@ -1277,12 +1329,17 @@ fn actual_diagnostics_after_rust_paths_keep_diagnostic_projection() {
 }
 #[test]
 fn projection_line_markers_cover_exact_crlf_gaps() {
-    let source = (1..=3000).map(|line| format!("source line {line:04}\r\n")).collect::<String>();
+    let source = (1..=3000)
+        .map(|line| format!("source line {line:04}\r\n"))
+        .collect::<String>();
     let output = crate::truncate_text_with_line_markers(&source, 1000);
     assert!(crate::approx_token_count(&output) <= 1000);
     assert_eq!(output.matches("[omitted lines ").count(), 2);
     let mut marked = std::collections::BTreeSet::new();
-    for marker in output.lines().filter_map(|line| line.strip_prefix("[omitted lines ")) {
+    for marker in output
+        .lines()
+        .filter_map(|line| line.strip_prefix("[omitted lines "))
+    {
         let (span, total) = marker.trim_end_matches(']').split_once(" of ").unwrap();
         assert_eq!(total, "3000");
         let (start, end) = span.split_once('-').unwrap();
@@ -1316,22 +1373,49 @@ fn marked_recovery_preserves_the_entire_known_gap() {
     );
     // The displayed marker is the recovery consumer's promise. Read its
     // independently visible endpoints rather than the producer's range vector.
-    let (first, last) = marked.output.text.lines()
+    let (first, last) = marked
+        .output
+        .text
+        .lines()
         .find_map(|line| line.strip_prefix("[omitted lines "))
         .and_then(|marker| marker.split_once(" of "))
         .and_then(|(span, _)| span.split_once('-'))
-        .map(|(start, end)| (start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()))
+        .map(|(start, end)| {
+            (
+                start.parse::<usize>().unwrap(),
+                end.parse::<usize>().unwrap(),
+            )
+        })
         .expect("numbered omission marker");
     assert!(last - first + 1 > 200, "fixture must exceed a preview page");
     assert_eq!(marked.first_omitted_line_range(), Some((first, last)));
-    let gap = source.lines().skip(first - 1).take(last - first + 1).collect::<Vec<_>>();
-    assert_eq!(gap.first().copied(), Some(format!("source 雪 line {first:04}").as_str()));
-    assert_eq!(gap.last().copied(), Some(format!("source 雪 line {last:04}").as_str()));
+    let gap = source
+        .lines()
+        .skip(first - 1)
+        .take(last - first + 1)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gap.first().copied(),
+        Some(format!("source 雪 line {first:04}").as_str())
+    );
+    assert_eq!(
+        gap.last().copied(),
+        Some(format!("source 雪 line {last:04}").as_str())
+    );
     // The source slice above is indexed by the marker itself; only the projection
     // shows whether those endpoints bound the lines that were actually dropped.
     let text = &marked.output.text;
-    for (line, retained) in [(first - 1, true), (first, false), (last, false), (last + 1, true)] {
-        assert_eq!(text.contains(&format!("source 雪 line {line:04}")), retained, "line {line}");
+    for (line, retained) in [
+        (first - 1, true),
+        (first, false),
+        (last, false),
+        (last + 1, true),
+    ] {
+        assert_eq!(
+            text.contains(&format!("source 雪 line {line:04}")),
+            retained,
+            "line {line}"
+        );
     }
 }
 

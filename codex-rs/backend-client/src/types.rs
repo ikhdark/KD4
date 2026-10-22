@@ -229,11 +229,52 @@ impl<'de> Deserialize<'de> for AccountsCheckResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CodeTaskDetailsResponse {
     #[serde(default)]
+    pub task: Option<CodeTaskIdentity>,
+    #[serde(default)]
     pub current_user_turn: Option<Turn>,
     #[serde(default)]
     pub current_assistant_turn: Option<Turn>,
     #[serde(default)]
     pub current_diff_task_turn: Option<Turn>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CodeTaskIdentity {
+    pub id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CloudEnvironment {
+    pub id: String,
+    pub label: Option<String>,
+    pub is_pinned: Option<bool>,
+    pub task_count: Option<i64>,
+}
+
+#[derive(Debug)]
+pub struct TaskIdentityMismatch {
+    pub requested: String,
+    pub observed: String,
+}
+
+impl std::fmt::Display for TaskIdentityMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task identity mismatch: requested {}, received {}", self.requested, self.observed)
+    }
+}
+
+impl std::error::Error for TaskIdentityMismatch {}
+
+impl CodeTaskDetailsResponse {
+    /// Missing legacy identity is unavailable, not a contradictory identity.
+    pub fn validate_task_id(&self, requested: &str) -> Result<(), TaskIdentityMismatch> {
+        if let Some(observed) = self.task.as_ref().and_then(|task| task.id.as_deref())
+            && observed != requested
+        {
+            return Err(TaskIdentityMismatch { requested: requested.into(), observed: observed.into() });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -244,8 +285,8 @@ pub struct Turn {
     pub attempt_placement: Option<i64>,
     #[serde(default, rename = "turn_status")]
     pub turn_status: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_vec")]
-    pub sibling_turn_ids: Vec<String>,
+    #[serde(default)]
+    pub sibling_turn_ids: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_vec")]
     pub input_items: Vec<TurnItem>,
     #[serde(default, deserialize_with = "deserialize_vec")]
@@ -378,11 +419,11 @@ impl TurnItem {
 }
 
 impl Turn {
-    fn unified_diff(&self) -> Option<String> {
+    pub fn unified_diff(&self) -> Option<String> {
         self.output_items.iter().find_map(TurnItem::diff_text)
     }
 
-    fn message_texts(&self) -> Vec<String> {
+    pub fn message_texts(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .output_items
             .iter()
@@ -427,7 +468,7 @@ impl Turn {
         }
     }
 
-    fn error_summary(&self) -> Option<String> {
+    pub fn error_summary(&self) -> Option<String> {
         self.error.as_ref().and_then(TurnError::summary)
     }
 }
@@ -491,7 +532,14 @@ impl CodeTaskDetailsResponseExt for CodeTaskDetailsResponse {
     }
 
     fn assistant_text_messages(&self) -> Vec<String> {
+        if let (Some(diff), Some(assistant)) = (&self.current_diff_task_turn, &self.current_assistant_turn)
+            && diff.id.as_deref().is_some_and(|id| !id.is_empty()) && diff.id == assistant.id
+        {
+            let messages = assistant.message_texts();
+            return if messages.is_empty() { diff.message_texts() } else { messages };
+        }
         let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for turn in [
             self.current_diff_task_turn.as_ref(),
             self.current_assistant_turn.as_ref(),
@@ -499,6 +547,11 @@ impl CodeTaskDetailsResponseExt for CodeTaskDetailsResponse {
         .into_iter()
         .flatten()
         {
+            if let Some(id) = turn.id.as_deref().filter(|id| !id.is_empty())
+                && !seen.insert(id)
+            {
+                continue;
+            }
             out.extend(turn.message_texts());
         }
         out

@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use crate::response_event_channel::ResponseEventReceiver;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::config_types::Verbosity as VerbosityConfig;
 use codex_protocol::models::ResponseItem;
@@ -17,7 +18,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
-use tokio::sync::mpsc;
 
 pub const WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY: &str = "ws_request_header_traceparent";
 pub const WS_REQUEST_HEADER_TRACESTATE_CLIENT_METADATA_KEY: &str = "ws_request_header_tracestate";
@@ -463,7 +463,7 @@ pub fn create_text_param_for_request(
 }
 
 pub struct ResponseStream {
-    pub rx_event: mpsc::Receiver<Result<ResponseEvent, ApiError>>,
+    pub rx_event: ResponseEventReceiver<ApiError>,
     /// Server-assigned `x-request-id` response header, when present.
     pub upstream_request_id: Option<String>,
 }

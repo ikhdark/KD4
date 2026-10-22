@@ -478,7 +478,9 @@ async fn send_add_credits_nudge_email_forwards_body_and_maps_backend_outcomes() 
             .and(path("/api/codex/accounts/send_add_credits_nudge_email"))
             .and(header("authorization", "Bearer chatgpt-token"))
             .and(header("chatgpt-account-id", "account-123"))
-            .and(wiremock::matchers::body_json(json!({"credit_type": "credits"})))
+            .and(wiremock::matchers::body_json(
+                json!({"credit_type": "credits"}),
+            ))
             .respond_with(ResponseTemplate::new(status).set_body_string("boom"))
             .expect(1)
             .mount(&server)
@@ -504,7 +506,13 @@ async fn send_add_credits_nudge_email_forwards_body_and_maps_backend_outcomes() 
             .await??;
             assert_eq!(error.id, RequestId::Integer(request_id));
             assert_eq!(error.error.code, INTERNAL_ERROR_CODE);
-            assert!(error.error.message.contains("failed to notify workspace owner"), "{error:?}");
+            assert!(
+                error
+                    .error
+                    .message
+                    .contains("failed to notify workspace owner"),
+                "{error:?}"
+            );
             assert_eq!(error.error.data, None);
         }
         server.verify().await;

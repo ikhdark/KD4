@@ -1,5 +1,7 @@
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
+#[path = "active_stream_replay.rs"]
+mod active_stream_replay;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadGoal;
@@ -227,6 +229,7 @@ struct ItemLocation {
 #[derive(Default)]
 struct ThreadTurnIndex {
     initialized: bool,
+    rollback_eligible_turn_ids: HashSet<String>,
     order: Vec<String>,
     turn_positions: HashMap<String, usize>,
     turns: HashMap<String, Turn>,
@@ -257,6 +260,7 @@ impl ThreadTurnIndex {
         if !changes.removed_turn_ids.is_empty() {
             for turn_id in changes.removed_turn_ids {
                 self.turns.remove(&turn_id);
+                self.rollback_eligible_turn_ids.remove(&turn_id);
             }
             self.order
                 .retain(|candidate| self.turns.contains_key(candidate));
@@ -598,7 +602,9 @@ pub(crate) struct ThreadState {
     last_thread_settings: Option<ThreadSettings>,
     listener_command_tx: Option<mpsc::Sender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
+    active_stream_replay: active_stream_replay::ActiveStreamReplay,
     turn_index: ThreadTurnIndex,
+    turn_index_source_partial: bool,
     turn_index_rollback_generation: u64,
     rolled_back_wait_ids: HashSet<String>,
     turn_origin_tracker: TurnOriginTracker,
@@ -749,6 +755,12 @@ impl ThreadState {
         self.current_turn_history.active_turn_snapshot()
     }
 
+    pub(crate) fn active_stream_replay(
+        &self,
+    ) -> Vec<codex_app_server_protocol::ServerNotification> {
+        self.active_stream_replay.snapshot()
+    }
+
     pub(crate) fn active_turn_id(&self) -> Option<&str> {
         self.current_turn_history.active_turn_id()
     }
@@ -759,6 +771,9 @@ impl ThreadState {
         page_size: usize,
         sort_direction: SortDirection,
     ) -> Result<Option<IndexedTurnPage>, ()> {
+        if self.turn_index_source_partial {
+            return Err(());
+        }
         self.turn_index.page(anchor, page_size, sort_direction)
     }
 
@@ -769,6 +784,9 @@ impl ThreadState {
         page_size: usize,
         sort_direction: SortDirection,
     ) -> Result<Option<IndexedItemPage>, ()> {
+        if self.turn_index_source_partial {
+            return Err(());
+        }
         self.turn_index
             .items_page(turn_id_filter, anchor, page_size, sort_direction)
     }
@@ -784,6 +802,19 @@ impl ThreadState {
         items: &[RolloutItem],
         expected_generation: u64,
     ) -> Result<(), ()> {
+        if codex_rollout::ensure_rollout_source_integrity(items).is_err() {
+            if self.turn_index_rollback_generation == expected_generation {
+                self.turn_index_source_partial = true;
+            }
+            return Err(());
+        }
+        if self.turn_index_source_partial {
+            if self.turn_index_rollback_generation != expected_generation {
+                return Err(());
+            }
+            self.seed_turn_index_from_history(items);
+            return Ok(());
+        }
         if self.turn_index.initialized {
             return Ok(());
         }
@@ -797,12 +828,29 @@ impl ThreadState {
     /// Seeds a synchronous history snapshot while preserving live additions.
     /// Asynchronous readers must use the generation-checked entrypoint above.
     pub(crate) fn seed_turn_index_from_history(&mut self, items: &[RolloutItem]) {
+        self.turn_index_source_partial =
+            codex_rollout::ensure_rollout_source_integrity(items).is_err();
         let live_index = std::mem::take(&mut self.turn_index);
         let mut builder = ThreadHistoryBuilder::new();
         for item in items {
             let changes = builder.handle_rollout_item_with_changes(item);
+            for turn_id in changes
+                .changed_turns
+                .iter()
+                .map(|change| &change.turn_id)
+                .chain(changes.changed_items.iter().map(|change| &change.turn_id))
+            {
+                if builder.is_rollback_eligible_turn(turn_id) {
+                    self.turn_index
+                        .rollback_eligible_turn_ids
+                        .insert(turn_id.clone());
+                }
+            }
             self.turn_index.apply_changes(changes);
         }
+        self.turn_index
+            .rollback_eligible_turn_ids
+            .extend(live_index.rollback_eligible_turn_ids);
         for turn_id in live_index.order {
             if let Some(turn) = live_index.turns.get(&turn_id).cloned() {
                 self.turn_index.overlay_turn(turn);
@@ -824,9 +872,13 @@ impl ThreadState {
     }
 
     pub(crate) fn is_current_summary_turn(&self, turn_id: &str) -> bool {
-        self.turn_summary_id.as_deref()
+        self.turn_summary_id
+            .as_deref()
             .or_else(|| self.in_progress_turn_id())
-            .map_or(!self.pending_turn_summaries.contains_key(turn_id), |current| current == turn_id)
+            .map_or(
+                !self.pending_turn_summaries.contains_key(turn_id),
+                |current| current == turn_id,
+            )
     }
 
     pub(crate) fn turn_summary_for(&self, turn_id: &str) -> Option<&TurnSummary> {
@@ -866,6 +918,7 @@ impl ThreadState {
         event_turn_id: &str,
         event: &EventMsg,
     ) -> Vec<ThreadHistoryItemChange> {
+        self.active_stream_replay.track(event_turn_id, event);
         if let EventMsg::TurnStarted(payload) = event {
             if self.turn_summary_id.as_deref() != Some(event_turn_id) {
                 let previous = std::mem::take(&mut self.turn_summary);
@@ -881,8 +934,18 @@ impl ThreadState {
                 self.turn_index_rollback_generation.wrapping_add(1);
             // The current-turn reducer is reset at terminal boundaries. Only
             // the pagination index retains the complete ordered live history.
-            let retained = self.turn_index.order.len()
-                .saturating_sub(usize::try_from(rollback.num_turns).unwrap_or(usize::MAX));
+            let mut remaining = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
+            let mut retained = self.turn_index.order.len();
+            while retained > 0 && remaining > 0 {
+                retained -= 1;
+                if self
+                    .turn_index
+                    .rollback_eligible_turn_ids
+                    .contains(&self.turn_index.order[retained])
+                {
+                    remaining -= 1;
+                }
+            }
             let removed_turn_ids = self.turn_index.order[retained..].to_vec();
             for turn_id in &removed_turn_ids {
                 self.pending_turn_summaries.remove(turn_id);
@@ -890,13 +953,18 @@ impl ThreadState {
                     self.turn_summary_id = None;
                     self.turn_summary = TurnSummary::default();
                 }
-                self.rolled_back_wait_ids.extend(self.turn_index.turns[turn_id].items.iter()
-                    .filter_map(|item| match item {
-                        codex_app_server_protocol::ThreadItem::CollabAgentToolCall {
-                            id, tool: codex_app_server_protocol::CollabAgentTool::Wait, ..
-                        } => Some(id.clone()),
-                        _ => None,
-                    }));
+                self.rolled_back_wait_ids.extend(
+                    self.turn_index.turns[turn_id]
+                        .items
+                        .iter()
+                        .filter_map(|item| match item {
+                            codex_app_server_protocol::ThreadItem::CollabAgentToolCall {
+                                id,
+                                ..
+                            } => Some(id.clone()),
+                            _ => None,
+                        }),
+                );
             }
             self.current_turn_history.handle_event(event);
             self.turn_index.apply_changes(ThreadHistoryChangeSet {
@@ -905,14 +973,37 @@ impl ThreadState {
             });
             return Vec::new();
         }
+        if let EventMsg::RawResponseItem(payload) = event {
+            // Every listener requests these events, including trusted mailbox
+            // inputs that have no visible UserMessage. Do not expose raw bytes
+            // or resurrect a removed turn just to retain rollback provenance.
+            if self.turn_index.turns.contains_key(event_turn_id)
+                && self
+                    .current_turn_history
+                    .record_raw_user_turn_boundary(event_turn_id, &payload.item)
+            {
+                self.turn_index
+                    .rollback_eligible_turn_ids
+                    .insert(event_turn_id.to_string());
+            }
+            return Vec::new();
+        }
         // Legacy wait completions lack a turn id. Resolve their owner from the
         // durable index, preferring the current owner just as replay does.
-        let wait_owner = if let EventMsg::CollabWaitingEnd(payload) = event {
-            let owns_wait = |turn: &&Turn| turn.items.iter().any(|item| matches!(item,
+        let wait_owner = if let Some((call_id, operation)) =
+            ThreadHistoryBuilder::legacy_collab_end_identity(event)
+        {
+            let owns_wait = |turn: &&Turn| {
+                turn.items.iter().any(|item| {
+                    matches!(item,
                 codex_app_server_protocol::ThreadItem::CollabAgentToolCall {
-                    id, tool: codex_app_server_protocol::CollabAgentTool::Wait, ..
-                } if id == &payload.call_id));
-            let current = self.current_turn_history.active_turn_id()
+                    id, tool, ..
+                } if id == call_id && *tool == operation)
+                })
+            };
+            let current = self
+                .current_turn_history
+                .active_turn_id()
                 .and_then(|id| self.turn_index.turns.get(id))
                 .filter(owns_wait);
             if let Some(turn) = current {
@@ -921,7 +1012,7 @@ impl ThreadState {
                 let mut owners = self.turn_index.turns.values().filter(owns_wait);
                 let first = owners.next().map(|turn| turn.id.clone());
                 if owners.next().is_some()
-                    || (first.is_none() && self.rolled_back_wait_ids.contains(&payload.call_id))
+                    || (first.is_none() && self.rolled_back_wait_ids.contains(call_id))
                 {
                     return Vec::new();
                 }
@@ -936,8 +1027,11 @@ impl ThreadState {
             .and_then(|id| self.turn_index.turns.get_mut(id).map(|turn| (id, turn)));
         let has_retained_turn = retained_turn.is_some();
         let changes = if let Some((turn_id, turn)) = retained_turn {
-            let changes = self.current_turn_history.handle_event_with_retained_turn(event, turn);
-            self.turn_index.refresh_retained_turn_item_locations(turn_id);
+            let changes = self
+                .current_turn_history
+                .handle_event_with_retained_turn(event, turn);
+            self.turn_index
+                .refresh_retained_turn_item_locations(turn_id);
             changes
         } else {
             self.current_turn_history.handle_event_with_changes(event)
@@ -963,6 +1057,18 @@ impl ThreadState {
         } else {
             Vec::new()
         };
+        for turn_id in changes
+            .changed_turns
+            .iter()
+            .map(|change| &change.turn_id)
+            .chain(changes.changed_items.iter().map(|change| &change.turn_id))
+        {
+            if self.current_turn_history.is_rollback_eligible_turn(turn_id) {
+                self.turn_index
+                    .rollback_eligible_turn_ids
+                    .insert(turn_id.clone());
+            }
+        }
         if !has_retained_turn {
             self.turn_index.apply_changes(changes);
         }
@@ -988,6 +1094,11 @@ impl ThreadState {
     ) -> bool {
         if self.listener_generation != listener_generation || self.listener_command_tx.is_none() {
             return false;
+        }
+        if codex_rollout::ensure_rollout_source_integrity(items).is_err() {
+            self.turn_index_source_partial = true;
+        } else if self.turn_index_source_partial {
+            self.seed_turn_index_from_history(items);
         }
         // Persisted history can lag events already consumed by this listener.
         // Keep the live turn, including its pending approvals, when rejoining it.
@@ -1085,8 +1196,43 @@ pub(crate) async fn resolve_server_request_on_thread_listener(
 }
 
 #[cfg(test)]
+#[path = "thread_state_compat_tests.rs"]
+mod compatibility_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_audit_14_live_indexes_do_not_publish_partial_source_as_clean() {
+        let notice: codex_protocol::models::ResponseItem =
+            serde_json::from_value(serde_json::json!({
+                "type": "message", "id": "msg_rollout_gap_1", "role": "developer",
+                "content": [{"type": "input_text", "text": "source history incomplete"}]
+            }))
+            .unwrap();
+        let mut state = ThreadState::default();
+        state.seed_turn_index_from_history(&[RolloutItem::ResponseItem(notice)]);
+        assert!(
+            state
+                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .is_err()
+        );
+        assert!(
+            state
+                .indexed_items_page(None, None, 10, SortDirection::Asc)
+                .is_err()
+        );
+        let generation = state.turn_index_history_generation();
+        state
+            .try_seed_turn_index_from_history(&[], generation)
+            .unwrap();
+        assert!(
+            state
+                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .is_ok()
+        );
+    }
     use codex_app_server_protocol::AskForApproval;
     use codex_app_server_protocol::SandboxPolicy;
     use codex_protocol::config_types::CollaborationMode;
@@ -1193,6 +1339,29 @@ mod tests {
     }
 
     #[test]
+    fn environment_order_and_disabled_selection_are_effective_settings_changes() {
+        let mut state = ThreadState::default();
+        let mut settings = thread_settings("mock-model");
+        let cwd = codex_utils_path_uri::PathUri::from_abs_path(&settings.cwd);
+        settings.environments = Some(
+            ["A", "B"]
+                .into_iter()
+                .map(|id| codex_app_server_protocol::ThreadSelectedEnvironment {
+                    environment_id: id.into(),
+                    cwd: cwd.clone(),
+                })
+                .collect(),
+        );
+        assert!(state.note_thread_settings(settings.clone()));
+        assert!(!state.note_thread_settings(settings.clone()));
+        settings.environments.as_mut().unwrap().reverse();
+        assert!(state.note_thread_settings(settings.clone()));
+        settings.environments = Some(Vec::new());
+        assert!(state.note_thread_settings(settings.clone()));
+        assert!(!state.note_thread_settings(settings));
+    }
+
+    #[test]
     fn turn_started_claims_the_origin_reserved_for_its_canonical_id() {
         let mut state = ThreadState::default();
         let turn_id = "turn-1".to_string();
@@ -1201,9 +1370,7 @@ mod tests {
         drop(cancelled);
         assert_eq!(tracker.take(&turn_id), None);
         let replaced = tracker.reserve(turn_id.clone(), ConnectionId(6));
-        tracker
-            .reserve(turn_id.clone(), ConnectionId(7))
-            .commit();
+        tracker.reserve(turn_id.clone(), ConnectionId(7)).commit();
         drop(replaced);
 
         state.track_current_turn_event(
@@ -1230,27 +1397,46 @@ mod tests {
         for successor_finishes_first in [false, true] {
             let mut state = ThreadState::default();
             for (id, started_at) in [("a", 1), ("b", 2)] {
-                state.turn_origin_tracker().reserve(id.to_string(), ConnectionId(started_at as u64)).commit();
-                state.track_current_turn_event(id, &EventMsg::TurnStarted(
-                    codex_protocol::protocol::TurnStartedEvent {
-                        turn_id: id.to_string(), trace_id: None, started_at: Some(started_at),
-                        model_context_window: None, collaboration_mode_kind: ModeKind::Default,
-                    },
-                ));
-                assert!(state.turn_summary.last_error.is_none(), "new turn must not inherit an error");
+                state
+                    .turn_origin_tracker()
+                    .reserve(id.to_string(), ConnectionId(started_at as u64))
+                    .commit();
+                state.track_current_turn_event(
+                    id,
+                    &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                        turn_id: id.to_string(),
+                        trace_id: None,
+                        started_at: Some(started_at),
+                        model_context_window: None,
+                        collaboration_mode_kind: ModeKind::Default,
+                    }),
+                );
+                assert!(
+                    state.turn_summary.last_error.is_none(),
+                    "new turn must not inherit an error"
+                );
                 state.turn_summary.last_error = Some(TurnError {
-                    message: id.to_string(), codex_error_info: None, additional_details: None,
+                    message: id.to_string(),
+                    codex_error_info: None,
+                    additional_details: None,
                 });
             }
             assert_eq!(state.pending_turn_summaries.len(), 1);
             assert!(!state.is_current_summary_turn("a"));
             assert!(state.is_current_summary_turn("b"));
-            let order = if successor_finishes_first { ["b", "a"] } else { ["a", "b"] };
+            let order = if successor_finishes_first {
+                ["b", "a"]
+            } else {
+                ["a", "b"]
+            };
             for id in order {
                 let summary = state.take_turn_summary(id);
                 let ordinal = if id == "a" { 1 } else { 2 };
                 assert_eq!(summary.started_at, Some(ordinal));
-                assert_eq!(summary.origin_connection_id, Some(ConnectionId(ordinal as u64)));
+                assert_eq!(
+                    summary.origin_connection_id,
+                    Some(ConnectionId(ordinal as u64))
+                );
                 assert_eq!(summary.last_error.expect("own error").message, id);
             }
             assert!(state.pending_turn_summaries.is_empty());
@@ -1259,7 +1445,9 @@ mod tests {
         }
 
         let mut state = ThreadState::default();
-        state.pending_turn_summaries.insert("unfinished".to_string(), TurnSummary::default());
+        state
+            .pending_turn_summaries
+            .insert("unfinished".to_string(), TurnSummary::default());
         state.turn_summary_id = Some("current".to_string());
         state.clear_listener();
         assert!(state.pending_turn_summaries.is_empty());
@@ -1574,10 +1762,15 @@ mod tests {
                         thread_id: ThreadId::new(),
                         turn_id: turn_id.to_string(),
                         completed_at_ms: 0,
-                        item: codex_protocol::items::TurnItem::Plan(
-                            codex_protocol::items::PlanItem {
+                        // Rollback units are user work, not maintenance turns.
+                        item: codex_protocol::items::TurnItem::UserMessage(
+                            codex_protocol::items::UserMessageItem {
                                 id: format!("item-{turn_id}"),
-                                text: turn_id.to_string(),
+                                client_id: None,
+                                content: vec![codex_protocol::user_input::UserInput::Text {
+                                    text: turn_id.to_string(),
+                                    text_elements: Vec::new(),
+                                }],
                             },
                         ),
                     }),
@@ -1594,9 +1787,10 @@ mod tests {
                     .try_seed_turn_index_from_history(&history, generation)
                     .unwrap();
             }
-            let rollback = EventMsg::ThreadRolledBack(
-                codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
-            );
+            let rollback =
+                EventMsg::ThreadRolledBack(codex_protocol::protocol::ThreadRolledBackEvent {
+                    num_turns: 1,
+                });
             state.track_current_turn_event("", &rollback);
             let stale_read = state.try_seed_turn_index_from_history(&history, generation);
             if initialized_by_other_reader {
@@ -1604,10 +1798,12 @@ mod tests {
                 assert!(stale_read.is_ok());
             } else {
                 assert!(stale_read.is_err());
-                assert!(state
-                    .indexed_turns_page(None, 10, SortDirection::Asc)
-                    .unwrap()
-                    .is_none());
+                assert!(
+                    state
+                        .indexed_turns_page(None, 10, SortDirection::Asc)
+                        .unwrap()
+                        .is_none()
+                );
                 // A fresh read containing the rollback can initialize normally.
                 history.push(RolloutItem::EventMsg(rollback));
                 let generation = state.turn_index_history_generation();
@@ -1627,17 +1823,21 @@ mod tests {
                 .unwrap();
             assert_eq!(items.items.len(), 1);
             assert_eq!(items.items[0].item.id(), "item-turn-1");
-            assert!(state
-                .indexed_turns_page(Some(("turn-2", false)), 10, SortDirection::Asc)
-                .is_err());
-            assert!(state
-                .indexed_items_page(
-                    None,
-                    Some(("turn-2", "item-turn-2", false)),
-                    10,
-                    SortDirection::Asc,
-                )
-                .is_err());
+            assert!(
+                state
+                    .indexed_turns_page(Some(("turn-2", false)), 10, SortDirection::Asc)
+                    .is_err()
+            );
+            assert!(
+                state
+                    .indexed_items_page(
+                        None,
+                        Some(("turn-2", "item-turn-2", false)),
+                        10,
+                        SortDirection::Asc,
+                    )
+                    .is_err()
+            );
         }
     }
 
@@ -1867,7 +2067,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            turns.turns.iter().map(|turn| turn.id.as_str()).collect::<Vec<_>>(),
+            turns
+                .turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["first"]
         );
         let items = state
@@ -1876,7 +2080,11 @@ mod tests {
             .unwrap();
         assert_eq!(items.items.len(), 1);
         assert_eq!(items.items[0].turn_id, "first");
-        assert!(state.indexed_turns_page(Some(("second", false)), 1, SortDirection::Asc).is_err());
+        assert!(
+            state
+                .indexed_turns_page(Some(("second", false)), 1, SortDirection::Asc)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1909,6 +2117,7 @@ mod tests {
         }
         // A unified-exec PTY can exit after its turn completes and another starts.
         let completed = EventMsg::ExecCommandEnd(codex_protocol::protocol::ExecCommandEndEvent {
+            environment: None,
             call_id: "late-command".into(),
             output_metadata: None,
             process_id: Some("pty-1".into()),
@@ -1934,10 +2143,17 @@ mod tests {
         assert_eq!(active.id, "second");
         assert_eq!(active.status, TurnStatus::InProgress);
         assert_eq!(active.items.len(), 1);
-        let page = state.indexed_items_page(None, None, 10, SortDirection::Asc)
-            .unwrap().unwrap();
-        assert_eq!(page.items.iter().map(|item| item.turn_id.as_str()).collect::<Vec<_>>(),
-            vec!["first", "first", "second"]);
+        let page = state
+            .indexed_items_page(None, None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "first", "second"]
+        );
         assert!(matches!(&page.items[1].item,
             codex_app_server_protocol::ThreadItem::CommandExecution {
                 id, status: codex_app_server_protocol::CommandExecutionStatus::Completed,
@@ -1945,13 +2161,29 @@ mod tests {
             } if id == "late-command" && output == "done"));
 
         // Removed owners must not be recreated by a delayed process exit.
-        state.track_current_turn_event("", &EventMsg::ThreadRolledBack(
-            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 2 }));
+        state.track_current_turn_event(
+            "",
+            &EventMsg::ThreadRolledBack(codex_protocol::protocol::ThreadRolledBackEvent {
+                num_turns: 2,
+            }),
+        );
         state.track_current_turn_event("first", &completed);
-        assert!(state.indexed_turns_page(None, 10, SortDirection::Asc)
-            .unwrap().unwrap().turns.is_empty());
-        assert!(state.indexed_items_page(None, None, 10, SortDirection::Asc)
-            .unwrap().unwrap().items.is_empty());
+        assert!(
+            state
+                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .unwrap()
+                .unwrap()
+                .turns
+                .is_empty()
+        );
+        assert!(
+            state
+                .indexed_items_page(None, None, 10, SortDirection::Asc)
+                .unwrap()
+                .unwrap()
+                .items
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1959,13 +2191,14 @@ mod tests {
         let mut state = ThreadState::default();
         state.seed_turn_index_from_history(&[]);
         let sender = ThreadId::new();
-        let begin = EventMsg::CollabWaitingBegin(codex_protocol::protocol::CollabWaitingBeginEvent {
-            started_at_ms: 0,
-            sender_thread_id: sender,
-            receiver_thread_ids: Vec::new(),
-            receiver_agents: Vec::new(),
-            call_id: "wait-1".into(),
-        });
+        let begin =
+            EventMsg::CollabWaitingBegin(codex_protocol::protocol::CollabWaitingBeginEvent {
+                started_at_ms: 0,
+                sender_thread_id: sender,
+                receiver_thread_ids: Vec::new(),
+                receiver_agents: Vec::new(),
+                call_id: "wait-1".into(),
+            });
         let end = EventMsg::CollabWaitingEnd(codex_protocol::protocol::CollabWaitingEndEvent {
             sender_thread_id: sender,
             call_id: "wait-1".into(),
@@ -1973,46 +2206,68 @@ mod tests {
             agent_statuses: Vec::new(),
             statuses: HashMap::new(),
         });
-        let start = |id: &str| EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
-            turn_id: id.into(),
-            trace_id: None,
-            started_at: None,
-            model_context_window: None,
-            collaboration_mode_kind: ModeKind::Default,
-        });
+        let start = |id: &str| {
+            EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: id.into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::Default,
+            })
+        };
         state.track_current_turn_event("first", &start("first"));
         state.track_current_turn_event("first", &begin);
         state.track_current_turn_event("first", &terminal_event("first", "done"));
         state.track_current_turn_event("second", &start("second"));
         state.track_current_turn_event("first", &end);
         state.track_current_turn_event("first", &end);
-        let page = state.indexed_items_page(None, None, 10, SortDirection::Asc)
-            .unwrap().unwrap();
+        let page = state
+            .indexed_items_page(None, None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].turn_id, "first");
-        assert!(matches!(&page.items[0].item,
+        assert!(matches!(
+            &page.items[0].item,
             codex_app_server_protocol::ThreadItem::CollabAgentToolCall {
-                status: codex_app_server_protocol::CollabAgentToolCallStatus::Completed, ..
-            }));
+                status: codex_app_server_protocol::CollabAgentToolCallStatus::Completed,
+                ..
+            }
+        ));
         assert!(state.active_turn_snapshot().unwrap().items.is_empty());
 
-        state.track_current_turn_event("", &EventMsg::ThreadRolledBack(
-            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 2 }));
+        state.track_current_turn_event(
+            "",
+            &EventMsg::ThreadRolledBack(codex_protocol::protocol::ThreadRolledBackEvent {
+                num_turns: 2,
+            }),
+        );
         state.track_current_turn_event("first", &end);
-        assert!(state.indexed_turns_page(None, 10, SortDirection::Asc)
-            .unwrap().unwrap().turns.is_empty());
+        assert!(
+            state
+                .indexed_turns_page(None, 10, SortDirection::Asc)
+                .unwrap()
+                .unwrap()
+                .turns
+                .is_empty()
+        );
         // Reusing a call id in a real new turn is still allowed.
         state.track_current_turn_event("third", &start("third"));
         state.track_current_turn_event("third", &begin);
         state.track_current_turn_event("third", &end);
-        let page = state.indexed_items_page(None, None, 10, SortDirection::Asc)
-            .unwrap().unwrap();
+        let page = state
+            .indexed_items_page(None, None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].turn_id, "third");
-        assert!(matches!(&page.items[0].item,
+        assert!(matches!(
+            &page.items[0].item,
             codex_app_server_protocol::ThreadItem::CollabAgentToolCall {
-                status: codex_app_server_protocol::CollabAgentToolCallStatus::Completed, ..
-            }));
+                status: codex_app_server_protocol::CollabAgentToolCallStatus::Completed,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2048,23 +2303,26 @@ mod tests {
     fn late_abort_reconciles_retained_wait_without_interrupting_current_turn() {
         let mut state = ThreadState::default();
         state.seed_turn_index_from_history(&[]);
-        let start = |id: &str| EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
-            turn_id: id.into(),
-            trace_id: None,
-            started_at: None,
-            model_context_window: None,
-            collaboration_mode_kind: ModeKind::Default,
-        });
+        let start = |id: &str| {
+            EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: id.into(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::Default,
+            })
+        };
         state.track_current_turn_event("first", &start("first"));
-        state.track_current_turn_event("first", &EventMsg::CollabWaitingBegin(
-            codex_protocol::protocol::CollabWaitingBeginEvent {
+        state.track_current_turn_event(
+            "first",
+            &EventMsg::CollabWaitingBegin(codex_protocol::protocol::CollabWaitingBeginEvent {
                 started_at_ms: 0,
                 sender_thread_id: ThreadId::new(),
                 receiver_thread_ids: Vec::new(),
                 receiver_agents: Vec::new(),
                 call_id: "pending-wait".into(),
-            },
-        ));
+            }),
+        );
         state.track_current_turn_event("first", &terminal_event("first", "done"));
         state.track_current_turn_event("second", &start("second"));
         let reconciled = state.track_current_turn_event_with_reconciled_wait_items(
@@ -2083,13 +2341,17 @@ mod tests {
             codex_app_server_protocol::ThreadItem::CollabAgentToolCall {
                 id, status: codex_app_server_protocol::CollabAgentToolCallStatus::Failed, ..
             } if id == "pending-wait"));
-        let page = state.indexed_items_page(None, None, 10, SortDirection::Asc)
-            .unwrap().unwrap();
+        let page = state
+            .indexed_items_page(None, None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].turn_id, "first");
         assert_eq!(page.items[0].item, reconciled[0].item);
-        let turns = state.indexed_turns_page(None, 10, SortDirection::Asc)
-            .unwrap().unwrap();
+        let turns = state
+            .indexed_turns_page(None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
         assert_eq!(turns.turns[0].status, TurnStatus::Interrupted);
         assert_eq!(turns.turns[1].status, TurnStatus::InProgress);
         assert_eq!(state.in_progress_turn_id(), Some("second"));
@@ -2240,6 +2502,7 @@ mod tests {
 
     fn thread_settings(model: &str) -> ThreadSettings {
         ThreadSettings {
+            environments: None,
             cwd: AbsolutePathBuf::from_absolute_path("/tmp").expect("absolute path"),
             approval_policy: AskForApproval::OnRequest,
             sandbox_policy: SandboxPolicy::ReadOnly {
@@ -2267,6 +2530,7 @@ mod tests {
 
 struct ThreadEntry {
     state: Arc<Mutex<ThreadState>>,
+    volatile_project: Option<(Weak<CodexThread>, String)>,
     connection_ids: HashSet<ConnectionId>,
     has_connections_watcher: watch::Sender<bool>,
 }
@@ -2275,6 +2539,7 @@ impl Default for ThreadEntry {
     fn default() -> Self {
         Self {
             state: Arc::new(Mutex::new(ThreadState::default())),
+            volatile_project: None,
             connection_ids: HashSet::new(),
             has_connections_watcher: watch::channel(false).0,
         }
@@ -2651,6 +2916,62 @@ impl ThreadStateManager {
         state.threads.entry(thread_id).or_default().state.clone()
     }
 
+    /// Read-only history access must not create a lifecycle entry without a
+    /// listener/subscription owner to dispose of it.
+    pub(crate) async fn existing_thread_state(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<Arc<Mutex<ThreadState>>> {
+        self.state
+            .lock()
+            .await
+            .threads
+            .get(&thread_id)
+            .map(|entry| Arc::clone(&entry.state))
+    }
+
+    pub(crate) async fn set_volatile_project(
+        &self,
+        id: ThreadId,
+        thread: &Arc<CodexThread>,
+        project: String,
+    ) {
+        self.state
+            .lock()
+            .await
+            .threads
+            .entry(id)
+            .or_default()
+            .volatile_project = Some((Arc::downgrade(thread), project));
+    }
+
+    pub(crate) async fn volatile_project(
+        &self,
+        id: ThreadId,
+        thread: &CodexThread,
+    ) -> Option<String> {
+        let state = self.state.lock().await;
+        let (owner, project) = state.threads.get(&id)?.volatile_project.as_ref()?;
+        let owner = owner.upgrade()?;
+        std::ptr::eq(owner.as_ref(), thread).then(|| project.clone())
+    }
+
+    pub(crate) async fn clear_volatile_project(&self, project: &str) -> Vec<String> {
+        let mut state = self.state.lock().await;
+        let mut affected = Vec::new();
+        for (id, entry) in &mut state.threads {
+            if entry
+                .volatile_project
+                .as_ref()
+                .is_some_and(|(owner, assigned)| assigned == project && owner.strong_count() > 0)
+            {
+                entry.volatile_project = None;
+                affected.push(id.to_string());
+            }
+        }
+        affected
+    }
+
     pub(crate) fn current_listener_command_tx(
         &self,
         thread_id: ThreadId,
@@ -2911,5 +3232,130 @@ impl ThreadStateManager {
             .threads
             .get(&thread_id)
             .map(|thread_entry| thread_entry.has_connections_watcher.subscribe())
+    }
+}
+#[cfg(test)]
+mod history_lookup_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn absent_history_lookups_do_not_allocate_or_remove_live_state() {
+        let manager = ThreadStateManager::new();
+        let live_id = ThreadId::new();
+        let live = manager.thread_state(live_id).await;
+        for _ in 0..10_000 {
+            assert!(
+                manager
+                    .existing_thread_state(ThreadId::new())
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(manager.state.lock().await.threads.len(), 1);
+        assert!(Arc::ptr_eq(
+            &live,
+            &manager.existing_thread_state(live_id).await.unwrap()
+        ));
+    }
+
+    fn started(id: &str) -> EventMsg {
+        EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+            turn_id: id.into(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        })
+    }
+
+    fn completed(id: &str) -> EventMsg {
+        EventMsg::TurnComplete(codex_protocol::protocol::TurnCompleteEvent {
+            turn_id: id.into(),
+            last_agent_message: None,
+            error: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+            timing: None,
+            surfaced_result: None,
+        })
+    }
+
+    #[test]
+    fn live_suffix_and_replayed_prefix_share_synthetic_item_identity() {
+        let input = |text: &str| {
+            EventMsg::UserMessage(codex_protocol::protocol::UserMessageEvent {
+                message: text.into(),
+                ..Default::default()
+            })
+        };
+        let history = [
+            started("a"),
+            input("earlier"),
+            completed("a"),
+            started("b"),
+            input("current"),
+        ]
+        .into_iter()
+        .map(RolloutItem::EventMsg)
+        .collect::<Vec<_>>();
+        let mut state = ThreadState::default();
+        state.track_current_turn_event("b", &started("b"));
+        state.track_current_turn_event("b", &input("current"));
+        let live = state.active_turn_snapshot().unwrap();
+        let generation = state.turn_index_history_generation();
+        state
+            .try_seed_turn_index_from_history(&history, generation)
+            .unwrap();
+        let page = state
+            .indexed_items_page(Some("b"), None, 10, SortDirection::Asc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "history seeding must not duplicate the live user message"
+        );
+        assert_eq!(page.items[0].item, live.items[0]);
+        let mut replay = ThreadHistoryBuilder::new();
+        for item in &history {
+            replay.handle_rollout_item(item);
+        }
+        assert_eq!(replay.finish()[1].items[0], page.items[0].item);
+    }
+
+    #[test]
+    fn active_stream_recovery_remains_partial_until_canonical_completion() {
+        use codex_app_server_protocol::ServerNotification;
+        let mut state = ThreadState::default();
+        state.track_current_turn_event("b", &started("b"));
+        for text in ["prefix-", "suffix"] {
+            state.track_current_turn_event(
+                "b",
+                &EventMsg::AgentMessageContentDelta(
+                    codex_protocol::protocol::AgentMessageContentDeltaEvent {
+                        thread_id: "thread".into(),
+                        turn_id: "b".into(),
+                        item_id: "assistant".into(),
+                        delta: text.into(),
+                    },
+                ),
+            );
+        }
+        let prefix = state.active_stream_replay();
+        assert!(
+            matches!(&prefix[..], [ServerNotification::AgentMessageDelta(delta)]
+            if delta.item_id == "assistant" && delta.delta == "prefix-suffix")
+        );
+        assert_eq!(
+            state.active_turn_snapshot().unwrap().status,
+            TurnStatus::InProgress
+        );
+        assert!(
+            state.active_turn_snapshot().unwrap().items.is_empty(),
+            "a live prefix must not be replayed as a completed assistant item"
+        );
+        state.track_current_turn_event("b", &completed("b"));
+        assert!(state.active_stream_replay().is_empty());
     }
 }

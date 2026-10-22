@@ -24,6 +24,7 @@ pub use bundle::REDUCED_STATE_FILE_NAME;
 pub use code_cell::CodeCellTraceContext;
 /// Raw checkpoint payload for a remote compaction install event.
 pub use compaction::CompactionCheckpointTracePayload;
+pub use compaction::CompactionResponseReceipt;
 /// No-op-capable handle for recording remote-compaction requests.
 pub use compaction::CompactionTraceAttempt;
 /// Shared recorder context for a compaction checkpoint.
@@ -52,6 +53,7 @@ pub use raw_event::RawTraceEvent;
 pub use raw_event::RawTraceEventContext;
 /// Typed payload for one raw trace event.
 pub use raw_event::RawTraceEventPayload;
+pub use raw_event::TraceOccurrence;
 /// Replay a raw trace bundle into its reduced `RolloutTrace`; callers own any cache file.
 pub use reducer::replay_bundle;
 /// Raw payload captured when a child agent reports completion to its parent.

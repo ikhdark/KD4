@@ -83,10 +83,18 @@ pub(super) fn resolve_tool_response(
         Ok(result) => {
             let value = json_to_v8(&mut tc, &result)
                 .ok_or_else(|| "failed to serialize tool response".to_string())?;
-            if let Some(projected) = codex_code_mode_protocol::model_visible_tool_result(&tool_name, &result) {
+            if let Some(projected) =
+                codex_code_mode_protocol::model_visible_tool_result(&tool_name, &result)
+            {
                 let source_fragments = tool_name.namespace.is_none()
                     && matches!(tool_name.name.as_str(), "read_file" | "read_tool_output");
-                super::output_projection::register(&mut tc, value, &result, &projected, source_fragments)?;
+                super::output_projection::register(
+                    &mut tc,
+                    value,
+                    &result,
+                    &projected,
+                    source_fragments,
+                )?;
             }
             resolver.resolve(&tc, value);
         }
@@ -142,17 +150,30 @@ pub(super) fn resolve_notification_response(
 pub(super) extern "C" fn promise_rejected(message: v8::PromiseRejectMessage) {
     v8::callback_scope!(unsafe scope, &message);
     let promise = v8::Global::new(scope, message.get_promise());
-    let Some(state) = scope.get_slot_mut::<RuntimeState>() else { return; };
+    let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
+        return;
+    };
     match message.get_event() {
         v8::PromiseRejectEvent::PromiseRejectWithNoHandler => {
             if state.unhandled_rejections.len() < super::MAX_OUTSTANDING_CALLBACKS_PER_CELL {
                 state.unhandled_rejections.push(promise);
             } else {
-                state.rejection_tracking_overflow = true;
+                state.untracked_rejections += 1;
             }
         }
         v8::PromiseRejectEvent::PromiseHandlerAddedAfterReject => {
-            state.unhandled_rejections.retain(|pending| pending != &promise);
+            if let Some(index) = state
+                .unhandled_rejections
+                .iter()
+                .position(|pending| pending == &promise)
+            {
+                state.unhandled_rejections.swap_remove(index);
+            } else {
+                // V8 emits this event once, only for a rejected promise that
+                // previously had no handler. Keep handles bounded while still
+                // accounting for handled promises outside the retained prefix.
+                state.untracked_rejections = state.untracked_rejections.saturating_sub(1);
+            }
         }
         _ => {}
     }
@@ -166,17 +187,31 @@ pub(super) fn completion_state(
     pending_promise: Option<&v8::Global<v8::Promise>>,
 ) -> CompletionState {
     let unhandled = scope.get_slot::<RuntimeState>().and_then(|state| {
-        state.unhandled_rejections.iter().find(|promise| Some(*promise) != pending_promise).cloned()
+        state
+            .unhandled_rejections
+            .iter()
+            .find(|promise| Some(*promise) != pending_promise)
+            .cloned()
     });
     let async_error = if let Some(unhandled) = unhandled {
         let promise = v8::Local::new(scope, &unhandled);
         let reason = promise.result(scope);
-        if is_exit_exception(scope, reason) { None } else {
-            Some(format!("Unhandled promise rejection: {}", value_to_error_text(scope, reason)))
+        if is_exit_exception(scope, reason) {
+            None
+        } else {
+            Some(format!(
+                "Unhandled promise rejection: {}",
+                value_to_error_text(scope, reason)
+            ))
         }
-    } else if scope.get_slot::<RuntimeState>().is_some_and(|state| state.rejection_tracking_overflow) {
+    } else if scope
+        .get_slot::<RuntimeState>()
+        .is_some_and(|state| state.untracked_rejections != 0)
+    {
         Some("code mode cell exceeded its unhandled promise rejection tracking limit".to_string())
-    } else { None };
+    } else {
+        None
+    };
     let error_text = if async_error.is_some() {
         async_error
     } else if let Some(pending_promise) = pending_promise {
@@ -210,7 +245,11 @@ pub(super) fn completion_state(
     // Accepted notifications retain the existing drain contract. Tool calls are
     // cancelled by the owner at completion; make abandonment an explicit failure.
     let error_text = error_text.or_else(|| super::unawaited_tool_error(scope));
-    if error_text.is_none() && scope.get_slot::<RuntimeState>().is_some_and(|state| !state.exit_requested && !state.pending_notifications.is_empty()) {
+    if error_text.is_none()
+        && scope
+            .get_slot::<RuntimeState>()
+            .is_some_and(|state| !state.exit_requested && !state.pending_notifications.is_empty())
+    {
         return CompletionState::Pending;
     }
     let stored_value_writes = scope

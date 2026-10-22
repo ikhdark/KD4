@@ -240,18 +240,24 @@ impl ThreadWatchManager {
     }
 
     pub(crate) async fn note_harness_phases(
-        &self, thread_id: &str, phases: Vec<codex_protocol::protocol::HarnessPhase>,
+        &self,
+        thread_id: &str,
+        phases: Vec<codex_protocol::protocol::HarnessPhase>,
     ) {
         self.update_runtime_for_thread(thread_id, move |runtime| {
             if runtime.running {
                 runtime.harness_phases = phases;
             }
-        }).await;
+        })
+        .await;
     }
 
     pub(crate) async fn note_turn_aborted(&self, thread_id: &str, reason: &TurnAbortReason) {
-        let failed = matches!(reason, TurnAbortReason::InternalError | TurnAbortReason::ProcessLost)
-            .then_some(true);
+        let failed = matches!(
+            reason,
+            TurnAbortReason::InternalError | TurnAbortReason::ProcessLost
+        )
+        .then_some(true);
         self.clear_active_state(thread_id, failed).await;
     }
 
@@ -846,8 +852,18 @@ mod tests {
             active_flags: vec![ThreadActiveFlag::WaitingOnApproval],
         };
         for (status, in_progress_status) in [
-            (ThreadStatus::Idle, ThreadStatus::Active { active_flags: vec![] }),
-            (ThreadStatus::NotLoaded, ThreadStatus::Active { active_flags: vec![] }),
+            (
+                ThreadStatus::Idle,
+                ThreadStatus::Active {
+                    active_flags: vec![],
+                },
+            ),
+            (
+                ThreadStatus::NotLoaded,
+                ThreadStatus::Active {
+                    active_flags: vec![],
+                },
+            ),
             (ThreadStatus::SystemError, ThreadStatus::SystemError),
             (active.clone(), active),
         ] {
@@ -1262,26 +1278,38 @@ mod tests {
 
         for permission in [true, false] {
             let (request, expected_flag) = if permission {
-                let request = manager.note_permission_requested(INTERACTIVE_THREAD_ID).await;
+                let request = manager
+                    .note_permission_requested(INTERACTIVE_THREAD_ID)
+                    .await;
                 assert_pending_request_counts(&manager, 1, 0);
                 (request, ThreadActiveFlag::WaitingOnApproval)
             } else {
-                let request = manager.note_user_input_requested(INTERACTIVE_THREAD_ID).await;
+                let request = manager
+                    .note_user_input_requested(INTERACTIVE_THREAD_ID)
+                    .await;
                 assert_pending_request_counts(&manager, 0, 1);
                 (request, ThreadActiveFlag::WaitingOnUserInput)
             };
             assert_eq!(
                 *subscription.borrow(),
-                ThreadStatus::Active { active_flags: vec![expected_flag] }
+                ThreadStatus::Active {
+                    active_flags: vec![expected_flag]
+                }
             );
 
             drop(request);
             // No await, yield, receive or fresh manager operation can repair this state.
             assert_pending_request_counts(&manager, 0, 0);
             assert_eq!(*subscription.borrow(), ThreadStatus::Idle);
-            assert_eq!(outgoing_rx.len(), 1, "cleanup must not require draining the queue");
             assert_eq!(
-                manager.loaded_status_for_thread(INTERACTIVE_THREAD_ID).await,
+                outgoing_rx.len(),
+                1,
+                "cleanup must not require draining the queue"
+            );
+            assert_eq!(
+                manager
+                    .loaded_status_for_thread(INTERACTIVE_THREAD_ID)
+                    .await,
                 ThreadStatus::Idle
             );
         }

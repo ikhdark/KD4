@@ -18,6 +18,7 @@ pub(crate) mod sandboxing;
 pub(crate) use codex_command_analysis::shell_output_summary;
 pub(crate) mod spec_plan;
 pub(crate) mod tool_dispatch_trace;
+pub(crate) mod typed_validation;
 
 use std::borrow::Cow;
 

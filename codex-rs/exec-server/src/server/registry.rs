@@ -76,31 +76,42 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         |handler: Arc<ExecServerHandler>, params: ExecParams| async move { handler.exec(params).await },
     );
     router.request(
+        crate::protocol::EXEC_OWNED_METHOD,
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::OwnedProcessParams<ExecParams>| async move {
+            handler.exec_owned(params).await
+        },
+    );
+    router.request(
         ENVIRONMENT_INFO_METHOD,
         |handler: Arc<ExecServerHandler>, _params: ()| async move { handler.environment_info() },
     );
     router.request(
         EXEC_READ_METHOD,
-        |handler: Arc<ExecServerHandler>, params: ReadParams| async move {
-            handler.exec_read(params).await
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::OwnedProcessParams<ReadParams>| async move {
+            handler.read_owned(params).await
         },
     );
     router.request(
         EXEC_WRITE_METHOD,
-        |handler: Arc<ExecServerHandler>, params: WriteParams| async move {
-            handler.exec_write(params).await
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::OwnedProcessParams<WriteParams>| async move {
+            handler.write_owned(params).await
         },
     );
     router.request(
         EXEC_SIGNAL_METHOD,
-        |handler: Arc<ExecServerHandler>, params: SignalParams| async move {
-            handler.signal(params).await
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::OwnedProcessParams<SignalParams>| async move {
+            handler.signal_owned(params).await
         },
     );
     router.request(
         EXEC_TERMINATE_METHOD,
-        |handler: Arc<ExecServerHandler>, params: TerminateParams| async move {
-            handler.terminate(params).await
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::OwnedProcessParams<TerminateParams>| async move {
+            handler.terminate_owned(params).await
         },
     );
     router.request(
@@ -137,6 +148,13 @@ pub(crate) fn build_router() -> RpcRouter<ExecServerHandler> {
         FS_WRITE_FILE_METHOD,
         |handler: Arc<ExecServerHandler>, params: FsWriteFileParams| async move {
             handler.fs_write_file(params).await
+        },
+    );
+    router.request(
+        crate::protocol::FS_MUTATE_FILE_IF_MATCHES_METHOD,
+        |handler: Arc<ExecServerHandler>,
+         params: crate::protocol::FsMutateFileIfMatchesParams| async move {
+            handler.fs_mutate_file_if_matches(params).await
         },
     );
     router.request(

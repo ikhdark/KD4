@@ -524,9 +524,7 @@ mod tests {
         );
         assert_eq!(
             context.rg_command(),
-            canonical_path_dir
-                .join("rg.exe")
-                .into_path_buf()
+            canonical_path_dir.join("rg.exe").into_path_buf()
         );
         assert_eq!(
             context.bundled_resource(TEST_RESOURCE_NAME),
@@ -592,9 +590,7 @@ mod tests {
         );
         assert_eq!(
             context.rg_command(),
-            canonical_path_dir
-                .join("rg.exe")
-                .into_path_buf()
+            canonical_path_dir.join("rg.exe").into_path_buf()
         );
         assert_eq!(
             context.bundled_resource(TEST_RESOURCE_NAME),
@@ -633,9 +629,7 @@ mod tests {
         assert!(context.package_layout.is_some());
         assert_eq!(
             context.rg_command(),
-            canonical_path_dir
-                .join("rg.exe")
-                .into_path_buf()
+            canonical_path_dir.join("rg.exe").into_path_buf()
         );
         Ok(())
     }

@@ -33,10 +33,10 @@ use crate::sandboxed_file_system::SandboxedFileSystem;
 
 const MAX_READ_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
-fn file_too_large_error() -> io::Error {
+fn file_too_large_error(max_bytes: u64) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!("file is too large to read: limit is {MAX_READ_FILE_BYTES} bytes"),
+        format!("file is too large to read: {max_bytes}-byte read response limit"),
     )
 }
 
@@ -108,6 +108,25 @@ impl LocalFileSystem {
 }
 
 impl LocalFileSystem {
+    pub(crate) async fn read_file_capped(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Vec<u8>> {
+        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
+            return self
+                .sandboxed()?
+                .read_file_capped(path, max_bytes, sandbox)
+                .await;
+        }
+        reject_platform_sandbox_context(sandbox)?;
+        self.unsandboxed
+            .file_system
+            .read_file_capped(path, max_bytes, None)
+            .await
+    }
+
     pub(crate) async fn open_file_for_read(
         &self,
         path: &PathUri,
@@ -259,6 +278,35 @@ impl LocalFileSystem {
 }
 
 impl ExecutorFileSystem for LocalFileSystem {
+    fn mutate_file_if_matches<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(async move {
+            let (fs, sandbox) = self.file_system_for(sandbox)?;
+            fs.mutate_file_if_matches(path, expected, replacement, sandbox)
+                .await
+        })
+    }
+
+    fn uses_host_native_paths(&self) -> bool {
+        true
+    }
+
+    fn directory_case_sensitive<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            let (file_system, sandbox) = self.file_system_for(sandbox)?;
+            file_system.directory_case_sensitive(path, sandbox).await
+        })
+    }
+
     fn canonicalize<'a>(
         &'a self,
         path: &'a PathUri,
@@ -284,6 +332,20 @@ impl ExecutorFileSystem for LocalFileSystem {
         Box::pin(LocalFileSystem::read_file_bounded(
             self, path, max_bytes, sandbox,
         ))
+    }
+
+    fn read_file_bounded_with_source<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<(Vec<u8>, Option<PathBuf>)>> {
+        Box::pin(async move {
+            let (file_system, sandbox) = self.file_system_for(sandbox)?;
+            file_system
+                .read_file_bounded_with_source(path, max_bytes, sandbox)
+                .await
+        })
     }
 
     fn read_file_bounded_confined<'a>(
@@ -545,6 +607,36 @@ impl UnsandboxedFileSystem {
 }
 
 impl ExecutorFileSystem for UnsandboxedFileSystem {
+    fn mutate_file_if_matches<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system
+                .mutate_file_if_matches(path, expected, replacement, None)
+                .await
+        })
+    }
+
+    fn uses_host_native_paths(&self) -> bool {
+        true
+    }
+
+    fn directory_case_sensitive<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system.directory_case_sensitive(path, None).await
+        })
+    }
+
     fn canonicalize<'a>(
         &'a self,
         path: &'a PathUri,
@@ -570,6 +662,20 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         Box::pin(UnsandboxedFileSystem::read_file_bounded(
             self, path, max_bytes, sandbox,
         ))
+    }
+
+    fn read_file_bounded_with_source<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<(Vec<u8>, Option<PathBuf>)>> {
+        Box::pin(async move {
+            reject_platform_sandbox_context(sandbox)?;
+            self.file_system
+                .read_file_bounded_with_source(path, max_bytes, None)
+                .await
+        })
     }
 
     fn read_file_bounded_confined<'a>(
@@ -711,19 +817,21 @@ impl DirectFileSystem {
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Vec<u8>> {
         reject_sandbox_context(sandbox)?;
+        self.read_file_capped(path, MAX_READ_FILE_BYTES as usize, None)
+            .await
+    }
+
+    pub(crate) async fn read_file_capped(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Vec<u8>> {
+        reject_sandbox_context(sandbox)?;
+        let max_bytes = (max_bytes as u64).min(MAX_READ_FILE_BYTES);
         let path = path.to_abs_path()?;
         let (file, metadata) = regular_file::open_with_metadata(path.as_path()).await?;
-        if metadata.len() > MAX_READ_FILE_BYTES {
-            return Err(file_too_large_error());
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_READ_FILE_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        if bytes.len() as u64 > MAX_READ_FILE_BYTES {
-            return Err(file_too_large_error());
-        }
-        Ok(bytes)
+        read_file_payload_capped(file, metadata.len(), max_bytes).await
     }
 
     async fn read_file_bounded(
@@ -834,7 +942,14 @@ impl DirectFileSystem {
         let (metadata, is_symlink) = tokio::task::spawn_blocking(move || {
             let symlink_metadata = std::fs::symlink_metadata(path.as_path())?;
             if symlink_metadata.file_type().is_symlink() {
-                Ok::<_, io::Error>((std::fs::metadata(path.as_path())?, true))
+                // Preserve a known link entry when only its target is absent.
+                // Other target errors (notably permission/cycle errors) remain errors.
+                let metadata = match std::fs::metadata(path.as_path()) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => symlink_metadata,
+                    Err(error) => return Err(error),
+                };
+                Ok::<_, io::Error>((metadata, true))
             } else {
                 Ok((symlink_metadata, false))
             }
@@ -889,28 +1004,9 @@ impl DirectFileSystem {
         // Metadata and deletion share one worker handoff. Check cancellation
         // again before the destructive step, as the old await boundary allowed.
         run_cancellable_file_system_task(move |cancel| {
-            match std::fs::symlink_metadata(path.as_path()) {
-                Ok(metadata) => {
-                    check_file_system_cancelled(&cancel)?;
-                    let file_type = metadata.file_type();
-                    use std::os::windows::fs::FileTypeExt;
-
-                    if file_type.is_symlink_dir() {
-                        std::fs::remove_dir(path.as_path())?;
-                    } else if file_type.is_dir() {
-                        if options.recursive {
-                            std::fs::remove_dir_all(path.as_path())?;
-                        } else {
-                            std::fs::remove_dir(path.as_path())?;
-                        }
-                    } else {
-                        std::fs::remove_file(path.as_path())?;
-                    }
-                    Ok(())
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound && options.force => Ok(()),
-                Err(err) => Err(err),
-            }
+            remove_sync(path.as_path(), options, || {
+                check_file_system_cancelled(&cancel)
+            })
         })
         .await
     }
@@ -963,6 +1059,57 @@ impl DirectFileSystem {
 }
 
 impl ExecutorFileSystem for DirectFileSystem {
+    fn mutate_file_if_matches<'a>(
+        &'a self,
+        path: &'a PathUri,
+        expected: Option<Vec<u8>>,
+        replacement: Option<Vec<u8>>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, codex_file_system::FileMutationOutcome> {
+        Box::pin(async move {
+            reject_sandbox_context(sandbox)?;
+            let path = path.to_abs_path()?;
+            // Like ordinary writes, this owned worker must finish after caller
+            // cancellation so publication/recovery can be reconciled truthfully.
+            tokio::task::spawn_blocking(move || {
+                // Preserve existing final-file-symlink write semantics. The
+                // patch delta remains inexact for that nonordinary endpoint.
+                let target = if replacement.is_some() {
+                    codex_file_system::resolve_symlink_write_paths(path.as_path())?.write_path
+                } else {
+                    path.as_path().to_path_buf()
+                };
+                codex_file_system::mutate_file_if_matches(
+                    &target,
+                    expected.as_deref(),
+                    replacement.as_deref(),
+                )
+            })
+            .await
+            .map_err(io::Error::other)?
+        })
+    }
+
+    fn uses_host_native_paths(&self) -> bool {
+        true
+    }
+
+    fn directory_case_sensitive<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<bool>> {
+        Box::pin(async move {
+            reject_sandbox_context(sandbox)?;
+            let path = path.to_abs_path()?;
+            run_cancellable_file_system_task(move |cancel| {
+                check_file_system_cancelled(&cancel)?;
+                codex_file_system::directory_case_sensitive(path.as_path())
+            })
+            .await
+        })
+    }
+
     fn canonicalize<'a>(
         &'a self,
         path: &'a PathUri,
@@ -988,6 +1135,38 @@ impl ExecutorFileSystem for DirectFileSystem {
         Box::pin(DirectFileSystem::read_file_bounded(
             self, path, max_bytes, sandbox,
         ))
+    }
+
+    fn read_file_bounded_with_source<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<(Vec<u8>, Option<PathBuf>)>> {
+        Box::pin(async move {
+            reject_sandbox_context(sandbox)?;
+            let path = path.to_abs_path()?;
+            run_cancellable_file_system_task(move |cancel| {
+                let mut source = None;
+                let bytes = read_bounded_file_sync(
+                    || {
+                        let (file, metadata) = regular_file::open_sync(path.as_path())?;
+                        let opened = codex_file_system::resolved_file_path(&file)?;
+                        if source.as_ref().is_some_and(|first| first != &opened) {
+                            return Err(io::Error::other(
+                                "opened source changed during acquisition",
+                            ));
+                        }
+                        source = Some(opened);
+                        Ok((file, metadata))
+                    },
+                    max_bytes,
+                    &cancel,
+                )?;
+                Ok(bytes.map(|bytes| (bytes, source)))
+            })
+            .await
+        })
     }
 
     fn read_file_bounded_confined<'a>(
@@ -1066,42 +1245,16 @@ impl ExecutorFileSystem for DirectFileSystem {
         max_entries: usize,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
-        Box::pin(async move {
-            reject_sandbox_context(sandbox)?;
-            if max_entries == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "bounded directory read limit must be greater than zero",
-                ));
-            }
-            let path = path.to_abs_path()?;
-            run_cancellable_file_system_task(move |cancel| {
-                read_directory_sync(
-                    path.as_path(),
-                    Some(max_entries),
-                    &cancel,
-                    |name, metadata, is_symlink| {
-                        // Lossy names must still be probed through the URI the
-                        // walker will report, not classified as a different file.
-                        let snapshot = name.to_str().and_then(|_| {
-                            let metadata = metadata?;
-                            is_symlink.map(|is_symlink| WalkEntryMetadata {
-                                is_directory: metadata.is_dir(),
-                                is_file: metadata.is_file(),
-                                is_symlink,
-                            })
-                        });
-                        // Keep failed metadata observations addressable. The
-                        // walker's existing fallback reports their per-path error.
-                        Some(WalkDirectoryEntry {
-                            file_name: name.to_string_lossy().into_owned(),
-                            metadata: snapshot,
-                        })
-                    },
-                )
-            })
-            .await
-        })
+        read_directory_for_walk(path, max_entries, sandbox, false)
+    }
+
+    fn read_directory_bounded_no_follow_for_walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
+        read_directory_for_walk(path, max_entries, sandbox, true)
     }
 
     fn remove<'a>(
@@ -1377,16 +1530,147 @@ fn file_metadata(metadata: &std::fs::Metadata, is_symlink: bool) -> FileMetadata
     }
 }
 
+pub(crate) async fn read_file_payload_capped<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    metadata_len: u64,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    if metadata_len > max_bytes {
+        return Err(file_too_large_error(max_bytes));
+    }
+    let mut bytes = Vec::with_capacity(metadata_len as usize);
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(file_too_large_error(max_bytes));
+    }
+    Ok(bytes)
+}
+
+fn remove_sync(
+    path: &Path,
+    options: RemoveOptions,
+    before_remove: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if options.force && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    before_remove()?;
+    let file_type = metadata.file_type();
+    let result = if file_type.is_symlink_dir() {
+        std::fs::remove_dir(path)
+    } else if file_type.is_dir() {
+        if options.recursive {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_dir(path)
+        }
+    } else {
+        std::fs::remove_file(path)
+    };
+    finish_remove(path, options.force, result)
+}
+
+fn finish_remove(path: &Path, force: bool, result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error) if force && error.kind() == io::ErrorKind::NotFound => {
+            // Recursive deletion can report a missing child while the root
+            // remains. Check only this failure path, without retrying deletion
+            // against a potentially recreated object.
+            match std::fs::symlink_metadata(path) {
+                Err(absence) if absence.kind() == io::ErrorKind::NotFound => Ok(()),
+                _ => Err(error),
+            }
+        }
+        result => result,
+    }
+}
+
 fn directory_entry(
     name: std::ffi::OsString,
     metadata: Option<&std::fs::Metadata>,
     _is_symlink: Option<bool>,
-) -> Option<ReadDirectoryEntry> {
-    let metadata = metadata?;
-    Some(ReadDirectoryEntry {
-        file_name: name.to_string_lossy().into_owned(),
+) -> io::Result<Option<ReadDirectoryEntry>> {
+    // A display approximation must never become another entry's identity.
+    let file_name = name.into_string().map_err(|name| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("directory entry has an unrepresentable native name: {name:?}"),
+        )
+    })?;
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    Ok(Some(ReadDirectoryEntry {
+        file_name,
         is_directory: metadata.is_dir(),
         is_file: metadata.is_file(),
+    }))
+}
+
+fn read_directory_for_walk<'a>(
+    path: &'a PathUri,
+    max_entries: usize,
+    sandbox: Option<&'a FileSystemSandboxContext>,
+    no_follow: bool,
+) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome<WalkDirectoryEntry>> {
+    Box::pin(async move {
+        reject_sandbox_context(sandbox)?;
+        if max_entries == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded directory read limit must be greater than zero",
+            ));
+        }
+        // An opaque parent can contain Unicode children too. Their labels
+        // cannot always be joined, so retain native child locators. The
+        // reserved prefix check adds no parse/allocation for ordinary roots.
+        let native_children = path.encoded_path().starts_with("/%00/bad/path/");
+        let path = path.to_abs_path()?;
+        run_cancellable_file_system_task(move |cancel| {
+            let _directories = if no_follow {
+                codex_file_system::lock_directory_chain(path.as_path())?
+            } else {
+                Vec::new()
+            };
+            read_directory_sync(
+                path.as_path(),
+                Some(max_entries),
+                &cancel,
+                |name, metadata, is_symlink| {
+                    let file_name = name.to_str();
+                    let snapshot = metadata.and_then(|metadata| {
+                        is_symlink.map(|is_symlink| WalkEntryMetadata {
+                            is_directory: metadata.is_dir(),
+                            is_file: metadata.is_file(),
+                            is_symlink,
+                        })
+                    });
+                    let Some(unicode_name) = file_name.filter(|_| !native_children) else {
+                        let entry = codex_file_system::NativeWalkDirectoryEntry {
+                            path: PathUri::from_host_native_path(path.as_path().join(&name))?,
+                            file_name: name.to_string_lossy().into_owned(),
+                            name_is_lossless: file_name.is_some(),
+                            metadata: snapshot,
+                        };
+                        return Ok(Some(WalkDirectoryEntry::NativeEntry(Box::new(entry))));
+                    };
+                    // Keep failed metadata observations addressable. The
+                    // walker's existing fallback reports their per-path error.
+                    Ok(Some(WalkDirectoryEntry::Entry {
+                        file_name: unicode_name.to_owned(),
+                        metadata: snapshot,
+                    }))
+                },
+            )
+        })
+        .await
     })
 }
 
@@ -1394,7 +1678,11 @@ fn read_directory_sync<T>(
     path: &Path,
     max_entries: Option<usize>,
     cancel: &CancellationToken,
-    mut classify: impl FnMut(std::ffi::OsString, Option<&std::fs::Metadata>, Option<bool>) -> Option<T>,
+    mut classify: impl FnMut(
+        std::ffi::OsString,
+        Option<&std::fs::Metadata>,
+        Option<bool>,
+    ) -> io::Result<Option<T>>,
 ) -> io::Result<ReadDirectoryOutcome<T>> {
     check_file_system_cancelled(cancel)?;
     let mut entries = Vec::new();
@@ -1422,7 +1710,7 @@ fn read_directory_sync<T>(
             Some(false) => entry.metadata(),
             _ => std::fs::metadata(entry.path()),
         };
-        if let Some(entry) = classify(entry.file_name(), metadata.as_ref().ok(), is_symlink) {
+        if let Some(entry) = classify(entry.file_name(), metadata.as_ref().ok(), is_symlink)? {
             entries.push(entry);
         }
     }
@@ -1439,10 +1727,39 @@ fn copy_dir_recursive(
     source_root: &Path,
     cancel: &CancellationToken,
 ) -> io::Result<()> {
+    // An invalid destination is a request error that precedes every
+    // destination effect, so it carries no partial-copy recovery context.
+    reject_destination_in_source(target, source_root)?;
+    let mut progress = codex_file_system::CopyFailure {
+        completed_entries: 0,
+        target_may_have_changed: false,
+        destination: target.display().to_string(),
+        cause: String::new(),
+    };
+    copy_dir_recursive_with_progress(source, target, source_root, cancel, &mut progress).map_err(
+        |error| {
+            progress.cause = error.to_string();
+            io::Error::new(error.kind(), progress)
+        },
+    )
+}
+
+fn copy_dir_recursive_with_progress(
+    source: &Path,
+    target: &Path,
+    source_root: &Path,
+    cancel: &CancellationToken,
+    progress: &mut codex_file_system::CopyFailure,
+) -> io::Result<()> {
+    progress.target_may_have_changed = false;
     check_file_system_cancelled(cancel)?;
     reject_destination_in_source(target, source_root)?;
     check_file_system_cancelled(cancel)?;
+    let existed = target.try_exists()?;
+    progress.target_may_have_changed = !existed;
     std::fs::create_dir_all(target)?;
+    progress.completed_entries += u64::from(!existed);
+    progress.target_may_have_changed = false;
     for entry in std::fs::read_dir(source)? {
         check_file_system_cancelled(cancel)?;
         let entry = entry?;
@@ -1451,14 +1768,26 @@ fn copy_dir_recursive(
         let file_type = entry.file_type()?;
 
         if file_type.is_dir() {
-            copy_dir_recursive(&source_path, &target_path, source_root, cancel)?;
+            copy_dir_recursive_with_progress(
+                &source_path,
+                &target_path,
+                source_root,
+                cancel,
+                progress,
+            )?;
         } else if file_type.is_file() {
             reject_destination_in_source(&target_path, source_root)?;
             check_file_system_cancelled(cancel)?;
+            progress.target_may_have_changed = true;
             std::fs::copy(&source_path, &target_path)?;
+            progress.completed_entries += 1;
+            progress.target_may_have_changed = false;
         } else if file_type.is_symlink() {
             check_file_system_cancelled(cancel)?;
+            progress.target_may_have_changed = true;
             copy_symlink(&source_path, &target_path)?;
+            progress.completed_entries += 1;
+            progress.target_may_have_changed = false;
         }
     }
     check_file_system_cancelled(cancel)
@@ -1543,9 +1872,45 @@ mod latency_tests;
 mod copy_cancellation_tests;
 
 #[cfg(test)]
+#[path = "local_file_system_race_tests.rs"]
+mod race_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "requires Windows symlink privilege or Developer Mode"
+    )]
+    async fn metadata_retains_a_dangling_entry_but_follows_a_live_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file("target", &link).unwrap();
+        let uri = PathUri::from(AbsolutePathBuf::from_absolute_path(&link).unwrap());
+        let fs = LocalFileSystem::unsandboxed();
+        let missing = fs.get_metadata(&uri, None).await.unwrap();
+        assert!(missing.is_symlink);
+        assert!(!missing.is_file && !missing.is_directory);
+        std::fs::write(&target, b"data").unwrap();
+        let live = fs.get_metadata(&uri, None).await.unwrap();
+        assert!(live.is_symlink && live.is_file);
+        assert_eq!(live.size, 4);
+        let absent = PathUri::from(
+            AbsolutePathBuf::from_absolute_path(directory.path().join("absent")).unwrap(),
+        );
+        assert_eq!(
+            fs.get_metadata(&absent, None).await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
 
     #[tokio::test]
     async fn metadata_preserves_file_times_before_unix_epoch() -> anyhow::Result<()> {
@@ -1563,6 +1928,121 @@ mod tests {
 
         assert!(metadata.is_file);
         assert_eq!(metadata.modified_at_ms, -1_234);
+        Ok(())
+    }
+
+    #[test]
+    fn force_remove_normalizes_late_absence_without_retrying_replacements() -> io::Result<()> {
+        for force in [false, true] {
+            for directory in [false, true] {
+                let temp = tempfile::tempdir()?;
+                let path = temp.path().join("target");
+                if directory {
+                    std::fs::create_dir(&path)?;
+                } else {
+                    std::fs::write(&path, b"old")?;
+                }
+                let result = remove_sync(
+                    &path,
+                    RemoveOptions {
+                        force,
+                        recursive: directory,
+                    },
+                    || {
+                        if directory {
+                            std::fs::remove_dir(&path)
+                        } else {
+                            std::fs::remove_file(&path)
+                        }
+                    },
+                );
+                if force {
+                    result?;
+                } else {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+                }
+                assert!(!path.exists());
+                // An internal missing child is not evidence that the requested
+                // root was removed. A recreated object must not be deleted.
+                std::fs::create_dir(&path)?;
+                std::fs::write(path.join("keep"), b"replacement")?;
+                let result = finish_remove(&path, force, Err(io::ErrorKind::NotFound.into()));
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::NotFound);
+                assert_eq!(std::fs::read(path.join("keep"))?, b"replacement");
+                for kind in [
+                    io::ErrorKind::PermissionDenied,
+                    io::ErrorKind::DirectoryNotEmpty,
+                    io::ErrorKind::Interrupted,
+                ] {
+                    assert_eq!(
+                        finish_remove(&path, force, Err(kind.into()))
+                            .unwrap_err()
+                            .kind(),
+                        kind
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_surrogate_names_cannot_alias_replacement_character_entries() -> io::Result<()> {
+        use std::os::windows::ffi::OsStringExt;
+        let temp = tempfile::tempdir()?;
+        let native = temp.path().join(std::ffi::OsString::from_wide(&[0xd800]));
+        std::fs::write(&native, b"original")?;
+        std::fs::create_dir(temp.path().join("\u{fffd}"))?;
+        let uri = PathUri::from_host_native_path(temp.path())?;
+        assert_eq!(
+            DirectFileSystem
+                .read_directory(&uri, None)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            DirectFileSystem
+                .read_directory_bounded(&uri, 10, None)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let outcome = DirectFileSystem
+            .walk(
+                &uri,
+                WalkOptions {
+                    max_depth: 2,
+                    max_directories: 10,
+                    max_entries: 10,
+                    follow_directory_symlinks: false,
+                    prune_hidden_directories: false,
+                    filters: Default::default(),
+                },
+                None,
+            )
+            .await?;
+        assert_eq!(outcome.entries.len(), 2);
+        assert!(outcome.errors.is_empty());
+        assert!(!outcome.truncated);
+        let native_uri = PathUri::from_host_native_path(&native)?;
+        let replacement_uri = PathUri::from_host_native_path(temp.path().join("\u{fffd}"))?;
+        assert!(
+            outcome
+                .entries
+                .iter()
+                .any(|entry| entry.path == native_uri && entry.kind == crate::WalkEntryKind::File)
+        );
+        assert!(
+            outcome
+                .entries
+                .iter()
+                .any(|entry| entry.path == replacement_uri
+                    && entry.kind == crate::WalkEntryKind::Directory)
+        );
+        assert_eq!(std::fs::read(native)?, b"original");
         Ok(())
     }
 

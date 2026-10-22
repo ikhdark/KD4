@@ -233,6 +233,12 @@ impl PsuedoCon {
             bail!("{msg}");
         }
 
+        crate::process_observation::observe_process_start(
+            "unified_conpty",
+            crate::process_observation::ProcessRole::RequestedRoot,
+            Some(pi.dwProcessId),
+            None,
+        );
         // SAFETY: Successful CreateProcessW returned this new thread handle, whose sole
         // ownership is transferred to OwnedHandle.
         let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
@@ -292,7 +298,7 @@ fn build_environment_block(cmd: &CommandBuilder) -> anyhow::Result<Vec<u16>> {
 }
 
 fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
-    let exe_os: OsString = if cmd.is_default_prog() {
+    let requested: OsString = if cmd.is_default_prog() {
         cmd.get_env("ComSpec")
             .unwrap_or(OsStr::new("cmd.exe"))
             .to_os_string()
@@ -301,12 +307,22 @@ fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
         let Some(first) = argv.first() else {
             anyhow::bail!("missing program name");
         };
-        search_path(cmd, first)
+        first.clone()
     };
 
     ensure!(
-        !exe_os.encode_wide().any(|c| c == 0),
+        !requested.encode_wide().any(|c| c == 0),
         "program name contains a null character"
+    );
+    let exe_os = search_path(cmd, &requested)?;
+    // Batch argv needs CMD-specific escaping, not the native argv encoder below.
+    // Refuse before dispatch instead of launching an invalid image or interpolating
+    // caller arguments into an unsafe shell script.
+    ensure!(
+        !Path::new(&exe_os).extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat")
+        }),
+        "ConPTY cannot execute batch argv directly; invoke cmd.exe /d /c with an explicit shell script"
     );
     let argv = cmd.get_argv();
     let args = argv.get(1..).unwrap_or_default();
@@ -335,47 +351,65 @@ fn build_cmdline(cmd: &CommandBuilder) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {
     Ok((exe, cmdline))
 }
 
-fn search_path(cmd: &CommandBuilder, exe: &OsStr) -> OsString {
-    if Path::new(exe).components().count() != 1
-        || Path::new(exe).file_name().is_none()
-        || exe
-            .encode_wide()
-            .any(|ch| ch == u16::from(b'/') || ch == u16::from(b'\\'))
-    {
-        return exe.to_os_string();
-    }
-    let host_path = env::var_os("PATH");
-    if let Some(path) = cmd.get_env("PATH").or(host_path.as_deref()) {
-        let host_extensions = env::var_os("PATHEXT");
-        let extensions = cmd
-            .get_env("PATHEXT")
-            .or(host_extensions.as_deref())
-            .unwrap_or(OsStr::new(".EXE"));
-        let extensions = env::split_paths(extensions)
-            .filter_map(|ext| {
-                ext.to_str()
-                    .map(|ext| ext.trim_start_matches('.').to_owned())
-            })
-            .filter(|ext| !ext.is_empty())
-            .collect::<Vec<_>>();
-        for path in env::split_paths(path) {
-            let candidate = path.join(exe);
-            if candidate.is_file() {
-                return candidate.into_os_string();
-            }
-
-            if Path::new(exe).extension().is_none() {
-                for ext in &extensions {
-                    let candidate = path.join(exe).with_extension(ext);
-                    if candidate.is_file() {
-                        return candidate.into_os_string();
-                    }
+fn search_path(cmd: &CommandBuilder, exe: &OsStr) -> anyhow::Result<OsString> {
+    let cwd = match resolve_current_directory(cmd)? {
+        Some(wide) => std::path::PathBuf::from(OsString::from_wide(&wide[..wide.len() - 1])),
+        None => env::current_dir()?,
+    };
+    let host_extensions = env::var_os("PATHEXT");
+    let extensions = cmd
+        .get_env("PATHEXT")
+        .or(host_extensions.as_deref())
+        .unwrap_or(OsStr::new(".EXE"));
+    let extensions = env::split_paths(extensions)
+        .filter_map(|ext| {
+            ext.to_str()
+                .map(|ext| ext.trim_start_matches('.').to_owned())
+        })
+        .filter(|ext| !ext.is_empty())
+        .collect::<Vec<_>>();
+    let probe = |path: std::path::PathBuf| {
+        if path.is_file() {
+            return Some(path.into_os_string());
+        }
+        if path.extension().is_none() {
+            for ext in &extensions {
+                let candidate = path.with_extension(ext);
+                if candidate.is_file() {
+                    return Some(candidate.into_os_string());
                 }
             }
         }
+        None
+    };
+    let qualified = Path::new(exe).components().count() != 1
+        || Path::new(exe).file_name().is_none()
+        || exe
+            .encode_wide()
+            .any(|ch| ch == u16::from(b'/') || ch == u16::from(b'\\'));
+    if qualified {
+        // GetFullPathName semantics resolve drive-relative and root-relative
+        // spellings without changing process-global cwd.
+        let candidate = std::path::absolute(cwd.join(exe))?;
+        return probe(candidate).ok_or_else(|| {
+            anyhow::anyhow!("program {exe:?} not found relative to execution directory {cwd:?}")
+        });
+    }
+    let host_path = env::var_os("PATH");
+    if let Some(path) = cmd.get_env("PATH").or(host_path.as_deref()) {
+        for path in env::split_paths(path) {
+            if let Some(candidate) = probe(std::path::absolute(cwd.join(path).join(exe))?) {
+                return Ok(candidate);
+            }
+        }
+    }
+    // The execution directory is only a last resort for a bare name: a file
+    // planted in the workspace must not shadow the same program on PATH.
+    if let Some(candidate) = probe(cwd.join(exe)) {
+        return Ok(candidate);
     }
 
-    exe.to_os_string()
+    bail!("program {exe:?} not found in the execution directory or PATH")
 }
 
 fn append_quoted(arg: &OsStr, cmdline: &mut Vec<u16>) {
@@ -516,17 +550,35 @@ mod tests {
 
     #[test]
     fn launch_rejects_nulls_in_every_native_string() {
-        assert_eq!(build_cmdline(&CommandBuilder::new("cmd.exe\0ignored")).unwrap_err().to_string(), "program name contains a null character");
+        assert_eq!(
+            build_cmdline(&CommandBuilder::new("cmd.exe\0ignored"))
+                .unwrap_err()
+                .to_string(),
+            "program name contains a null character"
+        );
         let mut command = CommandBuilder::new("cmd.exe");
         command.arg("argument\0ignored");
-        assert!(build_cmdline(&command).unwrap_err().to_string().starts_with("invalid encoding for command line argument"));
+        assert!(
+            build_cmdline(&command)
+                .unwrap_err()
+                .to_string()
+                .starts_with("invalid encoding for command line argument")
+        );
         let mut command = CommandBuilder::new("cmd.exe");
         command.cwd("C:\\bad\0directory");
-        assert_eq!(super::resolve_current_directory(&command).unwrap_err().to_string(), "current directory contains a null character");
+        assert_eq!(
+            super::resolve_current_directory(&command)
+                .unwrap_err()
+                .to_string(),
+            "current directory contains a null character"
+        );
         for (key, value) in [("BAD\0KEY", "value"), ("KEY", "bad\0value")] {
             let mut command = CommandBuilder::new("cmd.exe");
             command.env(key, value);
-            assert_eq!(build_environment_block(&command).unwrap_err().to_string(), "environment contains a null character");
+            assert_eq!(
+                build_environment_block(&command).unwrap_err().to_string(),
+                "environment contains a null character"
+            );
         }
     }
 
@@ -578,15 +630,38 @@ mod tests {
         command.env("PATH", &root.0);
         command.env("PATHEXT", ".EXE;.COM");
         assert_eq!(
-            super::search_path(&command, std::ffi::OsStr::new("tool")),
+            super::search_path(&command, std::ffi::OsStr::new("tool")).unwrap(),
             root.0.join("tool.COM")
         );
-        for name in [r"nested\tool.exe", ".\\tool", "tool.exe"] {
-            assert_eq!(
-                super::search_path(&command, std::ffi::OsStr::new(name)),
-                OsString::from(name)
-            );
-        }
+        command.cwd(&root.0);
+        assert_eq!(
+            super::search_path(&command, std::ffi::OsStr::new(r"nested\tool.exe"))?,
+            root.0.join(r"nested\tool.exe")
+        );
+        assert_eq!(
+            super::search_path(&command, std::ffi::OsStr::new(".\\tool"))?,
+            root.0.join("tool.COM")
+        );
+        assert!(super::search_path(&command, std::ffi::OsStr::new("tool.exe")).is_err());
+        command.env("PATH", "nested");
+        assert_eq!(
+            super::search_path(&command, std::ffi::OsStr::new("tool.exe"))?,
+            root.0.join(r"nested\tool.exe")
+        );
+        // The execution directory's tool.com must not shadow PATH's tool.exe.
+        assert_eq!(
+            super::search_path(&command, std::ffi::OsStr::new("tool"))?,
+            root.0.join(r"nested\tool.EXE")
+        );
+        std::fs::write(root.0.join("batch.cmd"), b"@echo off")?;
+        let mut batch = CommandBuilder::new(root.0.join("batch.cmd"));
+        batch.arg("untrusted & argument");
+        assert!(
+            build_cmdline(&batch)
+                .unwrap_err()
+                .to_string()
+                .contains("batch argv")
+        );
         Ok(())
     }
 }

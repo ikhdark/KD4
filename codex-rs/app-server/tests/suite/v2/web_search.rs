@@ -45,6 +45,14 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
     let server = responses::start_mock_server().await;
     mount_search_response(&server).await;
 
+    // This fixture serves HTTP SSE, not Responses WebSockets. Advertise the
+    // supported fallback while retaining trusted built-in OpenAI registration.
+    Mock::given(method("GET"))
+        .and(path("/api/codex/responses"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
+
     let response_mock = responses::mount_sse_sequence(
         &server,
         vec![
@@ -192,12 +200,16 @@ async fn standalone_web_search_round_trips_output() -> Result<()> {
     assert_eq!(
         started.item,
         ThreadItem::WebSearch(WebSearchItem {
+            status: Some("inProgress".to_string()),
+            error: None,
             id: call_id.to_string(),
             query: String::new(),
             action: None,
         })
     );
     let expected_completed_item = ThreadItem::WebSearch(WebSearchItem {
+        status: Some("completed".to_string()),
+        error: None,
         id: call_id.to_string(),
         query: "standalone web search".to_string(),
         action: Some(WebSearchAction::Search {
@@ -313,20 +325,13 @@ fn create_config_toml(codex_home: &Path, server_uri: &str) -> std::io::Result<()
 model = "mock-model"
 approval_policy = "never"
 sandbox_mode = "read-only"
-model_provider = "openai-custom"
+model_provider = "openai"
+openai_base_url = "{server_uri}/api/codex"
 chatgpt_base_url = "{server_uri}"
 
 [features]
 standalone_web_search = true
 
-[model_providers.openai-custom]
-name = "OpenAI"
-base_url = "{server_uri}/api/codex"
-wire_api = "responses"
-request_max_retries = 0
-stream_max_retries = 0
-supports_websockets = false
-requires_openai_auth = true
 "#
         ),
     )

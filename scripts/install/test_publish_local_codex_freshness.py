@@ -223,11 +223,13 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assert_proof_value(
-                result.stdout, "sourceSha256",
+                result.stdout,
+                "sourceSha256",
                 hashlib.sha256(fake_codex.read_bytes()).hexdigest(),
             )
             self.assert_proof_value(
-                result.stdout, "targetBeforeSha256",
+                result.stdout,
+                "targetBeforeSha256",
                 hashlib.sha256(original_target).hexdigest(),
             )
             self.assertNotEqual(fake_codex.read_bytes(), original_target)
@@ -317,7 +319,9 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
         with tempfile.TemporaryDirectory() as temp_dir:
             install_dir = Path(temp_dir) / "install"
             source_timestamp = FIXTURE_TIME + 100
-            entrypoint = self.repo_root / "scripts" / "install" / "publish-local-codex.ps1"
+            entrypoint = (
+                self.repo_root / "scripts" / "install" / "publish-local-codex.ps1"
+            )
             entrypoint.parent.mkdir(parents=True)
             entrypoint.write_text("# publish entrypoint\n", encoding="utf-8")
             self.run_git("add", "scripts/install/publish-local-codex.ps1")
@@ -532,20 +536,66 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 "sourceBuildStampValidation",
                 "tracked publish inputs changed",
             )
-            self.assert_proof_value(
-                result.stdout,
-                "sourceBuildFreshnessBasis",
-                "content-bound build stamp from different publish inputs",
-            )
-            self.assert_proof_value(result.stdout, "sourceBuildStale", "True")
-            self.assert_proof_value(
-                result.stdout, "replace", "blocked: source build stale"
-            )
-            # PowerShell hard-wraps errors at 120 columns; match within line one.
-            self.assertIn(
-                "their content-bound build stamp records different", result.stderr
-            )
+            # Raw skip now rejects before version probes, staging or routing,
+            # rather than entering the timestamp diagnostic fallback.
+            self.assertIn("SkipBuild requires a current content-bound", result.stderr)
+            self.assertNotIn("publishCommitted: true", result.stdout)
             self.assertEqual(target.read_bytes(), b"previous-codex")
+
+    def test_raw_skip_rejects_missing_malformed_and_legacy_stamps_despite_future_mtimes(
+        self,
+    ):
+        self.init_repo_fixture()
+        self.write_built_artifacts(timestamp=4_000_000_000)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            install = root / "install"
+            install.mkdir()
+            active = install / "codex.exe"
+            active.write_bytes(b"accepted prior bundle")
+            stamp = (
+                self.repo_root
+                / "codex-rs/target/codex-local-publish-local-release.stamp"
+            )
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            for contents in (None, "not JSON", json.dumps({"schemaVersion": 1})):
+                with self.subTest(contents=contents):
+                    if contents is None:
+                        stamp.unlink(missing_ok=True)
+                    else:
+                        stamp.write_text(contents)
+                    result = subprocess.run(
+                        [
+                            self.shell,
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                            str(SCRIPT),
+                            "-RepoRoot",
+                            str(self.repo_root),
+                            "-SkipBuild",
+                            "-InstallDir",
+                            str(install),
+                            "-BackupDir",
+                            str(root / "backups"),
+                            "-LocalCodexHome",
+                            str(root / "home"),
+                        ],
+                        text=True,
+                        capture_output=True,
+                        env=clean_env(),
+                        timeout=120,
+                        check=False,
+                    )
+                    self.assertNotEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    self.assertIn(
+                        "SkipBuild requires a current content-bound", result.stderr
+                    )
+                    self.assertEqual(active.read_bytes(), b"accepted prior bundle")
+                    self.assertFalse((root / "backups").exists())
 
     def test_auto_skip_revalidates_stamp_after_source_version_probe(self) -> None:
         self.init_repo_fixture()

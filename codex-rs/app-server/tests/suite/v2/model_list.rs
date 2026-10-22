@@ -72,8 +72,8 @@ fn model_from_preset(preset: &ModelPreset) -> Model {
 }
 
 fn expected_visible_models() -> Vec<Model> {
-    let mut catalog = codex_models_manager::bundled_models_response()
-        .expect("bundled models.json should parse");
+    let mut catalog =
+        codex_models_manager::bundled_models_response().expect("bundled models.json should parse");
     catalog.models.sort_by_key(|model| model.priority);
     // Filter by supported_in_api to support testing with both ChatGPT and non-ChatGPT auth modes.
     let mut presets = ModelPreset::filter_by_auth(
@@ -381,6 +381,77 @@ openai_base_url = "{server_uri}/v1"
     Ok(())
 }
 
-
-
-
+#[tokio::test]
+async fn model_list_follows_effective_provider_after_config_write() -> Result<()> {
+    use codex_app_server_protocol::ConfigValueWriteParams;
+    use codex_app_server_protocol::ConfigWriteResponse;
+    use codex_app_server_protocol::MergeStrategy;
+    let home = TempDir::new()?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, app.initialize()).await??;
+    let list_id = app
+        .send_list_models_request(ModelListParams {
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await?;
+    let first: ModelListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            app.read_stream_until_response_message(RequestId::Integer(list_id)),
+        )
+        .await??,
+    )?;
+    assert!(first.data[0].model.starts_with("gpt-"));
+    let old_cursor = first.next_cursor.expect("OpenAI catalog has another page");
+    let write_id = app
+        .send_config_value_write_request(ConfigValueWriteParams {
+            file_path: None,
+            key_path: "model_provider".into(),
+            value: json!("amazon-bedrock-runtime"),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+    let _: ConfigWriteResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            app.read_stream_until_response_message(RequestId::Integer(write_id)),
+        )
+        .await??,
+    )?;
+    let list_id = app
+        .send_list_models_request(ModelListParams {
+            cursor: Some(old_cursor),
+            ..Default::default()
+        })
+        .await?;
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        app.read_stream_until_error_message(RequestId::Integer(list_id)),
+    )
+    .await??;
+    assert!(error.error.message.contains("stale model cursor"));
+    let list_id = app
+        .send_list_models_request(ModelListParams::default())
+        .await?;
+    let current: ModelListResponse = to_response(
+        timeout(
+            DEFAULT_TIMEOUT,
+            app.read_stream_until_response_message(RequestId::Integer(list_id)),
+        )
+        .await??,
+    )?;
+    assert!(!current.data.is_empty());
+    assert!(
+        current
+            .data
+            .iter()
+            .all(|model| !model.model.starts_with("gpt-"))
+    );
+    Ok(())
+}

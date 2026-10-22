@@ -205,7 +205,8 @@ async fn exec_argv(
         normalization_cwd: None,
         sandbox_cwd: cwd.into(),
         turn_environment: environment,
-        network: None,
+        // Mirrors the exec_command handler, which forwards the turn's managed proxy.
+        network: turn.network.clone(),
         tty,
         sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
         additional_permissions: None,
@@ -1572,6 +1573,112 @@ async fn unified_exec_noninteractive_bursts_finish_in_one_initial_call() -> anyh
     Ok(())
 }
 
+/// Managed network requirements attach a proxy even when nothing enables it, and only a sandbox
+/// enforces managed network. On a host without a sandbox backend, unified exec must refuse the
+/// launch like `build_exec_request`: not fail on the disabled proxy, and not run unenforced.
+#[cfg(windows)]
+#[tokio::test]
+async fn managed_network_refuses_unified_exec_when_no_sandbox_is_available() -> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let marker = workspace.path().join("unexpected-process.txt");
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    turn.windows_sandbox_level = codex_protocol::config_types::WindowsSandboxLevel::Disabled;
+    turn.approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)?;
+    // Requirements without `enabled = true` leave the configured proxy disabled but attached.
+    let requirements = codex_config::NetworkConstraints {
+        domains: Some(codex_config::NetworkDomainPermissionsToml {
+            entries: std::collections::BTreeMap::from([(
+                "example.com".to_string(),
+                codex_config::NetworkDomainPermissionToml::Allow,
+            )]),
+        }),
+        ..Default::default()
+    };
+    let spec = crate::config::NetworkProxySpec::from_config_and_constraints(
+        codex_network_proxy::NetworkProxyConfig::default(),
+        Some(requirements),
+        &turn.permission_profile(),
+    )?;
+    assert!(!spec.enabled());
+    let started_proxy = spec
+        .start_proxy(
+            turn.config.codex_home.as_path(),
+            &turn.permission_profile(),
+            /*policy_decider*/ None,
+            /*blocked_request_observer*/ None,
+            /*enable_network_approval_flow*/ true,
+            codex_network_proxy::NetworkProxyAuditMetadata::default(),
+        )
+        .await?;
+    turn.network = Some(started_proxy.proxy());
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let command = format!(
+        "Set-Content -LiteralPath '{}' -Value unexpected",
+        marker.to_string_lossy().replace('\'', "''")
+    );
+    let (result, observed) = crate::tools::runtimes::unified_exec::test_observation::observe(
+        exec_command_with_tty(&session, &turn, &command, 10_000, None, false),
+    )
+    .await;
+    let message = match result {
+        Err(UnifiedExecError::CreateProcess { message }) => message,
+        Err(other) => panic!("expected the unavailable-sandbox refusal, got: {other}"),
+        Ok(_) => panic!("managed network must not run a command without a sandbox"),
+    };
+    assert!(message.contains("PermissionDenied"), "{message}");
+    assert!(
+        message.contains("no sandbox backend is available; refusing to run unsandboxed"),
+        "{message}"
+    );
+    assert_eq!(observed.process_launches, 0);
+    assert!(
+        !marker.exists(),
+        "a refused launch must not run the command"
+    );
+    drop(started_proxy);
+    Ok(())
+}
+
+/// The refusal is specific to managed network: without it, the same launch on a host without a
+/// sandbox backend still runs.
+#[cfg(windows)]
+#[tokio::test]
+async fn unified_exec_without_managed_network_still_runs_when_no_sandbox_is_available()
+-> anyhow::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let marker = workspace.path().join("expected-process.txt");
+    let (session, mut turn) = make_session_and_context().await;
+    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
+    turn.windows_sandbox_level = codex_protocol::config_types::WindowsSandboxLevel::Disabled;
+    turn.approval_policy
+        .set(codex_protocol::protocol::AskForApproval::Never)?;
+    assert!(turn.network.is_none());
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let command = format!(
+        "Set-Content -LiteralPath '{}' -Value ran; Write-Output ran",
+        marker.to_string_lossy().replace('\'', "''")
+    );
+    let (result, observed) = crate::tools::runtimes::unified_exec::test_observation::observe(
+        exec_command_with_tty(&session, &turn, &command, 10_000, None, false),
+    )
+    .await;
+    let result = result?;
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(
+        result.truncated_output(TEST_MAX_OUTPUT_TOKENS).trim(),
+        "ran"
+    );
+    assert_eq!(observed.process_launches, 1);
+    assert!(marker.exists(), "the launch must run the command");
+    Ok(())
+}
+
 /// Harness overhead of unified exec against the same argv spawned directly.
 /// Prints medians; run with `--run-ignored only` and passing-test output.
 #[cfg(windows)]
@@ -2336,6 +2443,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             Box::new(NoopSpawnLifecycle),
             None,
             &environment,
+            None,
             &PendingSpawnRegistration::default(),
         )
         .await?;

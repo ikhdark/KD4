@@ -9,6 +9,31 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 
 impl Session {
+    pub(crate) async fn settle_extension_terminal_intents(
+        &self,
+        turn_store: &ExtensionData,
+    ) -> Result<Vec<String>, codex_protocol::error::CodexErr> {
+        let mut feedback = Vec::new();
+        let result = bounded_lifecycle(async {
+            for contributor in self.services.extensions.turn_lifecycle_contributors() {
+                if let Some(message) = contributor
+                    .on_turn_settled(codex_extension_api::TurnStopInput {
+                        session_store: &self.services.session_extension_data,
+                        thread_store: &self.services.thread_extension_data,
+                        turn_store,
+                    })
+                    .await
+                {
+                    feedback.push(message);
+                }
+            }
+        })
+        .await;
+        result.map_err(|_| codex_protocol::error::CodexErr::Fatal(
+            "Extension terminal reconciliation failed or exceeded its deadline; staged goals remain unaccepted.".into()))?;
+        Ok(feedback)
+    }
+
     pub(super) async fn emit_turn_start_lifecycle(
         &self,
         turn_context: &TurnContext,

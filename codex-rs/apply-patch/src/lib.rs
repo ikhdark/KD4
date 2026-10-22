@@ -1,8 +1,11 @@
+#[cfg(test)]
+mod foreign_path_tests;
 mod invocation;
 mod parser;
 mod seek_sequence;
 mod standalone_executable;
 mod streaming_parser;
+mod transaction;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -17,6 +20,7 @@ use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::FileMetadata;
 use codex_exec_server::FileSystemSandboxContext;
+#[cfg(test)]
 use codex_exec_server::RemoveOptions;
 use codex_utils_path_uri::PathUri;
 use codex_utils_path_uri::PathUriParseError;
@@ -97,6 +101,7 @@ pub enum PatchContextMismatchKind {
     ExpectedLinesNotFound,
     AmbiguousMatch,
     IndentationMismatch,
+    RemovedLineMismatch,
     MalformedRange,
     RangeOutOfBounds,
     RangeOrderMismatch,
@@ -356,6 +361,9 @@ impl Default for AppliedPatchDelta {
 pub struct AppliedPatchChange {
     pub path: PathBuf,
     pub change: AppliedPatchFileChange,
+    // The public paths are legacy presentation values, not executor authority.
+    path_uri: PathUri,
+    move_path_uri: Option<PathUri>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -478,7 +486,20 @@ async fn apply_hunks_with_cancellation(
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
     let mut delta = AppliedPatchDelta::empty();
-    match apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, is_cancelled).await {
+    // Keep endpoint ownership alive through failure reconciliation and rollback,
+    // not just the successful write path. Preflight has no filesystem effects.
+    let mut _transaction = None;
+    let result = async {
+        if hunks.is_empty() {
+            anyhow::bail!("No files were modified.");
+        }
+        invocation::validate_mutation_endpoints(hunks, cwd, fs, sandbox).await?;
+        let prepared = preflight_hunks(hunks, cwd, fs, sandbox).await?;
+        _transaction = transaction::acquire(hunks, cwd, fs, sandbox).await?;
+        apply_hunks_to_files(hunks, cwd, fs, sandbox, &mut delta, prepared, is_cancelled).await
+    }
+    .await;
+    match result {
         Ok(()) => {
             if let Err(error) = print_summary(hunks, stdout) {
                 let _ = write!(stderr, "{error}\n{}", delta.failure_summary());
@@ -487,7 +508,15 @@ async fn apply_hunks_with_cancellation(
             Ok(delta)
         }
         Err(error) => {
-            rollback_committed_changes(&mut delta, fs, sandbox).await;
+            let rollback_errors = rollback_committed_changes(&mut delta, fs, sandbox).await;
+            let error = if rollback_errors.is_empty() {
+                error
+            } else {
+                error.context(format!(
+                    "rollback incomplete: {}",
+                    rollback_errors.join("; ")
+                ))
+            };
             let msg = format!("{error:#}");
             writeln!(stderr, "{msg}").map_err(|error| {
                 ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
@@ -519,62 +548,123 @@ async fn rollback_committed_changes(
     delta: &mut AppliedPatchDelta,
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
-) {
+) -> Vec<String> {
     if !delta.exact {
-        return;
+        return Vec::new();
     }
+    let mut errors = Vec::new();
     // Split moves into their actual writes so a partially restored move still
     // has an exact delta (e.g. source restored, destination remains installed).
-    delta.changes = std::mem::take(&mut delta.changes).into_iter().flat_map(|applied| {
-        match applied.change {
-            AppliedPatchFileChange::Update {
-                move_path: Some(destination), old_content, overwritten_move_content, new_content,
-            } => vec![
-                AppliedPatchChange { path: destination, change: AppliedPatchFileChange::Add {
-                    content: new_content, overwritten_content: overwritten_move_content,
-                } },
-                AppliedPatchChange { path: applied.path, change: AppliedPatchFileChange::Delete {
-                    content: old_content,
-                } },
-            ],
-            change => vec![AppliedPatchChange { path: applied.path, change }],
-        }
-    }).collect();
+    delta.changes = std::mem::take(&mut delta.changes)
+        .into_iter()
+        .flat_map(|applied| {
+            match (applied.change, applied.move_path_uri) {
+                (
+                    AppliedPatchFileChange::Update {
+                        move_path: Some(destination),
+                        old_content,
+                        overwritten_move_content,
+                        new_content,
+                    },
+                    Some(destination_uri),
+                ) => vec![
+                    AppliedPatchChange {
+                        path: destination,
+                        path_uri: destination_uri,
+                        move_path_uri: None,
+                        change: AppliedPatchFileChange::Add {
+                            content: new_content,
+                            overwritten_content: overwritten_move_content,
+                        },
+                    },
+                    AppliedPatchChange {
+                        path: applied.path,
+                        path_uri: applied.path_uri,
+                        move_path_uri: None,
+                        change: AppliedPatchFileChange::Delete {
+                            content: old_content,
+                        },
+                    },
+                ],
+                // Committed moves record their destination URI. Without it the
+                // destination cannot be restored exactly: keep the move whole and
+                // report the delta as inexact instead of guessing a location.
+                (
+                    change @ AppliedPatchFileChange::Update {
+                        move_path: Some(_), ..
+                    },
+                    None,
+                ) => {
+                    delta.exact = false;
+                    vec![AppliedPatchChange {
+                        path: applied.path,
+                        path_uri: applied.path_uri,
+                        move_path_uri: None,
+                        change,
+                    }]
+                }
+                (change, move_path_uri) => vec![AppliedPatchChange {
+                    path: applied.path,
+                    path_uri: applied.path_uri,
+                    move_path_uri,
+                    change,
+                }],
+            }
+        })
+        .collect();
     for index in (0..delta.changes.len()).rev() {
         let applied = &delta.changes[index];
-        let Ok(path) = PathUri::from_host_native_path(&applied.path) else {
-            delta.exact = false;
-            continue;
-        };
+        let path = &applied.path_uri;
         let (expected, original) = match &applied.change {
-            AppliedPatchFileChange::Add { content, overwritten_content } =>
-                (Some(content.as_str()), overwritten_content.as_deref()),
+            AppliedPatchFileChange::Add {
+                content,
+                overwritten_content,
+            } => (Some(content.as_str()), overwritten_content.as_deref()),
             AppliedPatchFileChange::Delete { content } => (None, Some(content.as_str())),
-            AppliedPatchFileChange::Update { old_content, new_content, .. } =>
-                (Some(new_content.as_str()), Some(old_content.as_str())),
+            // Only a move kept whole above remains unsplit. Its source no longer
+            // holds this patch's bytes, so leave the recorded move untouched.
+            AppliedPatchFileChange::Update {
+                move_path: Some(_), ..
+            } => continue,
+            AppliedPatchFileChange::Update {
+                old_content,
+                new_content,
+                ..
+            } => (Some(new_content.as_str()), Some(old_content.as_str())),
         };
-        let regular_or_absent = match fs.get_metadata(&path, sandbox).await {
+        let regular_or_absent = match fs.get_metadata(path, sandbox).await {
             Ok(metadata) => metadata.is_file && !metadata.is_symlink,
             Err(error) => error.kind() == io::ErrorKind::NotFound,
         };
         if !regular_or_absent
-            || !remove_failure_was_side_effect_free(&path, expected, fs, sandbox).await
+            || !remove_failure_was_side_effect_free(path, expected, fs, sandbox).await
         {
             delta.exact = false;
             continue;
         }
-        let restored = match original {
-            Some(content) => fs.write_file(&path, content.as_bytes().to_vec(), sandbox).await,
-            None => fs.remove(&path, RemoveOptions { recursive: false, force: false }, sandbox).await,
-        };
-        if restored.is_ok() {
-            delta.changes.remove(index);
-        } else {
-            // The Windows fallback (or a remote executor) may have changed the
-            // target before returning an error. Never claim an exact prefix then.
-            delta.exact &= remove_failure_was_side_effect_free(&path, expected, fs, sandbox).await;
+        let restored = conditional_mutation(
+            fs,
+            path,
+            expected,
+            original.map(|content| content.as_bytes().to_vec()),
+            sandbox,
+            &mut delta.exact,
+        )
+        .await;
+        match restored {
+            Ok(()) => {
+                delta.changes.remove(index);
+            }
+            Err(error) => {
+                // Keep any actual displaced-object recovery locator visible
+                // instead of discarding the rollback error behind the first failure.
+                errors.push(format!("{error:#}"));
+                delta.exact &=
+                    remove_failure_was_side_effect_free(path, expected, fs, sandbox).await;
+            }
         }
     }
+    errors
 }
 
 /// Apply the hunks to the filesystem, recording committed changes in the delta.
@@ -585,18 +675,15 @@ async fn apply_hunks_to_files(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&FileSystemSandboxContext>,
     delta: &mut AppliedPatchDelta,
+    mut prepared: Vec<Option<AppliedPatch>>,
     is_cancelled: &(dyn Fn() -> bool + Sync),
 ) -> anyhow::Result<()> {
-    if hunks.is_empty() {
-        anyhow::bail!("No files were modified.");
-    }
-
     invocation::validate_mutation_endpoints(hunks, cwd, fs, sandbox).await?;
-    let mut prepared = preflight_hunks(hunks, cwd, fs, sandbox).await?;
 
-    // Verify the complete read set before the first write. The executor gate
-    // excludes cooperative writers; per-file checks below also catch external
-    // edits. I/O failures still report the exact committed delta.
+    // Verify the complete read set before the first write. Local endpoint leases
+    // exclude participating patch processes through rollback. Per-file checks
+    // detect observed external edits, not CAS against nonparticipating writers.
+    // I/O failures still report the exact committed delta.
     for (index, (hunk, update)) in hunks.iter().zip(&mut prepared).enumerate() {
         if let Some(previous) = update {
             let path = hunk.resolve_path(cwd)?;
@@ -631,17 +718,15 @@ async fn apply_hunks_to_files(
             match $result {
                 Ok(value) => value,
                 Err(error) => {
-                    delta.exact &= remove_failure_was_side_effect_free(
-                        $path, $before, fs, sandbox,
-                    )
-                    .await;
+                    delta.exact &=
+                        remove_failure_was_side_effect_free($path, $before, fs, sandbox).await;
                     return Err(anyhow::Error::from(error));
                 }
             }
         };
     }
 
-    // TODO(anp): Carry PathUri through committed patch deltas and the turn diff tracker.
+    // Keep executor URIs for recovery; legacy paths are only for diff/event consumers.
     for (hunk_index, hunk) in hunks.iter().enumerate() {
         if is_cancelled() {
             return Err(std::io::Error::new(
@@ -660,8 +745,10 @@ async fn apply_hunks_to_files(
                     write_file_with_missing_parent_retry(
                         fs,
                         &path_uri,
+                        overwritten_content.as_deref(),
                         contents.clone().into_bytes(),
                         sandbox,
+                        &mut delta.exact,
                     )
                     .await,
                     &path_uri,
@@ -669,6 +756,8 @@ async fn apply_hunks_to_files(
                 );
                 delta.changes.push(AppliedPatchChange {
                     path: path_uri.to_path_buf(),
+                    path_uri,
+                    move_path_uri: None,
                     change: AppliedPatchFileChange::Add {
                         content: contents.clone(),
                         overwritten_content,
@@ -693,23 +782,21 @@ async fn apply_hunks_to_files(
                     "source changed after patch preparation; refusing to delete {}",
                     path_uri.inferred_native_path_string()
                 );
-                if let Err(error) = fs
-                    .remove(
-                        &path_uri,
-                        RemoveOptions {
-                            recursive: false,
-                            force: false,
-                        },
-                        sandbox,
+                if let Err(error) = conditional_mutation(
+                    fs,
+                    &path_uri,
+                    Some(&deleted_content),
+                    None,
+                    sandbox,
+                    &mut delta.exact,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to delete file {}",
+                        path_uri.inferred_native_path_string()
                     )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to delete file {}",
-                            path_uri.inferred_native_path_string()
-                        )
-                    })
-                {
+                }) {
                     delta.exact &= remove_failure_was_side_effect_free(
                         &path_uri,
                         Some(&deleted_content),
@@ -721,6 +808,8 @@ async fn apply_hunks_to_files(
                 }
                 delta.changes.push(AppliedPatchChange {
                     path: path_uri.to_path_buf(),
+                    path_uri,
+                    move_path_uri: None,
                     change: AppliedPatchFileChange::Delete {
                         content: deleted_content,
                     },
@@ -759,8 +848,10 @@ async fn apply_hunks_to_files(
                 } = update;
                 if let Some(dest) = move_path {
                     let dest_uri = cwd.join(&dest.to_string_lossy())?;
-                    let source_identity = invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await?;
-                    if source_identity == invocation::mutation_endpoint_identity(fs, &dest_uri, sandbox).await?
+                    let source_identity =
+                        invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await?;
+                    if source_identity
+                        == invocation::mutation_endpoint_identity(fs, &dest_uri, sandbox).await?
                     {
                         return Err(ApplyPatchError::ParseError(InvalidPatchError(format!(
                             "move source and destination identify the same path: {}",
@@ -775,8 +866,10 @@ async fn apply_hunks_to_files(
                         write_file_with_missing_parent_retry(
                             fs,
                             &dest_uri,
+                            overwritten_move_content.as_deref(),
                             new_contents.clone().into_bytes(),
                             sandbox,
+                            &mut delta.exact,
                         )
                         .await,
                         &dest_uri,
@@ -785,14 +878,19 @@ async fn apply_hunks_to_files(
                     let dest_write_change_index = delta.changes.len();
                     delta.changes.push(AppliedPatchChange {
                         path: dest_uri.to_path_buf(),
+                        path_uri: dest_uri.clone(),
+                        move_path_uri: None,
                         change: AppliedPatchFileChange::Add {
                             content: new_contents.clone(),
                             overwritten_content: overwritten_move_content.clone(),
                         },
                     });
                     if is_cancelled() {
-                        return Err(io::Error::new(io::ErrorKind::Interrupted,
-                            "Patch application cancelled after move destination publication").into());
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "Patch application cancelled after move destination publication",
+                        )
+                        .into());
                     }
                     ensure_not_directory(&path_uri, fs, sandbox)
                         .await
@@ -803,28 +901,27 @@ async fn apply_hunks_to_files(
                             )
                         })?;
                     anyhow::ensure!(
-                        invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await? == source_identity
+                        invocation::mutation_endpoint_identity(fs, &path_uri, sandbox).await?
+                            == source_identity
                             && fs.read_file_text(&path_uri, sandbox).await? == original_contents,
                         "move source changed during destination publication; refusing to remove {}",
                         path_uri.inferred_native_path_string()
                     );
-                    if let Err(error) = fs
-                        .remove(
-                            &path_uri,
-                            RemoveOptions {
-                                recursive: false,
-                                force: false,
-                            },
-                            sandbox,
+                    if let Err(error) = conditional_mutation(
+                        fs,
+                        &path_uri,
+                        Some(&original_contents),
+                        None,
+                        sandbox,
+                        &mut delta.exact,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to remove original {}",
+                            path_uri.inferred_native_path_string()
                         )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "Failed to remove original {}",
-                                path_uri.inferred_native_path_string()
-                            )
-                        })
-                    {
+                    }) {
                         delta.exact &= remove_failure_was_side_effect_free(
                             &path_uri,
                             Some(&original_contents),
@@ -836,6 +933,8 @@ async fn apply_hunks_to_files(
                     }
                     delta.changes[dest_write_change_index] = AppliedPatchChange {
                         path: path_uri.to_path_buf(),
+                        path_uri,
+                        move_path_uri: Some(dest_uri.clone()),
                         change: AppliedPatchFileChange::Update {
                             move_path: Some(dest_uri.to_path_buf()),
                             old_content: original_contents,
@@ -847,17 +946,26 @@ async fn apply_hunks_to_files(
                     // An update requires the source to remain present; unlike add/move,
                     // it must not recreate a parent removed after the source read.
                     try_write!(
-                        fs.write_file(&path_uri, new_contents.clone().into_bytes(), sandbox)
-                            .await
-                            .with_context(|| format!(
-                                "Failed to write file {}",
-                                path_uri.inferred_native_path_string()
-                            )),
+                        conditional_mutation(
+                            fs,
+                            &path_uri,
+                            Some(&original_contents),
+                            Some(new_contents.clone().into_bytes()),
+                            sandbox,
+                            &mut delta.exact
+                        )
+                        .await
+                        .with_context(|| format!(
+                            "Failed to write file {}",
+                            path_uri.inferred_native_path_string()
+                        )),
                         &path_uri,
                         Some(original_contents.as_str())
                     );
                     delta.changes.push(AppliedPatchChange {
                         path: path_uri.to_path_buf(),
+                        path_uri,
+                        move_path_uri: None,
                         change: AppliedPatchFileChange::Update {
                             move_path: None,
                             old_content: original_contents,
@@ -901,11 +1009,8 @@ pub(crate) async fn preflight_hunks(
                         // Validate the complete candidate before any hunk is
                         // published. Existing JSONC and malformed documents can
                         // still be edited; only strict-JSON regressions fail.
-                        if let Some(error) = invalid_json_candidate(
-                            hunk.path(),
-                            &original_contents,
-                            &new_contents,
-                        )
+                        if let Some(error) =
+                            invalid_json_candidate(hunk.path(), &original_contents, &new_contents)
                         {
                             failures.push(ApplyPatchError::ComputeReplacements(format!(
                                 "{} was valid JSON before this patch; candidate is invalid: {error}. No files were changed.",
@@ -913,9 +1018,12 @@ pub(crate) async fn preflight_hunks(
                             )));
                             prepared.push(None);
                         } else {
-                            prepared.push(Some(AppliedPatch { original_contents, new_contents }));
+                            prepared.push(Some(AppliedPatch {
+                                original_contents,
+                                new_contents,
+                            }));
                         }
-                    },
+                    }
                     Err(error) => {
                         // Keep the ordered matching error, then enumerate later
                         // independently broken chunks against this same snapshot.
@@ -1039,7 +1147,9 @@ async fn remove_failure_was_side_effect_free(
             .read_file_text(path, sandbox)
             .await
             .is_ok_and(|content| content == expected_content),
-        None => fs.get_metadata(path, sandbox).await
+        None => fs
+            .get_metadata(path, sandbox)
+            .await
             .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
     }
 }
@@ -1064,10 +1174,13 @@ async fn read_optional_file_text_for_delta(
                 Ok(_) => Err(source),
             }
         }
-        Err(source) => Err(io::Error::new(source.kind(), format!(
-            "refusing to overwrite {}: destination preimage is unreadable: {source}",
-            path.inferred_native_path_string(),
-        ))),
+        Err(source) => Err(io::Error::new(
+            source.kind(),
+            format!(
+                "refusing to overwrite {}: destination preimage is unreadable: {source}",
+                path.inferred_native_path_string(),
+            ),
+        )),
     }
 }
 
@@ -1088,12 +1201,18 @@ async fn note_existing_path_delta_support(
 async fn write_file_with_missing_parent_retry(
     fs: &dyn ExecutorFileSystem,
     path: &PathUri,
+    expected: Option<&str>,
     contents: Vec<u8>,
     sandbox: Option<&FileSystemSandboxContext>,
+    exact: &mut bool,
 ) -> anyhow::Result<()> {
-    match fs.write_file(path, contents.clone(), sandbox).await {
+    match conditional_mutation(fs, path, expected, Some(contents.clone()), sandbox, exact).await {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+        Err(err)
+            if err
+                .downcast_ref::<io::Error>()
+                .is_some_and(|err| err.kind() == io::ErrorKind::NotFound) =>
+        {
             if let Some(parent) = path.parent() {
                 fs.create_directory(&parent, CreateDirectoryOptions { recursive: true }, sandbox)
                     .await
@@ -1104,7 +1223,7 @@ async fn write_file_with_missing_parent_retry(
                         )
                     })?;
             }
-            fs.write_file(path, contents, sandbox)
+            conditional_mutation(fs, path, expected, Some(contents), sandbox, exact)
                 .await
                 .with_context(|| {
                     format!(
@@ -1120,6 +1239,42 @@ async fn write_file_with_missing_parent_retry(
                 path.inferred_native_path_string()
             )
         }),
+    }
+}
+
+async fn conditional_mutation(
+    fs: &dyn ExecutorFileSystem,
+    path: &PathUri,
+    expected: Option<&str>,
+    replacement: Option<Vec<u8>>,
+    sandbox: Option<&FileSystemSandboxContext>,
+    exact: &mut bool,
+) -> anyhow::Result<()> {
+    use codex_exec_server::FileMutationOutcome;
+    match fs
+        .mutate_file_if_matches(
+            path,
+            expected.map(|text| text.as_bytes().to_vec()),
+            replacement,
+            sandbox,
+        )
+        .await?
+    {
+        FileMutationOutcome::Committed => Ok(()),
+        FileMutationOutcome::Conflict => anyhow::bail!(
+            "source changed at mutation boundary; refusing to replace/remove {}",
+            path.inferred_native_path_string()
+        ),
+        FileMutationOutcome::RecoveryRequired {
+            retained_path,
+            message,
+        } => {
+            *exact = false;
+            anyhow::bail!(
+                "mutation requires recovery: {message}. Actual displaced file retained at {}; do not retry or restore over a competing writer",
+                retained_path.display()
+            )
+        }
     }
 }
 
@@ -1267,6 +1422,13 @@ fn compute_replacements(
     hunk_ordinal: Option<usize>,
     chunks: &[UpdateFileChunk],
 ) -> std::result::Result<Vec<(usize, usize, Vec<String>)>, ApplyPatchError> {
+    // This derivation sees one immutable snapshot. Keep hashing lazy for
+    // ordinary context patches, and still compare every supplied range hash.
+    let source_hash = std::cell::LazyCell::new(|| {
+        #[cfg(test)]
+        tests::SOURCE_GUARD_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
+        hex::encode(Sha256::digest(original_contents.as_bytes()))
+    });
     let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut line_index: usize = 0;
     // A search that follows an earlier match in this hunk is anchored: the
@@ -1280,11 +1442,26 @@ fn compute_replacements(
             .and_then(|s| s.strip_prefix("codex-range "))
         {
             let invalid = |kind, message: &str, excerpt| {
-                located_patch_mismatch(PatchMismatchSource { original_lines, original_contents,
-                    path: path_uri, hunk_ordinal }, chunk_index + 1, kind, message.into(), excerpt)
+                located_patch_mismatch(
+                    PatchMismatchSource {
+                        original_lines,
+                        original_contents,
+                        path: path_uri,
+                        hunk_ordinal,
+                    },
+                    chunk_index + 1,
+                    kind,
+                    message.into(),
+                    excerpt,
+                )
             };
-            let malformed = || invalid(PatchContextMismatchKind::MalformedRange,
-                "Malformed codex-range handle; expected START:END sha256:<64 hexadecimal characters>", None);
+            let malformed = || {
+                invalid(
+                    PatchContextMismatchKind::MalformedRange,
+                    "Malformed codex-range handle; expected START:END sha256:<64 hexadecimal characters>",
+                    None,
+                )
+            };
             let (range, hash) = handle.split_once(" sha256:").ok_or_else(malformed)?;
             let (start, end) = range.split_once(':').ok_or_else(malformed)?;
             let start = start.parse::<usize>().map_err(|_| malformed())?;
@@ -1293,21 +1470,33 @@ fn compute_replacements(
                 return Err(malformed());
             }
             if start == 0 || end < start || end > original_lines.len() {
-                return Err(invalid(PatchContextMismatchKind::RangeOutOfBounds,
-                    "codex-range bounds must name an inclusive region within the current source", None));
+                return Err(invalid(
+                    PatchContextMismatchKind::RangeOutOfBounds,
+                    "codex-range bounds must name an inclusive region within the current source",
+                    None,
+                ));
             }
             let excerpt = || bounded_source_excerpt(original_lines, start - 1, end);
             if start - 1 < line_index {
-                return Err(invalid(PatchContextMismatchKind::RangeOrderMismatch,
-                    "codex-range overlaps or precedes an earlier chunk; ranges must be ordered and nonoverlapping", excerpt()));
+                return Err(invalid(
+                    PatchContextMismatchKind::RangeOrderMismatch,
+                    "codex-range overlaps or precedes an earlier chunk; ranges must be ordered and nonoverlapping",
+                    excerpt(),
+                ));
             }
-            if hash != hex::encode(Sha256::digest(original_contents.as_bytes())) {
-                return Err(invalid(PatchContextMismatchKind::StaleRange,
-                    "codex-range source hash changed; reconcile current source before editing", excerpt()));
+            if hash != source_hash.as_str() {
+                return Err(invalid(
+                    PatchContextMismatchKind::StaleRange,
+                    "codex-range source hash changed; reconcile current source before editing",
+                    excerpt(),
+                ));
             }
             if !chunk.old_lines.is_empty() && chunk.old_lines != original_lines[start - 1..end] {
-                return Err(invalid(PatchContextMismatchKind::RangeOldLinesMismatch,
-                    "codex-range old lines do not match the requested region; no relocation was attempted", excerpt()));
+                return Err(invalid(
+                    PatchContextMismatchKind::RangeOldLinesMismatch,
+                    "codex-range old lines do not match the requested region; no relocation was attempted",
+                    excerpt(),
+                ));
             }
             replacements.push((start - 1, end - start + 1, chunk.new_lines.clone()));
             line_index = end;
@@ -1321,12 +1510,16 @@ fn compute_replacements(
             hunk_ordinal,
         };
         let ambiguous_match = |error: seek_sequence::AmbiguousMatch, pattern_len: usize| {
-            let hash = hex::encode(Sha256::digest(original_contents.as_bytes()));
-            let mut message = format!("{error} in {path}. Choose a candidate and replace its entire range (including unchanged context) using one of these revision-bound anchors:");
+            let hash = source_hash.as_str();
+            let mut message = format!(
+                "{error} in {path}. Choose a candidate and replace its entire range (including unchanged context) using one of these revision-bound anchors:"
+            );
             for start in [error.first_line, error.second_line] {
                 let end = start + pattern_len - 1;
                 message.push_str(&format!("\n@@ codex-range {start}:{end} sha256:{hash}\n"));
-                if let Some((_, _, excerpt)) = bounded_source_excerpt(original_lines, start - 1, end) {
+                if let Some((_, _, excerpt)) =
+                    bounded_source_excerpt(original_lines, start - 1, end)
+                {
                     message.push_str(&excerpt);
                 }
             }
@@ -1391,14 +1584,26 @@ fn compute_replacements(
 
         // Parsed blank lines are source preconditions, not newline sentinels.
         let pattern: &[String] = &chunk.old_lines;
+        // A textual anchor binds the following contiguous preimage, not an
+        // unbounded search through later siblings. Include intervening lines
+        // as context, or use a revision-bound range for a distant edit.
+        let search_lines = if chunk.change_context.is_some() {
+            let end = line_index
+                .saturating_add(pattern.len())
+                .min(original_lines.len());
+            &original_lines[..end]
+        } else {
+            original_lines
+        };
         let found = seek_sequence::seek_sequence(
-            original_lines,
+            search_lines,
             pattern,
             line_index,
             chunk.is_end_of_file,
             anchored,
         )
-        .map_err(|error| ambiguous_match(error, pattern.len()))?;
+        .map_err(|error| ambiguous_match(error, pattern.len()))?
+        .filter(|start| !chunk.is_end_of_file || start + pattern.len() == original_lines.len());
         let new_slice: &[String] = &chunk.new_lines;
 
         if let Some(start_idx) = found {
@@ -1430,6 +1635,19 @@ fn compute_replacements(
                             bounded_source_excerpt(original_lines, line, line + 1),
                         ));
                     }
+                    if expected != actual {
+                        let line = start_idx + old_index;
+                        return Err(located_patch_mismatch(
+                            source(),
+                            chunk_index + 1,
+                            PatchContextMismatchKind::RemovedLineMismatch,
+                            format!(
+                                "Removed line {} differs from current source in {path}; normalization is only allowed for unchanged context. Reconcile the exact current bytes before retrying.",
+                                line + 1
+                            ),
+                            bounded_source_excerpt(original_lines, line, line + 1),
+                        ));
+                    }
                 }
                 replacements.push((
                     start_idx + old_range.start,
@@ -1443,13 +1661,32 @@ fn compute_replacements(
             let expected = bounded_expected_lines(chunk.old_lines.iter().map(String::as_str));
             // Only a search that an earlier match anchors can fail because of
             // chunk order; otherwise the lines are absent from the whole file.
-            let message = if anchored {
+            let message = if chunk.change_context.is_some() {
+                format!(
+                    "Expected lines must immediately follow the textual anchor in {path} at line {line_index}; no later sibling was searched. Include intervening source as context or use a current codex-range:\n{expected}"
+                )
+            } else if anchored {
                 format!(
                     "Failed to find expected lines in {path} after line {line_index}. Chunks must be in top-to-bottom file order; check ordering and current context:\n{expected}"
                 )
             } else {
                 format!("Failed to find expected lines in {path}:\n{expected}")
             };
+            if chunk.change_context.is_some() {
+                return Err(located_patch_mismatch(
+                    source(),
+                    chunk_index + 1,
+                    PatchContextMismatchKind::ExpectedLinesNotFound,
+                    message,
+                    bounded_source_excerpt(
+                        original_lines,
+                        line_index.saturating_sub(1),
+                        line_index
+                            .saturating_add(pattern.len())
+                            .min(original_lines.len()),
+                    ),
+                ));
+            }
             return Err(patch_context_mismatch(
                 PatchMismatchSource {
                     original_lines,
@@ -1551,16 +1788,27 @@ fn bounded_patch_mismatch_excerpt(
     // duplicate anchors. Bound fallback work independently of the exact pass.
     let probes = chunk.old_lines.len().saturating_add(1);
     if original_lines.len().saturating_mul(probes) > 64 * 1024
-        || original_lines.iter().map(String::len).sum::<usize>().saturating_mul(probes)
+        || original_lines
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_mul(probes)
             > 4 * 1024 * 1024
     {
         return None;
     }
-    for line in chunk.old_lines.iter().filter(|line| !line.trim().is_empty())
+    for line in chunk
+        .old_lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
         .chain(chunk.change_context.iter())
     {
         if let Ok(Some(index)) = seek_sequence::seek_sequence(
-            original_lines, std::slice::from_ref(line), 0, false, false,
+            original_lines,
+            std::slice::from_ref(line),
+            0,
+            false,
+            false,
         ) {
             return bounded_source_excerpt(original_lines, index, index + 1);
         }
@@ -1575,8 +1823,9 @@ fn bounded_exact_patch_mismatch_excerpt(
     if original_lines.is_empty() {
         return None;
     }
-    // The @@ anchor need not be adjacent to the old block. Only old-line
-    // offsets describe contiguous source; blank lines still occupy an offset.
+    // Old-line offsets describe contiguous source, including blank lines.
+    // Located textual-anchor failures supply their own bounded excerpt rather
+    // than inferring a diagnostic location from a later sibling's old lines.
     let expected = if chunk.old_lines.is_empty() {
         std::slice::from_ref(chunk.change_context.as_ref()?)
     } else {
@@ -1794,6 +2043,12 @@ mod tests {
     use std::string::ToString;
     use tempfile::tempdir;
 
+    thread_local! {
+        // Count only this derivation's guard/anchor digest, not independent
+        // mismatch diagnostics or preflight/execution freshness checks.
+        pub(super) static SOURCE_GUARD_HASH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
@@ -1808,18 +2063,56 @@ mod tests {
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         let failure = apply_patch_with_cancellation(
             &wrap_patch("*** Update File: source\n*** Move to: destination\n@@\n-before\n+after"),
-            &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
             &|| {
-                if destination.exists() { fs::write(&source, "external edit\n").unwrap(); }
+                if destination.exists() {
+                    fs::write(&source, "external edit\n").unwrap();
+                }
                 false
             },
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(failure.to_string().contains("move source changed"));
         assert_eq!(fs::read_to_string(&source).unwrap(), "external edit\n");
         // Existing rollback owns only the destination; the external edit survives.
         assert!(!destination.exists());
         assert!(failure.delta().is_exact());
         assert!(failure.delta().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_keeps_a_move_without_its_destination_uri_as_inexact() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::write(&destination, "after\n").unwrap();
+        // An intervening file at the vacated source happens to hold the moved bytes.
+        fs::write(&source, "after\n").unwrap();
+        let recorded = AppliedPatchChange {
+            path: source.clone(),
+            path_uri: PathUri::from_host_native_path(&source).unwrap(),
+            move_path_uri: None,
+            change: AppliedPatchFileChange::Update {
+                move_path: Some(destination.clone()),
+                old_content: "before\n".into(),
+                overwritten_move_content: None,
+                new_content: "after\n".into(),
+            },
+        };
+        let mut delta = AppliedPatchDelta::new(vec![recorded.clone()], /*exact*/ true);
+        let errors = rollback_committed_changes(&mut delta, LOCAL_FS.as_ref(), None).await;
+        assert_eq!(errors, Vec::<String>::new());
+        assert!(!delta.is_exact());
+        assert_eq!(delta.changes(), [recorded].as_slice());
+        // Neither side is guessed at: the destination keeps the moved bytes and
+        // the source file is not rewritten as if the move were an in-place update.
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "after\n");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "after\n");
     }
 
     #[tokio::test]
@@ -1914,6 +2207,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_stale_range_hash_rejects_the_whole_patch_before_writes() {
+        let dir = tempdir().unwrap();
+        let original = "first\nsecond\n";
+        let source = dir.path().join("source.txt");
+        fs::write(&source, original).unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let hash = hex::encode(Sha256::digest(original));
+        let stale = "0".repeat(64);
+        let patch = wrap_patch(&format!(
+            "*** Add File: prefix.txt\n+must not be written\n*** Update File: source.txt\n@@ codex-range 1:1 sha256:{hash}\n+changed first\n@@ codex-range 2:2 sha256:{stale}\n+changed second"
+        ));
+        let failure = apply_patch(
+            &patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.delta().is_empty());
+        assert!(failure.delta().is_exact());
+        let (error, _) = failure.into_parts();
+        let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(mismatch.kind, PatchContextMismatchKind::StaleRange);
+        assert_eq!(mismatch.chunk_ordinal, 2);
+        assert_eq!(fs::read_to_string(source).unwrap(), original);
+        assert!(!dir.path().join("prefix.txt").exists());
+    }
+
+    #[test]
+    fn range_source_guard_hash_is_lazy_and_local_to_each_derivation() {
+        let path = PathUri::parse("file:///fixture.rs").unwrap();
+        for newline in ["\n", "\r\n"] {
+            for trailing_newline in [false, true] {
+                for count in [1, 4, 16, 64] {
+                    let ending = if trailing_newline { newline } else { "" };
+                    let original = (0..count)
+                        .map(|i| format!("source {i} λ"))
+                        .collect::<Vec<_>>()
+                        .join(newline)
+                        + ending;
+                    let expected = (0..count)
+                        .map(|i| format!("replacement {i} 漢"))
+                        .collect::<Vec<_>>()
+                        .join(newline)
+                        + ending;
+                    let hash = hex::encode(Sha256::digest(original.as_bytes()));
+                    let chunks = (0..count)
+                        .map(|i| UpdateFileChunk {
+                            change_context: Some(format!(
+                                "codex-range {}:{} sha256:{hash}",
+                                i + 1,
+                                i + 1
+                            )),
+                            old_lines: vec![format!("source {i} λ")],
+                            new_lines: vec![format!("replacement {i} 漢")],
+                            is_end_of_file: false,
+                        })
+                        .collect::<Vec<_>>();
+                    SOURCE_GUARD_HASH_CALLS.with(|calls| calls.set(0));
+                    assert_eq!(
+                        new_contents_from_chunks(&path, &original, &chunks, Some(1)).unwrap(),
+                        expected
+                    );
+                    SOURCE_GUARD_HASH_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+
+                    // A later call must not reuse the previous snapshot's hash,
+                    // even when the supplied handles and path are unchanged.
+                    let changed = original.replacen("source 0", "external edit", 1);
+                    SOURCE_GUARD_HASH_CALLS.with(|calls| calls.set(0));
+                    let error =
+                        new_contents_from_chunks(&path, &changed, &chunks, Some(1)).unwrap_err();
+                    let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+                        panic!("{error:?}");
+                    };
+                    assert_eq!(mismatch.kind, PatchContextMismatchKind::StaleRange);
+                    assert_eq!(mismatch.chunk_ordinal, 1);
+                    SOURCE_GUARD_HASH_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+                }
+            }
+        }
+
+        let context_only = UpdateFileChunk {
+            change_context: None,
+            old_lines: vec!["first".into()],
+            new_lines: vec!["changed".into()],
+            is_end_of_file: false,
+        };
+        SOURCE_GUARD_HASH_CALLS.with(|calls| calls.set(0));
+        assert_eq!(
+            new_contents_from_chunks(&path, "first\nsecond\n", &[context_only], Some(1)).unwrap(),
+            "changed\nsecond\n"
+        );
+        SOURCE_GUARD_HASH_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[tokio::test]
     async fn revision_bound_ranges_disambiguate_and_reject_stale_source() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.rs");
@@ -1962,7 +2356,11 @@ mod tests {
 
     #[tokio::test]
     async fn revision_bound_ranges_reject_overlap_and_reverse_order_before_writes() {
-        for (first, second, valid) in [("2:3", "3:4", false), ("3:4", "1:2", false), ("1:2", "3:4", true)] {
+        for (first, second, valid) in [
+            ("2:3", "3:4", false),
+            ("3:4", "1:2", false),
+            ("1:2", "3:4", true),
+        ] {
             let dir = tempdir().unwrap();
             let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
             let original = "one\ntwo\nthree\nfour\n";
@@ -1971,21 +2369,40 @@ mod tests {
             let patch = wrap_patch(&format!(
                 "*** Add File: prefix.txt\n+prefix\n*** Update File: source.txt\n@@ codex-range {first} sha256:{hash}\n+first replacement\n@@ codex-range {second} sha256:{hash}\n+second replacement"
             ));
-            let result = apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await;
+            let result = apply_patch(
+                &patch,
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await;
             if valid {
                 result.unwrap();
-                assert_eq!(fs::read_to_string(dir.path().join("source.txt")).unwrap(), "first replacement\nsecond replacement\n");
-                assert_eq!(fs::read_to_string(dir.path().join("prefix.txt")).unwrap(), "prefix\n");
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("source.txt")).unwrap(),
+                    "first replacement\nsecond replacement\n"
+                );
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("prefix.txt")).unwrap(),
+                    "prefix\n"
+                );
             } else {
                 let failure = result.unwrap_err();
                 assert!(failure.delta().is_empty());
                 assert!(failure.delta().is_exact());
                 let (error, _) = failure.into_parts();
-                let ApplyPatchError::PatchContextMismatch(mismatch) = error else { panic!("{error:?}"); };
+                let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+                    panic!("{error:?}");
+                };
                 assert_eq!(mismatch.kind, PatchContextMismatchKind::RangeOrderMismatch);
                 assert_eq!((mismatch.hunk_ordinal, mismatch.chunk_ordinal), (2, 2));
                 assert_eq!(mismatch.current_content_sha256, hash);
-                assert_eq!(fs::read_to_string(dir.path().join("source.txt")).unwrap(), original);
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("source.txt")).unwrap(),
+                    original
+                );
                 assert!(!dir.path().join("prefix.txt").exists());
             }
         }
@@ -1998,15 +2415,43 @@ mod tests {
         let hash = hex::encode(Sha256::digest(original));
         let path = PathUri::parse("file:///fixture.rs").unwrap();
         for (handle, old, kind, located) in [
-            ("broken".to_string(), Vec::new(), PatchContextMismatchKind::MalformedRange, false),
-            (format!("0:2 sha256:{hash}"), Vec::new(), PatchContextMismatchKind::RangeOutOfBounds, false),
-            (format!("1:2 sha256:{}", "0".repeat(64)), Vec::new(), PatchContextMismatchKind::StaleRange, true),
-            (format!("2:2 sha256:{hash}"), vec!["wrong".into()], PatchContextMismatchKind::RangeOldLinesMismatch, true),
+            (
+                "broken".to_string(),
+                Vec::new(),
+                PatchContextMismatchKind::MalformedRange,
+                false,
+            ),
+            (
+                format!("0:2 sha256:{hash}"),
+                Vec::new(),
+                PatchContextMismatchKind::RangeOutOfBounds,
+                false,
+            ),
+            (
+                format!("1:2 sha256:{}", "0".repeat(64)),
+                Vec::new(),
+                PatchContextMismatchKind::StaleRange,
+                true,
+            ),
+            (
+                format!("2:2 sha256:{hash}"),
+                vec!["wrong".into()],
+                PatchContextMismatchKind::RangeOldLinesMismatch,
+                true,
+            ),
         ] {
-            let chunk = UpdateFileChunk { change_context:Some(format!("codex-range {handle}")),
-                old_lines:old, new_lines:vec!["replacement".into()], is_end_of_file:false };
-            let error = compute_replacements(&lines, original, &path, "fixture.rs", Some(1), &[chunk]).unwrap_err();
-            let ApplyPatchError::PatchContextMismatch(mismatch) = error else { panic!("typed mismatch"); };
+            let chunk = UpdateFileChunk {
+                change_context: Some(format!("codex-range {handle}")),
+                old_lines: old,
+                new_lines: vec!["replacement".into()],
+                is_end_of_file: false,
+            };
+            let error =
+                compute_replacements(&lines, original, &path, "fixture.rs", Some(1), &[chunk])
+                    .unwrap_err();
+            let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+                panic!("typed mismatch");
+            };
             assert_eq!(mismatch.kind, kind);
             assert_eq!(mismatch.current_content_sha256, hash);
             assert_eq!(mismatch.current_line_start > 0, located);
@@ -2024,21 +2469,42 @@ mod tests {
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         let failure = apply_patch(
             &wrap_patch("*** Update File: a.rs\n@@\n-old\n+new\n context"),
-            &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None,
-        ).await.unwrap_err();
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(failure.delta().is_empty());
         let (error, _) = failure.into_parts();
-        let ApplyPatchError::PatchContextMismatch(mismatch) = error else { panic!("{error:?}"); };
+        let ApplyPatchError::PatchContextMismatch(mismatch) = error else {
+            panic!("{error:?}");
+        };
         let hash = hex::encode(Sha256::digest(original));
         let anchor = format!("@@ codex-range 5:6 sha256:{hash}");
-        assert!(mismatch.message.contains(&format!("@@ codex-range 2:3 sha256:{hash}")));
+        assert!(
+            mismatch
+                .message
+                .contains(&format!("@@ codex-range 2:3 sha256:{hash}"))
+        );
         assert!(mismatch.message.contains(&anchor));
         assert!(mismatch.message.contains("first") && mismatch.message.contains("second"));
         apply_patch(
             &wrap_patch(&format!("*** Update File: a.rs\n{anchor}\n+new\n+context")),
-            &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None,
-        ).await.unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "first\nold\ncontext\nsecond\nnew\ncontext\n");
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "first\nold\ncontext\nsecond\nnew\ncontext\n"
+        );
     }
 
     #[tokio::test]
@@ -2093,7 +2559,10 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                        assert_eq!(fs::read(dir.path().join(name)).unwrap(), expected.as_bytes());
+                        assert_eq!(
+                            fs::read(dir.path().join(name)).unwrap(),
+                            expected.as_bytes()
+                        );
                     }
                     // Even an edit outside the selected range invalidates the
                     // whole-file identity. Never silently accept a stale view.
@@ -2575,17 +3044,20 @@ mod tests {
     #[test]
     fn mismatch_excerpt_uses_matching_tiers_then_change_context() {
         let lines = ["prefix", "    fn target() {", "        actual();", "    }"]
-            .map(String::from).to_vec();
+            .map(String::from)
+            .to_vec();
         for chunk in [
             UpdateFileChunk {
                 change_context: None,
                 old_lines: vec!["fn target() {".into(), "missing();".into()],
-                new_lines: vec![], is_end_of_file: false,
+                new_lines: vec![],
+                is_end_of_file: false,
             },
             UpdateFileChunk {
                 change_context: Some("fn target() {".into()),
                 old_lines: vec!["missing();".into()],
-                new_lines: vec![], is_end_of_file: false,
+                new_lines: vec![],
+                is_end_of_file: false,
             },
         ] {
             let (_, _, excerpt) = bounded_patch_mismatch_excerpt(&lines, &chunk)
@@ -2837,6 +3309,8 @@ mod tests {
             delta.changes,
             vec![AppliedPatchChange {
                 path: path.clone(),
+                path_uri: PathUri::from_host_native_path(&path).unwrap(),
+                move_path_uri: None,
                 change: AppliedPatchFileChange::Delete {
                     content: "x".into()
                 },
@@ -2937,16 +3411,30 @@ mod tests {
         assert!(stderr.contains("candidate is invalid"), "{stderr}");
         assert!(stderr.contains("line 4"), "{stderr}");
         assert_eq!(fs::read_to_string(&valid).unwrap(), "{\n  \"a\": 1\n}\n");
-        assert_eq!(fs::read_to_string(&jsonc).unwrap(), "{\n  // comment\n  \"a\": 1\n}\n");
+        assert_eq!(
+            fs::read_to_string(&jsonc).unwrap(),
+            "{\n  // comment\n  \"a\": 1\n}\n"
+        );
         assert_eq!(
             fs::read_to_string(&broken).unwrap(),
             "{\n  \"a\": 1,\n  \"b\": 2\n}\n"
         );
         let repaired = patch.replace("+  \"b\": 2,", "+  \"b\": 3");
-        apply_patch(&repaired, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None)
-            .await.unwrap();
+        apply_patch(
+            &repaired,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(fs::read_to_string(&valid).unwrap(), "{\n  \"a\": 2\n}\n");
-        assert_eq!(fs::read_to_string(&jsonc).unwrap(), "{\n  // comment\n  \"a\": 2\n}\n");
+        assert_eq!(
+            fs::read_to_string(&jsonc).unwrap(),
+            "{\n  // comment\n  \"a\": 2\n}\n"
+        );
     }
 
     #[tokio::test]
@@ -3258,12 +3746,8 @@ mod tests {
         );
     }
 
-    /// Ensure that patches authored with ASCII characters can update lines that
-    /// contain typographic Unicode punctuation (e.g. EN DASH, NON-BREAKING
-    /// HYPHEN). Historically `git apply` succeeds in such scenarios but our
-    /// internal matcher failed requiring an exact byte-for-byte match.  The
-    /// fuzzy-matching pass that normalises common punctuation should now bridge
-    /// the gap.
+    /// Exact current Unicode removals remain supported. Normalized context may
+    /// locate a hunk, but must not authorize destroying different current bytes.
     #[tokio::test]
     async fn test_update_line_with_unicode_dash() {
         let dir = tempdir().unwrap();
@@ -3273,11 +3757,11 @@ mod tests {
         let original = "import asyncio  # local import \u{2013} avoids top\u{2011}level dep\n";
         std::fs::write(&path, original).unwrap();
 
-        // Patch uses plain ASCII dash / hyphen.
+        // Remove the actual current Unicode line, not an ASCII approximation.
         let patch = wrap_patch(&format!(
             r#"*** Update File: {}
 @@
--import asyncio  # local import - avoids top-level dep
+-import asyncio  # local import – avoids top‑level dep
 +import asyncio  # HELLO"#,
             path.display()
         ));
@@ -3346,12 +3830,237 @@ mod tests {
                 assert_eq!(contents, original);
                 assert!(stdout.is_empty());
             } else {
-                result.unwrap();
-                assert_eq!(
-                    contents,
-                    original.replacen("label = \"a\u{00a0}b\"", "label = \"updated\"", 1)
+                let failure = result.unwrap_err();
+                assert!(failure.delta().is_empty());
+                assert!(
+                    failure
+                        .to_string()
+                        .contains("normalization is only allowed for unchanged context")
                 );
-                assert!(stderr.is_empty());
+                assert_eq!(contents, original);
+                assert!(stdout.is_empty());
+            }
+        }
+    }
+
+    // Child of the regression below; ordinary discovery does no work.
+    #[tokio::test]
+    async fn audit107_patch_transaction_child() {
+        let Some(root) = std::env::var_os("KD4_AUDIT107_TRANSACTION_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let cwd = PathUri::from_host_native_path(&root).unwrap();
+        let args = parse_patch(&wrap_patch(
+            "*** Update File: source\n*** Move to: destination",
+        ))
+        .unwrap();
+        let _transaction = transaction::acquire(&args.hunks, &cwd, LOCAL_FS.as_ref(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        fs::write(root.join("admitted"), b"ready").unwrap();
+        std::future::pending::<()>().await;
+    }
+
+    #[tokio::test]
+    async fn audit107_patch_transactions_exclude_endpoints_and_release_on_death() {
+        use std::time::Duration;
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("source"), "own = 1\nother = 7\n").unwrap();
+        fs::write(root.path().join("independent"), "before\n").unwrap();
+        let cwd = PathUri::from_host_native_path(root.path()).unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::audit107_patch_transaction_child",
+                "--nocapture",
+            ])
+            .env("KD4_AUDIT107_TRANSACTION_ROOT", root.path())
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !root.path().join("admitted").exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited before admission"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for body in [
+            "*** Update File: source\n@@\n-own = 1\n+own = 2",
+            "*** Delete File: source",
+            "*** Add File: source\n+overwrite",
+            "*** Update File: source\n*** Move to: new-target",
+            "*** Update File: independent\n*** Move to: destination",
+            "*** Add File: destination\n+overwrite",
+            "*** Add File: prefix\n+must not commit\n*** Update File: source\n@@\n-own = 1\n+own = 2",
+        ] {
+            let failure = tokio::time::timeout(
+                Duration::from_secs(2),
+                apply_patch(
+                    &wrap_patch(body),
+                    &cwd,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    LOCAL_FS.as_ref(),
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(failure.delta().is_empty());
+            assert!(failure.to_string().contains("busy"), "{failure}");
+            assert_eq!(
+                fs::read_to_string(root.path().join("source")).unwrap(),
+                "own = 1\nother = 7\n"
+            );
+            assert!(!root.path().join("destination").exists());
+            assert!(!root.path().join("prefix").exists());
+        }
+        // Independent endpoints continue while the other process owns its pair.
+        apply_patch(
+            &wrap_patch("*** Update File: independent\n@@\n-before\n+after"),
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        apply_patch(
+            &wrap_patch("*** Update File: source\n@@\n-own = 1\n+own = 2"),
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("source")).unwrap(),
+            "own = 2\nother = 7\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("independent")).unwrap(),
+            "after\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit107_textual_anchor_cannot_relocate_into_a_sibling() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("module.py");
+        let original = "def target():\n    return 3\n\ndef sibling():\n    return 1\n";
+        fs::write(&path, original).unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+        let patch = wrap_patch(
+            "*** Add File: prefix\n+must not commit\n*** Update File: module.py\n@@ def target():\n-    return 1\n+    return 2",
+        );
+        let failure = apply_patch(
+            &patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.delta().is_empty());
+        assert!(
+            failure
+                .to_string()
+                .contains("no later sibling was searched")
+        );
+        assert!(!dir.path().join("prefix").exists());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let ApplyPatchError::PatchContextMismatch(mismatch) = failure.into_parts().0 else {
+            panic!("expected a located anchor conflict");
+        };
+        assert!(mismatch.current_excerpt.contains("return 3"));
+
+        // Rebinding the intended, fully inspected target cannot relocate.
+        let hash = hex::encode(Sha256::digest(original.as_bytes()));
+        let patch = wrap_patch(&format!(
+            "*** Update File: module.py\n@@ codex-range 1:2 sha256:{hash}\n+def target():\n+    return 2"
+        ));
+        apply_patch(
+            &patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "def target():\n    return 2\n\ndef sibling():\n    return 1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit107_removed_bytes_are_exact_but_equal_context_remains_tolerant() {
+        for (old, current) in [
+            ("label = \"fast-mode\"", "label = \"fast–mode\""),
+            ("label = \"mode\"", "label = “mode”"),
+            ("label = \"a b\"", "label = \"a\u{00a0}b\""),
+            ("label = \"mode\"", "label = \"mode\"  "),
+        ] {
+            for ending in ["\n", "\r\n"] {
+                let dir = tempdir().unwrap();
+                let path = dir.path().join("value.txt");
+                let original = format!("{current}{ending}value = 1{ending}");
+                fs::write(&path, &original).unwrap();
+                let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
+                let stale = wrap_patch(&format!(
+                    "*** Update File: value.txt\n@@\n-{old}\n+label = \"safe-mode\""
+                ));
+                let failure = apply_patch(
+                    &stale,
+                    &cwd,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    LOCAL_FS.as_ref(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+                assert!(failure.delta().is_empty());
+                let ApplyPatchError::PatchContextMismatch(mismatch) = failure.into_parts().0 else {
+                    panic!("expected a located removed-line mismatch");
+                };
+                assert_eq!(mismatch.kind, PatchContextMismatchKind::RemovedLineMismatch);
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+                let safe = wrap_patch(&format!(
+                    "*** Update File: value.txt\n@@\n {old}\n-value = 1\n+value = 2"
+                ));
+                apply_patch(
+                    &safe,
+                    &cwd,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    LOCAL_FS.as_ref(),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    format!("{current}{ending}value = 2{ending}")
+                );
             }
         }
     }
@@ -3417,10 +4126,7 @@ mod tests {
             "@@\n     1 => (\n@@\n     ),\n+    3 => (),\n@@\n-    missing => (),",
             "@@\n     1 => (\n@@\n-    missing => (),\n@@\n     ),\n+    3 => (),",
         ] {
-            let patch = wrap_patch(&format!(
-                "*** Update File: {}\n{chunks}",
-                path.display()
-            ));
+            let patch = wrap_patch(&format!("*** Update File: {}\n{chunks}", path.display()));
             let failure = apply_patch(
                 &patch,
                 &PathUri::from_host_native_path(dir.path()).unwrap(),
@@ -3749,7 +4455,11 @@ g
                 stderr.contains(&format!("A {}", dir.path().join("later.txt").display())),
                 !cancel
             );
-            assert_eq!(stderr.contains("do not retry the whole patch"), !cancel, "{stderr}");
+            assert_eq!(
+                stderr.contains("do not retry the whole patch"),
+                !cancel,
+                "{stderr}"
+            );
             assert!(
                 stderr.contains(if cancel { "cancelled" } else { "output closed" }),
                 "{stderr}"
@@ -3786,7 +4496,10 @@ g
             assert!(failure.delta().is_empty());
             assert!(stdout.is_empty());
             assert_eq!(fs::read(&path).unwrap(), [0xff, 0xfe, 0xfd]);
-            assert_eq!(fs::read_to_string(dir.path().join("source.txt")).unwrap(), "before\n");
+            assert_eq!(
+                fs::read_to_string(dir.path().join("source.txt")).unwrap(),
+                "before\n"
+            );
         }
     }
 
@@ -3802,14 +4515,27 @@ g
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
         // Permit writes and replacement, but deny reads. The preimage check,
         // not a coincidental write failure, must prevent mutation.
-        let denied = fs::OpenOptions::new().write(true).share_mode(2 | 4)
-            .open(&destination).unwrap();
+        let denied = fs::OpenOptions::new()
+            .write(true)
+            .share_mode(2 | 4)
+            .open(&destination)
+            .unwrap();
         for patch in [
             wrap_patch("*** Add File: destination.txt\n+replacement"),
-            wrap_patch("*** Update File: source.txt\n*** Move to: destination.txt\n@@\n-before\n+after"),
+            wrap_patch(
+                "*** Update File: source.txt\n*** Move to: destination.txt\n@@\n-before\n+after",
+            ),
         ] {
-            let failure = apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(),
-                LOCAL_FS.as_ref(), None).await.unwrap_err();
+            let failure = apply_patch(
+                &patch,
+                &cwd,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                LOCAL_FS.as_ref(),
+                None,
+            )
+            .await
+            .unwrap_err();
             assert!(failure.delta().is_exact());
             assert!(failure.delta().is_empty());
         }
@@ -3852,7 +4578,10 @@ g
         assert!(failure.delta().is_empty());
         let summary = String::from_utf8(stderr).unwrap();
         assert!(!summary.contains("prefix.txt"));
-        assert!(summary.contains("os error 32") || summary.contains("os error 5"), "{summary}");
+        assert!(
+            summary.contains("os error 32") || summary.contains("os error 5"),
+            "{summary}"
+        );
         assert!(!summary.contains("Additional filesystem changes"));
     }
 
@@ -3861,25 +4590,63 @@ g
     async fn multi_file_failure_restores_all_originals_and_identical_patch_retries() {
         use std::os::windows::fs::OpenOptionsExt;
         let dir = tempdir().unwrap();
-        let originals = [("update", "old\r\n"), ("delete", "deleted\n"),
-            ("move", "source\n"), ("destination", "overwritten\n"),
-            ("add", "replaced\n"), ("locked", "locked\n")];
-        for (name, bytes) in originals { fs::write(dir.path().join(name), bytes).unwrap(); }
-        let reader = fs::OpenOptions::new().read(true).share_mode(1)
-            .open(dir.path().join("locked")).unwrap();
-        let patch = wrap_patch("*** Update File: update\n@@\n-old\n+new\n*** Delete File: delete\n*** Update File: move\n*** Move to: destination\n@@\n-source\n+moved\n*** Add File: add\n+replacement\n*** Add File: new\n+created\n*** Update File: locked\n@@\n-locked\n+unlocked");
+        let originals = [
+            ("update", "old\r\n"),
+            ("delete", "deleted\n"),
+            ("move", "source\n"),
+            ("destination", "overwritten\n"),
+            ("add", "replaced\n"),
+            ("locked", "locked\n"),
+        ];
+        for (name, bytes) in originals {
+            fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(dir.path().join("locked"))
+            .unwrap();
+        let patch = wrap_patch(
+            "*** Update File: update\n@@\n-old\n+new\n*** Delete File: delete\n*** Update File: move\n*** Move to: destination\n@@\n-source\n+moved\n*** Add File: add\n+replacement\n*** Add File: new\n+created\n*** Update File: locked\n@@\n-locked\n+unlocked",
+        );
         let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
-        let failure = apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await.unwrap_err();
+        let failure = apply_patch(
+            &patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(failure.delta().is_empty());
         assert!(failure.delta().is_exact());
-        for (name, bytes) in originals { assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), bytes); }
+        for (name, bytes) in originals {
+            assert_eq!(fs::read_to_string(dir.path().join(name)).unwrap(), bytes);
+        }
         assert!(!dir.path().join("new").exists());
         drop(reader);
-        apply_patch(&patch, &cwd, &mut Vec::new(), &mut Vec::new(), LOCAL_FS.as_ref(), None).await.unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("update")).unwrap(), "new\r\n");
+        apply_patch(
+            &patch,
+            &cwd,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            LOCAL_FS.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("update")).unwrap(),
+            "new\r\n"
+        );
         assert!(!dir.path().join("delete").exists());
         assert!(!dir.path().join("move").exists());
-        assert_eq!(fs::read_to_string(dir.path().join("destination")).unwrap(), "moved\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("destination")).unwrap(),
+            "moved\n"
+        );
     }
 
     #[cfg(windows)]
@@ -3891,7 +4658,11 @@ g
             let prefix = dir.path().join("prefix");
             let locked = dir.path().join("locked");
             fs::write(&locked, "before\n").unwrap();
-            let _reader = fs::OpenOptions::new().read(true).share_mode(1).open(&locked).unwrap();
+            let _reader = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&locked)
+                .unwrap();
             let prefix_reader = std::sync::Mutex::new(None);
             let cwd = PathUri::from_host_native_path(dir.path()).unwrap();
             let failure = apply_patch_with_cancellation(
@@ -3907,8 +4678,20 @@ g
             ).await.unwrap_err();
             assert_eq!(failure.delta().changes().len(), 1);
             assert_eq!(failure.delta().is_exact(), !external_edit);
-            assert_eq!(fs::read_to_string(&prefix).unwrap(), if external_edit { "external\n" } else { "committed\n" });
-            assert!(failure.delta().failure_summary().contains("do not retry the whole patch"));
+            assert_eq!(
+                fs::read_to_string(&prefix).unwrap(),
+                if external_edit {
+                    "external\n"
+                } else {
+                    "committed\n"
+                }
+            );
+            assert!(
+                failure
+                    .delta()
+                    .failure_summary()
+                    .contains("do not retry the whole patch")
+            );
         }
     }
 }

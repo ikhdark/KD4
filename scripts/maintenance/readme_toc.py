@@ -10,8 +10,11 @@ rewrites the file to update the ToC.
 import argparse
 import difflib
 import html
+import os
 import re
+import stat
 import sys
+import tempfile
 import unicodedata
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -57,9 +60,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Check and optionally fix a Markdown Table of Contents."
     )
-    parser.add_argument(
-        "file", help="Markdown file to process"
-    )
+    parser.add_argument("file", help="Markdown file to process")
     parser.add_argument(
         "--fix", action="store_true", help="Rewrite file with updated ToC"
     )
@@ -311,8 +312,28 @@ def check_or_fix(
     )
     generated_toc = "".join(f"{line}{newline}" for line in parsed.expected)
     new_content = prefix + newline + generated_toc + newline + suffix
-    with readme_path.open("w", encoding="utf-8", newline="") as readme_file:
-        readme_file.write(new_content)
+    # Like the ASCII repair command, follow a supplied symlink and replace its
+    # target, not the link. Never truncate authored content before staging.
+    target = readme_path.resolve()
+    mode = stat.S_IMODE(target.stat().st_mode)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=target.parent,
+            delete=False,
+        ) as readme_file:
+            temporary = Path(readme_file.name)
+            readme_file.write(new_content)
+            readme_file.flush()
+            os.fsync(readme_file.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     print(f"Updated ToC in {readme_path}.")
     return 0
 

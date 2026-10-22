@@ -51,6 +51,7 @@ use codex_protocol::account::PlanType;
 pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorError>;
 
 const TURN_DELIVERY_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
 const TURN_DELIVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const WRITER_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -103,6 +104,10 @@ impl RequestContext {
 
     pub(crate) fn span(&self) -> Span {
         self.span.clone()
+    }
+
+    pub(crate) fn request_id(&self) -> &ConnectionRequestId {
+        &self.request_id
     }
 
     fn record_turn_id(&self, turn_id: &str) {
@@ -312,17 +317,13 @@ impl ThreadScopedOutgoingMessageSender {
             return;
         };
         let turn_id = completed.turn.id.clone();
-        let core_completed_at_ms = completed
+        let core_completed_at = completed
             .timing
             .as_ref()
-            .and_then(|timing| timing.completed_at_unix_ms)
-            .or_else(|| {
-                completed
-                    .turn
-                    .completed_at
-                    .and_then(|seconds| seconds.checked_mul(1_000))
-            })
-            .and_then(|milliseconds| u64::try_from(milliseconds).ok());
+            .and_then(|timing| timing.activity_timeline.as_ref())
+            .and_then(codex_protocol::timing::TurnTimingTimeline::local_end_instant);
+        // Legacy/coarse wall epochs cannot prove same-domain elapsed. Keep
+        // that latency unknown; writer-relative elapsed remains observable.
 
         let mut target_connection_ids = self.connection_ids.as_ref().clone();
         target_connection_ids.sort_unstable_by_key(|connection_id| connection_id.0);
@@ -333,7 +334,7 @@ impl ThreadScopedOutgoingMessageSender {
                 turn_id,
                 target_connection_ids,
                 origin_connection_id,
-                core_completed_at_ms,
+                core_completed_at,
                 notification,
             )
             .await;
@@ -523,6 +524,13 @@ impl OutgoingMessageSender {
         bytes: usize,
         control: bool,
     ) -> bool {
+        // Controls have an independent finite envelope: at most 64 global / 8
+        // connection owners, each no larger than 64 KiB (4 MiB / 512 KiB).
+        // They must never depend on the saturated ordinary byte semaphores.
+        if control && bytes > 64 * 1024 {
+            return false;
+        }
+        let bytes = if control { 0 } else { bytes };
         let Ok(bytes) = u32::try_from(bytes) else {
             return false;
         };
@@ -578,13 +586,14 @@ impl OutgoingMessageSender {
         self.dynamic_tool_owners.lock().await.remove(&thread_id);
     }
 
-    pub(crate) async fn register_request_context(&self, request_context: RequestContext) {
+    pub(crate) async fn register_request_context(&self, request_context: RequestContext) -> bool {
         let mut request_contexts = self.request_contexts.lock().await;
-        if request_contexts
-            .insert(request_context.request_id.clone(), request_context)
-            .is_some()
-        {
-            warn!("replaced unresolved request context");
+        match request_contexts.entry(request_context.request_id.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(request_context);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
         }
     }
 
@@ -678,6 +687,8 @@ impl OutgoingMessageSender {
                 warn!("could not notify callback for {request_id:?} due to: {err:?}");
             }
         }
+        self.analytics_events_client
+            .track_connection_closed(connection_id.0);
     }
 
     async fn changed_component_notification_targets(
@@ -1463,65 +1474,69 @@ impl OutgoingMessageSender {
             .is_ok()
     }
 
-    pub(crate) async fn send_server_notification_to_connections(
-        &self,
-        connection_ids: &[ConnectionId],
+    // Keep the timed fanout state out of callers that dispatch many notification variants.
+    // Only allocation is eager; tracing, deadlines, locks and delivery still begin on poll.
+    pub(crate) fn send_server_notification_to_connections<'a>(
+        &'a self,
+        connection_ids: &'a [ConnectionId],
         notification: ServerNotification,
-    ) {
-        tracing::trace!(
-            targeted_connections = connection_ids.len(),
-            "app-server event: {notification}"
-        );
-        let outgoing_message = OutgoingMessage::AppServerNotification(notification);
-        let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
-        if connection_ids.is_empty() {
-            let targets: Vec<_> = self
-                .active_connections
-                .lock()
-                .await
-                .keys()
-                .copied()
-                .collect();
-            let sent = tokio::select! {
-                biased;
-                _ = self.delivery_shutdown.cancelled() => false,
-                result = tokio::time::timeout_at(delivery_deadline, self.notification_sender().send(OutgoingEnvelope::Broadcast {
-                    message: outgoing_message,
-                })) => matches!(result, Ok(Ok(()))),
-            };
-            if !sent {
-                warn!("server notification delivery failed or exceeded its budget");
-                for target in targets {
-                    self.fail_connection_delivery(target).await;
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            tracing::trace!(
+                targeted_connections = connection_ids.len(),
+                "app-server event: {notification}"
+            );
+            let outgoing_message = OutgoingMessage::AppServerNotification(notification);
+            let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
+            if connection_ids.is_empty() {
+                let targets: Vec<_> = self
+                    .active_connections
+                    .lock()
+                    .await
+                    .keys()
+                    .copied()
+                    .collect();
+                let sent = tokio::select! {
+                    biased;
+                    _ = self.delivery_shutdown.cancelled() => false,
+                    result = tokio::time::timeout_at(delivery_deadline, self.notification_sender().send(OutgoingEnvelope::Broadcast {
+                        message: outgoing_message,
+                    })) => matches!(result, Ok(Ok(()))),
+                };
+                if !sent {
+                    warn!("server notification delivery failed or exceeded its budget");
+                    for target in targets {
+                        self.fail_connection_delivery(target).await;
+                    }
+                }
+                return;
+            }
+            let mut outgoing_message = Some(outgoing_message);
+            for (index, connection_id) in connection_ids.iter().enumerate() {
+                let Some(message) =
+                    clone_or_take_last(&mut outgoing_message, index + 1 == connection_ids.len())
+                else {
+                    warn!("targeted notification value was exhausted before fanout completed");
+                    break;
+                };
+                let sent = tokio::select! {
+                    biased;
+                    _ = self.delivery_shutdown.cancelled() => false,
+                    result = tokio::time::timeout_at(delivery_deadline, self.notification_sender().send(OutgoingEnvelope::ToConnection {
+                        connection_id: *connection_id,
+                        message,
+                        write_complete_tx: None,
+                    })) => matches!(result, Ok(Ok(()))),
+                };
+                if !sent {
+                    warn!(
+                        ?connection_id,
+                        "server notification delivery failed or exceeded its budget"
+                    );
+                    self.fail_connection_delivery(*connection_id).await;
                 }
             }
-            return;
-        }
-        let mut outgoing_message = Some(outgoing_message);
-        for (index, connection_id) in connection_ids.iter().enumerate() {
-            let Some(message) =
-                clone_or_take_last(&mut outgoing_message, index + 1 == connection_ids.len())
-            else {
-                warn!("targeted notification value was exhausted before fanout completed");
-                break;
-            };
-            let sent = tokio::select! {
-                biased;
-                _ = self.delivery_shutdown.cancelled() => false,
-                result = tokio::time::timeout_at(delivery_deadline, self.notification_sender().send(OutgoingEnvelope::ToConnection {
-                    connection_id: *connection_id,
-                    message,
-                    write_complete_tx: None,
-                })) => matches!(result, Ok(Ok(()))),
-            };
-            if !sent {
-                warn!(
-                    ?connection_id,
-                    "server notification delivery failed or exceeded its budget"
-                );
-                self.fail_connection_delivery(*connection_id).await;
-            }
-        }
+        })
     }
 
     /// Enqueues one resource-owned notification without allowing transport
@@ -1553,6 +1568,7 @@ impl OutgoingMessageSender {
                     ?connection_id,
                     "failed to enqueue resource notification: {err:?}"
                 );
+                self.fail_connection_delivery(connection_id).await;
                 false
             }
             Err(_) => {
@@ -1561,6 +1577,7 @@ impl OutgoingMessageSender {
                     timeout_ms = RESOURCE_DELIVERY_TIMEOUT.as_millis(),
                     "timed out enqueueing resource notification"
                 );
+                self.fail_connection_delivery(connection_id).await;
                 false
             }
         }
@@ -1573,7 +1590,7 @@ impl OutgoingMessageSender {
         turn_id: String,
         target_connection_ids: Vec<ConnectionId>,
         origin_connection_id: Option<ConnectionId>,
-        core_completed_at_ms: Option<u64>,
+        core_completed_at: Option<Instant>,
         notification: ServerNotification,
     ) {
         tracing::trace!(
@@ -1581,10 +1598,12 @@ impl OutgoingMessageSender {
             "app-server terminal event: {notification}"
         );
         let dispatch_started = Instant::now();
+        tracing::info!(target: "codex_task_observation", schema_version = 1,
+            %thread_id, %turn_id, phase = "server_notification_dispatch_started",
+            at_unix_ms = chrono::Utc::now().timestamp_millis(), clock = "unix_wall_ms",
+            "task boundary observation");
         let delivery_deadline = tokio::time::Instant::now() + RESOURCE_DELIVERY_TIMEOUT;
         let receipt_deadline = tokio::time::Instant::now() + TURN_DELIVERY_RECEIPT_TIMEOUT;
-        let post_core_dispatch_latency_ms = core_completed_at_ms
-            .map(|completed_at_ms| now_unix_timestamp_ms().saturating_sub(completed_at_ms));
         let outgoing_message = OutgoingMessage::AppServerNotification(notification);
         let mut receipts = Vec::with_capacity(target_connection_ids.len());
 
@@ -1638,7 +1657,7 @@ impl OutgoingMessageSender {
                     receipts,
                     dispatch_started,
                     receipt_deadline,
-                    post_core_dispatch_latency_ms,
+                    core_completed_at,
                     delivery_shutdown,
                 )
                 .await;
@@ -1673,6 +1692,20 @@ impl OutgoingMessageSender {
             ));
     }
 
+    /// The host owns the shared deadline and force signal. Do not start an
+    /// earlier independent grace that discards a healthy pending write receipt.
+    pub(crate) async fn settle_delivery_tasks(&self) {
+        {
+            let mut accepting = self.delivery_accepting.lock().await;
+            *accepting = false;
+            self.delivery_tasks.close();
+        }
+        self.delivery_tasks.wait().await;
+    }
+
+    /// Bounded test teardown that force-cancels stragglers. Production settles
+    /// through [`Self::settle_delivery_tasks`] under the host's deadline.
+    #[cfg(test)]
     pub(crate) async fn shutdown_delivery_tasks(&self) {
         {
             let mut accepting = self.delivery_accepting.lock().await;
@@ -1754,6 +1787,22 @@ impl OutgoingMessageSender {
             .await;
     }
 
+    /// Claim a rejected envelope too: otherwise an oversized duplicate could
+    /// publish a same-ID error while the original request still owns that ID.
+    pub(crate) async fn send_unregistered_error(
+        &self,
+        request_id: ConnectionRequestId,
+        error: JSONRPCErrorError,
+    ) {
+        let context = RequestContext::new(request_id.clone(), tracing::Span::none(), None);
+        if self.register_request_context(context).await {
+            self.send_error(request_id, error).await;
+        } else {
+            self.fail_connection_delivery(request_id.connection_id)
+                .await;
+        }
+    }
+
     pub(crate) async fn send_result<T, E>(
         &self,
         request_id: ConnectionRequestId,
@@ -1796,6 +1845,21 @@ impl OutgoingMessageSender {
         message: OutgoingMessage,
         message_kind: &'static str,
     ) {
+        let request_span = request_context.as_ref().map(RequestContext::span);
+        if let Some(span) = request_span.as_ref() {
+            match &message {
+                OutgoingMessage::Response(_) => {
+                    span.record("app_server.outcome", "success");
+                }
+                OutgoingMessage::Error(error) => {
+                    span.record("app_server.outcome", "error");
+                    span.record("rpc.jsonrpc.error_code", error.error.code);
+                    span.record("error.type", "jsonrpc");
+                    span.record("otel.status_code", "ERROR");
+                }
+                _ => {}
+            }
+        }
         let send_fut = self.sender.send(OutgoingEnvelope::ToConnection {
             connection_id,
             message,
@@ -1813,6 +1877,18 @@ impl OutgoingMessageSender {
         } else {
             send_fut.await
         };
+
+        if let Some(span) = request_span.as_ref() {
+            span.record(
+                "app_server.delivery_outcome",
+                match &send_result {
+                    Some(Ok(Ok(()))) => "enqueued",
+                    Some(Ok(Err(_))) => "closed",
+                    Some(Err(_)) => "timeout",
+                    None => "cancelled",
+                },
+            );
+        }
 
         if !matches!(&send_result, Some(Ok(Ok(())))) {
             self.fail_connection_delivery(connection_id).await;
@@ -1834,7 +1910,7 @@ async fn collect_turn_delivery_outcomes(
     receipts: Vec<PendingTurnDeliveryReceipt>,
     dispatch_started: Instant,
     receipt_deadline: tokio::time::Instant,
-    post_core_dispatch_latency_ms: Option<u64>,
+    core_completed_at: Option<Instant>,
     delivery_shutdown: CancellationToken,
 ) -> Vec<TurnDeliveryOutcome> {
     let mut pending = FuturesUnordered::new();
@@ -1864,17 +1940,21 @@ async fn collect_turn_delivery_outcomes(
             };
             match receipt_result {
                 Some(Ok(Ok(delivered_at))) => {
-                    let successful_elapsed_ms = u64::try_from(delivered_at
-                        .saturating_duration_since(dispatch_started).as_millis()).unwrap_or(u64::MAX);
+                    let successful_elapsed_ms = u64::try_from(
+                        delivered_at
+                            .saturating_duration_since(dispatch_started)
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX);
                     TurnDeliveryOutcome {
                         connection_id: receipt.connection_id,
                         kind: TurnDeliveryOutcomeKind::Success,
                         successful_elapsed_ms: Some(successful_elapsed_ms),
-                        post_core_delivery_latency_ms: post_core_dispatch_latency_ms.map(
-                            |dispatch_latency_ms| {
-                                dispatch_latency_ms.saturating_add(successful_elapsed_ms)
-                            },
-                        ),
+                        post_core_delivery_latency_ms: core_completed_at
+                            .and_then(|completed_at| {
+                                delivered_at.checked_duration_since(completed_at)
+                            })
+                            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
                     }
                 }
                 Some(Ok(Err(_))) => TurnDeliveryOutcome {
@@ -1963,6 +2043,18 @@ fn aggregate_turn_delivery(
         .iter()
         .filter_map(|outcome| outcome.post_core_delivery_latency_ms)
         .max();
+
+    // These are transport-writer receipts, NOT acknowledgements from the
+    // client or an independent correctness oracle. Success timestamps are
+    // dispatch-relative, not the later receipt-collection wall time.
+    tracing::info!(target: "codex_task_observation", schema_version = 1,
+        %thread_id, %turn_id, phase = "server_notification_receipts_collected",
+        origin_status = ?origin_delivery_status,
+        origin_dispatch_elapsed_ms = origin_outcome.and_then(|outcome| outcome.successful_elapsed_ms),
+        first_dispatch_elapsed_ms = first_successful_elapsed_ms,
+        last_dispatch_elapsed_ms = last_successful_elapsed_ms,
+        success_count, failure_count, timeout_count,
+        "task boundary observation");
 
     TurnDeliveryFact {
         thread_id: thread_id.to_string(),
@@ -2089,8 +2181,6 @@ mod tests {
             timing: None,
         })
     }
-
-
 
     #[test]
     fn verify_account_login_completed_notification_serialization() {
@@ -2381,8 +2471,6 @@ mod tests {
         assert_eq!(outgoing.request_context_count().await, 0);
     }
 
-
-
     #[tokio::test]
     async fn send_error_routes_to_target_connection() {
         let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
@@ -2513,6 +2601,40 @@ mod tests {
             .send(Instant::now())
             .expect("collector waiting");
         outgoing.shutdown_delivery_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn graceful_delivery_drain_waits_for_physical_receipt() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        let scoped = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(1)],
+            thread_id,
+        );
+        scoped
+            .send_server_notification_with_receipts(
+                turn_completed_notification(thread_id, "last-turn"),
+                None,
+            )
+            .await;
+        let OutgoingEnvelope::ToConnection {
+            write_complete_tx, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected targeted terminal");
+        };
+        let mut drain = Box::pin(outgoing.settle_delivery_tasks());
+        assert!(
+            futures::poll!(drain.as_mut()).is_pending(),
+            "queue admission is not physical write settlement"
+        );
+        write_complete_tx.unwrap().send(Instant::now()).unwrap();
+        timeout(Duration::from_secs(1), drain).await.unwrap();
     }
 
     #[tokio::test]
@@ -2676,10 +2798,25 @@ mod tests {
         let (second_tx, second_rx) = oneshot::channel();
         second_tx.send(started + Duration::from_millis(80)).unwrap();
         // Both writer timestamps precede collection without a wall-clock sleep.
-        let outcomes = collect_turn_delivery_outcomes(vec![
-            PendingTurnDeliveryReceipt { connection_id: ConnectionId(1), receiver: Some(first_rx), immediate_outcome: None },
-            PendingTurnDeliveryReceipt { connection_id: ConnectionId(2), receiver: Some(second_rx), immediate_outcome: None },
-        ], started, tokio::time::Instant::now() + Duration::from_secs(1), Some(5), CancellationToken::new()).await;
+        let outcomes = collect_turn_delivery_outcomes(
+            vec![
+                PendingTurnDeliveryReceipt {
+                    connection_id: ConnectionId(1),
+                    receiver: Some(first_rx),
+                    immediate_outcome: None,
+                },
+                PendingTurnDeliveryReceipt {
+                    connection_id: ConnectionId(2),
+                    receiver: Some(second_rx),
+                    immediate_outcome: None,
+                },
+            ],
+            started,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Some(started - Duration::from_millis(5)),
+            CancellationToken::new(),
+        )
+        .await;
         assert_eq!(outcomes[0].successful_elapsed_ms, Some(2));
         assert_eq!(outcomes[0].post_core_delivery_latency_ms, Some(7));
         assert_eq!(outcomes[1].successful_elapsed_ms, Some(80));
@@ -2700,7 +2837,7 @@ mod tests {
             }],
             Instant::now(),
             tokio::time::Instant::now() + Duration::from_secs(30),
-            Some(5),
+            Some(Instant::now()),
             shutdown,
         )
         .await;
@@ -3555,9 +3692,16 @@ mod tests {
             .expect("send task should not panic");
         assert_eq!(outgoing.pending_callback_count().await, 1);
 
-        assert!(rx.recv().await.is_none(), "second recipient was never published");
+        assert!(
+            rx.recv().await.is_none(),
+            "second recipient was never published"
+        );
         outgoing
-            .notify_client_response(second_connection, request_id.clone(), json!({"unauthorized": true}))
+            .notify_client_response(
+                second_connection,
+                request_id.clone(),
+                json!({"unauthorized": true}),
+            )
             .await;
         assert_eq!(outgoing.pending_callback_count().await, 1);
         let expected_result = json!({"contentItems": [], "success": true});
@@ -4267,7 +4411,11 @@ mod tests {
             .expect("request admitted");
 
         outgoing
-            .notify_client_response(other_connection, request_id.clone(), json!({"unauthorized": true}))
+            .notify_client_response(
+                other_connection,
+                request_id.clone(),
+                json!({"unauthorized": true}),
+            )
             .await;
         assert_eq!(outgoing.pending_callback_count().await, 1);
 
@@ -4333,6 +4481,48 @@ mod tests {
         drop(extra);
         outgoing.connection_closed(connection).await;
         assert_eq!(outgoing.outstanding.available_permits(), 1024);
+        assert_eq!(outgoing.outstanding_control.available_permits(), 64);
+        assert_eq!(
+            outgoing.outstanding_bytes.available_permits(),
+            32 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn control_envelopes_remain_bounded_and_independent_of_ordinary_bytes() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let outgoing = OutgoingMessageSender::new(sender, AnalyticsEventsClient::disabled());
+        let connection = ConnectionId(702);
+        outgoing
+            .connection_opened(connection, Arc::new(AtomicBool::new(true)))
+            .await;
+        let context = |id| {
+            RequestContext::new(
+                ConnectionRequestId {
+                    connection_id: connection,
+                    request_id: RequestId::Integer(id),
+                },
+                tracing::Span::none(),
+                None,
+            )
+        };
+        assert!(
+            outgoing
+                .admit_request_work(&mut context(0), 16 * 1024 * 1024, false)
+                .await
+        );
+        assert!(!outgoing.admit_request_work(&mut context(1), 1, false).await);
+        assert!(
+            outgoing
+                .admit_request_work(&mut context(2), 64 * 1024, true)
+                .await
+        );
+        assert!(
+            !outgoing
+                .admit_request_work(&mut context(3), 64 * 1024 + 1, true)
+                .await
+        );
+        outgoing.connection_closed(connection).await;
         assert_eq!(outgoing.outstanding_control.available_permits(), 64);
         assert_eq!(
             outgoing.outstanding_bytes.available_permits(),

@@ -154,12 +154,24 @@ where
 {
     let mut raw = std::collections::BTreeMap::<String, Option<ToolInfo>>::new();
     for tool in tools {
-        let identity = format!("{}\0{}\0{}\0{}\0{}", tool.server_name, tool.callable_namespace,
-            tool.connector_id.as_deref().unwrap_or_default(), tool.callable_name, tool.tool.name);
+        let identity = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            tool.server_name,
+            tool.callable_namespace,
+            tool.connector_id.as_deref().unwrap_or_default(),
+            tool.callable_name,
+            tool.tool.name
+        );
         match raw.entry(identity) {
-            std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(Some(tool)); }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(tool));
+            }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if entry.get().as_ref().is_some_and(|previous| previous != &tool) {
+                if entry
+                    .get()
+                    .as_ref()
+                    .is_some_and(|previous| previous != &tool)
+                {
                     entry.insert(None);
                 }
             }
@@ -171,10 +183,15 @@ where
             warn!(identity = ?raw_tool_identity, "quarantining conflicting MCP tool definitions");
             continue;
         };
-        let raw_namespace_identity = format!("{}\0{}\0{}", tool.server_name,
-            tool.callable_namespace, tool.connector_id.as_deref().unwrap_or_default());
+        let raw_namespace_identity = format!(
+            "{}\0{}\0{}",
+            tool.server_name,
+            tool.callable_namespace,
+            tool.connector_id.as_deref().unwrap_or_default()
+        );
         let sanitized_namespace = sanitize_responses_api_tool_name(&tool.callable_namespace);
-        let mut namespace = callable_namespace_with_prefix(&sanitized_namespace, prefix_mcp_tool_names);
+        let mut namespace =
+            callable_namespace_with_prefix(&sanitized_namespace, prefix_mcp_tool_names);
         // Hash lossy identities even in singleton catalogs. Adding another
         // connector must never change an existing callable name.
         if sanitized_namespace != tool.callable_namespace
@@ -189,7 +206,10 @@ where
         }
         if namespace.len() + name.len() + MCP_TOOL_NAME_DELIMITER.len() > MAX_TOOL_NAME_LENGTH {
             (namespace, name) = fit_callable_parts_with_hash(
-                &namespace, &name, &raw_tool_identity, MCP_TOOL_NAME_DELIMITER.len(),
+                &namespace,
+                &name,
+                &raw_tool_identity,
+                MCP_TOOL_NAME_DELIMITER.len(),
             );
         }
         tool.callable_namespace = namespace;
@@ -204,7 +224,9 @@ where
     }
     candidates.retain(|tool| {
         let valid = counts[&tool.canonical_tool_name()] == 1;
-        if !valid { warn!(name = %tool.canonical_tool_name(), "quarantining ambiguous MCP callable name"); }
+        if !valid {
+            warn!(name = %tool.canonical_tool_name(), "quarantining ambiguous MCP callable name");
+        }
         valid
     });
     candidates

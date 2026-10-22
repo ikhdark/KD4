@@ -231,8 +231,8 @@ async fn run_command_under_windows_session(
         }
     };
 
-    let exit_code = codex_windows_sandbox::forward_sandbox_session_stdio(spawned).await;
-    std::process::exit(exit_code);
+    let outcome = codex_windows_sandbox::forward_sandbox_session_stdio(spawned).await;
+    std::process::exit(outcome.exit_code());
 }
 
 async fn spawn_debug_sandbox_child(

@@ -35,6 +35,8 @@ use once_cell::sync::Lazy;
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct AuthDotJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_context: Option<OAuthContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
 
     #[serde(rename = "OPENAI_API_KEY")]
@@ -54,6 +56,39 @@ pub struct AuthDotJson {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bedrock_api_key: Option<BedrockApiKeyAuth>,
+}
+
+/// Explicit non-default OAuth provenance. Legacy records retain the default
+/// issuer/client interpretation and the existing test endpoint overrides.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct OAuthContext {
+    pub issuer: String,
+    pub client_id: String,
+}
+
+impl OAuthContext {
+    pub fn endpoint(&self, path: &str) -> std::io::Result<String> {
+        let issuer = url::Url::parse(&self.issuer).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid stored OAuth issuer",
+            )
+        })?;
+        if !matches!(issuer.scheme(), "https" | "http")
+            || issuer.host_str().is_none()
+            || !issuer.username().is_empty()
+            || issuer.password().is_some()
+            || issuer.query().is_some()
+            || issuer.fragment().is_some()
+            || self.client_id.trim().is_empty()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid stored OAuth context",
+            ));
+        }
+        Ok(format!("{}{path}", self.issuer.trim_end_matches('/')))
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
@@ -161,9 +196,178 @@ pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> 
 }
 
 pub(super) trait AuthStorageBackend: Debug + Send + Sync {
+    fn lifecycle_id(&self) -> Option<String> {
+        None
+    }
     fn load(&self) -> std::io::Result<Option<AuthDotJson>>;
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<bool>;
+    fn save_if_unchanged(
+        &self,
+        expected: Option<&AuthDotJson>,
+        auth: &AuthDotJson,
+    ) -> std::io::Result<()> {
+        if self.load()?.as_ref() != expected {
+            return Err(auth_changed());
+        }
+        self.save(auth)
+    }
+    fn prepare_replacement(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn replace_if_unchanged(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        self.save(auth)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("authentication changed before credential commit")]
+struct AuthCommitChanged;
+
+fn auth_changed() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, AuthCommitChanged)
+}
+
+pub(super) fn is_auth_changed(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + std::marker::Send + std::marker::Sync + 'static>::is::<AuthCommitChanged>)
+}
+
+// Lock order: lifecycle transaction -> backend writer. No HTTP or manager/cache
+// lock is held here. Contention is explicit, never an unbounded runtime wait.
+#[derive(Debug)]
+struct TransactionalAuthStorage {
+    inner: Arc<dyn AuthStorageBackend>,
+    home: PathBuf,
+    ephemeral: bool,
+    observed: Mutex<Option<String>>,
+}
+
+static EPHEMERAL_REVISIONS: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+impl TransactionalAuthStorage {
+    fn transaction<T>(
+        &self,
+        action: impl FnOnce(&mut String) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        if self.ephemeral {
+            let key = compute_store_key(&self.home)?;
+            let mut revisions = EPHEMERAL_REVISIONS
+                .lock()
+                .map_err(|_| std::io::Error::other("auth lifecycle lock poisoned"))?;
+            return action(revisions.entry(key).or_default());
+        }
+        let path = self.home.join("auth-lifecycle");
+        let _lock = codex_file_system::try_acquire_atomic_write_lock(&path)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "credential transaction is busy",
+            )
+        })?;
+        let mut revision = match std::fs::read_to_string(&path) {
+            Ok(value) => value,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(err),
+        };
+        action(&mut revision)
+    }
+
+    fn advance(&self, revision: &mut String) -> std::io::Result<()> {
+        let next = format!("{:032x}", rand::random::<u128>());
+        if !self.ephemeral {
+            codex_file_system::write_atomically(&self.home.join("auth-lifecycle"), &next)?;
+        }
+        *revision = next.clone();
+        *self
+            .observed
+            .lock()
+            .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))? = Some(next);
+        Ok(())
+    }
+}
+
+impl AuthStorageBackend for TransactionalAuthStorage {
+    fn lifecycle_id(&self) -> Option<String> {
+        self.observed
+            .lock()
+            .ok()
+            .and_then(|revision| revision.clone())
+    }
+    fn prepare_replacement(&self) -> std::io::Result<()> {
+        self.transaction(|revision| {
+            *self
+                .observed
+                .lock()
+                .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))? =
+                Some(revision.clone());
+            Ok(())
+        })
+    }
+
+    fn replace_if_unchanged(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        self.transaction(|revision| {
+            let observed = self
+                .observed
+                .lock()
+                .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))?
+                .clone();
+            if observed.as_deref() != Some(revision.as_str()) {
+                return Err(auth_changed());
+            }
+            self.advance(revision)?;
+            self.inner.save(auth)
+        })
+    }
+
+    fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
+        self.transaction(|revision| {
+            let auth = self.inner.load()?;
+            *self
+                .observed
+                .lock()
+                .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))? =
+                Some(revision.clone());
+            Ok(auth)
+        })
+    }
+
+    fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
+        self.transaction(|revision| {
+            // Invalidate old work even if a backend partially writes then fails.
+            self.advance(revision)?;
+            self.inner.save(auth)
+        })
+    }
+
+    fn delete(&self) -> std::io::Result<bool> {
+        self.transaction(|revision| {
+            self.advance(revision)?;
+            self.inner.delete()
+        })
+    }
+
+    fn save_if_unchanged(
+        &self,
+        expected: Option<&AuthDotJson>,
+        auth: &AuthDotJson,
+    ) -> std::io::Result<()> {
+        self.transaction(|revision| {
+            let observed = self
+                .observed
+                .lock()
+                .map_err(|_| std::io::Error::other("auth snapshot lock poisoned"))?
+                .clone();
+            if observed.as_deref() != Some(revision.as_str())
+                || self.inner.load()?.as_ref() != expected
+            {
+                return Err(auth_changed());
+            }
+            // A conditional update retains its lifecycle; payload comparison
+            // fences overlapping refresh/bootstrap updates within that lifecycle.
+            self.inner.save(auth)
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -259,10 +463,13 @@ impl DirectKeyringAuthStorage {
                 ))
             }),
             Ok(None) => Ok(None),
-            Err(error) => Err(std::io::Error::other(format!(
-                "failed to load CLI auth from keyring: {}",
-                error.message()
-            ))),
+            Err(error) => {
+                let error = std::io::Error::from(error);
+                Err(std::io::Error::new(
+                    error.kind(),
+                    format!("failed to load CLI auth from keyring: {error}"),
+                ))
+            }
         }
     }
 
@@ -275,7 +482,8 @@ impl DirectKeyringAuthStorage {
                     error.message()
                 );
                 warn!("{message}");
-                Err(std::io::Error::other(message))
+                let error = std::io::Error::from(error);
+                Err(std::io::Error::new(error.kind(), message))
             }
         }
     }
@@ -292,9 +500,7 @@ impl AuthStorageBackend for DirectKeyringAuthStorage {
         // Simpler error mapping per style: prefer method reference over closure
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
         self.save_to_keyring(&key, &serialized)?;
-        if let Err(err) = delete_file_if_exists(&self.codex_home) {
-            warn!("failed to remove CLI auth fallback file: {err}");
-        }
+        delete_file_if_exists(&self.codex_home)?;
         Ok(())
     }
 
@@ -350,9 +556,11 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
             .secrets_manager
             .get(&SecretScope::Global, &CODEX_AUTH_SECRET_NAME)
             .map_err(|err| {
-                std::io::Error::other(format!(
-                    "failed to load CLI auth from encrypted auth storage: {err}"
-                ))
+                std::io::Error::new(
+                    err.downcast_ref::<std::io::Error>()
+                        .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+                    format!("failed to load CLI auth from encrypted auth storage: {err}"),
+                )
             })? {
             Some(serialized) => serde_json::from_str(&serialized).map(Some).map_err(|err| {
                 std::io::Error::other(format!(
@@ -371,18 +579,12 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
                 let message =
                     format!("failed to write OAuth tokens to encrypted auth storage: {err}");
                 warn!("{message}");
-                let kind = if err.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                    error.kind() == std::io::ErrorKind::WouldBlock
-                }) {
-                    std::io::ErrorKind::WouldBlock
-                } else {
-                    std::io::ErrorKind::Other
-                };
+                let kind = err
+                    .downcast_ref::<std::io::Error>()
+                    .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
                 std::io::Error::new(kind, message)
             })?;
-        if let Err(err) = delete_file_if_exists(&self.codex_home) {
-            warn!("failed to remove CLI auth fallback file: {err}");
-        }
+        delete_file_if_exists(&self.codex_home)?;
         Ok(())
     }
 
@@ -429,10 +631,9 @@ impl AuthStorageBackend for AutoAuthStorage {
         match self.keyring_storage.load() {
             Ok(Some(auth)) => Ok(Some(auth)),
             Ok(None) => self.file_storage.load(),
-            Err(err) => {
-                warn!("failed to load CLI auth from keyring, falling back to file storage: {err}");
-                self.file_storage.load()
-            }
+            // An unreadable preferred authority is not evidence that fallback
+            // credentials belong to the currently selected account.
+            Err(err) => Err(err),
         }
     }
 
@@ -443,6 +644,10 @@ impl AuthStorageBackend for AutoAuthStorage {
             // the new credential behind the existing encrypted value.
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Err(err),
             Err(err) => {
+                match self.keyring_storage.load() {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => return Err(err),
+                }
                 warn!("failed to save auth to keyring, falling back to file storage: {err}");
                 self.file_storage.save(auth)
             }
@@ -539,7 +744,8 @@ fn create_auth_storage_with_store(
     keyring_store: Arc<dyn KeyringStore>,
     keyring_backend_kind: AuthKeyringBackendKind,
 ) -> Arc<dyn AuthStorageBackend> {
-    match mode {
+    let home = codex_home.clone();
+    let inner: Arc<dyn AuthStorageBackend> = match mode {
         AuthCredentialsStoreMode::File => Arc::new(FileAuthStorage::new(codex_home)),
         AuthCredentialsStoreMode::Keyring => {
             create_keyring_auth_storage(codex_home, keyring_store, keyring_backend_kind)
@@ -550,7 +756,13 @@ fn create_auth_storage_with_store(
             keyring_backend_kind,
         )),
         AuthCredentialsStoreMode::Ephemeral => Arc::new(EphemeralAuthStorage::new(codex_home)),
-    }
+    };
+    Arc::new(TransactionalAuthStorage {
+        inner,
+        home,
+        ephemeral: mode == AuthCredentialsStoreMode::Ephemeral,
+        observed: Mutex::new(None),
+    })
 }
 
 fn create_keyring_auth_storage(

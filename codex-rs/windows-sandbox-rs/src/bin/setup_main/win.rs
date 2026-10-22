@@ -15,6 +15,7 @@ use codex_windows_sandbox::add_deny_write_ace;
 use codex_windows_sandbox::canonicalize_path;
 use codex_windows_sandbox::ensure_allow_mask_aces_with_inheritance;
 use codex_windows_sandbox::ensure_allow_write_aces;
+use codex_windows_sandbox::ensure_directory_traversal_aces;
 use codex_windows_sandbox::extract_setup_failure;
 use codex_windows_sandbox::hide_newly_created_users;
 use codex_windows_sandbox::install_wfp_filters;
@@ -35,6 +36,7 @@ use codex_windows_sandbox::to_wide;
 use codex_windows_sandbox::workspace_write_cap_sid_for_root;
 use codex_windows_sandbox::workspace_write_root_overlaps_path;
 use codex_windows_sandbox::write_setup_error_report;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::io::Write;
@@ -62,6 +64,9 @@ use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::FILE_TRAVERSE;
+use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 
 const DENY_ACCESS: i32 = 3;
 const WRITE_ROOT_ALLOW_MASK: u32 =
@@ -163,6 +168,66 @@ struct ReadAclSubjects<'a> {
     rx_psids: &'a [*mut c_void],
 }
 
+fn ancestor_has_traversal_grant(path: &Path, subjects: &ReadAclSubjects<'_>) -> Result<bool> {
+    let psids = subjects
+        .rx_psids
+        .iter()
+        .copied()
+        .chain(std::iter::once(subjects.sandbox_group_psid))
+        .collect::<Vec<_>>();
+    // This is a grant-presence check, not an effective-access check: existing
+    // deny ACEs remain authoritative and must not be removed to enable traversal.
+    // SAFETY: All SID owners are retained by the synchronous setup caller.
+    unsafe {
+        path_mask_allows(
+            path,
+            &psids,
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+            true,
+        )
+    }
+    .with_context(|| format!("check ancestor traversal on {}", path.display()))
+}
+
+fn missing_read_root_ancestors(
+    read_roots: &[PathBuf],
+    subjects: &ReadAclSubjects<'_>,
+) -> Result<Vec<PathBuf>> {
+    let ancestors = read_roots
+        .iter()
+        .filter(|root| root.exists())
+        .flat_map(|root| root.ancestors().skip(1))
+        .collect::<BTreeSet<_>>();
+    let mut missing = Vec::new();
+    for ancestor in ancestors {
+        if !ancestor_has_traversal_grant(ancestor, subjects)? {
+            missing.push(ancestor.to_path_buf());
+        }
+    }
+    Ok(missing)
+}
+
+// The caller holds the read ACL mutex. Recheck after acquiring it because
+// another helper may have supplied the grants since the initial readiness scan.
+fn apply_read_root_ancestor_acls(
+    ancestors: &[PathBuf],
+    subjects: &ReadAclSubjects<'_>,
+) -> Result<()> {
+    for ancestor in ancestors {
+        if ancestor_has_traversal_grant(ancestor, subjects)? {
+            continue;
+        }
+        // Strict walks pin every ancestor using no-follow directory handles.
+        // Include CreateFileW's implicit SYNCHRONIZE requirement, without
+        // inheritance or sibling-content access.
+        // SAFETY: The caller retains the group SID; ancestors of existing read
+        // roots are directories. The setter updates only this directory object.
+        unsafe { ensure_directory_traversal_aces(ancestor, &[subjects.sandbox_group_psid]) }
+            .with_context(|| format!("grant ancestor traversal on {}", ancestor.display()))?;
+    }
+    Ok(())
+}
+
 fn apply_read_acls(
     read_roots: &[PathBuf],
     subjects: &ReadAclSubjects<'_>,
@@ -248,8 +313,8 @@ fn read_mask_allows_or_log(
     refresh_errors: &mut Vec<String>,
     log: &mut dyn Write,
 ) -> Result<bool> {
-    // SAFETY: This private helper is called only by apply_read_acls, whose SID
-    // pointers borrow LocalSid owners retained by run_read_acl_only.
+    // SAFETY: Both read-root and ancestor checks borrow SID pointers from
+    // LocalSid owners retained by run_read_acl_only.
     match unsafe {
         path_mask_allows(root, psids, read_mask, /*require_all_bits*/ true)
     } {
@@ -519,6 +584,8 @@ fn run_read_acl_only(
             sandbox_group_psid,
             rx_psids: &rx_psids,
         };
+        let ancestors = missing_read_root_ancestors(&payload.read_roots, &subjects)?;
+        apply_read_root_ancestor_acls(&ancestors, &subjects)?;
         apply_read_acls(
             &payload.read_roots,
             &subjects,
@@ -781,6 +848,26 @@ fn run_setup_full(payload: &Payload, log: &mut dyn Write, sbx_dir: &Path) -> Res
     if payload.read_roots.is_empty() {
         log_line(log, "no read roots to grant; skipping read ACL helper")?;
     } else {
+        let users = sid_bytes_to_local_sid(&resolve_sid("Users")?)?;
+        let auth = sid_bytes_to_local_sid(&resolve_sid("Authenticated Users")?)?;
+        let everyone = sid_bytes_to_local_sid(&resolve_sid("Everyone")?)?;
+        let rx_psids = [users.as_ptr(), auth.as_ptr(), everyone.as_ptr()];
+        let subjects = ReadAclSubjects {
+            sandbox_group_psid,
+            rx_psids: &rx_psids,
+        };
+        let ancestors = missing_read_root_ancestors(&payload.read_roots, &subjects)?;
+        if !ancestors.is_empty() {
+            // Do not wait for unrelated bulk read grants or launch a command
+            // whose required ancestor permissions are still pending.
+            let _read_acl_guard = acquire_read_acl_mutex()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ancestor traversal preparation pending: read ACL helper already running"
+                )
+            })?;
+            apply_read_root_ancestor_acls(&ancestors, &subjects)?;
+        }
+        // Release the targeted-preparation guard before scheduling bulk grants.
         match read_acl_mutex_exists() {
             Ok(true) => {
                 log_line(log, "read ACL helper already running; skipping spawn")?;

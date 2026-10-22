@@ -50,6 +50,12 @@ impl Session {
         };
 
         let previous_world_state = self.state.lock().await.history.world_state_baseline();
+        let recovered_agents =
+            if step_context.agents_md_freshness != crate::agents_md::AgentsMdFreshness::Refreshed {
+                self.services.agents_md_manager.recovered_snapshot().await
+            } else {
+                None
+            };
         let mut world_state = WorldState::default();
         world_state.add_section(
             self.services
@@ -60,33 +66,6 @@ impl Session {
                 )
                 .await,
         );
-        if turn_context
-            .config
-            .features
-            .enabled(codex_features::Feature::TokenBudget)
-        {
-            let ids = self.state.lock().await.auto_compact_window_ids();
-            world_state.add_section(crate::context::TokenBudgetContext::new(
-                turn_context
-                    .session_source
-                    .get_agent_path()
-                    .unwrap_or_else(codex_protocol::AgentPath::root),
-                ids.first_window_id,
-                ids.previous_window_id,
-                ids.window_id,
-                turn_context
-                    .config
-                    .token_budget
-                    .as_ref()
-                    .and_then(|config| config.guidance_message.as_deref())
-                    .filter(|_| self.token_budget_recovery_available())
-                    .map(|guidance| {
-                        crate::context::ContextualUserFragment::render(
-                            &crate::context::ContextWindowGuidance::new(guidance),
-                        )
-                    }),
-            ));
-        }
         world_state.add_section(
             AgentsMdState::new_cached(
                 step_context.loaded_agents_md.as_deref(),
@@ -98,6 +77,7 @@ impl Session {
                     .as_ref()
                     .and_then(|previous| previous.section("agents_md"))
                     .cloned()
+                    .or(recovered_agents)
             }),
         );
         if turn_context.config.include_environment_context {
@@ -167,6 +147,7 @@ impl Session {
                 turn_id: turn_context.sub_id.as_str(),
                 environments: &environments,
                 ready_selected_capability_roots: &ready_selected_capability_roots,
+                bound_selected_capability_roots: &step_context.selected_capability_roots,
                 session_store: &self.services.session_extension_data,
                 thread_store: &self.services.thread_extension_data,
                 turn_store: turn_context.extension_data.as_ref(),
@@ -187,6 +168,15 @@ impl Session {
         while let Some((contributor_index, owned_section_ids, result)) = pending.next().await {
             match result {
                 Ok(sections) => {
+                    for id in owned_section_ids {
+                        if !sections.iter().any(|section| section.id() == *id)
+                            && let Some(rendering) = previous_world_state
+                                .as_ref()
+                                .and_then(|previous| previous.rendered_extension(id))
+                        {
+                            world_state.add_removed_extension_section(id, rendering);
+                        }
+                    }
                     for section in sections {
                         world_state.add_extension_section(section);
                     }

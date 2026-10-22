@@ -939,6 +939,8 @@ function Copy-UserCargoConfig {
         catch { $previous = $null }
     }
     $previousHash = if ($null -ne $previous -and $null -ne $previous.PSObject.Properties["sha256"]) { [string]$previous.sha256 } else { $null }
+    $pendingHash = if ($null -ne $previous -and $null -ne $previous.PSObject.Properties["pendingSha256"]) { [string]$previous.pendingSha256 } else { $null }
+    if ($pendingHash -cnotmatch '^[0-9A-F]{64}$') { $pendingHash = $null }
     $targetHash = $null
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
         $target = Get-Item -LiteralPath $configPath -Force
@@ -948,23 +950,47 @@ function Copy-UserCargoConfig {
         # An old unmarked copy is safe to adopt only when it still equals its
         # source. Never overwrite a user's independently edited lane config.
         if (($target.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
-            ($targetHash -cne $previousHash -and $targetHash -cne $sourceHash)) {
+            ($targetHash -cne $previousHash -and $targetHash -cne $sourceHash -and $targetHash -cne $pendingHash)) {
             Write-Warning "Preserving independently managed isolated Cargo config '$configPath'; source is '$sourceConfig'."
             return $configPath
         }
     }
     if ($null -eq $sourceBytes) {
-        if ($null -ne $targetHash -and $targetHash -ceq $previousHash) {
+        if ($null -ne $targetHash -and ($targetHash -ceq $previousHash -or $targetHash -ceq $pendingHash)) {
             Remove-Item -LiteralPath $configPath -Force
             Remove-Item -LiteralPath $markerPath -Force
         }
         return $configPath
     }
-    if ($targetHash -cne $sourceHash) {
-        [IO.File]::WriteAllBytes($configPath, $sourceBytes)
+    if ($targetHash -ceq $sourceHash -and $previousHash -ceq $sourceHash -and $null -eq $pendingHash) { return $configPath }
+    # Record both admissible owned generations before replacing the config.
+    # A crash between config activation and marker settlement remains recoverable
+    # even when the source changes again before the next invocation.
+    $stagedConfig = Join-Path $CargoHome (".config-" + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $stagedMarker = Join-Path $CargoHome (".marker-" + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        if ($targetHash -cne $sourceHash) {
+            $file = [IO.File]::Open($stagedConfig, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $file.Write($sourceBytes, 0, $sourceBytes.Length); $file.Flush($true) }
+            finally { $file.Dispose() }
+        }
+        foreach ($state in @(@{ sha256 = $targetHash; pendingSha256 = $sourceHash }, @{ sha256 = $sourceHash })) {
+            $bytes = [Text.Encoding]::UTF8.GetBytes(($state | ConvertTo-Json -Compress))
+            $file = [IO.File]::Open($stagedMarker, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            try { $file.Write($bytes, 0, $bytes.Length); $file.Flush($true) }
+            finally { $file.Dispose() }
+            if ([IO.File]::Exists($markerPath)) { [IO.File]::Replace($stagedMarker, $markerPath, [NullString]::Value) }
+            else { [IO.File]::Move($stagedMarker, $markerPath) }
+            if ([IO.File]::Exists($stagedConfig)) {
+                if ([IO.File]::Exists($configPath)) { [IO.File]::Replace($stagedConfig, $configPath, [NullString]::Value) }
+                else { [IO.File]::Move($stagedConfig, $configPath) }
+            }
+        }
     }
-    if ($previousHash -cne $sourceHash) {
-        [IO.File]::WriteAllText($markerPath, (@{ sha256 = $sourceHash } | ConvertTo-Json -Compress))
+    finally {
+        foreach ($temporary in @($stagedConfig, $stagedMarker)) {
+            if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+        }
     }
     return $configPath
 }
@@ -1132,7 +1158,20 @@ try {
             throw "LOCALAPPDATA is not set. Pass a normal lane without -IsolateCargoHome."
         }
 
-        $cargoHome = Join-Path $env:LOCALAPPDATA "cargo-lanes\codexKD\$resolvedLane"
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $identity = (Get-NormalizedCargoLanePath $repoRoot).ToLowerInvariant()
+            $checkoutId = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))).Replace('-', '').ToLowerInvariant()
+        }
+        finally { $sha256.Dispose() }
+        # Legacy shared homes/caches remain untouched for explicit recovery;
+        # configuration-bearing homes now share the checkout's lane-lock scope.
+        $cargoHome = Join-Path $env:LOCALAPPDATA "cargo-lanes\codexKD\$checkoutId\$resolvedLane"
+        $legacyHome = Join-Path $env:LOCALAPPDATA "cargo-lanes\codexKD\$resolvedLane"
+        if ((Test-Path -LiteralPath (Join-Path $legacyHome 'config')) -or
+            (Test-Path -LiteralPath (Join-Path $legacyHome 'config.toml'))) {
+            Write-Warning "Legacy shared Cargo home retained at '$legacyHome'; review its config before migrating to '$cargoHome'."
+        }
         New-Item -ItemType Directory -Force -Path $cargoHome | Out-Null
         $sourceCargoHome = $env:CARGO_HOME
         $env:CARGO_HOME = $cargoHome
@@ -1168,7 +1207,7 @@ try {
             Write-Output "CARGO_HOME=$env:CARGO_HOME"
         }
         Write-Output "Core test example: just core-test-lane core_lib"
-        Write-Output "Generic package example: just test-lane-package codex-tui"
+        Write-Output "Generic package example: just test-lane-package codex-exec"
         Write-Output "Check example: just check-lane codex-core"
         exit 0
     }

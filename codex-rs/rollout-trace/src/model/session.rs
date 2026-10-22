@@ -37,12 +37,21 @@ pub struct AgentThread {
     /// Presentation hint. It can collide and must not be used as identity.
     pub nickname: Option<String>,
     pub origin: AgentOrigin,
-    /// Session lifecycle for this thread.
+    /// Latest observed runtime activation for this stable thread identity.
     ///
     /// Child threads can end independently from the root rollout, for example
     /// after a parent calls `close_agent`. Keeping this on the thread prevents
     /// those shutdowns from being mistaken for whole-rollout completion.
     pub execution: ExecutionWindow,
+    /// Closed activations, in order. Never include the unobserved idle intervals
+    /// between eviction and reload when computing execution time. Each window's
+    /// start sequence is its bundle-local activation identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous_executions: Vec<ExecutionWindow>,
+    /// This historical child was first observed on resume in this bundle.
+    /// Earlier execution is unknown, so this is not a complete task capture.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_before_trace: bool,
     /// Configured model presentation hint. Individual inference calls carry the actual upstream model.
     pub default_model: Option<String>,
     /// Logical conversation items first observed for this thread, in transcript order.
@@ -68,9 +77,9 @@ pub enum AgentOrigin {
 
 /// Runtime interval for a typed trace object.
 ///
-/// Wall-clock timestamps are for display and latency. Sequence numbers are the
-/// causal ordering primitive and should be used to pair observations or break
-/// same-millisecond ties.
+/// Wall-clock timestamps are recorder display times, not latency measurements.
+/// Sequence numbers describe persistence order, not cross-producer occurrence
+/// order. Use explicit monotonic occurrence evidence for elapsed durations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionWindow {
     pub started_at_unix_ms: i64,

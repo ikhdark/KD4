@@ -72,8 +72,8 @@ modelStreamWaitNs: bigint,
  */
 decisionLatencyNs: number | null,
 /**
- * Tool calls whose deferred executor future was polled for this generation.
- * Kept under its historical field name for rollout compatibility.
+ * Unique tool calls accepted for this generation, including unpolled calls.
+ * Timing schemas <=32 counted calls at executor polling instead.
  */
 toolCallCount: number,
 /**

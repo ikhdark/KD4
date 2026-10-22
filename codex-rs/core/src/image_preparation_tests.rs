@@ -79,7 +79,18 @@ fn detail_policies_apply_the_expected_budgets() {
         (Some(ImageDetail::Auto), (2048, 2048), (1600, 1600)),
         (None, (2048, 2048), (1600, 1600)),
     ] {
-        let (image_url, _) = png_data_url(input_dimensions.0, input_dimensions.1);
+        // Exercise dimension policy independently of the stricter RGBA working-
+        // set limit: alpha-safe filtering needs additional full-size float buffers.
+        let image = ImageBuffer::from_pixel(
+            input_dimensions.0,
+            input_dimensions.1,
+            image::Rgb([10u8, 20, 30]),
+        );
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .unwrap();
+        let image_url = data_url_from_bytes("image/png", encoded.get_ref());
         let mut items = vec![ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -93,17 +104,29 @@ fn detail_policies_apply_the_expected_budgets() {
         let ResponseItem::Message { content, .. } = &items[0] else {
             panic!("expected message");
         };
-        let [
-            ContentItem::InputImage {
-                image_url,
-                detail: prepared_detail,
-            },
-        ] = content.as_slice()
+        let Some(ContentItem::InputImage {
+            image_url,
+            detail: prepared_detail,
+        }) = content.first()
         else {
             panic!("expected image");
         };
         assert_eq!(decoded_image(image_url).1.dimensions(), expected_dimensions);
         assert_eq!(*prepared_detail, detail);
+        let resized_original =
+            detail == Some(ImageDetail::Original) && input_dimensions != expected_dimensions;
+        assert_eq!(content.len(), if resized_original { 2 } else { 1 });
+        if resized_original {
+            let ContentItem::InputText { text } = &content[1] else {
+                panic!("missing resize notice");
+            };
+            assert!(text.contains(&format!("{}x{}", input_dimensions.0, input_dimensions.1)));
+            assert!(text.contains(&format!(
+                "{}x{}",
+                expected_dimensions.0, expected_dimensions.1
+            )));
+            assert!(text.contains("exact source resolution was not delivered"));
+        }
     }
 }
 
@@ -202,5 +225,227 @@ fn preparation_errors_use_bounded_actionable_placeholders() {
 
     for (error, expected) in cases {
         assert_eq!(error.placeholder(), expected);
+    }
+}
+
+#[test]
+fn final_detail_negotiation_is_reversible_and_applies_to_user_and_tool_images() {
+    let (image_url, _) = png_data_url(2200, 2);
+    let tool_output = FunctionCallOutputPayload::from_content_items(vec![
+        FunctionCallOutputContentItem::InputText {
+            text: "before".into(),
+        },
+        FunctionCallOutputContentItem::InputImage {
+            image_url: image_url.clone(),
+            detail: Some(ImageDetail::Original),
+        },
+        FunctionCallOutputContentItem::InputText {
+            text: "after".into(),
+        },
+    ]);
+    let canonical: std::sync::Arc<[ResponseItem]> = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputImage {
+                image_url,
+                detail: Some(ImageDetail::Original),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "function".into(),
+            output: tool_output.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "custom".into(),
+            name: None,
+            output: tool_output,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]
+    .into();
+    let supported = for_model_image_detail(canonical.clone(), true);
+    assert!(std::sync::Arc::ptr_eq(&supported, &canonical));
+    let downgraded = for_model_image_detail(canonical.clone(), false);
+    let json = serde_json::to_string(&downgraded).unwrap();
+    assert!(!json.contains("\"detail\":\"original\""));
+    assert_eq!(
+        json.matches("Original image detail is unavailable").count(),
+        3
+    );
+    let ResponseItem::Message { content, .. } = &downgraded[0] else {
+        panic!("user message");
+    };
+    let ContentItem::InputImage { image_url, detail } = &content[0] else {
+        panic!("image");
+    };
+    assert_eq!(*detail, Some(ImageDetail::High));
+    assert_eq!(decoded_image(image_url).1.dimensions(), (2048, 2));
+    assert!(std::sync::Arc::ptr_eq(
+        &for_model_image_detail(canonical.clone(), true),
+        &canonical
+    ));
+    assert_eq!(
+        for_model_image_detail(downgraded.clone(), false),
+        downgraded
+    );
+}
+
+#[test]
+fn animation_notice_stays_next_to_its_static_preview_and_is_idempotent() {
+    let mut gif = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+        for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+            encoder
+                .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                    3,
+                    2,
+                    Rgba(color),
+                )))
+                .unwrap();
+        }
+    }
+    let mut items = vec![ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![
+            ContentItem::InputText {
+                text: "before".into(),
+            },
+            ContentItem::InputImage {
+                image_url: data_url_from_bytes("image/gif", &gif),
+                detail: None,
+            },
+            ContentItem::InputText {
+                text: "after".into(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    prepare_response_items(&mut items);
+    let ResponseItem::Message { content, .. } = &items[0] else {
+        panic!("message");
+    };
+    assert_eq!(content.len(), 4);
+    assert!(matches!(&content[1], ContentItem::InputImage { .. }));
+    assert!(
+        matches!(&content[2], ContentItem::InputText { text } if text.contains("other animation frames have not been analyzed"))
+    );
+    let prepared = items.clone();
+    prepare_response_items(&mut items);
+    assert_eq!(items, prepared);
+}
+
+#[test]
+fn unsupported_representations_are_isolated_in_every_history_shape() {
+    for url in [
+        "file:///tmp/a.png",
+        "ftp://host/a.png",
+        "blob:id",
+        "",
+        "plain",
+        " https://host/a.png",
+    ] {
+        let content = vec![
+            ContentItem::InputText {
+                text: "before".into(),
+            },
+            ContentItem::InputImage {
+                image_url: url.into(),
+                detail: Some(ImageDetail::Low),
+            },
+            ContentItem::InputText {
+                text: "after".into(),
+            },
+        ];
+        let output = FunctionCallOutputPayload::from_content_items(vec![
+            FunctionCallOutputContentItem::InputText {
+                text: "before".into(),
+            },
+            FunctionCallOutputContentItem::InputImage {
+                image_url: url.into(),
+                detail: Some(ImageDetail::Low),
+            },
+            FunctionCallOutputContentItem::InputText {
+                text: "after".into(),
+            },
+        ]);
+        let mut items = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content,
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                internal_chat_message_metadata_passthrough: None,
+                call_id: "function".into(),
+                output: output.clone(),
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "custom".into(),
+                name: None,
+                output,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        prepare_response_items(&mut items);
+        for item in &items {
+            let serialized = serde_json::to_string(item).unwrap();
+            assert!(!serialized.contains("input_image"));
+            assert!(serialized.contains("before") && serialized.contains("after"));
+            assert!(serialized.contains(UNSUPPORTED_IMAGE_URL_PLACEHOLDER));
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_image_acquisition_rejects_oversize_and_non_files_before_conversion() {
+    use codex_protocol::models::LocalImagePreparation;
+    use codex_protocol::models::ResponseInputItem;
+    use codex_protocol::user_input::UserInput;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("oversize.png");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 + 1)
+        .unwrap();
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    for path in [path, temp.path().to_path_buf()] {
+        let input = vec![
+            UserInput::Text {
+                text: "keep instructions".into(),
+                text_elements: Vec::new(),
+            },
+            UserInput::LocalImage {
+                path,
+                detail: Some(ImageDetail::Low),
+            },
+        ];
+        for mode in [LocalImagePreparation::Process, LocalImagePreparation::Defer] {
+            let item = ResponseInputItem::from_user_input(input.clone(), mode);
+            let json = serde_json::to_string(&item).unwrap();
+            assert!(!json.contains("input_image"));
+            assert!(
+                json.contains("keep instructions")
+                    && json.contains("could not read the local image")
+            );
+        }
+        let item = session.response_item_from_user_input(input).await.unwrap();
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("input_image"));
+        assert!(
+            json.contains("keep instructions") && json.contains("could not read the local image")
+        );
     }
 }

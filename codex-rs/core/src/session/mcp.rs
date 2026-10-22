@@ -105,12 +105,13 @@ impl Session {
             Self::available_selected_environment_ids(&selected_capability_roots);
         self.services
             .mcp_manager
-            .runtime_config_for_step(
+            .runtime_config_for_bound_step(
                 config,
                 &self.services.mcp_thread_init,
                 &self.services.thread_extension_data,
                 &originator,
                 &available_environment_ids,
+                &selected_capability_roots,
             )
             .await
             .config
@@ -131,20 +132,57 @@ impl Session {
     ) -> codex_protocol::error::Result<Arc<McpRuntimeSnapshot>> {
         let available_environment_ids =
             Self::available_selected_environment_ids(selected_capability_roots);
+        let current_context = self.services.latest_mcp_runtime().runtime_context().clone();
+        let local_cwd = environments
+            .turn_environments
+            .iter()
+            .find(|environment| !environment.environment.is_remote())
+            .and_then(|environment| environment.cwd().to_abs_path().ok())
+            .map(|cwd| cwd.to_path_buf())
+            .unwrap_or_else(|| current_context.local_fallback_cwd());
+        let mut captured = environments.captured_environments();
+        for root in selected_capability_roots {
+            let CapabilityRootLocation::Environment { environment_id, .. } =
+                &root.selected_root().location;
+            captured.insert(environment_id.clone(), Some(Arc::clone(root.environment())));
+        }
+        let selected_context = McpRuntimeContext::new(
+            self.services.turn_environments.environment_manager(),
+            local_cwd,
+        )
+        .with_selected_environments(captured);
         loop {
             let expected_runtime = self.services.latest_mcp_runtime();
-            if expected_runtime.available_environment_ids() == available_environment_ids {
+            let scope_matches = |runtime: &McpRuntimeSnapshot| {
+                runtime
+                    .config()
+                    .mcp_server_catalog
+                    .configured_servers()
+                    .values()
+                    .filter(|server| server.enabled)
+                    .all(|server| {
+                        runtime
+                            .runtime_context()
+                            .server_scope_matches(&selected_context, server)
+                    })
+            };
+            if expected_runtime.available_environment_ids() == available_environment_ids
+                && expected_runtime
+                    .runtime_context()
+                    .selected_scope_matches(&selected_context)
+            {
                 return Ok(expected_runtime);
             }
             let mcp_projection = self
                 .services
                 .mcp_manager
-                .runtime_config_for_step(
+                .runtime_config_for_bound_step(
                     &turn_context.config,
                     &self.services.mcp_thread_init,
                     &self.services.thread_extension_data,
                     &turn_context.originator,
                     &available_environment_ids,
+                    selected_capability_roots,
                 )
                 .await;
             let expected_runtime = {
@@ -152,7 +190,11 @@ impl Session {
                     unreachable!("MCP projection semaphore is never closed");
                 };
                 let current = self.services.latest_mcp_runtime();
-                if current.available_environment_ids() == available_environment_ids {
+                if current.available_environment_ids() == available_environment_ids
+                    && current
+                        .runtime_context()
+                        .selected_scope_matches(&selected_context)
+                {
                     return Ok(current);
                 }
                 if !Arc::ptr_eq(&current, &expected_runtime) {
@@ -172,6 +214,7 @@ impl Session {
                         server.enabled && was_available != is_available
                     });
                 if !changed_environment_is_used_by_mcp
+                    && scope_matches(&current)
                     && current
                         .config()
                         .mcp_server_catalog
@@ -186,7 +229,7 @@ impl Session {
                         &mut state_owner,
                         Arc::new(current.config().clone()),
                         mcp_projection.plugins_available,
-                        current.runtime_context().clone(),
+                        selected_context.clone(),
                         available_environment_ids,
                         current.as_ref(),
                     ));
@@ -211,9 +254,14 @@ impl Session {
                     environments,
                     &available_environment_ids,
                     expected_runtime,
+                    Some(selected_context.clone()),
                 )
                 .await;
-            if runtime.available_environment_ids() == available_environment_ids {
+            if runtime.available_environment_ids() == available_environment_ids
+                && runtime
+                    .runtime_context()
+                    .selected_scope_matches(&selected_context)
+            {
                 return Ok(runtime);
             }
             // A concurrent refresh published a projection for a different environment while this
@@ -268,13 +316,22 @@ impl Session {
             };
         }
 
-        let _elicitation = self.services.elicitations.register();
         let cleanup = tokio_util::sync::CancellationToken::new();
         let _cleanup_on_drop = cleanup.clone().drop_guard();
         let (tx_response, rx_response) = oneshot::channel();
-        let (originating_turn_state, prev_entry) = {
+        let (originating_turn_state, prev_entry, _elicitation) = {
             let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
+            match active.as_mut().filter(|at| {
+                // Terminal claim removes the task under this same lock. A
+                // taskless startup reservation cannot own an interaction.
+                at.task.as_ref().is_some_and(|task| {
+                    task.turn_context.sub_id == turn_context.sub_id
+                        && !task.cancellation_token.is_cancelled()
+                }) && at
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| terminal.turn_id() == turn_context.sub_id)
+            }) {
                 Some(at) => {
                     let mut ts = at.turn_state.lock().await;
                     let previous = ts.insert_pending_elicitation(
@@ -282,12 +339,22 @@ impl Session {
                         request_id.clone(),
                         tx_response,
                     );
-                    (Some(Arc::clone(&at.turn_state)), previous)
+                    (
+                        Arc::clone(&at.turn_state),
+                        previous,
+                        self.services.elicitations.register(),
+                    )
                 }
-                None => (None, None),
+                None => {
+                    return McpServerElicitationOutcome {
+                        response: None,
+                        sent: false,
+                    };
+                }
             }
         };
-        if let Some(turn_state) = originating_turn_state {
+        {
+            let turn_state = originating_turn_state;
             let server_name = server_name.clone();
             let request_id = request_id.clone();
             self.terminal_tasks.spawn(async move {
@@ -387,6 +454,7 @@ impl Session {
         available_environment_ids: &[String],
 
         expected_runtime: Arc<McpRuntimeSnapshot>,
+        bound_context: Option<McpRuntimeContext>,
     ) -> Arc<McpRuntimeSnapshot> {
         let auth = self.services.auth_manager.auth().await;
         let McpRuntimeProjection {
@@ -397,14 +465,17 @@ impl Session {
         let tool_plugin_provenance = codex_mcp::tool_plugin_provenance(&mcp_config);
         let mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
         let environment_manager = self.services.turn_environments.environment_manager();
-        // TODO(anp): Migrate MCP runtime cwd plumbing to PathUri so foreign environment cwd
-        // values can be used without falling back to the legacy host cwd.
         let cwd = environments
-            .primary()
+            .turn_environments
+            .iter()
+            .find(|environment| !environment.environment.is_remote())
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .map(|cwd| cwd.to_path_buf())
-            .unwrap_or_else(|| turn_context.cwd().to_path_buf());
-        let mcp_runtime_context = McpRuntimeContext::new(environment_manager, cwd);
+            .unwrap_or_else(|| expected_runtime.runtime_context().local_fallback_cwd());
+        let mcp_runtime_context = bound_context.unwrap_or_else(|| {
+            McpRuntimeContext::new(environment_manager, cwd)
+                .with_selected_environments(environments.captured_environments())
+        });
         let auth_statuses = compute_auth_statuses(
             mcp_servers.iter(),
             &mcp_config.codex_home,
@@ -618,6 +689,7 @@ impl Session {
                 &turn_context.environments,
                 &available_environment_ids,
                 expected_runtime,
+                None,
             )
             .await;
         // A lost compare-and-publish race returns the winning runtime. Only
@@ -713,6 +785,7 @@ impl Session {
             &turn_context.environments,
             &available_environment_ids,
             expected_runtime,
+            None,
         )
         .await;
     }

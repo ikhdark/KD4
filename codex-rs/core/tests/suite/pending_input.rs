@@ -3,6 +3,7 @@ use core_test_support::test_codex::local_selections;
 use codex_core::CodexThread;
 use codex_core::config::CurrentTimeReminderConfig;
 use codex_features::Feature;
+use codex_model_provider_info::ProviderKind;
 use codex_protocol::AgentPath;
 use codex_protocol::items::SleepItem;
 use codex_protocol::items::TurnItem;
@@ -140,9 +141,15 @@ fn gated_chunk(gate: oneshot::Receiver<()>, events: Vec<Value>) -> StreamingSseC
     }
 }
 
+/// A turn-ending response. It answers, because an empty completion spends the
+/// bounded missing-answer repair on another request.
 fn response_completed_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
     vec![
         chunk(ev_response_created(response_id)),
+        chunk(ev_message_item_done(
+            &format!("{response_id}-answer"),
+            "done",
+        )),
         chunk(ev_completed(response_id)),
     ]
 }
@@ -491,7 +498,13 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
     );
     assert_eq!(wait_output["nudged_assignment_ids"], json!([]));
     assert_eq!(wait_output["truncated_count"], json!(0));
-    assert!(wait_output.get("cursor").is_some_and(Value::is_string));
+    // Steering may preempt automatic cursor initialization. An input-only result
+    // reports the unchanged cursor, which is null when none was initialized.
+    assert!(
+        wait_output
+            .get("cursor")
+            .is_some_and(|cursor| cursor.is_string() || cursor.is_null())
+    );
     assert_eq!(wait_output["typed_deltas"], json!([]));
 
     let accepted_output = accepted_follow_up_mock
@@ -694,10 +707,16 @@ async fn injected_user_input_triggers_follow_up_request_with_deltas() {
         },
     ];
 
+    // The follow-up answers the injected input; an empty completion would spend the
+    // bounded missing-answer repair on a third request.
     let second_chunks = vec![
         StreamingSseChunk {
             gate: None,
             body: sse_event(ev_response_created("resp-2")),
+        },
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(ev_message_item_done("msg-2", "second turn")),
         },
         StreamingSseChunk {
             gate: None,
@@ -1232,6 +1251,9 @@ async fn steered_user_input_arrives_when_tool_output_triggers_compact_before_nex
         .with_model("gpt-5.4")
         .with_config(|config| {
             config.model_provider.name = "OpenAI (test)".to_string();
+            // The local-summary fixture needs local compaction. OpenAI behavior, including
+            // remote compaction, follows the trusted registration kind, not the display name.
+            config.model_provider.kind = ProviderKind::Custom;
             config.model_provider.supports_websockets = false;
             config.model_auto_compact_token_limit = Some(100_000);
             config.model_context_window = Some(1_000_000);

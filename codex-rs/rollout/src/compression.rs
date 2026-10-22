@@ -19,13 +19,60 @@ const OPEN_ROLLOUT_LINE_READER_RETRY_DELAY: Duration = Duration::from_millis(50)
 const TEMP_SUFFIX: &str = ".tmp";
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Starts a best-effort background job that compresses cold local rollout files.
-///
-/// The worker is fire-and-forget: failures are logged, startup is not blocked,
-/// and a run marker under `codex_home` prevents overlapping or too-frequent
-/// compression runs from the same local store.
-pub fn spawn_rollout_compression_worker(codex_home: PathBuf) {
-    worker::spawn(codex_home)
+/// A shared maintenance lifetime. Last-owner release stops future passes;
+/// an already accepted file transaction is joined, never aborted.
+pub struct RolloutCompressionWorker {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for RolloutCompressionWorker {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(task) = self.task.take() {
+            self.runtime.spawn(async move {
+                if let Err(error) = task.await {
+                    tracing::warn!(%error, "rollout compression owner failed");
+                }
+            });
+        }
+    }
+}
+
+/// Register one maintenance worker per live normalized home, without retaining
+/// abandoned homes in a strong process-global registry.
+pub fn spawn_rollout_compression_worker(
+    codex_home: PathBuf,
+) -> Option<std::sync::Arc<RolloutCompressionWorker>> {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::sync::Weak;
+    static WORKERS: OnceLock<
+        Mutex<std::collections::HashMap<PathBuf, Weak<RolloutCompressionWorker>>>,
+    > = OnceLock::new();
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let home = codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(&codex_home)
+        .map(|path| path.to_path_buf())
+        .unwrap_or(codex_home);
+    let mut workers = WORKERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    workers.retain(|_, worker| worker.strong_count() > 0);
+    if let Some(worker) = workers.get(&home).and_then(Weak::upgrade) {
+        return Some(worker);
+    }
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let task = worker::spawn(&runtime, home.clone(), stopped);
+    let worker = Arc::new(RolloutCompressionWorker {
+        stop,
+        task: Some(task),
+        runtime,
+    });
+    workers.insert(home, Arc::downgrade(&worker));
+    Some(worker)
 }
 
 /// Returns the modified time for the existing plain or compressed rollout file.
@@ -78,12 +125,12 @@ pub(crate) struct RolloutAppendLock {
 /// Owns archive/unarchive decisions across both physical collections. Keep this
 /// guard through lookups and movement (or an artifact reclamation decision).
 pub async fn lock_rollout_moves(codex_home: &Path) -> io::Result<File> {
-    let home = codex_home.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = open_lock_file(&home.join("rollout-moves.lock"))?;
-        file.lock()?;
-        Ok(file)
-    }).await.map_err(io::Error::other)?
+    try_lock_rollout_moves(codex_home).await?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "rollout movement is busy; retry after the current operation",
+        )
+    })
 }
 
 /// Reclamation is optional: skip it when another owner can change locations.
@@ -96,51 +143,91 @@ pub async fn try_lock_rollout_moves(codex_home: &Path) -> io::Result<Option<File
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(error) => Err(error.into()),
         }
-    }).await.map_err(io::Error::other)?
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Moves the current physical rollout representation while excluding compression.
 /// Both locations are exclusively owned; callers must first close live writers.
 pub async fn move_rollout_to_directory(path: &Path, directory: &Path) -> io::Result<PathBuf> {
+    move_rollout_to_directory_with_owner(path, directory, None).await
+}
+
+pub async fn move_rollout_to_directory_with_owner(
+    path: &Path,
+    directory: &Path,
+    owner: Option<File>,
+) -> io::Result<PathBuf> {
     let path = path.to_path_buf();
     let directory = directory.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let home = path.ancestors().find(|ancestor| ancestor.file_name().is_some_and(|name|
-            name == crate::SESSIONS_SUBDIR || name == crate::ARCHIVED_SESSIONS_SUBDIR))
-            .and_then(Path::parent).ok_or_else(|| io::Error::new(
-                io::ErrorKind::InvalidInput, "rollout move source is outside session storage"))?;
+        let home = path
+            .ancestors()
+            .find(|ancestor| {
+                ancestor.file_name().is_some_and(|name| {
+                    name == crate::SESSIONS_SUBDIR || name == crate::ARCHIVED_SESSIONS_SUBDIR
+                })
+            })
+            .and_then(Path::parent)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "rollout move source is outside session storage",
+                )
+            })?;
         // Owned by the blocking mover even when its async caller is cancelled.
-        let move_owner = open_lock_file(&home.join("rollout-moves.lock"))?;
-        move_owner.lock()?;
+        let _move_owner = match owner {
+            Some(owner) => owner,
+            None => {
+                let owner = open_lock_file(&home.join("rollout-moves.lock"))?;
+                owner.try_lock().map_err(io::Error::from)?;
+                owner
+            }
+        };
         let plain_path = plain_rollout_path(&path);
-        let parent = plain_path.parent().ok_or_else(|| io::Error::new(
-            io::ErrorKind::InvalidInput, "rollout path has no parent"))?;
-        let plain_path = std::fs::canonicalize(parent)?.join(plain_path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no file name")
-        })?);
+        let parent = plain_path.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no parent")
+        })?;
+        let plain_path =
+            std::fs::canonicalize(parent)?.join(plain_path.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no file name")
+            })?);
         std::fs::create_dir_all(&directory)?;
         let lock_directory = std::fs::canonicalize(&directory)?;
         let plain_destination = lock_directory.join(plain_path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "rollout path has no file name")
         })?);
         if plain_path == plain_destination {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "rollout move has identical endpoints"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rollout move has identical endpoints",
+            ));
         }
         // Stable ordering prevents inverse relocations from deadlocking.
         let mut lock_paths = [&plain_path, &plain_destination];
         lock_paths.sort();
         let first_lock = open_rollout_lock_file(lock_paths[0])?;
-        first_lock.lock()?;
+        first_lock.try_lock().map_err(io::Error::from)?;
         let second_lock = open_rollout_lock_file(lock_paths[1])?;
-        second_lock.lock()?;
+        second_lock.try_lock().map_err(io::Error::from)?;
         let compressed_source = path::compressed_rollout_path(&plain_path);
-        let current_source = if plain_path.try_exists()? { &plain_path } else { &compressed_source };
+        let current_source = if plain_path.try_exists()? {
+            &plain_path
+        } else {
+            &compressed_source
+        };
         let mut duplicate = None;
-        for destination in [&plain_destination, &path::compressed_rollout_path(&plain_destination)] {
+        for destination in [
+            &plain_destination,
+            &path::compressed_rollout_path(&plain_destination),
+        ] {
             if destination.try_exists()? {
                 if !rollouts_have_identical_bytes(current_source, destination)? {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists,
-                        format!("conflicting rollout destination: {}", destination.display())));
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("conflicting rollout destination: {}", destination.display()),
+                    ));
                 }
                 duplicate = Some(destination.clone());
             }
@@ -181,16 +268,26 @@ pub async fn move_rollout_to_directory(path: &Path, directory: &Path) -> io::Res
 fn move_rollout_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let destination: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     // No REPLACE_EXISTING or COPY_ALLOWED: an existing target or a sharing
     // violation leaves both directory entries unchanged. A hard-link/unlink
     // move would publish a duplicate before discovering a source delete denial.
     let moved = unsafe {
         windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            source.as_ptr(), destination.as_ptr(), 0,
+            source.as_ptr(),
+            destination.as_ptr(),
+            0,
         )
     };
-    if moved == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
@@ -203,12 +300,16 @@ fn rollouts_have_identical_bytes(first: &Path, second: &Path) -> io::Result<bool
     use std::io::BufRead;
     fn reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
         if !std::fs::symlink_metadata(path)?.file_type().is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput,
-                "rollout duplicate is not an ordinary file; preserving both copies"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rollout duplicate is not an ordinary file; preserving both copies",
+            ));
         }
         let file = File::open(path)?;
         if path.extension().is_some_and(|extension| extension == "zst") {
-            Ok(Box::new(std::io::BufReader::new(zstd::stream::read::Decoder::new(file)?)))
+            Ok(Box::new(std::io::BufReader::new(
+                zstd::stream::read::Decoder::new(file)?,
+            )))
         } else {
             Ok(Box::new(std::io::BufReader::new(file)))
         }
@@ -222,9 +323,151 @@ fn rollouts_have_identical_bytes(first: &Path, second: &Path) -> io::Result<bool
             return Ok(a.is_empty() && b.is_empty());
         }
         let count = a.len().min(b.len());
-        if a[..count] != b[..count] { return Ok(false); }
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
         first.consume(count);
         second.consume(count);
+    }
+}
+
+/// Identity, not equal content, makes an interrupted hard-link restore safe.
+pub fn rollout_files_same_identity(first: &Path, second: &Path) -> io::Result<bool> {
+    let first = open_regular_identity_file(first)?;
+    let second = open_regular_identity_file(second)?;
+    rollout_handles_same_identity(&first, &second)
+}
+
+fn open_regular_identity_file(path: &Path) -> io::Result<File> {
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::other(
+            "rollout identity requires an ordinary file",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    validate_regular_identity_file(&file)?;
+    // Also reject a substituted symlink on platforms without a no-follow std open.
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::other(
+            "rollout identity path changed to a non-file",
+        ));
+    }
+    Ok(file)
+}
+
+fn validate_regular_identity_file(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(io::Error::other(
+                "rollout identity cannot follow a reparse point",
+            ));
+        }
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::other(
+            "rollout identity requires an ordinary file",
+        ));
+    }
+    Ok(())
+}
+
+fn rollout_handles_same_identity(first: &File, second: &File) -> io::Result<bool> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+        use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+        let identity = |file: &File| -> io::Result<(u32, u32, u32)> {
+            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            // SAFETY: the live file owns the handle; the API initializes info on success.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, info.as_mut_ptr()) }
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let info = unsafe { info.assume_init() };
+            Ok((
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            ))
+        };
+        Ok(identity(first)? == identity(second)?)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let first = first.metadata()?;
+        let second = second.metadata()?;
+        Ok((first.dev(), first.ino()) == (second.dev(), second.ino()))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        Err(io::Error::other("filesystem identity is unavailable"))
+    }
+}
+
+/// Settle only the object this compressor published, never a substituted name.
+fn remove_owned_rollout_file(path: &Path, published: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    let current = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Exclude rename/delete while checking and deleting this exact handle.
+        std::fs::OpenOptions::new()
+            .access_mode(0x0001_0080)
+            .share_mode(0x0000_0003)
+            .custom_flags(0x0020_0000)
+            .open(path)
+    };
+    #[cfg(not(windows))]
+    let current = open_regular_identity_file(path);
+    let current = match current {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_regular_identity_file(&current)?;
+    if !rollout_handles_same_identity(&current, published)? {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "compressed rollout was replaced; replacement retained",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO;
+        use windows_sys::Win32::Storage::FileSystem::FileDispositionInfo;
+        use windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle;
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: current owns the delete-capable handle and disposition has
+        // exactly the layout and size required by FileDispositionInfo.
+        if unsafe {
+            SetFileInformationByHandle(
+                current.as_raw_handle() as _,
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of_val(&disposition) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(path)
     }
 }
 
@@ -240,10 +483,16 @@ pub(crate) fn lock_rollout_for_append_blocking(
     path: &Path,
 ) -> io::Result<(PathBuf, RolloutAppendLock)> {
     let plain_path = plain_rollout_path(path);
-    let lock_file = open_rollout_lock_file(plain_path.as_path())?;
-    lock_file.lock_shared()?;
+    let append_lock = lock_rollout_before_append_blocking(&plain_path)?;
     let plain_path = materialize_rollout_for_append_locked(plain_path.as_path())?;
-    Ok((plain_path, RolloutAppendLock { _file: lock_file }))
+    Ok((plain_path, append_lock))
+}
+
+/// Reserve the representation without materializing or repairing source bytes.
+pub(crate) fn lock_rollout_before_append_blocking(path: &Path) -> io::Result<RolloutAppendLock> {
+    let lock_file = open_rollout_lock_file(plain_rollout_path(path).as_path())?;
+    lock_file.lock_shared()?;
+    Ok(RolloutAppendLock { _file: lock_file })
 }
 
 pub(crate) fn lock_rollout_for_write_blocking(path: &Path) -> io::Result<RolloutWriteLock> {
@@ -277,7 +526,10 @@ fn try_lock_rollout_for_compression(path: &Path) -> io::Result<Option<File>> {
 /// Maintenance is nonblocking to avoid waiting on a live writer it must stop first.
 pub fn try_lock_rollout_for_maintenance(path: &Path) -> io::Result<File> {
     try_lock_rollout_for_compression(path)?.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::WouldBlock, "rollout has a live writer or compressor")
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "rollout has a live writer or compressor",
+        )
     })
 }
 
@@ -315,9 +567,14 @@ fn cleanup_orphan_rollout_lock(lock_path: &Path) -> io::Result<bool> {
     let Some(name) = lock_path.file_name().and_then(OsStr::to_str) else {
         return Ok(false);
     };
-    let Some(plain_name) = name.strip_prefix('.').and_then(|name| {
-        name.strip_suffix(".write.lock").or_else(|| name.strip_suffix(".lock"))
-    }).filter(|name| name.starts_with("rollout-") && name.ends_with(".jsonl")) else {
+    let Some(plain_name) = name
+        .strip_prefix('.')
+        .and_then(|name| {
+            name.strip_suffix(".write.lock")
+                .or_else(|| name.strip_suffix(".lock"))
+        })
+        .filter(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+    else {
         return Ok(false);
     };
     let plain_path = lock_path.with_file_name(plain_name);
@@ -367,7 +624,7 @@ fn rollout_write_lock_path(path: &Path) -> PathBuf {
     plain_path.with_file_name(format!(".{}.write.lock", file_name.to_string_lossy()))
 }
 
-fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {
     let plain_path = plain_rollout_path(path);
     if plain_path.exists() {
         metrics::materialize("plain_exists");
@@ -502,6 +759,8 @@ pub struct RolloutLineReader {
     inner: RolloutLineReaderInner,
     path: PathBuf,
     last_line_terminated: bool,
+    enroll_payloads: bool,
+    unresolved_payloads: usize,
 }
 
 enum RolloutLineReaderInner {
@@ -515,8 +774,15 @@ struct BlockingRolloutLineReader {
 }
 
 impl RolloutLineReader {
+    pub(crate) fn enroll_payload_dependencies(&mut self) {
+        self.enroll_payloads = true;
+    }
     pub(crate) fn last_line_terminated(&self) -> bool {
         self.last_line_terminated
+    }
+
+    pub(crate) fn unresolved_payloads(&self) -> usize {
+        self.unresolved_payloads
     }
 
     /// Reads the next JSONL record from the rollout.
@@ -540,15 +806,28 @@ impl RolloutLineReader {
                 }
             },
         }?;
-        let Some((line, terminated)) = line else { return Ok(None); };
+        let Some((line, terminated)) = line else {
+            return Ok(None);
+        };
         self.last_line_terminated = terminated;
-        if !line.contains("rollout_payload_artifact") { return Ok(Some(line)); }
+        if !line.contains("rollout_payload_artifact") {
+            return Ok(Some(line));
+        }
         let path = self.path.clone();
-        match tokio::task::spawn_blocking(move || crate::payload_artifact::hydrate_line(&path, line))
-            .await.map_err(io::Error::other)?
+        let enroll = self.enroll_payloads;
+        match tokio::task::spawn_blocking(move || {
+            if enroll {
+                crate::payload_artifact::hydrate_line_with_enrollment(&path, line, true)
+            } else {
+                crate::payload_artifact::hydrate_line(&path, line)
+            }
+        })
+        .await
+        .map_err(io::Error::other)?
         {
             Ok(line) => Ok(Some(line)),
             Err(error) => {
+                self.unresolved_payloads = self.unresolved_payloads.saturating_add(1);
                 tracing::warn!(path = %self.path.display(), %error, "skipping unreadable rollout payload");
                 // Keep the record slot, like torn UTF-8/JSON: consumers continue
                 // and the recorder counts the malformed record.
@@ -573,6 +852,56 @@ fn decode_rollout_line(mut line: Vec<u8>) -> String {
         }
     }
     String::from_utf8(line).unwrap_or_else(|_| "invalid UTF-8 rollout record".to_owned())
+}
+
+/// Hydrates a selected rollout for feedback on a blocking thread. Both raw
+/// records and referenced bodies are bounded before allocation. On any gap the
+/// caller omits this attachment with the record-specific error, never silently
+/// uploads a smaller stub-only history. The source and sidecars are read-only.
+pub fn read_rollout_for_feedback(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use std::io::BufRead;
+    use std::io::Read;
+
+    let file = File::open(path)?;
+    let input: Box<dyn Read> = if path::is_compressed_rollout_path(path) {
+        Box::new(zstd::stream::read::Decoder::new(file)?)
+    } else {
+        Box::new(file)
+    };
+    let mut reader = io::BufReader::new(input);
+    let mut output = Vec::new();
+    let mut record = 0_u64;
+    loop {
+        let remaining = max_bytes.saturating_sub(output.len());
+        let mut line = Vec::new();
+        let read = reader
+            .by_ref()
+            .take(remaining as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(output);
+        }
+        record = record.saturating_add(1);
+        if read > remaining {
+            return Err(io::Error::other(format!(
+                "rollout record {record} exceeds the remaining {remaining}-byte export budget"
+            )));
+        }
+        let line = String::from_utf8(line)
+            .map_err(|_| io::Error::other(format!("rollout record {record} has invalid UTF-8")))?;
+        let line = crate::payload_artifact::hydrate_line_bounded(path, line, remaining as u64)
+            .map_err(|error| io::Error::other(format!("rollout record {record}: {error}")))?;
+        let needs_newline = !line.ends_with('\n');
+        if line.len().saturating_add(usize::from(needs_newline)) > remaining {
+            return Err(io::Error::other(format!(
+                "hydrated rollout record {record} exceeds the remaining {remaining}-byte export budget"
+            )));
+        }
+        output.extend_from_slice(line.as_bytes());
+        if needs_newline {
+            output.push(b'\n');
+        }
+    }
 }
 
 mod worker {
@@ -677,32 +1006,50 @@ mod worker {
         }
     }
 
-    pub(super) fn spawn(codex_home: PathBuf) {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            metrics::run("skipped_no_runtime");
-            warn!(
-                "failed to start rollout compression worker for {}: no Tokio runtime",
-                codex_home.display()
-            );
-            return;
-        };
-        handle.spawn(run_periodically(codex_home, RUN_MARKER_STALE_AFTER));
+    pub(super) fn spawn(
+        handle: &tokio::runtime::Handle,
+        codex_home: PathBuf,
+        stopped: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        handle.spawn(run_periodically_until(
+            codex_home,
+            RUN_MARKER_STALE_AFTER,
+            stopped,
+        ))
     }
 
     /// Workers start with their process, and a long-lived app-server can start
     /// inside another process's cooldown. Retry every cooldown period so cold
     /// rollouts are still compressed while such a process keeps running.
+    #[cfg(test)]
     pub(super) async fn run_periodically(codex_home: PathBuf, interval: Duration) {
+        let (_stop, stopped) = tokio::sync::watch::channel(false);
+        run_periodically_until(codex_home, interval, stopped).await;
+    }
+
+    async fn run_periodically_until(
+        codex_home: PathBuf,
+        interval: Duration,
+        mut stopped: tokio::sync::watch::Receiver<bool>,
+    ) {
         loop {
+            if *stopped.borrow() {
+                break;
+            }
             if let Err(err) = run(codex_home.clone()).await {
                 warn!(
                     "rollout compression worker failed for {}: {err}",
                     codex_home.display()
                 );
             }
-            tokio::time::sleep(interval).await;
-            if let Err(error) = crate::payload_artifact::reclaim_payload_artifacts(&codex_home).await {
+            if let Err(error) =
+                crate::payload_artifact::reclaim_payload_artifacts(&codex_home).await
+            {
                 warn!(%error, "rollout payload reclamation incomplete; blobs retained");
+            }
+            tokio::select! {
+                _ = stopped.changed() => break,
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     }
@@ -823,9 +1170,16 @@ mod worker {
                 }
                 cleanup_stale_temp(&entry).await;
                 #[cfg(windows)]
-                if path.extension().is_some_and(|extension| extension == "lock") {
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
                     let lock_path = path.clone();
-                    match tokio::task::spawn_blocking(move || super::cleanup_orphan_rollout_lock(&lock_path)).await {
+                    match tokio::task::spawn_blocking(move || {
+                        super::cleanup_orphan_rollout_lock(&lock_path)
+                    })
+                    .await
+                    {
                         Ok(Ok(_)) => {}
                         result => debug!(?result, "orphan rollout lock cleanup skipped"),
                     }
@@ -1016,8 +1370,8 @@ mod worker {
         temp_file.as_file().sync_all()?;
         let compressed_bytes = temp_file.as_file().metadata()?.len();
 
-        match temp_file.persist_noclobber(compressed_path.as_path()) {
-            Ok(_) => {}
+        let published = match temp_file.persist_noclobber(compressed_path.as_path()) {
+            Ok(file) => file,
             Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
                 return Ok(CompressionMeasurement::new(
                     CompressionOutcome::SkippedAlreadyCompressed,
@@ -1026,9 +1380,9 @@ mod worker {
                 ));
             }
             Err(err) => return Err(err.error),
-        }
+        };
         if !same_file_state(path, &before)? {
-            let _ = std::fs::remove_file(compressed_path.as_path());
+            super::remove_owned_rollout_file(&compressed_path, &published)?;
             return Ok(CompressionMeasurement::new(
                 CompressionOutcome::SkippedChanged,
                 source_bytes,
@@ -1036,7 +1390,14 @@ mod worker {
             ));
         }
         after_final_check()?;
-        std::fs::remove_file(path)?;
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() == io::ErrorKind::NotFound {
+                super::remove_owned_rollout_file(&compressed_path, &published).map_err(|cleanup| {
+                    io::Error::other(format!("rollout source disappeared; compressed publication cleanup failed: {cleanup}"))
+                })?;
+            }
+            return Err(error);
+        }
         Ok(CompressionMeasurement::new(
             CompressionOutcome::Compressed,
             source_bytes,
@@ -1149,40 +1510,66 @@ mod worker {
         let Some((process, counter)) = process_and_counter.split_once('.') else {
             return false;
         };
-        [process, counter].into_iter().all(|part| {
-            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
-        })
+        [process, counter]
+            .into_iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
     }
 
     async fn cleanup_stale_temp(entry: &tokio::fs::DirEntry) {
         let path = entry.path();
-        if !path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(is_rollout_temp_file_name)
+        let cleanup_path = path.clone();
+        // The worker owns physical exclusion through unlink, including when its
+        // async observer is cancelled while storage is blocked.
+        match tokio::task::spawn_blocking(move || cleanup_stale_temp_blocking(&cleanup_path)).await
         {
-            return;
-        }
-        let stale = entry
-            .metadata()
-            .await
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age >= TEMP_FILE_STALE_AFTER);
-        if !stale {
-            return;
-        }
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => metrics::temp_cleanup("removed"),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
+            Ok(Ok(true)) => metrics::temp_cleanup("removed"),
+            Ok(Ok(false)) => {}
+            result => {
                 metrics::temp_cleanup("failed");
-                warn!(
-                    "failed to remove stale rollout temp {}: {err}",
-                    path.display()
-                );
+                warn!(?result, path = %path.display(), "stale rollout temporary cleanup deferred");
             }
+        }
+    }
+
+    pub(super) fn cleanup_stale_temp_blocking(path: &Path) -> io::Result<bool> {
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        if !is_rollout_temp_file_name(name) {
+            return Ok(false);
+        }
+        // Materializers inherit the cold source's mtime before publication.
+        // Age cannot establish that the corresponding producer has finished.
+        let rollout = name
+            .rsplit_once(".decompress.")
+            .map(|(rollout, _)| rollout)
+            .or_else(|| {
+                name.strip_suffix(TEMP_SUFFIX)
+                    .filter(|name| name.ends_with(".jsonl.zst"))
+            });
+        let _owner = if let Some(rollout) = rollout {
+            match super::try_lock_rollout_for_maintenance(&path.with_file_name(rollout)) {
+                Ok(owner) => Some(owner),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        }; // Random compression stages are covered by the run marker.
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file()
+            || !SystemTime::now()
+                .duration_since(metadata.modified()?)
+                .is_ok_and(|age| age >= TEMP_FILE_STALE_AFTER)
+        {
+            return Ok(false);
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
         }
     }
 }
@@ -1381,9 +1768,7 @@ mod reader {
             let mut reader = tokio::task::spawn_blocking(move || {
                 let input = File::open(path.as_path())?;
                 let decoder = zstd::stream::read::Decoder::new(input)?;
-                Ok::<_, io::Error>(io::BufReader::new(
-                    Box::new(decoder) as Box<dyn Read + Send>
-                ))
+                Ok::<_, io::Error>(io::BufReader::new(Box::new(decoder) as Box<dyn Read + Send>))
             })
             .await
             .map_err(io::Error::other)??;
@@ -1409,6 +1794,8 @@ mod reader {
             return Ok(RolloutLineReader {
                 path: source_path,
                 last_line_terminated: true,
+                enroll_payloads: false,
+                unresolved_payloads: 0,
                 inner: RolloutLineReaderInner::Blocking(BlockingRolloutLineReader {
                     receiver,
                     task: Some(task),
@@ -1419,6 +1806,8 @@ mod reader {
         Ok(RolloutLineReader {
             path: source_path,
             last_line_terminated: true,
+            enroll_payloads: false,
+            unresolved_payloads: 0,
             inner: RolloutLineReaderInner::Plain(tokio::io::BufReader::new(file)),
         })
     }

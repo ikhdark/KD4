@@ -383,6 +383,9 @@ mod tests {
 
     fn inner() -> Arc<Inner> {
         Arc::new(Inner {
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            cleanup_records: StdMutex::new(std::collections::VecDeque::new()),
+            cleanup_records_evicted: AtomicU64::new(0),
             unsupported_bounded_read: StdMutex::new(None),
             file_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::file_read::MAX_OPEN_FILE_READS,

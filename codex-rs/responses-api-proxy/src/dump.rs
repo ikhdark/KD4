@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use reqwest::header::HeaderMap;
+use http::HeaderMap;
 use serde::Serialize;
 use serde_json::Value;
 use tiny_http::Header;
@@ -172,8 +172,8 @@ impl From<&Header> for HeaderDump {
     }
 }
 
-impl From<(&reqwest::header::HeaderName, &reqwest::header::HeaderValue)> for HeaderDump {
-    fn from(header: (&reqwest::header::HeaderName, &reqwest::header::HeaderValue)) -> Self {
+impl From<(&http::HeaderName, &http::HeaderValue)> for HeaderDump {
+    fn from(header: (&http::HeaderName, &http::HeaderValue)) -> Self {
         let name = header.0.as_str();
         let value = if should_redact_header(name) {
             REDACTED_HEADER_VALUE.to_string()
@@ -190,6 +190,7 @@ impl From<(&reqwest::header::HeaderName, &reqwest::header::HeaderValue)> for Hea
 
 fn should_redact_header(name: &str) -> bool {
     name.eq_ignore_ascii_case(AUTHORIZATION_HEADER_NAME)
+        || name.eq_ignore_ascii_case("proxy-authorization")
         || name.to_ascii_lowercase().contains("cookie")
 }
 
@@ -214,10 +215,10 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use pretty_assertions::assert_eq;
-    use reqwest::header::AUTHORIZATION;
-    use reqwest::header::CONTENT_TYPE;
-    use reqwest::header::HeaderMap;
-    use reqwest::header::HeaderValue;
+    use http::header::AUTHORIZATION;
+    use http::header::CONTENT_TYPE;
+    use http::HeaderMap;
+    use http::HeaderValue;
     use serde_json::json;
     use tiny_http::Header;
     use tiny_http::Method;
@@ -233,6 +234,8 @@ mod tests {
         let headers = vec![
             Header::from_bytes(&b"Authorization"[..], &b"Bearer secret"[..])
                 .expect("authorization header"),
+            Header::from_bytes(&b"pRoXy-AuThOrIzAtIoN"[..], &b"Basic proxy-secret"[..])
+                .expect("proxy authorization header"),
             Header::from_bytes(&b"Cookie"[..], &b"user-session=secret"[..]).expect("cookie header"),
             Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                 .expect("content-type header"),
@@ -264,6 +267,10 @@ mod tests {
                 "headers": [
                     {
                         "name": "Authorization",
+                        "value": "[REDACTED]"
+                    },
+                    {
+                        "name": "pRoXy-AuThOrIzAtIoN",
                         "value": "[REDACTED]"
                     },
                     {

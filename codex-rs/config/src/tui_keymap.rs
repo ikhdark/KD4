@@ -2,7 +2,8 @@
 //!
 //! This module defines the on-disk `[tui.keymap]` contract used by
 //! `~/.codex/config.toml` and normalizes user-entered key specs into canonical
-//! forms consumed by runtime keymap resolution in `codex-rs/tui/src/keymap.rs`.
+//! forms. This fork no longer ships the TUI; the section is kept so existing
+//! config files still parse.
 //!
 //! Responsibilities:
 //!
@@ -664,7 +665,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn global_bindings_preserve_canonical_key_names() {
         for (spec, expected) in [
@@ -694,7 +694,6 @@ mod tests {
             assert_eq!(keymap, expected_keymap);
         }
     }
-
 
     #[test]
     fn binding_values_preserve_normalization_order_and_diagnostics() {

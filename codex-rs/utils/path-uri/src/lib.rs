@@ -28,6 +28,8 @@ pub use api_path_string::LegacyAppPathStringError;
 
 pub const FILE_SCHEME: &str = "file";
 const BAD_PATH_URI_PREFIX: &str = "file:///%00/bad/path/";
+// A slash-leading UTF-16 payload is otherwise indistinguishable from POSIX bytes.
+const WINDOWS_BAD_PATH_URI_PREFIX: &str = "file:///%00/bad/path/windows/";
 
 /// An immutable, cross-platform representation of a `file:` URI.
 ///
@@ -35,17 +37,19 @@ const BAD_PATH_URI_PREFIX: &str = "file:///%00/bad/path/";
 /// URL, and the URI cannot be mutated after construction. [`Self::basename`],
 /// [`Self::parent`], and [`Self::join`] operate on URI path segments without
 /// interpreting them using the operating system running Codex. Fallback URIs
-/// created by [`Self::from_abs_path`] are opaque to these lexical operations.
+/// created by [`Self::from_abs_path`] are opaque except for validated ordinary
+/// Windows UNC paths, whose hierarchy stops at the share root.
 ///
 /// `file:` paths retain their URI spelling so they can be parsed independently
 /// of the current host. A local POSIX `file:` URI can also retain
 /// percent-encoded non-UTF-8 bytes for lossless native round trips.
 ///
 /// Like [VS Code resources], path operations use `/` URI separators on every
-/// host. Lexical path operations preserve a URL authority without interpreting
-/// Windows drive or UNC roots from path text. Native path normalization,
-/// filesystem aliases, symlinks, case sensitivity, and Unicode normalization
-/// are not resolved.
+/// host. Lexical operations infer a POSIX or Windows convention from URI spelling
+/// and preserve drive or UNC share roots when traversing parents or joining paths.
+/// This interpretation is independent of the host operating system. These operations
+/// do not consult the host filesystem or resolve aliases, symlinks, case sensitivity,
+/// or Unicode normalization.
 ///
 /// Serde represents a `PathUri` as its canonical URI string. Deserialization
 /// accepts only valid `file:` URI strings. These strings round-trip through
@@ -72,17 +76,25 @@ impl PathUri {
     /// Paths without a valid URI representation are replaced by
     /// `file:///%00/bad/path/<base64>`, where `<base64>` is the URL-safe, unpadded
     /// encoding of the original path (Unix bytes or Windows UTF-16LE). This
-    /// includes paths containing nulls and, on Windows, unsupported prefix
+    /// uses `file:///%00/bad/path/windows/<base64>` for slash-leading Windows
+    /// payloads, so legacy POSIX bytes cannot be mistaken for UTF-16 paths.
+    /// Fallbacks include paths containing nulls and, on Windows, unsupported prefix
     /// kinds such as device and generic verbatim namespaces, non-Unicode path
     /// or UNC components, and UNC server names that are not valid URL hosts.
     /// The encoded null reserves a URI namespace that cannot collide with a
     /// real path on Unix or Windows.
     pub fn from_abs_path(path: &AbsolutePathBuf) -> Self {
+        // Checked native normalization already simplifies safe extended aliases.
+        // A surviving namespace prefix is significant even when `url` accepts it.
+        let namespace = matches!(path.as_path().components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if !matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::UNC(_, _)));
         let localhost_unc = matches!(path.as_path().components().next(),
             Some(std::path::Component::Prefix(prefix))
                 if matches!(prefix.kind(), std::path::Prefix::UNC(host, _) | std::path::Prefix::VerbatimUNC(host, _)
                     if host.to_str().is_some_and(|host| host.eq_ignore_ascii_case("localhost"))));
-        if !localhost_unc
+        if !namespace
+            && !localhost_unc
             && let Ok(url) = Url::from_file_path(path.as_path())
             && let Ok(uri) = Self::try_from(url)
         {
@@ -97,7 +109,7 @@ impl PathUri {
                 .flat_map(u16::to_le_bytes)
                 .collect::<Vec<_>>()
         };
-        Self::from_opaque_path_bytes(&path_bytes)
+        Self::from_windows_opaque_path_bytes(&path_bytes)
     }
 
     /// Parses an absolute native path using the specified path convention.
@@ -115,6 +127,67 @@ impl PathUri {
         let encoded_path = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path_bytes);
         let Ok(uri) = Self::parse(&format!("{BAD_PATH_URI_PREFIX}{encoded_path}")) else {
             unreachable!("URL-safe base64 always produces a valid fallback path URI");
+        };
+        uri
+    }
+
+    fn from_windows_opaque_path_bytes(path_bytes: &[u8]) -> Self {
+        if !path_bytes.starts_with(&[b'/', 0]) {
+            return Self::from_opaque_path_bytes(path_bytes);
+        }
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path_bytes);
+        let Ok(uri) = Self::parse(&format!("{WINDOWS_BAD_PATH_URI_PREFIX}{encoded}")) else {
+            unreachable!("URL-safe base64 produces a valid Windows fallback URI");
+        };
+        uri
+    }
+
+    // Only ordinary UNC grammar has hierarchy. Device/verbatim namespaces and
+    // malformed payloads remain opaque; no native text is reconstructed lossily.
+    fn opaque_unc_components(&self) -> Option<Vec<Vec<u16>>> {
+        if !self.as_str().starts_with(BAD_PATH_URI_PREFIX) {
+            return None;
+        }
+        if self.infer_path_convention()? != PathConvention::Windows {
+            return None;
+        }
+        let bytes = self.opaque_fallback_bytes()?;
+        let wide = windows_path_units(&bytes)?;
+        if wide.len() < 5 || !wide[..2].iter().all(|c| is_windows_separator_unit(*c)) {
+            return None;
+        }
+        let mut split = wide[2..].split(|c| is_windows_separator_unit(*c));
+        let host = split.next().filter(|part| !part.is_empty())?;
+        let share = split.next().filter(|part| !part.is_empty())?;
+        let parts = std::iter::once(host)
+            .chain(std::iter::once(share))
+            .chain(split.filter(|part| !part.is_empty()))
+            .map(<[u16]>::to_vec)
+            .collect::<Vec<_>>();
+        if parts.len() < 2
+            || parts.iter().any(|part| part == &[46] || part == &[46, 46])
+            || parts[0] == [63]
+            || parts[0] == [46]
+        {
+            return None;
+        }
+        Some(parts)
+    }
+
+    fn from_unc_components(parts: &[Vec<u16>]) -> Self {
+        let mut wide = vec![92, 92];
+        for (index, part) in parts.iter().enumerate() {
+            if index != 0 {
+                wide.push(92);
+            }
+            wide.extend(part);
+        }
+        // An opaque child can have an ordinary, representable parent. Reuse
+        // native producer eligibility instead of forging an opaque spelling.
+        use std::os::windows::ffi::OsStringExt;
+        let path = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+        let Ok(uri) = Self::from_host_native_path(path) else {
+            unreachable!("validated ordinary UNC components form an absolute path");
         };
         uri
     }
@@ -160,6 +233,9 @@ impl PathUri {
     /// environment's declared convention over this spelling-based heuristic.
     pub fn infer_path_convention(&self) -> Option<PathConvention> {
         if let Some(path_bytes) = self.opaque_fallback_bytes() {
+            if self.as_str().starts_with(WINDOWS_BAD_PATH_URI_PREFIX) {
+                return windows_path_units(&path_bytes).map(|_| PathConvention::Windows);
+            }
             return infer_opaque_path_convention(&path_bytes);
         }
         if self.0.host_str().is_some() {
@@ -192,11 +268,18 @@ impl PathUri {
     }
 
     /// Returns the decoded final URI path segment, or `None` for the URI root
-    /// or an opaque fallback URI created by [`Self::from_abs_path`].
+    /// or an opaque fallback without validated ordinary UNC hierarchy.
     ///
     /// If the segment contains non-UTF-8 encoded bytes, its percent-encoded
     /// spelling is returned instead.
     pub fn basename(&self) -> Option<String> {
+        if let Some(parts) = self.opaque_unc_components() {
+            return if parts.len() > 2 {
+                String::from_utf16(parts.last()?).ok()
+            } else {
+                None
+            };
+        }
         if decode_bad_path_uri(&self.0).is_some() {
             return None;
         }
@@ -215,8 +298,15 @@ impl PathUri {
     /// Returns the lexical parent without crossing the inferred native path root.
     ///
     /// POSIX `/`, Windows drive roots, Windows UNC share roots, and opaque fallback
-    /// URIs created by [`Self::from_abs_path`] have no parent.
+    /// URIs without validated ordinary UNC hierarchy have no parent.
     pub fn parent(&self) -> Option<Self> {
+        if let Some(mut parts) = self.opaque_unc_components() {
+            if parts.len() <= 2 {
+                return None;
+            }
+            parts.pop();
+            return Some(Self::from_unc_components(&parts));
+        }
         if decode_bad_path_uri(&self.0).is_some() {
             return None;
         }
@@ -252,10 +342,16 @@ impl PathUri {
     /// without consulting the host filesystem. Percent-encoded native path
     /// separators fail closed because native path conversion may interpret them
     /// as segment boundaries. Opaque fallback URIs created by
-    /// [`Self::from_abs_path`] only contain themselves.
+    /// [`Self::from_abs_path`] only contain themselves, except for validated
+    /// ordinary UNC hierarchy, which compares exact native components.
     pub fn starts_with(&self, base: &Self) -> bool {
         if self == base {
             return true;
+        }
+        if let (Some(parts), Some(base_parts)) =
+            (self.opaque_unc_components(), base.opaque_unc_components())
+        {
+            return parts.starts_with(&base_parts);
         }
         if decode_bad_path_uri(&self.0).is_some() || decode_bad_path_uri(&base.0).is_some() {
             return false;
@@ -293,8 +389,8 @@ impl PathUri {
     /// `%`, `?`, and `#` characters are percent-encoded as filename text. Paths
     /// containing a null character are rejected because they cannot be safely
     /// converted to native paths.
-    /// Opaque fallback URIs created by [`Self::from_abs_path`] reject relative
-    /// joins, but an absolute path can replace a base with an inferred convention.
+    /// Opaque fallback URIs reject relative joins unless they encode validated
+    /// ordinary UNC hierarchy. Absolute paths can replace an inferred base.
     pub fn join(&self, path: &str) -> Result<Self, PathUriParseError> {
         if path.contains('\0') {
             return Err(PathUriParseError::InvalidFileUriPath {
@@ -324,6 +420,23 @@ impl PathUri {
             return Err(PathUriParseError::InvalidFileUriPath {
                 path: path.to_string(),
             });
+        }
+        if let Some(mut parts) = self.opaque_unc_components() {
+            if path.starts_with(is_windows_separator_char) {
+                parts.truncate(2);
+            }
+            for part in path.split(is_windows_separator_char) {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        if parts.len() > 2 {
+                            parts.pop();
+                        }
+                    }
+                    part => parts.push(part.encode_utf16().collect()),
+                }
+            }
+            return Ok(Self::from_unc_components(&parts));
         }
         if decode_bad_path_uri(&self.0).is_some() {
             return Err(PathUriParseError::InvalidFileUriPath {
@@ -412,8 +525,13 @@ impl PathUri {
                 })
             };
             if let Some(decoded_path) = decoded_path
-                && let Ok(path) = AbsolutePathBuf::from_absolute_path_checked(decoded_path)
-                && Self::from_abs_path(&path).eq(self)
+                && let Ok(path) = AbsolutePathBuf::from_absolute_path_checked(&decoded_path)
+                && (Self::from_abs_path(&path).eq(self)
+                    // Legacy safe extended aliases were emitted opaquely. Accept
+                    // only the checked, safely simplified namespace form.
+                    || path.as_path() != decoded_path.as_path()
+                        && codex_utils_absolute_path::normalize_for_native_workdir(&decoded_path)
+                            == path.as_path())
             {
                 return Ok(path);
             }
@@ -573,7 +691,10 @@ fn decode_uri_path(path: &str) -> String {
 
 /// Returns the original platform path bytes from a canonical bad-path URI.
 fn decode_bad_path_uri(url: &Url) -> Option<Vec<u8>> {
-    let encoded_path = url.as_str().strip_prefix(BAD_PATH_URI_PREFIX)?;
+    let encoded_path = url
+        .as_str()
+        .strip_prefix(WINDOWS_BAD_PATH_URI_PREFIX)
+        .or_else(|| url.as_str().strip_prefix(BAD_PATH_URI_PREFIX))?;
     if encoded_path.is_empty() || encoded_path.contains('/') {
         return None;
     }
@@ -613,21 +734,32 @@ fn infer_opaque_path_convention(path_bytes: &[u8]) -> Option<PathConvention> {
     if path_bytes.starts_with(b"/") {
         return Some(PathConvention::Posix);
     }
-    if !path_bytes.len().is_multiple_of(2) {
+    windows_path_units(path_bytes).map(|_| PathConvention::Windows)
+}
+
+fn is_windows_separator_unit(unit: u16) -> bool {
+    unit == 92 || unit == 47
+}
+
+fn windows_path_units(bytes: &[u8]) -> Option<Vec<u16>> {
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-
-    let mut path_wide = path_bytes
+    let wide = bytes
         .as_chunks::<2>()
         .0
         .iter()
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
-    let first = path_wide.next()?;
-    let second = path_wide.next()?;
-    let has_drive = u8::try_from(first).is_ok_and(|drive| drive.is_ascii_alphabetic())
-        && second == u16::from(b':');
-    let has_unc_prefix = first == u16::from(b'\\') && second == u16::from(b'\\');
-    (has_drive || has_unc_prefix).then_some(PathConvention::Windows)
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return None;
+    }
+    let drive = matches!(wide.as_slice(), [drive, 58, separator, ..]
+        if u8::try_from(*drive).is_ok_and(|c| c.is_ascii_alphabetic())
+            && is_windows_separator_unit(*separator));
+    let unc = matches!(wide.as_slice(), [first, second, ..]
+        if is_windows_separator_unit(*first) && is_windows_separator_unit(*second));
+    (drive || unc).then_some(wide)
 }
 
 fn parse_posix_path(path: &str) -> Option<PathUri> {
@@ -651,7 +783,11 @@ fn parse_windows_path(path: &str) -> Option<PathUri> {
                 && matches!(*namespace, b'.' | b'?')
     );
     if uses_namespace {
-        return Some(windows_opaque_path_uri(path));
+        return Some(
+            AbsolutePathBuf::from_absolute_path_checked(path)
+                .map(|path| PathUri::from_abs_path(&path))
+                .unwrap_or_else(|_| windows_opaque_path_uri(path)),
+        );
     }
 
     if matches!(
@@ -690,11 +826,17 @@ fn parse_windows_path(path: &str) -> Option<PathUri> {
 }
 
 fn windows_opaque_path_uri(path: &str) -> PathUri {
+    // Exceptional string ingress must use the same checked lexical spelling
+    // as native ingress, including mixed UNC separators and the share root.
+    // Otherwise the native inverse correctly rejects a noncanonical fallback.
+    if let Ok(native) = AbsolutePathBuf::from_absolute_path_checked(path) {
+        return PathUri::from_abs_path(&native);
+    }
     let path_bytes = path
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
-    PathUri::from_opaque_path_bytes(&path_bytes)
+    PathUri::from_windows_opaque_path_bytes(&path_bytes)
 }
 
 fn is_windows_separator_char(character: char) -> bool {

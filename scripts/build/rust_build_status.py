@@ -165,10 +165,14 @@ class RustAdmissionBusy(RuntimeError):
     def __init__(self, message: str, *, resource: Path, wait_option: str):
         super().__init__(message)
         self.status = {
-            "kind": "codex_rust_admission_v1", "status": "busy",
+            "kind": "codex_rust_admission_v1",
+            "status": "busy",
             "exit_code": RUST_ADMISSION_BUSY_EXIT_CODE,
-            "resource": str(resource.resolve()), "validation_status": "pending",
-            "executed": False, "queued": False, "automatic_retry": False,
+            "resource": str(resource.resolve()),
+            "validation_status": "pending",
+            "executed": False,
+            "queued": False,
+            "automatic_retry": False,
             "working_directory": str(Path.cwd().resolve()),
             "automatic_resume": False,
             "wait_option": wait_option,
@@ -190,43 +194,59 @@ class RustAdmissionBusy(RuntimeError):
 
 
 def lane_runner_holder(target_dir: Path) -> dict[str, object] | None:
-    """Name the runner invocation holding this target, from its validation ledger.
-
-    The holder's record is admitted, unfinished and the most recently written
-    such record. A crashed runner leaves the same record behind, so only a held
-    runner lease makes it current. Any other holder, such as a plain Cargo
-    command, stays unknown (None).
-    """
+    """Read the current target owner's binding, never guess from ledger history."""
+    lock_path = target_dir / ".rust-test-runner.lock"
     try:
-        if not _binary_file_lock_is_busy(target_dir / ".rust-test-runner.lock"):
+        if not _binary_file_lock_is_busy(lock_path):
             return None
-        ledgers = sorted(
-            (target_dir / "test-runner-logs").glob("validation-*.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
-        return None
-    # Records newer than the holder's are other launches that found it busy.
-    for path in ledgers[:64]:
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(record, dict) or record.get("outcome") != "running":
-            continue
-        phases, argv = record.get("phases"), record.get("argv")
+        # Byte zero is locked on Windows; the bounded descriptor follows it.
+        with lock_path.open("rb") as source:
+            source.seek(1)
+            descriptor = source.read(4097)
+        if len(descriptor) > 4096:
+            return None
+        binding = json.loads(descriptor)
+        if not isinstance(binding, dict) or binding.get("version") != 1:
+            return None
+        path = Path(binding["ledger"])
         if (
-            isinstance(phases, dict)
-            and phases.get("admission") is not None
-            and isinstance(argv, list)
+            path.parent.resolve() != (target_dir / "test-runner-logs").resolve()
+            or path.name != "validation-" + binding["run_id"] + ".json"
+            or path.is_symlink()
         ):
-            return {
-                "argv": [str(arg) for arg in argv],
-                "working_directory": record.get("working_directory"),
-                "started_at": record.get("started_at"),
-                "ledger": str(path),
-            }
+            return None
+        record = json.loads(path.read_text(encoding="utf-8"))
+        owner_path = path.with_suffix(".owner.lock")
+        if (
+            not isinstance(record, dict)
+            or record.get("run_id") != binding["run_id"]
+            or record.get("owner_lock_version") != 1
+            or record.get("outcome") != "running"
+            or not owner_path.is_file()
+            or owner_path.is_symlink()
+        ):
+            return None
+        owner = _try_acquire_binary_file_lock(owner_path)
+        if owner is not None:
+            owner.close()
+            return None
+        # A release/new acquisition during inspection invalidates this binding.
+        with lock_path.open("rb") as source:
+            source.seek(1)
+            if source.read(4097) != descriptor:
+                return None
+        if not _binary_file_lock_is_busy(lock_path) or not isinstance(
+            record.get("argv"), list
+        ):
+            return None
+        return {
+            "argv": [str(arg) for arg in record["argv"]],
+            "working_directory": record.get("working_directory"),
+            "started_at": record.get("started_at"),
+            "ledger": str(path),
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
     return None
 
 
@@ -334,6 +354,9 @@ class BuildStatusSnapshot:
     # Kept in active_lanes for safety, but reported as quarantined, not active.
     quarantined_lanes: set[str] = field(default_factory=set)
     _lane_mtimes: dict[Path, float] = field(default_factory=dict, repr=False)
+    _lane_generations: dict[Path, tuple[int, ...] | None] = field(
+        default_factory=dict, repr=False
+    )
     _lane_sizes: dict[Path, tuple[int, int]] = field(default_factory=dict, repr=False)
     _non_lane_sizes: dict[Path, tuple[int, int]] = field(
         default_factory=dict, repr=False
@@ -395,6 +418,9 @@ class BuildStatusSnapshot:
             active_lanes=active_lanes,
             stale_lanes=stale_lanes,
             _lane_mtime=(lane_last_used_mtime if lane_mtime is None else lane_mtime),
+            _lane_generations={
+                path: _lane_prune_generation(path) for path in lane_dirs
+            },
             process_scan_error=process_scan_error,
             quarantined_lanes={
                 path.name
@@ -476,9 +502,9 @@ def active_rust_processes_windows() -> list[RustProcess]:
         'AND ProcessId != $selfPid" -ErrorAction Stop | '
         # CIM can retain a row after exit while its command line is already gone.
         # Requery only ambiguous rows; a still-hidden process remains fail-closed.
-        'ForEach-Object { if ([string]::IsNullOrWhiteSpace($_.CommandLine)) { '
+        "ForEach-Object { if ([string]::IsNullOrWhiteSpace($_.CommandLine)) { "
         'Get-CimInstance Win32_Process -Filter "ProcessId=$($_.ProcessId)" -ErrorAction Stop '
-        '} else { $_ } } | '
+        "} else { $_ } } | "
         "Select-Object Name,ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
     try:
@@ -835,8 +861,11 @@ def _binary_file_lock_is_busy(path: Path) -> bool:
 
 @contextmanager
 def reserve_rust_test_target(
-    target_dir: Path, *, timeout_seconds: float = 0.0,
+    target_dir: Path,
+    *,
+    timeout_seconds: float = 0.0,
     cargo_profile: str | None = None,
+    holder: Mapping[str, object] | None = None,
 ) -> Iterator[dict[str, object]]:
     """Coordinate whole runner invocations, not cached results.
 
@@ -855,7 +884,10 @@ def reserve_rust_test_target(
     """
     if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
         raise ValueError("admission timeout must be a finite nonnegative number")
-    if cargo_profile is not None and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None:
+    if (
+        cargo_profile is not None
+        and re.fullmatch(r"[A-Za-z0-9_-]+", cargo_profile) is None
+    ):
         raise ValueError("Cargo profile must be a profile name, not a filesystem path")
     profile_dir = {"dev": "debug", "test": "debug", "bench": "release"}.get(
         cargo_profile, cargo_profile
@@ -868,7 +900,8 @@ def reserve_rust_test_target(
     started = time.monotonic()
     deadline = started + timeout_seconds
     coordination_deadline = started + max(
-        timeout_seconds, 30.0 if parent_reserved else LANE_COORDINATION_GRACE_SECONDS,
+        timeout_seconds,
+        30.0 if parent_reserved else LANE_COORDINATION_GRACE_SECONDS,
     )
     handle = None
     announced = False
@@ -876,15 +909,21 @@ def reserve_rust_test_target(
         while handle is None:
             remaining = deadline - time.monotonic()
             if timeout_seconds > 0 and remaining <= 0:
-                raise TimeoutError(f"timed out waiting for Rust test target {target_dir}")
+                raise TimeoutError(
+                    f"timed out waiting for Rust test target {target_dir}"
+                )
             managed = (target_dir.parent / CARGO_LANES_ROOT_MARKER).is_file()
             coordination = (
                 cargo_lane_coordination_lock(
                     target_dir.parent,
                     # The parent already won this lane; a zero budget here
                     # would drop it whenever another launch is mid-probe.
-                    timeout_seconds=max(0.0, min(30.0, coordination_deadline - time.monotonic())),
-                ) if managed and os.name == "nt" else nullcontext()
+                    timeout_seconds=max(
+                        0.0, min(30.0, coordination_deadline - time.monotonic())
+                    ),
+                )
+                if managed and os.name == "nt"
+                else nullcontext()
             )
             with coordination:
                 target_dir.mkdir(parents=True, exist_ok=True)
@@ -897,10 +936,18 @@ def reserve_rust_test_target(
                     # Acquire once rather than opening, probing and releasing
                     # this same lease before reacquiring it. Raw Cargo probes
                     # are nonblocking; never retain our lease while waiting.
-                    candidate = _try_acquire_binary_file_lock(target_dir / ".rust-test-runner.lock")
+                    candidate = _try_acquire_binary_file_lock(
+                        target_dir / ".rust-test-runner.lock"
+                    )
                     if candidate is not None:
                         try:
-                            if not _cargo_profile_locks_are_busy(target_dir, profile=profile_dir):
+                            # Retire the previous owner's descriptor immediately,
+                            # including during this owner's pre-checkpoint interval.
+                            candidate.truncate(1)
+                            candidate.flush()
+                            if not _cargo_profile_locks_are_busy(
+                                target_dir, profile=profile_dir
+                            ):
                                 handle = candidate
                         finally:
                             if handle is None:
@@ -913,12 +960,21 @@ def reserve_rust_test_target(
                     raise RustAdmissionBusy(
                         f"Rust test target is busy: {target_dir}. No validation was run. "
                         "Required validation remains pending.",
-                        resource=target_dir, wait_option="--admission-timeout-seconds",
+                        resource=target_dir,
+                        wait_option="--admission-timeout-seconds",
                     )
                 if not announced:
-                    print(f"Rust admission: waiting for target {target_dir}", file=sys.stderr)
+                    print(
+                        f"Rust admission: waiting for target {target_dir}",
+                        file=sys.stderr,
+                    )
                     announced = True
                 time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        if holder is not None:
+            descriptor = json.dumps({"version": 1, **holder}).encode("utf-8")
+            if len(descriptor) <= 4096:
+                handle.write(descriptor)
+                handle.flush()
         try:
             yield {
                 "target_dir": str(target_dir),
@@ -929,7 +985,10 @@ def reserve_rust_test_target(
                 "cargo_profile_directory": profile_dir,
             }
         except BaseException as error:
-            if isinstance(error, CleanupFailed) or getattr(error, "outcome", None) == "cleanup_failed":
+            if (
+                isinstance(error, CleanupFailed)
+                or getattr(error, "outcome", None) == "cleanup_failed"
+            ):
                 (target_dir / ".lane-cleanup-unconfirmed").write_text(
                     "Runner process cleanup was not confirmed; inspect descendants before removing this quarantine.\n",
                     encoding="utf-8",
@@ -938,7 +997,15 @@ def reserve_rust_test_target(
     finally:
         if handle is not None:
             try:
-                _release_binary_file_lock(handle)
+                try:
+                    handle.truncate(1)
+                    handle.flush()
+                except OSError:
+                    # A leftover descriptor is not live without both leases.
+                    # Retention failure must not replace the command outcome.
+                    pass
+                finally:
+                    _release_binary_file_lock(handle)
             finally:
                 handle.close()
 
@@ -1093,6 +1160,57 @@ def _lane_path_observation(path: Path) -> os.stat_result | None:
         return None
 
 
+def _lane_prune_generation(path: Path) -> tuple[int, ...] | None:
+    """Bind eligibility to both the directory and its last reservation."""
+    observed = _lane_path_observation(path)
+    if observed is None:
+        return None
+    stamp = _lane_path_observation(path / LANE_LAST_USED_STAMP)
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_ctime_ns,
+        observed.st_mtime_ns,
+        *(
+            ()
+            if stamp is None
+            else (
+                stamp.st_dev,
+                stamp.st_ino,
+                stamp.st_mtime_ns,
+                stamp.st_ctime_ns,
+                stamp.st_size,
+            )
+        ),
+    )
+
+
+def _detach_expendable_lane_cache(path: Path, trash: Path) -> bool:
+    """Keep legacy published evidence paths continuously reachable.
+
+    Called under lane coordination after the final activity/generation checks.
+    Only immediate children move here; recursive deletion stays outside the lock.
+    Stable lock inodes remain at the original lane path for future waiters.
+    """
+    if not (path / "test-runner-logs").exists():
+        path.replace(trash)
+        return True
+    keep = {
+        "test-runner-logs",
+        ".lane-active.lock",
+        ".rust-test-runner.lock",
+        ".lane-cleanup-unconfirmed",
+        LANE_LAST_USED_STAMP,
+    }
+    children = [child for child in path.iterdir() if child.name not in keep]
+    if not children:
+        return False
+    trash.mkdir()
+    for child in children:
+        child.replace(trash / child.name)
+    return True
+
+
 def _lane_reservation_candidates(
     lane_root: Path,
     base_lane: str,
@@ -1182,7 +1300,9 @@ def reserve_cargo_lane(
     target_dir: Path | None = None
     resolved_lane: str | None = None
     deadline = time.monotonic() + max(0.0, warm_wait_seconds)
-    coordination_deadline = time.monotonic() + max(warm_wait_seconds, lock_timeout_seconds)
+    coordination_deadline = time.monotonic() + max(
+        warm_wait_seconds, lock_timeout_seconds
+    )
     announced_wait = False
     while active_handle is None:
         busy_reusable = False
@@ -1191,7 +1311,10 @@ def reserve_cargo_lane(
         # creation/prune lock its own bounded grace, without resetting its
         # deadline on each attempt or opting into waiting for a busy lane.
         with cargo_lane_coordination_lock(
-            root, timeout_seconds=max(0.0, min(lock_timeout_seconds, coordination_deadline - time.monotonic()))
+            root,
+            timeout_seconds=max(
+                0.0, min(lock_timeout_seconds, coordination_deadline - time.monotonic())
+            ),
         ):
             candidates = _lane_reservation_candidates(root, base_lane, prefer_warm=True)
             # Profile names are configurable. Inspect only immediate, direct
@@ -1246,7 +1369,8 @@ def reserve_cargo_lane(
                         raise RustAdmissionBusy(
                             f"Cargo lane {base_lane!r} is busy; no cold overflow was started. "
                             "Required validation remains pending.",
-                            resource=root / base_lane, wait_option="--warm-wait-seconds",
+                            resource=root / base_lane,
+                            wait_option="--warm-wait-seconds",
                         )
                 candidate_dir.mkdir(exist_ok=True)
                 if cargo_lock_is_busy(candidate_dir):
@@ -1274,7 +1398,8 @@ def reserve_cargo_lane(
     if active_handle is None or target_dir is None or resolved_lane is None:
         raise RustAdmissionBusy(
             f"unable to reserve an idle Cargo lane for {base_lane!r}; validation remains pending",
-            resource=root / base_lane, wait_option="--warm-wait-seconds",
+            resource=root / base_lane,
+            wait_option="--warm-wait-seconds",
         )
     stamp = target_dir / LANE_LAST_USED_STAMP
     try:
@@ -1684,11 +1809,24 @@ def _guard_cargo_checkout_cwd(command: Sequence[str], repo_root: Path) -> None:
         return
     index = _cargo_subcommand_index(command)
     if index is None or command[index] not in {
-        "build", "b", "check", "c", "test", "t", "bench", "run", "r",
-        "clippy", "doc", "d", "rustc", "rustdoc", "fix",
+        "build",
+        "b",
+        "check",
+        "c",
+        "test",
+        "t",
+        "bench",
+        "run",
+        "r",
+        "clippy",
+        "doc",
+        "d",
+        "rustc",
+        "rustdoc",
+        "fix",
     }:
         return
-    options = command[:command.index("--")] if "--" in command else command
+    options = command[: command.index("--")] if "--" in command else command
     if any(
         arg in {"--help", "-h", "--manifest-path"}
         or arg.startswith(("--manifest-path=", "-C"))
@@ -1711,8 +1849,12 @@ def _guard_cargo_checkout_cwd(command: Sequence[str], repo_root: Path) -> None:
 def _is_named_runner_command(command: Sequence[str]) -> bool:
     return (
         len(command) >= 3
-        and Path(command[0]).stem.lower() in {
-            "python", "python3", "py", Path(sys.executable).stem.lower(),
+        and Path(command[0]).stem.lower()
+        in {
+            "python",
+            "python3",
+            "py",
+            Path(sys.executable).stem.lower(),
         }
         and Path(command[1]).resolve()
         == Path(__file__).with_name("rust_test_runner.py").resolve()
@@ -1744,7 +1886,9 @@ def _guard_named_runner_args(command: Sequence[str]) -> None:
     except rust_test_runner.RunnerError as exc:
         raise ValueError(str(exc)) from exc
     except SystemExit as exc:
-        raise ValueError("Invalid named runner arguments; no build lane was reserved.") from exc
+        raise ValueError(
+            "Invalid named runner arguments; no build lane was reserved."
+        ) from exc
 
 
 def _implicit_cargo_package(command: Sequence[str]) -> str | None:
@@ -1770,7 +1914,10 @@ def _implicit_cargo_package(command: Sequence[str]) -> str | None:
     candidates = (
         [working_dir / manifest]
         if manifest is not None
-        else [directory / "Cargo.toml" for directory in (working_dir, *working_dir.parents)]
+        else [
+            directory / "Cargo.toml"
+            for directory in (working_dir, *working_dir.parents)
+        ]
     )
     for path in candidates:
         try:
@@ -1850,7 +1997,11 @@ def _direct_reserved_lane_command(
     elif recipe == "_core-test-small-reserved" and arguments:
         profile = "fast"
         runner_arguments = [
-            "--cargo-profile", "dev-small", "run-target", "--profile", profile,
+            "--cargo-profile",
+            "dev-small",
+            "run-target",
+            "--profile",
+            profile,
             *arguments,
         ]
     elif recipe == "_core-gate-reserved" and arguments:
@@ -2084,10 +2235,14 @@ def cargo_build_context(
     # selects test policy, not Cargo artifacts; use the same distinction as a
     # direct `cargo nextest` command when ranking warm lanes.
     nextest = (
-        cargo_index is not None and command[cargo_index] == "nextest"
+        cargo_index is not None
+        and command[cargo_index] == "nextest"
         or _is_named_runner_command(command)
-        or reserved_recipe in {
-            "_core-test-reserved", "_core-test-small-reserved", "_core-gate-reserved",
+        or reserved_recipe
+        in {
+            "_core-test-reserved",
+            "_core-test-small-reserved",
+            "_core-gate-reserved",
         }
     )
     if reserved_recipe == "_core-test-small-reserved":
@@ -2156,6 +2311,7 @@ def run_in_cargo_lane(
     timing_path: Path | None = None,
     warm_wait_seconds: float = 0.0,
     allow_cold_overflow: bool = False,
+    admission_invocation: Sequence[str] | None = None,
 ) -> int:
     if not command:
         raise ValueError("run-lane requires a command after --")
@@ -2176,8 +2332,14 @@ def run_in_cargo_lane(
         "status": "error",
         "phaseDurationsMs": phases,
     }
+    from scripts.build.validation_metrics import ValidationMetrics
+
     phase = "reservation"
     started = previous = time.perf_counter_ns()
+    # One timeline, not a second clock: the envelope starts and finishes on the
+    # phase boundaries below, so it covers every phase and equals totalMs.
+    metrics = ValidationMetrics(command, clock=lambda: previous / 1_000_000_000)
+    metrics.record.update(producer="rust_build_status", executed=False, queued=False)
 
     def next_phase(name: str | None) -> None:
         nonlocal phase, previous
@@ -2193,6 +2355,7 @@ def run_in_cargo_lane(
         _guard_cargo_checkout_cwd(command, repo_root)
         _guard_named_runner_args(command)
         child_env = os.environ.copy()
+        child_env["CODEX_VALIDATION_PARENT_RUN_ID"] = metrics.record["run_id"]
         updates = local_rust_env(child_env, repo_root=repo_root, which=shutil.which)
         child_env.update(updates)
         # Lane commands such as `cargo llvm-cov` and `cargo test` run libtest
@@ -2218,6 +2381,7 @@ def run_in_cargo_lane(
         ) as (resolved_lane, target_dir):
             next_phase("setup")
             record.update(resolvedLane=resolved_lane, targetDir=str(target_dir))
+            metrics.bind(target_dir)
             if requested_lane != "auto" and resolved_lane != requested_lane:
                 print(
                     f"using Cargo lane {resolved_lane!r} "
@@ -2266,6 +2430,10 @@ def run_in_cargo_lane(
                     file=sys.stderr,
                 )
             next_phase("command")
+            metrics.record["executed"] = True
+            from scripts.build.full_suite_dispatch import record_test_dispatch
+
+            record_test_dispatch(child_command, child_env)
             try:
                 try:
                     exit_code = run_owned(
@@ -2273,7 +2441,9 @@ def run_in_cargo_lane(
                         env=child_env,
                         # Keep foreground harness work ahead of lane builds;
                         # Windows descendants inherit this priority class.
-                        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0),
+                        creationflags=getattr(
+                            subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0
+                        ),
                         prepare_sccache=True,
                         check=False,
                         stdout=sys.stdout,
@@ -2286,11 +2456,17 @@ def run_in_cargo_lane(
                     raise
                 record.update(
                     exitCode=exit_code,
-                    status="completed" if exit_code == 0 else (
-                        "busy" if exit_code == RUST_ADMISSION_BUSY_EXIT_CODE
-                        and _is_named_runner_command(child_command) else "failed"
+                    status="completed"
+                    if exit_code == 0
+                    else (
+                        "busy"
+                        if exit_code == RUST_ADMISSION_BUSY_EXIT_CODE
+                        and _is_named_runner_command(child_command)
+                        else "failed"
                     ),
                 )
+                if record["status"] == "busy":
+                    metrics.record["executed"] = False
                 if exit_code == 0:
                     # Hold the lane lock until its successful context is recorded.
                     try:
@@ -2308,12 +2484,37 @@ def run_in_cargo_lane(
     except BaseException as error:
         if isinstance(error, TimeoutError) and phase == "reservation":
             error = RustAdmissionBusy(
-                str(error), resource=lane_root if lane_root is not None else cargo_lanes_root(repo_root),
+                str(error),
+                resource=lane_root
+                if lane_root is not None
+                else cargo_lanes_root(repo_root),
                 wait_option="--warm-wait-seconds",
             )
         if isinstance(error, RustAdmissionBusy):
-            record.update(status="busy", exitCode=RUST_ADMISSION_BUSY_EXIT_CODE,
-                          admission=error.status)
+            from scripts.build.full_suite_dispatch import record_dispatch
+
+            record_dispatch("not_started")
+            record.update(
+                status="busy",
+                exitCode=RUST_ADMISSION_BUSY_EXIT_CODE,
+                admission=error.status,
+            )
+            if admission_invocation is not None:
+                # Publish before the request ledger written in `finally`, so the
+                # first JSON line is the admission record, as from the runner
+                # and cargo-lane.ps1.
+                print(f"Rust admission busy: {error}", file=sys.stderr)
+                print(
+                    json.dumps(
+                        {
+                            **error.report(),
+                            "pending_command": list(command),
+                            "invocation": list(admission_invocation),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
             raise error
         record.update(
             status="interrupted" if isinstance(error, KeyboardInterrupt) else "error",
@@ -2323,6 +2524,17 @@ def run_in_cargo_lane(
     finally:
         next_phase(None)
         record["totalMs"] = (previous - started) / 1_000_000
+        metrics.record["outer_lifecycle"] = record
+        metrics.record["phases"] = {
+            name: duration / 1000 if duration is not None else None
+            for name, duration in phases.items()
+        }
+        metrics.finish(
+            {"completed": "passed", "interrupted": "cancelled"}.get(
+                record["status"],
+                record["status"],
+            )
+        )
         if stream is not None:
             try:
                 with stream:
@@ -2569,6 +2781,9 @@ def prunable_lane_dirs(
             f"unverified: {snapshot.process_scan_error}"
         )
     lane_dirs = snapshot.stale_lanes
+    for path in lane_dirs:
+        if path not in snapshot._lane_generations:
+            snapshot._lane_generations[path] = _lane_prune_generation(path)
     protected = protected_warm_lane_names(
         lane_dirs,
         keep_warm_per_base=keep_warm_per_base,
@@ -2721,6 +2936,11 @@ def prune_stale_lanes(
                         continue
                     if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
                         continue
+                    generation = snapshot._lane_generations.get(path)
+                    if generation is None or _lane_prune_generation(path) != generation:
+                        # A completed reservation or same-name replacement invalidates
+                        # the old plan, even when its locks have already been released.
+                        continue
                     timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
                     centiseconds = int((time.time() % 1) * 100)
                     trash_path = path.with_name(
@@ -2728,7 +2948,8 @@ def prune_stale_lanes(
                     )
                     if trash_path.exists():
                         raise FileExistsError(trash_path)
-                    path.replace(trash_path)
+                    if not _detach_expendable_lane_cache(path, trash_path):
+                        continue
                 # A new reservation may now recreate `path`; delete only the
                 # uniquely renamed tree after releasing the coordination lock.
                 remove_tree_allow_readonly(trash_path)
@@ -2761,6 +2982,16 @@ def prune_stale_lanes(
         if trash_path in failures or is_indirect_directory(trash_path):
             continue
         if cargo_lock_is_busy(trash_path) or lane_active_lock_is_held(trash_path):
+            continue
+        if (trash_path / "test-runner-logs").exists():
+            # A legacy worker may have detached required evidence already.
+            # Without a stable published-path handoff, absence of a build owner
+            # does not authorize erasing it.
+            failures.append(trash_path)
+            print(
+                f"warning: retained validation evidence in {trash_path}",
+                file=sys.stderr,
+            )
             continue
         if not dry_run:
             try:
@@ -3087,15 +3318,16 @@ def main(argv: list[str] | None = None) -> int:
                 timing_path=args.timing_json,
                 warm_wait_seconds=args.warm_wait_seconds,
                 allow_cold_overflow=args.allow_cold_overflow,
+                admission_invocation=[
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    *(sys.argv[1:] if argv is None else argv),
+                ],
             )
         else:
             parser.error(f"unknown command {args.command}")
-    except RustAdmissionBusy as exc:
-        print(f"Rust admission busy: {exc}", file=sys.stderr)
-        print(json.dumps({**exc.report(), "pending_command": command_args,
-                          "invocation": [sys.executable, str(Path(__file__).resolve()),
-                                         *(sys.argv[1:] if argv is None else argv)]},
-                         sort_keys=True), file=sys.stderr)
+    except RustAdmissionBusy:
+        # run_in_cargo_lane already published the pending admission record.
         return RUST_ADMISSION_BUSY_EXIT_CODE
     except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

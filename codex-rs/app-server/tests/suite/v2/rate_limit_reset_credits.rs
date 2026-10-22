@@ -126,7 +126,6 @@ async fn consume_account_rate_limit_reset_credit_maps_backend_outcomes() -> Resu
         .mount(&server)
         .await;
 
-
     let mut mcp = initialized_app_server(codex_home.path()).await?;
     for (params, expected_message) in [
         (
@@ -179,7 +178,6 @@ async fn consume_account_rate_limit_reset_credit_maps_backend_outcomes() -> Resu
 
     Ok(())
 }
-
 
 #[tokio::test]
 async fn consume_account_rate_limit_reset_credit_surfaces_backend_failure() -> Result<()> {

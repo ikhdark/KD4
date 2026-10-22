@@ -49,6 +49,70 @@ fn stores() -> &'static Mutex<HashMap<String, Arc<InMemoryThreadStore>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn same_id_resume_cache_cannot_remove_or_invent_accepted_history() {
+        let store = InMemoryThreadStore::default();
+        let id = ThreadId::new();
+        let mut params = create_thread_params(id, ThreadHistoryMode::Legacy);
+        let session_id = codex_protocol::SessionId::new();
+        params.session_id = session_id;
+        store.create_thread(params).await.unwrap();
+        let message = |text: &str| {
+            RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::UserMessage(
+                codex_protocol::protocol::UserMessageEvent {
+                    message: text.into(),
+                    ..Default::default()
+                },
+            ))
+        };
+        store
+            .append_persisted_items_ordered(id, &[message("U1")])
+            .await
+            .unwrap();
+        let load = || LoadThreadHistoryParams {
+            thread_id: id,
+            include_archived: false,
+        };
+        let mut stale = store.load_history(load()).await.unwrap().items;
+        store
+            .append_persisted_items_ordered(id, &[message("U2")])
+            .await
+            .unwrap();
+        let expected =
+            serde_json::to_value(store.load_history(load()).await.unwrap().items).unwrap();
+        for cache in [Some(stale.clone()), None, {
+            stale.push(message("fabricated"));
+            Some(stale)
+        }] {
+            store
+                .resume_thread(ResumeThreadParams {
+                    thread_id: id,
+                    rollout_path: None,
+                    history: cache.map(Arc::new),
+                    include_archived: false,
+                    metadata: thread_metadata(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(store.load_history(load()).await.unwrap().items).unwrap(),
+                expected
+            );
+            assert_eq!(
+                store
+                    .read_thread(ReadThreadParams {
+                        thread_id: id,
+                        include_archived: false,
+                        include_history: false
+                    })
+                    .await
+                    .unwrap()
+                    .session_id,
+                Some(session_id)
+            );
+        }
+    }
     use crate::ListItemsParams;
     use crate::ListTurnsParams;
     use crate::LiveThread;
@@ -217,7 +281,10 @@ mod tests {
             "no rollout item may be copied into an owned request batch"
         );
         assert_eq!(calls.append_items_ordered, 2);
-        assert_eq!(calls.flush_thread, 1, "only the synchronous append requests a barrier");
+        assert_eq!(
+            calls.flush_thread, 1,
+            "only the synchronous append requests a barrier"
+        );
         assert_eq!(calls.append_items, 2);
     }
 
@@ -981,21 +1048,15 @@ impl InMemoryThreadStore {
             .map(canonical_history_mode_from_rollout_items)
             .unwrap_or_else(|| history_mode_from_state(&state, params.thread_id));
         reject_paginated_history_mode(history_mode)?;
-        if let Some(history) = params.history {
-            if let Some(RolloutItem::SessionMeta(meta)) = history
+        if let Some(history) = params.history
+            && let Some(RolloutItem::SessionMeta(meta)) = history
                 .iter()
                 .find(|item| matches!(item, RolloutItem::SessionMeta(_)))
-                && meta.meta.id != params.thread_id
-            {
-                return Err(ThreadStoreError::InvalidRequest {
-                    message: "resume history belongs to a different thread".to_string(),
-                });
-            }
-            state
-                .histories
-                .insert(params.thread_id, Arc::unwrap_or_clone(history));
-        } else {
-            state.histories.entry(params.thread_id).or_default();
+            && meta.meta.id != params.thread_id
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "resume history belongs to a different thread".to_string(),
+            });
         }
         if let Some(rollout_path) = params.rollout_path {
             state
@@ -1439,6 +1500,7 @@ fn stored_thread_from_state(
     Ok(StoredThread {
         project_id: None,
         thread_id,
+        session_id: Some(created.session_id),
         extra_config: created.extra_config.clone(),
         rollout_path: metadata.and_then(|metadata| metadata.rollout_path.clone()),
         forked_from_id: created.forked_from_id,

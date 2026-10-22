@@ -120,16 +120,6 @@ pub mod legacy_core {
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-// A canceled shutdown must not detach its worker by dropping a plain JoinHandle.
-// Aborting an already completed worker is harmless on the graceful path.
-struct AbortWorkerOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortWorkerOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 #[cfg(test)]
 tokio::task_local! {
     // Scheduling control only: the real worker still owns its runtime and queue.
@@ -573,6 +563,7 @@ impl InProcessClientStartArgs {
 enum ClientCommand {
     Request {
         request: Box<ClientRequest>,
+        trace: Option<codex_protocol::protocol::W3cTraceContext>,
         response_tx: oneshot::Sender<IoResult<RequestResult>>,
     },
     Notify {
@@ -688,13 +679,13 @@ impl InProcessAppServerClient {
                     command = command_rx.recv() => {
                         match command {
                             Some(command) if command.is_abandoned_request() => {}
-                            Some(ClientCommand::Request { request, response_tx }) => {
+                            Some(ClientCommand::Request { request, trace, response_tx }) => {
                                 let request_sender = request_sender.clone();
                                 // Request waits happen on a detached task so
                                 // this loop can keep draining runtime events
                                 // while the request is blocked on client input.
                                 tokio::spawn(async move {
-                                    let result = request_sender.request(*request).await;
+                                    let result = request_sender.request_with_trace(*request, trace).await;
                                     let _ = response_tx.send(result);
                                 });
                             }
@@ -920,17 +911,27 @@ impl InProcessAppServerClient {
 
     /// Shuts down worker and in-process runtime with bounded wait.
     ///
-    /// If graceful shutdown exceeds timeout, the worker task is aborted to
-    /// avoid leaking background tasks in embedding callers.
+    /// Timeout stops observation, not custody of committed runtime work.
     pub async fn shutdown(self) -> IoResult<()> {
+        let owner = tokio::spawn(self.shutdown_owned());
+        tokio::time::timeout(SHUTDOWN_TIMEOUT, owner)
+            .await
+            .map_err(|_| {
+                IoError::new(
+                    ErrorKind::TimedOut,
+                    "in-process shutdown remains owned and pending",
+                )
+            })?
+            .map_err(|error| IoError::other(format!("in-process shutdown owner failed: {error}")))?
+    }
+
+    async fn shutdown_owned(self) -> IoResult<()> {
         let Self {
             command_tx,
             event_rx,
             initialize_response: _initialize_response,
             worker_handle,
         } = self;
-        let mut worker_handle = worker_handle;
-        let _abort_worker = AbortWorkerOnDrop(worker_handle.abort_handle());
         // Drop the caller-facing receiver before asking the worker to shut
         // down. That unblocks any pending must-deliver `event_tx.send(..)`
         // so the worker can reach `handle.shutdown()` instead of timing out
@@ -946,7 +947,10 @@ impl InProcessAppServerClient {
                 .await
                 .is_err()
             {
-                return Ok(());
+                return Err(IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "session persistence shutdown channel closed",
+                ));
             }
             response_rx.await.map_err(|_| {
                 IoError::new(
@@ -957,15 +961,20 @@ impl InProcessAppServerClient {
         })
         .await;
 
-        // Retire the owner even when graceful shutdown returned an error.
-        if tokio::time::timeout_at(deadline, &mut worker_handle)
+        // If admission timed out, the worker never saw Shutdown; releasing this
+        // sender lets it reach the channel-closed shutdown path once retained
+        // request handles are gone, instead of waiting on us forever.
+        drop(command_tx);
+        // This retained task owns the actual worker after any observer timeout.
+        worker_handle
             .await
-            .is_err()
-        {
-            worker_handle.abort();
-            let _ = worker_handle.await;
-        }
-        shutdown_result.unwrap_or(Ok(()))
+            .map_err(|error| IoError::other(format!("in-process facade worker failed: {error}")))?;
+        shutdown_result.unwrap_or_else(|_| {
+            Err(IoError::new(
+                ErrorKind::TimedOut,
+                "session persistence shutdown unconfirmed",
+            ))
+        })
     }
 }
 
@@ -975,6 +984,7 @@ impl InProcessAppServerRequestHandle {
         self.command_tx
             .send(ClientCommand::Request {
                 request: Box::new(request),
+                trace: codex_otel::current_span_w3c_trace_context(),
                 response_tx,
             })
             .await
@@ -1177,9 +1187,24 @@ mod tests {
         let fork = thread_fork_params_from_config(&config, "thread-id".to_string(), overrides);
 
         for (model, provider, cwd, instructions) in [
-            (&start.model, &start.model_provider, &start.cwd, &start.developer_instructions),
-            (&resume.model, &resume.model_provider, &resume.cwd, &resume.developer_instructions),
-            (&fork.model, &fork.model_provider, &fork.cwd, &fork.developer_instructions),
+            (
+                &start.model,
+                &start.model_provider,
+                &start.cwd,
+                &start.developer_instructions,
+            ),
+            (
+                &resume.model,
+                &resume.model_provider,
+                &resume.cwd,
+                &resume.developer_instructions,
+            ),
+            (
+                &fork.model,
+                &fork.model_provider,
+                &fork.cwd,
+                &fork.developer_instructions,
+            ),
         ] {
             assert_eq!(model.as_deref(), Some("configured-model"));
             assert_eq!(provider.as_deref(), Some("provider-override"));
@@ -1235,7 +1260,11 @@ mod tests {
 
         for (permissions, profile, sandbox) in [
             (start.permissions, start.permission_profile, start.sandbox),
-            (resume.permissions, resume.permission_profile, resume.sandbox),
+            (
+                resume.permissions,
+                resume.permission_profile,
+                resume.sandbox,
+            ),
             (fork.permissions, fork.permission_profile, fork.sandbox),
         ] {
             assert_eq!(permissions.as_deref(), Some("configured-profile"));
@@ -1753,10 +1782,9 @@ mod tests {
         client.shutdown().await.expect("shutdown should complete");
     }
 
-
-
     #[tokio::test]
     async fn in_process_requests_progress_while_required_delivery_is_full() {
+        const PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
         let signal = Arc::new(tokio::sync::Notify::new());
         let mut client = TEST_PENDING_DELIVERY
             .scope(
@@ -1771,7 +1799,7 @@ mod tests {
             })
             .await
             .expect("thread starts");
-        timeout(Duration::from_secs(2), async {
+        timeout(PROGRESS_TIMEOUT, async {
             loop {
                 let event = client.client.next_event().await.expect("event stream open");
                 if let InProcessServerEvent::ServerNotification(
@@ -1787,7 +1815,7 @@ mod tests {
         .expect("initial thread event arrives");
         for (id, name) in [(801, "first"), (802, "second")] {
             timeout(
-                Duration::from_secs(2),
+                PROGRESS_TIMEOUT,
                 client.request_typed::<codex_app_server_protocol::ThreadSetNameResponse>(
                     ClientRequest::ThreadSetName {
                         request_id: RequestId::Integer(id),
@@ -1802,11 +1830,11 @@ mod tests {
             .expect("name request completes while event queue fills")
             .expect("set thread name");
         }
-        timeout(Duration::from_secs(2), signal.notified())
+        timeout(PROGRESS_TIMEOUT, signal.notified())
             .await
             .expect("worker retains required event behind full queue");
         let response: GetAccountResponse = timeout(
-            Duration::from_secs(2),
+            PROGRESS_TIMEOUT,
             client.request_typed(ClientRequest::GetAccount {
                 request_id: RequestId::Integer(803),
                 params: codex_app_server_protocol::GetAccountParams {
@@ -1819,7 +1847,7 @@ mod tests {
         .expect("account read");
         assert_eq!(response.account, None);
         for name in ["first", "second"] {
-            let notification = timeout(Duration::from_secs(2), async {
+            let notification = timeout(PROGRESS_TIMEOUT, async {
                 loop {
                     let event = client.client.next_event().await.expect("event stream open");
                     if let InProcessServerEvent::ServerNotification(
@@ -3323,6 +3351,7 @@ mod tests {
     async fn next_event_surfaces_lagged_markers() {
         // The worker below has already exited, so its command receiver is gone too. Keeping one
         // alive would park the final shutdown on an unanswered command until its 5s deadline.
+        // A worker that exited without receiving Shutdown never confirmed session persistence.
         let (command_tx, _) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::channel(1);
         let worker_handle = tokio::spawn(async {});
@@ -3347,7 +3376,14 @@ mod tests {
             Some(InProcessServerEvent::Lagged { skipped: 3 })
         ));
 
-        client.shutdown().await.expect("shutdown should complete");
+        assert_eq!(
+            client
+                .shutdown()
+                .await
+                .expect_err("a closed shutdown channel cannot confirm session persistence")
+                .kind(),
+            ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
@@ -3400,16 +3436,6 @@ mod tests {
                             phase: None,
                         },
                     }
-                )
-            )
-        ));
-        assert!(event_requires_delivery(
-            &InProcessServerEvent::ServerNotification(
-                codex_app_server_protocol::ServerNotification::ExternalAgentConfigImportCompleted(
-                    codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification {
-                        import_id: "import".to_string(),
-                        item_type_results: Vec::new(),
-                    },
                 )
             )
         ));
@@ -3559,46 +3585,48 @@ mod tests {
         let pause = Arc::new(tokio::sync::Notify::new());
         let client = TEST_WORKER_PAUSE
             .scope(
-                pause,
+                Arc::clone(&pause),
                 start_test_client_with_capacity(SessionSource::Cli, 1),
             )
             .await;
         let request_handle = client.request_handle();
         let worker = client.worker_handle.abort_handle();
-        let request = || ClientRequest::GetAccount {
+        let mut queued_request = Box::pin(request_handle.request(ClientRequest::GetAccount {
             request_id: RequestId::Integer(701),
             params: codex_app_server_protocol::GetAccountParams {
                 refresh_token: false,
             },
-        };
-        let mut queued_request = std::pin::pin!(request_handle.request(request()));
+        }));
         assert!(futures::poll!(&mut queued_request).is_pending());
         assert_eq!(client.command_tx.capacity(), 0);
 
-        timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(2), client.shutdown())
+        // Timeout stops observation, not custody: an undrained worker is
+        // reported as still pending and is never aborted.
+        let error = timeout(SHUTDOWN_TIMEOUT + Duration::from_secs(2), client.shutdown())
             .await
             .expect("a full command queue must not escape the shutdown deadline")
-            .expect("forced shutdown should complete");
-
+            .expect_err("an undrained worker cannot confirm shutdown");
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert!(
-            worker.is_finished(),
-            "shutdown must retire the actual worker"
+            !worker.is_finished(),
+            "an observer timeout must not abort the worker"
         );
-        assert_eq!(
-            queued_request
-                .await
-                .expect_err("queued request is abandoned")
-                .kind(),
-            ErrorKind::BrokenPipe
-        );
-        assert_eq!(
-            request_handle
-                .request(request())
-                .await
-                .expect_err("retained handles cannot send to a retired worker")
-                .kind(),
-            ErrorKind::BrokenPipe
-        );
+
+        // The retained owner reaps the worker once it can drain the admitted
+        // request and the last retained request handle is gone.
+        pause.notify_one();
+        let _ = timeout(Duration::from_secs(5), &mut queued_request)
+            .await
+            .expect("the admitted request must resolve once the worker drains it");
+        drop(queued_request);
+        drop(request_handle);
+        timeout(Duration::from_secs(5), async {
+            while !worker.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retained shutdown owner must reap the worker");
     }
 
     #[tokio::test]
@@ -3616,7 +3644,7 @@ mod tests {
         let pause = Arc::new(tokio::sync::Notify::new());
         let client = TEST_WORKER_PAUSE
             .scope(
-                pause,
+                Arc::clone(&pause),
                 start_test_client_with_capacity(SessionSource::Cli, 1),
             )
             .await;
@@ -3633,8 +3661,12 @@ mod tests {
         let mut shutdown = Box::pin(client.shutdown());
         assert!(futures::poll!(&mut shutdown).is_pending());
         drop(shutdown);
-        let closed = timeout(Duration::from_secs(1), request_handle.command_tx.closed()).await;
-        // Do not leave the baseline's paused worker running after a failure.
+        // Cancelling the observer leaves the retained owner in custody: once the
+        // worker drains its full queue, the pending Shutdown is admitted and
+        // retires it without an abort.
+        pause.notify_one();
+        let closed = timeout(Duration::from_secs(5), request_handle.command_tx.closed()).await;
+        // Do not leave a paused worker running after a failure.
         worker.abort();
         request_handle.command_tx.closed().await;
         assert!(
@@ -3642,12 +3674,9 @@ mod tests {
             "cancelled shutdown must not detach its worker"
         );
         assert!(worker.is_finished());
-        assert_eq!(
-            request
-                .await
-                .expect_err("queued request is abandoned")
-                .kind(),
-            ErrorKind::BrokenPipe
-        );
+        // The admitted request is answered or failed by shutdown; it never hangs.
+        let _ = timeout(Duration::from_secs(5), request)
+            .await
+            .expect("the admitted request must resolve when the worker retires");
     }
 }

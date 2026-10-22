@@ -48,7 +48,11 @@ async fn websocket_fallback_recovers_first_abrupt_close_and_stays_on_http() -> R
                 ev_assistant_message("recovered", "recovered over HTTP"),
                 ev_completed("resp-http-1"),
             ]),
-            sse(vec![ev_completed("resp-http-2")]),
+            // A turn that ends without a final answer gets one repair request.
+            sse(vec![
+                ev_assistant_message("second", "second turn over HTTP"),
+                ev_completed("resp-http-2"),
+            ]),
         ],
     )
     .await;
@@ -206,7 +210,11 @@ async fn websocket_fallback_switches_to_http_after_retries_exhausted() -> Result
         .await;
     let _response_mock = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done over HTTP"),
+            ev_completed("resp-1"),
+        ]),
     )
     .await;
 
@@ -274,7 +282,11 @@ async fn websocket_fallback_surfaces_every_websocket_retry_stream_error() -> Res
         .await;
     let response_mock = mount_sse_once(
         &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "done over HTTP"),
+            ev_completed("resp-1"),
+        ]),
     )
     .await;
 
@@ -370,8 +382,16 @@ async fn websocket_fallback_is_sticky_across_turns() -> Result<()> {
     let response_mock = mount_sse_sequence(
         &server,
         vec![
-            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "first answer"),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-2", "second answer"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;

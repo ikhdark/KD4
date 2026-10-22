@@ -965,39 +965,15 @@ fn powershell_command_segments(script: &str) -> Option<Vec<&str>> {
     Some(segments)
 }
 
-/// Whether exit 1 can describe an empty search for the whole command.
-/// A statement sequence takes its exit status from the final statement, so a
-/// standalone final search classifies it; callers still require empty stderr.
-/// Pipelines, conditional chains, blocks and errexit scripts can surface an
-/// earlier command's silent exit 1 and are not classified.
+/// Only a proved standalone search owns the whole process status.
+/// A trailing search may never execute (exit, exec, throw, cancellation, etc.).
 pub fn ends_with_native_search(command: &str) -> bool {
-    if command.contains("&&") || command.contains("||") || command_sets_errexit(command) {
-        return false;
-    }
-    let Some(last) = powershell_command_segments(command).and_then(|segments| {
-        let last = segments
-            .into_iter()
-            .rev()
-            .find(|segment| !segment.trim().is_empty())?;
-        // Only `;` or a line break may introduce the final statement.
-        let offset = last.as_ptr() as usize - command.as_ptr() as usize;
-        let separated = command[..offset]
-            .trim_end_matches([' ', '\t'])
-            .chars()
-            .last()
-            .is_none_or(|separator| matches!(separator, ';' | '\n' | '\r'));
-        separated.then(|| last.trim())
-    }) else {
+    let Some(argv) = codex_shell_command::validation::standalone_argv(command) else {
         return false;
     };
-    if last.contains(['}', ')']) {
+    let Some(program) = argv.first() else {
         return false;
-    }
-    let program = last
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_matches(['"', '\'']);
+    };
     let program = program
         .rsplit(['/', '\\'])
         .next()
@@ -1007,22 +983,6 @@ pub fn ends_with_native_search(command: &str) -> bool {
         program.strip_suffix(".exe").unwrap_or(&program),
         "rg" | "grep" | "findstr"
     )
-}
-
-/// `set -e` stops a script at the first failing command with that command's
-/// status, so a silent earlier exit 1 would look like the final search's.
-fn command_sets_errexit(command: &str) -> bool {
-    command.contains("errexit")
-        || command
-            .split([';', '\n', '\r', '&', '|'])
-            .any(|statement| {
-                let mut words = statement.split_whitespace();
-                words.next() == Some("set")
-                    && words.any(|word| {
-                        word.strip_prefix('-')
-                            .is_some_and(|flags| !flags.starts_with('-') && flags.contains('e'))
-                    })
-            })
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1044,6 +1004,7 @@ fn critical_line(line: &str, trimmed: &str) -> bool {
             || starts_with_diagnostic_label_ascii_case(trimmed, "failure")
             || starts_with_diagnostic_label_ascii_case(trimmed, "panic")
             || starts_with_diagnostic_label_ascii_case(trimmed, "fatal")
+            || compiler_location_error(trimmed)
             || starts_with_ascii_case(trimmed, "fail [")
             || starts_with_ascii_case(trimmed, "--- fail:")
             || strip_prefix_ascii_case(trimmed, "try ").is_some_and(|retry| {
@@ -1095,6 +1056,47 @@ fn classify_line(line: &str) -> LineClassification {
             || starts_with_ascii_case(trimmed, "summary:")
             || starts_with_ascii_case(trimmed, "summary ["),
     }
+}
+
+fn compiler_location_error(line: &str) -> bool {
+    // Do not classify quoted source/prose merely because it contains an error
+    // spelling. Require a compiler-style location before the diagnostic label.
+    line.match_indices(": ").any(|(separator, _)| {
+        let location = line[..separator].trim();
+        let located = if let Some(location) = location.strip_suffix(')') {
+            location
+                .rsplit_once('(')
+                .is_some_and(|(path, coordinates)| {
+                    !path.is_empty()
+                        && !path.contains(['"', '\''])
+                        && !coordinates.is_empty()
+                        && coordinates.split(',').all(|part| {
+                            !part.trim().is_empty()
+                                && part.trim().bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                })
+        } else {
+            location.rsplit_once(':').is_some_and(|(path, number)| {
+                !path.is_empty()
+                    && !path.contains(['"', '\''])
+                    && !number.is_empty()
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        };
+        if !located {
+            return false;
+        }
+        let diagnostic = &line[separator + 2..];
+        starts_with_ascii_case(diagnostic, "fatal error:")
+            || strip_prefix_ascii_case(diagnostic, "fatal error ")
+                .or_else(|| strip_prefix_ascii_case(diagnostic, "error "))
+                .and_then(|coded| coded.split_once(':'))
+                .is_some_and(|(code, _)| {
+                    code.strip_prefix('C').is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
+    })
 }
 
 fn diagnostic_line_start(line: &str) -> &str {

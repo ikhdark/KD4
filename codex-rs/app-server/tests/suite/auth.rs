@@ -3,6 +3,7 @@ use app_test_support::ChatGptAuthFixture;
 use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_chatgpt_auth;
+use app_test_support::write_rotated_chatgpt_auth;
 use chrono::Duration;
 use chrono::Utc;
 use codex_app_server_protocol::Account;
@@ -301,7 +302,6 @@ async fn get_auth_status_with_api_key_when_auth_not_required() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_auth_status_omits_token_after_permanent_refresh_failure() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -518,7 +518,10 @@ async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Res
         }
     );
 
-    write_chatgpt_auth(
+    // `refresh_token_reused` means another process already refreshed this
+    // login; recovery is that process rotating tokens within the same login
+    // lifecycle, not a replacement login that fences in-flight auth reads.
+    write_rotated_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("recovered-access-token")
             .refresh_token("recovered-refresh-token")
@@ -526,7 +529,6 @@ async fn get_auth_status_returns_token_after_proactive_refresh_recovery() -> Res
             .email("user@example.com")
             .plan_type("pro")
             .last_refresh(Some(Utc::now())),
-        AuthCredentialsStoreMode::File,
     )?;
 
     let recovered_request_id = mcp

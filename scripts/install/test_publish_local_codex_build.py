@@ -25,15 +25,22 @@ FRESH_SOURCE_TIME = FIXTURE_TIME + 10_000
 
 
 class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
-    def test_build_failure_restores_environment_and_removes_temporary_config(self) -> None:
+    def test_build_failure_restores_environment_and_removes_temporary_config(
+        self,
+    ) -> None:
         # Failure before Cargo is just as much a scoped build as Cargo failure:
         # imported callers must retain their cwd/environment and no temp config.
         for boundary in (
-            "Assert-RustyV8ArchiveReadyForPublish", "Enable-BuildMetadataForPublish",
-            "Enable-SccacheForPublish", "Set-CodexRustMsvcLinkerEnvironment",
+            "Assert-RustyV8ArchiveReadyForPublish",
+            "Enable-BuildMetadataForPublish",
+            "Enable-SccacheForPublish",
+            "Set-CodexRustMsvcLinkerEnvironment",
             "Invoke-CargoForPublish",
         ):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 root = Path(directory)
                 env = clean_env()
                 env.update(TEMP=str(root), TMP=str(root))
@@ -53,9 +60,13 @@ try {{
 @{{ before = $before; after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 'Process') }}); cwdBefore = $cwd; cwdAfter = (Get-Location).Path }} | ConvertTo-Json -Compress
 """
                 result = subprocess.run(
-                    [self.shell, "-NoProfile", "-Command", command], env=env,
-                    capture_output=True, text=True, check=False,
-                    timeout=RUN_TIMEOUT_SECONDS, creationflags=CREATE_NO_WINDOW,
+                    [self.shell, "-NoProfile", "-Command", command],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=RUN_TIMEOUT_SECONDS,
+                    creationflags=CREATE_NO_WINDOW,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 state = json.loads(result.stdout.splitlines()[-1])
@@ -159,8 +170,14 @@ try {{
             for relative, expected in (
                 ("codex.exe", self.source_exe_bytes),
                 ("codex-code-mode-host.exe", self.source_code_mode_host_bytes),
-                ("codex-resources/codex-windows-sandbox-setup.exe", self.source_windows_sandbox_setup_bytes),
-                ("codex-resources/codex-command-runner.exe", self.source_command_runner_bytes),
+                (
+                    "codex-resources/codex-windows-sandbox-setup.exe",
+                    self.source_windows_sandbox_setup_bytes,
+                ),
+                (
+                    "codex-resources/codex-command-runner.exe",
+                    self.source_command_runner_bytes,
+                ),
             ):
                 self.assertEqual((install_dir / relative).read_bytes(), expected)
             self.assertIn("cargoTargetDirEnv=", result.stdout)
@@ -258,15 +275,23 @@ try {{
             self.assertEqual(metadata["profile"], "local-release")
             self.assertRegex(metadata["sourceFingerprint"], r"\A[0-9a-f]{64}\Z")
             for key, artifact in zip(
-                ("codexSha256", "codeModeHostSha256",
-                 "windowsSandboxSetupSha256", "commandRunnerSha256"),
+                (
+                    "codexSha256",
+                    "codeModeHostSha256",
+                    "windowsSandboxSetupSha256",
+                    "commandRunnerSha256",
+                ),
                 self.built_artifact_paths(),
                 strict=True,
             ):
-                self.assertEqual(metadata[key], hashlib.sha256(artifact.read_bytes()).hexdigest())
+                self.assertEqual(
+                    metadata[key], hashlib.sha256(artifact.read_bytes()).hexdigest()
+                )
             self.assertIn("action: build-only", result.stdout)
             self.assertIn("buildOnly: true", result.stdout)
-            self.assert_proof_value(result.stdout, "builtCodexPath", str(self.built_artifact_paths()[0]))
+            self.assert_proof_value(
+                result.stdout, "builtCodexPath", str(self.built_artifact_paths()[0])
+            )
             self.assert_proof_value(result.stdout, "buildStampPath", str(stamp))
             self.assertIn("fake cargo build --target-dir ", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
@@ -746,11 +771,17 @@ try {{
                 result.stdout,
             )
             for name in (
-                "rustcWrapperEnv", "cargoBuildRustcWrapperEnv",
-                "workspaceWrapperEnv", "cargoWorkspaceWrapperEnv",
+                "rustcWrapperEnv",
+                "cargoBuildRustcWrapperEnv",
+                "workspaceWrapperEnv",
+                "cargoWorkspaceWrapperEnv",
             ):
                 self.assertEqual(
-                    [line for line in result.stdout.splitlines() if line.startswith(name + "=")],
+                    [
+                        line
+                        for line in result.stdout.splitlines()
+                        if line.startswith(name + "=")
+                    ],
                     [name + "="],
                 )
             self.assertIn("fake cargo --config ", result.stdout)
@@ -987,7 +1018,9 @@ $after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 
                 FIXTURE_TIME,
             )
             epoch_result = self.run_script(
-                "-NoSccache", "-InstallDir", str(install_dir),
+                "-NoSccache",
+                "-InstallDir",
+                str(install_dir),
                 env={**env, "SOURCE_DATE_EPOCH": "123456789"},
             )
             self.assertEqual(
@@ -1027,13 +1060,20 @@ $after = @($names | ForEach-Object {{ [Environment]::GetEnvironmentVariable($_, 
             source_arguments = (
                 ("-SourceExe", str(foreign_codex)),
                 ("-SourceCodeModeHostExe", str(self.source_code_mode_host)),
-                ("-SourceWindowsSandboxSetupExe", str(self.source_windows_sandbox_setup)),
+                (
+                    "-SourceWindowsSandboxSetupExe",
+                    str(self.source_windows_sandbox_setup),
+                ),
                 ("-SourceCommandRunnerExe", str(self.source_command_runner)),
             )
             for mode, explicit_sources in (
                 (mode, sources)
                 for mode in (
-                    (), ("-AutoSkipBuild",), ("-BuildOnly",), ("-TestRun",), ("-DryRun",),
+                    (),
+                    ("-AutoSkipBuild",),
+                    ("-BuildOnly",),
+                    ("-TestRun",),
+                    ("-DryRun",),
                 )
                 for sources in (
                     tuple(arg for pair in source_arguments for arg in pair),

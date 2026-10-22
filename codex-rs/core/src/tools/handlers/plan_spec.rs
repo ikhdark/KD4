@@ -4,6 +4,84 @@ use codex_tools::ToolSpec;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+fn acceptance_schema() -> JsonSchema {
+    let reference = || {
+        JsonSchema::object(
+            BTreeMap::from([
+                ("turn_id".into(), JsonSchema::string(None)),
+                ("sha256".into(), JsonSchema::string(None)),
+            ]),
+            Some(vec!["turn_id".into(), "sha256".into()]),
+            Some(false.into()),
+        )
+    };
+    let requirement = |kind: &str, fields: Vec<(&str, JsonSchema)>| {
+        let mut properties = BTreeMap::from([(
+            "kind".into(),
+            JsonSchema::string_enum(vec![json!(kind)], None),
+        )]);
+        let mut required = vec!["kind".into()];
+        for (name, schema) in fields {
+            required.push(name.into());
+            properties.insert(name.into(), schema);
+        }
+        JsonSchema::object(properties, Some(required), Some(false.into()))
+    };
+    let proof = JsonSchema {
+        one_of: Some(vec![
+            requirement(
+                "inspection",
+                vec![
+                    ("environment_id", JsonSchema::string(None)),
+                    ("path", JsonSchema::string(None)),
+                    (
+                        "start",
+                        JsonSchema {
+                            minimum: Some(0.into()),
+                            ..JsonSchema::integer(None)
+                        },
+                    ),
+                    (
+                        "end",
+                        JsonSchema {
+                            minimum: Some(1.into()),
+                            ..JsonSchema::integer(None)
+                        },
+                    ),
+                ],
+            ),
+            requirement(
+                "validation",
+                vec![
+                    ("environment_id", JsonSchema::string(None)),
+                    ("path", JsonSchema::string(None)),
+                    ("test_execution", JsonSchema::boolean(None)),
+                ],
+            ),
+            requirement(
+                "assignment",
+                vec![
+                    ("assignment_id", JsonSchema::string(None)),
+                    ("attempt_id", JsonSchema::string(None)),
+                ],
+            ),
+        ]),
+        ..Default::default()
+    };
+    JsonSchema {
+        description: Some("Independent declared acceptance IDs (maximum 128), not checklist statuses. Incremental: omitted criteria persist. Text, origin and proof kind are immutable; evidence_ref must name current task-state acceptance_evidence. Inspection ranges are byte offsets. Assignment criteria are mandatory and require current typed receipt, gates and parent integration; optional children need no criterion. Retire only with retired_by accepted input and retirement_reason. Declare every required artifact/consumer explicitly: this finite contract cannot certify omitted scope or semantic correctness. Never introduce unauthorized tests.".into()),
+        ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::object(BTreeMap::from([
+            ("text".into(), JsonSchema::string(None)),
+            ("origin".into(), reference()),
+            ("requirement".into(), proof),
+            ("evidence_ref".into(), JsonSchema::string(None)),
+            ("blocker".into(), JsonSchema::string(Some("Concrete external dependency; do not use a truthful partial report to abandon obtainable work.".into()))),
+            ("retired_by".into(), reference()),
+            ("retirement_reason".into(), JsonSchema::string(None)),
+        ]), Some(vec!["text".into(), "origin".into(), "requirement".into()]), Some(false.into())).into()))
+    }
+}
+
 pub fn create_update_plan_tool() -> ToolSpec {
     let item_properties = || {
         BTreeMap::from([
@@ -79,7 +157,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
     status_updates.min_items = Some(1);
     ToolSpec::Function(ResponsesApiTool {
         name: "update_plan".to_string(),
-        description: "Updates the task checklist for work with multiple substantive dependent steps. Skip plans for straightforward or read-only work; do not create single-step plans. At most one step can be in_progress at a time. Send a status update in the same cell as the work it reports, never as a cell of its own."
+        description: "Updates the task checklist for work with multiple substantive dependent steps. Skip plans for straightforward work; use plans for complex tasks, including read-only audits, when dependencies or coverage require tracking. Do not create single-step plans. At most one step can be in_progress at a time. Send a status update in the same cell as the work it reports, never as a cell of its own."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -116,8 +194,15 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::string(None).into()))
                 }),
                 ("superseded".to_string(), superseded),
+                ("scope_change_reviewed_revision".to_string(), JsonSchema::string(Some(
+                    "Current task-state scope_input_revision. Required when citing an earlier accepted input: explicitly reconcile every later instruction, including contradictions, before using it. This records interpretation, not host semantic approval.".into()
+                ))),
+                ("acceptance".to_string(), acceptance_schema()),
+                ("acceptance_reviewed_revision".to_string(), JsonSchema::string(Some(
+                    "Current scope_input_revision against which the independent acceptance criteria were reconciled. Required with acceptance updates; later input invalidates scoped acceptance until reviewed.".into()
+                ))),
                 ("scope_change_refs".to_string(), JsonSchema {
-                    description: Some("Superseded step/orphan ID to an accepted_input_refs entry from current task state. Alternative to copying scope_change_instructions; identical user provenance checks apply. A reference establishes source identity, not semantic authorization. Conflicting text and reference sources are rejected.".into()),
+                    description: Some("Superseded step/orphan ID to an accepted_input_refs entry from current task state. References include authenticated explicit request_user_input answers bound to their full question/options, session, turn and call; use the host-provided reference, not a hash of the answer label. Interrupted, empty, timed-out, skipped, legacy-disposition or transport-error replies do not mint decision references. Alternative to copying scope_change_instructions for raw user text; identical user provenance checks apply. A reference establishes source identity, not semantic authorization. Conflicting text and reference sources are rejected.".into()),
                     ..JsonSchema::object(BTreeMap::new(), None, Some(JsonSchema::object(
                         BTreeMap::from([
                             ("turn_id".into(), JsonSchema::string(None)),
@@ -162,6 +247,8 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     "description": "Persistent original requirements, independent of checklist wording; supersession records survive subsequent updates and resume. Printed results show only message, effect, no_progress, revision and obligations; the task-state context carries the stored plan, step IDs and this lineage.",
                     "properties": {
                         "resolved_requirements": { "type": "array", "items": { "type": "string" } },
+                        "acceptance": acceptance_schema(),
+                        "acceptance_reviewed_revision": { "type": "string" },
                         "step_revisions": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
                         "accepted_supersessions": { "type": "object", "additionalProperties": {
                             "type": "object", "properties": { "turn_id": { "type": "string" }, "sha256": { "type": "string" } },

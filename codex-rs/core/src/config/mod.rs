@@ -147,11 +147,6 @@ pub(crate) mod agent_roles;
 mod auth_keyring;
 pub mod edit;
 mod managed_features;
-mod token_budget;
-mod token_budget_startup;
-pub use token_budget::TokenBudgetConfig;
-pub(crate) use token_budget::resolve_token_budget_config;
-pub use token_budget_startup::TokenBudgetStartupConfig;
 mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
@@ -981,8 +976,6 @@ pub struct Config {
 
     /// Current-time reminder and clock tool configuration, when enabled.
     pub current_time_reminder: Option<CurrentTimeReminderConfig>,
-    pub token_budget: Option<TokenBudgetConfig>,
-    pub token_budget_startup_config: Option<TokenBudgetStartupConfig>,
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
@@ -1204,8 +1197,16 @@ impl ConfigBuilder {
     }
 
     pub async fn build(self) -> std::io::Result<Config> {
+        let loader = self.cloud_config_bundle.clone();
+        let generation = loader.candidate_generation();
         // Keep the large config-loading future off small runtime thread stacks.
-        Box::pin(self.build_inner()).await
+        let result = Box::pin(self.build_inner()).await;
+        if result.is_err() {
+            loader.reject_candidate(generation);
+        }
+        loader
+            .publish_if_current(|| result)
+            .map_err(std::io::Error::other)?
     }
 
     async fn build_inner(self) -> std::io::Result<Config> {
@@ -1745,6 +1746,17 @@ fn load_catalog_json(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse> 
             ),
         ));
     }
+    for model in &catalog.models {
+        model.validate_capabilities().map_err(|err| {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "invalid model_catalog_json path `{}`: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+    }
     Ok(catalog)
 }
 
@@ -1992,6 +2004,31 @@ pub struct AgentRoleConfig {
     pub config_file: Option<PathBuf>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+    /// One immutable file observation per configuration generation, shared by guidance and dispatch.
+    #[doc(hidden)]
+    pub config_snapshot: Arc<std::sync::OnceLock<(PathBuf, Result<String, String>)>>,
+}
+
+impl AgentRoleConfig {
+    pub(crate) fn config_file_contents(&self) -> Result<&str, String> {
+        let path = self.config_file.as_ref().ok_or("role has no config file")?;
+        let (snapshot_path, contents) = self.config_snapshot.get_or_init(|| {
+            (
+                path.clone(),
+                std::fs::read_to_string(path).map_err(|error| error.to_string()),
+            )
+        });
+        if path != snapshot_path {
+            return Err("role file path changed without a new configuration generation".into());
+        }
+        contents.as_deref().map_err(Clone::clone)
+    }
+
+    pub(crate) fn capture_config_file_contents(&self, contents: String) {
+        if let Some(path) = self.config_file.as_ref() {
+            let _ = self.config_snapshot.set((path.clone(), Ok(contents)));
+        }
+    }
 }
 
 fn resolve_tool_suggest_config(
@@ -3136,7 +3173,6 @@ impl Config {
         let code_mode = resolve_code_mode_config(&cfg);
         let multi_agent_v2 = resolve_multi_agent_v2_config(&cfg);
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
-        let token_budget = resolve_token_budget_config(&cfg, &features)?;
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
@@ -3166,6 +3202,14 @@ impl Config {
                 std::io::Error::new(std::io::ErrorKind::NotFound, message)
             })?
             .clone();
+
+        if cfg.web_search.is_some_and(|mode| mode != WebSearchMode::Disabled)
+            && !model_provider.supports_hosted_web_search
+        {
+            startup_warnings.push(format!(
+                "Provider `{model_provider_id}` does not support hosted web search. Search requires a registered standalone web tool; compatible custom providers can opt in with model_providers.{model_provider_id}.supports_hosted_web_search = true."
+            ));
+        }
 
         let shell_environment_policy = cfg.shell_environment_policy.into();
         let allow_login_shell = cfg.allow_login_shell.unwrap_or(true);
@@ -3614,8 +3658,6 @@ impl Config {
             background_terminal_max_timeout,
             multi_agent_v2,
             current_time_reminder,
-            token_budget,
-            token_budget_startup_config: None,
             features,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning

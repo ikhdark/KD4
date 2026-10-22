@@ -69,18 +69,34 @@ class Report26ValidationRegressions(unittest.TestCase):
         from scripts.build.build_tooling_test_support import load_format_module
 
         for module in (schema, config_schema_check):
+
             def bounded(args, **kwargs):
                 return process_owner.run_finite(args, timeout=0.2, **kwargs)
 
-            with mock.patch.object(module, "run_finite", side_effect=bounded), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as diagnostic:
-                self.assertEqual(module.run([sys.executable, "-c", "import time; time.sleep(60)"], cwd=Path.cwd()), 124)
+            with (
+                mock.patch.object(module, "run_finite", side_effect=bounded),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as diagnostic,
+            ):
+                self.assertEqual(
+                    module.run(
+                        [sys.executable, "-c", "import time; time.sleep(60)"],
+                        cwd=Path.cwd(),
+                    ),
+                    124,
+                )
             self.assertIn("timed_out", diagnostic.getvalue())
         formatter = load_format_module()
-        command = formatter.Command((sys.executable, "-c", "import sys; sys.stdout.write('x'*2097152+'END')"))
-        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            formatter.tempfile, "gettempdir", return_value=directory
+        command = formatter.Command(
+            (sys.executable, "-c", "import sys; sys.stdout.write('x'*2097152+'END')")
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(formatter.tempfile, "gettempdir", return_value=directory),
         ):
-            result = formatter.run_formatter_group(formatter.FormatterGroup("noisy", (command,)))
+            result = formatter.run_formatter_group(
+                formatter.FormatterGroup("noisy", (command,))
+            )
             [retained] = list(Path(directory).glob("codex-formatter-*.log"))
             self.assertIn(f"Full formatter log: {retained}", result.output)
             self.assertEqual(retained.read_bytes(), b"x" * 2097152 + b"END")
@@ -273,7 +289,9 @@ class ScriptReportRegressions(unittest.TestCase):
         for path, case in cases.items():
             with (
                 self.subTest(path=path),
-                mock.patch.object(root_maintenance, "run_python_tests", return_value=0) as run,
+                mock.patch.object(
+                    root_maintenance, "run_python_tests", return_value=0
+                ) as run,
             ):
                 self.assertEqual(
                     root_maintenance.main(["test-python", "--changed", path]), 0
@@ -294,18 +312,20 @@ class ScriptReportRegressions(unittest.TestCase):
                 suite = loader.loadTestsFromName(selector)
                 self.assertEqual(loader.errors, [])
                 self.assertEqual(suite.countTestCases(), 1)
-        # A module requested through another changed owner subsumes its cases.
+        # A module requested through another changed owner must not suppress
+        # its explicit case selectors: a load_tests hook may omit them. Each
+        # selector is passed once; the JSON worker coalesces loaded overlap.
         selected = root_maintenance.python_test_targets(
             [prefix], list(cases) + ["scripts/common/process_owner.py"]
         )
         self.assertIn(prefix, selected)
-        self.assertFalse(any(target.startswith(prefix + ".") for target in selected))
+        for case in cases.values():
+            self.assertEqual(selected.count(f"{prefix}.{case}"), 1)
         cls = prefix + ".ScriptReportRegressions"
+        child = cls + ".test_recent_overflow_survives_expired_base"
         self.assertEqual(
-            root_maintenance.python_test_targets(
-                [cls, cls + ".test_recent_overflow_survives_expired_base"], []
-            ),
-            [cls],
+            root_maintenance.python_test_targets([child, cls, child], []),
+            [cls, child],
         )
 
     def test_recent_overflow_survives_expired_base(self):
@@ -443,7 +463,9 @@ class ScriptReportRegressions(unittest.TestCase):
             self.assertIn("quarantine", marker.read_text())
 
     def test_owner_cli_stops_the_tree_when_its_parent_exits(self):
-        parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+        parent = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(0.3)"]
+        )
         try:
             started = time.monotonic()
             code = process_owner.main(
@@ -509,8 +531,6 @@ class ScriptReportRegressions(unittest.TestCase):
             self.assertIsNotNone(processes[0].poll(), "cancelled sibling kept running")
             self.assertNotEqual(processes[0].returncode, 0)
 
-
-
     def test_npm_cancellation_restores_all_outputs_and_clears_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -556,7 +576,11 @@ class ScriptReportRegressions(unittest.TestCase):
     def test_activation_rollback_retains_old_outputs_without_copying(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            package, archive, checksum = root / "package", root / "archive.zip", root / "checksum"
+            package, archive, checksum = (
+                root / "package",
+                root / "archive.zip",
+                root / "checksum",
+            )
             package.mkdir()
             (package / "old").write_bytes(b"old")
             archive.write_bytes(b"old archive")
@@ -628,7 +652,9 @@ class ScriptReportRegressions(unittest.TestCase):
 
     def test_nextest_progress_counter_and_binary_identity(self):
         from scripts.build.test_rust_test_runner import (
-            MANIFEST_DATA, METADATA_PACKAGES, nextest_run_payload,
+            MANIFEST_DATA,
+            METADATA_PACKAGES,
+            nextest_run_payload,
         )
         from scripts.build.rust_test_runner import (
             Manifest,
@@ -652,7 +678,8 @@ class ScriptReportRegressions(unittest.TestCase):
             )
             for binary in ("codex-core", "wrong-package"):
                 result = subprocess.CompletedProcess(
-                    [], 0,
+                    [],
+                    0,
                     nextest_run_payload([("proof", "ok")], package=binary),
                     "PASS [ 0.1s] (1/1) codex-core proof\n",
                 )

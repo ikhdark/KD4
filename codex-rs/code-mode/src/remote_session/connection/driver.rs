@@ -89,17 +89,25 @@ impl ConnectionDriver {
 
     pub(super) async fn run(mut self) {
         enum Ready {
+            ControlTimeout,
             Event(Option<DriverEvent>),
             Claim(Option<RequestId>),
             Command(Option<DriverCommand>),
         }
         loop {
+            let deadline = self.requests.next_control_deadline();
             let ready = tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => {
                     self.fail("code-mode host connection closed".to_string());
                     return;
                 }
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => Ready::ControlTimeout,
                 ready = async {
                     // Cancellation stays first; traffic channels share the
                     // default fair selector rather than event-first priority.
@@ -111,6 +119,10 @@ impl ConnectionDriver {
                 } => ready,
             };
             match ready {
+                Ready::ControlTimeout => {
+                    self.fail("code-mode destructive cleanup acknowledgement timed out; external effects are unknown; do not replay work".to_string());
+                    return;
+                }
                 Ready::Event(event) => {
                     let Some(event) = event else {
                         self.fail("code-mode host event stream closed".to_string());

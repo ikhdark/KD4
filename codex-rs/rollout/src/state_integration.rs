@@ -132,6 +132,7 @@ async fn try_init_with_roots_inner(
                     sqlite_home.display()
                 )
             })?;
+    let mut backfill_memo = metadata::BackfillMemo::default();
     let backfill_gate_started = Instant::now();
     let backfill_gate_result = wait_for_backfill_gate_with_timeout(
         codex_home.as_path(),
@@ -143,6 +144,7 @@ async fn try_init_with_roots_inner(
             backfill_lease_seconds,
             wait_timeout,
             poll_interval,
+            &mut backfill_memo,
         ),
     )
     .await;
@@ -155,7 +157,50 @@ async fn try_init_with_roots_inner(
         runtime.close().await;
         return Err(err);
     }
+    let weak = std::sync::Arc::downgrade(&runtime);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let Some(runtime) = weak.upgrade() else {
+                break;
+            };
+            refresh_backfill_once(
+                &runtime,
+                &codex_home,
+                &default_model_provider_id,
+                &mut backfill_memo,
+            )
+            .await;
+        }
+    });
     Ok(runtime)
+}
+
+/// One periodic reconciliation pass: reopen coverage completed at least one
+/// interval ago, then reconcile within a bound. `memo` holds this runtime's
+/// earlier outcomes, so only rollouts whose inputs changed are read again.
+async fn refresh_backfill_once(
+    runtime: &codex_state::StateRuntime,
+    codex_home: &Path,
+    default_model_provider_id: &str,
+    memo: &mut metadata::BackfillMemo,
+) -> Option<metadata::BackfillPassReport> {
+    if let Err(error) = runtime.request_backfill_refresh(60).await {
+        warn!(%error, "rollout metadata reconciliation remains pending");
+        return None;
+    }
+    let stop_at = tokio::time::Instant::now() + Duration::from_secs(20);
+    Some(
+        metadata::backfill_sessions_until(
+            runtime,
+            codex_home,
+            default_model_provider_id,
+            metadata::BACKFILL_LEASE_SECONDS,
+            memo,
+            || tokio::time::Instant::now() >= stop_at,
+        )
+        .await,
+    )
 }
 
 async fn wait_for_backfill_gate_with_timeout(
@@ -180,6 +225,7 @@ async fn wait_for_backfill_gate(
     backfill_lease_seconds: Option<i64>,
     wait_timeout: Duration,
     poll_interval: Duration,
+    memo: &mut metadata::BackfillMemo,
 ) -> anyhow::Result<()> {
     // Stop this startup's own backfill before the outer bound cancels it, leaving time to
     // checkpoint and release the claim. A cancelled claim would make every later startup
@@ -188,6 +234,7 @@ async fn wait_for_backfill_gate(
         tokio::time::Instant::now() + wait_timeout.saturating_sub(wait_timeout / 6);
     let backfill_lease_seconds = backfill_lease_seconds.unwrap_or(metadata::BACKFILL_LEASE_SECONDS);
     let mut reported_wait = false;
+    let mut confirming_gaps = false;
     loop {
         let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
             anyhow::anyhow!(
@@ -195,7 +242,7 @@ async fn wait_for_backfill_gate(
                 codex_home.display()
             )
         })?;
-        if backfill_state.status == codex_state::BackfillStatus::Complete {
+        if backfill_coverage_certified(&backfill_state) {
             return Ok(());
         }
 
@@ -204,6 +251,7 @@ async fn wait_for_backfill_gate(
             codex_home,
             default_model_provider_id,
             backfill_lease_seconds,
+            memo,
             || tokio::time::Instant::now() >= backfill_stop_at,
         )
         .await;
@@ -217,6 +265,27 @@ async fn wait_for_backfill_gate(
             return Ok(());
         }
         if backfill_state.status == codex_state::BackfillStatus::Pending {
+            // Serving is separate from certification. When the only unsettled rollouts
+            // are payload gaps a reread at unchanged versions confirmed, serve the rows
+            // indexed so far. Coverage stays uncertified and each gap keeps the
+            // checkpoint before it, so a later repair is still reconciled.
+            match memo.last_pass_remainder() {
+                Some(metadata::PassRemainder::ConfirmedPayloadGaps(gaps)) => {
+                    warn!(
+                        "state db at {} serves with {gaps} rollouts whose payload artifacts are missing; backfill coverage remains pending",
+                        codex_home.display(),
+                    );
+                    return Ok(());
+                }
+                // A gap read once may be a transient payload read failure. One more
+                // pass stamps the payloads it names and reads it again, reusing every
+                // rollout this pass settled.
+                Some(metadata::PassRemainder::UnconfirmedPayloadGaps) if !confirming_gaps => {
+                    confirming_gaps = true;
+                    continue;
+                }
+                _ => {}
+            }
             return Err(anyhow::anyhow!(
                 "state db backfill remains incomplete at {}; falling back until a later startup retry",
                 codex_home.display(),
@@ -289,12 +358,19 @@ pub fn sqlite_telemetry_recorder(
     sqlite_metrics::recorder(metrics, originator)
 }
 
+/// Coverage certified once stays usable. The periodic refresh and the identity
+/// migration reopen reconciliation without invalidating indexed rows, and readers
+/// fall back to rollout headers for fields a later pass has not filled yet.
+fn backfill_coverage_certified(state: &codex_state::BackfillState) -> bool {
+    state.status == codex_state::BackfillStatus::Complete || state.last_success_at.is_some()
+}
+
 async fn require_backfill_complete(
     runtime: StateDbHandle,
     codex_home: &Path,
 ) -> Option<StateDbHandle> {
     match runtime.get_backfill_state().await {
-        Ok(state) if state.status == codex_state::BackfillStatus::Complete => Some(runtime),
+        Ok(state) if backfill_coverage_certified(&state) => Some(runtime),
         Ok(state) => {
             warn!(
                 "state db backfill not complete at {} (status: {})",
@@ -462,6 +538,16 @@ pub async fn list_threads_db(
                     let existing_path =
                         crate::compression::existing_rollout_path(item.rollout_path.as_path())
                             .await;
+                    let existing_path = match existing_path {
+                        Some(path)
+                            if crate::list::read_session_meta_line(&path)
+                                .await
+                                .is_ok_and(|header| header.meta.id != item.id) =>
+                        {
+                            None
+                        }
+                        other => other,
+                    };
                     (item, existing_path)
                 })
                 .buffered(MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS);
@@ -474,20 +560,31 @@ pub async fn list_threads_db(
                     // without the state row following it. Repair only a verified
                     // file; absence is not permission to delete thread metadata.
                     let id = item.id.to_string();
-                    let active = crate::list::find_thread_path_by_id_str(codex_home, &id, None)
-                        .await;
+                    let active =
+                        crate::list::find_thread_path_by_id_str(codex_home, &id, None).await;
                     let relocated = match active {
                         Ok(Some(path)) => Some((path, false)),
-                        Ok(None) => crate::list::find_archived_thread_path_by_id_str(
-                            codex_home, &id, None,
-                        ).await.ok().flatten().map(|path| (path, true)),
+                        Ok(None) => {
+                            crate::list::find_archived_thread_path_by_id_str(codex_home, &id, None)
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|path| (path, true))
+                        }
                         Err(_) => None,
                     };
                     if let Some((path, is_archived)) = relocated
-                        && crate::list::read_session_meta_line(&path).await
+                        && crate::list::read_session_meta_line(&path)
+                            .await
                             .is_ok_and(|meta| meta.meta.id == item.id)
                     {
-                        read_repair_rollout_path(Some(ctx), Some(item.id), Some(is_archived), &path).await;
+                        read_repair_rollout_path(
+                            Some(ctx),
+                            Some(item.id),
+                            Some(is_archived),
+                            &path,
+                        )
+                        .await;
                         if is_archived == archived {
                             item.rollout_path = path;
                             valid_items.push(item);
@@ -552,6 +649,12 @@ pub async fn reconcile_rollout(
         )
         .await;
     }
+    let (Ok(expected), Ok(source_version)) = (
+        metadata::expected_thread_metadata_for_rollout(ctx, rollout_path).await,
+        metadata::rollout_source_version(rollout_path).await,
+    ) else {
+        return false;
+    };
     let outcome =
         match metadata::extract_metadata_from_rollout(rollout_path, default_provider).await {
             Ok(outcome) => outcome,
@@ -579,16 +682,38 @@ pub async fn reconcile_rollout(
         }
         Some(true) | None => {}
     }
-    if let Err(err) = ctx.upsert_thread_preserving_timestamps(&metadata).await {
+    if let Err(err) = ctx
+        .reconcile_thread_metadata(&metadata, expected.as_ref(), &source_version)
+        .await
+    {
         warn!(
             "state db reconcile_rollout upsert failed {}: {err}",
             rollout_path.display()
         );
         return false;
     }
+    if let Err(error) = ctx
+        .patch_existing_thread_metadata(metadata.id, |current| {
+            if !rollout_path.exists() && !rollout_path.with_extension("jsonl.zst").exists() {
+                return;
+            }
+            current.rollout_path = rollout_path.to_path_buf();
+            match archived_only {
+                Some(true) if current.archived_at.is_none() => {
+                    current.archived_at = Some(metadata.updated_at)
+                }
+                Some(false) => current.archived_at = None,
+                _ => {}
+            }
+        })
+        .await
+    {
+        warn!(%error, "rollout location reconciliation remains pending");
+        return false;
+    }
     if let Some(parent_thread_id) = parent_thread_id
         && let Err(err) = ctx
-            .insert_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
+            .infer_thread_spawn_edge_if_absent(parent_thread_id, metadata.id)
             .await
     {
         warn!(
@@ -634,7 +759,23 @@ pub async fn read_repair_rollout_path(
             return;
         }
         warn!("state db discrepancy during read_repair_rollout_path: upsert_needed (fast path)");
-        if let Err(err) = ctx.upsert_thread_preserving_timestamps(&repaired).await {
+        if let Err(err) = ctx
+            .patch_existing_thread_metadata(thread_id, |current| {
+                if !rollout_path.exists() && !rollout_path.with_extension("jsonl.zst").exists() {
+                    return;
+                }
+                current.rollout_path = rollout_path.to_path_buf();
+                current.cwd = normalize_cwd_for_state_db(&current.cwd);
+                match archived_only {
+                    Some(true) if current.archived_at.is_none() => {
+                        current.archived_at = Some(current.updated_at)
+                    }
+                    Some(false) => current.archived_at = None,
+                    _ => {}
+                }
+            })
+            .await
+        {
             warn!(
                 "state db read-repair upsert failed for {}: {err}",
                 rollout_path.display()

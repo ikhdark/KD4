@@ -1398,8 +1398,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn render_human_report_snapshot_covers_environment_rows() {
         insta::assert_snapshot!(
@@ -1540,8 +1538,6 @@ Run codex doctor without --summary for detailed diagnostics.
         );
         assert_eq!(rendered, expected);
     }
-
-
 
     #[test]
     fn render_human_report_explains_terminal_warning_issue() {
@@ -1719,25 +1715,31 @@ Run codex doctor without --summary for detailed diagnostics.
     #[test]
     fn redact_detail_removes_secrets_and_preserves_presence_information() {
         for (input, expected) in [
-            ("reachability failed: https://user:pass@example.com/mcp?x=abc#frag (connect failed)",
-             "reachability failed: https://example.com/mcp (connect failed)"),
-            ("reachability failed: https://example.com/mcp/abc123xyz",
-             "reachability failed: https://example.com/mcp/<redacted>"),
-            ("auth env vars present: OPENAI_API_KEY, CODEX_API_KEY",
-             "auth env vars present: OPENAI_API_KEY, CODEX_API_KEY"),
+            (
+                "reachability failed: https://user:pass@example.com/mcp?x=abc#frag (connect failed)",
+                "reachability failed: https://example.com/mcp (connect failed)",
+            ),
+            (
+                "reachability failed: https://example.com/mcp/abc123xyz",
+                "reachability failed: https://example.com/mcp/<redacted>",
+            ),
+            (
+                "auth env vars present: OPENAI_API_KEY, CODEX_API_KEY",
+                "auth env vars present: OPENAI_API_KEY, CODEX_API_KEY",
+            ),
             ("stored ChatGPT tokens: true", "stored ChatGPT tokens: true"),
-            ("stored ChatGPT tokens: false", "stored ChatGPT tokens: false"),
-            ("stored ChatGPT tokens: sensitive-token", "stored ChatGPT tokens: <redacted>"),
+            (
+                "stored ChatGPT tokens: false",
+                "stored ChatGPT tokens: false",
+            ),
+            (
+                "stored ChatGPT tokens: sensitive-token",
+                "stored ChatGPT tokens: <redacted>",
+            ),
         ] {
             assert_eq!(redact_detail(input), expected, "{input}");
         }
     }
-
-
-
-
-
-
 
     #[test]
     fn render_human_report_can_emit_color() {

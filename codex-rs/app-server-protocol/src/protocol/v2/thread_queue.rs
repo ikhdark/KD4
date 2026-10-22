@@ -32,6 +32,39 @@ pub struct ThreadQueueListParams {
 pub struct ThreadQueueListResponse {
     pub data: Vec<QueuedSubmission>,
     pub next_cursor: Option<String>,
+    /// Absent on older peers, not proof that no submission was accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub snapshot: Option<ThreadQueueSnapshot>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadQueueSnapshot {
+    #[ts(type = "number")]
+    pub revision: u64,
+    pub paused: bool,
+    pub pending_start: Option<ThreadQueuePendingStart>,
+    /// Bounded recent receipts. An absent ID is unknown/expired, never proof of
+    /// rejection or permission to resubmit potentially accepted input.
+    pub accepted_submissions: Vec<ThreadQueueAcceptedSubmission>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadQueuePendingStart {
+    pub queued_submission_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadQueueAcceptedSubmission {
+    pub queued_submission_id: String,
+    pub turn_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -116,6 +149,10 @@ pub struct ThreadQueueStartResponse {
 #[ts(export_to = "v2/")]
 pub struct ThreadQueueChangedNotification {
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "number")]
+    pub revision: Option<u64>,
 }
 
 #[cfg(test)]
@@ -127,7 +164,10 @@ mod tests {
     fn thread_queue_desktop_requests_round_trip() {
         let input = json!([{"type":"text", "text":"next task", "text_elements":[]}]);
         for (method, params) in [
-            ("list", json!({"threadId":"thread", "cursor":"page", "limit":7})),
+            (
+                "list",
+                json!({"threadId":"thread", "cursor":"page", "limit":7}),
+            ),
             (
                 "add",
                 json!({"threadId":"thread", "input":input, "clientUserMessageId":"client"}),
@@ -153,11 +193,14 @@ mod tests {
             let wire = json!({
                 "id":1, "method":method, "params":params,
             });
-            let request: ClientRequest = serde_json::from_value(wire.clone())
-                .expect("Desktop queue request");
+            let request: ClientRequest =
+                serde_json::from_value(wire.clone()).expect("Desktop queue request");
             let encoded = serde_json::to_value(&request).expect("encode queue request");
             assert_eq!(encoded, wire, "{method}");
-            assert_eq!(serde_json::from_value::<ClientRequest>(encoded).unwrap(), request);
+            assert_eq!(
+                serde_json::from_value::<ClientRequest>(encoded).unwrap(),
+                request
+            );
             assert!(matches!(request.serialization_scope(),
                 Some(crate::ClientRequestSerializationScope::Thread { thread_id }) if thread_id == "thread"));
         }

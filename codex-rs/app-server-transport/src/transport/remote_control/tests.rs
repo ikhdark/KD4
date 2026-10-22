@@ -88,6 +88,69 @@ fn remote_control_auth_manager() -> Arc<AuthManager> {
     auth_manager_from_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
 }
 
+#[tokio::test]
+async fn remote_policy_tracks_identity_and_cancels_pending_admission() {
+    let home = TempDir::new().unwrap();
+    let auth = remote_control_auth_manager_with_home(&home);
+    let (events, _receiver) = mpsc::channel(CHANNEL_CAPACITY);
+    let shutdown = CancellationToken::new();
+    let (task, handle) = start_remote_control(
+        RemoteControlStartConfig {
+            remote_control_url: TEST_REMOTE_CONTROL_URL.into(),
+            installation_id: TEST_INSTALLATION_ID.into(),
+            policy: RemoteControlPolicy::Allowed,
+            http_client_factory: codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+        },
+        None,
+        auth.clone(),
+        events,
+        shutdown.clone(),
+        None,
+        RemoteControlStartupMode::DisabledEphemeral,
+    )
+    .await
+    .unwrap();
+    let epoch = handle.policy_auth_epoch().unwrap();
+    assert!(handle.ensure_remote_control_allowed().is_ok());
+    handle
+        .desired_state_tx
+        .send_replace(RemoteControlDesiredState::Enabled {
+            persistence_preference: None,
+        });
+    handle.update_policy(epoch, RemoteControlPolicy::DisabledByRequirements);
+    assert!(!handle.desired_state_tx.borrow().is_enabled());
+    assert!(handle.ensure_remote_control_allowed().is_err());
+    handle.update_policy(epoch, RemoteControlPolicy::Allowed);
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let pending_handle = handle.clone();
+    let pending = tokio::spawn(async move {
+        pending_handle
+            .run_with_policy(async move {
+                let _ = entered_tx.send(());
+                std::future::pending::<io::Result<()>>().await
+            })
+            .await
+    });
+    entered_rx.await.unwrap();
+    auth.logout().await.unwrap();
+    handle.update_policy(epoch, RemoteControlPolicy::Allowed); // Retired authority cannot reauthorize.
+    assert!(handle.ensure_remote_control_allowed().is_err());
+    assert!(
+        timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    let current_epoch = handle.policy_auth_epoch().unwrap();
+    handle.update_policy(current_epoch, RemoteControlPolicy::Allowed);
+    assert!(handle.ensure_remote_control_allowed().is_ok());
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
 fn remote_control_auth_manager_with_home(codex_home: &TempDir) -> Arc<AuthManager> {
     auth_manager_from_auth_with_home(
         CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -120,6 +183,7 @@ fn remote_control_auth_dot_json(account_id: Option<&str>) -> AuthDotJson {
     let fake_jwt = format!("{header_b64}.{payload_b64}.sig");
 
     AuthDotJson {
+        oauth_context: None,
         auth_mode: Some(AuthMode::Chatgpt),
         openai_api_key: None,
         tokens: Some(TokenData {
@@ -515,7 +579,16 @@ pub(super) fn remote_control_handle_with_current_enrollment(
         },
     )));
     RemoteControlHandle {
-        policy: RemoteControlPolicy::Allowed,
+        policy: Arc::new(
+            watch::channel((
+                RemoteControlPolicy::Allowed,
+                auth_manager
+                    .policy_auth_snapshot()
+                    .ok()
+                    .map(|(epoch, _)| epoch),
+            ))
+            .0,
+        ),
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
         desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
@@ -1374,7 +1447,10 @@ async fn remote_control_handle_enable_disable_stops_and_restarts_connections() {
         .await
         .expect("disabling remote control should close the websocket");
     assert!(
-        matches!(closed, None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))),
+        matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))
+        ),
         "disable must terminate the connection, not merely produce a frame: {closed:?}"
     );
     timeout(Duration::from_millis(100), listener.accept())
@@ -2079,7 +2155,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     let (transport_event_tx, _transport_event_rx) =
         mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
     let shutdown_token = CancellationToken::new();
-    let (remote_task, _remote_handle) = start_remote_control(
+    let (remote_task, remote_handle) = start_remote_control(
         RemoteControlStartConfig {
             remote_control_url,
             installation_id: TEST_INSTALLATION_ID.to_string(),
@@ -2101,19 +2177,37 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
     timeout(Duration::from_millis(100), listener.accept())
         .await
         .expect_err("remote control should wait for account id before enrolling");
+    let pending_epoch = remote_handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
 
-    save_auth(
-        codex_home.path(),
+    // The account id arrives within the same login, which completes its identity.
+    write_auth_in_current_login(
+        &codex_home,
         &remote_control_auth_dot_json(Some("account_id")),
-        AuthCredentialsStoreMode::File,
-        AuthKeyringBackendKind::default(),
-    )
-    .expect("auth with account id should save");
+    );
     auth_manager.reload().await;
+
+    // Managed requirements are fetched per account, so the completion holds enrollment, without
+    // disabling remote control, until the embedder re-checks them for the completed account.
+    timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .expect_err("remote control should wait for a requirements re-check before enrolling");
+    assert!(remote_handle.desired_state_tx.borrow().is_enabled());
+    assert!(remote_handle.policy_recheck_pending());
+    assert_eq!(
+        remote_handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+    let completed_epoch = remote_handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+    assert_ne!(completed_epoch, pending_epoch);
+    remote_handle.update_policy(completed_epoch, RemoteControlPolicy::Allowed);
 
     let enroll_request = timeout(Duration::from_millis(100), accept_http_request(&listener))
         .await
-        .expect("auth change should wake remote control before the retry delay");
+        .expect("the re-check should wake remote control before the retry delay");
     assert_eq!(
         enroll_request.request_line,
         "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
@@ -2133,9 +2227,505 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         handshake_request.headers.get("x-codex-server-id"),
         Some(&expected_enrollment.server_id)
     );
+    assert!(!remote_handle.policy_recheck_pending());
+    assert_eq!(remote_handle.ensure_remote_control_allowed(), Ok(()));
 
     shutdown_token.cancel();
     remote_task.await.expect("remote control task should join");
+}
+
+/// Stores a login for `account_id` and loads it. `save_auth` starts a new login lifecycle.
+async fn remote_control_login(codex_home: &TempDir, account_id: Option<&str>) -> Arc<AuthManager> {
+    save_auth(
+        codex_home.path(),
+        &remote_control_auth_dot_json(account_id),
+        AuthCredentialsStoreMode::File,
+        AuthKeyringBackendKind::default(),
+    )
+    .expect("login auth should save");
+    AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        /*enable_codex_api_key_env*/ false,
+        AuthCredentialsStoreMode::File,
+        /*forced_chatgpt_workspace_id*/ None,
+        /*chatgpt_base_url*/ None,
+        AuthKeyringBackendKind::default(),
+        codex_login::test_support::transport_default_auth_route_config(),
+    )
+    .await
+}
+
+/// Rewrites auth.json in place, as a refresh commit or another process does. Unlike
+/// `save_auth`, this keeps the stored login lifecycle.
+fn write_auth_in_current_login(codex_home: &TempDir, auth: &AuthDotJson) {
+    std::fs::write(
+        codex_home.path().join("auth.json"),
+        serde_json::to_vec(auth).expect("auth should serialize"),
+    )
+    .expect("auth should write in place");
+}
+
+fn refreshed_remote_control_auth_dot_json(account_id: &str) -> AuthDotJson {
+    let mut auth = remote_control_auth_dot_json(Some(account_id));
+    auth.tokens
+        .as_mut()
+        .expect("refreshed auth should include tokens")
+        .access_token = "Refreshed Access Token".to_string();
+    auth
+}
+
+/// Remote control started against a backend listener after a stored login.
+struct RemoteControlLoginFixture {
+    listener: TcpListener,
+    codex_home: TempDir,
+    auth_manager: Arc<AuthManager>,
+    handle: RemoteControlHandle,
+    task: JoinHandle<()>,
+    shutdown_token: CancellationToken,
+    _transport_event_rx: mpsc::Receiver<TransportEvent>,
+}
+
+impl RemoteControlLoginFixture {
+    async fn start(account_id: Option<&str>, startup_mode: RemoteControlStartupMode) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let remote_control_url = remote_control_url_for_listener(&listener);
+        let codex_home = TempDir::new().expect("temp dir should create");
+        let auth_manager = remote_control_login(&codex_home, account_id).await;
+        let state_db = remote_control_state_runtime(&codex_home).await;
+        let (transport_event_tx, transport_event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let shutdown_token = CancellationToken::new();
+        let (task, handle) = start_remote_control(
+            RemoteControlStartConfig {
+                remote_control_url,
+                installation_id: TEST_INSTALLATION_ID.to_string(),
+                policy: RemoteControlPolicy::Allowed,
+                http_client_factory: codex_http_client::HttpClientFactory::new(
+                    codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+                ),
+            },
+            Some(state_db),
+            auth_manager.clone(),
+            transport_event_tx,
+            shutdown_token.clone(),
+            /*app_server_client_name_rx*/ None,
+            startup_mode,
+        )
+        .await
+        .expect("remote control should start");
+        Self {
+            listener,
+            codex_home,
+            auth_manager,
+            handle,
+            task,
+            shutdown_token,
+            _transport_event_rx: transport_event_rx,
+        }
+    }
+
+    async fn update_current_login(&self, auth: &AuthDotJson) {
+        write_auth_in_current_login(&self.codex_home, auth);
+        self.auth_manager.reload().await;
+    }
+
+    async fn replace_login(&self, auth: &AuthDotJson) {
+        save_auth(
+            self.codex_home.path(),
+            auth,
+            AuthCredentialsStoreMode::File,
+            AuthKeyringBackendKind::default(),
+        )
+        .expect("replacement login should save");
+        self.auth_manager.reload().await;
+    }
+
+    /// Records the embedder's managed-requirements decision for the current policy epoch, as the
+    /// app-server's re-check after an account-id completion does.
+    fn recheck_requirements(&self, policy: RemoteControlPolicy) {
+        let epoch = self
+            .handle
+            .policy_auth_epoch()
+            .expect("policy epoch should load");
+        self.handle.update_policy(epoch, policy);
+    }
+
+    /// Completes the pending enrollment and returns the backend end of its websocket.
+    async fn accept_enrollment(&self) -> WebSocketStream<TcpStream> {
+        let enroll_request = accept_http_request(&self.listener).await;
+        assert_eq!(
+            enroll_request.request_line,
+            "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"
+        );
+        respond_with_json(
+            enroll_request.stream,
+            remote_control_server_token_response(
+                "srv_e_login",
+                "env_login",
+                TEST_REMOTE_CONTROL_SERVER_TOKEN,
+            ),
+        )
+        .await;
+        let (_handshake_request, websocket) =
+            accept_remote_control_backend_connection(&self.listener).await;
+        websocket
+    }
+
+    async fn assert_no_backend_contact(&self, reason: &str) {
+        timeout(Duration::from_millis(100), self.listener.accept())
+            .await
+            .expect_err(reason);
+    }
+
+    async fn wait_until_disabled(&self, reason: &str) {
+        let mut desired_state_rx = self.handle.desired_state_tx.subscribe();
+        timeout(
+            Duration::from_secs(1),
+            desired_state_rx.wait_for(|state| *state == RemoteControlDesiredState::Disabled),
+        )
+        .await
+        .expect(reason)
+        .expect("desired state channel should stay open");
+    }
+
+    async fn shutdown(self) {
+        self.shutdown_token.cancel();
+        self.task.await.expect("remote control task should join");
+    }
+}
+
+#[tokio::test]
+async fn account_id_completion_holds_policy_checks_for_a_requirements_recheck() {
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let auth_manager = remote_control_login(&codex_home, /*account_id*/ None).await;
+    // No monitor runs for this handle, so the checks themselves must follow the completion.
+    let handle = remote_control_handle_with_current_enrollment(
+        TEST_REMOTE_CONTROL_URL,
+        auth_manager.clone(),
+    );
+    let pending_epoch = handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+    assert!(!handle.policy_recheck_pending());
+
+    write_auth_in_current_login(
+        &codex_home,
+        &remote_control_auth_dot_json(Some("account_id")),
+    );
+    auth_manager.reload().await;
+
+    // Requirements are fetched per account, so a decision made before the account id arrived
+    // admits nothing until it is re-checked for the completed account.
+    let completed_epoch = handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+    assert_ne!(completed_epoch, pending_epoch);
+    assert!(handle.policy_recheck_pending());
+    assert_eq!(
+        handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+    assert_eq!(
+        handle
+            .enable_ephemeral()
+            .expect_err("enable should wait for the requirements re-check"),
+        RemoteControlEnableError::DisabledByRequirements(RemoteControlDisabledByRequirements)
+    );
+    // Waiting for the re-check is not a denial.
+    assert!(handle.desired_state_tx.borrow().is_enabled());
+
+    // A requirements denial computed before the completion still lands after it.
+    handle.update_policy(pending_epoch, RemoteControlPolicy::DisabledByRequirements);
+    assert!(!handle.desired_state_tx.borrow().is_enabled());
+    assert_eq!(
+        handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+
+    // The re-check for the completed account decides, without enabling anything by itself.
+    handle.update_policy(completed_epoch, RemoteControlPolicy::Allowed);
+    assert!(!handle.policy_recheck_pending());
+    assert_eq!(handle.ensure_remote_control_allowed(), Ok(()));
+    assert!(!handle.desired_state_tx.borrow().is_enabled());
+}
+
+#[tokio::test]
+async fn late_requirements_decision_from_before_account_id_completion_does_not_override() {
+    let codex_home = TempDir::new().expect("temp dir should create");
+    let auth_manager = remote_control_login(&codex_home, /*account_id*/ None).await;
+    let handle = remote_control_handle_with_current_enrollment(
+        TEST_REMOTE_CONTROL_URL,
+        auth_manager.clone(),
+    );
+    let pending_epoch = handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+    write_auth_in_current_login(
+        &codex_home,
+        &remote_control_auth_dot_json(Some("account_id")),
+    );
+    auth_manager.reload().await;
+    let completed_epoch = handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+    assert_ne!(completed_epoch, pending_epoch);
+
+    // The re-check denies the completed account; a sync computed before the completion then
+    // finishes late with `Allowed`. The older decision must not replace the newer denial.
+    handle.update_policy(completed_epoch, RemoteControlPolicy::DisabledByRequirements);
+    handle.update_policy(pending_epoch, RemoteControlPolicy::Allowed);
+    assert_eq!(
+        *handle.policy.borrow(),
+        (
+            RemoteControlPolicy::DisabledByRequirements,
+            Some(completed_epoch)
+        )
+    );
+    assert!(!handle.policy_recheck_pending());
+    assert_eq!(
+        handle
+            .enable_ephemeral()
+            .expect_err("the newer denial should still reject enable"),
+        RemoteControlEnableError::DisabledByRequirements(RemoteControlDisabledByRequirements)
+    );
+
+    // Symmetrically, a late denial computed before the completion does not override a newer
+    // decision that allows the completed account.
+    handle.update_policy(completed_epoch, RemoteControlPolicy::Allowed);
+    handle.update_policy(pending_epoch, RemoteControlPolicy::DisabledByRequirements);
+    assert_eq!(
+        *handle.policy.borrow(),
+        (RemoteControlPolicy::Allowed, Some(completed_epoch))
+    );
+    assert_eq!(handle.ensure_remote_control_allowed(), Ok(()));
+}
+
+#[tokio::test]
+async fn same_account_token_refresh_keeps_remote_control_connected() {
+    let fixture = RemoteControlLoginFixture::start(
+        Some("account_id"),
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await;
+    let _websocket = fixture.accept_enrollment().await;
+    let epoch = fixture
+        .handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+
+    fixture
+        .update_current_login(&refreshed_remote_control_auth_dot_json("account_id"))
+        .await;
+
+    assert_eq!(
+        fixture
+            .auth_manager
+            .auth_cached()
+            .and_then(|auth| auth.get_token().ok()),
+        Some("Refreshed Access Token".to_string())
+    );
+    fixture
+        .assert_no_backend_contact("a same-account refresh should not reconnect or re-enroll")
+        .await;
+    assert_eq!(
+        fixture
+            .handle
+            .policy_auth_epoch()
+            .expect("policy epoch should load"),
+        epoch
+    );
+    assert_eq!(fixture.handle.ensure_remote_control_allowed(), Ok(()));
+    assert!(fixture.handle.desired_state_tx.borrow().is_enabled());
+    assert_eq!(
+        fixture.handle.status().status,
+        RemoteControlConnectionStatus::Connected
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn account_switch_after_account_id_completion_disables_remote_control() {
+    let fixture = RemoteControlLoginFixture::start(
+        /*account_id*/ None,
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await;
+    fixture
+        .update_current_login(&remote_control_auth_dot_json(Some("account_id")))
+        .await;
+    fixture.recheck_requirements(RemoteControlPolicy::Allowed);
+    let mut websocket = fixture.accept_enrollment().await;
+
+    // Another account is a new identity even within the same login lifecycle.
+    fixture
+        .update_current_login(&remote_control_auth_dot_json(Some("account_b")))
+        .await;
+
+    fixture
+        .wait_until_disabled("an account switch should disable remote control")
+        .await;
+    let closed = timeout(Duration::from_secs(2), websocket.next())
+        .await
+        .expect("an account switch should stop the live socket");
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(tungstenite::Message::Close(_)))
+    ));
+    fixture
+        .assert_no_backend_contact("remote control should not enroll the new account")
+        .await;
+    assert_eq!(
+        fixture.handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn new_login_supplying_missing_account_id_requires_reauthorization() {
+    let fixture = RemoteControlLoginFixture::start(
+        /*account_id*/ None,
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await;
+    fixture
+        .replace_login(&remote_control_auth_dot_json(Some("account_id")))
+        .await;
+
+    fixture
+        .wait_until_disabled("a new login should disable remote control")
+        .await;
+    assert_eq!(
+        fixture.handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .enable_ephemeral()
+            .expect_err("enable should wait for reauthorization"),
+        RemoteControlEnableError::DisabledByRequirements(RemoteControlDisabledByRequirements)
+    );
+    // A new login is not an account-id completion, so no automatic re-check reauthorizes it.
+    assert!(!fixture.handle.policy_recheck_pending());
+
+    // Refreshing the new login does not reauthorize it.
+    fixture
+        .update_current_login(&refreshed_remote_control_auth_dot_json("account_id"))
+        .await;
+    fixture
+        .assert_no_backend_contact("a refresh should not reauthorize a new login")
+        .await;
+    assert_eq!(
+        fixture.handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+    assert!(!fixture.handle.policy_recheck_pending());
+
+    // Reauthorization restores the policy without enabling remote control by itself.
+    let epoch = fixture
+        .handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+    fixture
+        .handle
+        .update_policy(epoch, RemoteControlPolicy::Allowed);
+    assert_eq!(fixture.handle.ensure_remote_control_allowed(), Ok(()));
+    fixture
+        .assert_no_backend_contact("reauthorization alone should not enroll")
+        .await;
+    assert!(!fixture.handle.desired_state_tx.borrow().is_enabled());
+
+    fixture
+        .handle
+        .enable_ephemeral()
+        .expect("explicit enable should succeed after reauthorization");
+    let _websocket = fixture.accept_enrollment().await;
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn account_id_completion_does_not_lift_a_requirements_denial() {
+    let fixture = RemoteControlLoginFixture::start(
+        /*account_id*/ None,
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await;
+    let epoch = fixture
+        .handle
+        .policy_auth_epoch()
+        .expect("policy epoch should load");
+    fixture
+        .handle
+        .update_policy(epoch, RemoteControlPolicy::DisabledByRequirements);
+
+    fixture
+        .update_current_login(&remote_control_auth_dot_json(Some("account_id")))
+        .await;
+
+    fixture
+        .assert_no_backend_contact("a requirements denial should block enrollment")
+        .await;
+    assert!(!fixture.handle.desired_state_tx.borrow().is_enabled());
+    assert_eq!(
+        fixture.handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .enable_ephemeral()
+            .expect_err("a requirements denial should reject enable"),
+        RemoteControlEnableError::DisabledByRequirements(RemoteControlDisabledByRequirements)
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn requirements_recheck_denial_after_account_id_completion_disables_remote_control() {
+    let fixture = RemoteControlLoginFixture::start(
+        /*account_id*/ None,
+        RemoteControlStartupMode::EnabledEphemeral,
+    )
+    .await;
+    fixture
+        .update_current_login(&remote_control_auth_dot_json(Some("account_id")))
+        .await;
+
+    fixture
+        .assert_no_backend_contact("a completion should wait for a requirements re-check")
+        .await;
+    assert!(fixture.handle.policy_recheck_pending());
+    assert!(fixture.handle.desired_state_tx.borrow().is_enabled());
+
+    // The completed account's managed requirements deny remote control.
+    fixture.recheck_requirements(RemoteControlPolicy::DisabledByRequirements);
+
+    fixture
+        .wait_until_disabled("a re-check denial should disable remote control")
+        .await;
+    fixture
+        .assert_no_backend_contact("a re-check denial should block enrollment")
+        .await;
+    assert!(!fixture.handle.policy_recheck_pending());
+    assert_eq!(
+        fixture.handle.ensure_remote_control_allowed(),
+        Err(RemoteControlDisabledByRequirements)
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .enable_ephemeral()
+            .expect_err("a re-check denial should reject enable"),
+        RemoteControlEnableError::DisabledByRequirements(RemoteControlDisabledByRequirements)
+    );
+
+    fixture.shutdown().await;
 }
 
 #[tokio::test]
@@ -2243,6 +2833,7 @@ async fn persisted_enable_account_change(close_socket: bool, logout_first: bool)
         save_auth(
             codex_home.path(),
             &AuthDotJson {
+                oauth_context: None,
                 auth_mode: Some(AuthMode::ApiKey),
                 openai_api_key: Some("test-key".to_string()),
                 tokens: None,

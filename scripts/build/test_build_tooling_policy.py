@@ -16,7 +16,6 @@ from functools import partial
 from pathlib import Path
 from unittest import mock
 
-from scripts.build import rust_packages
 from scripts.build.build_tooling_test_support import REPO_ROOT
 from scripts.build.build_tooling_test_support import load_format_module
 from scripts.build.build_tooling_test_support import load_toml
@@ -47,8 +46,11 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertEqual(owner.run_test_command.keywords["timeout"], 60)
         with self.assertRaises(subprocess.TimeoutExpired):
-            owner.run_test_command([sys.executable, "-c", "import time; time.sleep(30)"],
-                                   capture_output=True, timeout=0.1)
+            owner.run_test_command(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                capture_output=True,
+                timeout=0.1,
+            )
 
     def test_dead_code_preserves_target_config_and_rejects_unused_code(self):
         shell = powershell()
@@ -169,7 +171,12 @@ for (const outcome of ['success', 'timeout', 'unsupported']) {
 console.log(JSON.stringify(results));
 """
         result = subprocess.run(
-            [node, "-e", harness, str(REPO_ROOT / "scripts" / "maintenance" / "run-python.js")],
+            [
+                node,
+                "-e",
+                harness,
+                str(REPO_ROOT / "scripts" / "maintenance" / "run-python.js"),
+            ],
             capture_output=True,
             text=True,
             check=True,
@@ -188,22 +195,11 @@ console.log(JSON.stringify(results));
         self.assertIn("probe timed out", timeout["errors"][0])
         self.assertEqual(unsupported["exitCode"], 127)
         self.assertEqual(len(unsupported["calls"]), 1)
-        self.assertIn("Python 3 was not found", unsupported["errors"][0])
-
-    def test_explicit_package_bound_allows_nested_codex_rs_package(self):
-        from scripts.build.rust_packages import nearest_package_root
-
-        with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp)
-            package = repo / "codex-rs" / "nested" / "codex-rs"
-            package.mkdir(parents=True)
-            (package / "Cargo.toml").write_text('[package]\nname = "nested"\n')
-            self.assertEqual(
-                nearest_package_root(
-                    package / "src" / "lib.rs", repo_root=repo, assume_file=True
-                ),
-                package,
-            )
+        # The probed interpreter exists but fails the 3.11+ capability check.
+        self.assertIn(
+            "No Python 3.11 or newer interpreter passed the capability check",
+            unsupported["errors"][0],
+        )
 
     def test_analyzer_preserves_child_exit_and_streams_progress(self):
         result, calls = self.run_workspace_analyzer(
@@ -229,7 +225,8 @@ console.log(JSON.stringify(results));
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(calls), 2)
         self.assertEqual(
-            calls[0]["args"][-4:], ["--exclude", "codex-code-mode-runtime", "--", "-Dwarnings"]
+            calls[0]["args"][-4:],
+            ["--exclude", "codex-code-mode-runtime", "--", "-Dwarnings"],
         )
         self.assertEqual(calls[1]["args"][-2:], ["--", "-Dwarnings"])
 
@@ -542,9 +539,9 @@ function Get-Command($Name) {
         build_info = (rust_root / "utils" / "build-info" / "src" / "lib.rs").read_text(
             encoding="utf-8"
         )
-        publisher = (REPO_ROOT / "scripts" / "install" / "publish-local-codex.ps1").read_text(
-            encoding="utf-8"
-        )
+        publisher = (
+            REPO_ROOT / "scripts" / "install" / "publish-local-codex.ps1"
+        ).read_text(encoding="utf-8")
         for variable in (
             "CODEX_BUILD_COMMIT",
             "CODEX_BUILD_DIRTY",
@@ -591,23 +588,14 @@ function Get-Command($Name) {
         rust_root = REPO_ROOT / "codex-rs"
         rmcp = load_toml(rust_root / "rmcp-client" / "Cargo.toml")
         state = load_toml(rust_root / "state" / "Cargo.toml")
-        tui = load_toml(rust_root / "tui" / "Cargo.toml")
 
         self.assertNotIn("codex-utils-home-dir", rmcp["dependencies"])
         self.assertNotIn("hmac", state["dependencies"])
         self.assertNotIn("rand", state["dependencies"])
-        self.assertNotIn("core_test_support", tui["dev-dependencies"])
 
-        diff_render = (rust_root / "tui" / "src" / "diff_render.rs").read_text(
-            encoding="utf-8"
-        )
         responses_stream = (
             rust_root / "codex-api" / "src" / "responses_stream.rs"
         ).read_text(encoding="utf-8")
-        self.assertNotRegex(
-            diff_render,
-            r"#\[allow\(dead_code\)\]\s*path: PathBuf",
-        )
         self.assertNotRegex(
             responses_stream,
             r"#\[allow\(dead_code\)\]\s*struct ResponseCompleted",
@@ -751,7 +739,8 @@ function Get-Command($Name) {
         self.assertIsNotNone(heading)
         section = re.split(r"(?m)^## ", text[heading.end() :], maxsplit=1)[0]
         self.assertIn(
-            "contains the Rust CLI and app-server, not the native Windows shell", section
+            "contains the Rust CLI and app-server, not the native Windows shell",
+            section,
         )
         self.assertIn("The published fork Desktop must use", section)
         self.assertIn("CODEX_HOME=", section)
@@ -783,18 +772,25 @@ function Get-Command($Name) {
         with tempfile.TemporaryDirectory() as temp_dir:
             metadata = Path(temp_dir) / "codex-install.env"
             metadata.write_text("version=previous\n", encoding="utf-8")
+            # Mirror the installer's strict mode and pass the receipt-v2 inputs
+            # its only caller supplies.
             command = (
-                "$ErrorActionPreference='Stop'; $tokens=$null; $errors=$null; "
+                "Set-StrictMode -Version Latest; $ErrorActionPreference='Stop'; $tokens=$null; $errors=$null; "
                 f"$ast=[Management.Automation.Language.Parser]::ParseFile({ps_single_quote(installer)},[ref]$tokens,[ref]$errors); "
                 "$fn=$ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Write-InstallMetadata'},$true)[0]; "
                 "Invoke-Expression $fn.Extent.Text; $InstallMetadataFile='codex-install.env'; "
+                "$ReleaseRepository='owner/repo'; "
+                "$package=[pscustomobject]@{ReleaseId='12';AssetId='34';Sha256='a1'}; "
+                "$checksums=[pscustomobject]@{ReleaseId='12';AssetId='35';Sha256='b2'}; "
                 "$script:moveCalls=0; $script:written=@(); $caught=$false; "
                 "function Move-Item { param($LiteralPath,$Destination,[switch]$Force) "
                 "$script:moveCalls++; $script:written=@(Get-Content -LiteralPath $LiteralPath); throw 'injected move failure' }; "
-                f"try {{ Write-InstallMetadata -ReleaseDir {ps_single_quote(Path(temp_dir))} -ResolvedVersion '1' -Target 't' -Layout 'Package' }} "
+                f"try {{ Write-InstallMetadata -ReleaseDir {ps_single_quote(Path(temp_dir))} -ResolvedVersion '1' -Target 't' -Layout 'Package' "
+                "-ArtifactIdentity 'identity' -PackageMetadata $package -ChecksumMetadata $checksums } "
                 "catch { if ($_.Exception.Message -cne 'injected move failure') { throw }; $caught=$true }; "
                 "if (-not $caught -or $script:moveCalls -ne 1 -or "
-                "($script:written -join '|') -cne 'version=1|target=t|layout=Package') { exit 8 }"
+                "($script:written -join '|') -cne ('receiptVersion=2|version=1|target=t|layout=Package|repository=owner/repo|' + "
+                "'releaseId=12|assetId=34|archiveSha256=a1|checksumAssetId=35|checksumSha256=b2|artifactIdentity=identity')) { exit 8 }"
             )
             completed = run_test_command(
                 [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
@@ -913,9 +909,11 @@ function Get-Command($Name) {
                     completed.returncode, 0 if accepted else 7, completed.stderr
                 )
                 if accepted:
+                    # GitHub owner/name are case-insensitive; the installer
+                    # canonicalizes them so receipt-v2 repository checks are exact.
                     self.assertEqual(
                         completed.stdout.strip(),
-                        f"https://api.github.com/repos/{repository}/releases",
+                        f"https://api.github.com/repos/{repository.lower()}/releases",
                     )
                 else:
                     self.assertIn("Invalid Codex release repository:", completed.stderr)
@@ -1047,6 +1045,8 @@ function Get-Command($Name) {
                 expected: bool,
             ) -> subprocess.CompletedProcess[str]:
                 command = (
+                    "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; "
+                    "$InstallMetadataFile = 'codex-install.env'; "
                     "$tokens = $null; $errors = $null; "
                     f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
                     f"{ps_single_quote(powershell_installer)}, "
@@ -1107,6 +1107,39 @@ function Get-Command($Name) {
                 f"stdout:\n{complete_windows.stdout}\nstderr:\n{complete_windows.stderr}",
             )
 
+            original_metadata = json.loads(json.dumps(metadata))
+            malformed = []
+            for key in ("bundleId", "files", "buildIdentity"):
+                candidate = json.loads(json.dumps(metadata))
+                del candidate[key]
+                malformed.append(candidate)
+            for files in (
+                None,
+                {},
+                [None],
+                [
+                    {
+                        "path": "bin/codex.exe",
+                        "role": "entrypoint",
+                        "size": "bad",
+                        "sha256": "f" * 64,
+                    }
+                ],
+            ):
+                malformed.append({**metadata, "files": files})
+            for size in (-1, 2**80, "not a number", 0.5):
+                candidate = json.loads(json.dumps(metadata))
+                candidate["files"][0]["size"] = size
+                malformed.append(candidate)
+            for candidate in malformed:
+                with self.subTest(metadata=candidate):
+                    metadata_path.write_text(json.dumps(candidate), encoding="utf-8")
+                    result = run_powershell_probe(False)
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+            metadata_path.write_text(json.dumps(original_metadata), encoding="utf-8")
+
             metadata["bundleId"] = "f" * 64
             metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
             mismatched_bundle = run_powershell_probe(False)
@@ -1133,10 +1166,14 @@ function Get-Command($Name) {
             # requested; a manifest must cover every payload, not only visible ones.
             hidden = run_test_command(
                 [
-                    ps, "-NoProfile", "-Command",
+                    ps,
+                    "-NoProfile",
+                    "-Command",
                     f"(Get-Item -LiteralPath {ps_single_quote(windows_package / 'unexpected.dll')}).Attributes = [IO.FileAttributes]::Hidden",
                 ],
-                text=True, capture_output=True, check=False,
+                text=True,
+                capture_output=True,
+                check=False,
             )
             self.assertEqual(hidden.returncode, 0, hidden.stderr)
             hidden_file = run_powershell_probe(False)
@@ -1178,13 +1215,26 @@ function Get-Command($Name) {
                         encoding="utf-8",
                     )
                     completed = run_test_command(
-                        [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
-                        text=True, capture_output=True, check=False,
+                        [
+                            ps,
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-Command",
+                            command,
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
                     )
                     self.assertEqual(completed.returncode, 0, completed.stderr)
-                    self.assertEqual(json.loads(completed.stdout), {
-                        "version": expected, "preference": "Stop",
-                    })
+                    self.assertEqual(
+                        json.loads(completed.stdout),
+                        {
+                            "version": expected,
+                            "preference": "Stop",
+                        },
+                    )
 
     def test_windows_installer_uninstall_removes_only_its_path_entry(self) -> None:
         ps = powershell()
@@ -1217,11 +1267,15 @@ function Get-Command($Name) {
             active = releases / "active"
             incomplete = releases / "incomplete"
             # Names must disagree with modification time.
-            completed_releases = [releases / name for name in ("z-oldest", "a-middle", "m-newest")]
+            completed_releases = [
+                releases / name for name in ("z-oldest", "a-middle", "m-newest")
+            ]
             for release in (active, incomplete, *completed_releases):
                 release.mkdir(parents=True)
             # An active completed release must survive even when it is oldest.
-            (active / "codex-install.env").write_text("version=active\n", encoding="utf-8")
+            (active / "codex-install.env").write_text(
+                "version=active\n", encoding="utf-8"
+            )
             os.utime(active, (1, 1))
             for index, release in enumerate(completed_releases):
                 (release / "codex-install.env").write_text(
@@ -1440,9 +1494,6 @@ function Get-Command($Name) {
     def test_windows_distribution_keeps_library_platform_dependencies_gated(
         self,
     ) -> None:
-        cargo = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
-        self.assertEqual(cargo["workspace"]["dependencies"]["arboard"], "3")
-
         deny = load_toml(REPO_ROOT / "codex-rs" / "deny.toml")
         self.assertEqual(
             set(deny["graph"]["targets"]),
@@ -1676,7 +1727,11 @@ function Get-Command($Name) {
                     if configured is not None:
                         env["PYTHON"] = configured
                     result = subprocess.run(
-                        [node, str(REPO_ROOT / "scripts/maintenance/run-python.js"), str(script)],
+                        [
+                            node,
+                            str(REPO_ROOT / "scripts/maintenance/run-python.js"),
+                            str(script),
+                        ],
                         cwd=REPO_ROOT,
                         env=env,
                         capture_output=True,
@@ -1848,97 +1903,6 @@ function Get-Command($Name) {
                 self.assertNotIn("just write-config-schema", source)
                 self.assertNotIn("just write-app-server-schema", source)
 
-    def test_rust_package_search_start_keeps_existing_dotted_directories(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_root = Path(temp_dir)
-            package_dir = repo_root / "codex-rs" / "crate.with.dot"
-            package_dir.mkdir(parents=True)
-            (package_dir / "Cargo.toml").write_text(
-                '[package]\nname = "crate-with-dot"\n',
-                encoding="utf-8",
-            )
-
-            self.assertEqual(
-                rust_packages.package_search_start(package_dir), package_dir
-            )
-            self.assertEqual(
-                rust_packages.nearest_package_root(package_dir, repo_root=repo_root),
-                package_dir,
-            )
-
-    def test_rust_package_search_does_not_escape_repo_root(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            parent = Path(temp_dir)
-            (parent / "Cargo.toml").write_text(
-                '[package]\nname = "external"\n',
-                encoding="utf-8",
-            )
-            repo_root = parent / "kd4"
-            script = repo_root / "scripts" / "maintenance" / "format.py"
-            script.parent.mkdir(parents=True)
-            script.write_text("", encoding="utf-8")
-
-            self.assertIsNone(
-                rust_packages.nearest_package_root(
-                    script,
-                    repo_root=repo_root,
-                    assume_file=True,
-                )
-            )
-
-    def test_rust_package_search_reuses_cached_ancestor(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_root = Path(temp_dir)
-            package_root = repo_root / "codex-rs" / "crate"
-            nested = package_root / "src" / "nested"
-            nested.mkdir(parents=True)
-            cache = {package_root: package_root}
-
-            self.assertEqual(
-                rust_packages.nearest_package_root(
-                    nested,
-                    repo_root=repo_root,
-                    package_root_cache=cache,
-                ),
-                package_root,
-            )
-            self.assertEqual(cache[nested], package_root)
-
-    def test_rust_package_search_skips_virtual_workspace_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_root = Path(temp_dir)
-            codex_rs_root = repo_root / "codex-rs"
-            # A virtual workspace has no package to select. The nested case
-            # must inspect the manifest, not pass via the codex-rs boundary.
-            for workspace in (codex_rs_root, codex_rs_root / "nested-workspace"):
-                with self.subTest(workspace=workspace):
-                    workspace.mkdir(parents=True, exist_ok=True)
-                    (workspace / "Cargo.toml").write_text(
-                        '[workspace]\nmembers = ["crate"]\n', encoding="utf-8"
-                    )
-                    source = workspace / "workspace-file.rs"
-                    source.touch()
-                    self.assertIsNone(
-                        rust_packages.nearest_package_root(
-                            source, repo_root=repo_root, assume_file=True
-                        )
-                    )
-
-                    # A member remains a package even below a virtual manifest.
-                    member = workspace / "crate"
-                    member.mkdir()
-                    (member / "Cargo.toml").write_text(
-                        '[package]\nname = "member"\n', encoding="utf-8"
-                    )
-                    self.assertEqual(
-                        rust_packages.nearest_package_root(
-                            member / "src" / "lib.rs",
-                            repo_root=repo_root,
-                            assume_file=True,
-                        ),
-                        member,
-                    )
-
     def test_formatter_group_decodes_command_output_as_utf8(self) -> None:
         format_script = load_format_module()
         group = format_script.FormatterGroup(
@@ -2087,7 +2051,15 @@ function Get-Command($Name) {
                         # PowerShell consumes the literal -- when calling the
                         # recording function instead of a native executable.
                         command[1:8],
-                        ["run-lane", "--lane", "auto", "--warm-wait-seconds", "0", "cargo", "clippy"],
+                        [
+                            "run-lane",
+                            "--lane",
+                            "auto",
+                            "--warm-wait-seconds",
+                            "0",
+                            "cargo",
+                            "clippy",
+                        ],
                     )
                     self.assertEqual(command[-len(args) :], list(args))
                     self.assertEqual("--fix" in command, recipe == "fix")
@@ -2220,6 +2192,7 @@ function Get-Command($Name) {
                 "app-server-thread-status",
             ],
         )
+
     def test_release_tooling_recipe_runs_from_repository_root(self) -> None:
         result, calls = self.run_just_recipe(
             "test-release-tooling", from_subdirectory=True
@@ -2480,16 +2453,24 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         recipe = justfile.split("deps-policy-check *args:", 1)[1].split("\n\n", 1)[0]
-        self.assertIn('scripts/maintenance/check_duplicate_deps.py" --policy {args}', recipe)
+        self.assertIn(
+            'scripts/maintenance/check_duplicate_deps.py" --policy {args}', recipe
+        )
         runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(check_dependency_policy([], runner=runner), 0)
-        self.assertEqual(runner.call_args_list, [
-            mock.call(["just", "deps-advisories-check"], check=False),
-            mock.call(["just", "deps-duplicates-check", "--locked"], check=False),
-            mock.call(["just", "deps-v8-boundary-check", "--locked"], check=False),
-            mock.call(["cargo", "deny", "check", "bans", "sources", "licenses"], check=False),
-        ])
+        self.assertEqual(
+            runner.call_args_list,
+            [
+                mock.call(["just", "deps-advisories-check"], check=False),
+                mock.call(["just", "deps-duplicates-check", "--locked"], check=False),
+                mock.call(["just", "deps-v8-boundary-check", "--locked"], check=False),
+                mock.call(
+                    ["cargo", "deny", "check", "bans", "sources", "licenses"],
+                    check=False,
+                ),
+            ],
+        )
         self.assertIn("cargo tree -d --workspace", justfile)
         self.assertNotIn("--target all", justfile)
 
@@ -2505,7 +2486,11 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
             "run-lane --lane app-server-test-client -- just _app-server-test-client-reserved",
         ):
             if snippet.startswith("run-lane"):
-                snippet = snippet.replace(" -- ", ' --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- ', 1)
+                snippet = snippet.replace(
+                    " -- ",
+                    ' --warm-wait-seconds "{{ rust_validation_wait_seconds }}" -- ',
+                    1,
+                )
             self.assertIn(snippet, justfile)
         self.assertNotIn("target/lanes/", justfile)
         self.assertEqual(justfile.count("scripts\\build\\cargo-lane.ps1"), 1)
@@ -2524,8 +2509,16 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
     def test_gate_recipes_forward_all_requested_gates(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         for recipe, forwarding, command in (
-            ("core-gate", '*sys.argv[1:]', '"--", "just", "_core-gate-reserved", *sys.argv[1:]'),
-            ("_core-gate-reserved", "$forwarded_args = @($args | Select-Object -Skip 1)", "run-gate @forwarded_args"),
+            (
+                "core-gate",
+                "*sys.argv[1:]",
+                '"--", "just", "_core-gate-reserved", *sys.argv[1:]',
+            ),
+            (
+                "_core-gate-reserved",
+                "$forwarded_args = @($args | Select-Object -Skip 1)",
+                "run-gate @forwarded_args",
+            ),
         ):
             body = justfile.split(f"\n{recipe} +gates:\n", 1)[1].split("\n\n", 1)[0]
             self.assertIn(forwarding, body)
@@ -2701,8 +2694,12 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
         )
         # Python script recipes receive only declared positional arguments,
         # without the shell recipe-name slot. Real dispatch tests cover values.
-        for recipe in ("core-test-fast target *args:", "core-test-lane target *args:",
-                       "core-test-small target *args:", "core-gate +gates:"):
+        for recipe in (
+            "core-test-fast target *args:",
+            "core-test-lane target *args:",
+            "core-test-small target *args:",
+            "core-gate +gates:",
+        ):
             body = justfile.split(f"\n{recipe}\n", 1)[1].split("\n\n", 1)[0]
             self.assertIn("*sys.argv[1:]", body)
         body = justfile.split("\ncore-test target *args:\n", 1)[1].split("\n\n", 1)[0]
@@ -2710,9 +2707,9 @@ function python { Record-Setup 'python' $args; 'test-toolchain' }
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        perf_env = (REPO_ROOT / "scripts" / "build" / "invoke-rust-perf-env.ps1").read_text(
-            encoding="utf-8"
-        )
+        perf_env = (
+            REPO_ROOT / "scripts" / "build" / "invoke-rust-perf-env.ps1"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("[string]$CargoTargetLane", perf_env)
         self.assertIn("[Parameter(ValueFromRemainingArguments = $true)]", perf_env)

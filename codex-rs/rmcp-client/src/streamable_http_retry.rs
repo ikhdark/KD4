@@ -140,7 +140,7 @@ impl RmcpClient {
                 ExecServerError::HttpRequest(_),
             )) => true,
             StreamableHttpError::Client(StreamableHttpClientAdapterError::HttpRequest(
-                ExecServerError::Server { code, message },
+                ExecServerError::Server { code, message, .. },
             )) => {
                 *code == JSON_RPC_INTERNAL_ERROR_CODE && message.starts_with("http/request failed:")
             }
@@ -169,23 +169,31 @@ impl RmcpClient {
 pub(super) fn retry_delay(error: &(dyn std::error::Error + 'static), fallback_ms: u64) -> Duration {
     fn advice(error: &(dyn std::error::Error + 'static)) -> Option<Duration> {
         if let Some(StreamableHttpClientAdapterError::UnexpectedHttpStatus {
-            retry_after, retry_after_received_at, ..
-        }) =
-            error.downcast_ref::<StreamableHttpClientAdapterError>()
+            retry_after,
+            retry_after_received_at,
+            ..
+        }) = error.downcast_ref::<StreamableHttpClientAdapterError>()
         {
             // Keep durations representable even when an absolute deadline would
             // overflow; sleep_with_retry_deadline handles that case safely.
-            return retry_after.map(|delay| delay.saturating_sub(retry_after_received_at.elapsed()));
+            return retry_after
+                .map(|delay| delay.saturating_sub(retry_after_received_at.elapsed()));
         }
         if let Some(StreamableHttpError::Client(error)) =
             error.downcast_ref::<StreamableHttpError<StreamableHttpClientAdapterError>>()
-        { return advice(error); }
+        {
+            return advice(error);
+        }
         if let Some(rmcp::service::ClientInitializeError::TransportError { error, .. }) =
             error.downcast_ref::<rmcp::service::ClientInitializeError>()
-        { return advice(error.error.as_ref()); }
+        {
+            return advice(error.error.as_ref());
+        }
         if let Some(rmcp::service::ServiceError::TransportSend(error)) =
             error.downcast_ref::<rmcp::service::ServiceError>()
-        { return advice(error.error.as_ref()); }
+        {
+            return advice(error.error.as_ref());
+        }
         error.source().and_then(advice)
     }
     Duration::from_millis(fallback_ms).max(advice(error).unwrap_or_default())

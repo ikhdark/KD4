@@ -3,7 +3,10 @@ use pretty_assertions::assert_eq;
 
 #[test]
 fn preset_names_use_mode_display_names() {
-    assert_eq!(builtin_collaboration_mode_presets(), vec![plan_preset(), default_preset()]);
+    assert_eq!(
+        builtin_collaboration_mode_presets(),
+        vec![plan_preset(), default_preset()]
+    );
     assert_eq!(plan_preset().mode, Some(ModeKind::Plan));
     assert_eq!(default_preset().mode, Some(ModeKind::Default));
     assert_eq!(plan_preset().name, ModeKind::Plan.display_name());
@@ -25,11 +28,18 @@ fn default_mode_instructions_keep_only_the_compact_execution_contract() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(default_instructions.len() < 400);
-    assert!(normalized_instructions.contains("Only a later developer message can change the active mode"));
+    assert!(
+        normalized_instructions
+            .contains("Only a later developer message can change the active mode")
+    );
     assert!(default_instructions.contains("`request_user_input` if available"));
     assert!(normalized_instructions.contains("structured choice fits its schema"));
     assert!(normalized_instructions.contains("one concise direct question"));
-    for duplicated in ["scoped implementation", "Complete the entire requested task", "requests are read-only"] {
+    for duplicated in [
+        "scoped implementation",
+        "Complete the entire requested task",
+        "requests are read-only",
+    ] {
         assert!(!default_instructions.contains(duplicated));
     }
 }
@@ -56,4 +66,3 @@ fn plan_mode_instructions_preserve_planning_contract() {
     assert!(plan_instructions.contains("completely replace the prior plan"));
     assert!(plan_instructions.len() < 3_000);
 }
-

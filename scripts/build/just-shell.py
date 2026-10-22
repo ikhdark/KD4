@@ -68,7 +68,9 @@ def main() -> int:
         return 1
 
 
-def prepare_recipe_environment(command: str) -> tuple[Callable[[str], str | None], Path]:
+def prepare_recipe_environment(
+    command: str,
+) -> tuple[Callable[[str], str | None], Path]:
     """Apply the same defaults to shell and explicitly structured recipes."""
     repo_root = Path(__file__).resolve().parents[2]
     cache_dir = probe_cache_dir(repo_root)
@@ -110,7 +112,10 @@ def run_python(script: str, arguments: list[str], *, program: str = "python") ->
         quoted_script = "'" + script.replace("'", "''") + "'"
         return run_powershell(
             f"{program} {quoted_script} {{args}}; exit $LASTEXITCODE",
-            "python-recipe", arguments, which=which, cache_dir=cache_dir,
+            "python-recipe",
+            arguments,
+            which=which,
+            cache_dir=cache_dir,
         )
     try:
         return subprocess.run(

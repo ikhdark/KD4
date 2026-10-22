@@ -3,6 +3,112 @@ use crate::session::step_context::StepContext;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
+struct PrivateModelOutput(crate::tools::context::FunctionToolOutput);
+
+impl ToolOutput for PrivateModelOutput {
+    fn log_preview(&self) -> String {
+        "private output".into()
+    }
+    fn success_for_logging(&self) -> bool {
+        true
+    }
+    fn allows_generic_artifact_retention(&self) -> bool {
+        false
+    }
+    fn canonical_result(&self, _payload: &ToolPayload) -> Option<CanonicalToolResult> {
+        panic!("private evidence must never reach generic artifact materialization")
+    }
+    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
+        self.0.to_response_item(call_id, payload)
+    }
+    fn code_mode_result(&self, _payload: &ToolPayload) -> Value {
+        Value::String("History tools are unavailable in code mode.".into())
+    }
+}
+
+#[tokio::test]
+async fn private_typed_results_are_native_or_explicitly_unavailable_without_artifacts() {
+    for completed_history in [false, true] {
+        for size in [8, 65_536] {
+            for kind in 0..4 {
+                let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+                Arc::make_mut(&mut turn.config).completed_tool_history_projection =
+                    completed_history;
+                let invocation = test_invocation(
+                    Arc::new(session),
+                    Arc::new(turn),
+                    "private",
+                    ToolName::namespaced("notes", "read_file"),
+                );
+                let mut content = if kind < 2 {
+                    vec![FunctionCallOutputContentItem::EncryptedContent {
+                        encrypted_content: "x".repeat(size),
+                    }]
+                } else {
+                    vec![FunctionCallOutputContentItem::InputText {
+                        text: if kind == 2 {
+                            "t".repeat(size)
+                        } else {
+                            "exact text".into()
+                        },
+                    }]
+                };
+                if kind > 0 {
+                    for _ in 0..if kind == 3 { 2 } else { 1 } {
+                        content.push(FunctionCallOutputContentItem::InputImage {
+                            image_url: format!("data:image/png;base64,{}", "a".repeat(size)),
+                            detail: None,
+                        });
+                    }
+                }
+                let output = PrivateModelOutput(
+                    crate::tools::context::FunctionToolOutput::from_content(content, Some(true)),
+                );
+                let expected = output.to_response_item("private", &invocation.payload);
+                let mut result = AnyToolResult {
+                    call_id: "private".into(),
+                    payload: invocation.payload.clone(),
+                    result: Box::new(output),
+                    model_projection: None,
+                    source_dependencies: None,
+                    code_mode_feedback: Vec::new(),
+                };
+                assert!(
+                    prepare_model_projection(&invocation, &mut result, None, None, false, true,)
+                        .await
+                        .is_none()
+                );
+                assert!(result.model_projection.is_none());
+                assert!(
+                    result.success_for_logging(),
+                    "delivery does not undo execution"
+                );
+                // Typed images have a separate image-preparation budget, not
+                // a base64-as-text charge. Oversized text/ciphertext cannot be
+                // sliced or moved to ordinary recovery storage.
+                let unavailable = size == 65_536 && kind != 3;
+                assert_eq!(result.result.model_delivery_unavailable(), unavailable);
+                if !unavailable {
+                    assert_eq!(
+                        result.response(),
+                        expected,
+                        "fitting native types must survive"
+                    );
+                } else {
+                    let text = consolidated_history_output_text(&result.response());
+                    assert!(text.contains("result delivery is unavailable"));
+                    assert!(text.contains("No generic recovery artifact"));
+                    assert!(!text.contains("canonical_sha256"));
+                }
+                assert_eq!(
+                    result.result.code_mode_result(&invocation.payload),
+                    Value::String("History tools are unavailable in code mode.".into())
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn automatic_excerpts_reuse_producer_bytes_without_artifact_reread() {
     let temp = tempfile::tempdir().unwrap();
@@ -915,6 +1021,29 @@ fn projection_model_render_is_compact_and_keeps_selected_text_unescaped() {
         internal.model_approximate_tokens,
         approx_token_count(rendered) as u64
     );
+}
+
+#[test]
+fn reduced_patch_projection_keeps_false_mutation_exactness() {
+    let mut envelope = ToolProjectionV1 {
+        version: 1,
+        tool: "apply_patch".into(),
+        outcome: "success".into(),
+        canonical_sha256: "hash".into(),
+        canonical_bytes: 10000,
+        canonical_approximate_tokens: 2500,
+        canonical_complete: true,
+        model_bytes: 0,
+        model_approximate_tokens: 0,
+        artifact_id: Some("saved".into()),
+        sections: Vec::new(),
+        omitted_sections: Vec::new(),
+        result: serde_json::json!({"essential": {"changes_exact": false}}),
+    };
+    let rendered = render_projection_with_exact_metrics(&mut envelope).unwrap();
+    let header: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(header["changes_exact"], false);
+    assert_eq!(header["outcome"], "success");
 }
 
 async fn semantic_controls_projection_round_trip() -> std::time::Duration {
@@ -2085,6 +2214,26 @@ fn recovery_deduplication_preserves_independent_output_and_line_boundaries() {
     );
 }
 
+#[test]
+fn recovery_deduplication_does_not_treat_literal_json_as_search_hydration() {
+    for kind in ["json_pointer", "search"] {
+        let recovery = serde_json::json!({
+            "artifact_id": "artifact", "results": [{
+                "selector": {"kind": kind}, "status": "ok",
+                "value": {"hydrated_ranges": [{"text": "independent evidence"}]}
+            }]
+        });
+        assert_eq!(
+            without_preserved_recovery_text("independent evidence", &[recovery]),
+            if kind == "search" {
+                ""
+            } else {
+                "independent evidence"
+            }
+        );
+    }
+}
+
 #[tokio::test]
 async fn projection_owner_recovery_mixed_selectors_survive_code_mode_continuation_merging() {
     let temp = tempfile::tempdir().expect("temporary Codex home");
@@ -2681,6 +2830,7 @@ fn post_tool_feedback_wrapper_preserves_original_control_metadata() {
             "payload": "must remain spillable",
         }))),
         model_visible: FunctionToolOutput::from_text("hook feedback".to_string(), Some(false)),
+        context_error: None,
     };
 
     let metadata = wrapped.projection_metadata().expect("wrapper metadata");
@@ -2689,7 +2839,41 @@ fn post_tool_feedback_wrapper_preserves_original_control_metadata() {
     assert_eq!(metadata.essential_inline["nextCursor"], "opaque-cursor");
     assert_eq!(metadata.essential_inline["omitted_result_count"], 5);
     assert!(metadata.essential_inline.get("payload").is_none());
-    assert_eq!(metadata.spillable_text, vec!["hook feedback"]);
+    assert!(
+        metadata
+            .spillable_text
+            .iter()
+            .any(|text| text.contains("hook feedback"))
+    );
+    assert_eq!(metadata.outcome, ToolOutputOutcome::Success);
+}
+
+#[test]
+fn failed_post_context_publication_retains_native_success_and_stop_cause() {
+    let receipt = serde_json::json!({"effect_id": "committed-once"});
+    let wrapped = PostToolUseFeedbackOutput {
+        original: Box::new(codex_tools::JsonToolOutput::new(receipt.clone())),
+        model_visible: FunctionToolOutput::from_text(
+            "context publication failed; do not repeat".into(),
+            Some(true),
+        ),
+        context_error: Some("context publication failed; stop continuation".into()),
+    };
+    let payload = ToolPayload::Function {
+        arguments: "{}".into(),
+    };
+    assert!(wrapped.success_for_logging());
+    assert_eq!(wrapped.code_mode_result(&payload), receipt);
+    assert!(
+        wrapped.sampling_request_signal().unwrap()["post_tool_context_error"]
+            .as_str()
+            .unwrap()
+            .contains("stop")
+    );
+    let response = wrapped.to_response_item("call", &payload);
+    let text = consolidated_history_output_text(&response);
+    assert!(text.contains("committed-once"));
+    assert!(text.contains("do not repeat"));
 }
 
 #[test]
@@ -3252,8 +3436,11 @@ async fn verified10_external_dispatch_rejects_invalid_and_hook_rewritten_argumen
                 registry.code_mode_argument_preflight_counts(&name),
                 Some((1, if rewrite { 2 } else { 1 }))
             );
-            assert_eq!(mutation_tracker.lock().await.current_mutation_revision() > 0, rewrite,
-                "only an actually entered hook invalidates evidence, even when rewritten arguments fail");
+            assert_eq!(
+                mutation_tracker.lock().await.current_mutation_revision() > 0,
+                rewrite,
+                "only an actually entered hook invalidates evidence, even when rewritten arguments fail"
+            );
             errors.push(error);
         }
     }
@@ -3317,8 +3504,9 @@ async fn callable_alias_executes_same_identity_after_catalog_growth() {
         }
         fn cell_closed(&self, _: &codex_code_mode::CellId) {}
     }
-    let service =
-        codex_code_mode_runtime::InProcessCodeModeSession::with_delegate(Arc::new(IdentityDelegate));
+    let service = codex_code_mode_runtime::InProcessCodeModeSession::with_delegate(Arc::new(
+        IdentityDelegate,
+    ));
     let specs = [
         test_spec(&ToolName::plain("read_file")),
         test_spec(&ToolName::plain("read-file")),
@@ -3845,6 +4033,7 @@ fn post_tool_feedback_survives_code_mode_projection() {
                 serde_json::json!({ "typed": true }),
             )),
             model_visible,
+            context_error: None,
         }),
         model_projection: None,
         source_dependencies: None,
@@ -3853,15 +4042,13 @@ fn post_tool_feedback_survives_code_mode_projection() {
         }],
     };
 
-    assert_eq!(
-        result.into_response(),
-        ResponseInputItem::FunctionCallOutput {
-            call_id: "call-1".to_string(),
-            output: codex_protocol::models::FunctionCallOutputPayload::from_text(
-                "hook feedback".to_string()
-            ),
-        }
-    );
+    let ResponseInputItem::FunctionCallOutput { output, .. } = result.into_response() else {
+        panic!("function output");
+    };
+    assert_eq!(output.success, Some(true));
+    let text = history_output_body_text(&output.body).unwrap();
+    assert!(text.contains("typed"));
+    assert!(text.contains("hook feedback"));
 
     for original in [
         serde_json::json!({ "typed": true }),
@@ -3881,6 +4068,7 @@ fn post_tool_feedback_survives_code_mode_projection() {
             result: Box::new(PostToolUseFeedbackOutput {
                 original: Box::new(codex_tools::JsonToolOutput::new(original.clone())),
                 model_visible,
+                context_error: None,
             }),
             model_projection: None,
             source_dependencies: None,
@@ -4292,7 +4480,7 @@ fn custom_invocation_identity_preserves_raw_text_semantics() {
 }
 
 #[test]
-fn admission_normalizes_multi_text_output_without_dropping_non_text_content() {
+fn admission_preserves_multi_text_and_image_positions() {
     let original = ResponseInputItem::FunctionCallOutput {
         call_id: "multi-text-call".to_string(),
         output: FunctionCallOutputPayload {
@@ -4314,13 +4502,10 @@ fn admission_normalizes_multi_text_output_without_dropping_non_text_content() {
 
     assert_eq!(history_output_text(&original), None);
     let (normalized, text) =
-        normalize_admission_response(original).expect("normalized admission response");
+        normalize_admission_response(original.clone()).expect("normalized admission response");
 
     assert_eq!(text, "first\nsecond");
-    assert_eq!(
-        history_output_text(&normalized).as_deref(),
-        Some("first\nsecond")
-    );
+    assert_eq!(normalized, original);
     assert_eq!(
         preserved_non_text_content(&normalized),
         vec![
@@ -5138,6 +5323,7 @@ fn continuity_delivery_status_survives_output_wrappers_and_serialization() {
     let wrapped = PostToolUseFeedbackOutput {
         original: unavailable,
         model_visible: FunctionToolOutput::from_text("hook feedback".into(), Some(true)),
+        context_error: None,
     };
     assert!(wrapped.model_delivery_unavailable());
     assert!(wrapped.success_for_logging());
@@ -5145,4 +5331,73 @@ fn continuity_delivery_status_survives_output_wrappers_and_serialization() {
     let restored = serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
     assert!(is_model_delivery_unavailable_receipt(&restored, "call"));
     assert!(!is_model_delivery_unavailable_receipt(&restored, "other"));
+}
+#[tokio::test]
+async fn ctxaudit_direct_typed_images_do_not_spill_as_base64_text() {
+    for completed_history in [false, true] {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        Arc::make_mut(&mut turn.config).completed_tool_history_projection = completed_history;
+        let invocation = test_invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "image",
+            ToolName::plain("view_image"),
+        );
+        // Independently constructed, lossless PNG with a noncompressible pixel
+        // pattern: valid supported visual evidence, larger than the text cap.
+        let mut state = 0x1234_5678u32;
+        let pixels = image::RgbImage::from_fn(192, 192, |_, _| {
+            let mut pixel = [0u8; 3];
+            for channel in &mut pixel {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *channel = state as u8;
+            }
+            image::Rgb(pixel)
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        assert!(png.get_ref().len() > 32_000);
+        let image = FunctionCallOutputContentItem::InputImage {
+            image_url: format!(
+                "data:image/png;base64,{}",
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png.get_ref())
+            ),
+            detail: None,
+        };
+        let mut native = crate::tools::context::FunctionToolOutput::from_text(
+            "image attached".into(),
+            Some(true),
+        );
+        native.body.push(image.clone());
+        let mut result = AnyToolResult {
+            call_id: "image".into(),
+            payload: invocation.payload.clone(),
+            result: Box::new(native),
+            model_projection: None,
+            source_dependencies: None,
+            code_mode_feedback: Vec::new(),
+        };
+        let input =
+            prepare_model_projection(&invocation, &mut result, None, None, false, true).await;
+        let response = if let Some(input) = input {
+            project_model_output(input).await.unwrap().response()
+        } else {
+            result
+                .result
+                .to_response_item_with_projection_metadata(&result.call_id, &result.payload)
+                .0
+        };
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            panic!("typed function output")
+        };
+        let FunctionCallOutputBody::ContentItems(items) = output.body else {
+            panic!("image must not become text")
+        };
+        assert!(items.contains(&image));
+        assert!(!items.iter().any(|part| matches!(part, FunctionCallOutputContentItem::InputText { text } if text.contains("data:image"))));
+    }
 }

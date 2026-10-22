@@ -6,7 +6,6 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnEnvironment;
-use crate::state::ActiveTurn;
 use crate::test_harness::apps_test_server::AppsTestServer;
 use crate::test_harness::apps_test_server::AppsTestToolLoading;
 use crate::test_harness::apps_test_server::CALENDAR_EXTRACT_TEXT_TOOL_NAME;
@@ -2554,7 +2553,13 @@ async fn codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_resu
 async fn codex_apps_auth_elicitation_reports_refresh_failure_after_acceptance() {
     let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
     let manager = host_owned_codex_apps_manager(&session, &turn_context).await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    // Elicitations need a live, unclaimed owner of this turn; a taskless
+    // reservation cannot own an interaction.
+    *session.active_turn.lock().await = Some(
+        crate::session::elicitation_holders_tests::registry_interaction_owner(Arc::clone(
+            &turn_context,
+        )),
+    );
     let result = codex_apps_auth_failure_result();
     let metadata = codex_apps_auth_failure_metadata();
 
@@ -3714,7 +3719,13 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
     let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
     {
         let mut active_turn = session.active_turn.lock().await;
-        *active_turn = Some(ActiveTurn::default());
+        // Approval requests need a live, unclaimed owner of this turn; a
+        // taskless reservation cannot own an interaction.
+        *active_turn = Some(
+            crate::session::elicitation_holders_tests::registry_interaction_owner(Arc::clone(
+                &turn_context,
+            )),
+        );
     }
     let invocation = McpInvocation {
         server: "custom_server".to_string(),

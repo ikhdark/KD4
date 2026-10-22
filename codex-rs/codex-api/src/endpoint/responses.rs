@@ -8,7 +8,7 @@ use crate::requests::Compression;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
-use crate::sse::spawn_response_stream;
+use crate::sse::spawn_response_stream_with_dialect;
 use crate::telemetry::SseTelemetry;
 use bytes::Bytes;
 use codex_client::EncodedJsonBody;
@@ -27,6 +27,7 @@ use tracing::instrument;
 pub struct ResponsesClient<T: HttpTransport> {
     session: EndpointSession<T>,
     sse_telemetry: Option<Arc<dyn SseTelemetry>>,
+    ollama_single_summary: bool,
 }
 
 #[derive(Default)]
@@ -44,6 +45,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         Self {
             session: EndpointSession::new(transport, provider, auth),
             sse_telemetry: None,
+            ollama_single_summary: false,
         }
     }
 
@@ -55,6 +57,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
         Self {
             session: self.session.with_request_telemetry(request),
             sse_telemetry: sse,
+            ollama_single_summary: self.ollama_single_summary,
         }
     }
 
@@ -141,6 +144,12 @@ impl<T: HttpTransport> ResponsesClient<T> {
             .await
     }
 
+    /// Enable only for the registered Ollama provider's single-summary dialect.
+    pub fn with_ollama_summary_compat(mut self, enabled: bool) -> Self {
+        self.ollama_single_summary = enabled;
+        self
+    }
+
     async fn stream_encoded(
         &self,
         body: EncodedJsonBody,
@@ -170,11 +179,12 @@ impl<T: HttpTransport> ResponsesClient<T> {
             )
             .await?;
 
-        Ok(spawn_response_stream(
+        Ok(spawn_response_stream_with_dialect(
             stream_response,
             self.session.provider().stream_idle_timeout,
             self.sse_telemetry.clone(),
             turn_state,
+            self.ollama_single_summary,
         ))
     }
 }

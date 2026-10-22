@@ -154,7 +154,10 @@ impl OllamaClient {
                 self.host_root,
                 resp.status()
             );
-            Err(io::Error::other(OLLAMA_CONNECTION_ERROR))
+            Err(io::Error::other(format!(
+                "Ollama answered with HTTP {}. Check the configured endpoint and server error; authentication or route configuration may need attention.",
+                resp.status()
+            )))
         }
     }
 
@@ -181,24 +184,11 @@ impl OllamaClient {
                 resp.status()
             )));
         }
-        let val = resp.json::<JsonValue>().await.map_err(io::Error::other)?;
-        val.get("models")
-            .and_then(|m| m.as_array())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "No 'models' array in response")
-            })?
-            .iter()
-            .map(|model| {
-                model
-                    .get("name")
-                    .and_then(|name| name.as_str())
-                    .filter(|name| !name.trim().is_empty())
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid model name in response")
-                    })
-            })
-            .collect()
+        let value = resp.json::<JsonValue>().await.map_err(io::Error::other)?;
+        codex_model_provider_info::local::parse_model_ids(
+            codex_model_provider_info::ProviderKind::Ollama,
+            &value,
+        )
     }
 
     /// Query the server for its version string, returning `None` when unavailable.
@@ -282,11 +272,11 @@ impl OllamaClient {
                         let text = text.trim();
                         if text.is_empty() { continue; }
                         if let Ok(value) = serde_json::from_str::<JsonValue>(text) {
-                            for ev in pull_events_from_value(&value) { yield ev; }
                             if let Some(err_msg) = value.get("error").and_then(|e| e.as_str()) {
                                 yield PullEvent::Error(err_msg.to_string());
                                 return;
                             }
+                            for ev in pull_events_from_value(&value) { yield ev; }
                             // The parser already emitted `Success` for this line.
                             if let Some(status) = value.get("status").and_then(|s| s.as_str())
                                 && status == "success" { return; }
@@ -372,20 +362,24 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let listing = wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/tags"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"models": [{"name": "installed:latest"}]}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"models": [{"name": "installed:latest"}]})),
+            )
             .expect(1)
             .mount_as_scoped(&server)
             .await;
         let provider = create_oss_provider_with_base_url(&server.uri(), WireApi::Responses);
-        let (client, models) = OllamaClient::try_from_provider_with_models(&provider).await.unwrap();
+        let (client, models) = OllamaClient::try_from_provider_with_models(&provider)
+            .await
+            .unwrap();
         assert_eq!(models.unwrap(), vec!["installed:latest"]);
         drop(listing);
         wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"models": [{"name": "new:latest"}]}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"models": [{"name": "new:latest"}]})),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -397,11 +391,14 @@ mod tests {
     async fn setup_round_trip_benchmark() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
-            .respond_with(wiremock::ResponseTemplate::new(200)
-                .set_delay(Duration::from_millis(20))
-                .set_body_json(serde_json::json!({"models": [{"name": "installed"}]})))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(20))
+                    .set_body_json(serde_json::json!({"models": [{"name": "installed"}]})),
+            )
             .expect(30)
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let provider = create_oss_provider_with_base_url(&server.uri(), WireApi::Responses);
         let mut rows = Vec::new();
         for combined in [false, true] {
@@ -410,9 +407,18 @@ mod tests {
             for _ in 0..10 {
                 let start = std::time::Instant::now();
                 let models = if combined {
-                    OllamaClient::try_from_provider_with_models(&provider).await.unwrap().1.unwrap()
+                    OllamaClient::try_from_provider_with_models(&provider)
+                        .await
+                        .unwrap()
+                        .1
+                        .unwrap()
                 } else {
-                    OllamaClient::try_from_provider(&provider).await.unwrap().fetch_models().await.unwrap()
+                    OllamaClient::try_from_provider(&provider)
+                        .await
+                        .unwrap()
+                        .fetch_models()
+                        .await
+                        .unwrap()
                 };
                 assert_eq!(models, vec!["installed"]);
                 samples.push(start.elapsed().as_micros());
@@ -435,14 +441,17 @@ mod tests {
     async fn setup_keeps_malformed_listing_distinct_from_missing_models() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"models": [{"missing_name": true}]}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"models": [{"missing_name": true}]})),
+            )
             .expect(1)
             .mount(&server)
             .await;
         let provider = create_oss_provider_with_base_url(&server.uri(), WireApi::Responses);
-        let (_, models) = OllamaClient::try_from_provider_with_models(&provider).await.unwrap();
+        let (_, models) = OllamaClient::try_from_provider_with_models(&provider)
+            .await
+            .unwrap();
         assert_eq!(models.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
@@ -455,14 +464,18 @@ mod tests {
             .mount(&server)
             .await;
         wiremock::Mock::given(wiremock::matchers::path("/api/tags"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"models": [{"name": "installed:latest"}]}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"models": [{"name": "installed:latest"}]})),
+            )
             .expect(1)
             .mount(&server)
             .await;
-        let provider = create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
-        let (_, models) = OllamaClient::try_from_provider_with_models(&provider).await.unwrap();
+        let provider =
+            create_oss_provider_with_base_url(&format!("{}/v1", server.uri()), WireApi::Responses);
+        let (_, models) = OllamaClient::try_from_provider_with_models(&provider)
+            .await
+            .unwrap();
         assert_eq!(models.unwrap(), vec!["installed:latest"]);
     }
 
@@ -480,9 +493,10 @@ mod tests {
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/gateway/v1/api/tags"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"models": [{"name": "installed:latest"}]}),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"models": [{"name": "installed:latest"}]})),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -493,7 +507,10 @@ mod tests {
         let (_, models) = OllamaClient::try_from_provider_with_models(&provider)
             .await
             .expect("probe the configured API root");
-        assert_eq!(models.expect("native model listing"), vec!["installed:latest"]);
+        assert_eq!(
+            models.expect("native model listing"),
+            vec!["installed:latest"]
+        );
     }
 
     #[tokio::test]
@@ -657,6 +674,10 @@ mod tests {
 
         for (body, expected_error) in [
             (
+                "{\"status\":\"success\",\"error\":\"model unavailable\"}\n",
+                "Pull failed: model unavailable",
+            ),
+            (
                 "{\"error\":\"model unavailable\"}\n{\"status\":\"success\"}\n",
                 "Pull failed: model unavailable",
             ),
@@ -672,8 +693,7 @@ mod tests {
                     "model": "test-model", "stream": true
                 })))
                 .respond_with(
-                    wiremock::ResponseTemplate::new(200)
-                        .set_body_raw(body, "application/x-ndjson"),
+                    wiremock::ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"),
                 )
                 .expect(2)
                 .mount(&server)
@@ -692,7 +712,10 @@ mod tests {
                 assert_matches!(events.as_slice(), [PullEvent::Status(message)]
                     if message == "pulling layers");
             }
-            let error = client.pull_with_cli_progress("test-model").await.unwrap_err();
+            let error = client
+                .pull_with_cli_progress("test-model")
+                .await
+                .unwrap_err();
             assert_eq!(error.to_string(), expected_error);
         }
     }
@@ -704,10 +727,10 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/api/pull"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
-                "x".repeat(MAX_PULL_LINE_BYTES + 1),
-                "application/x-ndjson",
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("x".repeat(MAX_PULL_LINE_BYTES + 1), "application/x-ndjson"),
+            )
             .mount(&server)
             .await;
 
@@ -811,11 +834,25 @@ mod tests {
     async fn test_try_from_oss_provider_err_when_server_missing() {
         require_network();
 
+        // Nothing listens on a just-released local port: the connection is refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        let err = OllamaClient::try_from_provider_with_base_url(&format!("http://{address}/v1"))
+            .await
+            .err()
+            .expect("expected error");
+        assert_eq!(OLLAMA_CONNECTION_ERROR, err.to_string());
+
+        // A reachable server that answers with an HTTP error is not a missing server.
         let server = wiremock::MockServer::start().await;
         let err = OllamaClient::try_from_provider_with_base_url(&format!("{}/v1", server.uri()))
             .await
             .err()
             .expect("expected error");
-        assert_eq!(OLLAMA_CONNECTION_ERROR, err.to_string());
+        assert!(
+            err.to_string().starts_with("Ollama answered with HTTP 404"),
+            "{err}"
+        );
     }
 }

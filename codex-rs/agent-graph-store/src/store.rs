@@ -15,6 +15,16 @@ pub type AgentGraphStoreFuture<'a, T> =
 /// Implementations are expected to return stable ordering for list methods so callers can merge
 /// persisted graph state with live in-memory state without introducing nondeterministic output.
 pub trait AgentGraphStore: Send + Sync {
+    /// Reconcile retained/live edges with current durable parent authority, then
+    /// return reachable edges from the root. A durable incoming edge wins over
+    /// a supplied edge for the same child, including Closed/future-status edges.
+    /// Implementations must terminate on legacy cycles and avoid per-node I/O.
+    fn list_reconciled_thread_spawn_edges(
+        &self,
+        root_thread_id: ThreadId,
+        live_edges: Vec<(ThreadId, ThreadId)>,
+    ) -> AgentGraphStoreFuture<'_, Vec<(ThreadId, ThreadId)>>;
+
     /// Insert or replace the directional parent/child edge for a spawned thread.
     ///
     /// `child_thread_id` has at most one persisted parent, and persisted edges must remain

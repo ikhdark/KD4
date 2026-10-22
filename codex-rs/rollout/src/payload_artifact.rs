@@ -1,15 +1,173 @@
 //! Private on-disk indirection; public rollout readers still return full records.
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::RolloutItem;
+use sha2::Digest;
+use sha2::Sha256;
 use std::io;
 use std::io::Read;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use sha2::{Digest, Sha256};
-use codex_protocol::protocol::{EventMsg, RolloutItem};
+use std::path::Path;
+use std::path::PathBuf;
 
 const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const INLINE_BYTES: usize = 8 * 1024;
 pub(crate) const KIND: &str = "rollout_payload_artifact";
 const MAX_CONCURRENT_PAYLOAD_SYNCS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadDependencyVersion {
+    path: PathBuf,
+    stamp: Option<(
+        u64,
+        Option<std::time::SystemTime>,
+        Option<std::time::SystemTime>,
+    )>,
+}
+
+fn dependency_stamp(
+    path: &Path,
+) -> Option<(
+    u64,
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+)> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .map(|metadata| {
+            (
+                metadata.len(),
+                metadata.modified().ok(),
+                metadata.created().ok(),
+            )
+        })
+}
+
+/// Cold-cache reference discovery only; verification remains in the canonical
+/// hydrator. Warm pages stat these dependencies without replaying history.
+pub async fn payload_dependency_versions(path: &Path) -> io::Result<Vec<PayloadDependencyVersion>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let file = std::fs::File::open(&path)?;
+        let input: Box<dyn Read> = if path.extension().is_some_and(|extension| extension == "zst") {
+            Box::new(zstd::stream::read::Decoder::new(file)?)
+        } else {
+            Box::new(file)
+        };
+        let mut reader = std::io::BufReader::new(input);
+        let mut paths = std::collections::BTreeSet::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if !line.contains(KIND) {
+                continue;
+            }
+            let record: serde_json::Value =
+                serde_json::from_str(&line).map_err(io::Error::other)?;
+            if record["type"] != KIND {
+                continue;
+            }
+            let hash = record["payload"]["sha256"]
+                .as_str()
+                .filter(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .ok_or_else(|| io::Error::other("invalid rollout payload digest"))?;
+            paths.insert(root(&path).join(format!("{hash}.json")));
+        }
+        Ok(paths
+            .into_iter()
+            .map(|path| PayloadDependencyVersion {
+                stamp: dependency_stamp(&path),
+                path,
+            })
+            .collect())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+pub async fn payload_dependencies_unchanged(versions: &[PayloadDependencyVersion]) -> bool {
+    let versions = versions.to_vec();
+    tokio::task::spawn_blocking(move || {
+        versions.iter().all(|version| {
+            version.stamp.is_some() && dependency_stamp(&version.path) == version.stamp
+        })
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Stamps every payload a rollout names, so a known payload gap can be reused.
+/// Unlike [`payload_dependency_versions`], records that cannot name a payload
+/// are skipped instead of failing the scan: no artifact change repairs them.
+pub(crate) async fn named_payload_versions(
+    path: &Path,
+) -> io::Result<Vec<PayloadDependencyVersion>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::BufRead;
+        let file = std::fs::File::open(&path)?;
+        let input: Box<dyn Read> = if path.extension().is_some_and(|extension| extension == "zst") {
+            Box::new(zstd::stream::read::Decoder::new(file)?)
+        } else {
+            Box::new(file)
+        };
+        let mut reader = std::io::BufReader::new(input);
+        let mut paths = std::collections::BTreeSet::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            if !text.contains(KIND) {
+                continue;
+            }
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if record["type"] != KIND {
+                continue;
+            }
+            if let Some(hash) = record["payload"]["sha256"].as_str().filter(|hash| {
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                paths.insert(root(&path).join(format!("{hash}.json")));
+            }
+        }
+        Ok(paths
+            .into_iter()
+            .map(|path| PayloadDependencyVersion {
+                stamp: dependency_stamp(&path),
+                path,
+            })
+            .collect())
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Unlike [`payload_dependencies_unchanged`], a payload that was missing still
+/// matches while it stays missing: a known gap is read again only once a named
+/// payload appears, is replaced, or is repaired.
+pub(crate) async fn payload_versions_match(versions: &[PayloadDependencyVersion]) -> bool {
+    let versions = versions.to_vec();
+    tokio::task::spawn_blocking(move || {
+        versions
+            .iter()
+            .all(|version| dependency_stamp(&version.path) == version.stamp)
+    })
+    .await
+    .unwrap_or(false)
+}
 
 #[derive(Default)]
 struct PendingSync {
@@ -29,10 +187,17 @@ pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
     let directory = root(path);
     let rollout = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let pending = pending_sync().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-            .paths.iter().filter(|((owner, _), _)| owner == &rollout)
-            .map(|(path, sequence)| (path.clone(), *sequence)).collect::<Vec<_>>();
-        if pending.is_empty() { return Ok(()); }
+        let pending = pending_sync()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .paths
+            .iter()
+            .filter(|((owner, _), _)| owner == &rollout)
+            .map(|(path, sequence)| (path.clone(), *sequence))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
         #[cfg(test)]
         let hook = sync_test_hooks().lock().unwrap().get(&rollout).cloned();
         let parallelism = MAX_CONCURRENT_PAYLOAD_SYNCS;
@@ -40,19 +205,29 @@ pub(crate) async fn sync_payload_artifacts(path: &Path) -> io::Result<()> {
         let parallelism = hook.as_ref().map_or(parallelism, |hook| hook.parallelism);
         sync_payload_files(&pending, parallelism, |path| {
             #[cfg(test)]
-            if let Some(hook) = &hook { (hook.before_sync)(path)?; }
-            std::fs::OpenOptions::new().read(true).write(true).open(path)?.sync_all()
+            if let Some(hook) = &hook {
+                (hook.before_sync)(path)?;
+            }
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?
+                .sync_all()
         })?;
         #[cfg(unix)]
         std::fs::File::open(&directory)?.sync_all()?;
-        let mut registry = pending_sync().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut registry = pending_sync()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (path, sequence) in pending {
             if registry.paths.get(&path) == Some(&sequence) {
                 registry.paths.remove(&path);
             }
         }
         Ok(())
-    }).await.map_err(io::Error::other)?
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 /// Independent immutable payloads can sync concurrently, but the rollout must
@@ -63,9 +238,13 @@ fn sync_payload_files(
     parallelism: usize,
     sync_file: impl Fn(&Path) -> io::Result<()> + Sync,
 ) -> io::Result<()> {
-    let workers = parallelism.clamp(1, MAX_CONCURRENT_PAYLOAD_SYNCS).min(pending.len());
+    let workers = parallelism
+        .clamp(1, MAX_CONCURRENT_PAYLOAD_SYNCS)
+        .min(pending.len());
     if workers <= 1 {
-        return pending.iter().try_for_each(|((_, path), _)| sync_file(path));
+        return pending
+            .iter()
+            .try_for_each(|((_, path), _)| sync_file(path));
     }
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
@@ -76,14 +255,21 @@ fn sync_payload_files(
                 chunk.iter().try_for_each(|((_, path), _)| sync_file(path))
             }) {
                 Ok(handle) => handles.push(handle),
-                Err(error) => { result = Err(error); break; }
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
             }
         }
         // Join successful siblings even after a failure or panic. A failed
         // barrier acknowledges nothing, so an explicit retry is lossless.
         for handle in handles {
-            let joined = handle.join().unwrap_or_else(|_| Err(io::Error::other("payload sync worker panicked")));
-            if result.is_ok() { result = joined; }
+            let joined = handle
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("payload sync worker panicked")));
+            if result.is_ok() {
+                result = joined;
+            }
         }
         result
     })
@@ -100,20 +286,28 @@ pub(crate) struct SyncTestHook {
 }
 
 #[cfg(test)]
-pub(crate) fn sync_test_hooks() -> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, SyncTestHook>> {
-    static HOOKS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<PathBuf, SyncTestHook>>> = std::sync::OnceLock::new();
+pub(crate) fn sync_test_hooks()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, SyncTestHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<PathBuf, SyncTestHook>>,
+    > = std::sync::OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
 
 pub(crate) fn root(path: &Path) -> PathBuf {
     for ancestor in path.ancestors().skip(1) {
-        if ancestor.file_name().is_some_and(|name|
-            name == crate::SESSIONS_SUBDIR || name == crate::ARCHIVED_SESSIONS_SUBDIR)
-        {
-            return ancestor.parent().unwrap_or(ancestor).join("rollout-payloads");
+        if ancestor.file_name().is_some_and(|name| {
+            name == crate::SESSIONS_SUBDIR || name == crate::ARCHIVED_SESSIONS_SUBDIR
+        }) {
+            return ancestor
+                .parent()
+                .unwrap_or(ancestor)
+                .join("rollout-payloads");
         }
     }
-    path.parent().unwrap_or(Path::new(".")).join("rollout-payloads")
+    path.parent()
+        .unwrap_or(Path::new("."))
+        .join("rollout-payloads")
 }
 
 /// Held from opening an append owner through its last reference publication.
@@ -121,89 +315,112 @@ pub(crate) fn root(path: &Path) -> PathBuf {
 pub(crate) fn lock_publication(path: &Path) -> io::Result<std::fs::File> {
     let directory = root(path);
     std::fs::create_dir_all(&directory)?;
-    let file = std::fs::File::options().read(true).write(true).create(true).truncate(false)
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
         .open(directory.join(".retention.lock"))?;
     file.lock_shared()?;
     Ok(file)
 }
 
-/// Conservative bounded collection. Busy writers, corrupt histories, unknown
-/// layouts and incomplete scans retain every blob rather than guessing reachability.
+/// Collection is deferred until every authoritative rollout root and publisher
+/// participates in retention ownership. Explicit resume paths can live outside
+/// the session directories, and older writers do not take the retention lock.
+/// Neither a bounded directory scan nor an age cutoff proves a blob is unused.
+/// Keep the optional-maintenance error explicit instead of reporting reclamation
+/// success while silently accumulating retained orphan bytes.
 pub async fn reclaim_payload_artifacts(home: &Path) -> io::Result<usize> {
-    let Some(moves) = crate::try_lock_rollout_moves(home).await? else { return Ok(0); };
-    let home = home.to_path_buf();
+    let directory = home.join("rollout-payloads");
     tokio::task::spawn_blocking(move || {
-        use std::io::BufRead;
-        let _moves = moves;
-        let directory = home.join("rollout-payloads");
-        if !directory.try_exists()? { return Ok(0); }
-        let lock = std::fs::File::options().read(true).write(true).create(true).truncate(false)
-            .open(directory.join(".retention.lock"))?;
-        match lock.try_lock() {
-            Ok(()) => {},
-            Err(std::fs::TryLockError::WouldBlock) => return Ok(0),
+        reclaim_abandoned_payload_stages(&directory, std::time::SystemTime::now())
+    })
+    .await
+    .map_err(io::Error::other)??;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "payload collection deferred: complete rollout roots and publisher ownership are not established",
+    ))
+}
+
+const PAYLOAD_STAGE_PREFIX: &str = "payload-stage-v1-";
+const PAYLOAD_STAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+fn payload_stage(directory: &Path) -> io::Result<tempfile::NamedTempFile> {
+    let file = tempfile::Builder::new()
+        .prefix(PAYLOAD_STAGE_PREFIX)
+        .suffix(".pending")
+        .tempfile_in(directory)?;
+    // Admission precedes the first retained byte. Normal Drop still owns error
+    // cleanup; after process death this recognizable, unlocked stage is collectible.
+    file.as_file().try_lock().map_err(io::Error::from)?;
+    Ok(file)
+}
+
+fn reclaim_abandoned_payload_stages(
+    directory: &Path,
+    now: std::time::SystemTime,
+) -> io::Result<usize> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(tag) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(PAYLOAD_STAGE_PREFIX))
+            .and_then(|name| name.strip_suffix(".pending"))
+        else {
+            continue;
+        };
+        if tag.is_empty() || !tag.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || !now
+                .duration_since(metadata.modified()?)
+                .is_ok_and(|age| age >= PAYLOAD_STAGE_GRACE)
+        {
+            continue;
+        }
+        let owner = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        match owner.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => continue,
             Err(error) => return Err(error.into()),
         }
-        let mut referenced = std::collections::HashSet::new();
-        let mut stack = vec![home.join(crate::SESSIONS_SUBDIR), home.join(crate::ARCHIVED_SESSIONS_SUBDIR)];
-        // Uncommitted/recoverable deletion staging is retained evidence too.
-        for entry in std::fs::read_dir(&home)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("thread-delete-") {
-                stack.push(entry.path());
-            }
+        // Recheck after admission; never remove a fresh/replaced pathname based
+        // on the inventory's age. Final CAS objects and legacy anonymous names
+        // are deliberately outside this private staging contract.
+        let current = std::fs::symlink_metadata(&path)?;
+        let held = owner.metadata()?;
+        if !current.is_file()
+            || current.len() != held.len()
+            || current.modified()? != held.modified()?
+            || current.created().ok() != held.created().ok()
+            || !now
+                .duration_since(current.modified()?)
+                .is_ok_and(|age| age >= PAYLOAD_STAGE_GRACE)
+        {
+            continue;
         }
-        let mut entries_left = 100_000usize;
-        let mut bytes_left = 128 * 1024 * 1024usize;
-        while let Some(path) = stack.pop() {
-            let metadata = match std::fs::symlink_metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound && (path == home.join(crate::SESSIONS_SUBDIR) || path == home.join(crate::ARCHIVED_SESSIONS_SUBDIR)) => continue,
-                Err(error) => return Err(error),
-            };
-            if metadata.file_type().is_symlink() { return Err(io::Error::other("payload sweep encountered a symlink")); }
-            if metadata.is_dir() {
-                for entry in std::fs::read_dir(path)? {
-                    entries_left = entries_left.checked_sub(1).ok_or_else(|| io::Error::other("payload sweep entry budget exceeded"))?;
-                    stack.push(entry?.path());
-                }
-                continue;
-            }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if !name.ends_with(".jsonl") && !name.ends_with(".jsonl.zst") { continue; }
-            let file = std::fs::File::open(&path)?;
-            let reader: Box<dyn std::io::Read> = if name.ends_with(".zst") {
-                Box::new(zstd::stream::read::Decoder::new(file)?)
-            } else { Box::new(file) };
-            let mut reader = std::io::BufReader::new(reader);
-            loop {
-                let mut line = Vec::new();
-                let read = (&mut reader).take(bytes_left as u64 + 1).read_until(b'\n', &mut line)?;
-                if read == 0 { break; }
-                bytes_left = bytes_left.checked_sub(read).ok_or_else(|| io::Error::other("payload sweep byte budget exceeded"))?;
-                let value: serde_json::Value = serde_json::from_slice(&line)?;
-                if value["type"] == KIND {
-                    let hash = value["payload"]["sha256"].as_str().ok_or_else(|| io::Error::other("invalid payload reference"))?;
-                    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(io::Error::other("invalid payload digest")); }
-                    referenced.insert(hash.to_string());
-                }
-            }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        let mut garbage = Vec::new();
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
-            entries_left = entries_left.checked_sub(1).ok_or_else(|| io::Error::other("payload sweep entry budget exceeded"))?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(hash) = name.strip_suffix(".json")
-                && hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                && entry.file_type()?.is_file() && !referenced.contains(hash)
-            { garbage.push(entry.path()); }
-        }
-        let mut removed = 0;
-        for path in garbage { std::fs::remove_file(path)?; removed += 1; }
-        Ok(removed)
-    }).await.map_err(io::Error::other)?
+    }
+    Ok(removed)
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -228,22 +445,28 @@ pub(crate) fn is_artifact_candidate(item: &RolloutItem) -> bool {
 /// Failures fall back to the original inline record at the writer boundary.
 /// The caller selects eligible items with `is_artifact_candidate`.
 pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
-    if line.len() < INLINE_BYTES { return Ok(line.to_vec()); }
+    if line.len() < INLINE_BYTES {
+        return Ok(line.to_vec());
+    }
     let mut item: serde_json::Value = serde_json::from_slice(line)?;
     // Full tool-manifest definitions are usually byte-identical across threads,
     // so the content address stores one copy for every rollout that uses them.
-    let fields = item.as_object_mut().ok_or_else(|| io::Error::other("invalid rollout object"))?;
+    let fields = item
+        .as_object_mut()
+        .ok_or_else(|| io::Error::other("invalid rollout object"))?;
     let timestamp = fields.remove("timestamp");
     let format_version = fields.remove("format_version");
     let bytes = serde_json::to_vec(&item)?;
-    if bytes.len() as u64 > MAX_PAYLOAD_BYTES { return Ok(line.to_vec()); }
+    if bytes.len() as u64 > MAX_PAYLOAD_BYTES {
+        return Ok(line.to_vec());
+    }
     let sha256 = digest(&bytes);
     let directory = root(path);
     std::fs::create_dir_all(&directory)?;
     let destination = directory.join(format!("{sha256}.json"));
     let mut published_here = false;
     if !destination.exists() {
-        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        let mut temporary = payload_stage(&directory)?;
         temporary.write_all(&bytes)?;
         match temporary.persist_noclobber(&destination) {
             // The destination is exactly the complete temporary file we wrote.
@@ -258,14 +481,20 @@ pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
     if !published_here && read_payload(&directory, &sha256, bytes.len() as u64).is_err() {
         // Repair the shared directory entry atomically, without truncating it
         // or following a substituted symlink.
-        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        let mut temporary = payload_stage(&directory)?;
         temporary.write_all(&bytes)?;
-        temporary.persist(&destination).map_err(|error| error.error)?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| error.error)?;
     }
-    let mut pending = pending_sync().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut pending = pending_sync()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     pending.sequence = pending.sequence.saturating_add(1);
     let sequence = pending.sequence;
-    pending.paths.insert((path.to_path_buf(), destination), sequence);
+    pending
+        .paths
+        .insert((path.to_path_buf(), destination), sequence);
     drop(pending);
     let mut reference = serde_json::json!({
         "timestamp": timestamp, "format_version": format_version,
@@ -278,7 +507,8 @@ pub(crate) fn store_line(path: &Path, line: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8>> {
-    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    if sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
         || bytes > MAX_PAYLOAD_BYTES
     {
         return Err(io::Error::other("invalid rollout payload reference"));
@@ -286,10 +516,14 @@ fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8
     let path = directory.join(format!("{sha256}.json"));
     let metadata = std::fs::symlink_metadata(&path)?;
     if !metadata.file_type().is_file() || metadata.len() != bytes {
-        return Err(io::Error::other("rollout payload is missing, replaced, or incomplete"));
+        return Err(io::Error::other(
+            "rollout payload is missing, replaced, or incomplete",
+        ));
     }
     let mut payload = Vec::new();
-    std::fs::File::open(path)?.take(bytes.saturating_add(1)).read_to_end(&mut payload)?;
+    std::fs::File::open(path)?
+        .take(bytes.saturating_add(1))
+        .read_to_end(&mut payload)?;
     if payload.len() as u64 != bytes || digest(&payload) != sha256 {
         return Err(io::Error::other("rollout payload checksum mismatch"));
     }
@@ -297,19 +531,72 @@ fn read_payload(directory: &Path, sha256: &str, bytes: u64) -> io::Result<Vec<u8
 }
 
 pub(crate) fn hydrate_line(path: &Path, line: String) -> io::Result<String> {
-    if !line.contains(KIND) { return Ok(line); }
+    hydrate_line_with_enrollment(path, line, false)
+}
+
+pub(crate) fn hydrate_line_with_enrollment(
+    path: &Path,
+    line: String,
+    enroll: bool,
+) -> io::Result<String> {
+    hydrate_line_with_limit(path, line, enroll, u64::MAX)
+}
+
+pub(crate) fn hydrate_line_bounded(
+    path: &Path,
+    line: String,
+    max_bytes: u64,
+) -> io::Result<String> {
+    hydrate_line_with_limit(path, line, false, max_bytes)
+}
+
+fn hydrate_line_with_limit(
+    path: &Path,
+    line: String,
+    enroll: bool,
+    max_bytes: u64,
+) -> io::Result<String> {
+    if !line.contains(KIND) {
+        return Ok(line);
+    }
     let reference: serde_json::Value = match serde_json::from_str(&line) {
         Ok(value) => value,
         Err(_) => return Ok(line), // Preserve the existing torn-line handling.
     };
-    if reference["type"] != KIND { return Ok(line); }
-    let sha256 = reference["payload"]["sha256"].as_str()
+    if reference["type"] != KIND {
+        return Ok(line);
+    }
+    let sha256 = reference["payload"]["sha256"]
+        .as_str()
         .ok_or_else(|| io::Error::other("rollout payload has no hash"))?;
-    let bytes = reference["payload"]["bytes"].as_u64()
+    let bytes = reference["payload"]["bytes"]
+        .as_u64()
         .ok_or_else(|| io::Error::other("rollout payload has no byte length"))?;
-    let mut item: serde_json::Value = serde_json::from_slice(&read_payload(&root(path), sha256, bytes)?)?;
+    if bytes > max_bytes {
+        return Err(io::Error::other(format!(
+            "rollout payload exceeds the remaining {max_bytes}-byte export budget"
+        )));
+    }
+    let mut item: serde_json::Value =
+        serde_json::from_slice(&read_payload(&root(path), sha256, bytes)?)?;
     if item["type"] != reference["payload"]["item_type"] || item["type"] == KIND {
         return Err(io::Error::other("rollout payload type mismatch"));
+    }
+    if enroll {
+        let mut pending = pending_sync()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.sequence = pending.sequence.saturating_add(1);
+        let sequence = pending.sequence;
+        // A cold reader observes `.jsonl.zst`, but the writer's durable barrier
+        // syncs dependencies keyed by the materialized plain rollout path.
+        pending.paths.insert(
+            (
+                crate::compression::plain_rollout_path(path),
+                root(path).join(format!("{sha256}.json")),
+            ),
+            sequence,
+        );
     }
     item["timestamp"] = reference["timestamp"].clone();
     item["format_version"] = reference["format_version"].clone();
@@ -320,39 +607,177 @@ pub(crate) fn hydrate_line(path: &Path, line: String) -> io::Result<String> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn sweep_preserves_shared_archived_staged_and_inflight_references() {
+    #[test]
+    fn audit63_only_dead_owned_payload_stages_collect_after_grace() {
         let home = tempfile::tempdir().unwrap();
-        let active = home.path().join("sessions/active.jsonl");
-        let archived = home.path().join("archived_sessions/archive.jsonl.zst");
-        let staged = home.path().join("thread-delete-v2-fixture/unindexed/thread/sessions/staged.jsonl");
-        for path in [&active, &archived, &staged] { std::fs::create_dir_all(path.parent().unwrap()).unwrap(); }
-        let line = serde_json::to_vec(&serde_json::json!({"type":"event_msg", "payload":{"text":"x".repeat(INLINE_BYTES)}})).unwrap();
-        let publication = lock_publication(&active).unwrap();
-        let reference = store_line(&active, &line).unwrap();
-        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0, "inflight publication owns the unreferenced blob");
-        std::fs::write(&active, &reference).unwrap();
-        std::fs::write(&archived, zstd::stream::encode_all(reference.as_slice(), 0).unwrap()).unwrap();
-        std::fs::write(&staged, &reference).unwrap();
-        drop(publication);
-        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
-        std::fs::remove_file(&active).unwrap();
-        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
-        std::fs::remove_file(&archived).unwrap();
-        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
-        std::fs::remove_file(&staged).unwrap();
-        std::fs::write(&active, b"corrupt history").unwrap();
-        assert!(reclaim_payload_artifacts(home.path()).await.is_err());
-        std::fs::remove_file(&active).unwrap();
-        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 1);
-        assert_eq!(reclaim_payload_artifacts(home.path()).await.unwrap(), 0);
+        let mut live = payload_stage(home.path()).unwrap();
+        live.write_all(b"live publication").unwrap();
+        let mut dead = payload_stage(home.path()).unwrap();
+        dead.write_all(b"dead publication").unwrap();
+        let (dead_file, dead_path) = dead.keep().unwrap();
+        drop(dead_file); // Simulate process death without its RAII cleanup.
+        let legacy = home.path().join(".tmp-unowned");
+        std::fs::write(&legacy, b"unattributed evidence").unwrap();
+        let now = std::time::SystemTime::now();
+        assert_eq!(
+            reclaim_abandoned_payload_stages(home.path(), now).unwrap(),
+            0
+        );
+        assert_eq!(
+            reclaim_abandoned_payload_stages(
+                home.path(),
+                now + PAYLOAD_STAGE_GRACE + std::time::Duration::from_secs(1)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(!dead_path.exists());
+        assert!(live.path().exists());
+        assert_eq!(std::fs::read(legacy).unwrap(), b"unattributed evidence");
+    }
+
+    #[tokio::test]
+    async fn durable_audit_02_resumed_dependencies_reenter_the_durable_barrier() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("sessions/resumed.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let line = serde_json::to_vec(&serde_json::json!({"type": "event_msg", "payload": {"text": "x".repeat(INLINE_BYTES)}})).unwrap();
+        let reference = store_line(&path, &line).unwrap();
+        std::fs::write(&path, &reference).unwrap();
+        pending_sync()
+            .lock()
+            .unwrap()
+            .paths
+            .retain(|(owner, _), _| owner != &path);
+        let mut reader = crate::open_rollout_line_reader(&path).await.unwrap();
+        reader.enroll_payload_dependencies();
+        reader.next_line().await.unwrap().unwrap();
+        assert_eq!(
+            pending_sync()
+                .lock()
+                .unwrap()
+                .paths
+                .keys()
+                .filter(|(owner, _)| owner == &path)
+                .count(),
+            1
+        );
+        sync_payload_artifacts(&path).await.unwrap();
+        assert!(
+            !pending_sync()
+                .lock()
+                .unwrap()
+                .paths
+                .keys()
+                .any(|(owner, _)| owner == &path)
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_resume_enrolls_dependencies_under_the_writer_path() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("sessions/cold.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let line = serde_json::to_vec(&serde_json::json!({"type": "event_msg", "payload": {"text": "x".repeat(INLINE_BYTES)}})).unwrap();
+        let reference = store_line(&path, &line).unwrap();
+        // Only the cold representation exists, as before resume materializes it.
+        let compressed = crate::compression::compressed_rollout_path(&path);
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(reference.as_slice(), 0).unwrap(),
+        )
+        .unwrap();
+        pending_sync()
+            .lock()
+            .unwrap()
+            .paths
+            .retain(|(owner, _), _| owner != &path && owner != &compressed);
+        let mut reader = crate::open_rollout_line_reader(&path).await.unwrap();
+        reader.enroll_payload_dependencies();
+        reader.next_line().await.unwrap().unwrap();
+        {
+            let pending = pending_sync().lock().unwrap();
+            assert_eq!(
+                pending
+                    .paths
+                    .keys()
+                    .filter(|(owner, _)| owner == &path)
+                    .count(),
+                1
+            );
+            assert!(!pending.paths.keys().any(|(owner, _)| owner == &compressed));
+        }
+        // The writer's barrier names the plain path and must acknowledge them.
+        sync_payload_artifacts(&path).await.unwrap();
+        assert!(
+            !pending_sync()
+                .lock()
+                .unwrap()
+                .paths
+                .keys()
+                .any(|(owner, _)| owner == &path)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_audit_21_dependency_stamps_invalidate_on_loss_and_repair() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("sessions/source.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let line = serde_json::to_vec(&serde_json::json!({"type": "event_msg", "payload": {"text": "x".repeat(INLINE_BYTES)}})).unwrap();
+        let reference = store_line(&path, &line).unwrap();
+        std::fs::write(&path, reference).unwrap();
+        let versions = payload_dependency_versions(&path).await.unwrap();
+        assert!(payload_dependencies_unchanged(&versions).await);
+        let bytes = std::fs::read(&versions[0].path).unwrap();
+        std::fs::remove_file(&versions[0].path).unwrap();
+        assert!(!payload_dependencies_unchanged(&versions).await);
+        let missing = payload_dependency_versions(&path).await.unwrap();
+        assert!(!payload_dependencies_unchanged(&missing).await);
+        std::fs::write(&versions[0].path, bytes).unwrap();
+        assert!(!payload_dependencies_unchanged(&missing).await);
+        assert!(
+            payload_dependencies_unchanged(&payload_dependency_versions(&path).await.unwrap())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_defers_without_deleting_external_or_unpublished_payloads() {
+        let home = tempfile::tempdir().unwrap();
+        let external = home.path().join("imported.jsonl");
+        let line = serde_json::to_vec(&serde_json::json!({
+            "timestamp":"2026-10-19T00:00:00Z", "format_version":1,
+            "type":"event_msg", "payload":{"text":"x".repeat(INLINE_BYTES)}
+        }))
+        .unwrap();
+        let reference = store_line(&external, &line).unwrap();
+        std::fs::write(&external, &reference).unwrap();
+        for referenced in [true, false] {
+            if !referenced {
+                std::fs::remove_file(&external).unwrap();
+            }
+            let error = reclaim_payload_artifacts(home.path()).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            // An old publisher may not have appended its reference yet. Both
+            // that case and a supported external root must retain exact bytes.
+            let decoded =
+                hydrate_line(&external, String::from_utf8(reference.clone()).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&decoded).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&line).unwrap()
+            );
+        }
     }
 
     #[test]
     fn parallel_payload_sync_is_bounded_and_joins_failed_or_panicking_siblings() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
         for failure in ["none", "error", "panic"] {
-            let pending = (0..8).map(|i| ((PathBuf::new(), PathBuf::from(i.to_string())), 0)).collect::<Vec<_>>();
+            let pending = (0..8)
+                .map(|i| ((PathBuf::new(), PathBuf::from(i.to_string())), 0))
+                .collect::<Vec<_>>();
             let barrier = std::sync::Barrier::new(8);
             let active = AtomicUsize::new(0);
             let peak = AtomicUsize::new(0);
@@ -362,7 +787,9 @@ mod tests {
                 barrier.wait();
                 if path == Path::new("0") && failure != "none" {
                     active.fetch_sub(1, Ordering::SeqCst);
-                    if failure == "panic" { panic!("injected worker panic"); }
+                    if failure == "panic" {
+                        panic!("injected worker panic");
+                    }
                     return Err(io::Error::other("injected sync failure"));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -372,69 +799,129 @@ mod tests {
             });
             assert_eq!(result.is_ok(), failure == "none");
             assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_PAYLOAD_SYNCS);
-            assert_eq!(active.load(Ordering::SeqCst), 0, "all started siblings must settle");
-            assert_eq!(completed.load(Ordering::SeqCst), if failure == "none" { 8 } else { 7 });
+            assert_eq!(
+                active.load(Ordering::SeqCst),
+                0,
+                "all started siblings must settle"
+            );
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                if failure == "none" { 8 } else { 7 }
+            );
         }
-        let pending = (0..65).map(|i| ((PathBuf::new(), PathBuf::from(i.to_string())), 0)).collect::<Vec<_>>();
+        let pending = (0..65)
+            .map(|i| ((PathBuf::new(), PathBuf::from(i.to_string())), 0))
+            .collect::<Vec<_>>();
         let completed = AtomicUsize::new(0);
         // More files than the limit must not add workers, whatever the caller requests.
-        let workers = std::sync::Mutex::new(std::collections::HashSet::<std::thread::ThreadId>::new());
+        let workers =
+            std::sync::Mutex::new(std::collections::HashSet::<std::thread::ThreadId>::new());
         sync_payload_files(&pending, usize::MAX, |_| {
             workers.lock().unwrap().insert(std::thread::current().id());
             completed.fetch_add(1, Ordering::SeqCst);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(completed.load(Ordering::SeqCst), pending.len());
-        assert_eq!(workers.into_inner().unwrap().len(), MAX_CONCURRENT_PAYLOAD_SYNCS);
+        assert_eq!(
+            workers.into_inner().unwrap().len(),
+            MAX_CONCURRENT_PAYLOAD_SYNCS
+        );
         sync_payload_files(&[], 8, |_| panic!("empty barrier must not perform I/O")).unwrap();
     }
 
     #[tokio::test]
     async fn cancelled_payload_barrier_keeps_ownership_and_newer_publications() {
-        use std::sync::{Arc, Condvar, Mutex};
+        use std::sync::Arc;
+        use std::sync::Condvar;
+        use std::sync::Mutex;
         use std::time::Duration;
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("rollout.jsonl");
-        let lines = (0..8).map(|i| serde_json::to_vec(&serde_json::json!({
-            "type":"event_msg", "payload":{"index":i,"saved":"exact bytes".repeat(2000)}
-        })).unwrap()).collect::<Vec<_>>();
-        for line in &lines { store_line(&path, line).unwrap(); }
+        let lines = (0..8)
+            .map(|i| {
+                serde_json::to_vec(&serde_json::json!({
+                    "type":"event_msg", "payload":{"index":i,"saved":"exact bytes".repeat(2000)}
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for line in &lines {
+            store_line(&path, line).unwrap();
+        }
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let blocked = Arc::clone(&gate);
         let (entered, started) = tokio::sync::oneshot::channel();
         let entered = Mutex::new(Some(entered));
-        sync_test_hooks().lock().unwrap().insert(path.clone(), SyncTestHook {
-            parallelism: 8,
-            before_sync: Arc::new(move |_| {
-                if let Some(entered) = entered.lock().unwrap().take() { let _ = entered.send(()); }
-                let released = blocked.1.wait_timeout_while(blocked.0.lock().unwrap(), Duration::from_secs(5), |value| !*value).unwrap();
-                if !*released.0 { return Err(io::Error::other("test did not release blocked storage")); }
-                Ok(())
-            }),
-        });
+        sync_test_hooks().lock().unwrap().insert(
+            path.clone(),
+            SyncTestHook {
+                parallelism: 8,
+                before_sync: Arc::new(move |_| {
+                    if let Some(entered) = entered.lock().unwrap().take() {
+                        let _ = entered.send(());
+                    }
+                    let released = blocked
+                        .1
+                        .wait_timeout_while(
+                            blocked.0.lock().unwrap(),
+                            Duration::from_secs(5),
+                            |value| !*value,
+                        )
+                        .unwrap();
+                    if !*released.0 {
+                        return Err(io::Error::other("test did not release blocked storage"));
+                    }
+                    Ok(())
+                }),
+            },
+        );
         let observed_path = path.clone();
         let observer = tokio::spawn(async move { sync_payload_artifacts(&observed_path).await });
-        tokio::time::timeout(Duration::from_secs(2), started).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started)
+            .await
+            .unwrap()
+            .unwrap();
         observer.abort();
         assert!(observer.await.unwrap_err().is_cancelled());
         // No registry mutex is held by stalled I/O. Another rollout completes,
         // and a repeated publication gets a newer sequence during the barrier.
         let other = home.path().join("other.jsonl");
         store_line(&other, &lines[0]).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), sync_payload_artifacts(&other)).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sync_payload_artifacts(&other))
+            .await
+            .unwrap()
+            .unwrap();
         store_line(&path, &lines[0]).unwrap();
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let remaining = pending_sync().lock().unwrap().paths.keys().filter(|(owner, _)| owner == &path).count();
-                if remaining == 1 { break; }
+                let remaining = pending_sync()
+                    .lock()
+                    .unwrap()
+                    .paths
+                    .keys()
+                    .filter(|(owner, _)| owner == &path)
+                    .count();
+                if remaining == 1 {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await.expect("cancelled observer must not cancel acknowledgement of its old prefix");
+        })
+        .await
+        .expect("cancelled observer must not cancel acknowledgement of its old prefix");
         sync_test_hooks().lock().unwrap().remove(&path);
         sync_payload_artifacts(&path).await.unwrap();
-        assert!(!pending_sync().lock().unwrap().paths.keys().any(|(owner, _)| owner == &path));
+        assert!(
+            !pending_sync()
+                .lock()
+                .unwrap()
+                .paths
+                .keys()
+                .any(|(owner, _)| owner == &path)
+        );
     }
 
     #[tokio::test]
@@ -445,16 +932,37 @@ mod tests {
             "type":"patch_apply_end", "saved":"undo bytes".repeat(2000)
         }});
         let line = serde_json::to_vec(&item).unwrap();
-        let reference: serde_json::Value = serde_json::from_slice(&store_line(&path, &line).unwrap()).unwrap();
-        let blob = root(&path).join(format!("{}.json", reference["payload"]["sha256"].as_str().unwrap()));
+        let reference: serde_json::Value =
+            serde_json::from_slice(&store_line(&path, &line).unwrap()).unwrap();
+        let blob = root(&path).join(format!(
+            "{}.json",
+            reference["payload"]["sha256"].as_str().unwrap()
+        ));
         let bytes = std::fs::read(&blob).unwrap();
         // Fault between publication and the rollout durability barrier.
         std::fs::remove_file(&blob).unwrap();
-        assert_eq!(sync_payload_artifacts(&path).await.unwrap_err().kind(), io::ErrorKind::NotFound);
-        assert!(pending_sync().lock().unwrap().paths.keys().any(|(owner, _)| owner == &path));
+        assert_eq!(
+            sync_payload_artifacts(&path).await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(
+            pending_sync()
+                .lock()
+                .unwrap()
+                .paths
+                .keys()
+                .any(|(owner, _)| owner == &path)
+        );
         std::fs::write(&blob, bytes).unwrap();
         sync_payload_artifacts(&path).await.unwrap();
-        assert!(!pending_sync().lock().unwrap().paths.keys().any(|(owner, _)| owner == &path));
+        assert!(
+            !pending_sync()
+                .lock()
+                .unwrap()
+                .paths
+                .keys()
+                .any(|(owner, _)| owner == &path)
+        );
     }
 
     #[tokio::test]
@@ -472,20 +980,78 @@ mod tests {
         let reference: serde_json::Value = serde_json::from_slice(&stored).unwrap();
         assert_eq!(reference["type"], KIND);
         std::fs::write(&path, stored).unwrap();
-        let mut reader = crate::compression::open_rollout_line_reader(&path).await.unwrap();
-        let restored: serde_json::Value = serde_json::from_str(
-            &reader.next_line().await.unwrap().unwrap(),
-        ).unwrap();
+        let mut reader = crate::compression::open_rollout_line_reader(&path)
+            .await
+            .unwrap();
+        let restored: serde_json::Value =
+            serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(restored, item);
         let sha256 = reference["payload"]["sha256"].as_str().unwrap();
         std::fs::write(root(&path).join(format!("{sha256}.json")), b"corrupt").unwrap();
-        let mut reader = crate::compression::open_rollout_line_reader(&path).await.unwrap();
+        let mut reader = crate::compression::open_rollout_line_reader(&path)
+            .await
+            .unwrap();
         let invalid = reader.next_line().await.unwrap().unwrap();
         assert!(serde_json::from_str::<serde_json::Value>(&invalid).is_err());
         let repaired = store_line(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
         let restored: serde_json::Value = serde_json::from_str(
             &hydrate_line(&path, String::from_utf8(repaired).unwrap()).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(restored, item);
+    }
+
+    #[test]
+    fn feedback_export_hydrates_or_reports_the_exact_record_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rollout.jsonl");
+        let item = serde_json::json!({
+            "timestamp": "2026-10-02T00:00:00Z", "format_version": 1,
+            "type": "event_msg", "payload": {"type": "turn_complete",
+                "turn_id": "turn", "timing": {"detail": "timing evidence".repeat(1000)}}
+        });
+        let stored = store_line(&path, &serde_json::to_vec(&item).unwrap()).unwrap();
+        let reference: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(reference["type"], KIND);
+        std::fs::write(&path, &stored).unwrap();
+        let export = crate::read_rollout_for_feedback(&path, 100_000).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&export).unwrap(),
+            item
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), stored);
+
+        let compressed = crate::compression::compressed_rollout_path(&path);
+        std::fs::write(
+            &compressed,
+            zstd::stream::encode_all(stored.as_slice(), 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::read_rollout_for_feedback(&compressed, 100_000).unwrap(),
+            export
+        );
+        let oversized = crate::read_rollout_for_feedback(&path, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(oversized.contains("record 1"));
+        assert!(oversized.contains("budget"));
+
+        let sha256 = reference["payload"]["sha256"].as_str().unwrap();
+        let blob = root(&path).join(format!("{sha256}.json"));
+        std::fs::write(&blob, b"corrupt").unwrap();
+        assert!(
+            crate::read_rollout_for_feedback(&path, 100_000)
+                .unwrap_err()
+                .to_string()
+                .contains("record 1")
+        );
+        std::fs::remove_file(&blob).unwrap();
+        assert!(
+            crate::read_rollout_for_feedback(&path, 100_000)
+                .unwrap_err()
+                .to_string()
+                .contains("record 1")
+        );
     }
 }

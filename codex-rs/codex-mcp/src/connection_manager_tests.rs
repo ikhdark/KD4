@@ -195,28 +195,59 @@ async fn approval_authority_tracks_provider_account_and_connection_reuse() {
     let mut manager = McpConnectionManager::new_uninitialized(&policy, &permissions, true);
     let client = create_ready_async_managed_client(Vec::new()).await;
     manager.clients.insert("docs".into(), client.clone());
-    manager.server_definitions.insert("docs".into(), EffectiveMcpServer::configured(test_stdio_server_config("docs")));
+    manager.server_definitions.insert(
+        "docs".into(),
+        EffectiveMcpServer::configured(test_stdio_server_config("docs")),
+    );
     let original = manager.approval_authority("docs").unwrap();
-    assert!(!original.1, "unknown provider account may only be remembered for this connection");
+    assert!(
+        !original.1,
+        "unknown provider account may only be remembered for this connection"
+    );
     manager.clients.insert("docs".into(), client);
     assert_eq!(manager.approval_authority("docs").unwrap(), original);
-    manager.clients.insert("docs".into(), create_ready_async_managed_client(Vec::new()).await);
+    manager.clients.insert(
+        "docs".into(),
+        create_ready_async_managed_client(Vec::new()).await,
+    );
     assert_ne!(manager.approval_authority("docs").unwrap(), original);
 
-    manager.server_definitions.insert("docs".into(), EffectiveMcpServer::configured(
-        crate::codex_apps_mcp_server_config("https://example.com", None, None),
-    ));
-    manager.client_reuse_context.codex_apps_tools_cache_key.account_id = Some("account-a".into());
+    manager.server_definitions.insert(
+        "docs".into(),
+        EffectiveMcpServer::configured(crate::codex_apps_mcp_server_config(
+            "https://example.com",
+            None,
+            None,
+        )),
+    );
+    manager
+        .client_reuse_context
+        .codex_apps_tools_cache_key
+        .account_id = Some("account-a".into());
     let known = manager.approval_authority("docs").unwrap();
     assert!(known.1);
-    manager.clients.insert("docs".into(), create_ready_async_managed_client(Vec::new()).await);
+    manager.clients.insert(
+        "docs".into(),
+        create_ready_async_managed_client(Vec::new()).await,
+    );
     assert_eq!(manager.approval_authority("docs").unwrap(), known);
-    manager.client_reuse_context.codex_apps_tools_cache_key.account_id = Some("account-b".into());
+    manager
+        .client_reuse_context
+        .codex_apps_tools_cache_key
+        .account_id = Some("account-b".into());
     assert_ne!(manager.approval_authority("docs").unwrap(), known);
-    manager.client_reuse_context.codex_apps_tools_cache_key.account_id = Some("account-a".into());
-    manager.server_definitions.insert("docs".into(), EffectiveMcpServer::configured(
-        crate::codex_apps_mcp_server_config("https://other.example.com", None, None),
-    ));
+    manager
+        .client_reuse_context
+        .codex_apps_tools_cache_key
+        .account_id = Some("account-a".into());
+    manager.server_definitions.insert(
+        "docs".into(),
+        EffectiveMcpServer::configured(crate::codex_apps_mcp_server_config(
+            "https://other.example.com",
+            None,
+            None,
+        )),
+    );
     assert_ne!(manager.approval_authority("docs").unwrap(), known);
 }
 
@@ -499,7 +530,9 @@ async fn cancelled_manager_construction_releases_adopted_client_lease() {
     let client = create_ready_async_managed_client(Vec::new()).await;
     let owners = Arc::clone(&client.manager_owners);
     let cancel_token = client.cancel_token.clone();
-    previous.server_definitions.insert(adopted_name.clone(), server);
+    previous
+        .server_definitions
+        .insert(adopted_name.clone(), server);
     previous.clients.insert(adopted_name, client);
     let (tx_event, _rx_event) = async_channel::bounded(1);
     tx_event
@@ -623,18 +656,30 @@ async fn aggregate_resource_discovery_skips_servers_without_resources_capability
 async fn resource_collection_keeps_prefix_and_cursor_under_one_budget() {
     for fail in [false, true] {
         let start = tokio::time::Instant::now();
-        let (items, cursor, meta) = collect_resource_pages(Duration::from_secs(1), |cursor, _remaining| async move {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            match cursor.as_deref() {
-                None => Ok((vec![1], Some("second".into()))),
-                Some("second") if fail => Err(anyhow!("late failure")),
-                Some("second") => Ok((vec![2], Some("third".into()))),
-                _ => Ok((vec![3], None)),
-            }
-        }).await.unwrap();
+        let (items, cursor, meta) =
+            collect_resource_pages(Duration::from_secs(1), |cursor, _remaining| async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                match cursor.as_deref() {
+                    None => Ok((vec![1], Some("second".into()))),
+                    Some("second") if fail => Err(anyhow!("late failure")),
+                    Some("second") => Ok((vec![2], Some("third".into()))),
+                    _ => Ok((vec![3], None)),
+                }
+            })
+            .await
+            .unwrap();
         assert_eq!(items, if fail { vec![1] } else { vec![1, 2] });
-        assert_eq!(cursor.as_deref(), Some(if fail { "second" } else { "third" }));
-        let message = meta.unwrap().get("codex/collectionError").unwrap().as_str().unwrap().to_string();
+        assert_eq!(
+            cursor.as_deref(),
+            Some(if fail { "second" } else { "third" })
+        );
+        let message = meta
+            .unwrap()
+            .get("codex/collectionError")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
         assert!(message.contains("incomplete"));
         assert!(message.contains(if fail { "late failure" } else { "deadline" }));
         assert!(start.elapsed() <= Duration::from_secs(1));
@@ -1089,15 +1134,15 @@ fn elicitation_granular_policy_respects_never_and_config() {
             mcp_elicitations: false,
         }
     )));
-    assert!(!elicitation_is_rejected_by_policy(AskForApproval::Granular(
-        GranularApprovalConfig {
+    assert!(!elicitation_is_rejected_by_policy(
+        AskForApproval::Granular(GranularApprovalConfig {
             sandbox_approval: false,
             rules: false,
             skill_approval: false,
             request_permissions: false,
             mcp_elicitations: true,
-        }
-    )));
+        })
+    ));
 }
 
 #[tokio::test]
@@ -1160,8 +1205,7 @@ async fn disabled_permissions_do_not_auto_accept_elicitation_with_requested_fiel
                     )
                     .build()
                     .expect("schema should build"),
-            },
-        ),
+        }),
     )
     .await
     .expect("elicitation should auto decline");
@@ -1398,14 +1442,23 @@ fn test_normalize_tools_names_survive_catalog_growth_cache_and_reduction() {
     let original = create_test_tool("basic-server", "read-file");
     let other = create_test_tool("basic_server", "read_file");
     let expected = normalize_tools_for_model_with_prefix([original.clone()], true);
-    let cached: ToolInfo = serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+    let cached: ToolInfo =
+        serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
     for catalog in [
-        vec![original.clone(), other.clone()], vec![other, original.clone()],
-        vec![cached], vec![original],
+        vec![original.clone(), other.clone()],
+        vec![other, original.clone()],
+        vec![cached],
+        vec![original],
     ] {
         let normalized = normalize_tools_for_model_with_prefix(catalog, true);
-        let same = normalized.iter().find(|tool| tool.server_name == "basic-server").unwrap();
-        assert_eq!(same.canonical_tool_name(), expected[0].canonical_tool_name());
+        let same = normalized
+            .iter()
+            .find(|tool| tool.server_name == "basic-server")
+            .unwrap();
+        assert_eq!(
+            same.canonical_tool_name(),
+            expected[0].canonical_tool_name()
+        );
         assert_eq!(same.tool, expected[0].tool);
     }
 }
@@ -1415,7 +1468,10 @@ fn test_normalize_tools_duplicated_names_skipped() {
     let first = create_test_tool("server1", "duplicate_tool");
     let mut second = first.clone();
     second.tool.description = Some("second duplicate".into());
-    assert_eq!(normalize_tools_for_model_with_prefix(vec![first.clone(), first.clone()], true).len(), 1);
+    assert_eq!(
+        normalize_tools_for_model_with_prefix(vec![first.clone(), first.clone()], true).len(),
+        1
+    );
     for tools in [vec![first.clone(), second.clone()], vec![second, first]] {
         assert!(normalize_tools_for_model_with_prefix(tools, true).is_empty());
     }
@@ -1465,7 +1521,13 @@ fn test_normalize_tools_sanitizes_invalid_characters() {
     assert_eq!(model_tools.len(), 1);
     let tool = model_tools.into_iter().next().expect("one tool");
     let model_name = tool.canonical_tool_name();
-    assert!(model_name.namespace.as_deref().unwrap().starts_with("mcp__server_one_"));
+    assert!(
+        model_name
+            .namespace
+            .as_deref()
+            .unwrap()
+            .starts_with("mcp__server_one_")
+    );
     assert!(model_name.name.starts_with("tool_two_three_"));
     assert_eq!(
         ToolName::namespaced(tool.callable_namespace.clone(), tool.callable_name.clone()),
@@ -1632,8 +1694,7 @@ fn codex_apps_env_bearer_token_bypasses_shared_tools_cache() {
         /*uses_env_bearer_token*/ false,
     ));
     assert!(!should_share_codex_apps_tools_cache(
-        "docs",
-        /*uses_env_bearer_token*/ false,
+        "docs", /*uses_env_bearer_token*/ false,
     ));
 }
 
@@ -2893,6 +2954,10 @@ async fn tool_snapshot_keeps_ready_servers_while_another_starts() {
         .shared();
     pending.startup_complete.store(false, Ordering::Release);
     manager.clients.insert("starting".to_string(), pending);
+    assert_eq!(
+        manager.catalog_availability().await,
+        (vec!["starting".to_string()], Vec::new())
+    );
     let initial = tokio::time::timeout(
         Duration::from_millis(250),
         manager.list_all_tools_snapshot(),
@@ -2913,6 +2978,122 @@ async fn tool_snapshot_keeps_ready_servers_while_another_starts() {
     let ready = manager.list_all_tools_snapshot().await;
     assert_eq!(ready.len(), 2);
     assert!(!Arc::ptr_eq(&initial, &ready));
+    assert_eq!(
+        manager.catalog_availability().await,
+        (Vec::new(), Vec::new())
+    );
+}
+
+#[tokio::test]
+async fn initialization_elicitation_route_is_scoped_and_preserves_policy() {
+    let router = ElicitationRequestRouter::default();
+    let manager = ElicitationRequestManager::new(
+        AskForApproval::OnRequest,
+        PermissionProfile::default(),
+        None,
+        router.clone(),
+    );
+    let (tx, rx) = async_channel::bounded(2);
+    let sender = manager.make_sender("required".to_string(), tx);
+    let form = codex_rmcp_client::Elicitation::Mcp(ElicitRequestParams::FormElicitationParams {
+        meta: None,
+        message: "Initialization input".to_string(),
+        requested_schema: rmcp::model::ElicitationSchema::builder()
+            .required_property(
+                "message",
+                rmcp::model::PrimitiveSchemaDefinition::String(rmcp::model::StringSchema::new()),
+            )
+            .build()
+            .unwrap(),
+    });
+    let thread_id = codex_protocol::ThreadId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let handler = crate::StartupElicitationHandler::new(move |id, event| {
+        assert_eq!(id, thread_id);
+        assert_eq!(event.server_name, "required");
+        observed.fetch_add(1, Ordering::SeqCst);
+        async {
+            ElicitationResponse {
+                action: ElicitationAction::Accept,
+                content: Some(serde_json::json!({"message":"ready"})),
+                meta: None,
+            }
+        }
+    });
+    handler
+        .scope(async {
+            let route = router.startup_route(thread_id);
+            let response = sender(NumberOrString::Number(1), form.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.content,
+                Some(serde_json::json!({"message":"ready"}))
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "no unpublished event-queue round trip"
+            );
+            *manager.approval_policy.lock().unwrap() = AskForApproval::Never;
+            assert_eq!(
+                sender(NumberOrString::Number(2), form.clone())
+                    .await
+                    .unwrap()
+                    .action,
+                ElicitationAction::Decline
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "Never must not call the interactive route"
+            );
+            *manager.approval_policy.lock().unwrap() = AskForApproval::OnRequest;
+            drop(route);
+            let pending = tokio::spawn(sender(NumberOrString::Number(1), form));
+            let EventMsg::ElicitationRequest(event) = rx.recv().await.unwrap().msg else {
+                panic!("ordinary request")
+            };
+            let codex_protocol::mcp::RequestId::String(id) = event.id else {
+                panic!("unique public token")
+            };
+            manager
+                .resolve(
+                    "required".to_string(),
+                    NumberOrString::String(id.clone().into()),
+                    ElicitationResponse {
+                        action: ElicitationAction::Cancel,
+                        content: None,
+                        meta: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                pending.await.unwrap().unwrap().action,
+                ElicitationAction::Cancel
+            );
+            assert!(
+                manager
+                    .resolve(
+                        "required".to_string(),
+                        NumberOrString::String(id.into()),
+                        ElicitationResponse {
+                            action: ElicitationAction::Accept,
+                            content: None,
+                            meta: None
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "route must retire at publication"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -2921,7 +3102,8 @@ async fn startup_barrier_waits_past_short_poll_and_bounds_stuck_clients() {
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
     let mut manager =
         McpConnectionManager::new_uninitialized(&approval_policy, &permission_profile, true);
-    let mut delayed = create_ready_async_managed_client(vec![create_test_tool("late", "read")]).await;
+    let mut delayed =
+        create_ready_async_managed_client(vec![create_test_tool("late", "read")]).await;
     let ready = delayed.client.clone();
     delayed.startup_complete.store(false, Ordering::Release);
     let complete = Arc::clone(&delayed.startup_complete);
@@ -2929,7 +3111,9 @@ async fn startup_barrier_waits_past_short_poll_and_bounds_stuck_clients() {
         tokio::time::sleep(Duration::from_secs(3)).await;
         complete.store(true, Ordering::Release);
         ready.await
-    }.boxed().shared();
+    }
+    .boxed()
+    .shared();
     manager.clients.insert("late".to_owned(), delayed);
     let start = tokio::time::Instant::now();
     manager.wait_for_startup().await;
@@ -2938,11 +3122,15 @@ async fn startup_barrier_waits_past_short_poll_and_bounds_stuck_clients() {
 
     let mut stuck = create_ready_async_managed_client(Vec::new()).await;
     stuck.client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
-        .boxed().shared();
+        .boxed()
+        .shared();
     stuck.startup_complete.store(false, Ordering::Release);
     manager.clients.insert("stuck".to_owned(), stuck);
     let start = tokio::time::Instant::now();
     manager.wait_for_startup().await;
-    assert_eq!(start.elapsed(), crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT + DEFAULT_TOOL_TIMEOUT);
+    assert_eq!(
+        start.elapsed(),
+        crate::rmcp_client::DEFAULT_STARTUP_TIMEOUT + DEFAULT_TOOL_TIMEOUT
+    );
     assert_eq!(manager.list_all_tools_snapshot().await.len(), 1);
 }

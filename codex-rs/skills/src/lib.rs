@@ -31,7 +31,9 @@ pub fn system_cache_root_dir(codex_home: &AbsolutePathBuf) -> AbsolutePathBuf {
 /// with a fingerprint of the embedded directory. When the marker matches, the
 /// install is skipped.
 pub fn install_system_skills(codex_home: &AbsolutePathBuf) -> Result<(), SystemSkillsError> {
-    install_system_skills_with(codex_home, |dest| write_embedded_dir(&SYSTEM_SKILLS_DIR, dest))
+    install_system_skills_with(codex_home, |dest| {
+        write_embedded_dir(&SYSTEM_SKILLS_DIR, dest)
+    })
 }
 
 fn install_system_skills_with(
@@ -285,7 +287,12 @@ mod tests {
         assert!(SYSTEM_SKILLS_DIR.get_dir("harness-tools").is_none());
         assert!(!retired.as_path().exists());
         assert!(installed.join("skill-creator/SKILL.md").as_path().is_file());
-        assert!(installed.join("skill-installer/SKILL.md").as_path().is_file());
+        assert!(
+            installed
+                .join("skill-installer/SKILL.md")
+                .as_path()
+                .is_file()
+        );
     }
 
     #[test]

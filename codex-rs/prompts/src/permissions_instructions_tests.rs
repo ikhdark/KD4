@@ -343,7 +343,10 @@ fn catalog_approval_messages_are_hard_capped() {
         (MAX_APPROVAL_MESSAGE_BYTES - APPROVAL_MESSAGE_TRUNCATED_MARKER.len()) / 3;
     assert_eq!(
         text,
-        format!("{}{APPROVAL_MESSAGE_TRUNCATED_MARKER}", "界".repeat(retained_characters))
+        format!(
+            "{}{APPROVAL_MESSAGE_TRUNCATED_MARKER}",
+            "界".repeat(retained_characters)
+        )
     );
 }
 

@@ -264,11 +264,15 @@ impl ConnectionDriver {
                 response_tx,
             } => match result {
                 Ok(HostResponse::SessionClosed { session_id }) if session_id == session.id => {
-                    let effects = self.close_session_locally(&session.id);
-                    if !self.apply_delegate_effects(effects) {
+                    if !self.close_session_locally(&session.id) {
                         return false;
                     }
                     let _ = response_tx.send(Ok(()));
+                }
+                Err(err) if err == codex_code_mode_protocol::host::SESSION_SHUTDOWN_PENDING => {
+                    // The host answered and still owns admitted storage. Keep
+                    // the session fenced, but do not kill its publisher.
+                    let _ = response_tx.send(Err(err));
                 }
                 Ok(_) => {
                     let err = "code-mode host returned an invalid shutdown response".to_string();

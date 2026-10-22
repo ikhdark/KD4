@@ -1,6 +1,57 @@
 use super::*;
 
 #[tokio::test]
+async fn semantic_json_continuations_keep_their_source_byte_charge() {
+    let home = tempfile::tempdir().unwrap();
+    let text = r#"{"a":"123456","b":"ABCDEF"}"#;
+    let artifact = crate::tools::command_output_artifact::create_canonical_output_artifact(
+        home.path(),
+        "semantic-cost",
+        &CanonicalToolResult::text(text),
+    )
+    .await;
+    let snapshot = load_tool_output_snapshot(
+        home.path(),
+        "semantic-cost",
+        &artifact.artifact_id().unwrap(),
+    )
+    .await
+    .unwrap();
+    let selected = drain_recovery_snapshot_with_byte_limit(
+        &snapshot,
+        vec![
+            ToolOutputSelector::JsonPointer {
+                pointer: "/a".into(),
+            },
+            ToolOutputSelector::JsonPointer {
+                pointer: "/b".into(),
+            },
+        ],
+        10_000,
+        10,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(!selected.output.complete);
+    assert!(selected.output.represented_source_bytes() <= 10);
+    assert_eq!(
+        selected.output.results[0].value,
+        Some(serde_json::json!("123456"))
+    );
+    assert!(
+        !selected
+            .output
+            .results
+            .iter()
+            .any(|result| result.value == Some(serde_json::json!("ABCDEF")))
+    );
+    // A semantic value is charged, but does not prove its lexical quotes and
+    // escape spelling were delivered as exact raw bytes.
+    assert!(!selected.output.delivered_ranges().contains(&(5, 13)));
+}
+
+#[tokio::test]
 async fn search_source_byte_budget_preserves_coordinates_and_recoverable_context() {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let session = std::sync::Arc::new(session);
@@ -379,4 +430,23 @@ fn adjacent_partial_recovery_pages_share_one_payload_envelope() {
         pages[0].selector,
         ToolOutputSelector::Bytes { start: 0, end: 13 }
     );
+}
+#[test]
+fn json_payload_hydration_is_not_charged_as_search_source_bytes() {
+    let text = r#"{"picked":{"hydrated_ranges":[{"text":"x","canonical_range":{"start":0,"end":999999}}]}}"#;
+    let canonical = CanonicalToolResult::text(text);
+    let mut output = crate::tools::command_output_artifact::select_producer_snapshot(
+        &canonical,
+        "artifact",
+        vec![ToolOutputSelector::JsonPointer {
+            pointer: "/picked".into(),
+        }],
+        9000,
+    )
+    .unwrap();
+    let value = output.results[0].value.clone();
+    bound_recovery_source_bytes(&mut output, text.len());
+    assert!(output.complete);
+    assert_eq!(output.results[0].value, value);
+    assert!(output.delivered_ranges().is_empty());
 }

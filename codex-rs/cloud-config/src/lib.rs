@@ -1,11 +1,11 @@
 //! Cloud-hosted configuration data for Codex.
 //!
-//! This crate owns transport, caching, and refresh behavior for cloud-delivered
-//! config data. Parsing and composition remain in `codex-config`.
+//! This crate owns authenticated transport and startup snapshots for cloud-delivered
+//! config data. Unauthenticated disk caches are not used. Parsing and composition
+//! remain in `codex-config`; effective validation remains with the config consumer.
 
 mod backend;
 mod bundle_loader;
-mod cache;
 mod metrics;
 mod service;
 mod validation;

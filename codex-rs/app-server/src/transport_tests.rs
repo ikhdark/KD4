@@ -15,6 +15,10 @@ fn absolute_path(path: &str) -> AbsolutePathBuf {
 
 fn experimental_notification() -> ServerNotification {
     ServerNotification::ProcessExited(codex_app_server_protocol::ProcessExitedNotification {
+        stdout_base64: None,
+        stderr_base64: None,
+        stdout_capture: None,
+        stderr_capture: None,
         process_handle: "process-1".to_string(),
         exit_code: 0,
         stdout: String::new(),
@@ -22,6 +26,29 @@ fn experimental_notification() -> ServerNotification {
         stderr: String::new(),
         stderr_cap_reached: false,
     })
+}
+
+/// Stdio output is handed to a per-connection delivery owner, so the router
+/// returns before the message reaches the physical writer queue.
+async fn next_delivered(
+    writer_rx: &mut mpsc::Receiver<QueuedOutgoingMessage>,
+    context: &str,
+) -> QueuedOutgoingMessage {
+    timeout(Duration::from_secs(1), writer_rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{context}: delivery timed out"))
+        .unwrap_or_else(|| panic!("{context}: writer closed"))
+}
+
+fn config_warning(summary: &str) -> OutgoingMessage {
+    OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+        ConfigWarningNotification {
+            summary: summary.to_string(),
+            details: None,
+            path: None,
+            range: None,
+        },
+    ))
 }
 
 #[test]
@@ -99,7 +126,11 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
         vec![initialized_connection_id]
     );
     route_outgoing_envelope(&mut connections, broadcast).await;
-    assert!(initialized_writer_rx.try_recv().is_ok());
+    next_delivered(
+        &mut initialized_writer_rx,
+        "broadcast should reach the initialized connection",
+    )
+    .await;
     assert!(matches!(
         uninitialized_writer_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
@@ -117,16 +148,28 @@ async fn envelope_target_selection_preserves_the_only_delivery_path_difference()
         );
     }
 
+    // Delivery is FIFO per connection: a leaked broadcast would arrive before
+    // this distinct direct message.
     route_outgoing_envelope(
         &mut connections,
         OutgoingEnvelope::ToConnection {
             connection_id: uninitialized_connection_id,
-            message: notification,
+            message: config_warning("direct-target-selection"),
             write_complete_tx: None,
         },
     )
     .await;
-    assert!(uninitialized_writer_rx.try_recv().is_ok());
+    let direct = next_delivered(
+        &mut uninitialized_writer_rx,
+        "direct delivery should reach the uninitialized connection",
+    )
+    .await;
+    assert!(matches!(
+        direct.message,
+        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+            ConfigWarningNotification { summary, .. }
+        )) if summary == "direct-target-selection"
+    ));
 }
 
 #[tokio::test]
@@ -146,38 +189,39 @@ async fn to_connection_notification_respects_opt_out_filters() {
         ),
     )]);
 
-    for (methods, should_deliver) in [
+    // Each case is distinct and delivery is FIFO, so a suppressed case that
+    // leaked would arrive ahead of the next delivered case. The final case
+    // delivers, so every suppressed case is checked.
+    for (case, (methods, should_deliver)) in [
         (vec!["configWarning"], false),
         (vec!["thread/started"], true),
         (vec![], true),
         (vec!["thread/started", "configWarning"], false),
         (vec![], true),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_summary = format!("task_started-{case}");
         assert!(opt_outs.replace(methods.iter().map(|method| (*method).to_string()).collect()));
         route_outgoing_envelope(
             &mut connections,
             OutgoingEnvelope::ToConnection {
                 connection_id,
-                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                    ConfigWarningNotification {
-                        summary: "task_started".to_string(),
-                        details: None,
-                        path: None,
-                        range: None,
-                    },
-                )),
+                message: config_warning(&expected_summary),
                 write_complete_tx: None,
             },
         )
         .await;
 
         if should_deliver {
-            let queued = writer_rx.try_recv().expect("non-opted-out notification must arrive");
+            let queued =
+                next_delivered(&mut writer_rx, "non-opted-out notification must arrive").await;
             assert!(matches!(
                 queued.message,
                 OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
                     ConfigWarningNotification { summary, .. }
-                )) if summary == "task_started"
+                )) if summary == expected_summary
             ));
         }
         assert!(
@@ -223,9 +267,11 @@ async fn to_connection_receipt_sender_reaches_the_transport_writer() {
     )
     .await;
 
-    let queued_message = writer_rx
-        .try_recv()
-        .expect("notification should reach the transport writer");
+    let queued_message = next_delivered(
+        &mut writer_rx,
+        "notification should reach the transport writer",
+    )
+    .await;
     queued_message
         .write_complete_tx
         .expect("routing must preserve the receipt sender")
@@ -300,9 +346,11 @@ async fn experimental_notifications_are_preserved_with_capability() {
     )
     .await;
 
-    let message = writer_rx
-        .try_recv()
-        .expect("experimental notification should reach opted-in client");
+    let message = next_delivered(
+        &mut writer_rx,
+        "experimental notification should reach opted-in client",
+    )
+    .await;
     let OutgoingMessage::AppServerNotification(ServerNotification::ProcessExited(notification)) =
         message.message
     else {
@@ -371,9 +419,11 @@ async fn command_execution_request_approval_strips_additional_permissions_withou
     )
     .await;
 
-    let message = writer_rx
-        .try_recv()
-        .expect("request should be delivered to the connection");
+    let message = next_delivered(
+        &mut writer_rx,
+        "request should be delivered to the connection",
+    )
+    .await;
     let json = serde_json::to_value(message.message).expect("request should serialize");
     assert_eq!(json["params"].get("additionalPermissions"), None);
 }
@@ -437,9 +487,11 @@ async fn command_execution_request_approval_keeps_additional_permissions_with_ca
     )
     .await;
 
-    let message = writer_rx
-        .try_recv()
-        .expect("request should be delivered to the connection");
+    let message = next_delivered(
+        &mut writer_rx,
+        "request should be delivered to the connection",
+    )
+    .await;
     let json = serde_json::to_value(message.message).expect("request should serialize");
     let allowed_path = absolute_path("/tmp/allowed").to_string_lossy().into_owned();
     assert_eq!(
@@ -571,28 +623,26 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
         registered_stdio_connection(connection_id, writer_tx, shutdown.clone()),
     );
 
-    let route_task = async {
-        route_outgoing_envelope(
+    // The per-stdio delivery owner retains the second message until the
+    // writer has capacity; the router itself never waits on stdio.
+    {
+        let route = route_outgoing_envelope(
             &mut connections,
             OutgoingEnvelope::ToConnection {
                 connection_id,
-                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                    ConfigWarningNotification {
-                        summary: "second".to_string(),
-                        details: None,
-                        path: None,
-                        range: None,
-                    },
-                )),
+                message: config_warning("second"),
                 write_complete_tx: None,
             },
-        )
-        .await
-    };
-    tokio::pin!(route_task);
+        );
+        tokio::pin!(route);
+        assert!(
+            futures::poll!(&mut route).is_ready(),
+            "stdio backpressure must not own the router"
+        );
+    }
     assert!(
-        futures::poll!(&mut route_task).is_pending(),
-        "full stdio queue must retain the second message until capacity is available"
+        connections.contains_key(&connection_id),
+        "a full stdio queue must not disconnect the connection"
     );
     assert!(!shutdown.is_cancelled());
 
@@ -600,9 +650,6 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
         .await
         .expect("first queued message should be readable")
         .expect("first queued message should exist");
-    timeout(Duration::from_millis(100), &mut route_task)
-        .await
-        .expect("routing should finish after the first queued message is drained");
     assert!(!shutdown.is_cancelled());
 
     assert!(matches!(
@@ -620,15 +667,18 @@ async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is
             )) if summary == "queued"
         ));
     }
-    let second = writer_rx
-        .try_recv()
-        .expect("second notification should be delivered once the queue has room");
+    let second = next_delivered(
+        &mut writer_rx,
+        "second notification should be delivered once the queue has room",
+    )
+    .await;
     assert!(matches!(
         second.message,
         OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
             ConfigWarningNotification { summary, .. }
         )) if summary == "second"
     ));
+    assert!(!shutdown.is_cancelled());
 }
 
 fn registered_stdio_connection(
@@ -643,7 +693,9 @@ fn registered_stdio_connection(
         None,
         shutdown,
     );
-    connection.outbound_initialized.store(true, Ordering::Release);
+    connection
+        .outbound_initialized
+        .store(true, Ordering::Release);
     let crate::OutboundControlEvent::Opened {
         connection_id: registered_id,
         state,
@@ -682,16 +734,20 @@ async fn stdio_shutdown_releases_backpressure_without_acknowledging_unsent_outpu
             },
         );
         tokio::pin!(route);
-        assert!(futures::poll!(&mut route).is_pending());
+        assert!(
+            futures::poll!(&mut route).is_ready(),
+            "stdio backpressure must not own the router"
+        );
         assert!(!shutdown.is_cancelled());
         shutdown.cancel();
-        timeout(Duration::from_secs(1), route)
-            .await
-            .expect("shutdown must release a full stdio queue");
     }
+    disconnect_connection(&mut connections, connection_id);
     assert!(connections.is_empty());
     assert!(
-        completed.await.is_err(),
+        timeout(Duration::from_secs(1), completed)
+            .await
+            .unwrap()
+            .is_err(),
         "unsent output must not be acknowledged"
     );
     assert!(reader.try_recv().is_ok(), "original output stays queued");
@@ -724,9 +780,29 @@ async fn closed_stdio_writer_shuts_down_runtime() {
         },
     )
     .await;
-    assert!(shutdown.is_cancelled());
+    // The per-stdio delivery owner observes the closed physical writer and
+    // retires the runtime; the router does not wait on that write.
+    timeout(Duration::from_secs(1), shutdown.cancelled())
+        .await
+        .expect("closed stdio writer should shut down the runtime");
+    assert!(
+        timeout(Duration::from_secs(1), completed)
+            .await
+            .expect("unsent output receipt should resolve")
+            .is_err(),
+        "unsent output must not be acknowledged"
+    );
+    // Routing to the retired transport disconnects instead of queueing output.
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: config_warning("after-shutdown"),
+            write_complete_tx: None,
+        },
+    )
+    .await;
     assert!(connections.is_empty());
-    assert!(completed.await.is_err());
 }
 
 #[test]
@@ -850,4 +926,78 @@ async fn dropping_router_state_closes_registered_websocket_connection() {
             .unwrap()
             .is_none()
     );
+}
+#[tokio::test]
+async fn unread_stdio_does_not_block_a_healthy_remote_writer() {
+    let shutdown = CancellationToken::new();
+    let (stdio, mut stdio_reader) = mpsc::channel(1);
+    let (remote, mut remote_reader) = mpsc::channel(1);
+    let message = |id| {
+        OutgoingMessage::Response(OutgoingResponse {
+            id: RequestId::Integer(id),
+            result: json!({"ready": true}),
+        })
+    };
+    stdio
+        .try_send(QueuedOutgoingMessage::new(message(1)))
+        .unwrap();
+    let mut connections = HashMap::from([
+        (
+            ConnectionId(1),
+            registered_stdio_connection(ConnectionId(1), stdio, shutdown.clone()),
+        ),
+        (
+            ConnectionId(2),
+            OutboundConnectionState::new(
+                remote,
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(OutboundNotificationOptOuts::new(HashSet::new())),
+                Some(CancellationToken::new()),
+                shutdown.clone(),
+            ),
+        ),
+    ]);
+    for id in [2, 3] {
+        timeout(
+            Duration::from_secs(1),
+            route_outgoing_envelope(
+                &mut connections,
+                OutgoingEnvelope::ToConnection {
+                    connection_id: ConnectionId(1),
+                    message: message(id),
+                    write_complete_tx: None,
+                },
+            ),
+        )
+        .await
+        .expect("stdio admission cannot wait on its unread writer");
+    }
+    timeout(
+        Duration::from_secs(1),
+        route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::ToConnection {
+                connection_id: ConnectionId(2),
+                message: message(4),
+                write_complete_tx: None,
+            },
+        ),
+    )
+    .await
+    .expect("remote delivery cannot be held by stdio");
+    assert!(
+        matches!(remote_reader.recv().await.unwrap().message, OutgoingMessage::Response(reply) if reply.id == RequestId::Integer(4))
+    );
+    for id in [1, 2, 3] {
+        let queued = timeout(Duration::from_secs(1), stdio_reader.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(queued.message, OutgoingMessage::Response(reply) if reply.id == RequestId::Integer(id)),
+            "stdio FIFO is unchanged after the peer resumes reading"
+        );
+    }
+    shutdown.cancel();
 }

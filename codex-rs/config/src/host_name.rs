@@ -52,15 +52,25 @@ mod tests {
     fn normalize_fqdn_candidate_requires_a_qualified_normalized_name() {
         for (input, expected) in [
             ("runner-01.ci.example.com", Some("runner-01.ci.example.com")),
-            ("RUNNER-01.CI.EXAMPLE.COM.", Some("runner-01.ci.example.com")),
-            ("  RUNNER-01.CI.EXAMPLE.COM.  ", Some("runner-01.ci.example.com")),
+            (
+                "RUNNER-01.CI.EXAMPLE.COM.",
+                Some("runner-01.ci.example.com"),
+            ),
+            (
+                "  RUNNER-01.CI.EXAMPLE.COM.  ",
+                Some("runner-01.ci.example.com"),
+            ),
             ("runner-01", None),
             ("runner-01.", None),
             ("", None),
             ("   ", None),
             (".", None),
         ] {
-            assert_eq!(normalize_fqdn_candidate(input).as_deref(), expected, "{input:?}");
+            assert_eq!(
+                normalize_fqdn_candidate(input).as_deref(),
+                expected,
+                "{input:?}"
+            );
         }
     }
 }

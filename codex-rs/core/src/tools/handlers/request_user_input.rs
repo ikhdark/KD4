@@ -46,6 +46,7 @@ impl RequestUserInputHandler {
             step_context,
             call_id,
             payload,
+            cancellation_token,
             ..
         } = invocation;
         let turn = Arc::clone(&step_context.turn);
@@ -74,11 +75,20 @@ impl RequestUserInputHandler {
         let args =
             normalize_request_user_input_args(args).map_err(FunctionCallError::RespondToModel)?;
         let response = session
-            .request_user_input(turn.as_ref(), call_id, args)
+            .request_user_input(turn.as_ref(), call_id.clone(), args.clone())
             .await
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
                     "{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response"
+                ))
+            })?;
+
+        session
+            .record_accepted_user_decision(&turn, &call_id, args, &response, cancellation_token)
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to record accepted user decision: {error}"
                 ))
             })?;
 

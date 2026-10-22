@@ -260,11 +260,22 @@ mod tests {
     fn redact_username_segments_preserves_nonmatching_segments() {
         let usernames = vec!["Alice".to_string(), "Bob".to_string()];
         for (message, expected) in [
-            (r"failed to write C:\Users\Alice\file.txt; fallback D:\Profiles\Bob\x",
-             r"failed to write C:\Users\<user>\file.txt; fallback D:\Profiles\<user>\x"),
-            (r"failed to write E:\data\file.txt", r"failed to write E:\data\file.txt"),
-            (r"C:\Users\Alice\a and C:\Users\Alice\b", r"C:\Users\<user>\a and C:\Users\<user>\b"),
-            ("C:/Users/aLiCe/file and /AliceBackup/file", "C:/Users/<user>/file and /AliceBackup/file"),
+            (
+                r"failed to write C:\Users\Alice\file.txt; fallback D:\Profiles\Bob\x",
+                r"failed to write C:\Users\<user>\file.txt; fallback D:\Profiles\<user>\x",
+            ),
+            (
+                r"failed to write E:\data\file.txt",
+                r"failed to write E:\data\file.txt",
+            ),
+            (
+                r"C:\Users\Alice\a and C:\Users\Alice\b",
+                r"C:\Users\<user>\a and C:\Users\<user>\b",
+            ),
+            (
+                "C:/Users/aLiCe/file and /AliceBackup/file",
+                "C:/Users/<user>/file and /AliceBackup/file",
+            ),
         ] {
             assert_eq!(redact_username_segments(message, &usernames), expected);
             assert_eq!(redact_username_segments(message, &[]), message);

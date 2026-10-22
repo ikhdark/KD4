@@ -13,6 +13,7 @@ fn completed_image_generation_item() -> ExtensionItem {
         revised_prompt: Some("A blue square".to_string()),
         result: "cG5n".to_string(),
         saved_path: None,
+        provider_usage: None,
     })
 }
 
@@ -40,6 +41,8 @@ fn image_generation_item_preserves_stable_wire_shape() {
 #[test]
 fn web_search_item_preserves_stable_wire_shape() {
     let item = ExtensionItem::WebSearch(WebSearchItem {
+        status: None,
+        error: None,
         id: "search-1".to_string(),
         query: "docs".to_string(),
         action: Some(WebSearchAction::Search {

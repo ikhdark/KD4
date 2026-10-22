@@ -10,7 +10,6 @@ use codex_agent_task_store::AgentReceipt;
 use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
-use codex_agent_task_store::AgentTaskBindingDraft;
 use codex_agent_task_store::ArchitectureContractV1;
 use codex_agent_task_store::AssignmentAdmissionOrigin;
 use codex_agent_task_store::AssignmentId;
@@ -149,13 +148,11 @@ async fn handle_get_agent_task(
 
     let coordinator = session.services.agent_control.task_coordinator();
     let caller_binding = if turn.session_source.is_non_root_agent() {
-        let binding = coordinator
-            .binding_for_turn(&turn)
-            .ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own current bound task"
-                ))
-            })?;
+        let binding = coordinator.binding_for_turn(&turn).ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own current bound task"
+            ))
+        })?;
         Some(binding)
     } else {
         None
@@ -168,7 +165,9 @@ async fn handle_get_agent_task(
         let caller = if binding.assignment_id == assignment_id {
             task.clone()
         } else {
-            coordinator.get_agent_task(binding.assignment_id, Some(0)).await
+            coordinator
+                .get_agent_task(binding.assignment_id, Some(0))
+                .await
                 .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?
         };
         let current = caller.current_attempt.attempt_id == binding.attempt_id;
@@ -183,7 +182,10 @@ async fn handle_get_agent_task(
             )));
         }
     }
-    let cold_review_context = if caller_binding.as_ref().is_some_and(|binding| binding.assignment_id == assignment_id) {
+    let cold_review_context = if caller_binding
+        .as_ref()
+        .is_some_and(|binding| binding.assignment_id == assignment_id)
+    {
         build_evaluation_context(session.as_ref(), turn.config.cwd.as_path(), &task).await?
     } else {
         None
@@ -390,6 +392,12 @@ async fn build_evaluation_context(
         .get_agent_task(target_assignment_id, Some(0))
         .await
         .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+    let target_receipt_scope = crate::agent::task_capabilities::cold_review_receipt_scope(&target)
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "{GET_AGENT_TASK_TOOL}: target receipt scope is invalid: {error}"
+            ))
+        })?;
     let agents_md_observation = session
         .services
         .agents_md_manager
@@ -404,7 +412,18 @@ async fn build_evaluation_context(
         })
         .into_iter()
         .collect();
-    let relevant_contracts = parse_risk_hints(&target.assignment.risk_hints).contracts;
+    let mut relevant_contracts = parse_risk_hints(&target.assignment.risk_hints).contracts;
+    if let Some(contract) = target
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.architecture_contract.as_ref())
+    {
+        relevant_contracts.push(serde_json::to_string(contract).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "{GET_AGENT_TASK_TOOL}: invalid sealed architecture contract: {error}"
+            ))
+        })?);
+    }
     let nearest_tests = target
         .assignment
         .required_evidence
@@ -442,7 +461,10 @@ async fn build_evaluation_context(
             "{GET_AGENT_TASK_TOOL}: cold-review evidence worker failed: {error}"
         ))
     })?
-    .map(Some)
+    .map(|mut context| {
+        context.target_receipt_scope = target_receipt_scope;
+        Some(context)
+    })
     .map_err(|error| {
         FunctionCallError::RespondToModel(format!(
             "{GET_AGENT_TASK_TOOL}: cold-review evidence is invalid: {error}"
@@ -519,7 +541,9 @@ async fn handle_set_agent_gate(
     let arguments = function_arguments(payload)?;
     let args: SetAgentGateArgs = parse_arguments(&arguments)?;
     let assignment_id = parse_assignment_id(SET_AGENT_GATE_TOOL, &args.assignment_id)?;
-    let expected_attempt_id = args.expected_attempt_id.parse::<AttemptId>()
+    let expected_attempt_id = args
+        .expected_attempt_id
+        .parse::<AttemptId>()
         .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
     let coordinator = session.services.agent_control.task_coordinator();
     let actor = if turn.session_source.is_non_root_agent() {
@@ -530,7 +554,9 @@ async fn handle_set_agent_gate(
         })?;
         TaskActor::Attempt(binding.attempt_id)
     } else {
-        TaskActor::Root
+        coordinator
+            .root_actor()
+            .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?
     };
     let store = coordinator.store().ok_or_else(|| {
         FunctionCallError::RespondToModel(format!(
@@ -538,7 +564,14 @@ async fn handle_set_agent_gate(
         ))
     })?;
     let gate = store
-        .set_agent_gate(actor, assignment_id, expected_attempt_id, args.gate, args.status, args.reason)
+        .set_agent_gate(
+            actor,
+            assignment_id,
+            expected_attempt_id,
+            args.gate,
+            args.status,
+            args.reason,
+        )
         .await
         .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
     coordinator
@@ -562,37 +595,10 @@ async fn handle_amend_agent_task(
     require_root(&turn.session_source, AMEND_AGENT_TASK_TOOL)?;
     let assignment_id = parse_assignment_id(AMEND_AGENT_TASK_TOOL, &args.assignment_id)?;
     let coordinator = session.services.agent_control.task_coordinator();
-    let store = coordinator.store().ok_or_else(|| {
-        FunctionCallError::RespondToModel(format!(
-            "{AMEND_AGENT_TASK_TOOL}: the typed task store is unavailable"
-        ))
-    })?;
-    let attempt = store
-        .amend_agent_task(TaskActor::Root, assignment_id, args.into_amendment())
+    let attempt = coordinator
+        .amend_agent_task(assignment_id, args.into_amendment())
         .await
         .map_err(|error| task_store_error(AMEND_AGENT_TASK_TOOL, error))?;
-
-    // A correction attempt remains assigned to the same typed agent. Refresh both the durable
-    // binding and the coordinator cache so mutation attribution and receipt fallback use it.
-    let binding = match coordinator.binding_for_assignment(assignment_id) {
-        Some(binding) => Some(binding),
-        None => coordinator
-            .get_agent_task_binding(assignment_id)
-            .await
-            .map_err(|error| task_store_error(AMEND_AGENT_TASK_TOOL, error))?,
-    };
-    if let Some(binding) = binding {
-        coordinator
-            .bind_agent_task(AgentTaskBindingDraft {
-                assignment_id,
-                attempt_id: attempt.attempt_id,
-                agent_path: binding.agent_path,
-                task_name: binding.task_name,
-                thread_id: binding.thread_id,
-            })
-            .await
-            .map_err(|error| task_store_error(AMEND_AGENT_TASK_TOOL, error))?;
-    }
 
     Ok(boxed_tool_output(AmendAgentTaskResult { attempt }))
 }
@@ -619,7 +625,9 @@ async fn handle_waive_agent_gate(
     })?;
     let gate = store
         .waive_agent_gate(
-            TaskActor::Root,
+            coordinator
+                .root_actor()
+                .map_err(|error| task_store_error(WAIVE_AGENT_GATE_TOOL, error))?,
             assignment_id,
             args.gate.into(),
             args.reason,
@@ -653,7 +661,13 @@ async fn handle_abandon_agent_task(
         ))
     })?;
     let receipt = store
-        .abandon_agent_task(TaskActor::Root, assignment_id, args.reason)
+        .abandon_agent_task(
+            coordinator
+                .root_actor()
+                .map_err(|error| task_store_error(ABANDON_AGENT_TASK_TOOL, error))?,
+            assignment_id,
+            args.reason,
+        )
         .await
         .map_err(|error| task_store_error(ABANDON_AGENT_TASK_TOOL, error))?;
     coordinator.mark_task_inactive(assignment_id);
@@ -915,11 +929,14 @@ impl AmendAgentTaskArgs {
 struct AcceptanceCriterionArgs {
     id: String,
     text: String,
+    #[serde(default)]
+    evidence_policy: Option<codex_agent_task_store::CriterionEvidencePolicy>,
 }
 
 impl AcceptanceCriterionArgs {
     fn into_acceptance_criterion(self) -> AcceptanceCriterion {
         AcceptanceCriterion {
+            evidence_policy: self.evidence_policy,
             id: self.id,
             text: self.text,
         }
@@ -1150,6 +1167,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
                 "event_id": observation.event_id,
                 "wake_event_id": observation.wake_event_id,
                 "attempt_id": observation.attempt_id,
+                "execution_stop_cause": observation.execution_stop_cause,
                 "kind": observation.kind,
                 "summary": bounded_detail(Some(&observation.summary)),
                 "call_id": observation.call_id.as_deref().filter(|value| value.len() <= MAX_PROJECTED_EXACT_STRING_BYTES),
@@ -1173,7 +1191,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
                     .find(|result| result.criterion_id == criterion.id)
                     .map(|result| result.status)
             });
-            if status == Some(CriterionStatus::Passed)
+            if task.criterion_is_satisfied(&criterion.id)
                 || criterion.id.len() > MAX_PROJECTED_EXACT_STRING_BYTES
             {
                 return None;
@@ -1181,6 +1199,11 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
             Some(json!({
                 "id": criterion.id,
                 "status": status,
+                "verification": task.criterion_assessments.iter().find(|assessment| assessment.criterion_id == criterion.id),
+                "evidence_policy": criterion.evidence_policy.as_ref().map(|policy| json!({
+                    "kind": policy.kind, "freshness": policy.freshness,
+                    "required_evidence": bounded_detail(policy.required_evidence.as_deref()),
+                })),
                 "text": bounded_detail(Some(&criterion.text)),
             }))
         })
@@ -1188,15 +1211,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         .collect::<Vec<_>>();
     let unresolved_criteria_total = criteria
         .iter()
-        .filter(|criterion| {
-            task.receipt.as_ref().and_then(|receipt| {
-                receipt
-                    .criterion_results
-                    .iter()
-                    .find(|result| result.criterion_id == criterion.id)
-                    .map(|result| result.status)
-            }) != Some(CriterionStatus::Passed)
-        })
+        .filter(|criterion| !task.criterion_is_satisfied(&criterion.id))
         .count();
     let unresolved_required_evidence = task
         .assignment
@@ -1232,12 +1247,32 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         .saturating_sub(unresolved_required_evidence.len());
     let omitted_unresolved_required_evidence =
         unresolved_required_evidence_total.saturating_sub(unresolved_required_evidence.len());
+    let target_scope = result.cold_review_context.as_ref().map(|context| {
+        context.target_receipt_scope.as_ref().map(|scope| {
+            let paths = scope.declared_paths.iter()
+                .filter(|path| path.len() <= MAX_PROJECTED_EXACT_STRING_BYTES)
+                .take(MAX_PROJECTED_CHANGED_PATHS).collect::<Vec<_>>();
+            json!({
+                "assignment_id": scope.assignment_id, "attempt_id": scope.attempt_id,
+                "status": scope.status, "provenance": scope.provenance, "freshness": scope.freshness,
+                "declared_paths": paths, "total_paths": scope.declared_paths.len(),
+                "delivered_paths": paths.len(), "omitted_paths": scope.declared_paths.len() - paths.len(),
+                "recovery_json_pointer": "/cold_review_context/target_receipt_scope",
+            })
+        })
+    });
     json!({
+        "target_receipt_scope": target_scope,
         "assignment_id": task.assignment.assignment_id,
         "attempt_id": task.current_attempt.attempt_id,
         "role": task.assignment.role,
         "attempt_state": task.current_attempt.state,
         "completion_evidence": task.completion_evidence_summary(),
+        "dependency_provenance": {
+            "policy": "pin_at_admission; not a current-acceptance or filesystem-freshness claim",
+            "captured": task.dependency_admissions.len(),
+            "recovery_json_pointer": "/task/dependency_admissions",
+        },
         "gates": task.gates.iter().map(|gate| json!({
             "kind": gate.kind,
             "status": gate.status,
@@ -1256,7 +1291,7 @@ fn task_projection(result: &GetAgentTaskResult) -> JsonValue {
         "receipt": task.receipt.as_ref().map(|receipt| bounded_receipt_projection_with_proof_limit(receipt, 0)),
         "proof_references": proof_references,
         "workspace": {
-            "freshness": "not_tracked",
+            "freshness": "criterion_policy_assessed; unknown without a current input binding",
             "last_progress_at": task.workspace_status.last_progress_at,
             "lease_state": task.workspace_status.lease_state,
             "next_required_action": bounded_prose(task.workspace_status.next_required_action.as_deref()),
@@ -1385,6 +1420,13 @@ fn task_projection_json_pointers(
 ) -> Vec<codex_tools::ToolOutputProjectionJsonPointer> {
     let task = &result.task;
     let mut selectors = Vec::new();
+    for index in 0..task.dependency_admissions.len() {
+        push_predetermined_json_pointer(
+            &mut selectors,
+            format!("task:dependency-admission:{index}"),
+            format!("/task/dependency_admissions/{index}"),
+        );
+    }
     if let Some(receipt) = task.receipt.as_ref() {
         for (index, _) in receipt.blockers.iter().enumerate() {
             push_predetermined_json_pointer(
@@ -1423,11 +1465,7 @@ fn task_projection_json_pointers(
         );
     let mut retained_unresolved_criteria = 0_usize;
     for (index, criterion) in criteria.iter().enumerate() {
-        let passed = task.receipt.as_ref().is_some_and(|receipt| {
-            receipt.criterion_results.iter().any(|result| {
-                result.criterion_id == criterion.id && result.status == CriterionStatus::Passed
-            })
-        });
+        let passed = task.criterion_is_satisfied(&criterion.id);
         if !passed {
             let inline_eligible = criterion.id.len() <= MAX_PROJECTED_EXACT_STRING_BYTES;
             let retained_inline = inline_eligible
@@ -1435,7 +1473,14 @@ fn task_projection_json_pointers(
             if retained_inline {
                 retained_unresolved_criteria = retained_unresolved_criteria.saturating_add(1);
             }
-            if !retained_inline || criterion.text.len() > MAX_PROJECTED_DETAIL_BYTES {
+            if !retained_inline
+                || criterion.text.len() > MAX_PROJECTED_DETAIL_BYTES
+                || criterion
+                    .evidence_policy
+                    .as_ref()
+                    .and_then(|policy| policy.required_evidence.as_ref())
+                    .is_some_and(|required| required.len() > MAX_PROJECTED_DETAIL_BYTES)
+            {
                 push_predetermined_json_pointer(
                     &mut selectors,
                     format!("task:unresolved-criterion:{}", criterion.id),
@@ -1728,7 +1773,7 @@ fn get_agent_task_spec() -> ToolSpec {
         GET_AGENT_TASK_TOOL,
         "Read a durable typed-agent assignment, its current attempt, gates, receipt, captured \
          validation calls, and recent observations. A bound reviewer or verifier also receives \
-         isolated evidence for its target. Non-root callers may also read their immediate children's durable receipts, not siblings or unrelated tasks. observation_limit defaults to 20 and is capped at 100.",
+         isolated evidence for its target, including current-attempt worker-declared paths (not verified mutations or freshness). Missing receipt scope is unavailable, not an empty change list; oversized manifests have exact artifact recovery. Non-root callers may also read their immediate children's durable receipts, not siblings or unrelated tasks. observation_limit defaults to 20 and is capped at 100.",
         object_schema(
             [
                 (
@@ -1753,6 +1798,10 @@ fn get_agent_task_spec() -> ToolSpec {
 fn submit_agent_receipt_spec() -> ToolSpec {
     let architecture_criterion = object_schema(
         [
+            (
+                "evidence_policy",
+                crate::tools::handlers::multi_agents_spec::criterion_evidence_policy_schema(),
+            ),
             (
                 "id",
                 JsonSchema::string(Some("Stable acceptance-criterion id.".to_string())),
@@ -2004,6 +2053,10 @@ fn set_agent_gate_spec() -> ToolSpec {
 fn amend_agent_task_spec() -> ToolSpec {
     let criterion = object_schema(
         [
+            (
+                "evidence_policy",
+                crate::tools::handlers::multi_agents_spec::criterion_evidence_policy_schema(),
+            ),
             (
                 "id",
                 JsonSchema::string(Some("Stable criterion id.".to_string())),
@@ -2301,10 +2354,12 @@ mod projection_tests {
         let now = Utc::now();
         let criteria = vec![
             AcceptanceCriterion {
+                evidence_policy: None,
                 id: "criterion-closed".to_string(),
                 text: "closed criterion".to_string(),
             },
             AcceptanceCriterion {
+                evidence_policy: None,
                 id: "criterion-open".to_string(),
                 text: "open criterion".to_string(),
             },
@@ -2338,6 +2393,7 @@ mod projection_tests {
         };
         let observations = (0..6)
             .map(|index| RuntimeObservation {
+                execution_stop_cause: None,
                 event_id: MutationEventId::new(),
                 wake_event_id: WakeEventId::new(),
                 assignment_id,
@@ -2380,6 +2436,8 @@ mod projection_tests {
         };
         let result = GetAgentTaskResult {
             task: AgentTask {
+                dependency_admissions: Vec::new(),
+                criterion_assessments: Vec::new(),
                 assignment: Assignment {
                     assignment_id,
                     root_session_id: "root-session".to_string(),
@@ -2492,7 +2550,12 @@ mod projection_tests {
                 .len()
                 <= TASK_OUTPUT_INLINE_LIMIT_BYTES
         );
-        assert_eq!(projection["workspace"]["freshness"], "not_tracked");
+        assert!(
+            projection["workspace"]["freshness"]
+                .as_str()
+                .unwrap()
+                .contains("criterion_policy_assessed")
+        );
         for field in [
             "epoch",
             "current_epoch",
@@ -2512,7 +2575,15 @@ mod projection_tests {
         assert_eq!(projection["unresolved_gates"][0]["kind"], "review");
         assert_eq!(
             projection["unresolved_obligations"]["acceptance_criteria"][0]["id"],
-            "criterion-open"
+            "criterion-closed"
+        );
+        assert_eq!(
+            projection["unresolved_obligations"]["acceptance_criteria"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "a reported pass without an applicable evidence policy remains unresolved"
         );
         assert_eq!(
             projection["unresolved_obligations"]["required_evidence"][0]["ordinal"],
@@ -2557,6 +2628,62 @@ mod projection_tests {
                 arguments: "{}".to_string(),
             })
             .expect("canonical task JSON");
+        let empty = crate::agent::task_capabilities::cold_review_receipt_scope(&result.task)
+            .unwrap()
+            .unwrap();
+        assert!(empty.declared_paths.is_empty());
+        let mut result = result;
+        let receipt = result.task.receipt.as_mut().unwrap();
+        receipt.summary = "worker narrative must not enter cold scope".to_string();
+        receipt.declared_changes = (0..1000)
+            .map(|index| codex_agent_task_store::DeclaredChange {
+                path: format!("src/λ-{index}.rs"),
+                summary: "worker narrative".to_string(),
+            })
+            .collect();
+        let scope = crate::agent::task_capabilities::cold_review_receipt_scope(&result.task)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.provenance, "worker_declared");
+        assert_eq!(scope.freshness, "unverified");
+        assert!(!serde_json::to_string(&scope).unwrap().contains("narrative"));
+        result.cold_review_context = Some(ColdReviewContext {
+            assignment: result.task.assignment.clone(),
+            effective_contract: result.task.assignment.effective_contract(None),
+            attempt_id,
+            target_receipt_scope: Some(scope),
+            applicable_instructions: Vec::new(),
+            attempt_specific_diff: String::new(),
+            observed_writes: Vec::new(),
+            relevant_contracts: Vec::new(),
+            nearest_tests: Vec::new(),
+        });
+        let scoped = task_projection(&result);
+        assert_eq!(scoped["target_receipt_scope"]["total_paths"], 1000);
+        assert_eq!(scoped["target_receipt_scope"]["delivered_paths"], 8);
+        assert_eq!(scoped["target_receipt_scope"]["omitted_paths"], 992);
+        let scoped_metadata = bounded_task_projection_metadata(
+            &result,
+            scoped,
+            task_projection_json_pointers(&result),
+        )
+        .unwrap();
+        let full: JsonValue = serde_json::from_str(&scoped_metadata.spillable_text[0]).unwrap();
+        assert_eq!(
+            full["cold_review_context"]["target_receipt_scope"]["declared_paths"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1000
+        );
+        result.task.receipt.as_mut().unwrap().attempt_id = AttemptId::new();
+        assert!(crate::agent::task_capabilities::cold_review_receipt_scope(&result.task).is_err());
+        result.task.receipt = None;
+        assert!(
+            crate::agent::task_capabilities::cold_review_receipt_scope(&result.task)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(canonical.kind, codex_tools::CanonicalToolResultKind::Json);
         assert!(
             metadata
@@ -2570,6 +2697,7 @@ mod projection_tests {
 #[cfg(test)]
 mod review_policy_tests {
     use super::*;
+    use codex_agent_task_store::AgentTaskBindingDraft;
     use codex_agent_task_store::AssignmentAdmissionOrigin;
     use codex_agent_task_store::AssignmentDraft;
     use codex_agent_task_store::CapabilityProfile;
@@ -2583,40 +2711,111 @@ mod review_policy_tests {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let coordinator = session.services.agent_control.task_coordinator();
-        coordinator.initialize(codex_state::StateRuntime::init(home.path().into(), "test".into()).await.unwrap(), "root".into()).await.unwrap();
+        coordinator
+            .initialize(
+                codex_state::StateRuntime::init(home.path().into(), "test".into())
+                    .await
+                    .unwrap(),
+                "root".into(),
+            )
+            .await
+            .unwrap();
         let draft = |parent_assignment_id| AssignmentDraft {
-            root_session_id: "root".into(), admission_origin: AssignmentAdmissionOrigin::LegacyMessage { parent_assignment_id },
-            role: AgentRole::Explorer, capability_profile: CapabilityProfile::ReadSearch,
-            objective: "report".into(), acceptance_criteria: vec![AcceptanceCriterion { id: "report".into(), text: "report".into() }],
-            read_scope: vec![], write_scope: vec![], stop_condition: "report".into(), dependencies: vec![],
-            risk_hints: vec![], required_evidence: vec![], prohibited_changes: vec![], contract_claims: vec![],
-            workspace_strategy: WorkspaceStrategy::Shared, relation: None, architecture_contract_ref: None,
+            root_session_id: "root".into(),
+            admission_origin: AssignmentAdmissionOrigin::LegacyMessage {
+                parent_assignment_id,
+            },
+            role: AgentRole::Explorer,
+            capability_profile: CapabilityProfile::ReadSearch,
+            objective: "report".into(),
+            acceptance_criteria: vec![AcceptanceCriterion {
+                evidence_policy: None,
+                id: "report".into(),
+                text: "report".into(),
+            }],
+            read_scope: vec![],
+            write_scope: vec![],
+            stop_condition: "report".into(),
+            dependencies: vec![],
+            risk_hints: vec![],
+            required_evidence: vec![],
+            prohibited_changes: vec![],
+            contract_claims: vec![],
+            workspace_strategy: WorkspaceStrategy::Shared,
+            relation: None,
+            architecture_contract_ref: None,
         };
-        let (parent, attempt) = coordinator.create_assignment(repo.path(), draft(None)).await.unwrap();
-        let path = codex_protocol::AgentPath::root().join("coordinator").unwrap();
-        let binding = coordinator.bind_agent_task(AgentTaskBindingDraft {
-            assignment_id: parent.assignment_id, attempt_id: attempt.attempt_id,
-            agent_path: path.to_string(), task_name: "coordinator".into(), thread_id: Some(session.thread_id.to_string()),
-        }).await.unwrap();
-        turn.session_source = SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
-            parent_thread_id: ThreadId::new(), depth: 1, agent_path: Some(path), agent_nickname: None, agent_role: None,
-        });
+        let (parent, attempt) = coordinator
+            .create_assignment(repo.path(), draft(None))
+            .await
+            .unwrap();
+        let path = codex_protocol::AgentPath::root()
+            .join("coordinator")
+            .unwrap();
+        let binding = coordinator
+            .bind_agent_task(AgentTaskBindingDraft {
+                assignment_id: parent.assignment_id,
+                attempt_id: attempt.attempt_id,
+                agent_path: path.to_string(),
+                task_name: "coordinator".into(),
+                thread_id: Some(session.thread_id.to_string()),
+            })
+            .await
+            .unwrap();
+        turn.session_source =
+            SessionSource::SubAgent(codex_protocol::protocol::SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: Some(path),
+                agent_nickname: None,
+                agent_role: None,
+            });
         turn.agent_task_binding.set(Some(binding)).unwrap();
-        let (child, child_attempt) = coordinator.create_assignment(repo.path(), draft(Some(parent.assignment_id))).await.unwrap();
-        coordinator.store().unwrap().record_legacy_agent_outcome(child_attempt.attempt_id, AgentStatusClaim::Completed, "durable nested result".into()).await.unwrap();
-        let (sibling, _) = coordinator.create_assignment(repo.path(), draft(None)).await.unwrap();
-        let (grandchild, _) = coordinator.create_assignment(repo.path(), draft(Some(child.assignment_id))).await.unwrap();
+        let (child, child_attempt) = coordinator
+            .create_assignment(repo.path(), draft(Some(parent.assignment_id)))
+            .await
+            .unwrap();
+        coordinator
+            .store()
+            .unwrap()
+            .record_legacy_agent_outcome(
+                child_attempt.attempt_id,
+                AgentStatusClaim::Completed,
+                "durable nested result".into(),
+            )
+            .await
+            .unwrap();
+        let (sibling, _) = coordinator
+            .create_assignment(repo.path(), draft(None))
+            .await
+            .unwrap();
+        let (grandchild, _) = coordinator
+            .create_assignment(repo.path(), draft(Some(child.assignment_id)))
+            .await
+            .unwrap();
         let step = crate::session::step_context::StepContext::for_test(Arc::new(turn));
         // No live child exists: every read must recover the stored record.
-        for (id, allowed) in [(parent.assignment_id, true), (child.assignment_id, true), (sibling.assignment_id, false), (grandchild.assignment_id, false)] {
+        for (id, allowed) in [
+            (parent.assignment_id, true),
+            (child.assignment_id, true),
+            (sibling.assignment_id, false),
+            (grandchild.assignment_id, false),
+        ] {
             let result = handle_get_agent_task(ToolInvocation {
-                session: Arc::clone(&session), step_context: Arc::clone(&step),
+                session: Arc::clone(&session),
+                step_context: Arc::clone(&step),
                 cancellation_token: tokio_util::sync::CancellationToken::new(),
-                tracker: Arc::new(tokio::sync::Mutex::new(crate::turn_diff_tracker::TurnDiffTracker::new())),
-                call_id: "read-child".into(), tool_name: ToolName::plain(GET_AGENT_TASK_TOOL),
+                tracker: Arc::new(tokio::sync::Mutex::new(
+                    crate::turn_diff_tracker::TurnDiffTracker::new(),
+                )),
+                call_id: "read-child".into(),
+                tool_name: ToolName::plain(GET_AGENT_TASK_TOOL),
                 source: crate::tools::context::ToolCallSource::Direct,
-                payload: ToolPayload::Function { arguments: json!({"assignment_id":id}).to_string() },
-            }).await;
+                payload: ToolPayload::Function {
+                    arguments: json!({"assignment_id":id}).to_string(),
+                },
+            })
+            .await;
             assert_eq!(result.is_ok(), allowed, "lineage access for {id}");
         }
     }
@@ -2640,6 +2839,7 @@ mod review_policy_tests {
                     capability_profile: CapabilityProfile::ReadSearch,
                     objective: "inspect the owning path".to_string(),
                     acceptance_criteria: vec![AcceptanceCriterion {
+                        evidence_policy: None,
                         id: "coverage".to_string(),
                         text: "report inspected coverage".to_string(),
                     }],

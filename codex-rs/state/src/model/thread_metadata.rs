@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::DateTime;
 use chrono::Utc;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
@@ -47,6 +48,8 @@ pub struct ExtractionOutcome {
     pub parent_thread_id: Option<ThreadId>,
     /// The number of rollout lines that failed to parse.
     pub parse_errors: usize,
+    /// Unreadable external payloads that can be repaired without changing the rollout.
+    pub unresolved_payloads: usize,
 }
 
 /// Canonical thread metadata derived from rollout files.
@@ -56,6 +59,10 @@ pub struct ThreadMetadata {
     pub project_id: Option<String>,
     /// The thread identifier.
     pub id: ThreadId,
+    /// Shared session identity, absent until recovered for legacy index rows.
+    pub session_id: Option<SessionId>,
+    /// Current incoming graph owner, distinct from immutable rollout provenance.
+    pub current_parent_thread_id: Option<ThreadId>,
     /// The absolute rollout path on disk.
     pub rollout_path: PathBuf,
     /// The creation timestamp.
@@ -113,6 +120,8 @@ pub struct ThreadMetadata {
 pub struct ThreadMetadataBuilder {
     /// The thread identifier.
     pub id: ThreadId,
+    /// Canonical shared session identity when available in the rollout header.
+    pub session_id: Option<SessionId>,
     /// The absolute rollout path on disk.
     pub rollout_path: PathBuf,
     /// The creation timestamp.
@@ -165,6 +174,7 @@ impl ThreadMetadataBuilder {
     ) -> Self {
         Self {
             id,
+            session_id: None,
             rollout_path,
             created_at,
             updated_at: None,
@@ -205,6 +215,8 @@ impl ThreadMetadataBuilder {
         ThreadMetadata {
             project_id: None,
             id: self.id,
+            session_id: self.session_id,
+            current_parent_thread_id: None,
             rollout_path: self.rollout_path.clone(),
             created_at,
             updated_at,
@@ -281,6 +293,8 @@ fn canonicalize_datetime(dt: DateTime<Utc>) -> DateTime<Utc> {
 pub(crate) struct ThreadRow {
     project_id: Option<String>,
     id: String,
+    session_id: Option<String>,
+    current_parent_thread_id: Option<String>,
     rollout_path: String,
     created_at: i64,
     updated_at: i64,
@@ -312,6 +326,8 @@ impl ThreadRow {
     pub(crate) fn try_from_row(row: &SqliteRow) -> Result<Self> {
         Ok(Self {
             id: row.try_get("id")?,
+            session_id: row.try_get("session_id")?,
+            current_parent_thread_id: row.try_get("current_parent_thread_id")?,
             rollout_path: row.try_get("rollout_path")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -348,6 +364,8 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
     fn try_from(row: ThreadRow) -> std::result::Result<Self, Self::Error> {
         let ThreadRow {
             id,
+            session_id,
+            current_parent_thread_id,
             rollout_path,
             created_at,
             updated_at,
@@ -382,6 +400,10 @@ impl TryFrom<ThreadRow> for ThreadMetadata {
         let history_mode = history_mode.parse().map_err(anyhow::Error::msg)?;
         Ok(Self {
             id: ThreadId::try_from(id)?,
+            session_id: session_id.map(SessionId::try_from).transpose()?,
+            current_parent_thread_id: current_parent_thread_id
+                .map(ThreadId::try_from)
+                .transpose()?,
             rollout_path: PathBuf::from(rollout_path),
             created_at: epoch_millis_to_datetime(created_at)?,
             updated_at: epoch_millis_to_datetime(updated_at)?,
@@ -469,6 +491,8 @@ mod tests {
     fn thread_row(reasoning_effort: Option<&str>) -> ThreadRow {
         ThreadRow {
             project_id: None,
+            session_id: None,
+            current_parent_thread_id: None,
             id: "00000000-0000-0000-0000-000000000123".to_string(),
             rollout_path: "/tmp/rollout-123.jsonl".to_string(),
             created_at: 1_700_000_000_000,
@@ -501,6 +525,8 @@ mod tests {
     fn expected_thread_metadata(reasoning_effort: Option<ReasoningEffort>) -> ThreadMetadata {
         ThreadMetadata {
             project_id: None,
+            session_id: None,
+            current_parent_thread_id: None,
             id: ThreadId::from_string("00000000-0000-0000-0000-000000000123")
                 .expect("valid thread id"),
             rollout_path: PathBuf::from("/tmp/rollout-123.jsonl"),
@@ -535,11 +561,14 @@ mod tests {
     fn thread_row_parses_known_custom_and_absent_reasoning_effort() {
         for (wire, expected) in [
             (Some("high"), Some(ReasoningEffort::High)),
-            (Some("future"), Some(ReasoningEffort::Custom("future".to_string()))),
+            (
+                Some("future"),
+                Some(ReasoningEffort::Custom("future".to_string())),
+            ),
             (None, None),
         ] {
-            let metadata = ThreadMetadata::try_from(thread_row(wire))
-                .expect("thread metadata should parse");
+            let metadata =
+                ThreadMetadata::try_from(thread_row(wire)).expect("thread metadata should parse");
             assert_eq!(metadata, expected_thread_metadata(expected), "{wire:?}");
         }
     }

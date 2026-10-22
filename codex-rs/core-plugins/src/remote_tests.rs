@@ -16,7 +16,10 @@ async fn recommended_catalog_preserves_status_and_classifies_truncated_bodies() 
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(std::time::Instant::now() < deadline, "client did not connect");
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "client did not connect"
+                        );
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
                     Err(error) => panic!("accept request: {error}"),

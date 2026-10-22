@@ -153,7 +153,12 @@ impl ManagedRootProcess {
         }
 
         #[cfg(windows)]
-        let job = match crate::win::JobObject::create() {
+        let job = match crate::win::JobObject::create().and_then(|job| {
+            // Every managed launch promises cancellation of the contained
+            // workload, including pipes and the direct core execution path.
+            job.require_descendant_containment()?;
+            Ok(job)
+        }) {
             Ok(job) => job,
             Err(error) => {
                 MANAGED_ROOT_COUNT.fetch_sub(1, Ordering::AcqRel);
@@ -435,18 +440,27 @@ where
     T: Send + 'static,
     F: FnOnce() -> io::Result<T> + Send + 'static,
 {
-    tokio::time::timeout(timeout, tokio::task::spawn_blocking(operation))
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "Windows process operation did not return within {} seconds",
-                    timeout.as_secs_f64()
-                ),
+    let observation = crate::process_observation::ProcessObservationContext::current();
+    tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            crate::process_observation::ProcessObservationContext::scope_sync(
+                observation,
+                operation,
             )
-        })?
-        .map_err(|error| io::Error::other(format!("Windows process task failed: {error}")))?
+        }),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "Windows process operation did not return within {} seconds",
+                timeout.as_secs_f64()
+            ),
+        )
+    })?
+    .map_err(|error| io::Error::other(format!("Windows process task failed: {error}")))?
 }
 
 #[cfg(windows)]
@@ -582,6 +596,39 @@ mod tests {
     use super::*;
 
     #[cfg(windows)]
+    #[tokio::test]
+    async fn managed_root_disallows_breakaway_before_any_launch() {
+        use std::os::windows::io::AsRawHandle;
+        use winapi::um::jobapi2::QueryInformationJobObject;
+        use winapi::um::winnt::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        use winapi::um::winnt::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        use winapi::um::winnt::JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+        use winapi::um::winnt::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+        use winapi::um::winnt::JobObjectExtendedLimitInformation;
+        let _guard = managed_root_test_lock().acquire().await.unwrap();
+        let root = ManagedRootProcess::reserve().unwrap();
+        // SAFETY: native query writes exactly this initialized structure; root
+        // retains the Job throughout the call.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            QueryInformationJobObject(
+                root.job.as_raw_handle().cast(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of_mut!(limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(queried, 0);
+        let flags = limits.BasicLimitInformation.LimitFlags;
+        assert_eq!(
+            flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK),
+            0
+        );
+        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+    }
+
+    #[cfg(windows)]
     async fn check_suspended_resume(native_resume: Option<NtResumeProcess>, expect_native: bool) {
         use std::os::windows::io::AsHandle;
         use winapi::um::winnt::PROCESS_SUSPEND_RESUME;
@@ -595,7 +642,9 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id().unwrap();
-        let process = root.attach_with_access(pid, PROCESS_SUSPEND_RESUME).unwrap();
+        let process = root
+            .attach_with_access(pid, PROCESS_SUSPEND_RESUME)
+            .unwrap();
         assert!(child.try_wait().unwrap().is_none());
         // A native success must not fall through to the system-wide scan. No real
         // process can match this PID, so accidentally scanning makes the test fail.
@@ -617,7 +666,11 @@ mod tests {
             winapi::shared::ntstatus::STATUS_ACCESS_DENIED
         }
 
-        check_suspended_resume(Some(nt_resume_process().expect("native resume export")), true).await;
+        check_suspended_resume(
+            Some(nt_resume_process().expect("native resume export")),
+            true,
+        )
+        .await;
         check_suspended_resume(None, false).await;
         check_suspended_resume(Some(failed_resume), false).await;
     }
@@ -625,6 +678,33 @@ mod tests {
     fn managed_root_test_lock() -> &'static tokio::sync::Semaphore {
         static TEST_LOCK: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
         TEST_LOCK.get_or_init(|| tokio::sync::Semaphore::new(1))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_pty_rejects_shared_capacity_before_native_setup() {
+        let _guard = managed_root_test_lock().acquire().await.unwrap();
+        let roots = (0..MANAGED_ROOT_LIMIT)
+            .map(|_| ManagedRootProcess::reserve().unwrap())
+            .collect::<Vec<_>>();
+        let result = crate::spawn_pty_process(
+            "nonexistent-capacity-probe",
+            &[],
+            std::path::Path::new("."),
+            &std::collections::HashMap::new(),
+            &None,
+            crate::TerminalSize::default(),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("capacity must reject before spawn"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("managed root process limit"),
+            "{error}"
+        );
+        drop(roots);
+        assert!(ManagedRootProcess::reserve().is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]

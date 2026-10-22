@@ -7,7 +7,7 @@
       "name": "Cargo launch",
       "cargo": {
         "cwd": "${workspaceFolder}/codex-rs",
-        "args": ["build", "--bin=codex-tui"]
+        "args": ["build", "--bin=codex"]
       },
       "args": []
     },

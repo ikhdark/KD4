@@ -856,7 +856,12 @@ mod tests {
                 .expect("query feedback logs"),
         )
         .expect("valid utf-8");
-        for expected in ["threadless-before", "thread-scoped", "foo=2", "threadless-after"] {
+        for expected in [
+            "threadless-before",
+            "thread-scoped",
+            "foo=2",
+            "threadless-after",
+        ] {
             assert!(sqlite_logs.contains(expected), "{expected}: {sqlite_logs}");
         }
         assert_eq!(
@@ -866,7 +871,6 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
-
 
     #[tokio::test]
     async fn flush_reports_failed_automatic_batch() {
@@ -1003,7 +1007,6 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
-
     #[tokio::test]
     async fn flush_waits_for_queue_capacity_and_receiver_processing() {
         use std::future::Future;
@@ -1033,5 +1036,4 @@ mod tests {
             .expect("flush completes")
             .expect("flush succeeds");
     }
-
 }

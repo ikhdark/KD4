@@ -80,11 +80,21 @@ async fn new_thread_is_recorded_in_state_db() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Result<()> {
     let server = start_mock_server().await;
+    // Each turn answers; an empty completion spends the bounded missing-answer
+    // repair on another request, which would shift the resumed request.
     let mock = mount_sse_sequence(
         &server,
         vec![
-            responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-            responses::sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            responses::sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "persisted"),
+                ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-2"),
+                responses::ev_assistant_message("msg-2", "resumed"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;
@@ -147,7 +157,10 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
 
     started.thread.flush_rollout().await?;
     started.thread.submit(Op::Shutdown).await?;
-    wait_for_event(&started.thread, |event| matches!(event, EventMsg::ShutdownComplete)).await;
+    wait_for_event(&started.thread, |event| {
+        matches!(event, EventMsg::ShutdownComplete)
+    })
+    .await;
     let mut resume_builder = test_codex();
     let resumed = resume_builder
         .resume(&server, base_test.home.clone(), rollout_path)
@@ -187,11 +200,21 @@ async fn resume_restores_dynamic_tools_from_rollout_with_sqlite_enabled() -> Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled() -> Result<()> {
     let server = start_mock_server().await;
+    // Each turn answers; an empty completion spends the bounded missing-answer
+    // repair on another request, which would shift the resumed request.
     let mock = mount_sse_sequence(
         &server,
         vec![
-            responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-            responses::sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            responses::sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "persisted"),
+                ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-2"),
+                responses::ev_assistant_message("msg-2", "resumed"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;
@@ -301,11 +324,21 @@ async fn resume_restores_legacy_dynamic_tools_from_rollout_with_sqlite_enabled()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resume_quarantines_invalid_dynamic_tools_from_rollout() -> Result<()> {
     let server = start_mock_server().await;
+    // Each turn answers; an empty completion spends the bounded missing-answer
+    // repair on another request, which would shift the resumed request.
     let mock = mount_sse_sequence(
         &server,
         vec![
-            responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-            responses::sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            responses::sse(vec![
+                ev_response_created("resp-1"),
+                responses::ev_assistant_message("msg-1", "persisted"),
+                ev_completed("resp-1"),
+            ]),
+            responses::sse(vec![
+                ev_response_created("resp-2"),
+                responses::ev_assistant_message("msg-2", "resumed"),
+                ev_completed("resp-2"),
+            ]),
         ],
     )
     .await;

@@ -122,7 +122,8 @@ async fn duplicate_process_ids_allow_only_one_successful_start() {
         .next()
         .expect("one failed request")
         .expect_err("expected duplicate process error");
-    assert_eq!(error.code, -32600);
+    // Duplicate IDs are refused before dispatch with the dedicated start-refusal code.
+    assert_eq!(error.code, crate::rpc::PROCESS_START_REFUSED_ERROR_CODE);
     assert_eq!(error.message, "process proc-1 already exists");
 
     handler.shutdown().await;
@@ -284,7 +285,9 @@ async fn active_session_resume_is_rejected() {
         .await
         .expect("failed attachment must permit retry on the same connection");
     assert_eq!(resumed.session_id, initialize_response.session_id);
-    second_handler.initialized().expect("initialized after retry");
+    second_handler
+        .initialized()
+        .expect("initialized after retry");
     assert!(!first_handler.is_session_attached());
     assert!(second_handler.is_session_attached());
     second_handler.shutdown().await;

@@ -244,11 +244,13 @@ fn model_provider_from_proto(
         websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
+        kind: Default::default(),
         supports_standalone_web_search: provider.supports_standalone_web_search,
+        // This remote source does not advertise the optional hosted capability.
+        supports_hosted_web_search: false,
     };
     Ok((id, info))
 }
-
 
 fn model_provider_auth_from_proto(
     auth: proto::ModelProviderAuthInfo,
@@ -270,9 +272,6 @@ fn model_provider_auth_from_proto(
         cwd,
     })
 }
-
-
-
 
 fn parse_error(message: impl Into<String>) -> ThreadConfigLoadError {
     ThreadConfigLoadError::new(
@@ -316,7 +315,8 @@ mod tests {
             &self,
             request: Request<proto::LoadThreadConfigRequest>,
         ) -> Result<Response<proto::LoadThreadConfigResponse>, Status> {
-            self.entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             if self.stall {
                 std::future::pending::<()>().await;
             }
@@ -562,7 +562,6 @@ mod tests {
         }
     }
 
-
     fn proto_sources() -> Vec<proto::ThreadConfigSource> {
         let workspace_cwd = workspace_dir().to_string_lossy().into_owned();
         vec![
@@ -674,8 +673,10 @@ mod tests {
             websocket_connect_timeout_ms: Some(10_000),
             requires_openai_auth: false,
             supports_websockets: true,
+            kind: Default::default(),
             supports_standalone_web_search: false,
             aws: None,
+            supports_hosted_web_search: false,
         }
     }
 

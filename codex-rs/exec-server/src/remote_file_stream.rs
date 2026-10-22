@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use codex_utils_path_uri::PathUri;
+use std::sync::Arc;
 use tokio::io;
 use uuid::Uuid;
 
@@ -9,13 +10,20 @@ use crate::FILE_READ_CHUNK_SIZE;
 use crate::FileSystemReadStream;
 use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
+use crate::protocol::FS_CLOSE_METHOD;
+use crate::protocol::FS_OPEN_METHOD;
 use crate::protocol::FS_READ_BLOCK_METHOD;
 use crate::protocol::FsCloseParams;
+use crate::protocol::FsCloseResponse;
 use crate::protocol::FsOpenParams;
+use crate::protocol::FsOpenResponse;
 use crate::protocol::FsReadBlockParams;
+use crate::protocol::FsReadBlockResponse;
+use crate::rpc::RpcClient;
 
 struct FileReadRegistration {
     client: ExecServerClient,
+    rpc_client: Arc<RpcClient>,
     handle_id: String,
     runtime: Option<tokio::runtime::Handle>,
     cleanup_slot: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -32,19 +40,25 @@ pub(super) async fn open(
         .reserve_file_stream()
         .await
         .map_err(map_remote_error)?;
+    let rpc_client = client.rpc_client().await.map_err(map_remote_error)?;
     let registration = FileReadRegistration {
         client,
+        rpc_client,
         handle_id: Uuid::new_v4().simple().to_string(),
         runtime: tokio::runtime::Handle::try_current().ok(),
         cleanup_slot: Some(cleanup_slot),
     };
-    registration
+    let _: FsOpenResponse = registration
         .client
-        .fs_open(FsOpenParams {
-            handle_id: registration.handle_id.clone(),
-            path,
-            sandbox,
-        })
+        .call_rpc(
+            &registration.rpc_client,
+            FS_OPEN_METHOD,
+            &FsOpenParams {
+                handle_id: registration.handle_id.clone(),
+                path,
+                sandbox,
+            },
+        )
         .await
         .map_err(map_remote_error)?;
     Ok(FileSystemReadStream::new(futures::stream::try_unfold(
@@ -53,13 +67,17 @@ pub(super) async fn open(
             let Some((registration, offset)) = state else {
                 return Ok(None);
             };
-            let response = registration
+            let response: FsReadBlockResponse = registration
                 .client
-                .fs_read_block(FsReadBlockParams {
-                    handle_id: registration.handle_id.clone(),
-                    offset,
-                    len: FILE_READ_CHUNK_SIZE,
-                })
+                .call_rpc(
+                    &registration.rpc_client,
+                    FS_READ_BLOCK_METHOD,
+                    &FsReadBlockParams {
+                        handle_id: registration.handle_id.clone(),
+                        offset,
+                        len: FILE_READ_CHUNK_SIZE,
+                    },
+                )
                 .await
                 .map_err(map_remote_error)?;
             let chunk = Bytes::from(response.chunk.into_inner());
@@ -103,7 +121,7 @@ pub(super) async fn open(
 impl Drop for FileReadRegistration {
     fn drop(&mut self) {
         let cleanup_slot = self.cleanup_slot.take();
-        let client = self.client.clone();
+        let rpc_client = Arc::clone(&self.rpc_client);
         let handle_id = self.handle_id.clone();
         let runtime = self
             .runtime
@@ -112,8 +130,17 @@ impl Drop for FileReadRegistration {
         if let Some(runtime) = runtime {
             runtime.spawn(async move {
                 let _cleanup_slot = cleanup_slot;
-                let _ = client.fs_close(FsCloseParams { handle_id }).await;
+                let _: Result<FsCloseResponse, _> = ExecServerClient::call_for_cleanup_on_before(
+                    &rpc_client,
+                    FS_CLOSE_METHOD,
+                    &FsCloseParams { handle_id },
+                    tokio::time::Instant::now() + crate::client::PROCESS_TERMINATION_TIMEOUT,
+                )
+                .await;
             });
+        } else {
+            // No executor can own the deferred close; never leave its transport live.
+            rpc_client.request_transport_close();
         }
     }
 }

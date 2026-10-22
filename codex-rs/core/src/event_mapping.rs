@@ -233,6 +233,7 @@ pub fn parse_turn_item(item: &ResponseItem) -> Option<TurnItem> {
                 revised_prompt: revised_prompt.clone(),
                 result: result.clone(),
                 saved_path: None,
+                provider_usage: None,
             },
         )),
         _ => None,

@@ -114,9 +114,7 @@ async fn get_conversation_summary_resolves_thread_id_and_rollout_paths() -> Resu
             rollout_path: absolute_path,
         },
     ] {
-        let request_id = mcp
-            .send_get_conversation_summary_request(params)
-            .await?;
+        let request_id = mcp.send_get_conversation_summary_request(params).await?;
         let response: JSONRPCResponse = timeout(
             DEFAULT_READ_TIMEOUT,
             mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
@@ -246,7 +244,6 @@ async fn get_conversation_summary_reads_configured_in_memory_store() -> Result<(
     client.shutdown().await?;
     Ok(())
 }
-
 
 struct InMemoryThreadStoreId {
     store_id: String,

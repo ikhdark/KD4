@@ -30,21 +30,7 @@ impl SessionTask for CompactTask {
         cancellation_token: CancellationToken,
     ) -> BoxFuture<'static, SessionTaskResult> {
         Box::pin(async move {
-            // A fresh window discards history; without recovery tools, keep a replacement history.
-            let result = if ctx
-                .config
-                .features
-                .enabled(codex_features::Feature::TokenBudget)
-                && session.token_budget_recovery_available()
-            {
-                crate::compact_token_budget::run_manual_compact_task(
-                    session.clone(),
-                    ctx,
-                    &cancellation_token,
-                )
-                .await?;
-                Ok(())
-            } else if crate::compact::should_use_remote_compact_task(
+            let result = if crate::compact::should_use_remote_compact_task(
                 ctx.provider.info(),
                 ctx.config.compact_prompt.as_deref(),
             ) {
@@ -91,7 +77,8 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn compact_task_returns_recovery_storage_failure_and_keeps_history() -> anyhow::Result<()> {
+    async fn compact_task_returns_recovery_storage_failure_and_keeps_history() -> anyhow::Result<()>
+    {
         use crate::test_harness::responses;
         use codex_protocol::error::CodexErr;
         use codex_protocol::models::ResponseItem;
@@ -100,14 +87,16 @@ mod tests {
         let home = tempfile::tempdir()?;
         let (session, turn, _events) =
             crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
-                codex_login::CodexAuth::from_api_key("test"), Vec::new(), home.path(),
+                codex_login::CodexAuth::from_api_key("test"),
+                Vec::new(),
+                home.path(),
                 |config| {
                     config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
                     config.model_provider.supports_websockets = false;
                     config.compact_prompt = Some("Summarize this task".into());
-                    config.features.disable(codex_features::Feature::TokenBudget).unwrap();
                 },
-            ).await;
+            )
+            .await;
         let input: ResponseItem = serde_json::from_value(serde_json::json!({
             "type":"message", "role":"user", "content":[{
                 "type":"input_text", "text":"Keep exact unresolved constraints. ".repeat(20_000)
@@ -118,17 +107,32 @@ mod tests {
         let window = session.current_window_id().await;
         // Exercise the real recovery-artifact writer, not a synthetic task result.
         std::fs::write(home.path().join("tool-output"), "not a directory")?;
-        let log = responses::mount_sse_once(&server, responses::sse(vec![
-            responses::ev_assistant_message("summary", "Summary fixture"),
-            responses::ev_completed("summary-response"),
-        ])).await;
-        let result = Arc::new(CompactTask).run(
-            Arc::clone(&session), turn, Vec::new(), CancellationToken::new(),
-        ).await;
+        let log = responses::mount_sse_once(
+            &server,
+            responses::sse(vec![
+                responses::ev_assistant_message("summary", "Summary fixture"),
+                responses::ev_completed("summary-response"),
+            ]),
+        )
+        .await;
+        let result = Arc::new(CompactTask)
+            .run(
+                Arc::clone(&session),
+                turn,
+                Vec::new(),
+                CancellationToken::new(),
+            )
+            .await;
         assert!(matches!(result, Err(CodexErr::Fatal(_))));
         assert_eq!(session.current_window_id().await, window);
-        assert_eq!(session.clone_history().await.raw_items(), before.raw_items());
-        assert!(log.requests().len() <= 1, "storage failure must not regenerate a summary");
+        assert_eq!(
+            session.clone_history().await.raw_items(),
+            before.raw_items()
+        );
+        assert!(
+            log.requests().len() <= 1,
+            "storage failure must not regenerate a summary"
+        );
         Ok(())
     }
 }

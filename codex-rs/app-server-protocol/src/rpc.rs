@@ -65,13 +65,57 @@ impl fmt::Display for RequestId {
 pub type Result = serde_json::Value;
 
 /// Refers to any valid JSON-RPC object that can be decoded off the wire, or encoded to be sent.
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
 #[serde(untagged)]
 pub enum JSONRPCMessage {
     Request(JSONRPCRequest),
     Notification(JSONRPCNotification),
     Response(JSONRPCResponse),
     Error(JSONRPCError),
+}
+
+impl JsonSchema for JSONRPCMessage {
+    fn schema_name() -> String {
+        "JSONRPCMessage".into()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        // Presence, not the decoded value, selects the runtime envelope. Only
+        // reserved fields are exclusive; unrelated extension fields stay legal.
+        let branches = [
+            (
+                generator.subschema_for::<JSONRPCRequest>(),
+                &["result", "error"][..],
+            ),
+            (
+                generator.subschema_for::<JSONRPCNotification>(),
+                &["id", "result", "error"][..],
+            ),
+            (
+                generator.subschema_for::<JSONRPCResponse>(),
+                &["method", "error"][..],
+            ),
+            (
+                generator.subschema_for::<JSONRPCError>(),
+                &["method", "result"][..],
+            ),
+        ]
+        .into_iter()
+        .map(|(shape, forbidden)| {
+            serde_json::json!({
+                "allOf": [shape, {"not": {"anyOf": forbidden.iter().map(|field| {
+                    serde_json::json!({"required": [field]})
+                }).collect::<Vec<_>>()}}]
+            })
+        })
+        .collect::<Vec<_>>();
+        // Statically valid; `expect_used` is denied in library code, and a
+        // degraded schema fails the envelope test and fixture checks.
+        serde_json::from_value(serde_json::json!({
+            "description": "Refers to any valid JSON-RPC object that can be decoded off the wire, or encoded to be sent.",
+            "anyOf": branches,
+        })).unwrap_or(schemars::schema::Schema::Bool(true))
+    }
 }
 
 impl<'de> Deserialize<'de> for JSONRPCMessage {
@@ -156,6 +200,40 @@ pub struct JSONRPCErrorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_envelope_schema_matches_reserved_field_decoder() {
+        let schema = serde_json::to_value(schemars::schema_for!(JSONRPCMessage)).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for (input, valid) in [
+            (
+                r#"{"id":1,"method":"future/method","params":null,"extension":true}"#,
+                true,
+            ),
+            (r#"{"method":"future/notification","extension":true}"#, true),
+            (r#"{"id":"request","result":null}"#, true),
+            (r#"{"id":1,"error":{"code":-1,"message":"failure"}}"#, true),
+            (r#"{"id":null,"method":"example"}"#, false),
+            (r#"{"id":{},"method":"example"}"#, false),
+            (
+                r#"{"id":1,"result":null,"error":{"code":-1,"message":"failure"}}"#,
+                false,
+            ),
+            (r#"{"method":"example","result":null}"#, false),
+            (r#"{"method":"example","error":null}"#, false),
+            (r#"{"id":1}"#, false),
+            (r#"{"id":1,"method":null}"#, false),
+            (r#"[]"#, false),
+        ] {
+            let value: serde_json::Value = serde_json::from_str(input).unwrap();
+            assert_eq!(
+                serde_json::from_value::<JSONRPCMessage>(value.clone()).is_ok(),
+                valid,
+                "decoder: {input}"
+            );
+            assert_eq!(validator.is_valid(&value), valid, "schema: {input}");
+        }
+    }
 
     #[test]
     fn wire_decoder_rejects_malformed_and_conflicting_envelopes() {

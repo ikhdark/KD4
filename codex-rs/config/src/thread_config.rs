@@ -289,6 +289,7 @@ mod tests {
                     wire_api = "responses"
                     requires_openai_auth = false
                     supports_websockets = true
+                    supports_hosted_web_search = false
 
                     [features]
                     plugins = false
@@ -317,7 +318,9 @@ mod tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            kind: Default::default(),
             supports_standalone_web_search: false,
+            supports_hosted_web_search: false,
         }
     }
 }

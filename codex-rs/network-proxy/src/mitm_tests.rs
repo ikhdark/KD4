@@ -136,6 +136,43 @@ fn policy_ctx(
 }
 
 #[tokio::test]
+async fn local_reload_failure_is_not_reported_as_an_upstream_failure() {
+    struct FailingReloader;
+    impl crate::runtime::ConfigReloader for FailingReloader {
+        fn source_label(&self) -> String {
+            "failing test policy".to_string()
+        }
+        fn maybe_reload(
+            &self,
+        ) -> crate::runtime::ConfigReloaderFuture<'_, Option<crate::runtime::ConfigState>> {
+            Box::pin(async { Err(anyhow!("synthetic local reload failure")) })
+        }
+        fn reload_now(
+            &self,
+        ) -> crate::runtime::ConfigReloaderFuture<'_, crate::runtime::ConfigState> {
+            Box::pin(async { Err(anyhow!("synthetic local reload failure")) })
+        }
+    }
+    let initial =
+        crate::state::build_config_state(NetworkProxyConfig::default(), Default::default())
+            .unwrap();
+    let state = Arc::new(NetworkProxyState::with_reloader(
+        initial,
+        Arc::new(FailingReloader),
+    ));
+    let context = Arc::new(MitmRequestContext {
+        policy: policy_ctx(state, "example.test", 443),
+    });
+    let request = Request::builder()
+        .uri("https://example.test/")
+        .body(Body::empty())
+        .unwrap();
+    let response = handle_mitm_request(request, context).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.headers()["x-proxy-error"], "local_configuration");
+}
+
+#[tokio::test]
 async fn mitm_policy_blocks_disallowed_method_and_records_telemetry() {
     let app_state = Arc::new(network_proxy_state_for_policy({
         let mut network = NetworkProxyConfig {

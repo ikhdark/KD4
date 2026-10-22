@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
+import sys
 import threading
 from concurrent.futures import Future
 from contextlib import nullcontext
@@ -12,7 +14,7 @@ from pydantic import BaseModel
 from ._goal import _GoalOperationState
 from ._run import _raise_for_failed_turn
 from .client import CodexClient, CodexConfig
-from .errors import CodexError, TransportClosedError
+from .errors import CodexError, InvalidRequestError, TransportClosedError
 from .generated.v2_all import (
     AccountLoginCompletedNotification,
     AgentMessageDeltaNotification,
@@ -50,6 +52,7 @@ from .models import InitializeResponse, JsonObject, Notification
 ModelT = TypeVar("ModelT", bound=BaseModel)
 ParamsT = ParamSpec("ParamsT")
 ReturnT = TypeVar("ReturnT")
+_LOGGER = logging.getLogger(__name__)
 
 
 def _consume_background_future_result(future: Future[ReturnT]) -> None:
@@ -110,8 +113,9 @@ class AsyncCodexClient:
         delivered = threading.Event()
 
         def run_operation() -> None:
+            owner = None
             try:
-                with nullcontext() if shutdown else self._sync._operation(cancelled):
+                with nullcontext() if shutdown else self._sync._operation(cancelled) as owner:
                     if expected_epoch is not None and self.process_epoch != expected_epoch:
                         raise TransportClosedError("turn handle belongs to a closed Codex process")
                     result = fn()
@@ -122,10 +126,27 @@ class AsyncCodexClient:
                     if not delivered.wait(self._sync.config.operation_timeout_s):
                         cancelled.set()
                     if cancelled.is_set():
-                        on_cancel(result)
+                        assert owner is not None
+                        with self._sync._cleanup_operation(owner):
+                            on_cancel(result)
             except BaseException as exc:
                 if not operation.done():
                     operation.set_exception(exc)
+                else:
+                    # Result delivery and cleanup settlement are independent.
+                    # Keep this synchronous and bounded; never retain tracebacks
+                    # or schedule another worker after the caller has left.
+                    try:
+                        _LOGGER.error(
+                            "Background SDK cleanup failed (epoch=%s, error=%s)",
+                            owner.epoch if owner is not None else None,
+                            type(exc).__name__,
+                        )
+                    except BaseException:
+                        try:
+                            sys.stderr.write("Background SDK cleanup failed; logging unavailable\n")
+                        except BaseException:
+                            pass
             finally:
                 slots.release()
                 exited.set_result(None)
@@ -183,9 +204,13 @@ class AsyncCodexClient:
         """Close the wrapped sync client in a worker thread."""
         await self._run_sync(self._sync.close, shutdown=True)
 
-    async def initialize(self) -> InitializeResponse:
+    async def initialize(
+        self, *, notification_opt_outs: tuple[str, ...] = ()
+    ) -> InitializeResponse:
         """Initialize the Codex session."""
-        return await self._call_sync(self._sync.initialize)
+        return await self._call_sync(
+            lambda: self._sync.initialize(notification_opt_outs=notification_opt_outs)
+        )
 
     def register_turn_notifications(self, turn_id: str) -> None:
         """Register a turn notification queue on the wrapped sync client."""
@@ -354,7 +379,7 @@ class AsyncCodexClient:
         def cleanup(started: TurnStartResponse) -> None:
             try:
                 self._sync.turn_interrupt(thread_id, started.turn.id)
-            except BaseException:
+            except (TransportClosedError, InvalidRequestError):
                 pass
             finally:
                 self._sync.unregister_turn_notifications(started.turn.id)

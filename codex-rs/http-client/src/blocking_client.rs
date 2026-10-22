@@ -16,6 +16,7 @@ use crate::custom_ca::build_blocking_reqwest_client_with_custom_ca_policy;
 /// Configures a blocking client without exposing the underlying transport.
 pub struct BlockingHttpClientBuilder {
     follow_redirects: bool,
+    connect_timeout: Option<Duration>,
     request_timeout: Option<Option<Duration>>,
     tls_certs_only: Option<Vec<reqwest::Certificate>>,
     identity: Option<reqwest::Identity>,
@@ -26,6 +27,7 @@ impl BlockingHttpClientBuilder {
     pub fn new() -> Self {
         Self {
             follow_redirects: true,
+            connect_timeout: None,
             request_timeout: None,
             tls_certs_only: None,
             identity: None,
@@ -35,6 +37,12 @@ impl BlockingHttpClientBuilder {
 
     pub fn without_redirects(mut self) -> Self {
         self.follow_redirects = false;
+        self
+    }
+
+    /// Limits only connection establishment, not the response stream.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
         self
     }
 
@@ -109,6 +117,9 @@ impl BlockingHttpClientBuilder {
         }
         if !self.follow_redirects {
             builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        if let Some(timeout) = self.connect_timeout {
+            builder = builder.connect_timeout(timeout);
         }
         if let Some(timeout) = self.request_timeout {
             builder = builder.timeout(timeout);

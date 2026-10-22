@@ -460,9 +460,7 @@ mod tests {
         );
         let at_limit = vec![b'x'; super::MAX_SECRET_INPUT_BYTES as usize];
         assert_eq!(
-            super::read_secret_input(at_limit.as_slice())
-                .unwrap()
-                .len(),
+            super::read_secret_input(at_limit.as_slice()).unwrap().len(),
             at_limit.len(),
             "input of exactly the limit must be accepted"
         );

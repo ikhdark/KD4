@@ -10,6 +10,7 @@ $ProgressPreference = 'SilentlyContinue'
 #   { "id": <same>, "status": "ok", "commands": [["Get-Content", "foo.txt"]],
 #     "standalone_command": true,
 #     "direct_argv": ["git", "status"], "native_argument_mode": "Standard",
+#     "inspection_argv": ["git", "status"],
 #     "powershell_version": "7.5.2",
 #     "resolved_application": "C:\\Program Files\\Git\\cmd\\git.exe" | null }
 # or:
@@ -183,9 +184,13 @@ function Invoke-ParseRequest {
 
     $standaloneCommand = Get-StandaloneCommand $ast
     $directArgv = Get-DirectArgvCandidate $standaloneCommand
+    $inspectionArgv = $directArgv
+    if ($inspectionArgv -eq $null) {
+        $inspectionArgv = Get-DirectArgvCandidate $standaloneCommand $true
+    }
     $nativeArgumentMode = $null
     $powershellVersion = $null
-    if ($directArgv -ne $null) {
+    if ($directArgv -ne $null -or $inspectionArgv -ne $null) {
         # Windows PowerShell and PowerShell's Legacy mode reconstruct one native command line.
         # That is not unambiguously equivalent to passing an argv vector, especially for empty
         # and quoted arguments. Standard and Windows mode both use the modern argv contract for
@@ -201,6 +206,7 @@ function Invoke-ParseRequest {
 
         if ($nativeArgumentMode -eq $null) {
             $directArgv = $null
+            $inspectionArgv = $null
         }
     }
 
@@ -215,6 +221,7 @@ function Invoke-ParseRequest {
         commands = $commands
         standalone_command = $standaloneCommand -ne $null
         direct_argv = $directArgv
+        inspection_argv = $inspectionArgv
         native_argument_mode = $nativeArgumentMode
         powershell_version = $powershellVersion
         resolved_application = $resolvedApplication
@@ -606,7 +613,7 @@ function Convert-CommandElement {
 }
 
 function Convert-DirectCommandElement {
-    param($element)
+    param($element, [bool]$AllowCanonicalIntegers = $false)
 
     if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
         # PowerShell 7 expands an unquoted leading `~` (for example `~` or `~/src`) to the home
@@ -614,7 +621,8 @@ function Convert-DirectCommandElement {
         # process receives. Quoted `'~'` stays literal and remains eligible.
         if (
             $element.StringConstantType -eq [System.Management.Automation.Language.StringConstantType]::BareWord -and
-            $element.Value.StartsWith('~')
+            ($element.Value.StartsWith('~') -or
+                ($element.Value.StartsWith('-') -and $element.Value.Contains(':')))
         ) {
             return $null
         }
@@ -628,10 +636,24 @@ function Convert-DirectCommandElement {
         return @($element.Value)
     }
 
+    # Resource admission may inspect canonical decimal integers such as the 0
+    # in --retries 0. Keep the stricter direct-execution candidate unchanged.
+    # Reject alternate spellings, suffixes and non-integer expressions rather
+    # than guessing how native argument conversion would format them.
+    if (
+        $AllowCanonicalIntegers -and
+        $element -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+        ($element.Value -is [int] -or $element.Value -is [long]) -and
+        $element.Extent.Text -cmatch '^(0|[1-9][0-9]*)$' -and
+        $element.Extent.Text -ceq $element.Value.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    ) {
+        return @($element.Extent.Text)
+    }
+
     if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
         # A parameter with an attached argument can have native tokenization semantics that are
         # not represented by two argv values (for example -Name:value). Fail closed.
-        if ($element.Argument -ne $null) {
+        if ($element.Argument -ne $null -or $element.ParameterName.Contains(':')) {
             return $null
         }
         return @('-' + $element.ParameterName)
@@ -679,7 +701,7 @@ function Get-StandaloneCommand {
 }
 
 function Get-DirectArgvCandidate {
-    param($command)
+    param($command, [bool]$AllowCanonicalIntegers = $false)
 
     if ($command -eq $null) {
         return $null
@@ -687,7 +709,7 @@ function Get-DirectArgvCandidate {
 
     $argv = [System.Collections.ArrayList]::new()
     foreach ($element in $command.CommandElements) {
-        $converted = Convert-DirectCommandElement $element
+        $converted = Convert-DirectCommandElement $element $AllowCanonicalIntegers
         if ($converted -eq $null) {
             return $null
         }

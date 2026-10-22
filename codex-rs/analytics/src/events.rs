@@ -567,6 +567,10 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) subagent_tool_call_count: Option<usize>,
     pub(crate) web_search_count: Option<usize>,
     pub(crate) image_generation_count: Option<usize>,
+    /// These scalars are observed turn subtotals, qualified by receipt coverage.
+    pub(crate) token_usage_scope: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) token_usage_coverage: Option<codex_protocol::protocol::TokenUsageCoverage>,
     pub(crate) input_tokens: Option<i64>,
     pub(crate) cached_input_tokens: Option<i64>,
     pub(crate) output_tokens: Option<i64>,

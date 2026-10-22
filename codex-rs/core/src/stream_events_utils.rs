@@ -186,6 +186,7 @@ impl InFlightToolCall {
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
+    pub assistant_output: Option<FinalizedAssistantOutput>,
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightToolCall>,
     pub eager_read_eligible: bool,
@@ -208,6 +209,8 @@ struct OrderedResponseItemRecorderState {
     required_tail: Option<ResponseItemPersistenceBarrier>,
     auxiliary_tail: Option<ResponseItemPersistenceBarrier>,
     accepted_tool_calls: BTreeMap<String, ToolCall>,
+    prior_call_ids: Option<std::collections::HashSet<String>>,
+    call_id_remaps: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Default)]
@@ -216,6 +219,38 @@ pub(crate) struct OrderedResponseItemRecorder {
 }
 
 impl OrderedResponseItemRecorder {
+    async fn normalize_call_id(&self, sess: &Session, item: &mut ResponseItem) {
+        let Some((_, is_call, raw_id)) = crate::tool_occurrence::identity(item) else {
+            return;
+        };
+        let raw_id = raw_id.to_string();
+        // Never hold the recorder lock while acquiring session state.
+        let needs_history = is_call && self.state.lock().await.prior_call_ids.is_none();
+        let prior = if needs_history {
+            Some(sess.reserved_tool_call_ids().await)
+        } else {
+            None
+        };
+        let mut state = self.state.lock().await;
+        if let Some(prior) = prior {
+            state.prior_call_ids.get_or_insert(prior);
+        }
+        let mapped = if let Some(mapped) = state.call_id_remaps.get(&raw_id) {
+            mapped.clone()
+        } else if is_call {
+            let ids = state.prior_call_ids.get_or_insert_default();
+            let mut mapped = raw_id.clone();
+            while !ids.insert(mapped.clone()) {
+                mapped = format!("call_{}", uuid::Uuid::new_v4().simple());
+            }
+            state.call_id_remaps.insert(raw_id, mapped.clone());
+            mapped
+        } else {
+            return;
+        };
+        crate::tool_occurrence::set_call_id(item, mapped);
+    }
+
     async fn accepted_tool_call_replay(&self, call: &ToolCall) -> Option<bool> {
         self.state
             .lock()
@@ -292,6 +327,15 @@ impl OrderedResponseItemRecorder {
         required_barrier
     }
 
+    /// Wait only for conversation publication, not auxiliary delivery bookkeeping.
+    pub(crate) async fn flush_required(&self) -> codex_protocol::error::Result<()> {
+        let tail = self.state.lock().await.required_tail.clone();
+        if let Some(tail) = tail {
+            tail.await.map_err(CodexErr::Fatal)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn flush(&self) -> codex_protocol::error::Result<()> {
         let tail = self.state.lock().await.auxiliary_tail.clone();
         if let Some(tail) = tail {
@@ -359,7 +403,16 @@ pub(crate) struct FinalizedTurnItem {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FinalizedTurnItemFacts {
     pub(crate) last_agent_message: Option<String>,
+    pub(crate) assistant_output: Option<FinalizedAssistantOutput>,
     pub(crate) defers_mailbox_delivery_to_next_turn: bool,
+}
+
+/// Completed, contributed client-visible output, never a streaming prefix.
+#[derive(Clone, Debug)]
+pub(crate) struct FinalizedAssistantOutput {
+    pub(crate) item_id: String,
+    pub(crate) phase: Option<MessagePhase>,
+    pub(crate) text: String,
 }
 
 pub(crate) async fn finalize_non_tool_response_item(
@@ -370,6 +423,7 @@ pub(crate) async fn finalize_non_tool_response_item(
 ) -> Option<FinalizedTurnItem> {
     let turn_item =
         handle_non_tool_response_item(sess, contributor_policy, item, plan_mode).await?;
+    let mut assistant_output = None;
     let (last_agent_message, defers_mailbox_delivery_to_next_turn) = match &turn_item {
         TurnItem::AgentMessage(agent_message) => {
             let combined = agent_message
@@ -379,6 +433,11 @@ pub(crate) async fn finalize_non_tool_response_item(
                     codex_protocol::items::AgentMessageContent::Text { text } => text.as_str(),
                 })
                 .collect::<String>();
+            assistant_output = Some(FinalizedAssistantOutput {
+                item_id: agent_message.id.clone(),
+                phase: agent_message.phase.clone(),
+                text: combined.clone(),
+            });
             let last_agent_message = if combined.trim().is_empty() {
                 None
             } else {
@@ -395,6 +454,7 @@ pub(crate) async fn finalize_non_tool_response_item(
         turn_item,
         facts: FinalizedTurnItemFacts {
             last_agent_message,
+            assistant_output,
             defers_mailbox_delivery_to_next_turn,
         },
     })
@@ -403,13 +463,16 @@ pub(crate) async fn finalize_non_tool_response_item(
 #[instrument(level = "trace", skip_all)]
 pub(crate) async fn handle_output_item_done(
     ctx: &mut HandleOutputCtx,
-    item: ResponseItem,
+    mut item: ResponseItem,
     previously_active_item: Option<TurnItem>,
     earlier_tool_calls_eligible: &mut bool,
 ) -> Result<OutputItemResult> {
     let item_accepted_at = Instant::now();
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
+    ctx.response_item_recorder
+        .normalize_call_id(&ctx.sess, &mut item)
+        .await;
 
     match ToolRouter::build_tool_call(&item) {
         // The model emitted a tool call; admit it, persist it, and queue the tool execution.
@@ -477,6 +540,7 @@ pub(crate) async fn handle_output_item_done(
                         &execution_id,
                         TurnTimingToolCallSource::Direct,
                         None,
+                        call.tool_name.name.as_str(),
                     )
             });
             if !accepted {
@@ -587,7 +651,10 @@ pub(crate) async fn handle_output_item_done(
                     .await,
             );
 
-            output.last_agent_message = finalized_facts.and_then(|facts| facts.last_agent_message);
+            if let Some(facts) = finalized_facts {
+                output.last_agent_message = facts.last_agent_message;
+                output.assistant_output = facts.assistant_output;
+            }
         }
         // Preserve the tool-search response shape and call ID when argument parsing fails.
         Err(ToolCallBuildError::ToolSearchArguments { call_id, message }) => {

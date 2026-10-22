@@ -14,7 +14,11 @@ fn runtime_paths_include_only_available_runtime_roots() {
     let mut both = desktop.clone();
     both.push(primary.clone());
     for (local, profile, expected) in [
-        (Some(local_app_data.clone()), Some(user_profile.clone()), both),
+        (
+            Some(local_app_data.clone()),
+            Some(user_profile.clone()),
+            both,
+        ),
         (Some(local_app_data), None, desktop),
         (None, Some(user_profile), vec![primary]),
         (None, None, vec![]),

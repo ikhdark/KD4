@@ -720,7 +720,6 @@ allowed_sandbox_modes = ["workspace-write"]
     }
 }
 
-
 #[test]
 fn hostname_resolution_is_lazy_for_absent_and_empty_selectors() {
     for selector in [None, Some("remote_sandbox_config = []")] {
@@ -742,7 +741,6 @@ fn hostname_resolution_is_lazy_for_absent_and_empty_selectors() {
         );
     }
 }
-
 
 #[test]
 fn hostname_resolver_is_called_once_for_multiple_remote_sandbox_layers() {
@@ -1296,7 +1294,6 @@ deny_read = ['C:\high', 'C:\shared', 'C:\low', 'C:\other']
     );
 }
 
-
 #[test]
 fn marketplace_allowed_sources_use_default_toml_merge() {
     let composed = compose(vec![
@@ -1409,5 +1406,3 @@ reff = "main"
     assert!(err.to_string().contains("Bad marketplace layer (req_bad)"));
     assert!(err.to_string().contains("unknown field `reff`"));
 }
-
-

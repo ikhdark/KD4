@@ -23,6 +23,8 @@ use crate::user_input::ByteRange;
 use crate::user_input::TextElement;
 use crate::user_input::UserInput;
 use codex_extension_items::ExtensionItem;
+pub use codex_extension_items::image_generation::ImageGenerationUsage;
+pub use codex_extension_items::image_generation::ImageTokenDetails;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use quick_xml::de::from_str as from_xml_str;
@@ -220,8 +222,19 @@ pub struct CommandExecutionOutputMetadata {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentProvenance {
+    pub environment_id: String,
+    /// Opaque registration/logical-session identity captured before dispatch.
+    pub owner_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct CommandExecutionItem {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<EnvironmentProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub output_metadata: Option<CommandExecutionOutputMetadata>,
@@ -363,6 +376,9 @@ pub struct WebSearchItem {
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct ImageViewItem {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<EnvironmentProvenance>,
     /// Path resolved within the selected execution environment.
     ///
     /// This core protocol type is not exposed directly in the app-server API.
@@ -387,11 +403,17 @@ pub struct ImageGenerationItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub saved_path: Option<AbsolutePathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_usage: Option<ImageGenerationUsage>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct FileChangeItem {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub environment: Option<EnvironmentProvenance>,
     pub changes: HashMap<PathBuf, FileChange>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

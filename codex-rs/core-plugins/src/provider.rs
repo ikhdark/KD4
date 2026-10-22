@@ -126,6 +126,25 @@ impl ExecutorPluginProvider {
             file_system,
         }))
     }
+
+    /// Resolves metadata through the exact owner captured by the sampling step.
+    pub async fn resolve_captured(
+        &self,
+        root: &codex_exec_server::ResolvedSelectedCapabilityRoot,
+    ) -> Result<Option<ResolvedExecutorPlugin>, ExecutorPluginProviderError> {
+        let selected = root.selected_root();
+        let file_system = root.file_system();
+        let plugin = resolve_plugin_root(
+            selected,
+            selected_plugin_root(selected),
+            file_system.as_ref(),
+        )
+        .await?;
+        Ok(plugin.map(|plugin| ResolvedExecutorPlugin {
+            plugin,
+            file_system,
+        }))
+    }
 }
 
 fn selected_plugin_root(selected_root: &SelectedCapabilityRoot) -> PathUri {

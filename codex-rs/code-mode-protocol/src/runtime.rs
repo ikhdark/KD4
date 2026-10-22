@@ -27,8 +27,7 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
 pub const MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 40_000;
 /// Fallback nested display budget when no owning cell budget is available.
 /// Runtime dispatch scales this reserve with the cell's remaining budget.
-pub const MAX_NESTED_COMMAND_OUTPUT_TOKENS: usize =
-    DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 5;
+pub const MAX_NESTED_COMMAND_OUTPUT_TOKENS: usize = DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL * 4 / 5;
 /// Hard deadline applied to a single nested tool call when the host supplies no
 /// per-cell default. A host-supplied default must still leave room for the
 /// longest wait its own tools can be asked to perform.

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,10 +76,16 @@ def package_build_lease(spec, profile, *, inputs=None):
         "package build target",
     ):
         token = _build_leases.set(held | {target})
-        targets_token = _leased_targets.set({
-            **(_leased_targets.get() or {}),
-            (spec.target, profile, str(package_target_base(spec, profile).resolve())): target,
-        })
+        targets_token = _leased_targets.set(
+            {
+                **(_leased_targets.get() or {}),
+                (
+                    spec.target,
+                    profile,
+                    str(package_target_base(spec, profile).resolve()),
+                ): target,
+            }
+        )
         try:
             yield target
         finally:
@@ -140,7 +147,8 @@ def build_source_binaries(
     )
     target_dir = (
         cargo_package_target_dir(spec, profile)
-        if requested_binaries else package_target_base(spec, profile)
+        if requested_binaries
+        else package_target_base(spec, profile)
     )
     output_dir = cargo_profile_output_dir(spec, profile, target_dir=target_dir)
     outputs = SourceBuildOutputs(
@@ -210,6 +218,40 @@ def build_source_binaries(
                 cargo=cargo,
                 release_version=release_version,
                 build_env=build_env,
+            )
+        external = observation["recipe"]["external_inputs"]
+        expected_target = _target_for_tools(
+            package_target_base(spec, profile), observation["recipe"]["tools"], external
+        )
+        if target_dir != expected_target:
+            raise RuntimeError(
+                "package external inputs changed while acquiring the build lease; retry packaging"
+            )
+        if external["status"] != "ok":
+            # Unknown closure cannot authorize either our skip or Cargo's
+            # timestamp-based native reuse. This target is private and leased.
+            if any(
+                path is not None and path.resolve().is_relative_to(target_dir.resolve())
+                for path in (
+                    entrypoint_bin,
+                    code_mode_host_bin,
+                    codex_command_runner_bin,
+                    codex_windows_sandbox_setup_bin,
+                )
+            ):
+                raise RuntimeError(
+                    "Cannot rebuild unverified external inputs over explicit prebuilt inputs in the package target"
+                )
+            run_owned(
+                [
+                    resolve_command(cargo, env=build_env) or cargo,
+                    "clean",
+                    "--target-dir",
+                    str(target_dir),
+                ],
+                cwd=CODEX_RS_ROOT,
+                check=True,
+                env=build_env,
             )
         run_cargo_build(
             cargo,
@@ -447,15 +489,21 @@ def package_target_base(spec: TargetSpec, profile: str) -> Path:
 
 def cargo_package_target_dir(spec: TargetSpec, profile: str) -> Path:
     base = package_target_base(spec, profile)
-    held = (_leased_targets.get() or {}).get((spec.target, profile, str(base.resolve())))
+    held = (_leased_targets.get() or {}).get(
+        (spec.target, profile, str(base.resolve()))
+    )
     if held is not None:
         return held
     env = cargo_build_env(spec, profile, target_dir=base)
     identity = effective_tool_contents(spec, env)
-    return _target_for_tools(base, identity)
+    return _target_for_tools(base, identity, external_input_fingerprint(spec, env))
 
 
-def _target_for_tools(base, identity):
+def _target_for_tools(base, identity, external_inputs=None):
+    if external_inputs and (
+        external_inputs["inputs"] or external_inputs["status"] != "ok"
+    ):
+        identity = {"tools": identity, "external_inputs": external_inputs}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
     return base / f"toolchain-{key}"
 
@@ -610,6 +658,29 @@ def cargo_build_env(
     # Remove it from execution as well as evidence, leaving arbitrary build
     # script inputs covered by the full environment fingerprint.
     env.pop("CODEX_THREAD_ID", None)
+    archive = env.get("RUSTY_V8_ARCHIVE")
+    if archive and "://" not in archive:
+        archive_path = CODEX_RS_ROOT / archive
+        if archive_path.is_dir():
+            archive_path = next(
+                (
+                    path
+                    for suffix in (".lib.gz", ".lib")
+                    if (
+                        path := archive_path / f"rusty_v8_release_{spec.target}{suffix}"
+                    ).is_file()
+                ),
+                archive_path,
+            )
+        if archive_path.is_file():
+            digest = source_output_fingerprint(archive_path)["sha256"]
+            pin = env.get("RUSTY_V8_ARCHIVE_SHA256")
+            if pin and pin.lower() != digest:
+                raise RuntimeError(
+                    "RUSTY_V8_ARCHIVE_SHA256 does not match the selected local archive"
+                )
+            # Upstream enforces this pin and treats it as a rerun input.
+            env["RUSTY_V8_ARCHIVE_SHA256"] = digest
     env.setdefault("RUST_MIN_STACK", DEFAULT_RUST_MIN_STACK)
     if release_version is not None:
         env["CODEX_RELEASE_VERSION"] = release_version
@@ -880,6 +951,7 @@ def write_source_build_stamp(
         raise RuntimeError("package build inputs changed during build; retry packaging")
     if source_before is not None and (
         source_before.get("status") != "ok"
+        or stamp["build_recipe"]["external_inputs"]["status"] != "ok"
         or any(
             value.get("status") == "unavailable"
             for value in (
@@ -1013,6 +1085,7 @@ def source_build_stamp_metadata_matches(
             tool.get("status") != "unavailable"
             for tool in recipe.get("tools", {}).values()
         )
+        and recipe.get("external_inputs", {}).get("status") == "ok"
         and stamp.get("build_recipe") == recipe
     )
 
@@ -1027,7 +1100,9 @@ def build_recipe_fingerprint(
 ) -> dict[str, object]:
     """Capture toolchain and environment inputs that can change Cargo output."""
     base = package_target_base(spec, profile)
-    held = (_leased_targets.get() or {}).get((spec.target, profile, str(base.resolve())))
+    held = (_leased_targets.get() or {}).get(
+        (spec.target, profile, str(base.resolve()))
+    )
     effective_env = (
         build_env
         if build_env is not None
@@ -1038,7 +1113,8 @@ def build_recipe_fingerprint(
     # Each proof boundary still observes executable contents freshly. Target
     # derivation reuses this observation rather than hashing the tools again.
     tools = effective_tool_contents(spec, effective_env)
-    target_dir = held or _target_for_tools(base, tools)
+    external_inputs = external_input_fingerprint(spec, effective_env)
+    target_dir = held or _target_for_tools(base, tools, external_inputs)
     if build_env is None:
         effective_env = cargo_build_env(
             spec, profile, target_dir=target_dir, release_version=release_version
@@ -1067,12 +1143,13 @@ def build_recipe_fingerprint(
     ]
 
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "target": spec.target,
         "profile": profile,
         "cargo": command_identity(cargo, "--version", "--verbose", env=effective_env),
         "rustc": command_identity(rustc, "-Vv", env=effective_env),
         "tools": tools,
+        "external_inputs": external_inputs,
         "environment": environment,
         "effective_command_sha256": hashlib.sha256(
             "\0".join(effective_command).encode("utf-8")
@@ -1113,6 +1190,143 @@ def cargo_config_paths(env: dict[str, str]) -> tuple[Path, ...]:
         for directory in directories
         for name in ("config", "config.toml")
     )
+
+
+def external_input_fingerprint(spec: TargetSpec, env: dict[str, str]) -> dict:
+    """Hash selected native files and local Cargo dependency/source roots.
+
+    Follow declared local edges, including transitive path dependencies, rather
+    than guessing paths from arbitrary environment variables or hashing caches.
+    Unknown closure disables receipts and requires a fresh private Cargo build.
+    """
+    inputs: dict[str, object] = {}
+    seen: set[Path] = set()
+    root = CODEX_RS_ROOT.resolve()
+
+    def digest_tree(path: Path) -> None:
+        path = path.resolve(strict=True)
+        if not path.is_dir():
+            raise ValueError(f"not a local source directory: {path}")
+        digest = hashlib.sha256()
+
+        def unreadable(error):
+            raise error
+
+        for directory, directories, files in os.walk(
+            path, onerror=unreadable, followlinks=False
+        ):
+            directories[:] = sorted(name for name in directories if name != ".git")
+            for name in sorted(directories + files):
+                entry = Path(directory) / name
+                relative = entry.relative_to(path)
+                if name == ".git":
+                    continue
+                if entry.is_symlink() or (
+                    hasattr(entry, "is_junction") and entry.is_junction()
+                ):
+                    raise ValueError(f"opaque local link: {entry}")
+                if entry.is_file():
+                    fingerprint = source_output_fingerprint(entry)
+                    record = [
+                        relative.as_posix(),
+                        fingerprint["size"],
+                        fingerprint["sha256"],
+                    ]
+                elif entry.is_dir():
+                    record = [relative.as_posix(), "directory"]
+                else:
+                    raise ValueError(f"unsupported local input: {entry}")
+                digest.update(json.dumps(record, separators=(",", ":")).encode())
+                digest.update(b"\n")
+        inputs[str(path)] = {"kind": "directory", "sha256": digest.hexdigest()}
+
+    def local_package(path: Path) -> None:
+        path = path.resolve(strict=True)
+        if path in seen:
+            return
+        seen.add(path)
+        if not path.is_relative_to(root):
+            digest_tree(path)
+        manifest = path / "Cargo.toml"
+        if not manifest.is_file():
+            raise ValueError(f"missing local dependency manifest: {manifest}")
+        document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        local_edges(document, path)
+        for pattern in document.get("workspace", {}).get("members", []):
+            for member in sorted(path.glob(pattern)):
+                local_package(member)
+
+    def local_edges(value, base: Path) -> None:
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            if key in {
+                "dependencies",
+                "dev-dependencies",
+                "build-dependencies",
+                "patch",
+                "replace",
+            }:
+                dependency_edges(child, base)
+            elif isinstance(child, dict):
+                local_edges(child, base)
+
+    def dependency_edges(value, base: Path) -> None:
+        if not isinstance(value, dict):
+            return
+        if isinstance(value.get("path"), str):
+            local_package(base / value["path"])
+        for child in value.values():
+            if isinstance(child, dict):
+                dependency_edges(child, base)
+
+    try:
+        for name in ("RUSTY_V8_ARCHIVE", "RUSTY_V8_SRC_BINDING_PATH"):
+            selected = env.get(name)
+            if not selected:
+                continue
+            if "://" in selected:
+                pin = (
+                    env.get("RUSTY_V8_ARCHIVE_SHA256", "")
+                    if name == "RUSTY_V8_ARCHIVE"
+                    else ""
+                )
+                if not re.fullmatch("[0-9a-fA-F]{64}", pin):
+                    raise ValueError(f"unbound remote native input: {name}")
+                inputs[name] = {"url": selected, "sha256": pin.lower()}
+                continue
+            path = (root / selected).resolve(strict=True)
+            if path.is_dir():
+                digest_tree(path)
+            else:
+                inputs[name] = source_output_fingerprint(path)
+                if inputs[name] is None:
+                    raise ValueError(f"missing native input: {path}")
+        if env.get("V8_FROM_SOURCE", "").lower() in {"1", "true", "yes"}:
+            raise ValueError("V8 source-build tool/input closure is not available")
+        if env.get("RUSTY_V8_SKIP_DOWNLOAD", "").lower() in {"1", "true", "yes"}:
+            raise ValueError("V8 skip-download mode cannot prove a linked native input")
+        if env.get("RUSTY_V8_SRC_BINDING_URL"):
+            raise ValueError("remote binding input has no content-bound local snapshot")
+        if (root / "Cargo.toml").is_file():
+            local_package(root)
+        paths = cargo_config_paths(env)
+        for legacy, modern in zip(paths[::2], paths[1::2]):
+            config = legacy if legacy.is_file() else modern
+            if not config.is_file():
+                continue
+            document = tomllib.loads(config.read_text(encoding="utf-8"))
+            base = config.parent.parent
+            local_edges(document, base)
+            for path in document.get("paths", []):
+                local_package(base / path)
+            for source in document.get("source", {}).values():
+                for key in ("directory", "local-registry"):
+                    if key in source:
+                        digest_tree(base / source[key])
+        return {"status": "ok", "inputs": inputs}
+    except (OSError, ValueError, TypeError, RecursionError) as error:
+        return {"status": "unavailable", "inputs": inputs, "reason": str(error)}
 
 
 def resolve_command(command: str, *, env: dict[str, str] | None = None) -> str | None:

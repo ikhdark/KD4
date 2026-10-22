@@ -29,12 +29,12 @@ use codex_file_watcher::FileWatcherSubscriber;
 use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
 use codex_git_utils::DISABLED_HOOKS_PATH;
-use codex_git_utils::get_git_remote_urls_assume_git_repo;
+use codex_git_utils::get_git_remote_urls_result;
 #[cfg(test)]
 use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_git_repo_root_with_fs;
 use codex_git_utils::get_has_changes;
-use codex_git_utils::get_head_commit_hash;
+use codex_git_utils::get_head_commit_hash_result;
 use codex_otel::MetricsClient;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -97,6 +97,7 @@ struct GitWorkspaceEntry {
 #[derive(Clone)]
 pub(crate) struct GitWorkspaceSnapshot {
     environment_generation: u64,
+    primary_environment_id: Option<String>,
     entries: Vec<GitWorkspaceEntry>,
     cache: Arc<GitWorkspaceCache>,
 }
@@ -125,11 +126,11 @@ impl GitWorkspaceSnapshot {
     }
 
     pub(crate) fn primary_is_git(&self) -> Option<bool> {
-        self.entries.first().map(|entry| entry.repo_root.is_some())
+        self.primary_entry().map(|entry| entry.repo_root.is_some())
     }
 
     pub(crate) fn primary_local_metadata_source(&self) -> Option<GitWorkspaceMetadataSource> {
-        let entry = self.entries.first()?;
+        let entry = self.primary_entry()?;
         if entry.remote {
             return None;
         }
@@ -139,6 +140,13 @@ impl GitWorkspaceSnapshot {
             repo_root,
             cache: Arc::clone(&self.cache),
         })
+    }
+
+    fn primary_entry(&self) -> Option<&GitWorkspaceEntry> {
+        let id = self.primary_environment_id.as_ref()?;
+        self.entries
+            .iter()
+            .find(|entry| &entry.environment_id == id)
     }
 }
 
@@ -403,140 +411,67 @@ impl WorkspaceRootCache {
     }
 }
 
-/// Classify one bounded batch, not one subprocess pair per changed path.
-/// A failed/oversized query proves no exclusions. Tracked descendants keep an
-/// ignored directory relevant, just like the single-path watcher check.
-async fn git_ignored_validation_paths(
-    root: &Path,
-    paths: &[PathBuf],
-) -> std::collections::BTreeSet<PathBuf> {
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
-    let mut ignored_paths = std::collections::BTreeSet::new();
-    let mut offset = 0;
-    while offset < paths.len() {
-        let mut input = Vec::new();
-        let mut batch = Vec::new();
-        while offset < paths.len() {
-            let path = &paths[offset];
-            let Some(relative) = path.strip_prefix(root).ok().and_then(Path::to_str) else {
-                offset += 1;
-                continue;
-            };
-            if relative.len() + 1 > 8 * 1024 {
-                offset += 1;
-                continue;
-            }
-            if input.len() + relative.len() + 1 > 8 * 1024 {
-                break;
-            }
-            input.extend_from_slice(relative.as_bytes());
-            input.push(0);
-            batch.push((path.clone(), relative.to_string()));
-            offset += 1;
-        }
-        if batch.is_empty() {
-            continue;
-        }
-        let excluded = timeout(Duration::from_secs(2), async {
-            let mut tracked = Command::new(codex_git_utils::git_executable_async().await)
-                .args(["--literal-pathspecs", "ls-files", "--cached", "-z", "--"])
-                .args(batch.iter().map(|(_, relative)| relative))
-                .current_dir(root)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .ok()?;
-            let mut bytes = Vec::new();
-            tracked
-                .stdout
-                .take()?
-                .take(1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .await
-                .ok()?;
-            if bytes.len() > 1024 * 1024 || !tracked.wait().await.ok()?.success() {
-                return None;
-            }
-            let tracked = std::str::from_utf8(&bytes)
-                .ok()?
-                .split('\0')
-                .filter(|path| !path.is_empty())
-                .map(|path| root.join(path))
-                .collect::<Vec<_>>();
-            let mut query = Command::new(codex_git_utils::git_executable_async().await)
-                .args(["check-ignore", "-z", "--stdin"])
-                .current_dir(root)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .ok()?;
-            let mut stdin = query.stdin.take()?;
-            let (written, output) = tokio::join!(
-                async move {
-                    stdin.write_all(&input).await?;
-                    stdin.shutdown().await
-                },
-                query.wait_with_output()
-            );
-            written.ok()?;
-            let output = output.ok()?;
-            if !matches!(output.status.code(), Some(0 | 1)) {
-                return None;
-            }
-            let ignored = std::str::from_utf8(&output.stdout)
-                .ok()?
-                .split('\0')
-                .filter(|path| !path.is_empty())
-                .collect::<std::collections::BTreeSet<_>>();
-            Some(
-                batch
-                    .iter()
-                    .filter(|(path, relative)| {
-                        ignored.contains(relative.as_str())
-                            && !tracked
-                                .iter()
-                                .any(|tracked| path_is_same_or_descendant(tracked, path))
-                    })
-                    .map(|(path, _)| path.clone())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .await
-        .ok()
-        .flatten();
-        ignored_paths.extend(excluded.unwrap_or_default());
-    }
-    ignored_paths
+pub(crate) async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]) -> bool {
+    let ignored = git_ignored_paths(root, paths).await;
+    paths.iter().all(|path| ignored.contains(path))
 }
 
-pub(crate) async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]) -> bool {
+/// Bounded per-path classification, shared by change attribution and search
+/// advisories. Unreadable/oversize/failed batches prove no exclusions.
+pub(crate) async fn git_ignored_paths(root: &Path, paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut ignored = BTreeSet::new();
+    let mut batch = Vec::new();
+    let mut bytes = 0;
+    for path in paths {
+        let Some(value) = path.to_str().filter(|value| !value.as_bytes().contains(&0)) else {
+            continue;
+        };
+        let len = value.len() + 1;
+        if len > 8 * 1024 {
+            continue;
+        }
+        if bytes + len > 8 * 1024 {
+            ignored.extend(
+                git_ignored_path_batch(root, &batch)
+                    .await
+                    .unwrap_or_default(),
+            );
+            batch.clear();
+            bytes = 0;
+        }
+        batch.push(path.clone());
+        bytes += len;
+    }
+    if !batch.is_empty() {
+        ignored.extend(
+            git_ignored_path_batch(root, &batch)
+                .await
+                .unwrap_or_default(),
+        );
+    }
+    ignored
+}
+
+async fn git_ignored_path_batch(root: &Path, paths: &[PathBuf]) -> Option<BTreeSet<PathBuf>> {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
-    if paths.is_empty() {
-        return true;
-    }
     let mut input = Vec::new();
     for path in paths {
-        let Some(path) = path.to_str() else {
-            return false;
-        };
+        let path = path.to_str()?;
         input.extend_from_slice(path.as_bytes());
         input.push(0);
-    }
-    // Bound both command-line size and ignore-query output. Overflow and any
-    // inability to prove exclusion remain capture-relevant.
-    if input.len() > 8 * 1024 {
-        return false;
     }
     timeout(Duration::from_secs(2), async {
         // An ignored directory can still contain force-added tracked files.
         let mut tracked = Command::new(codex_git_utils::git_executable_async().await)
-            .args(["--literal-pathspecs", "ls-files", "--cached", "-z", "--"])
+            .args([
+                "--literal-pathspecs",
+                "ls-files",
+                "--full-name",
+                "--cached",
+                "-z",
+                "--",
+            ])
             .args(paths)
             .current_dir(root)
             .stdin(std::process::Stdio::null())
@@ -545,12 +480,30 @@ pub(crate) async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]
             .kill_on_drop(true)
             .spawn()
             .ok()?;
-        let mut byte = [0];
-        if tracked.stdout.take()?.read(&mut byte).await.ok()? != 0
-            || !tracked.wait().await.ok()?.success()
-        {
-            return Some(false);
+        let tracked_observation = codex_utils_pty::process_observation::observe_process_start(
+            "git_ls_files",
+            codex_utils_pty::process_observation::ProcessRole::AuxiliaryRoot,
+            tracked.id(),
+            None,
+        );
+        let mut tracked_output = Vec::new();
+        tracked
+            .stdout
+            .take()?
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut tracked_output)
+            .await
+            .ok()?;
+        if tracked_output.len() > 64 * 1024 || !tracked.wait().await.ok()?.success() {
+            return None;
         }
+        tracked_observation.cleanup_observed("root_reaped");
+        let tracked_paths: Vec<_> = std::str::from_utf8(&tracked_output)
+            .ok()?
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(|path| root.join(path))
+            .collect();
         let mut ignored = Command::new(codex_git_utils::git_executable_async().await)
             .args(["check-ignore", "-z", "--stdin"])
             .current_dir(root)
@@ -560,25 +513,60 @@ pub(crate) async fn git_ignores_all_changed_paths(root: &Path, paths: &[PathBuf]
             .kill_on_drop(true)
             .spawn()
             .ok()?;
+        let ignored_observation = codex_utils_pty::process_observation::observe_process_start(
+            "git_check_ignore",
+            codex_utils_pty::process_observation::ProcessRole::AuxiliaryRoot,
+            ignored.id(),
+            None,
+        );
         let mut stdin = ignored.stdin.take()?;
+        let input_len = input.len();
+        let mut stdout = ignored.stdout.take()?.take(input_len as u64 + 1);
         let (written, output) = tokio::join!(
             async move {
                 stdin.write_all(&input).await?;
                 stdin.shutdown().await
             },
-            ignored.wait_with_output()
+            async move {
+                let mut output = Vec::new();
+                stdout.read_to_end(&mut output).await.map(|_| output)
+            }
         );
         written.ok()?;
         let output = output.ok()?;
+        if output.len() > input_len || !matches!(ignored.wait().await.ok()?.code(), Some(0 | 1)) {
+            return None;
+        }
+        ignored_observation.cleanup_observed("root_reaped");
+        if !output.is_empty() && !output.ends_with(&[0]) {
+            return None;
+        }
+        let excluded: BTreeSet<_> = std::str::from_utf8(&output)
+            .ok()?
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .collect();
         Some(
-            output.status.success()
-                && output.stdout.iter().filter(|byte| **byte == 0).count() == paths.len(),
+            paths
+                .iter()
+                .filter(|path| {
+                    let absolute = if path.is_absolute() {
+                        (*path).clone()
+                    } else {
+                        root.join(path)
+                    };
+                    excluded.contains(path.to_str().unwrap_or_default())
+                        && !tracked_paths
+                            .iter()
+                            .any(|tracked| tracked.starts_with(&absolute))
+                })
+                .cloned()
+                .collect(),
         )
     })
     .await
     .ok()
     .flatten()
-    .unwrap_or(false)
 }
 
 async fn remote_workspace_evidence_capture(
@@ -1174,6 +1162,91 @@ async fn capture_workspace_metadata(
     }).await.ok()?
 }
 
+// A workspace outside any Git repository has no Git-visible tree. The analogous
+// observation hashes its whole tree, so it is taken only while the tree is
+// small. Beyond these bounds no identity exists.
+const NON_GIT_TREE_MAX_ENTRIES: usize = 2_048;
+const NON_GIT_TREE_MAX_DECLARED_BYTES: u64 = 16 * 1024 * 1024;
+const NON_GIT_TREE_CAPTURE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Content identity of a local workspace tree outside any Git repository.
+/// Every regular file and symlink below `root` is hashed the way untracked
+/// files are for a repository, and every directory is listed. Nothing is
+/// ignored, so build or cache output written into the tree changes it too.
+/// `None` (over the bounds, an unreadable or special entry, a non-UTF-8 name,
+/// or a change while reading) never proves anything.
+pub(crate) async fn capture_non_git_tree_identity(root: &Path) -> Option<String> {
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    let control = WorkspaceCaptureControl {
+        deadline: Instant::now() + NON_GIT_TREE_CAPTURE_DEADLINE,
+        cancellation,
+    };
+    let walk_root = root.to_path_buf();
+    let walk_control = control.clone();
+    let (directories, files) =
+        tokio::task::spawn_blocking(move || non_git_tree_entries(&walk_root, &walk_control))
+            .await
+            .ok()??;
+    let paths = files
+        .into_iter()
+        .map(|path| WorkspaceGenerationPath {
+            path,
+            deleted: false,
+        })
+        .collect();
+    let metadata = capture_workspace_metadata(root.to_path_buf(), paths, control).await?;
+    let mut identity = Sha256::new();
+    identity.update(b"KD4_NON_GIT_TREE_IDENTITY_V1\n");
+    for directory in &directories {
+        identity.update(directory.as_bytes());
+        identity.update(b"\0directory\n");
+    }
+    identity.update(metadata.manifest);
+    Some(hex::encode(identity.finalize()))
+}
+
+/// Sorted relative directories and non-directory entries below `root`.
+/// Symlinks are recorded, never followed.
+fn non_git_tree_entries(
+    root: &Path,
+    control: &WorkspaceCaptureControl,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let mut pending = vec![PathBuf::new()];
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+    let mut entries = 0_usize;
+    let mut declared_bytes = 0_u64;
+    while let Some(relative) = pending.pop() {
+        for entry in std::fs::read_dir(root.join(&relative)).ok()? {
+            entries += 1;
+            if entries > NON_GIT_TREE_MAX_ENTRIES || !control.active() {
+                return None;
+            }
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            let path = relative.join(entry.file_name());
+            let name = path.to_str()?.to_owned();
+            if file_type.is_dir() {
+                directories.push(name);
+                pending.push(path);
+                continue;
+            }
+            if file_type.is_file() {
+                declared_bytes = declared_bytes
+                    .checked_add(entry.metadata().ok()?.len())
+                    .filter(|bytes| *bytes <= NON_GIT_TREE_MAX_DECLARED_BYTES)?;
+            } else if !file_type.is_symlink() {
+                return None;
+            }
+            files.push(name);
+        }
+    }
+    directories.sort_unstable();
+    files.sort_unstable();
+    Some((directories, files))
+}
+
 #[cfg(test)]
 async fn workspace_generation_git_output(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
     let mut command = Command::new("git");
@@ -1492,6 +1565,8 @@ struct MetadataCacheEntry {
     dependencies: StableMetadataDependencies,
     watcher_generation: u64,
     metadata: StableGitMetadata,
+    retry_after: Option<Instant>,
+    last_used: Instant,
     _registration: GitWatchLease,
 }
 
@@ -1756,6 +1831,7 @@ pub(crate) struct GitWorkspaceCache {
     state: Mutex<GitWorkspaceCacheState>,
     pub(crate) roots: Arc<WorkspaceRootCache>,
     watcher_epoch: u64,
+    watcher_incarnation: uuid::Uuid,
     watcher_generation: AtomicU64,
     host_mutation_generation: AtomicU64,
     watcher_reliable: AtomicBool,
@@ -1787,6 +1863,10 @@ pub(crate) struct GitWorkspaceCache {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct SourcePathChangeObservation {
     watcher_epoch: u64,
+    // Numeric epochs can repeat after PID reuse. Legacy observations remain
+    // recoverable, but cannot prove continuity with a newly created watcher.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watcher_incarnation: Option<uuid::Uuid>,
     watcher_generation: u64,
     #[serde(default)]
     registration_generation: u64,
@@ -1810,7 +1890,8 @@ impl SourcePathChangeObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SourceFreshness {
-    Current,
+    /// The live journal has no delivered relevant change. Events may be pending.
+    NoObservedChange,
     Changed,
     Unknown,
 }
@@ -2105,6 +2186,7 @@ impl GitWorkspaceCache {
             state: Mutex::new(GitWorkspaceCacheState::default()),
             roots: Arc::default(),
             watcher_epoch,
+            watcher_incarnation: uuid::Uuid::new_v4(),
             watcher_generation: AtomicU64::new(0),
             host_mutation_generation: AtomicU64::new(0),
             watcher_reliable: AtomicBool::new(watcher_available),
@@ -2235,43 +2317,6 @@ impl GitWorkspaceCache {
             }),
             Err(_) => Some(WorkspaceEvidenceIdentity::unavailable(None)),
         }
-    }
-
-    /// Exclude only proven irrelevant local paths. Discovery/ignore failures and
-    /// remote environments remain conservatively attributable.
-    pub(crate) async fn validation_relevant_paths(
-        &self,
-        cwd: &Path,
-        paths: Vec<(String, PathBuf)>,
-    ) -> Vec<(String, PathBuf)> {
-        if paths.is_empty() {
-            return paths;
-        }
-        let local = |environment: &str| {
-            environment.is_empty() || environment == codex_exec_server::LOCAL_ENVIRONMENT_ID
-        };
-        let root = match self.resolve_workspace_root(cwd).await {
-            Ok(Some(root)) => root,
-            // Directory names alone cannot prove output provenance: .codex can
-            // contain authored hooks, and dependencies can be edited sources.
-            Ok(None) => return paths,
-            Err(_) => return paths,
-        };
-        let candidates = paths
-            .iter()
-            .filter(|(environment, path)| {
-                local(environment) && path_is_same_or_descendant(path, &root)
-            })
-            .map(|(_, path)| path.clone())
-            .collect::<Vec<_>>();
-        let ignored = git_ignored_validation_paths(&root, &candidates).await;
-        paths
-            .into_iter()
-            .filter(|(environment, path)| {
-                !local(environment)
-                    || (path_is_same_or_descendant(path, &root) && !ignored.contains(path))
-            })
-            .collect()
     }
 
     pub(crate) async fn workspace_evidence_identity_with_attribution(
@@ -2543,6 +2588,11 @@ impl GitWorkspaceCache {
         project_discovery: Option<&ProjectDiscoveryContext>,
         metrics: Option<&MetricsClient>,
     ) -> GitWorkspaceSnapshot {
+        // Read the role from this same selection snapshot, never from the
+        // ready/path-convertible subset below (including on a root-cache hit).
+        let primary_environment_id = environments
+            .primary()
+            .map(|environment| environment.environment_id.clone());
         let environment_candidates = environments
             .turn_environments
             .iter()
@@ -2587,6 +2637,7 @@ impl GitWorkspaceCache {
             {
                 return GitWorkspaceSnapshot {
                     environment_generation: key.environment_generation,
+                    primary_environment_id,
                     entries: entry.entries.clone(),
                     cache: Arc::clone(self),
                 };
@@ -2644,6 +2695,7 @@ impl GitWorkspaceCache {
 
         GitWorkspaceSnapshot {
             environment_generation: key.environment_generation,
+            primary_environment_id,
             entries,
             cache: Arc::clone(self),
         }
@@ -2660,24 +2712,29 @@ impl GitWorkspaceCache {
         if self.watcher_reliable.load(Ordering::Acquire)
             && let Some(dependencies) = dependencies.as_ref()
         {
-            let state = self.state.lock().await;
-            if let Some(entry) = state.metadata.get(source.repo_root.as_path())
+            let mut state = self.state.lock().await;
+            if let Some(entry) = state.metadata.get_mut(source.repo_root.as_path())
                 && entry.watcher_generation == watcher_generation
                 && entry.dependencies == *dependencies
+                && entry
+                    .retry_after
+                    .is_none_or(|deadline| Instant::now() < deadline)
                 && self.watcher_reliable.load(Ordering::Acquire)
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
+                entry.last_used = Instant::now();
                 return entry.metadata.clone();
             }
         }
 
         let (head_commit_hash, associated_remote_urls) = tokio::join!(
-            get_head_commit_hash(source.cwd.as_path()),
-            get_git_remote_urls_assume_git_repo(source.cwd.as_path()),
+            get_head_commit_hash_result(source.cwd.as_path()),
+            get_git_remote_urls_result(source.cwd.as_path()),
         );
+        let failed = head_commit_hash.is_err() || associated_remote_urls.is_err();
         let metadata = StableGitMetadata {
-            associated_remote_urls,
-            latest_git_commit_hash: head_commit_hash.map(|sha| sha.0),
+            associated_remote_urls: associated_remote_urls.ok().flatten(),
+            latest_git_commit_hash: head_commit_hash.ok().flatten().map(|sha| sha.0),
         };
 
         if let Some(before_dependencies) = dependencies {
@@ -2687,15 +2744,44 @@ impl GitWorkspaceCache {
                 && self.watcher_generation.load(Ordering::Acquire) == watcher_generation
             {
                 let registration = self.register_dependencies(&before_dependencies.files).await;
-                self.state.lock().await.metadata.insert(
+                let mut state = self.state.lock().await;
+                if failed
+                    && let Some(entry) = state.metadata.get(source.repo_root.as_path())
+                    && entry.dependencies == before_dependencies
+                    && entry.watcher_generation == watcher_generation
+                    && entry.retry_after.is_none()
+                {
+                    // A delayed failed fill must not replace a complete observation.
+                    return entry.metadata.clone();
+                }
+                let evicted = if !state.metadata.contains_key(source.repo_root.as_path())
+                    && state.metadata.len() >= RETAINED_REPOSITORY_CAPACITY
+                {
+                    let oldest = state
+                        .metadata
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(root, _)| root.clone());
+                    oldest.and_then(|root| state.metadata.remove(&root))
+                } else {
+                    None
+                };
+                let replaced = state.metadata.insert(
                     source.repo_root.to_path_buf(),
                     MetadataCacheEntry {
                         dependencies: before_dependencies,
                         watcher_generation,
                         metadata: metadata.clone(),
+                        retry_after: failed
+                            .then(|| Instant::now() + WORKSPACE_FAILURE_RETRY_INTERVAL),
+                        last_used: Instant::now(),
                         _registration: registration,
                     },
                 );
+                drop(state);
+                // Lease retirement wakes the native worker outside the cache lock.
+                drop(replaced);
+                drop(evicted);
             }
         }
         metadata
@@ -2735,12 +2821,6 @@ impl GitWorkspaceCache {
     }
 
     fn record_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) -> u64 {
-        let changed_paths = changed_paths.map(|paths| {
-            paths
-                .into_iter()
-                .filter(|path| !is_generated_codex_eval_path(path))
-                .collect::<Vec<_>>()
-        });
         self.record_filtered_source_change_event(changed_paths)
     }
 
@@ -2754,12 +2834,6 @@ impl GitWorkspaceCache {
     )]
     async fn record_watched_source_change_event(&self, changed_paths: Option<Vec<PathBuf>>) {
         let _guard = self.source_event_gate.write().await;
-        let changed_paths = changed_paths.map(|paths| {
-            paths
-                .into_iter()
-                .filter(|path| !is_generated_codex_eval_path(path))
-                .collect::<Vec<_>>()
-        });
         if changed_paths.as_ref().is_some_and(Vec::is_empty) {
             return;
         }
@@ -2772,6 +2846,10 @@ impl GitWorkspaceCache {
             self.record_source_change_with_capture_effect(changed_paths, false);
             return;
         }
+        // Source changes are already known. Publish them before ignore I/O so
+        // root-only prompt preparation cannot keep old bytes current. Full
+        // captures still wait on the gate for the capture-key decision below.
+        self.record_source_change_with_capture_effect(changed_paths.clone(), false);
         if changed_paths.is_none() {
             self.ignored_directories.lock().await.clear();
         }
@@ -2838,7 +2916,10 @@ impl GitWorkspaceCache {
         }
         // Ignored files remain observable dependencies. Only the git-status
         // capture identity is unaffected; never omit them from the journal.
-        self.record_source_change_with_capture_effect(changed_paths, !ignored);
+        if !ignored {
+            self.source_capture_generation
+                .fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     fn record_source_change_with_capture_effect(
@@ -2904,13 +2985,9 @@ impl GitWorkspaceCache {
         let paths = paths.to_vec();
         let paths = tokio::task::spawn_blocking(move || {
             let repo_root = dunce::canonicalize(&repo_root).unwrap_or(repo_root);
-            let same_path = |left: &Path, right: &Path| {
-                if cfg!(windows) {
-                    source_change_path_key(left) == source_change_path_key(right)
-                } else {
-                    left == right
-                }
-            };
+            // Canonical spelling proves ordinary insensitive aliases. An
+            // unproved case difference must remain a separately watched alias.
+            let same_path = |left: &Path, right: &Path| left == right;
             paths
                 .into_iter()
                 .map(|(path, recursive)| {
@@ -2984,6 +3061,7 @@ impl GitWorkspaceCache {
                 .map(
                     |(watch_root, path, recursive, alias)| SourcePathChangeObservation {
                         watcher_epoch: self.watcher_epoch,
+                        watcher_incarnation: Some(self.watcher_incarnation),
                         watcher_generation,
                         registration_generation: registrations[&watch_root],
                         repo_root: watch_root,
@@ -2992,6 +3070,7 @@ impl GitWorkspaceCache {
                         alias: alias.map(|(repo_root, path)| {
                             Box::new(SourcePathChangeObservation {
                                 watcher_epoch: self.watcher_epoch,
+                                watcher_incarnation: Some(self.watcher_incarnation),
                                 watcher_generation,
                                 registration_generation: registrations[&repo_root],
                                 repo_root,
@@ -3067,14 +3146,16 @@ impl GitWorkspaceCache {
         &self,
         observation: &SourcePathChangeObservation,
     ) -> bool {
-        self.source_path_freshness(observation) == SourceFreshness::Current
+        // Tests a live journal token, not present file bytes.
+        self.source_path_freshness(observation) == SourceFreshness::NoObservedChange
     }
 
-    pub(crate) fn source_observation_is_from_prior_watcher(
+    fn source_observation_matches_watcher(
         &self,
         observation: &SourcePathChangeObservation,
     ) -> bool {
-        observation.watcher_epoch != self.watcher_epoch
+        observation.watcher_epoch == self.watcher_epoch
+            && observation.watcher_incarnation == Some(self.watcher_incarnation)
     }
 
     pub(crate) fn source_path_freshness(
@@ -3083,11 +3164,11 @@ impl GitWorkspaceCache {
     ) -> SourceFreshness {
         if let Some(alias) = &observation.alias {
             let freshness = self.source_path_freshness(alias);
-            if freshness != SourceFreshness::Current {
+            if freshness != SourceFreshness::NoObservedChange {
                 return freshness;
             }
         }
-        if observation.watcher_epoch != self.watcher_epoch
+        if !self.source_observation_matches_watcher(observation)
             || is_generated_codex_eval_path(&observation.path)
             || !path_is_same_or_descendant(&observation.path, &observation.repo_root)
         {
@@ -3131,7 +3212,7 @@ impl GitWorkspaceCache {
         if journal.path_changed_since(observation) {
             SourceFreshness::Changed
         } else {
-            SourceFreshness::Current
+            SourceFreshness::NoObservedChange
         }
     }
 
@@ -3195,7 +3276,6 @@ impl GitWorkspaceCache {
                 let alias = (resolved != absolute).then_some(absolute);
                 std::iter::once(resolved).chain(alias)
             })
-            .filter(|path| !is_generated_codex_eval_path(path))
             .collect::<Vec<_>>();
         if paths.is_empty() && !changed_paths.is_empty() {
             return;
@@ -3253,6 +3333,34 @@ async fn matching_checkout_root(
         record_project_discovery_reuse(metrics, "git", "miss", "checkout_root_unavailable");
         return None;
     };
+    if !environment
+        .cwd
+        .as_path()
+        .starts_with(checkout_root.as_path())
+    {
+        return None;
+    }
+    for ancestor in environment.cwd.as_path().ancestors() {
+        if ancestor == checkout_root.as_path() {
+            break;
+        }
+        let marker = AbsolutePathBuf::from_absolute_path(ancestor.join(".git")).ok()?;
+        match fs
+            .get_metadata(&PathUri::from_abs_path(&marker), None)
+            .await
+        {
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            _ => {
+                record_project_discovery_reuse(
+                    metrics,
+                    "git",
+                    "miss",
+                    "nearer_marker_or_unavailable",
+                );
+                return None;
+            }
+        }
+    }
     let marker = PathUri::from_abs_path(&checkout_root.join(".git"));
     let Ok(metadata) = fs.get_metadata(&marker, /*sandbox*/ None).await else {
         record_project_discovery_reuse(metrics, "git", "miss", "git_marker_unavailable");
@@ -3324,13 +3432,17 @@ fn canonical_workspace_evidence_root(repo_root: &Path) -> PathBuf {
 }
 
 fn path_is_same_or_descendant(path: &Path, ancestor: &Path) -> bool {
-    path_is_same_or_descendant_with_case_sensitivity(path, ancestor, false)
+    path.starts_with(ancestor)
 }
 
 fn source_change_path_key(path: &Path) -> String {
+    // This is only an invalidation index, never a locator or containment proof.
+    // Folding may over-invalidate case-sensitive siblings, but cannot certify
+    // unchanged source when an event arrives with a different native casing.
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
+#[cfg(test)]
 fn path_is_same_or_descendant_with_case_sensitivity(
     path: &Path,
     ancestor: &Path,

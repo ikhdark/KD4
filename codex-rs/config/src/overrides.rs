@@ -115,8 +115,7 @@ mod tests {
         )])
         .unwrap();
         assert_eq!(
-            root["plugins"]["codex-app-tools@openai-bundled"]["mcp_servers"]["codex_app"]
-                ["enabled"],
+            root["plugins"]["codex-app-tools@openai-bundled"]["mcp_servers"]["codex_app"]["enabled"],
             TomlValue::Boolean(false)
         );
     }

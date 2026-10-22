@@ -4,6 +4,7 @@ use codex_config::types::McpServerOAuthConfig;
 use codex_config::types::McpServerToolConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::SessionPickerViewMode;
+use codex_file_system::acquire_atomic_write_lock;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -43,6 +44,68 @@ fn config_alias_and_target_share_the_persistence_lock() {
     let persisted: TomlValue = toml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
     assert_eq!(persisted["model"].as_str(), Some("updated"));
     assert_eq!(persisted["alias_key"].as_bool(), Some(true));
+}
+
+#[test]
+fn extension_config_writers_share_core_target_admission() {
+    for writer_kind in ["plugin", "mcp", "marketplace"] {
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("settings.toml");
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(&target, "model = 'before'\n").unwrap();
+        std::os::windows::fs::symlink_file(&target, home.join(CONFIG_TOML_FILE)).unwrap();
+        let lock = acquire_atomic_write_lock(&target).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let result = match writer_kind {
+                "plugin" => codex_config::apply_user_plugin_config_edits_blocking(
+                    &home,
+                    vec![codex_config::PluginConfigEdit::SetEnabled {
+                        plugin_key: "demo@market".into(),
+                        enabled: true,
+                    }],
+                ),
+                "mcp" => runtime.block_on(
+                    codex_config::ConfigEditsBuilder::new(&home)
+                        .replace_mcp_servers(&BTreeMap::new())
+                        .apply(),
+                ),
+                _ => codex_config::record_user_marketplace(
+                    &home,
+                    "demo",
+                    &codex_config::MarketplaceConfigUpdate {
+                        last_updated: "2026-10-19",
+                        last_revision: None,
+                        source_type: "local",
+                        source: "fixture",
+                        ref_name: None,
+                        sparse_paths: &[],
+                    },
+                ),
+            };
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+        std::fs::write(&target, "model = 'concurrent-core-edit'\n").unwrap();
+        drop(lock);
+        assert!(
+            early.is_err(),
+            "{writer_kind} bypassed the core target lock"
+        );
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        let persisted: TomlValue =
+            toml::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(persisted["model"].as_str(), Some("concurrent-core-edit"));
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

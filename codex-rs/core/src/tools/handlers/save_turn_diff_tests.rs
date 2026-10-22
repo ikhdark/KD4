@@ -196,6 +196,46 @@ async fn refuses_a_partial_diff_and_names_the_untracked_paths() {
 }
 
 #[tokio::test]
+async fn audit107_refuses_foreign_hunks_between_exact_patches_without_exec() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("edited.txt");
+    std::fs::write(&path, "own = 1\nother = 7\n").unwrap();
+    let save_call = invocation(root.path(), tracker_for(root.path()), "foreign").await;
+    let handler = crate::tools::handlers::apply_patch::ApplyPatchHandler::new(true);
+    for (ordinal, old, new) in [(1, 1, 2), (2, 2, 3)] {
+        if ordinal == 2 {
+            // Deliberately no exec/command reconciliation between patch calls.
+            std::fs::write(&path, "own = 2\nother = 9\n").unwrap();
+        }
+        let mut patch_call = save_call.clone();
+        patch_call.call_id = format!("audit107-patch-{ordinal}");
+        patch_call.tool_name = ToolName::plain("apply_patch");
+        patch_call.payload = ToolPayload::Custom {
+            input: format!(
+                "*** Begin Patch\n*** Update File: edited.txt\n@@\n-own = {old}\n+own = {new}\n*** End Patch"
+            ),
+        };
+        let payload = patch_call.payload.clone();
+        let output = handler.handle(patch_call).await.unwrap();
+        assert_eq!(output.code_mode_result(&payload)["success"], true);
+    }
+    // Exercise the production patch handler -> emitter -> tracker -> exporter.
+    let result = SaveTurnDiffHandler.handle(save_call).await;
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("foreign ownership must not be exported as exact");
+    };
+    assert!(
+        message.contains("partial") && message.contains("edited.txt"),
+        "{message}"
+    );
+    assert!(!root.path().join(".codex").exists());
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "own = 3\nother = 9\n"
+    );
+}
+
+#[tokio::test]
 async fn refuses_a_turn_without_tracked_edits() {
     let root = tempfile::tempdir().unwrap();
     let result = SaveTurnDiffHandler

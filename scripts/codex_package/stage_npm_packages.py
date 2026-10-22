@@ -409,7 +409,7 @@ def resolve_release_workflow(
     workflow = json.loads(stdout or "null")
     if not workflow:
         raise RuntimeError(
-            f"Unable to find rust-release workflow for version {version}."
+            f"Unable to find workflow {workflow_name!r} for version {version} in {github_repo}."
         )
     return workflow
 
@@ -1401,14 +1401,17 @@ def _main() -> int:
             args.max_stage_workers,
         )
 
-        staged_by_package = {result.package: result.pack_output for result in staged_results}
+        staged_by_package = {
+            result.package: result.pack_output for result in staged_results
+        }
         if (
             os.name == "nt"
             and platform.machine().lower() in {"amd64", "x86_64"}
             and "codex" in staged_by_package
         ):
             native_package = next(
-                name for name, target in codex_platform_packages().items()
+                name
+                for name, target in codex_platform_packages().items()
                 if target["platform_key"] == "win32-x64"
             )
             load_build_module().smoke_test_npm_tarball(

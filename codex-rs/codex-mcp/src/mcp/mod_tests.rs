@@ -183,7 +183,10 @@ async fn threadless_resource_read_skips_oauth_discovery_on_success() {
         "resource read: {} ms, {probes} discovery requests",
         started.elapsed().as_millis()
     );
-    assert_eq!(probes, 0, "successful reads need no diagnostic OAuth probes");
+    assert_eq!(
+        probes, 0,
+        "successful reads need no diagnostic OAuth probes"
+    );
 }
 
 #[test]

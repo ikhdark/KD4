@@ -4,6 +4,55 @@ use pretty_assertions::assert_eq;
 use rama_http::HeaderValue;
 use rama_http::header::AUTHORIZATION;
 
+#[cfg(windows)]
+#[test]
+fn windows_aliases_are_removed_before_publishing_child_credentials() {
+    let broker = CredentialBroker::new(true);
+    let mut env = env_map([
+        ("OPENAI_API_KEY", "sk-losing-secret"),
+        ("OpenAi_Api_Key", "sk-winning-secret"),
+        ("Gh_Host", "enterprise.example"),
+        ("gh_enterprise_token", "ghp-enterprise-secret"),
+    ]);
+    broker.virtualize_child_env(&mut env);
+    assert!(!env.contains_key("OpenAi_Api_Key"));
+    assert!(!env.contains_key("gh_enterprise_token"));
+    let dummy = &env["OPENAI_API_KEY"];
+    // cmd also parses its own argv[0]; a forward slash there can be
+    // interpreted as a switch even though CreateProcess accepts the path.
+    let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("cmd.exe");
+    let output = std::process::Command::new(cmd)
+        .args(["/D", "/C", "echo %OPENAI_API_KEY%"])
+        .env_clear()
+        .envs(&env)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "cmd failed: {output:?}");
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), dummy);
+    assert!(!format!("{env:?}").contains("secret"));
+    let mut headers = headers_with_bearer(dummy);
+    broker.inject_request_headers("api.openai.com", &mut headers);
+    assert_eq!(authorization(&headers), Some("Bearer sk-winning-secret"));
+    let mut headers = headers_with_bearer(&env["GH_ENTERPRISE_TOKEN"]);
+    broker.inject_request_headers("enterprise.example", &mut headers);
+    assert_eq!(
+        authorization(&headers),
+        Some("Bearer ghp-enterprise-secret")
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unix_environment_names_remain_case_sensitive() {
+    let broker = CredentialBroker::new(true);
+    let mut env = env_map([("OpenAi_Api_Key", "sk-real")]);
+    broker.virtualize_child_env(&mut env);
+    assert_eq!(env["OpenAi_Api_Key"], "sk-real");
+    assert!(!broker.host_requires_mitm("api.openai.com"));
+}
+
 fn env_map<const N: usize>(entries: [(&str, &str); N]) -> HashMap<String, String> {
     entries
         .into_iter()

@@ -395,15 +395,22 @@ mod tests {
         ] {
             let args = Args::try_parse_from(["codex-state-logs", "--level", value])
                 .expect("canonical level");
-            assert_eq!(build_filter(&args).expect("filter").levels_upper, expected, "{value}");
+            assert_eq!(
+                build_filter(&args).expect("filter").levels_upper,
+                expected,
+                "{value}"
+            );
         }
         for value in ["warning", "err", "warn,error"] {
             let error = Args::try_parse_from(["codex-state-logs", "--level", value])
                 .expect_err("aliases and lists are not thresholds");
-            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue, "{value}");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidValue,
+                "{value}"
+            );
         }
     }
-
 
     #[test]
     fn poll_interval_must_be_positive() {

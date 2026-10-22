@@ -45,6 +45,27 @@ Layers with a `disabled_reason` are still surfaced for UI, but are ignored when
 computing the effective config and origins metadata. This is what
 `ConfigLayerStack::effective_config()` implements.
 
+### Cloud policy lifetime and trust
+
+Cloud policy is fetched with the selected backend's authenticated credentials.
+The legacy `cloud-config-bundle-cache.json` is neither read nor rewritten: its
+public HMAC key cannot establish backend provenance. Eligible offline startup
+therefore fails closed. Offline reuse requires a backend-signed envelope with a
+declared source, identity, revision, and validity contract; no such contract is
+assumed by the client.
+
+A successful loader retains its in-process startup snapshot. Identity or plan
+changes retire that loader for future work; same-identity token rotation does
+not. Existing admitted coding sessions retain their snapshots. Process-level
+remote control instead requires current, successfully resolved policy and is
+disabled while authority is unresolved or denies it.
+
+Downloaded fragments are candidates, not proof of effective semantic validity.
+The complete configuration still validates after higher-priority layers merge,
+so legal repairs remain supported. A failed effective build retires that
+candidate, allowing a subsequent load to fetch a corrected bundle without an
+invalid disk-cache TTL or a permanently memoized successful download.
+
 ## Typical usage
 
 Most callers want the effective config plus metadata:

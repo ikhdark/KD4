@@ -39,6 +39,7 @@ pub(crate) use response_lifecycle::ConnectionResponseHistory;
 /// Transport-independent metadata returned when a Responses stream is established.
 #[derive(Debug, Clone)]
 pub(crate) struct ResponsesStreamMetadata {
+    pub(crate) ollama_single_summary: bool,
     rate_limit_snapshots: Vec<RateLimitSnapshot>,
     models_etag: Option<String>,
     server_model: Option<String>,
@@ -57,6 +58,7 @@ impl Default for ResponsesStreamMetadata {
 impl ResponsesStreamMetadata {
     pub(crate) fn from_headers(headers: &HeaderMap) -> Self {
         Self {
+            ollama_single_summary: false,
             rate_limit_snapshots: parse_all_rate_limits(headers),
             models_etag: header_string(headers, X_MODELS_ETAG_HEADER),
             server_model: header_string(headers, OPENAI_MODEL_HEADER),
@@ -124,6 +126,7 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// Stateful, transport-independent interpreter for Responses stream payloads.
 pub(crate) struct ResponsesEventInterpreter {
+    ollama_single_summary: bool,
     last_server_model: Option<String>,
     safety_buffering_treatment: SafetyBufferingTreatment,
     turn_state: Option<Arc<OnceLock<String>>>,
@@ -147,6 +150,7 @@ impl ResponsesEventInterpreter {
     ) -> Self {
         Self {
             last_server_model: metadata.server_model.clone(),
+            ollama_single_summary: metadata.ollama_single_summary,
             safety_buffering_treatment: metadata.safety_buffering_treatment.clone(),
             turn_state,
             events: Vec::new(),
@@ -214,7 +218,18 @@ impl ResponsesEventInterpreter {
             return Ok(self.events.drain(..));
         }
 
-        let event = event?;
+        let mut event = event?;
+        // Ollama's admitted single-summary dialect omits this index. Keep this
+        // opt-in below trusted provider selection; generic Responses stays strict.
+        if self.ollama_single_summary
+            && event.summary_index.is_none()
+            && matches!(
+                event.kind.as_ref(),
+                "response.reasoning_summary_text.delta" | "response.reasoning_summary_text.done"
+            )
+        {
+            event.summary_index = Some(0);
+        }
 
         if let Some(response_turn_state) = event.turn_state()
             && let Some(turn_state) = self.turn_state.as_deref()
@@ -254,19 +269,28 @@ impl ResponsesEventInterpreter {
         let rejected_completion_usage = if event.kind == "response.completed" {
             event.response.as_ref().and_then(|response| {
                 let response_id = response.id.as_ref().and_then(Value::as_str);
-                if !self.lifecycle.owns_terminal_observation(response_id) { return None; }
-                parse_usage(response.usage.clone()).map(|usage| (response_id.map(str::to_owned), usage))
+                if !self.lifecycle.owns_terminal_observation(response_id) {
+                    return None;
+                }
+                parse_usage(response.usage.clone())
+                    .map(|usage| (response_id.map(str::to_owned), usage))
             })
-        } else { None };
-        let interpreted = self.lifecycle.process(event, payload.len()).map_err(|error| {
-            match (error, rejected_completion_usage) {
-                (ResponsesEventError::Api(source), Some((response_id, usage))) =>
+        } else {
+            None
+        };
+        let interpreted = self
+            .lifecycle
+            .process(event, payload.len())
+            .map_err(|error| match (error, rejected_completion_usage) {
+                (ResponsesEventError::Api(source), Some((response_id, usage))) => {
                     ResponsesEventError::Api(ApiError::TerminalResponse {
-                        source: Box::new(source), response_id, token_usage: Some(usage),
-                    }),
+                        source: Box::new(source),
+                        response_id,
+                        token_usage: Some(usage),
+                    })
+                }
                 (error, _) => error,
-            }
-        })?;
+            })?;
         if let Some(event) = interpreted {
             self.events.push(event);
         }
@@ -290,43 +314,6 @@ impl From<serde_json::Error> for ResponsesEventError {
 struct Error {
     code: Option<String>,
     message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseCompletedUsage {
-    input_tokens: i64,
-    input_tokens_details: Option<ResponseCompletedInputTokensDetails>,
-    output_tokens: i64,
-    output_tokens_details: Option<ResponseCompletedOutputTokensDetails>,
-    total_tokens: i64,
-}
-
-impl From<ResponseCompletedUsage> for TokenUsage {
-    fn from(value: ResponseCompletedUsage) -> Self {
-        Self {
-            input_tokens: value.input_tokens,
-            cached_input_tokens: value
-                .input_tokens_details
-                .map(|details| details.cached_tokens)
-                .unwrap_or(0),
-            output_tokens: value.output_tokens,
-            reasoning_output_tokens: value
-                .output_tokens_details
-                .map(|details| details.reasoning_tokens)
-                .unwrap_or(0),
-            total_tokens: value.total_tokens,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseCompletedInputTokensDetails {
-    cached_tokens: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseCompletedOutputTokensDetails {
-    reasoning_tokens: i64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -393,15 +380,69 @@ pub(crate) fn decode_diagnostic(context: &str, error: &serde_json::Error) -> Str
 }
 
 fn parse_usage(value: Option<Value>) -> Option<TokenUsage> {
-    let value = value.filter(|value| !value.is_null())?;
-    match serde_json::from_value::<ResponseCompletedUsage>(value) {
-        Ok(usage) => Some(usage.into()),
-        Err(error) => {
-            debug!(category = ?error.classify(), line = error.line(), column = error.column(),
-                "response usage unavailable");
-            None
-        }
-    }
+    use codex_protocol::protocol::TokenUsageCoverage;
+    let value = value?;
+    let object = value.as_object()?;
+    let mut invalid = false;
+    let mut count = |value: Option<&Value>| {
+        let parsed = value.and_then(Value::as_i64).filter(|value| *value >= 0);
+        invalid |= value.is_some_and(|value| !value.is_null()) && parsed.is_none();
+        parsed
+    };
+    let input = count(object.get("input_tokens"));
+    let output = count(object.get("output_tokens"));
+    let total = count(object.get("total_tokens"));
+    let cached = count(
+        object
+            .get("input_tokens_details")
+            .and_then(|v| v.get("cached_tokens")),
+    );
+    let cache_write = count(
+        object
+            .get("input_tokens_details")
+            .and_then(|v| v.get("cache_write_tokens")),
+    );
+    let reasoning = count(
+        object
+            .get("output_tokens_details")
+            .and_then(|v| v.get("reasoning_tokens")),
+    );
+    invalid |= ["input_tokens_details", "output_tokens_details"]
+        .into_iter()
+        .any(|key| {
+            object
+                .get(key)
+                .is_some_and(|value| !value.is_null() && !value.is_object())
+        });
+    invalid |= input
+        .zip(cached)
+        .is_some_and(|(input, cached)| cached > input);
+    invalid |= input
+        .zip(cached)
+        .zip(cache_write)
+        .is_some_and(|((input, cached), write)| {
+            cached.checked_add(write).is_none_or(|sum| sum > input)
+        });
+    Some(TokenUsage {
+        input_tokens: input.unwrap_or(0),
+        cached_input_tokens: cached.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+        reasoning_output_tokens: reasoning.unwrap_or(0),
+        total_tokens: total.unwrap_or(0),
+        coverage: Some(TokenUsageCoverage {
+            receipts: 1,
+            input_tokens: u64::from(input.is_some()),
+            reported_receipts: Some(1),
+            cache_write_input_tokens: cache_write.unwrap_or(0),
+            cache_write_receipts: u64::from(cache_write.is_some()),
+            cached_input_tokens: u64::from(cached.is_some()),
+            output_tokens: u64::from(output.is_some()),
+            reasoning_output_tokens: u64::from(reasoning.is_some()),
+            total_tokens: u64::from(total.is_some()),
+            invalid_receipts: u64::from(invalid),
+            saturated: false,
+        }),
+    })
 }
 
 /// Stable error fields are independent of optional provider metadata. HTTP
@@ -655,13 +696,29 @@ fn process_responses_event(
         }
         "response.failed" => {
             let response = event.response;
-            let response_id = response.as_ref().and_then(|response| response.id.as_ref())
-                .and_then(Value::as_str).map(str::to_owned);
-            let error = provider_error(response.as_ref().and_then(|response| response.error.as_ref()).unwrap_or(&Value::Null));
+            let response_id = response
+                .as_ref()
+                .and_then(|response| response.id.as_ref())
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let error = provider_error(
+                response
+                    .as_ref()
+                    .and_then(|response| response.error.as_ref())
+                    .unwrap_or(&Value::Null),
+            );
             let token_usage = parse_usage(response.and_then(|response| response.usage));
-            return Err(ResponsesEventError::Api(if response_id.is_some() || token_usage.is_some() {
-                ApiError::TerminalResponse { source: Box::new(error), response_id, token_usage }
-            } else { error }));
+            return Err(ResponsesEventError::Api(
+                if response_id.is_some() || token_usage.is_some() {
+                    ApiError::TerminalResponse {
+                        source: Box::new(error),
+                        response_id,
+                        token_usage,
+                    }
+                } else {
+                    error
+                },
+            ));
         }
         "response.incomplete" => {
             let response = event.response;
@@ -741,8 +798,10 @@ fn parse_required_response_item(
     // explicit provider finality before deserialization can discard status
     // (notably for legacy FunctionCall). Omitted/null status remains compatible.
     if event_kind == "response.output_item.done"
-        && matches!(item.get("type").and_then(Value::as_str),
-            Some("function_call" | "custom_tool_call" | "tool_search_call" | "local_shell_call"))
+        && matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call" | "custom_tool_call" | "tool_search_call" | "local_shell_call")
+        )
         && let Some(status) = item.get("status").filter(|status| !status.is_null())
         && status.as_str() != Some("completed")
     {
@@ -750,14 +809,47 @@ fn parse_required_response_item(
             "executable output item has a non-completed status",
         )));
     }
-    serde_json::from_value(item).map_err(|error| {
+    let mut item: ResponseItem = serde_json::from_value(item).map_err(|error| {
         let message = decode_diagnostic(
             &format!("failed to parse ResponseItem from {event_kind}"),
             &error,
         );
         debug!("{message}");
         ResponsesEventError::Api(ApiError::invalid_response(message))
-    })
+    })?;
+    // ResponseItem is also the durable host-input schema. Deserializing it
+    // does not grant a provider authority to create local policy or mail.
+    let admitted = match &item {
+        ResponseItem::Message { role, content, .. } => {
+            role == "assistant"
+                && content.iter().all(|part| {
+                    matches!(part, codex_protocol::models::ContentItem::OutputText { .. })
+                })
+        }
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::Other => false,
+    };
+    if !admitted {
+        return Err(ResponsesEventError::Api(ApiError::invalid_response(
+            format!("{event_kind} contains a host-only or invalid provider output item"),
+        )));
+    }
+    item.clear_internal_chat_message_metadata_passthrough();
+    Ok(item)
 }
 
 pub(crate) fn json_headers_to_http_headers<'a>(
@@ -824,36 +916,151 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn ollama_single_summary_progress_is_opt_in_and_retains_finality() {
+        for enabled in [false, true] {
+            let metadata = ResponsesStreamMetadata {
+                ollama_single_summary: enabled,
+                ..Default::default()
+            };
+            let mut interpreter = ResponsesEventInterpreter::new(&metadata, None);
+            for payload in [
+                json!({"type":"response.created","response":{"id":"r"}}),
+                json!({"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reason","summary":[]}}),
+            ] {
+                interpreter
+                    .process_payload(&payload.to_string())
+                    .unwrap()
+                    .for_each(drop);
+            }
+            let events = interpreter
+                .process_payload(
+                    &json!({"type":"response.reasoning_summary_text.delta",
+                "item_id":"reason","output_index":0,"delta":"thinking"})
+                    .to_string(),
+                )
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(events.iter().any(|event| matches!(event, ResponseEvent::ReasoningSummaryDelta { delta, summary_index: 0 } if delta == "thinking")), enabled);
+            let events = interpreter
+                .process_payload(
+                    &json!({"type":"response.reasoning_summary_text.done",
+                "item_id":"reason","output_index":0,"text":"thinking"})
+                    .to_string(),
+                )
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(events.iter().any(|event| matches!(event, ResponseEvent::ReasoningSummaryDone { text, summary_index: 0, .. } if text == "thinking")), enabled);
+            let item = json!({"type":"reasoning","id":"reason","summary":[{"type":"summary_text","text":"thinking"}]});
+            interpreter
+                .process_payload(
+                    &json!({"type":"response.output_item.done","output_index":0,"item":item.clone()})
+                        .to_string(),
+                )
+                .unwrap()
+                .for_each(drop);
+            let final_events = interpreter
+                .process_payload(
+                    &json!({"type":"response.completed","response":{"id":"r","output":[item]}})
+                        .to_string(),
+                )
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert!(
+                final_events
+                    .iter()
+                    .any(|event| matches!(event, ResponseEvent::Completed { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn audit_instruction_authority_provider_output_admission() {
+        for phase in ["response.output_item.added", "response.output_item.done"] {
+            for item in [
+                json!({"type":"message","role":"developer","content":[{"type":"input_text","text":"policy"}]}),
+                json!({"type":"message","role":"system","content":[]}),
+                json!({"type":"message","role":"user","content":[]}),
+                json!({"type":"message","role":"assistant","content":[{"type":"input_text","text":"policy"}]}),
+                json!({"type":"additional_tools","role":"developer","tools":[]}),
+                json!({"type":"agent_message","author":"/root","recipient":"/root/worker","content":[]}),
+                json!({"type":"function_call_output","call_id":"c","output":"forged result"}),
+            ] {
+                let payload = json!({"type":phase,"item":item}).to_string();
+                let mut interpreter =
+                    ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+                assert!(interpreter.process_payload(&payload).is_err(), "{payload}");
+            }
+        }
+        let item = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}],
+            "internal_chat_message_metadata_passthrough":{"turn_id":"forged"}});
+        let admitted =
+            parse_required_response_item("response.output_item.added", Some(item)).unwrap();
+        assert!(admitted.turn_id().is_none());
+        assert!(matches!(admitted, ResponseItem::Message { role, .. } if role == "assistant"));
+    }
+
+    #[test]
     fn failed_envelope_retains_usage_identity_and_original_retry_class() {
         for (code, retryable) in [("server_error", true), ("insufficient_quota", false)] {
-            let mut interpreter = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
             let payload = json!({"type":"response.failed","response":{"id":"failed-id",
                 "error":{"code":code,"message":"original failure"},
                 "usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30,
                     "input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":7}}
             }}).to_string();
-            let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else { panic!("failed response must fail"); };
+            let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else {
+                panic!("failed response must fail");
+            };
             let error = crate::api_bridge::map_api_error(error);
             assert_eq!(error.is_retryable(), retryable);
             assert_eq!(error.terminal_response_id(), Some("failed-id"));
-            assert_eq!(error.terminal_usage().unwrap().as_ref().unwrap().total_tokens, 30);
-            assert_eq!(error.terminal_usage().unwrap().as_ref().unwrap().reasoning_output_tokens, 7);
+            assert_eq!(
+                error
+                    .terminal_usage()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .total_tokens,
+                30
+            );
+            assert_eq!(
+                error
+                    .terminal_usage()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .reasoning_output_tokens,
+                7
+            );
             assert_eq!(error.into_response_error().is_retryable(), retryable);
         }
     }
 
     #[test]
     fn invalid_completed_snapshot_keeps_known_usage_without_claiming_success() {
-        let mut interpreter = ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        let mut interpreter =
+            ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
         let payload = json!({"type":"response.completed","response":{"id":"invalid",
             "output":[{"type":"message","id":"m","role":"assistant","content":[]}],
             "usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}
-        }}).to_string();
-        let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else { panic!("unadmitted terminal output"); };
+        }})
+        .to_string();
+        let Err(ResponsesEventError::Api(error)) = interpreter.process_payload(&payload) else {
+            panic!("unadmitted terminal output");
+        };
         let error = crate::api_bridge::map_api_error(error);
         assert!(!error.is_retryable());
         assert_eq!(error.terminal_response_id(), Some("invalid"));
-        assert_eq!(error.terminal_usage().unwrap().as_ref().unwrap().total_tokens, 30);
+        assert_eq!(
+            error
+                .terminal_usage()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .total_tokens,
+            30
+        );
     }
 
     #[test]
@@ -865,39 +1072,65 @@ mod tests {
                     "item": {"type": kind, "status": status, "name": "marker",
                         "call_id": "call", "arguments": "{}", "input": "marker",
                         "execution": "client"}
-                }).to_string();
-                let mut interpreter = ResponsesEventInterpreter::new(
-                    &ResponsesStreamMetadata::default(), None,
+                })
+                .to_string();
+                let mut interpreter =
+                    ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+                assert!(
+                    matches!(
+                        interpreter.process_payload(&payload),
+                        Err(ResponsesEventError::Api(_))
+                    ),
+                    "{kind}: {status}"
                 );
-                assert!(matches!(interpreter.process_payload(&payload),
-                    Err(ResponsesEventError::Api(_))), "{kind}: {status}");
             }
         }
         for status in [Value::Null, json!("completed")] {
             let payload = json!({"type": "response.output_item.done", "item": {
                 "type": "function_call", "name": "marker", "call_id": "call",
                 "arguments": "{}", "status": status
-            }}).to_string();
-            let mut interpreter = ResponsesEventInterpreter::new(
-                &ResponsesStreamMetadata::default(), None,
-            );
-            assert!(matches!(interpreter.process_payload(&payload).unwrap().next(),
-                Some(ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. }))));
+            }})
+            .to_string();
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            assert!(matches!(
+                interpreter.process_payload(&payload).unwrap().next(),
+                Some(ResponseEvent::OutputItemDone(
+                    ResponseItem::FunctionCall { .. }
+                ))
+            ));
         }
+    }
+
+    fn admit_test_item(interpreter: &mut ResponsesEventInterpreter, item: Value) {
+        interpreter
+            .process_payload(&json!({"type":"response.output_item.added","item":item}).to_string())
+            .unwrap()
+            .for_each(drop);
     }
 
     #[test]
     fn function_argument_fragments_are_productive_but_empty_fragments_are_not() {
         for delta in ["", "{\"code\":\"", "partial code"] {
             let payload = json!({"type": "response.function_call_arguments.delta",
-                "item_id": "fc_1", "delta": delta}).to_string();
-            let mut interpreter = ResponsesEventInterpreter::new(
-                &ResponsesStreamMetadata::default(), None,
+                "item_id": "fc_1", "delta": delta})
+            .to_string();
+            let mut interpreter =
+                ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            admit_test_item(
+                &mut interpreter,
+                json!({"type":"function_call","id":"fc_1","call_id":"call","name":"marker","arguments":""}),
             );
-            let event = interpreter.process_payload(&payload).unwrap().next().unwrap();
+            let event = interpreter
+                .process_payload(&payload)
+                .unwrap()
+                .next()
+                .unwrap();
             assert_eq!(event.advances_model_response(), !delta.is_empty());
-            assert!(matches!(event, ResponseEvent::ToolCallInputDelta { item_id, delta: actual, .. }
-                if item_id == "fc_1" && actual == delta));
+            assert!(
+                matches!(event, ResponseEvent::ToolCallInputDelta { item_id, delta: actual, .. }
+                if item_id == "fc_1" && actual == delta)
+            );
         }
     }
 
@@ -1012,6 +1245,10 @@ mod tests {
             .to_string();
             let mut interpreter =
                 ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+            admit_test_item(
+                &mut interpreter,
+                json!({"type":"custom_tool_call","id":item_id.unwrap_or("fixture-item"),"call_id":call_id.unwrap_or("fixture-call"),"name":"marker","input":""}),
+            );
             let events = interpreter
                 .process_payload(&payload)
                 .unwrap()
@@ -1046,8 +1283,35 @@ mod tests {
                 .process_payload(&payload)
                 .unwrap()
                 .collect::<Vec<_>>();
-            assert!(matches!(events.as_slice(), [ResponseEvent::Completed {
-                response_id, token_usage: None, end_turn: Some(true) }] if response_id == "done"));
+            let [
+                ResponseEvent::Completed {
+                    response_id,
+                    token_usage,
+                    end_turn,
+                },
+            ] = events.as_slice()
+            else {
+                panic!("optional usage must not destroy completion")
+            };
+            assert_eq!(response_id, "done");
+            assert_eq!(*end_turn, Some(true));
+            if usage.is_null() {
+                assert!(token_usage.is_none());
+            } else {
+                let tokens = token_usage
+                    .as_ref()
+                    .expect("retain independently valid components");
+                assert_eq!(tokens.known_cached_input(), None);
+                assert_eq!(tokens.known_reasoning_output(), None);
+                if usage["input_tokens"] == 1 {
+                    assert_eq!(tokens.known_input(), Some(1));
+                    assert_eq!(tokens.known_output(), Some(2));
+                    assert_eq!(tokens.known_total(), Some(3));
+                } else {
+                    assert_eq!(tokens.known_input(), None);
+                    assert_eq!(tokens.known_total(), None);
+                }
+            }
         }
         // Control: a well-formed usage object is still reported, including its details.
         let mut interpreter =
@@ -1067,6 +1331,7 @@ mod tests {
             output_tokens: 20,
             reasoning_output_tokens: 7,
             total_tokens: 30,
+            coverage: Some(codex_protocol::protocol::TokenUsageCoverage::fully_reported()),
         };
         assert!(matches!(events.as_slice(), [ResponseEvent::Completed {
             response_id, token_usage: Some(usage), end_turn: None }]
@@ -1255,6 +1520,10 @@ mod tests {
     fn ordinary_events_skip_transport_error_parsing() {
         let mut interpreter =
             ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        admit_test_item(
+            &mut interpreter,
+            json!({"type":"message","id":"m","role":"assistant","content":[]}),
+        );
         for payload in [
             r#"{"type":"response.output_text.delta","delta":"hello"}"#,
             r#"{"delta":"hello","type":"response.output_text.\u0064elta"}"#,
@@ -1315,6 +1584,10 @@ mod tests {
             &ResponsesStreamMetadata::default(),
             Some(Arc::clone(&turn_state)),
         );
+        admit_test_item(
+            &mut interpreter,
+            json!({"type":"message","id":"m","role":"assistant","content":[]}),
+        );
 
         let metadata_events = interpreter
             .process_payload(
@@ -1367,6 +1640,10 @@ mod tests {
     fn interpreter_reuses_event_storage_and_does_not_replay_dropped_or_failed_frames() {
         let mut interpreter =
             ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+        admit_test_item(
+            &mut interpreter,
+            json!({"type":"message","id":"m","role":"assistant","content":[]}),
+        );
         let frame = r#"{"type":"response.output_text.delta","delta":"first","headers":{"openai-model":["model-a"]}}"#;
         let mut events = interpreter.process_payload(frame).unwrap();
         assert!(
@@ -1517,5 +1794,131 @@ mod tests {
             }) if actual_delay.remaining_delay() == expected && actual_message == message)
             );
         }
+    }
+}
+#[cfg(test)]
+mod component_receipt_regressions {
+    use super::*;
+
+    #[test]
+    fn cache_details_survive_every_terminal_shape_without_inventing_zero() {
+        for (details, cached, write, invalid) in [
+            (None, None, None, false),
+            (Some(serde_json::Value::Null), None, None, false),
+            (
+                Some(serde_json::json!({"cached_tokens": 0})),
+                Some(0),
+                None,
+                false,
+            ),
+            (
+                Some(serde_json::json!({"cached_tokens": 40, "cache_write_tokens": 0})),
+                Some(40),
+                Some(0),
+                false,
+            ),
+            (
+                Some(serde_json::json!({"cached_tokens": 40, "cache_write_tokens": 30})),
+                Some(40),
+                Some(30),
+                false,
+            ),
+            (
+                Some(serde_json::json!({"cached_tokens": null, "cache_write_tokens": "bad"})),
+                None,
+                None,
+                true,
+            ),
+            (
+                Some(serde_json::json!({"cached_tokens": 40, "cache_write_tokens": -1})),
+                Some(40),
+                None,
+                true,
+            ),
+            (
+                Some(serde_json::json!({"cached_tokens": 80, "cache_write_tokens": 30})),
+                Some(80),
+                Some(30),
+                true,
+            ),
+        ] {
+            for terminal in [
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+            ] {
+                let mut usage =
+                    serde_json::json!({"input_tokens":100,"output_tokens":20,"total_tokens":120});
+                if let Some(details) = &details {
+                    usage["input_tokens_details"] = details.clone();
+                }
+                let payload = serde_json::json!({"type": terminal, "response": {
+                    "id":"receipt", "usage":usage,
+                    "error":{"code":"server_error","message":"failed"},
+                    "incomplete_details":{"reason":"max_output_tokens"}
+                }})
+                .to_string();
+                let mut interpreter =
+                    ResponsesEventInterpreter::new(&ResponsesStreamMetadata::default(), None);
+                let usage = match interpreter.process_payload(&payload) {
+                    Ok(mut events) => events
+                        .find_map(|event| match event {
+                            ResponseEvent::Completed { token_usage, .. } => token_usage,
+                            _ => None,
+                        })
+                        .expect("completion receipt"),
+                    Err(ResponsesEventError::Api(error)) => crate::api_bridge::map_api_error(error)
+                        .terminal_usage()
+                        .expect("terminal observation")
+                        .clone()
+                        .expect("receipt"),
+                    Err(error) => panic!("unexpected terminal error: {error:?}"),
+                };
+                assert_eq!(usage.known_input(), Some(100));
+                assert_eq!(usage.known_cached_input(), cached);
+                assert_eq!(usage.known_cache_write_input(), write);
+                assert_eq!(usage.coverage.as_ref().unwrap().reported_receipts, Some(1));
+                assert_eq!(
+                    usage.coverage.as_ref().unwrap().invalid_receipts,
+                    u64::from(invalid)
+                );
+                let ordinary = if invalid {
+                    None
+                } else {
+                    cached.zip(write).map(|(read, write)| 100 - read - write)
+                };
+                assert_eq!(usage.known_ordinary_input(), ordinary);
+                let mut subtotal = TokenUsage::empty_ledger();
+                subtotal.add_assign(&usage);
+                subtotal.add_assign(&TokenUsage::missing_receipt());
+                assert_eq!(subtotal.known_input(), None);
+                assert_eq!(subtotal.coverage.as_ref().unwrap().receipts, 2);
+                assert_eq!(
+                    subtotal.coverage.as_ref().unwrap().reported_receipts,
+                    Some(1)
+                );
+                assert_eq!(subtotal.known_cache_write_input(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_signed_component_does_not_reduce_or_erase_independent_usage() {
+        let usage = parse_usage(Some(serde_json::json!({
+            "input_tokens": -5, "output_tokens": 7, "total_tokens": 2,
+            "input_tokens_details":{"cached_tokens":0}
+        })))
+        .unwrap();
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.known_input(), None);
+        assert_eq!(usage.known_cached_input(), Some(0));
+        assert_eq!(usage.known_output(), Some(7));
+        assert_eq!(usage.known_reasoning_output(), None);
+        assert_eq!(usage.known_visible_output(), None);
+        assert_eq!(usage.known_total(), Some(2));
+        assert_eq!(usage.coverage.unwrap().invalid_receipts, 1);
+        let mut ledger = TokenUsage::empty_ledger();
+        ledger.add_assign(&usage);
+        assert_eq!(ledger.known_total(), Some(2));
     }
 }

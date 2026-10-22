@@ -43,6 +43,7 @@ pub fn build_file_change_approval_request_item(
     payload: &ApplyPatchApprovalRequestEvent,
 ) -> ThreadItem {
     ThreadItem::FileChange {
+        environment: None,
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
         status: PatchApplyStatus::InProgress,
@@ -51,6 +52,7 @@ pub fn build_file_change_approval_request_item(
 
 pub fn build_file_change_begin_item(payload: &PatchApplyBeginEvent) -> ThreadItem {
     ThreadItem::FileChange {
+        environment: payload.environment.clone(),
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
         status: PatchApplyStatus::InProgress,
@@ -59,6 +61,7 @@ pub fn build_file_change_begin_item(payload: &PatchApplyBeginEvent) -> ThreadIte
 
 pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItem {
     ThreadItem::FileChange {
+        environment: payload.environment.clone(),
         id: payload.call_id.clone(),
         changes: convert_patch_changes(&payload.changes),
         status: (&payload.status).into(),
@@ -68,6 +71,7 @@ pub fn build_file_change_end_item(payload: &PatchApplyEndEvent) -> ThreadItem {
 pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> ThreadItem {
     let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
     ThreadItem::CommandExecution {
+        environment: payload.environment.clone(),
         output_metadata: None,
         stdout: None,
         stderr: None,
@@ -98,6 +102,7 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
     let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
 
     ThreadItem::CommandExecution {
+        environment: payload.environment.clone(),
         output_metadata: payload.output_metadata.clone(),
         stdout: Some(payload.stdout.clone()),
         stderr: Some(payload.stderr.clone()),

@@ -131,6 +131,43 @@ pub fn parse_shell_script_into_commands(script: &str) -> Option<Vec<Vec<String>>
     try_parse_word_only_commands_sequence(&tree, script)
 }
 
+/// Possible literal command prefixes in opaque source, for conservative
+/// admission only. AST command ownership excludes comments and quoted examples,
+/// but does not prove execution count, argv completeness or exit authority.
+pub fn possible_command_argvs(script: &str) -> Vec<Vec<String>> {
+    let Some(tree) = try_parse_shell(script) else {
+        return Vec::new();
+    };
+    let mut stack = vec![tree.root_node()];
+    let mut commands = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.kind() == "command" {
+            if let Some(argv) = parse_plain_command_from_node(node, script) {
+                commands.push(argv);
+            } else if let Ok(source) = node.utf8_text(script.as_bytes())
+                && let Some(mut argv) = shlex::split(source)
+            {
+                let assignments = argv
+                    .iter()
+                    .take_while(|arg| {
+                        arg.split_once('=').is_some_and(|(name, _)| {
+                            !name.is_empty()
+                                && name
+                                    .chars()
+                                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        })
+                    })
+                    .count();
+                argv.drain(..assignments);
+                commands.push(argv);
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    commands
+}
+
 pub fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
     let [shell, flag, script] = command else {
         return None;

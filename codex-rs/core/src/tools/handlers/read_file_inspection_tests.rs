@@ -27,6 +27,7 @@ async fn paged_native_source_acquisition_round_trip() -> std::time::Duration {
         capability_profile: CapabilityProfile::ScopedSourceWrite,
         objective: "Acquire the complete large source snapshot".into(),
         acceptance_criteria: vec![AcceptanceCriterion {
+            evidence_policy: None,
             id: "acquisition".into(), text: "Acquire every source byte".into(),
         }],
         read_scope: Vec::new(), write_scope: Vec::new(),
